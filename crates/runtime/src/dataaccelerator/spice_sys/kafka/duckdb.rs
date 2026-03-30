@@ -112,8 +112,9 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+    use tempfile::TempDir;
 
-    async fn create_test_dataset(ds_name: &str) -> Dataset {
+    async fn create_test_dataset(ds_name: &str) -> (Dataset, TempDir) {
         let app = app::AppBuilder::new("test").build();
         let runtime = RuntimeBuilder::new().build().await;
 
@@ -124,19 +125,23 @@ mod tests {
             .build()
             .expect("to create dataset");
 
+        // Use a unique temp directory for each test to avoid parallel test interference
+        let temp_dir = TempDir::new().expect("to create temp dir");
+        let db_path = temp_dir.path().join("kafka_test.db");
+
         dataset.acceleration = Some(Acceleration {
             engine: Engine::DuckDB,
             mode: Mode::File,
             params: [(
                 "duckdb_file".to_string(),
-                ".spice/data/kafka_duckdb_test.db".to_string(),
+                db_path.to_string_lossy().to_string(),
             )]
             .into_iter()
             .collect(),
             ..Default::default()
         });
 
-        dataset
+        (dataset, temp_dir)
     }
 
     fn create_test_metadata() -> KafkaMetadata {
@@ -154,7 +159,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duckdb_roundtrip() {
-        let ds = create_test_dataset("test_duckdb_roundtrip").await;
+        let (ds, _temp_dir) = create_test_dataset("test_duckdb_roundtrip").await;
         let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
@@ -174,7 +179,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duckdb_metadata_overwrite() {
-        let ds = create_test_dataset("test_duckdb_metadata_overwrite").await;
+        let (ds, _temp_dir) = create_test_dataset("test_duckdb_metadata_overwrite").await;
         let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");
@@ -200,7 +205,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duckdb_get_nonexistent() {
-        let ds = create_test_dataset("test_duckdb_get_nonexistent").await;
+        let (ds, _temp_dir) = create_test_dataset("test_duckdb_get_nonexistent").await;
         let kafka_sys = KafkaSys::try_new(&ds, OpenOption::CreateIfNotExists)
             .await
             .expect("to create KafkaSys");

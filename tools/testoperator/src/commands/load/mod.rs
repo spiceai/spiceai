@@ -21,6 +21,7 @@ use test_framework::{
     TestType, anyhow,
     app::AppBuilder,
     arrow::util::pretty::print_batches,
+    git,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, QueryStatus, StatisticsCollector},
     opentelemetry::KeyValue,
     opentelemetry_sdk::Resource,
@@ -36,11 +37,17 @@ use test_framework::{
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
+#[expect(clippy::too_many_lines)]
 pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     if args.test_args.common.concurrency < 2 {
         return Err(anyhow::anyhow!(
             "Concurrency should be greater than 1 for a load test"
         ));
+    }
+
+    // Warn if api_key is set but not connecting to an external instance
+    if args.api_key.is_some() && !args.test_args.common.is_external_instance() {
+        println!("--api-key is only applicable when connecting to an external instance; ignoring");
     }
 
     // Check if connecting to an external instance or starting a new one
@@ -53,7 +60,8 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         let app = AppBuilder::new(spicepod.name.clone())
             .with_spicepod(spicepod)
             .build();
-        let instance = SpicedInstance::external(&args.test_args.common.spiced_path);
+        let instance = SpicedInstance::external(&args.test_args.common.spiced_path)
+            .with_api_key(args.api_key.clone());
         (app, instance)
     } else {
         let (app, start_request) = get_app_and_start_request(&args.test_args.common).await?;
@@ -61,13 +69,57 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         (app, instance)
     };
 
+    println!("Waiting for spiced instance to be ready...");
+
     spiced_instance
         .wait_for_ready(Duration::from_secs(args.test_args.common.ready_wait))
         .await?;
 
-    // Create telemetry early before any metrics calls (e.g., HealthMonitor)
-    // Resource will be set later with set_resource() before emit()
-    let mut telemetry = super::create_telemetry(&args.test_args.common);
+    println!("spiced instance is ready!");
+
+    // Build resource with attributes known upfront, before creating telemetry.
+    // This ensures the SdkMeterProvider is created with the correct resource,
+    // so all metrics (including HealthMonitor) have proper resource attributes.
+    let spiced_version = spiced_instance.version().to_string();
+    let spiced_commit_sha =
+        std::env::var("SPICED_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+    let testoperator_commit_sha = git::get_commit_sha();
+    let branch_name = git::get_branch_name();
+    let spicepod = args.test_args.common.spicepod_path.display().to_string();
+
+    let query_set = args.test_args.load_query_set()?;
+    let load_resource = Resource::builder_empty()
+        .with_attributes(vec![
+            KeyValue::new("service.name", "testoperator"),
+            KeyValue::new("type", "load_test"),
+            KeyValue::new("name", app.name.clone()),
+            KeyValue::new("spiced_version", spiced_version),
+            KeyValue::new("query_set", query_set.to_string()),
+            KeyValue::new("testoperator_commit_sha", testoperator_commit_sha),
+            KeyValue::new("spiced_commit_sha", spiced_commit_sha),
+            KeyValue::new("branch_name", branch_name),
+            KeyValue::new("concurrency", args.test_args.common.concurrency.to_string()),
+            KeyValue::new("spicepod", spicepod),
+            KeyValue::new(
+                "param_set_variants",
+                args.test_args
+                    .random_param_set_count
+                    .unwrap_or(1)
+                    .to_string(),
+            ),
+            KeyValue::new(
+                "protocol",
+                if args.test_args.http_clients {
+                    "http"
+                } else {
+                    "flight"
+                },
+            ),
+        ])
+        .build();
+
+    // Create telemetry with resource upfront, before any metrics calls
+    let telemetry = super::create_telemetry_with_resource(&args.test_args.common, load_resource);
 
     let health_monitor = HealthMonitor::spawn()?;
 
@@ -78,6 +130,9 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         None
     };
 
+    // Create the appropriate query executor based on args
+    let executor = super::create_query_executor(&args.test_args, &spiced_instance).await?;
+
     // warm up run
     println!("Performing warm up");
 
@@ -86,16 +141,15 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::QuerySetCompleted(1))
-            .with_disable_caching(args.test_args.disable_caching)
-            .with_http_client(args.test_args.http_clients),
+            .with_query_executor(executor.clone()),
     )
     .await?;
 
     let warm_up = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
+        .with_api_key(args.api_key.clone())
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
 
     let spiced_instance = warm_up.wait().await?.end()?;
 
@@ -108,21 +162,20 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     // baseline run
     println!("Running baseline throughput test for {baseline_duration_secs}s",);
 
-    let (_query_set, test_builder) = super::build_test_with_validation(
+    let (_, test_builder) = super::build_test_with_validation(
         &args.test_args,
         NotStarted::new()
             .with_parallel_count(args.test_args.common.concurrency)
             .with_end_condition(EndCondition::Duration(baseline_duration))
-            .with_disable_caching(args.test_args.disable_caching)
-            .with_http_client(args.test_args.http_clients),
+            .with_query_executor(executor.clone()),
     )
     .await?;
 
     let baseline_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
+        .with_api_key(args.api_key.clone())
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
 
     let test = baseline_test.wait().await?;
     let baseline_percentiles = test.get_query_durations().percentile(99.0)?;
@@ -159,8 +212,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let mut test_builder = NotStarted::new()
         .with_parallel_count(args.test_args.common.concurrency)
         .with_end_condition(load_end_condition)
-        .with_disable_caching(args.test_args.disable_caching)
-        .with_http_client(args.test_args.http_clients)
+        .with_query_executor(executor)
         .with_query_duration_threshold(args.test_args.mark_query_failed_if_exceeds);
 
     // Add streaming metrics sender if exporter is configured
@@ -181,9 +233,9 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
 
     let throughput_test = SpiceTest::<NotStarted>::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
+        .with_api_key(args.api_key.clone())
         .with_progress_bars(!args.test_args.common.disable_progress_bars)
-        .start()
-        .await?;
+        .start()?;
     let shutdown_token = throughput_test.cancellation_token();
     let test_future = throughput_test.wait();
     tokio::pin!(test_future);
@@ -217,48 +269,6 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
         println!("Memory monitoring not available for external spiced instances");
         (0.0, 0.0)
     };
-
-    // Set up telemetry for load test metrics
-    let commit_sha = metrics.commit_sha.clone();
-    let spiced_commit_sha = std::env::var("SPICED_COMMIT").unwrap_or("unknown".to_string());
-    let spiced_version = metrics.spiced_version.clone();
-    let spicepod = args.test_args.common.spicepod_path.display().to_string();
-    let app_name = app.name.clone();
-
-    let attributes = vec![
-        KeyValue::new("service.name", "testoperator"),
-        KeyValue::new("type", "load_test"),
-        KeyValue::new("name", app_name.clone()),
-        KeyValue::new("spiced_version", spiced_version),
-        KeyValue::new("query_set", query_set.to_string()),
-        KeyValue::new("testoperator_commit_sha", commit_sha),
-        KeyValue::new("spiced_commit_sha", spiced_commit_sha),
-        KeyValue::new("branch_name", metrics.branch_name.clone()),
-        KeyValue::new("concurrency", args.test_args.common.concurrency.to_string()),
-        KeyValue::new("spicepod", spicepod),
-        // If not specified, default to 1 meaning single fixed params set was used
-        KeyValue::new(
-            "param_set_variants",
-            args.test_args
-                .random_param_set_count
-                .unwrap_or(1)
-                .to_string(),
-        ),
-        KeyValue::new(
-            "protocol",
-            if args.test_args.http_clients {
-                "http"
-            } else {
-                "flight"
-            },
-        ),
-    ];
-
-    telemetry.set_resource(
-        Resource::builder_empty()
-            .with_attributes(attributes.clone())
-            .build(),
-    );
 
     // Record per-query metrics for load test
     for query in &metrics.metrics {
@@ -308,8 +318,7 @@ pub(crate) async fn run(args: &LoadTestArgs) -> anyhow::Result<()> {
     let health_report = health_monitor.stop().await;
 
     // Stop and process metrics scraper if enabled
-    super::process_spiced_metrics(metrics_scraper, args.test_args.common.metrics, &attributes)
-        .await;
+    super::process_spiced_metrics(metrics_scraper, args.test_args.common.metrics, &[]).await;
 
     // Shutdown streaming exporter before emitting final telemetry
     if let Some(exporter) = streaming_exporter {

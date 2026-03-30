@@ -289,25 +289,25 @@ impl TestCases {
                 "limit": 4
             })),
             Self::VectorSearchSqlBasic => SearchTestType::Sql(
-                "SELECT id, answer, trunc(score, 3) FROM vector_search(qs, 'second', answer) order by score desc, id LIMIT 4".to_string()
+                "SELECT id, answer, trunc(_score, 3) FROM vector_search(qs, 'second', answer) order by _score desc, id LIMIT 4".to_string()
             ),
             Self::VectorSearchSqlProjection => SearchTestType::Sql(
-                "SELECT id, answer, question, subject, trunc(score, 3) as score FROM vector_search(qs, 'second', answer) order by score desc, id LIMIT 4".to_string()
+                "SELECT id, answer, question, subject, trunc(_score, 3) as _score FROM vector_search(qs, 'second', answer) order by _score desc, id LIMIT 4".to_string()
             ),
             Self::VectorSearchSqlFilters => SearchTestType::Sql(
-                "SELECT id, answer, trunc(score, 3) as score FROM vector_search(qs, 'secondary', answer) where subject!='math' order by score desc, id LIMIT 4".to_string()
+                "SELECT id, answer, trunc(_score, 3) as _score FROM vector_search(qs, 'secondary', answer) where subject!='math' order by _score desc, id LIMIT 4".to_string()
             ),
             Self::VectorSearchSqlNoScore => SearchTestType::Sql(
-                "SELECT id, answer FROM vector_search(qs, 'second', answer) order by score desc, id LIMIT 4".to_string()
+                "SELECT id, answer FROM vector_search(qs, 'second', answer) order by _score desc, id LIMIT 4".to_string()
             ),
             Self::VectorSearchSqlRandom => SearchTestType::Sql(
-                "SELECT subject FROM vector_search(qs, 'second', answer) order by score desc LIMIT 4".to_string()
+                "SELECT subject FROM vector_search(qs, 'second', answer) order by _score desc LIMIT 4".to_string()
             ),
             Self::VectorSearchSqlVectors => SearchTestType::Sql(
-                "SELECT id, answer, array_length(answer_embedding), trunc(score, 3) as score  FROM vector_search(qs, 'second', answer) order by score desc, id desc LIMIT 4;".to_string()
+                "SELECT id, answer, array_length(answer_embedding), trunc(_score, 3) as _score  FROM vector_search(qs, 'second', answer) order by _score desc, id desc LIMIT 4;".to_string()
             ),
             Self::VectorSearchSqlIndexOnly => SearchTestType::Sql(
-                "SELECT id, trunc(score, 3) as score  FROM vector_search(qs, 'second', answer) order by score desc, id desc LIMIT 4;".to_string()
+                "SELECT id, trunc(_score, 3) as _score  FROM vector_search(qs, 'second', answer) order by _score desc, id desc LIMIT 4;".to_string()
             ),
        }
     }

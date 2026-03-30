@@ -24,8 +24,15 @@ use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Component name is not a valid identifier"))]
+    #[snafu(display(
+        "Component name is not a valid SQL identifier. Use alphanumeric characters, underscores, or quoted identifiers."
+    ))]
     InvalidIdentifier,
+
+    #[snafu(display(
+        "'{name}' is a reserved catalog name and cannot be used. Choose a different name for the catalog."
+    ))]
+    ReservedCatalogName { name: String },
 }
 
 pub mod access;

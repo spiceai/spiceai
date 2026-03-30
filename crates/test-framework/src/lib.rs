@@ -21,10 +21,13 @@ pub mod app_utils;
 // this is our test framework, used in tests - expect is acceptable
 pub mod arrow_record_batch_gen;
 pub mod constants;
+pub mod execution;
 pub mod flight;
 pub mod gh_utils;
 pub mod git;
 pub mod metrics;
+pub mod object_store;
+pub mod pki;
 pub mod process;
 pub mod queries;
 pub mod snapshot;
@@ -45,9 +48,9 @@ pub use octocrab;
 pub use opentelemetry;
 pub use opentelemetry_sdk;
 pub use rustls;
-pub use serde_yaml;
 pub use spicepod;
 pub use tokio_util;
+pub use yaml;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TestType {
@@ -58,6 +61,9 @@ pub enum TestType {
     DataConsistency,
     Search,
     TextToSql,
+    Streaming,
+    StreamingCorrectness,
+    Schema,
 }
 
 impl TestType {
@@ -71,6 +77,9 @@ impl TestType {
             TestType::DataConsistency => "testoperator_run_data_consistency.yml",
             TestType::Search => "testoperator_run_search.yml",
             TestType::TextToSql => "testoperator_run_texttosql.yml",
+            TestType::Streaming => "testoperator_run_streaming_bench.yml",
+            TestType::StreamingCorrectness => "testoperator_run_streaming_correctness.yml",
+            TestType::Schema => "testoperator_run_schema.yml",
         }
     }
 }
@@ -85,6 +94,9 @@ impl Display for TestType {
             TestType::DataConsistency => write!(f, "data_consistency"),
             TestType::Search => write!(f, "search"),
             TestType::TextToSql => write!(f, "text_to_sql"),
+            TestType::Streaming => write!(f, "streaming"),
+            TestType::StreamingCorrectness => write!(f, "streaming_correctness"),
+            TestType::Schema => write!(f, "schema"),
         }
     }
 }

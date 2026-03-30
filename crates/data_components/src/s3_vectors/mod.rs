@@ -52,7 +52,7 @@ pub static S3_VECTOR_EMBEDDING_NAME: &str = "data";
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to s3vector. {source} Report an issue on GitHub: https://github.com/spiceai/spiceai/issues"
+        "An internal error occurred in S3 Vectors: {source}. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     InternalError {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -185,7 +185,7 @@ pub async fn list_index_names(
 ) -> Result<Vec<String>, Error> {
     let list_indexes_output = client
         .list_indexes(
-            ListIndexesInput::builder()
+            &ListIndexesInput::builder()
                 .set_vector_bucket_name(Some(bucket_name.to_string()))
                 .set_prefix(Some(prefix.to_string()))
                 .build()
@@ -220,7 +220,7 @@ async fn gather_and_limit_providers(
     }
 
     Ok(Arc::new(GlobalLimitExec::new(
-        Arc::new(UnionExec::new(physical_plans)),
+        UnionExec::try_new(physical_plans)?,
         0,
         limit,
     )))

@@ -20,13 +20,15 @@ limitations under the License.
 //! avoiding the overhead of opening a new connection for each operation.
 
 use super::{
-    ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreValue, QueryParams,
-    QueryRowParams,
+    duplicate_delete_file_index_error_message, ExecuteParams, MetastoreBackend, MetastoreGetValue,
+    MetastoreRow, MetastoreValue, QueryParams, QueryRowParams,
 };
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
 use std::path::Path;
 use tokio::sync::OnceCell;
+
+const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_delete_file_table_path ON cayenne_delete_file(table_id, path)";
 
 /// `SQLite`-based metastore backend with a persistent connection.
 ///
@@ -39,13 +41,19 @@ pub struct SqliteMetastore {
     conn: OnceCell<tokio_rusqlite::Connection>,
 }
 
-/// Convert a `tokio_rusqlite::Error` to a `CatalogError`, preserving the underlying
-/// `rusqlite::Error` when possible for better error matching.
+/// Convert a `tokio_rusqlite::Error` to a `CatalogError`, distinguishing constraint violations.
 fn convert_tokio_rusqlite_error(
     e: tokio_rusqlite::Error<rusqlite::Error>,
     context: &str,
 ) -> CatalogError {
     match e {
+        tokio_rusqlite::Error::Error(rusqlite::Error::SqliteFailure(err, msg))
+            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            CatalogError::ConstraintViolation {
+                message: msg.unwrap_or_else(|| "Constraint violation".to_string()),
+            }
+        }
         tokio_rusqlite::Error::Error(sqlite_err) => CatalogError::Sqlite { source: sqlite_err },
         other => CatalogError::Database {
             message: format!("{context}: {other}"),
@@ -147,12 +155,9 @@ impl SqliteMetastore {
     }
 
     /// Schema for the `cayenne_table` table.
-    /// Using INTEGER for AUTOINCREMENT is required
-    /// It is unlikely someone will have more than `9223372036854775807` tables (`SQLite` INTEGER max)
     const TABLE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
-            table_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_uuid TEXT NOT NULL,
+            table_id TEXT PRIMARY KEY,
             table_name TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
@@ -166,11 +171,16 @@ impl SqliteMetastore {
         )
     ";
 
+    const TABLE_NAME_UNIQUE_INDEX_DDL: &'static str = r"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_table_name_unique
+        ON cayenne_table(table_name)
+    ";
+
     /// Schema for the `cayenne_delete_file` table.
     const DELETE_FILE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_delete_file (
-            delete_file_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_id INTEGER NOT NULL,
+            delete_file_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             format TEXT NOT NULL,
@@ -183,18 +193,23 @@ impl SqliteMetastore {
     ";
 
     /// Schema for the `cayenne_partition` table.
+    ///
+    /// Supports composite partition keys by storing column names and values as JSON arrays.
+    /// The `partition_key` column stores a unique composite key (slash-separated values)
+    /// for efficient lookups and uniqueness constraints.
     const PARTITION_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_partition (
-            partition_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_id INTEGER NOT NULL,
-            partition_column TEXT NOT NULL,
-            partition_value TEXT NOT NULL,
+            partition_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
+            partition_columns_json TEXT NOT NULL,
+            partition_values_json TEXT NOT NULL,
+            partition_key TEXT NOT NULL,
             path TEXT NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             record_count BIGINT NOT NULL DEFAULT 0,
             file_size_bytes BIGINT NOT NULL DEFAULT 0,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
-            UNIQUE(table_id, partition_column, partition_value)
+            UNIQUE(table_id, partition_key)
         )
     ";
 
@@ -207,8 +222,8 @@ impl SqliteMetastore {
     /// - If `delete_sequence` > `insert_sequence`, the row is filtered out
     const INSERT_RECORD_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_insert_record (
-            insert_record_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_id INTEGER NOT NULL,
+            insert_record_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
             pk_bytes BLOB NOT NULL,
             sequence_number BIGINT NOT NULL,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
@@ -223,7 +238,7 @@ impl SqliteMetastore {
     /// <= the delete file's `sequence_number`.
     const SNAPSHOT_SEQUENCE_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_snapshot_sequence (
-            table_id INTEGER NOT NULL,
+            table_id TEXT NOT NULL,
             snapshot_id TEXT NOT NULL,
             sequence_number BIGINT NOT NULL,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
@@ -334,8 +349,9 @@ impl MetastoreBackend for SqliteMetastore {
         conn.call(|conn| {
             // Create tables in a transaction
             conn.execute_batch(&format!(
-                "{}; {}; {}; {}; {};",
+                "{}; {}; {}; {}; {}; {};",
                 Self::TABLE_TABLE_DDL,
+                Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                 Self::DELETE_FILE_TABLE_DDL,
                 Self::PARTITION_TABLE_DDL,
                 Self::INSERT_RECORD_TABLE_DDL,
@@ -358,6 +374,40 @@ impl MetastoreBackend for SqliteMetastore {
             },
         )?;
 
+        conn.call(|conn| {
+            conn.execute(DELETE_FILE_TABLE_UNIQUE_INDEX_DDL, [])?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .map_err(
+            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                message: duplicate_delete_file_index_error_message("SQLite", e),
+            },
+        )?;
+
+        // Validate that existing tables match the expected schema.
+        // This catches incompatible metadata databases from previous versions.
+        let validate_conn = self.get_conn().await?;
+        super::validate_existing_schema(|table_name| {
+            let conn = validate_conn.clone();
+            async move {
+                conn.call(move |conn| {
+                    let mut stmt = conn.prepare(&format!("PRAGMA table_info('{table_name}')"))?;
+                    let columns: Vec<String> = stmt
+                        .query_map([], |row| row.get::<_, String>(1))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok::<Vec<String>, rusqlite::Error>(columns)
+                })
+                .await
+                .map_err(
+                    |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                        message: format!("Failed to read table schema for validation: {e}"),
+                    },
+                )
+            }
+        })
+        .await?;
+
         Ok(())
     }
 
@@ -372,7 +422,7 @@ impl MetastoreBackend for SqliteMetastore {
                 .iter()
                 .map(|v| v as &dyn rusqlite::ToSql)
                 .collect();
-            conn.execute(&sql, params_refs.as_slice())?;
+            conn.prepare_cached(&sql)?.execute(params_refs.as_slice())?;
             Ok::<_, rusqlite::Error>(())
         })
         .await
@@ -417,17 +467,18 @@ impl MetastoreBackend for SqliteMetastore {
                     .map(|v| v as &dyn rusqlite::ToSql)
                     .collect();
 
-                conn.query_row(&sql, params_refs.as_slice(), |row| {
-                    let column_count = row.as_ref().column_count();
-                    let mut values = Vec::with_capacity(column_count);
+                conn.prepare_cached(&sql)?
+                    .query_row(params_refs.as_slice(), |row| {
+                        let column_count = row.as_ref().column_count();
+                        let mut values = Vec::with_capacity(column_count);
 
-                    for i in 0..column_count {
-                        let value = row.get_ref(i)?;
-                        values.push(convert_sqlite_value(value));
-                    }
+                        for i in 0..column_count {
+                            let value = row.get_ref(i)?;
+                            values.push(convert_sqlite_value(value));
+                        }
 
-                    Ok(values)
-                })
+                        Ok(values)
+                    })
             })
             .await
             .map_err(
@@ -459,7 +510,7 @@ impl MetastoreBackend for SqliteMetastore {
                     .map(|v| v as &dyn rusqlite::ToSql)
                     .collect();
 
-                let mut stmt = conn.prepare(&sql)?;
+                let mut stmt = conn.prepare_cached(&sql)?;
                 let rows = stmt.query_map(params_refs.as_slice(), |row| {
                     let column_count = row.as_ref().column_count();
                     let mut values = Vec::with_capacity(column_count);
@@ -507,12 +558,19 @@ impl MetastoreBackend for SqliteMetastore {
                 if journal_mode.eq_ignore_ascii_case("wal") {
                     tracing::info!("Truncating Cayenne catalog WAL log");
                     // Truncate the WAL log to persist changes and reduce file size
-                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", [])?;
+                    // wal_checkpoint returns results (busy, log, checkpointed), so we use query_row
+                    let _: (i32, i32, i32) =
+                        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                        })?;
                 }
 
                 // Run optimize to improve query performance for future connections
+                // PRAGMA optimize may return rows indicating what was optimized
                 tracing::info!("Running optimize on Cayenne catalog");
-                conn.execute("PRAGMA optimize", [])?;
+                let mut stmt = conn.prepare("PRAGMA optimize")?;
+                let mut rows = stmt.query([])?;
+                while rows.next()?.is_some() {} // Consume all results to ensure PRAGMA completes
 
                 Ok::<_, rusqlite::Error>(())
             })
@@ -522,6 +580,12 @@ impl MetastoreBackend for SqliteMetastore {
                     message: format!("Failed to shutdown catalog: {e}"),
                 },
             )?;
+
+            // Note: We intentionally do not explicitly close the connection here.
+            // Closing a cloned handle would leave a closed connection stored in the
+            // OnceCell, and any subsequent use of the metastore would see a closed
+            // connection and fail. Instead, we rely on normal drop semantics to
+            // clean up the background connection when the metastore is dropped.
         }
 
         Ok(())

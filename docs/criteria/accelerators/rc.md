@@ -9,7 +9,7 @@ All criteria must be met for the accelerator to be considered [RC](../definition
 | Accelerator | RC Quality | DRI Sign-off |
 | ----------- | ---------- | ------------ |
 | Arrow       | ✅          | @sgrebnov    |
-| Cayenne     | 🔄          | @lukekim     |
+| Cayenne     | ✅          | @peasee      |
 | DuckDB      | ✅          | @peasee      |
 | SQLite      | ✅          | @peasee      |
 | PostgreSQL  | ✅          | @peasee      |

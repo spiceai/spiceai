@@ -18,7 +18,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use app::AppBuilder;
 
-use crate::utils::{run_query, wait_until_true};
+use crate::utils::{register_test_connectors, run_query, wait_until_true};
 use crate::{
     init_tracing,
     utils::{runtime_ready_check, test_request_context},
@@ -70,6 +70,7 @@ async fn podswatcher_integration_test() -> Result<(), anyhow::Error> {
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -167,6 +168,7 @@ async fn test_runtime_without_spicepod_in_pods_watcher_mode() -> Result<(), anyh
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -231,6 +233,7 @@ async fn test_runtime_without_spicepod_normal_mode_fails() -> Result<(), anyhow:
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

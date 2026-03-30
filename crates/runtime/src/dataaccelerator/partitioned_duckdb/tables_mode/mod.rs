@@ -29,6 +29,7 @@ use datafusion::{
     common::DFSchema,
     datasource::TableProvider,
     error::DataFusionError,
+    execution::runtime_env::RuntimeEnv,
     logical_expr::{CreateExternalTable, TableProviderFilterPushDown},
     prelude::Expr,
     scalar::ScalarValue,
@@ -185,6 +186,7 @@ impl DataAccelerator for TablesModePartitionedDuckDBAccelerator {
         mut cmd: CreateExternalTable,
         source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let partition_by_last = partition_by
             .last()
@@ -354,7 +356,7 @@ impl DuckDBPartitionCreator {
 impl PartitionCreator for DuckDBPartitionCreator {
     async fn create_partition(
         &self,
-        _partition_value: ScalarValue,
+        _partition_values: Vec<ScalarValue>,
     ) -> Result<Partition, creator::Error> {
         Err(creator::Error::CreatePartition {
             source: "Table-based partitions must not be manually created".into(),
@@ -409,7 +411,7 @@ impl PartitionCreator for DuckDBPartitionCreator {
                 .map_err(|e| creator::Error::InferringPartitions { source: e })?;
 
             partitions.push(Partition {
-                partition_value,
+                partition_values: vec![partition_value],
                 table_provider,
             });
         }
@@ -567,6 +569,7 @@ mod tests {
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
+            or_replace: false,
             definition: None,
             order_exprs: vec![],
             unbounded: false,
@@ -584,7 +587,7 @@ mod tests {
         let accelerator = TablesModePartitionedDuckDBAccelerator::new();
 
         let table = accelerator
-            .create_external_table(external_table, Some(&dataset), partitioned_by)
+            .create_external_table(external_table, Some(&dataset), partitioned_by, None)
             .await
             .expect("accelerated table created");
 

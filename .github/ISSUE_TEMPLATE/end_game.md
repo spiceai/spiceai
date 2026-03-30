@@ -9,7 +9,7 @@ assignees: ''
 ## DRIs
 
 | Role           | DRI          |
-|----------------|--------------|
+| -------------- | ------------ |
 | Primary        |              |
 | QA + Secondary |              |
 | Docs           |              |
@@ -55,8 +55,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] Verify [integration](https://github.com/spiceai/spiceai/actions/workflows/integration.yml) tests (which include the `run_all_tests` flag) is green on the release branch.
 
 1. **E2E Tests**
-   - [ ] Verify [E2E Test CI (core)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on `trunk` and the release branch.
-   - [ ] Verify [E2E Test CI (models)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci_models.yml) is green on `trunk` and the release branch.
+   - [ ] Verify [E2E Test CI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on `trunk` and the release branch.
    - [ ] Verify [Makefile Targets](https://github.com/spiceai/spiceai/actions/workflows/makefile_targets.yml) is green on `trunk` and the release branch.
    - [ ] Verify [Test Operator Benchmarks](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_bench.yml) is green on `trunk` and the release branch.
      - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new benchmark run. Specify `trunk` as the branch source, with the following parameters:
@@ -91,7 +90,6 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [HTTP](https://github.com/spiceai/cookbook/blob/trunk/http/README.md)
      - [ ] [MSSQL](https://github.com/spiceai/cookbook/blob/trunk/mssql/README.md)
      - [ ] [MySQL](https://github.com/spiceai/cookbook/blob/trunk/mysql/connector/README.md)
-     - [ ] [ODBC](https://github.com/spiceai/cookbook/blob/trunk/odbc/README.md)
      - [ ] [PostgreSQL](https://github.com/spiceai/cookbook/blob/trunk/postgres/connector/README.md)
      - [ ] [S3](https://github.com/spiceai/cookbook/blob/trunk/s3/README.md)
      - [ ] [SharePoint](https://github.com/spiceai/cookbook/blob/trunk/sharepoint/README.md)
@@ -101,7 +99,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [Spice.ai Cloud Platform](https://github.com/spiceai/cookbook/blob/trunk/spiceai/README.md)
      - [ ] [Debezium CDC (plain & SASL/SCRAM)](https://github.com/spiceai/cookbook/blob/trunk/cdc-debezium/README.md)
      - [ ] [IMAP](https://github.com/spiceai/cookbook/blob/trunk/imap/README.md)
-     - [ ] Update connector status per [Connector RC Criteria](/docs/criteria/connectors/rc.md).
+     - [ ] Update connector status per [Connector RC Criteria](https://github.com/spiceai/spiceai/blob/trunk/docs/criteria/connectors/rc.md).
 
    - **Data Accelerators**
      - [ ] [DuckDB Accelerator](https://github.com/spiceai/cookbook/blob/trunk/duckdb/accelerator/README.md)
@@ -109,7 +107,7 @@ release coordination channel. Secondary DRI should positively acknowledge the ha
      - [ ] [SQLite Accelerator](https://github.com/spiceai/cookbook/blob/trunk/sqlite/accelerator/README.md)
      - [ ] [Arrow Accelerator](https://github.com/spiceai/cookbook/blob/trunk/arrow/README.md)
      - [ ] [Caching Accelerator](https://github.com/spiceai/cookbook/blob/trunk/caching/accelerator/README.md)
-     - [ ] Update accelerator status per [Accelerator RC Criteria](/docs/criteria/accelerators/rc.md)
+     - [ ] Update accelerator status per [Accelerator RC Criteria](https://github.com/spiceai/spiceai/blob/trunk/docs/criteria/accelerators/rc.md)
 
    - **Catalog Connectors**
      - [ ] [Databricks Unity Catalog](https://github.com/spiceai/cookbook/blob/trunk/catalogs/databricks/README.md)
@@ -221,7 +219,6 @@ Testing focus DRIs are responsible for:
 - [ ] Perform a final test pass on the released binaries and Docker images.
 - [ ] Run the following workflows to confirm installation health after the release is marked as official:
   - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
-  - [ ] [E2E Test Release Installation (AI)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install_ai.yml)
   - [ ] [E2E Test Release Installation (Helm)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install_helm.yml)
   - [ ] [E2E Test CLI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_spice_cli.yml)
     - Use parameters:

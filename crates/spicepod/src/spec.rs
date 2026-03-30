@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,7 +23,6 @@ use std::{collections::HashMap, fmt::Debug};
 
 use crate::component::catalog::Catalog;
 use crate::component::embeddings::Embeddings;
-use crate::component::eval::Eval;
 use crate::component::is_default;
 use crate::component::management::Management;
 use crate::component::runtime::Runtime;
@@ -39,9 +38,9 @@ use crate::extension::Extension;
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SpicepodVersion {
-    #[default]
-    V1Beta1,
     V1,
+    #[default]
+    V2,
 }
 
 impl Display for SpicepodVersion {
@@ -118,10 +117,6 @@ pub struct SpicepodDefinition {
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
-    pub evals: Vec<ComponentOrReference<Eval>>,
-
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    #[serde(default)]
     pub tools: Vec<ComponentOrReference<Tool>>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -138,4 +133,17 @@ pub struct SpicepodDefinition {
 pub enum SpicepodKind {
     #[default]
     Spicepod,
+}
+
+impl SpicepodDefinition {
+    /// Create a new `SpicepodDefinition` with the given name.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: SpicepodVersion::V2,
+            kind: SpicepodKind::Spicepod,
+            ..Default::default()
+        }
+    }
 }

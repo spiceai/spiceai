@@ -20,9 +20,13 @@ use crate::{
     configure_test_datafusion,
     docker::RunningContainer,
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
-use std::sync::Arc;
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::init_tracing;
 
@@ -54,6 +58,7 @@ mod sqlite;
 #[tokio::test]
 async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context().scope(async {
         let running_container = prepare_test_environment()
@@ -118,18 +123,19 @@ async fn execute_spill_to_disk_and_rehydration(
     let num_rows: u64 = res[0].get(0).context("Unable to retrieve number of rows")?;
     assert!(num_rows > 0);
 
-    let accelerated_db_file_path = resolve_local_db_file_path(engine, db_file_path)?;
+    let accelerated_db_file_path = resolve_local_db_file_path(engine, db_file_path);
     tracing::debug!(
         "Expected accelerated database location: {}",
-        &accelerated_db_file_path
+        accelerated_db_file_path.display()
     );
 
     // clean up: delete local database file if exists before running the test
+    let accelerated_db_file_path_str = accelerated_db_file_path.display().to_string();
     for file_path in [
         accelerated_db_file_path.clone(),
-        format!("{accelerated_db_file_path}-wal"),
-        format!("{accelerated_db_file_path}.wal"),
-        format!("{accelerated_db_file_path}-shm"),
+        path_with_appended_suffix(&accelerated_db_file_path, "-wal"),
+        accelerated_db_file_path.with_added_extension("wal"),
+        path_with_appended_suffix(&accelerated_db_file_path, "-shm"),
     ] {
         if std::fs::metadata(&file_path).is_ok() {
             std::fs::remove_file(&file_path).context("should remove local database")?;
@@ -141,7 +147,7 @@ async fn execute_spill_to_disk_and_rehydration(
 
     if std::fs::metadata(&accelerated_db_file_path).is_err() {
         return Err(anyhow::anyhow!(
-            "Accelerated database file not found at path: {accelerated_db_file_path}"
+            "Accelerated database file not found at path: {accelerated_db_file_path_str}"
         ));
     }
 
@@ -217,12 +223,13 @@ async fn execute_spill_to_disk_and_rehydration(
 
 async fn get_locally_persisted_records(
     engine: &str,
-    db_file_path: &str,
+    db_file_path: &Path,
     query: &str,
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {
+    let db_file_path = db_file_path.to_string_lossy();
     let query_result = match engine {
-        "duckdb" => duckdb::query_local_db(db_file_path, query).await?,
-        "sqlite" => sqlite::query_local_db(db_file_path, query).await?,
+        "duckdb" => duckdb::query_local_db(db_file_path.as_ref(), query).await?,
+        "sqlite" => sqlite::query_local_db(db_file_path.as_ref(), query).await?,
         _ => Err(anyhow::anyhow!("Unsupported engine: {engine}"))?,
     };
 
@@ -232,22 +239,22 @@ async fn get_locally_persisted_records(
         .map_err(|e| anyhow::anyhow!("Unable to collect query results: {e}"))
 }
 
-fn resolve_local_db_file_path(
-    engine: &str,
-    db_file_path: Option<&str>,
-) -> Result<String, anyhow::Error> {
+fn resolve_local_db_file_path(engine: &str, db_file_path: Option<&str>) -> PathBuf {
     if let Some(db_file_path) = db_file_path {
         let working_dir = std::env::current_dir().unwrap_or(".".into());
-        return Ok(format!(
-            "{}/{db_file_path}",
-            working_dir.to_str().context("Unable to get current dir")?
-        ));
+        return working_dir.join(db_file_path);
     }
 
-    Ok(format!(
-        "{}/accelerated_{engine}.db",
-        spice_data_base_path()
-    ))
+    PathBuf::from(spice_data_base_path()).join(format!("accelerated_{engine}.db"))
+}
+
+fn path_with_appended_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .map(OsString::from)
+        .expect("database path should include a file name");
+    file_name.push(suffix);
+    path.with_file_name(file_name)
 }
 
 async fn run_query(query: &str, rt: &Runtime) -> Result<Vec<RecordBatch>, anyhow::Error> {
@@ -273,6 +280,9 @@ async fn init_spice_app(
     db_file_path: Option<&str>,
     with_pk_and_indexes: bool,
 ) -> Result<Runtime, anyhow::Error> {
+    // Re-register connectors in case a previous runtime shutdown cleared them
+    register_test_connectors().await;
+
     let ds = create_test_dataset(acceleration_engine, db_file_path, with_pk_and_indexes);
 
     let app = AppBuilder::new("spiceapp").with_dataset(ds).build();
@@ -353,7 +363,7 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
 
     tracing::debug!("INSERT INTO lineitem...");
     let insert_stmt =
-        InsertBuilder::new(&TableReference::from("lineitem"), tpch_lineitem).build_mysql(None)?;
+        InsertBuilder::new(&TableReference::from("lineitem"), &tpch_lineitem).build_mysql(None)?;
     let _: Vec<Row> = conn.exec(insert_stmt, Params::Empty).await?;
     tracing::debug!("MySQL initialized!");
 

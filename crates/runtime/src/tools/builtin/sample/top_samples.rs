@@ -21,6 +21,7 @@ use std::{
 
 use super::SampleFrom;
 use crate::datafusion::DataFusion;
+use crate::datafusion::error::format_datafusion_error;
 use arrow::{array::RecordBatch, compute::concat_batches};
 use datafusion::{
     error::DataFusionError,
@@ -39,10 +40,15 @@ use futures::TryStreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu, ensure};
+use tracing::Span;
+use tracing_futures::Instrument;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to parse order_by '{order_by}' for top_n_sample: {source}"))]
+    #[snafu(display(
+        "Failed to parse order_by '{order_by}' for top_n_sample: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToParseOrderBy {
         source: DataFusionError,
         order_by: String,
@@ -86,8 +92,10 @@ impl SampleFrom for TopSamplesParams {
         let order_by = sanitize_order_by(self.order_by.as_str())
             .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        let batches = df
-            .query_builder(&format!(
+        let current_span = Span::current();
+
+        let batches = async {
+            df.query_builder(&format!(
                 "SELECT * FROM {tbl} ORDER BY {order_by} LIMIT {limit}",
                 limit = self.limit,
                 tbl = self.tbl,
@@ -99,7 +107,10 @@ impl SampleFrom for TopSamplesParams {
             .data
             .try_collect::<Vec<RecordBatch>>()
             .await
-            .boxed()?;
+            .boxed()
+        }
+        .instrument(current_span)
+        .await?;
 
         let schema = Arc::new(df.get_arrow_schema(self.tbl.as_str()).await.boxed()?);
 

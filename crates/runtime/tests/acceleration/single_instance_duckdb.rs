@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 use super::get_params;
@@ -52,6 +52,7 @@ fn get_dataset(from: &str, name: &str, path: &str) -> Dataset {
 #[tokio::test]
 async fn test_acceleration_duckdb_single_instance() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope_retry(3, || async {

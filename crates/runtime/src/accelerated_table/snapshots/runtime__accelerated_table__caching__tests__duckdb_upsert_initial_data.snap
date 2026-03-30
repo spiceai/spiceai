@@ -1,0 +1,13 @@
+---
+source: crates/runtime/src/accelerated_table/caching.rs
+expression: initial_pretty
+---
++----+-----------+
+| id | name      |
++----+-----------+
+| 0  | initial_0 |
+| 1  | initial_1 |
+| 2  | initial_2 |
+| 3  | initial_3 |
+| 4  | initial_4 |
++----+-----------+

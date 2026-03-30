@@ -26,8 +26,8 @@ expression: formatted
 |               |                         RepartitionExec: partitioning=Hash([i_item_sk@0], 3), input_partitions=3                                                                  |
 |               |                           CoalesceBatchesExec: target_batch_size=8192                                                                                             |
 |               |                             ProjectionExec: expr=[CAST(key@0 AS Int32) as i_item_sk, 1 - distance@1 as score]                                                     |
-|               |                               RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                |
-|               |                                 BytesProcessedExec                                                                                                                |
+|               |                               BytesProcessedExec                                                                                                                  |
+|               |                                 RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                              |
 |               |                                   S3VectorsQueryExec: limit=100                                                                                                   |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                                                 |
 |               |                         RepartitionExec: partitioning=Hash([i_item_sk@0], 3), input_partitions=3                                                                  |

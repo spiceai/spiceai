@@ -1,5 +1,5 @@
 # Simple Spicepod for testing Python ADBC Flight SQL
-version: v1beta1
+version: v2
 kind: Spicepod
 name: adbc_test
 

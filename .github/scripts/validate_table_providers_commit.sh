@@ -19,7 +19,7 @@ set -euo pipefail
 
 CARGO_TOML="${1:-Cargo.toml}"
 REPO_URL="https://github.com/datafusion-contrib/datafusion-table-providers.git"
-BRANCH="spiceai"
+BRANCH="${BRANCH:-spiceai}"
 
 # Extract the commit hash from the datafusion-table-providers line in [patch.crates-io]
 # Use portable regex (BSD sed on macOS doesn't support \s)

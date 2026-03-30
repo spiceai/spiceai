@@ -44,11 +44,18 @@ pub enum Error {
 
 #[async_trait]
 pub trait PartitionCreator: Debug + Send + Sync {
-    /// Create a new [`Partition`] using the `partition_value`.
+    /// Create a new [`Partition`] using the given partition values.
+    ///
+    /// For single-column partitions, pass a single-element vector.
+    /// For composite partitions (e.g., `partition_by: [year, month]`), pass
+    /// multiple values in the same order as the partition expressions.
     ///
     /// # Errors
     /// Returns an error when creating a [`Partition`] is unsuccessful.
-    async fn create_partition(&self, partition_value: ScalarValue) -> Result<Partition, Error>;
+    async fn create_partition(
+        &self,
+        partition_values: Vec<ScalarValue>,
+    ) -> Result<Partition, Error>;
 
     /// Find and load previously created [`Partition`]s
     ///

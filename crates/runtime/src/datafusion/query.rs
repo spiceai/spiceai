@@ -27,10 +27,13 @@ use arrow_tools::schema::verify_schema;
 use cache::PlanOrCached;
 use datafusion::{
     common::ParamValues,
-    error::DataFusionError,
+    error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::LogicalPlan,
-    physical_plan::{ExecutionPlan, execute_stream, stream::RecordBatchStreamAdapter},
+    physical_plan::{
+        ExecutionPlan, ExecutionPlanProperties, execute_stream, repartition::RepartitionExec,
+        sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
+    },
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
@@ -43,37 +46,36 @@ pub mod builder;
 pub use builder::QueryBuilder;
 mod cache;
 pub mod error_code;
+mod handle;
 mod metrics;
 mod tracker;
 
+pub use handle::{DistributedJobStatus, QueryHandle, QueryHandleError};
+
 use {
-    crate::config::ClusterRole,
-    crate::datafusion::builder::default_extension_planners,
-    ballista_core::extension::{SessionConfigExt, SessionStateExt},
-    ballista_core::planner::BallistaQueryPlanner,
-    datafusion::execution::SessionStateBuilder,
-    datafusion::physical_planner::DefaultPhysicalPlanner,
-    datafusion_proto::protobuf::LogicalPlanNode,
+    ballista_core::extension::SessionConfigExt,
+    ballista_scheduler::scheduler_server::SchedulerServer,
+    datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
 };
 
 use datafusion::execution::SessionState;
 use datafusion::prelude::SessionContext;
 
 use async_stream::stream;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use futures::StreamExt;
 
-use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
+use super::{
+    SPICE_RUNTIME_SCHEMA,
+    error::{find_datafusion_root, format_datafusion_error},
+};
 
 use super::managed_runtime;
-use crate::cluster::datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use crate::datafusion::{
     DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
 };
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
 use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
-use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_request_context::{AsyncMarker, RequestContext};
 use tokio::runtime::Handle;
 
@@ -81,22 +83,31 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to execute query: {source}"))]
+    #[snafu(display("Failed to execute query: {}", format_datafusion_error(source)))]
     UnableToExecuteQuery { source: DataFusionError },
 
     #[snafu(display("Failed to access query results cache: {source}"))]
     FailedToAccessCache { source: ::cache::Error },
 
-    #[snafu(display("Unable to convert cached result to a record batch stream: {source}"))]
+    #[snafu(display(
+        "Unable to convert cached result to a record batch stream: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToCreateMemoryStream { source: DataFusionError },
 
-    #[snafu(display("Unable to collect results after query execution: {source}"))]
+    #[snafu(display(
+        "Unable to collect results after query execution: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToCollectResults { source: DataFusionError },
 
     #[snafu(display("Schema mismatch: {source}"))]
     SchemaMismatch { source: arrow_tools::schema::Error },
 
-    #[snafu(display("Failed to set parameters in logical plan: {source}"))]
+    #[snafu(display(
+        "Failed to set parameters in logical plan: {}",
+        format_datafusion_error(source)
+    ))]
     BindingParameters { source: DataFusionError },
 
     // Error message matches DataFusion's own error for table not found (not exposing existance of un-authorized table to unauthorized user).
@@ -109,6 +120,27 @@ pub enum Error {
         Either remove 'stale-while-revalidate' from the Cache-Control header or change cache_key_type to 'sql'."
     ))]
     UnsupportedStaleWhileRevalidate { cache_key_type: String },
+
+    #[snafu(display("Distributed query scheduler is not available"))]
+    SchedulerUnavailable,
+
+    #[snafu(display("Failed to create session for distributed query: {message}"))]
+    SessionCreationFailed { message: String },
+
+    #[snafu(display("Failed to submit job to distributed scheduler: {message}"))]
+    JobSubmissionFailed { message: String },
+
+    #[snafu(display(
+        "Querying locally accelerated dataset '{table}' via async queries API is not currently supported. \
+        Use the synchronous query API (/v1/sql or Flight SQL) instead."
+    ))]
+    AcceleratedTableNotSupportedInDistributedQuery { table: String },
+
+    #[snafu(display(
+        "Querying Cayenne catalog table '{table}' via async queries API is not currently supported. \
+        Use the synchronous query API (/v1/sql or Flight SQL) instead."
+    ))]
+    CayenneCatalogTableNotSupportedInDistributedQuery { table: String },
 }
 
 impl Error {
@@ -159,86 +191,21 @@ macro_rules! handle_error {
 }
 
 impl Query {
-    fn get_session_state(&self, request_context: &Arc<RequestContext>) -> Result<SessionState> {
+    /// Returns the session state for local query execution.
+    ///
+    /// For Flight SQL sessions, returns the session-specific context to preserve
+    /// prepared statements. Otherwise, returns the default local context.
+    fn get_session_state(&self, request_context: &Arc<RequestContext>) -> SessionState {
         // Check if there's a Flight SQL session-specific context
         if let Some(flight_session) =
             request_context.extension::<super::flight_session_extension::FlightSessionExtension>()
         {
-            // For cluster mode with session context, we don't apply cluster modifications
-            // since the session state should remain local to preserve prepared statements
-            return Ok(flight_session.session_context().state());
+            // Use session-specific context to preserve prepared statements
+            return flight_session.session_context().state();
         }
 
-        if !matches!(self.df.cluster_config.role(), Some(ClusterRole::Scheduler)) {
-            return Ok(self.df.ctx.state());
-        }
-
-        let Some(scheduler_url) = self.df.cluster_config.scheduler_url_string() else {
-            return Err(Error::UnableToExecuteQuery {
-                source: datafusion::error::DataFusionError::Configuration(
-                    "Scheduler mode requires --node-advertise-address".to_string(),
-                ),
-            });
-        };
-
-        let client_tls_config = self.df.cluster_config.client_tls_config().cloned();
-        let tls_enabled = client_tls_config.is_some();
-
-        let mut cfg = self
-            .df
-            .ctx
-            .copied_config()
-            .with_ballista_logical_extension_codec(SpiceLogicalCodec::new_codec())
-            .with_ballista_use_tls(tls_enabled)
-            // Use 100MB max message size to match other gRPC configurations in the codebase
-            // (see flight_client::MAX_DECODING_MESSAGE_SIZE). The default Ballista config
-            // is 16MB which is too small for queries returning large batches.
-            .with_ballista_grpc_client_max_message_size(100 * 1024 * 1024);
-
-        if let Some(tls_config) = client_tls_config {
-            cfg = cfg.with_ballista_override_create_grpc_client_endpoint(Arc::new(move |ep| {
-                ep.tls_config(tls_config.clone()).boxed()
-            }));
-        }
-
-        let query_planner: BallistaQueryPlanner<LogicalPlanNode> =
-            BallistaQueryPlanner::with_local_planner(
-                scheduler_url.to_string(),
-                cfg.ballista_config(),
-                SpiceLogicalCodec::new_codec(),
-                DefaultPhysicalPlanner::with_extension_planners(default_extension_planners()),
-            );
-
-        SessionStateBuilder::new_from_existing(self.df.ctx.state())
-            .with_config(
-                cfg.with_ballista_query_planner(Arc::new(query_planner))
-                    .with_option_extension(SpiceClusterConfig::default()),
-            )
-            .build()
-            .upgrade_for_ballista(scheduler_url.to_string())
-            .map_err(|e| Error::UnableToExecuteQuery { source: e })
-    }
-
-    fn should_distribute_plan(plan: &LogicalPlan) -> datafusion::common::Result<bool> {
-        let mut should_distribute = true;
-
-        let _ = plan.apply(|p| {
-            if let LogicalPlan::DescribeTable(_) = p {
-                should_distribute = false;
-            } else if let LogicalPlan::TableScan(scan) = p
-                && matches!(scan.table_name.schema(), Some(SPICE_RUNTIME_SCHEMA))
-            {
-                should_distribute = false;
-            }
-
-            if should_distribute {
-                Ok(TreeNodeRecursion::Continue)
-            } else {
-                Ok(TreeNodeRecursion::Stop)
-            }
-        })?;
-
-        Ok(should_distribute)
+        // Always use local execution for synchronous APIs (/v1/sql, FlightSQL)
+        self.df.ctx.state()
     }
 
     /// Run a query and return the result.
@@ -255,6 +222,240 @@ impl Query {
         }
 
         self.run_internal(request_context).await
+    }
+
+    /// Submit a query for distributed execution via Ballista and return a handle.
+    ///
+    /// This method submits a job to the Ballista scheduler and returns a `QueryHandle`
+    /// that can be used to poll for status and retrieve results.
+    /// This method returns immediately after job submission without waiting for completion.
+    ///
+    /// The returned `QueryHandle` provides methods for:
+    /// - Polling job status (`poll_status`)
+    /// - Cancelling the job (`cancel`)
+    /// - Waiting for completion and retrieving results (`into_stream`)
+    ///
+    /// Results are cached based on the input cache key when retrieved.
+    ///
+    /// # Arguments
+    ///
+    /// * `job_id` - A unique identifier for this job, used as the Ballista session/job ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The scheduler server is not available
+    /// - Session creation fails
+    /// - The query plan cannot be created
+    /// - Job submission fails
+    pub async fn submit_distributed(self, job_id: &str) -> Result<QueryHandle> {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+        self.submit_distributed_internal(job_id, request_context)
+            .await
+    }
+
+    /// Internal implementation for submitting a distributed query.
+    async fn submit_distributed_internal(
+        self,
+        job_id: &str,
+        request_context: Arc<RequestContext>,
+    ) -> Result<QueryHandle> {
+        crate::metrics::telemetry::track_query_count(&request_context.to_dimensions());
+
+        let span = tracing::span!(
+            target: "task_history",
+            tracing::Level::INFO,
+            "sql_query",
+            input = %self.sql,
+            runtime_query = false,
+            distributed = true,
+            job_id = %job_id
+        );
+
+        if let Some(traceparent) = request_context.trace_parent() {
+            crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
+        }
+
+        // Get the scheduler server
+        let scheduler = Self::get_scheduler_server(&self.df)?;
+        let tracker = self.tracker;
+
+        // Create session for this job
+        let session_config = datafusion::prelude::SessionConfig::new_with_ballista();
+        let session_ctx = scheduler
+            .state
+            .session_manager
+            .create_or_update_session(job_id, &session_config)
+            .await
+            .map_err(|e| Error::SessionCreationFailed {
+                message: e.to_string(),
+            })?;
+
+        // Get the session state for planning
+        let session = session_ctx.state();
+
+        // Get logical plan and cache key, reusing existing cache infrastructure
+        let (plan, mut tracker, cache_key) = match &self.sql {
+            QueryMethod::Text {
+                sql, parameters, ..
+            } => {
+                // Use the existing get_plan_or_cached which handles all cache control,
+                // stale-while-revalidate, and query tracking
+                match Query::get_plan_or_cached(
+                    &self.df,
+                    &session,
+                    Arc::clone(&request_context),
+                    sql,
+                    parameters.clone(),
+                    tracker,
+                )
+                .await?
+                {
+                    cache::PlanOrCached::Cached(cached_result) => {
+                        tracing::debug!(job_id, "Returning cached result for distributed query");
+                        // Return a QueryHandle with cached results
+                        let schema = cached_result.data.schema();
+                        return Ok(QueryHandle::new_with_cached_result(
+                            job_id.to_string(),
+                            schema,
+                            Arc::clone(&self.df),
+                            None, // Cache key already used for lookup
+                            cached_result.data,
+                            Arc::clone(&request_context),
+                        ));
+                    }
+                    cache::PlanOrCached::Plan(plan, tracker, cache_manager) => {
+                        // Plan needs execution - cache_manager contains the raw cache key for storing results
+                        let cache_key = if cache_manager.should_cache_results() {
+                            Some(cache_manager.raw_cache_key)
+                        } else {
+                            None
+                        };
+                        (*plan, tracker, cache_key)
+                    }
+                }
+            }
+            QueryMethod::Plan(logical_plan) => {
+                // For direct plan submission, compute cache key and check cache
+                let plan_cache_key =
+                    CacheKey::LogicalPlan(logical_plan).as_raw_key(Self::plan_hasher(&self.df));
+
+                // Check for cached results using the standard cache lookup
+                if let Some(cache_provider) = self.df.results_cache_provider()
+                    && let Ok(Some(cached_result)) =
+                        cache_provider.get_raw_key(&plan_cache_key).await
+                {
+                    let ttl = cache_provider.ttl();
+                    let now = std::time::Instant::now();
+                    if !cached_result.is_stale(ttl, now)
+                        && let Ok(records) = cached_result.records().await
+                    {
+                        tracing::debug!(
+                            job_id,
+                            cache_key = plan_cache_key.as_u64(),
+                            "Returning cached result for distributed query (plan)"
+                        );
+                        let stream = ::cache::result::query::CachedStream::new(
+                            Arc::new(records),
+                            cached_result.schema,
+                        );
+                        return Ok(QueryHandle::new_with_cached_result(
+                            job_id.to_string(),
+                            Arc::clone(logical_plan.schema().inner()),
+                            Arc::clone(&self.df),
+                            None,
+                            Box::pin(stream),
+                            Arc::clone(&request_context),
+                        ));
+                    }
+                }
+
+                (logical_plan.as_ref().clone(), tracker, Some(plan_cache_key))
+            }
+        };
+
+        // Validate query operations
+        if let Err(e) = validate_sql_query_operations(&plan, &self.df) {
+            let e = find_datafusion_root(e);
+            return Err(Error::UnableToExecuteQuery { source: e });
+        }
+
+        // Get the schema from the logical plan
+        let schema = Arc::new(plan.schema().as_arrow().clone());
+
+        let input_tables = get_logical_plan_input_tables(&plan);
+        if input_tables
+            .iter()
+            .any(|tr| matches!(tr.schema(), Some(SPICE_RUNTIME_SCHEMA)))
+        {
+            span.record("runtime_query", true);
+        }
+
+        // Distributed execution doesn't currently support querying accelerated datasets
+        // or Cayenne catalog tables
+        for tr in &input_tables {
+            if self.df.is_accelerated(tr).await {
+                return Err(Error::AcceleratedTableNotSupportedInDistributedQuery {
+                    table: tr.to_string(),
+                });
+            }
+            if self.df.is_cayenne_catalog(tr) {
+                return Err(Error::CayenneCatalogTableNotSupportedInDistributedQuery {
+                    table: tr.to_string(),
+                });
+            }
+        }
+
+        // All tables verified non-accelerated above
+        tracker = tracker.map(|mut t| {
+            t.is_accelerated = Some(false);
+            t
+        });
+
+        let datasets = Arc::new(input_tables);
+        let tracker = tracker.map(|t| t.datasets(Arc::clone(&datasets)));
+
+        // Start the timer for the query execution
+        let tracker = tracker.map(|mut t| {
+            t.query_execution_duration_timer = Instant::now();
+            t
+        });
+
+        // Submit the job to the Ballista scheduler
+        let ballista_job_id = scheduler
+            .submit_job(job_id, session_ctx, &plan, None)
+            .await
+            .map_err(|e| Error::JobSubmissionFailed {
+                message: e.to_string(),
+            })?;
+
+        tracing::debug!(
+            job_id,
+            ballista_job_id = %ballista_job_id,
+            "Job submitted to Ballista scheduler"
+        );
+
+        Ok(QueryHandle::new(
+            ballista_job_id,
+            scheduler,
+            schema,
+            datasets,
+            Arc::clone(&self.df),
+            cache_key,
+            tracker,
+            request_context,
+        ))
+    }
+
+    /// Returns the scheduler server if available.
+    fn get_scheduler_server(
+        df: &DataFusion,
+    ) -> Result<Arc<SchedulerServer<LogicalPlanNode, PhysicalPlanNode>>> {
+        df.scheduler_server
+            .try_read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or(Error::SchedulerUnavailable)
     }
 
     async fn run_with_managed_runtime(
@@ -304,7 +505,7 @@ impl Query {
         let inner_span = span.clone();
 
         let query_result = async {
-            let mut session = self.get_session_state(&request_context)?;
+            let mut session = self.get_session_state(&request_context);
 
             let ctx = self;
             let tracker = ctx.tracker;
@@ -406,6 +607,24 @@ impl Query {
                 )
             }
 
+            // Proactively invalidate cached query state for tables affected by
+            // DML mutations (INSERT, DELETE, UPDATE).
+            // - results cache must be cleared so repeated SQL does not replay
+            //   pre-mutation answers
+            // - plans cache must be cleared so future queries re-resolve table
+            //   providers with up-to-date in-memory state.
+            if let LogicalPlan::Dml(dml) = &*plan
+                && let Err(e) = ctx
+                    .df
+                    .caching()
+                    .invalidate_for_table(dml.table_name.clone())
+            {
+                tracing::warn!(
+                    "Failed to invalidate caches for table {} before DML: {e}",
+                    dml.table_name
+                );
+            }
+
             let input_tables = get_logical_plan_input_tables(&plan);
             if input_tables
                 .iter()
@@ -437,16 +656,6 @@ impl Query {
                 t.query_execution_duration_timer = Instant::now();
                 t
             });
-
-            // Special handling in cluster mode - execute DescribeTable and runtime.* queries locally
-            let should_distribute =
-                Self::should_distribute_plan(&plan).context(UnableToExecuteQuerySnafu)?;
-
-            let session_for_execution = if should_distribute {
-                session
-            } else {
-                ctx.df.ctx.state()
-            };
 
             // Statement plans (PREPARE, EXECUTE, DEALLOCATE) need special handling
             // They modify session state rather than producing query results, so must be
@@ -508,8 +717,11 @@ impl Query {
                         }
                     };
 
-                    let task_ctx = Arc::new(TaskContext::from(&session_for_execution));
-                    let stream = match execute_stream(Arc::clone(&df_plan), task_ctx) {
+                    let task_ctx = Arc::new(TaskContext::from(&session));
+                    let stream = match execute_stream_preserving_output_order(
+                        Arc::clone(&df_plan),
+                        task_ctx,
+                    ) {
                         Ok(stream) => stream,
                         Err(e) => {
                             let e = find_datafusion_root(e);
@@ -526,25 +738,27 @@ impl Query {
                     (stream, df_plan)
                 } else {
                     // For regular plans, use the standard physical plan execution
-                    let physical_plan =
-                        match session_for_execution.create_physical_plan(&plan).await {
-                            Ok(stream) => stream,
-                            Err(e) => {
-                                let e = find_datafusion_root(e);
-                                let error_code = ErrorCode::from(&e);
-                                handle_error!(
-                                    tracker,
-                                    &request_context,
-                                    error_code,
-                                    e,
-                                    UnableToExecuteQuery
-                                )
-                            }
-                        };
+                    let physical_plan = match session.create_physical_plan(&plan).await {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            let error_code = ErrorCode::from(&e);
+                            handle_error!(
+                                tracker,
+                                &request_context,
+                                error_code,
+                                e,
+                                UnableToExecuteQuery
+                            )
+                        }
+                    };
 
-                    let task_ctx = Arc::new(TaskContext::from(&session_for_execution));
+                    let task_ctx = Arc::new(TaskContext::from(&session));
 
-                    let stream = match execute_stream(Arc::clone(&physical_plan), task_ctx) {
+                    let stream = match execute_stream_preserving_output_order(
+                        Arc::clone(&physical_plan),
+                        task_ctx,
+                    ) {
                         Ok(stream) => stream,
                         Err(e) => {
                             let e = find_datafusion_root(e);
@@ -561,9 +775,20 @@ impl Query {
                     (stream, physical_plan)
                 };
 
-            // Skip schema verification for Statement plans (PREPARE/EXECUTE/DEALLOCATE)
-            // as their logical plan schema may differ from the actual execution result
-            if !matches!(&*plan, LogicalPlan::Statement(_)) {
+            // Skip schema verification for Statement plans (PREPARE/EXECUTE/DEALLOCATE),
+            // DDL plans (CREATE TABLE/DROP TABLE), and DML Delete plans, as their logical
+            // plan schema may differ from the actual execution result (DDL plans may be
+            // rewritten by analyzer rules into extension nodes with different output schemas)
+            let res_stream = if !matches!(&*plan, LogicalPlan::Statement(_) | LogicalPlan::Ddl(_))
+                && !matches!(
+                    &*plan,
+                    LogicalPlan::Dml(dml)
+                        if matches!(
+                            &dml.op,
+                            datafusion::logical_expr::WriteOp::Delete
+                                | datafusion::logical_expr::WriteOp::Update
+                        )
+                ) {
                 let plan_schema = Arc::clone(plan.schema().inner());
                 let res_schema = res_stream.schema();
 
@@ -576,7 +801,17 @@ impl Query {
                         SchemaMismatch
                     )
                 }
-            }
+                // The AggregateStatistics physical optimizer may replace an
+                // AggregateExec with a ProjectionExec containing a literal
+                // value, which changes the output nullability (literals report
+                // nullable = value.is_null()).  Reconcile the execution result
+                // schema with the logical plan schema so downstream consumers
+                // (e.g. FlightSQL GetFlightInfo vs DoGet) see consistent
+                // nullability.
+                reconcile_stream_nullability(res_stream, &plan_schema)
+            } else {
+                res_stream
+            };
 
             let final_stream = if cache_manager.should_cache_results() {
                 Self::wrap_stream_with_cache(
@@ -663,14 +898,49 @@ impl Query {
 
         let plan = match self.sql {
             QueryMethod::Plan(ref plan) => plan.clone(),
-            QueryMethod::Text { ref sql, .. } => match session.create_logical_plan(sql).await {
-                Ok(plan) => Box::new(plan),
-                Err(e) => {
-                    let e = find_datafusion_root(e);
-                    self.handle_schema_error(&request_context, &e);
-                    return Err(e);
+            QueryMethod::Text { ref sql, .. } => {
+                // Pre-process CREATE TABLE extensions (WITH options, PARTITION BY) before planning
+                let preprocessed =
+                    match super::ddl::preprocess::preprocess_create_table_with_options(
+                        sql,
+                        self.df.ddl_extension_store(),
+                    ) {
+                        Ok(preprocessed) => preprocessed,
+                        Err(e) => {
+                            let e = find_datafusion_root(e);
+                            self.handle_schema_error(&request_context, &e);
+                            return Err(e);
+                        }
+                    };
+
+                let (effective_sql, store_key) = match &preprocessed {
+                    super::ddl::preprocess::PreprocessResult::Modified {
+                        sql: modified,
+                        store_key,
+                    } => (modified.as_str(), Some(store_key.clone())),
+                    super::ddl::preprocess::PreprocessResult::Unchanged => (sql.as_ref(), None),
+                };
+
+                match session.create_logical_plan(effective_sql).await {
+                    Ok(plan) => Box::new(plan),
+                    Err(e) => {
+                        if let Some(store_key) = store_key
+                            && let Err(cleanup_err) =
+                                super::ddl::preprocess::cleanup_preprocessed_ddl_options(
+                                    self.df.ddl_extension_store(),
+                                    &store_key,
+                                )
+                        {
+                            let cleanup_err = find_datafusion_root(cleanup_err);
+                            self.handle_schema_error(&request_context, &cleanup_err);
+                            return Err(cleanup_err);
+                        }
+                        let e = find_datafusion_root(e);
+                        self.handle_schema_error(&request_context, &e);
+                        return Err(e);
+                    }
                 }
-            },
+            }
         };
 
         // Verify the plan against the restricted options
@@ -921,6 +1191,74 @@ fn collect_physical_plan_metrics(plan: &dyn ExecutionPlan, totals: &mut Physical
     }
 }
 
+fn execute_stream_preserving_output_order(
+    plan: Arc<dyn ExecutionPlan>,
+    context: Arc<TaskContext>,
+) -> DataFusionResult<SendableRecordBatchStream> {
+    let plan = prepare_physical_plan_for_sync_results(plan)?;
+    execute_stream(plan, context)
+}
+
+fn prepare_physical_plan_for_sync_results(
+    plan: Arc<dyn ExecutionPlan>,
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    let plan = strip_root_order_preserving_repartition(plan)?;
+
+    if plan.output_partitioning().partition_count() > 1
+        && let Some(ordering) = plan.output_ordering().cloned()
+    {
+        // `execute_stream()` coalesces multi-partition output with
+        // `CoalescePartitionsExec`, which does not preserve global ordering.
+        // For synchronous APIs (/v1/sql, FlightSQL), preserve SQL ORDER BY
+        // semantics by collapsing ordered multi-partition output with an
+        // explicit sort-preserving merge first.
+        return Ok(Arc::new(
+            SortPreservingMergeExec::new(ordering, plan).with_round_robin_repartition(false),
+        ));
+    }
+
+    Ok(plan)
+}
+
+fn strip_root_order_preserving_repartition(
+    plan: Arc<dyn ExecutionPlan>,
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    let children = plan.children();
+    if children.len() != 1 {
+        return Ok(plan);
+    }
+
+    let child = Arc::clone(children[0]);
+    let rewritten_child = strip_root_order_preserving_repartition(child)?;
+    let plan = if Arc::ptr_eq(children[0], &rewritten_child) {
+        plan
+    } else {
+        plan.with_new_children(vec![rewritten_child])?
+    };
+
+    if let Some(spm) = plan.as_any().downcast_ref::<SortPreservingMergeExec>() {
+        return Ok(Arc::new(
+            SortPreservingMergeExec::new(spm.expr().clone(), Arc::clone(spm.input()))
+                .with_fetch(spm.fetch())
+                .with_round_robin_repartition(false),
+        ));
+    }
+
+    if let Some(repartition) = plan.as_any().downcast_ref::<RepartitionExec>()
+        && repartition.input().output_partitioning().partition_count() == 1
+        && repartition.input().output_ordering().is_some()
+        && repartition.partitioning().partition_count() > 1
+    {
+        // The synchronous query APIs consume a single stream. Repartitioning a
+        // single already-sorted stream back out to multiple output partitions at
+        // the root only makes `execute_stream()` coalesce it again later,
+        // destroying row order for ORDER BY queries.
+        return Ok(Arc::clone(repartition.input()));
+    }
+
+    Ok(plan)
+}
+
 pub fn write_to_json_string(
     data: &[RecordBatch],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -931,6 +1269,74 @@ pub fn write_to_json_string(
     writer.finish()?;
 
     String::from_utf8(writer.into_inner()).boxed()
+}
+
+/// Reconciles the nullability of a result stream with the logical plan schema.
+///
+/// Physical optimizer rules (e.g. `AggregateStatistics`) may replace aggregate
+/// execution plans with literal projections whose nullability differs from the
+/// logical plan.  For example, `MAX(int64)` is logically nullable (empty input
+/// → NULL) but the optimized literal `ScalarValue::Int64(Some(v))` is
+/// non-nullable.
+///
+/// This function widens non-nullable fields to nullable when the logical plan
+/// schema says they should be nullable, and wraps the stream so every batch
+/// conforms.  This uses the same `try_cast_to` mechanism as `SchemaCastScanExec`.
+fn reconcile_stream_nullability(
+    stream: SendableRecordBatchStream,
+    plan_schema: &Arc<Schema>,
+) -> SendableRecordBatchStream {
+    let exec_schema = stream.schema();
+
+    if exec_schema.fields().len() != plan_schema.fields().len() {
+        tracing::warn!(
+            "Schema field count mismatch during nullability reconciliation: \
+             execution schema has {} fields, logical plan has {}",
+            exec_schema.fields().len(),
+            plan_schema.fields().len(),
+        );
+        return stream;
+    }
+
+    let mut needs_reconciliation = false;
+    for (exec_field, plan_field) in exec_schema.fields().iter().zip(plan_schema.fields()) {
+        if plan_field.is_nullable() && !exec_field.is_nullable() {
+            needs_reconciliation = true;
+            break;
+        }
+    }
+
+    if !needs_reconciliation {
+        return stream;
+    }
+
+    // Build a reconciled schema: widen to nullable where the logical plan says
+    // so, but keep data types and metadata from the execution schema.
+    let reconciled_fields: Vec<Field> = exec_schema
+        .fields()
+        .iter()
+        .zip(plan_schema.fields())
+        .map(|(exec_field, plan_field)| {
+            if plan_field.is_nullable() && !exec_field.is_nullable() {
+                exec_field.as_ref().clone().with_nullable(true)
+            } else {
+                exec_field.as_ref().clone()
+            }
+        })
+        .collect();
+
+    let reconciled =
+        Arc::new(Schema::new(reconciled_fields).with_metadata(exec_schema.metadata().clone()));
+    let target = Arc::clone(&reconciled);
+
+    Box::pin(RecordBatchStreamAdapter::new(
+        reconciled,
+        stream.map(move |batch| {
+            batch.and_then(|b| {
+                arrow_tools::record_batch::try_cast_to(b, Arc::clone(&target)).map_err(Into::into)
+            })
+        }),
+    ))
 }
 
 #[cfg(test)]
@@ -1348,5 +1754,276 @@ mod tests {
         assert_eq!(totals.produced_spills, 40);
         assert_eq!(totals.spilled_bytes, 0);
         assert_eq!(totals.spilled_rows, 200);
+    }
+
+    /// Helper: build a `SendableRecordBatchStream` from a schema and batches.
+    fn stream_from_batches(
+        schema: &Arc<Schema>,
+        batches: Vec<RecordBatch>,
+    ) -> SendableRecordBatchStream {
+        Box::pin(RecordBatchStreamAdapter::new(Arc::clone(schema), {
+            futures::stream::iter(batches.into_iter().map(Ok))
+        }))
+    }
+
+    /// Collect all batches from a `SendableRecordBatchStream`.
+    async fn collect_stream(mut stream: SendableRecordBatchStream) -> Vec<RecordBatch> {
+        let mut batches = Vec::new();
+        while let Some(result) = stream.next().await {
+            batches.push(result.expect("unexpected error in stream"));
+        }
+        batches
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_widens_non_nullable() {
+        // Simulates AggregateStatistics replacing MAX(id) with a literal:
+        // execution schema has non-nullable field, plan schema has nullable.
+        let exec_schema = Arc::new(Schema::new(vec![Field::new(
+            "max(id)",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let plan_schema = Arc::new(Schema::new(vec![Field::new(
+            "max(id)",
+            arrow::datatypes::DataType::Int64,
+            true,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&exec_schema),
+            vec![Arc::new(Int64Array::from(vec![42]))],
+        )
+        .expect("batch");
+
+        let stream = stream_from_batches(&exec_schema, vec![batch]);
+        let reconciled = reconcile_stream_nullability(stream, &plan_schema);
+
+        // Schema should now be nullable
+        assert!(
+            reconciled.schema().field(0).is_nullable(),
+            "field should be nullable after reconciliation"
+        );
+
+        // Batch data should be preserved
+        let batches = collect_stream(reconciled).await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert!(
+            batches[0].schema().field(0).is_nullable(),
+            "batch schema should also be nullable"
+        );
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 array");
+        assert_eq!(col.value(0), 42);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_no_op_when_already_matching() {
+        // Both schemas agree: nullable. No wrapping needed.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "max(id)",
+            arrow::datatypes::DataType::Int64,
+            true,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![42]))],
+        )
+        .expect("batch");
+
+        let stream = stream_from_batches(&schema, vec![batch]);
+        let reconciled = reconcile_stream_nullability(stream, &schema);
+
+        // Schema unchanged
+        assert_eq!(reconciled.schema(), schema);
+
+        let batches = collect_stream(reconciled).await;
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_no_op_when_non_nullable_in_both() {
+        // Both schemas agree: non-nullable. No wrapping needed.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "count",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![10]))],
+        )
+        .expect("batch");
+
+        let stream = stream_from_batches(&schema, vec![batch]);
+        let reconciled = reconcile_stream_nullability(stream, &schema);
+
+        assert!(!reconciled.schema().field(0).is_nullable());
+
+        let batches = collect_stream(reconciled).await;
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_mixed_fields() {
+        // Multiple fields: only some need reconciliation.
+        let exec_schema = Arc::new(Schema::new(vec![
+            Field::new("name", arrow::datatypes::DataType::Utf8, true), // already nullable
+            Field::new("max(id)", arrow::datatypes::DataType::Int64, false), // needs widening
+            Field::new("count", arrow::datatypes::DataType::Int64, false), // stays non-nullable
+        ]));
+        let plan_schema = Arc::new(Schema::new(vec![
+            Field::new("name", arrow::datatypes::DataType::Utf8, true),
+            Field::new("max(id)", arrow::datatypes::DataType::Int64, true), // nullable in plan
+            Field::new("count", arrow::datatypes::DataType::Int64, false),  // non-nullable in plan
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&exec_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a"])),
+                Arc::new(Int64Array::from(vec![42])),
+                Arc::new(Int64Array::from(vec![10])),
+            ],
+        )
+        .expect("batch");
+
+        let stream = stream_from_batches(&exec_schema, vec![batch]);
+        let reconciled = reconcile_stream_nullability(stream, &plan_schema);
+
+        let schema = reconciled.schema();
+        assert!(schema.field(0).is_nullable(), "name stays nullable");
+        assert!(schema.field(1).is_nullable(), "max(id) widened to nullable");
+        assert!(!schema.field(2).is_nullable(), "count stays non-nullable");
+
+        let batches = collect_stream(reconciled).await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(batches[0].schema(), schema);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_field_count_mismatch() {
+        // Different field counts: return stream unchanged.
+        let exec_schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let plan_schema = Arc::new(Schema::new(vec![
+            Field::new("a", arrow::datatypes::DataType::Int64, true),
+            Field::new("b", arrow::datatypes::DataType::Int64, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&exec_schema),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .expect("batch");
+
+        let stream = stream_from_batches(&exec_schema, vec![batch]);
+        let reconciled = reconcile_stream_nullability(stream, &plan_schema);
+
+        // Should be unchanged — no widening when field counts differ
+        assert!(!reconciled.schema().field(0).is_nullable());
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_stream_nullability_empty_stream() {
+        let exec_schema = Arc::new(Schema::new(vec![Field::new(
+            "max(id)",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )]));
+        let plan_schema = Arc::new(Schema::new(vec![Field::new(
+            "max(id)",
+            arrow::datatypes::DataType::Int64,
+            true,
+        )]));
+
+        let stream = stream_from_batches(&exec_schema, vec![]);
+        let reconciled = reconcile_stream_nullability(stream, &plan_schema);
+
+        assert!(reconciled.schema().field(0).is_nullable());
+
+        let batches = collect_stream(reconciled).await;
+        assert!(batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_physical_plan_for_sync_results_preserves_ordered_rows() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::{
+            datasource::MemTable, execution::context::SessionContext, prelude::SessionConfig,
+        };
+
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from_iter_values(0..32))],
+        )
+        .expect("batch");
+        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).expect("table");
+        ctx.register_table("t", Arc::new(table))
+            .expect("register table");
+
+        let dataframe = ctx
+            .sql("SELECT id FROM t ORDER BY id DESC")
+            .await
+            .expect("sql");
+        let plan = dataframe
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        assert!(
+            plan.output_ordering().is_some(),
+            "expected ordered output plan"
+        );
+
+        let wrapped = Arc::new(
+            RepartitionExec::try_new(plan, Partitioning::RoundRobinBatch(4)).expect("repartition"),
+        ) as Arc<dyn ExecutionPlan>;
+        assert!(
+            wrapped.output_ordering().is_some(),
+            "expected ordered output after repartition"
+        );
+        assert!(
+            wrapped.output_partitioning().partition_count() > 1,
+            "expected multi-partition output before sync rewrite"
+        );
+
+        let prepared = prepare_physical_plan_for_sync_results(wrapped).expect("prepare plan");
+        assert_eq!(prepared.output_partitioning().partition_count(), 1);
+
+        let batches = collect_stream(
+            execute_stream(prepared, Arc::new(TaskContext::from(&ctx.state())))
+                .expect("execute prepared plan"),
+        )
+        .await;
+
+        let ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("int32 array")
+                    .iter()
+                    .map(|v| v.expect("non-null id"))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(ids, (0..32).rev().collect::<Vec<_>>());
     }
 }

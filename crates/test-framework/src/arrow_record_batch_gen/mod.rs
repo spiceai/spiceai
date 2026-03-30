@@ -1,8 +1,19 @@
 use chrono::NaiveDate;
 use datafusion::arrow::array::RecordBatch;
-#[expect(clippy::wildcard_imports)]
 use datafusion::arrow::{
-    array::*,
+    array::{
+        Array, ArrayRef, ArrowPrimitiveType, BinaryArray, BinaryBuilder, BinaryViewArray,
+        BooleanArray, BooleanBuilder, Date32Array, Date64Array, Decimal128Array, Decimal256Array,
+        DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray,
+        DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListBuilder,
+        Float16Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int32Builder,
+        Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray,
+        LargeBinaryArray, LargeListBuilder, LargeStringArray, ListBuilder, MapArray, StringArray,
+        StringDictionaryBuilder, StringViewArray, StructBuilder, Time32MillisecondArray,
+        Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    },
     datatypes::{
         DataType, Date32Type, Date64Type, Field, Int8Type, IntervalDayTime, IntervalMonthDayNano,
         IntervalUnit, Schema, SchemaRef, TimeUnit, i256,

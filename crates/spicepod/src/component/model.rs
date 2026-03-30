@@ -88,7 +88,6 @@ pub enum ModelSource {
     Google,
     Xai,
     HuggingFace,
-    Perplexity,
     SpiceAI,
     File,
     Databricks,
@@ -158,8 +157,6 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::Anthropic)
         } else if value.starts_with("google") {
             Ok(ModelSource::Google)
-        } else if value.starts_with("perplexity") {
-            Ok(ModelSource::Perplexity)
         } else if value.starts_with("openai") {
             Ok(ModelSource::OpenAi)
         } else if value.starts_with("azure") {
@@ -187,7 +184,6 @@ impl Display for ModelSource {
             ModelSource::Xai => write!(f, "xai"),
             ModelSource::Anthropic => write!(f, "anthropic"),
             ModelSource::Google => write!(f, "google"),
-            ModelSource::Perplexity => write!(f, "perplexity"),
             ModelSource::HuggingFace => write!(f, "huggingface"),
             ModelSource::File => write!(f, "file"),
             ModelSource::SpiceAI => write!(f, "spiceai"),
@@ -206,7 +202,6 @@ impl ModelSource {
             ModelSource::Xai => "xai",
             ModelSource::Anthropic => "anthropic",
             ModelSource::Google => "google",
-            ModelSource::Perplexity => "perplexity",
             ModelSource::HuggingFace => "hf",
             ModelSource::File => "file",
             ModelSource::SpiceAI => "spiceai",
@@ -369,8 +364,7 @@ impl Model {
         // Some providers only support either ML or LLMs.
         if matches!(
             source,
-            ModelSource::Perplexity
-                | ModelSource::Azure
+            ModelSource::Azure
                 | ModelSource::OpenAi
                 | ModelSource::Anthropic
                 | ModelSource::Xai

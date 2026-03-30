@@ -30,7 +30,7 @@ mod mcp {
     use serde_json::Value;
     use spicepod::component::tool::Tool;
     use std::sync::Arc;
-    use test_framework::serde_yaml;
+    use test_framework::yaml;
 
     /// Test that spiced can run a stdio MCP server.
     #[tokio::test]
@@ -42,8 +42,7 @@ params:
   mcp_args: run -i --rm mcp/fetch
 ";
         let http_base_url = start_spiced_with_tools(vec![
-            serde_yaml::from_str(tool_yaml)
-                .expect("Tool spicepod component is not in expected format"),
+            yaml::from_str(tool_yaml).expect("Tool spicepod component is not in expected format"),
         ])
         .await
         .expect("Failed to start spiced with tools");
@@ -69,7 +68,7 @@ params:
 
         let tool_yaml = format!("name: mcp_from_spiced\nfrom: mcp:{http_server_url}/v1/mcp/sse");
         let http_client_url = start_spiced_with_tools(vec![
-            serde_yaml::from_str(tool_yaml.as_str())
+            yaml::from_str(tool_yaml.as_str())
                 .expect("Tool spicepod component is not in expected format"),
         ])
         .await

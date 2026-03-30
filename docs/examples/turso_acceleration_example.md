@@ -5,7 +5,7 @@ This example demonstrates how to configure Turso as a data acceleration engine i
 ## Memory Mode
 
 ```yaml
-version: v1beta1
+version: v2
 kind: Spicepod
 name: turso_file_default
 
@@ -20,7 +20,7 @@ datasets:
 ## File Mode with Default Path
 
 ```yaml
-version: v1beta1
+version: v2
 kind: Spicepod
 name: turso_file_default
 
@@ -37,7 +37,7 @@ datasets:
 ## File Mode with Custom Path
 
 ```yaml
-version: v1beta1
+version: v2
 kind: Spicepod
 name: turso_file_custom
 
@@ -55,7 +55,7 @@ datasets:
 ## With Refresh Configuration
 
 ```yaml
-version: v1beta1
+version: v2
 kind: Spicepod
 name: turso_with_refresh
 

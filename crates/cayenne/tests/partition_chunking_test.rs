@@ -21,10 +21,15 @@ limitations under the License.
 mod common;
 
 use arrow::array::{Array, Int64Array, StringArray};
+
 use arrow::datatypes::{DataType, Field, Schema};
+
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
+
 use cayenne::CayenneTableProvider;
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
 
 // Generate test variants for each backend
@@ -59,15 +64,16 @@ async fn test_partitioned_table_with_chunking_impl(
     };
 
     // Create Cayenne table provider
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
     println!("✓ Partitioned table created");
 
     // Register with DataFusion
-    let ctx = SessionContext::new();
     ctx.register_table("partitioned_table", Arc::new(table))?;
 
     // Insert data into multiple partitions
@@ -280,13 +286,14 @@ async fn test_partitioned_table_with_large_chunks_impl(
         },
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
 
-    let ctx = SessionContext::new();
     ctx.register_table("large_chunk_table", Arc::new(table))?;
 
     // Insert small amount of data (should all fit in one chunk per partition)
@@ -352,14 +359,15 @@ async fn test_timestamp_partition_with_date_part_impl(
         },
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
     println!("✓ Timestamp-partitioned table created");
 
-    let ctx = SessionContext::new();
     ctx.register_table("timestamp_partitioned_table", Arc::new(table))?;
 
     // Insert data across multiple months (Jan, Feb, Mar 2024)

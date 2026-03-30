@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -37,10 +38,12 @@ use cache::Caching;
 use data_components::cdc::ChangesStream;
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::sqlparser;
 use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
 use rand::Rng;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
+use runtime_acceleration::snapshot::ForceCreate;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use spicepod::metric::Metrics;
@@ -50,6 +53,122 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::{Mutex, Notify};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
+
+/// Columns selected in the refresh SQL.
+#[derive(Clone, Debug)]
+pub enum RefreshSQLColumns {
+    /// SELECT * — all columns from source.
+    All,
+    /// SELECT col1, col2, ... — specific columns preserving original quoting/case.
+    Named(Vec<sqlparser::ast::Ident>),
+}
+
+/// Structured representation of refresh SQL, decomposed into validated parts.
+/// The user's `refresh_sql` config is parsed into columns + `user_filters` + limit.
+/// System-generated filters (partitions) are stored separately.
+#[derive(Clone, Debug)]
+pub struct RefreshSQL {
+    /// The source table this refresh targets.
+    table: TableReference,
+    /// Column projection (All or specific named columns).
+    columns: RefreshSQLColumns,
+    /// User-provided WHERE predicates from `refresh_sql`, split on top-level `AND`.
+    /// Stored as sqlparser `AST` `Expr`s so they can be recombined with system filters.
+    user_filters: Vec<sqlparser::ast::Expr>,
+    /// LIMIT clause from user SQL, if any.
+    limit: Option<usize>,
+    /// Cluster partition filter expressions (`DataFusion` Exprs).
+    /// Applied as `DataFrame` `.filter()` calls at query time.
+    partition_filters: Vec<datafusion_expr::Expr>,
+}
+
+impl RefreshSQL {
+    /// Create a new `RefreshSQL` with the given parts.
+    #[must_use]
+    pub fn new(
+        table: TableReference,
+        columns: RefreshSQLColumns,
+        user_filters: Vec<sqlparser::ast::Expr>,
+        limit: Option<usize>,
+    ) -> Self {
+        Self {
+            table,
+            columns,
+            user_filters,
+            limit,
+            partition_filters: vec![],
+        }
+    }
+
+    /// Reconstruct the user SQL from parts: `SELECT {columns} FROM {table} WHERE {user_filters} LIMIT {limit}`.
+    /// This does NOT include partition filters — those are applied as `DataFrame` filters.
+    #[must_use]
+    pub fn to_sql(&self) -> String {
+        let columns_str = match &self.columns {
+            RefreshSQLColumns::All => "*".to_string(),
+            RefreshSQLColumns::Named(idents) => idents
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
+
+        let mut sql = format!("SELECT {columns_str} FROM {}", self.table);
+
+        if !self.user_filters.is_empty() {
+            let where_clause = self
+                .user_filters
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            let _ = write!(sql, " WHERE {where_clause}");
+        }
+
+        if let Some(limit) = self.limit {
+            let _ = write!(sql, " LIMIT {limit}");
+        }
+
+        sql
+    }
+
+    /// Get the partition filter expressions for `DataFrame` filtering.
+    #[must_use]
+    pub fn partition_filters(&self) -> &[datafusion_expr::Expr] {
+        &self.partition_filters
+    }
+
+    /// Set the partition filter expressions.
+    pub fn set_partition_filters(&mut self, filters: Vec<datafusion_expr::Expr>) {
+        self.partition_filters = filters;
+    }
+
+    /// For logging/status display. Shows the user SQL and annotates if partition filters are active.
+    #[must_use]
+    pub fn display_sql(&self) -> String {
+        let base = self.to_sql();
+        if self.partition_filters.is_empty() {
+            base
+        } else {
+            format!(
+                "{base} [+{} partition filter(s)]",
+                self.partition_filters.len()
+            )
+        }
+    }
+
+    /// Returns the table reference.
+    #[must_use]
+    pub fn table(&self) -> &TableReference {
+        &self.table
+    }
+
+    /// Returns the columns selection.
+    #[must_use]
+    pub fn columns(&self) -> &RefreshSQLColumns {
+        &self.columns
+    }
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -78,7 +197,10 @@ pub struct Refresh {
     pub(crate) time_partition_format: Option<TimeFormat>,
     pub(crate) check_interval: Option<Duration>,
     pub(crate) max_jitter: Option<Duration>,
-    pub(crate) sql: Option<String>,
+    pub(crate) sql: Option<RefreshSQL>,
+    /// Raw SQL string from an override request, not yet parsed.
+    /// When set, this should be parsed into a `RefreshSQL` before use.
+    pub(crate) override_sql_raw: Option<String>,
     pub(crate) mode: RefreshMode,
     pub(crate) period: Option<Duration>,
     pub(crate) append_overlap: Option<Duration>,
@@ -174,9 +296,15 @@ impl Refresh {
     }
 
     #[must_use]
-    pub fn sql(mut self, sql: String) -> Self {
+    pub fn refresh_sql(mut self, sql: RefreshSQL) -> Self {
         self.sql = Some(sql);
         self
+    }
+
+    /// Get the display SQL string for logging/status purposes.
+    #[must_use]
+    pub fn display_sql(&self) -> Option<String> {
+        self.sql.as_ref().map(RefreshSQL::display_sql)
     }
 
     #[must_use]
@@ -204,10 +332,16 @@ impl Refresh {
         self
     }
 
+    /// Apply overrides from a refresh request.
+    ///
+    /// Note: if the override includes a `sql` string, it is stored as the raw override.
+    /// The caller is responsible for parsing it into a `RefreshSQL` using
+    /// `crate::datafusion::refresh_sql::parse_refresh_sql` before use
+    /// (this requires table name and schema context).
     #[must_use]
     pub fn with_overrides(mut self, overrides: &RefreshOverrides) -> Self {
-        if let Some(sql) = &overrides.sql {
-            self.sql = Some(sql.clone());
+        if let Some(sql_str) = &overrides.sql {
+            self.override_sql_raw = Some(sql_str.clone());
         }
         if let Some(mode) = overrides.mode {
             self.mode = mode;
@@ -321,9 +455,11 @@ impl Refresh {
             } else {
                 match refresh_on_startup {
                     // The elapsed time since the last checkpoint is less than the refresh interval, so we need to wait for the refresh interval to pass.
-                    RefreshOnStartup::Auto => {
-                        NextRefresh::WaitFor(check_interval - elapsed_time_since_checkpoint)
-                    }
+                    RefreshOnStartup::Auto => NextRefresh::WaitFor(
+                        check_interval
+                            .checked_sub(elapsed_time_since_checkpoint)
+                            .unwrap_or(Duration::ZERO),
+                    ),
                     // The refresh mode is `Always`, so we need to refresh now.
                     RefreshOnStartup::Always => NextRefresh::WaitFor(Duration::ZERO),
                 }
@@ -434,6 +570,7 @@ impl Default for Refresh {
             check_interval: None,
             max_jitter: None,
             sql: None,
+            override_sql_raw: None,
             mode: RefreshMode::Full,
             period: None,
             append_overlap: None,
@@ -472,18 +609,21 @@ pub struct Refresher {
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
+    /// Notification for completion of refresh operation
     on_complete_notification: Option<Arc<Notify>>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
-    /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations
-    /// Shared with `CachingAccelerationScanExec`.
+    /// Mutex to protect concurrent access to the accelerator during insert/update/delete/cache/snapshot operations
+    /// Shared with `DataConnector` and `CachingAccelerationScanExec`.
     accelerator_write_mutex: Arc<Mutex<()>>,
     /// The bootstrap status from dataset initialization.
     bootstrap_status: BootstrapStatus,
     /// Timestamp (milliseconds since epoch) of the last `insert_into` operation.
     /// Shared with `AcceleratedTable`.
-    last_updated_at: Option<Arc<AtomicI64>>,
+    last_updated_at: Arc<AtomicI64>,
+    /// Whether the acceleration uses S3 Express One Zone storage.
+    is_s3_express_acceleration: bool,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -535,7 +675,8 @@ impl Refresher {
             resource_monitor: None,
             accelerator_write_mutex,
             bootstrap_status: BootstrapStatus::none(),
-            last_updated_at: None,
+            last_updated_at: Arc::new(AtomicI64::from(0)),
+            is_s3_express_acceleration: false,
         }
     }
 
@@ -574,7 +715,7 @@ impl Refresher {
         self
     }
 
-    pub fn with_last_updated_at(&mut self, last_updated_at: Option<Arc<AtomicI64>>) -> &mut Self {
+    pub fn with_last_updated_at(&mut self, last_updated_at: Arc<AtomicI64>) -> &mut Self {
         self.last_updated_at = last_updated_at;
         self
     }
@@ -623,6 +764,12 @@ impl Refresher {
         monitor: crate::resource_monitor::ResourceMonitor,
     ) -> &mut Self {
         self.resource_monitor = Some(monitor);
+        self
+    }
+
+    /// Set whether the acceleration uses S3 Express One Zone storage.
+    pub fn with_s3_express_acceleration(&mut self, is_s3_express: bool) -> &mut Self {
+        self.is_s3_express_acceleration = is_s3_express;
         self
     }
 
@@ -695,12 +842,6 @@ impl Refresher {
                 _,
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
-                let on_dataset_ready = self.on_complete_notification.as_ref().map(|n| {
-                    DatasetReadyNotification::new(
-                        Arc::clone(n),
-                        Arc::clone(&self.initial_load_completed),
-                    )
-                });
                 let (snapshot_interval_task, on_batch_process_callback) = match snapshot_trigger {
                     None | Some(SnapshotCreateTrigger::RefreshComplete) => (None, None),
                     Some(SnapshotCreateTrigger::Interval(duration)) => (
@@ -711,9 +852,10 @@ impl Refresher {
                             Arc::clone(&self.accelerator_write_mutex),
                             dataset_name.clone(),
                             Arc::clone(&federated_schema),
-                            on_dataset_ready,
+                            Arc::clone(&self.runtime_status),
                             self.bootstrap_status.clone(),
-                            self.last_updated_at.clone(),
+                            Arc::clone(&self.last_updated_at),
+                            Some(Arc::clone(&self.accelerator)),
                         ),
                         None,
                     ),
@@ -726,8 +868,10 @@ impl Refresher {
                             Arc::clone(&self.accelerator_write_mutex),
                             &self.dataset_name,
                             self.federated.schema(),
-                            on_dataset_ready,
-                            self.last_updated_at.clone(),
+                            Arc::clone(&self.runtime_status),
+                            self.bootstrap_status.clone(),
+                            Arc::clone(&self.last_updated_at),
+                            Some(Arc::clone(&self.accelerator)),
                         ),
                     ),
                 };
@@ -749,7 +893,8 @@ impl Refresher {
             self.io_runtime.clone(),
             Arc::clone(&self.accelerator_write_mutex),
         )
-        .with_disable_federation(self.disable_federation);
+        .with_disable_federation(self.disable_federation)
+        .with_last_updated_at(Arc::clone(&self.last_updated_at));
 
         if let Some(semaphore) = &self.semaphore {
             refresh_task_runner = refresh_task_runner.with_semaphore(Arc::clone(semaphore));
@@ -763,6 +908,9 @@ impl Refresher {
             refresh_task_runner =
                 refresh_task_runner.with_resource_monitor(resource_monitor.clone());
         }
+
+        refresh_task_runner =
+            refresh_task_runner.with_s3_express_acceleration(self.is_s3_express_acceleration);
 
         let mut refresh_task_runner = refresh_task_runner.build();
 
@@ -778,7 +926,8 @@ impl Refresher {
         let snapshot_mutex = Arc::clone(&self.accelerator_write_mutex);
 
         let initial_load_completed = Arc::clone(&self.initial_load_completed);
-        let last_updated_at = self.last_updated_at.clone();
+        let last_updated_at = Arc::clone(&self.last_updated_at);
+        let accelerator = Arc::clone(&self.accelerator);
 
         let synchronize_with = self.synchronize_with.clone();
 
@@ -789,35 +938,67 @@ impl Refresher {
                 None => (None, true),
                 Some(SnapshotCreateTrigger::Batches(_)) => (None, false),
                 Some(SnapshotCreateTrigger::RefreshComplete) => (None, true),
-                Some(SnapshotCreateTrigger::Interval(duration)) => {
-                    let on_dataset_ready = self.on_complete_notification.as_ref().map(|n| {
-                        DatasetReadyNotification::new(
-                            Arc::clone(n),
-                            Arc::clone(&self.initial_load_completed),
-                        )
-                    });
-                    (
-                        spawn_snapshot_interval_task(
-                            Some(*duration),
-                            checkpointer.clone(),
-                            snapshot_manager.clone(),
-                            Arc::clone(&self.accelerator_write_mutex),
-                            dataset_name.clone(),
-                            Arc::clone(&federated_schema),
-                            on_dataset_ready,
-                            self.bootstrap_status.clone(),
-                            self.last_updated_at.clone(),
-                        ),
-                        false,
-                    )
-                }
+                Some(SnapshotCreateTrigger::Interval(duration)) => (
+                    spawn_snapshot_interval_task(
+                        Some(*duration),
+                        checkpointer.clone(),
+                        snapshot_manager.clone(),
+                        Arc::clone(&self.accelerator_write_mutex),
+                        dataset_name.clone(),
+                        Arc::clone(&federated_schema),
+                        Arc::clone(&self.runtime_status),
+                        self.bootstrap_status.clone(),
+                        Arc::clone(&self.last_updated_at),
+                        Some(Arc::clone(&self.accelerator)),
+                    ),
+                    false,
+                ),
             };
         self.snapshot_interval_task = snapshot_interval_task;
+
+        // Gates when checkpoint counting/creation can start after runtime is ready.
+        // Set to true immediately when snapshots are not configured, or after the initial
+        // snapshot task completes (regardless of success) when snapshots are configured.
+        let checkpoint_counting_enabled = Arc::new(AtomicBool::new(snapshot_manager.is_none()));
+        let bootstrap_status = self.bootstrap_status.clone();
 
         if create_checkpoint_snapshot_after_refresh && snapshot_manager.is_some() {
             tracing::info!(
                 "Snapshots for dataset {dataset_name} will be created after every refresh"
             );
+
+            // Spawn a task to create initial snapshot once runtime is ready
+            if let Some(checkpointer) = checkpointer.clone() {
+                let checkpoint_counting_enabled_clone = Arc::clone(&checkpoint_counting_enabled);
+                let runtime_status_clone = Arc::clone(&self.runtime_status);
+                let snapshot_manager_clone = snapshot_manager.clone();
+                let federated_schema_clone = Arc::clone(&federated_schema);
+                let accelerator_write_mutex_clone = Arc::clone(&self.accelerator_write_mutex);
+                let dataset_name_clone = dataset_name.clone();
+                let last_updated_at_clone = Arc::clone(&self.last_updated_at);
+                let accelerator_clone = Arc::clone(&self.accelerator);
+
+                tokio::spawn(async move {
+                    runtime_status_clone.wait_for_ready().await;
+                    if !bootstrap_status.is_bootstrapped() {
+                        create_checkpoint_and_snapshot(
+                            &checkpointer,
+                            snapshot_manager_clone.as_ref(),
+                            &federated_schema_clone,
+                            &accelerator_write_mutex_clone,
+                            &dataset_name_clone,
+                            &last_updated_at_clone,
+                            ForceCreate(true),
+                            Some(&accelerator_clone),
+                        )
+                        .await;
+                    }
+                    checkpoint_counting_enabled_clone.store(true, Ordering::Release);
+                    tracing::debug!(
+                        "Refresh-based snapshot creation for {dataset_name_clone} starting after runtime ready"
+                    );
+                });
+            }
         }
 
         // Spawns a tasks that both periodically refreshes the dataset, and upon request, will manually refresh the dataset.
@@ -879,14 +1060,16 @@ impl Refresher {
                                     }
                             }
 
-                            if create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
+                            if checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
                                 create_checkpoint_and_snapshot(
                                     checkpointer,
                                     snapshot_manager.as_ref(),
                                     &federated_schema,
                                     &snapshot_mutex,
                                     &dataset_name,
-                                    last_updated_at.as_ref(),
+                                    &last_updated_at,
+                                    ForceCreate(false),
+                                    Some(&accelerator),
                                 ).await;
                             }
                         }
@@ -956,6 +1139,8 @@ impl Refresher {
             .with_cpu_runtime(self.cpu_runtime.clone())
             .with_metrics(self.metrics.clone())
             .with_on_stream_batch_process_callback(on_batch_process_callback)
+            .with_last_updated_at(Arc::clone(&self.last_updated_at))
+            .with_s3_express_acceleration(self.is_s3_express_acceleration)
             .build(),
         );
 
@@ -1012,38 +1197,10 @@ async fn notify_refresh_done(
     let mut labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
     let refresh_guard = refresh.read().await;
     if let Some(sql) = &refresh_guard.sql {
-        labels.push(KeyValue::new("sql", sql.clone()));
+        labels.push(KeyValue::new("sql", sql.display_sql()));
     }
 
     metrics::LAST_REFRESH_TIME_MS.record(now.as_secs_f64() * 1000.0, &labels);
-}
-
-/// A notification wrapper that handles "already ready" state.
-/// Subscribers are notified immediately if already ready, otherwise they wait.
-#[derive(Clone)]
-pub struct DatasetReadyNotification {
-    notify: Arc<Notify>,
-    is_ready: Arc<AtomicBool>,
-}
-
-impl DatasetReadyNotification {
-    pub fn new(notify: Arc<Notify>, is_ready: Arc<AtomicBool>) -> Arc<Self> {
-        Arc::new(Self { notify, is_ready })
-    }
-
-    /// Wait until the dataset is ready. Returns immediately if already ready.
-    pub async fn wait(&self) {
-        // IMPORTANT: Create the future FIRST, before checking the condition.
-        // This ensures we'll catch any notification that happens after this point.
-        let notified = self.notify.notified();
-
-        if self.is_ready.load(Ordering::Acquire) {
-            return;
-        }
-
-        // Any notify_waiters() call that happened after we created `notified` will wake us up.
-        notified.await;
-    }
 }
 
 #[cfg(test)]
@@ -1240,11 +1397,15 @@ mod tests {
             delay: Duration,
         ) -> bool {
             for _attempt in 0..max_attempts {
+                let Ok(desired_discriminant) = u8::try_from(desired.discriminant()) else {
+                    return false;
+                };
+
                 let metrics = registry.gather();
                 if let Some(metric) = metrics.iter().find(|m| {
                     m.name() == "dataset_load_state" && m.get_field_type() == MetricType::GAUGE
                 }) && let Some(gauge) = metric.get_metric()[0].get_gauge().as_ref()
-                    && gauge.value().is_eq(f64::from(desired as i32))
+                    && gauge.value().is_eq(f64::from(desired_discriminant))
                 {
                     return true;
                 }

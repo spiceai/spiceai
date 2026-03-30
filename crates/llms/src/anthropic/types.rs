@@ -713,7 +713,7 @@ mod tests {
         "claude-opus-4-0",
         "claude-sonnet-4-0",
         "claude-3-7-sonnet-latest",
-        "claude-3-5-haiku-latest",
+        "claude-haiku-4-5",
         "claude-sonnet-4-20250514",
         "claude-3-7-sonnet-20250219",
         "claude-3-5-haiku-20241022",

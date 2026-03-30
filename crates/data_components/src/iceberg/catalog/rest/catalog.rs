@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use iceberg::{
     Catalog, Namespace, NamespaceIdent, Result as IcebergResult, TableCommit, TableCreation,
-    TableIdent, io::CustomAwsCredentialLoader, table::Table,
+    TableIdent, table::Table,
 };
 use iceberg_catalog_rest::RestCatalog as IcebergRestCatalog;
 
@@ -34,16 +34,6 @@ impl RestCatalog {
     #[must_use]
     pub fn new(inner: IcebergRestCatalog) -> Self {
         Self { inner }
-    }
-
-    #[must_use]
-    pub fn with_file_io_extension(
-        self,
-        custom_credential_loader: CustomAwsCredentialLoader,
-    ) -> Self {
-        Self {
-            inner: self.inner.with_file_io_extension(custom_credential_loader),
-        }
     }
 }
 
@@ -149,6 +139,7 @@ mod tests {
     use iceberg::CatalogBuilder;
     use iceberg_catalog_rest::RestCatalogBuilder;
     use iceberg_datafusion::IcebergTableProvider;
+    use iceberg_storage_opendal::OpenDalStorageFactory;
     use std::sync::Arc;
 
     use super::*;
@@ -164,6 +155,10 @@ mod tests {
     async fn test_rest_catalog() {
         let catalog = RestCatalog::new(
             RestCatalogBuilder::default()
+                .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+                    configured_scheme: "s3".to_string(),
+                    customized_credential_load: None,
+                }))
                 .load(
                     "rest",
                     HashMap::from([
@@ -194,18 +189,10 @@ mod tests {
             .await;
         println!("{tables:?}");
 
-        let table = catalog
-            .load_table(&TableIdent::new(
-                NamespaceIdent::new("nyc".to_string()),
-                "taxis".to_string(),
-            ))
-            .await
-            .expect("Failed to load table");
-        println!("{table:?}");
-
         let df_table_provider = IcebergTableProvider::try_new(
             Arc::new(catalog),
-            TableIdent::new(NamespaceIdent::new("nyc".to_string()), "taxis".to_string()),
+            NamespaceIdent::new("nyc".to_string()),
+            "taxis".to_string(),
         )
         .await
         .expect("Failed to create table provider");

@@ -32,10 +32,12 @@ impl Namespace {
         Self { parts }
     }
 
+    #[must_use]
     pub fn from_single_part(part: String) -> Self {
         Self { parts: vec![part] }
     }
 
+    #[must_use]
     pub fn from_parts(parts: Vec<String>) -> Self {
         Self { parts }
     }

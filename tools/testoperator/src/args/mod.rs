@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser, Subcommand};
 
 mod dataset;
-pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, QueryArgs, QuerySetLoader};
+pub use dataset::{DataConsistencyArgs, DatasetTestArgs, LoadTestArgs};
 
 #[cfg(feature = "append")]
 mod append;
@@ -29,14 +29,17 @@ pub use append::AppendTestArgs;
 pub mod dispatch;
 use dispatch::DispatchArgs;
 
-mod evals;
-pub use evals::EvalsTestArgs;
-
 mod search;
 pub use search::SearchTestArgs;
 
 mod text_to_sql;
 pub use text_to_sql::TextToSqlArgs;
+
+mod schema;
+pub use schema::SchemaTestArgs;
+
+mod streaming;
+pub use streaming::{StreamingDynamodbArgs, StreamingDynamodbCorrectnessArgs};
 
 #[derive(Subcommand)]
 pub enum Commands {
@@ -60,15 +63,19 @@ pub enum TestCommands {
     Bench(DatasetTestArgs),
     /// Run a data consistency test
     DataConsistency(DataConsistencyArgs),
-    /// Run a models evaluations test
-    Evals(EvalsTestArgs),
     #[cfg(feature = "append")]
     Append(AppendTestArgs),
     Search(SearchTestArgs),
     /// Execute benchmark queries against a pre-existing spiced instance
-    Query(QueryArgs),
+    Query(DatasetTestArgs),
     /// Run a text-to-sql test
     TextToSql(TextToSqlArgs),
+    /// Run a streaming ingestion performance benchmark for `DynamoDB` Streams
+    StreamingDynamodb(StreamingDynamodbArgs),
+    /// Run a streaming `DynamoDB` data correctness test (multi-round CDC verification)
+    StreamingDynamodbCorrectness(StreamingDynamodbCorrectnessArgs),
+    /// Validate catalog connector schema discovery via `information_schema`
+    Schema(SchemaTestArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].

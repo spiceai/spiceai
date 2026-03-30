@@ -31,7 +31,6 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Service, flightsql, to_tonic_err};
 
-#[expect(clippy::too_many_lines)]
 pub(crate) async fn handle(
     request: Request<Ticket>,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
@@ -68,11 +67,11 @@ pub(crate) async fn handle(
             Box::pin(flightsql::get_xdbc_type_info::do_get(command)).await
         }
         // Additional Commands not yet supported
-        Command::CommandStatementUpdate(cmd) => {
+        Command::CommandStatementUpdate(_cmd) => {
             let _start = metrics::track_flight_request("do_get", Some("statement_update")).await;
-            tracing::debug!("CommandStatementUpdate not yet implemented: {cmd:?}");
-            Err(Status::unimplemented(
-                "CommandStatementUpdate is not yet implemented",
+            // CommandStatementUpdate should be sent via DoPut, not DoGet
+            Err(Status::invalid_argument(
+                "CommandStatementUpdate should be sent via DoPut, not DoGet. See the FlightSQL specification.",
             ))
         }
         Command::CommandStatementSubstraitPlan(cmd) => {

@@ -49,7 +49,7 @@ impl MetricReader for InitialReader {
         self.reader.register_pipeline(pipeline);
     }
 
-    fn collect(&self, rm: &mut ResourceMetrics) -> opentelemetry_sdk::metrics::MetricResult<()> {
+    fn collect(&self, rm: &mut ResourceMetrics) -> OTelSdkResult {
         self.reader.collect(rm)
     }
 
@@ -59,6 +59,15 @@ impl MetricReader for InitialReader {
 
     fn shutdown(&self) -> OTelSdkResult {
         self.reader.shutdown()
+    }
+
+    /// Delegates to the inner `ManualReader`'s timeout-aware shutdown.
+    ///
+    /// Simple delegation is appropriate here because `InitialReader` is a thin wrapper
+    /// that adds no state requiring cleanup beyond what `ManualReader` handles. The
+    /// inner reader manages all pipeline state and timeout logic.
+    fn shutdown_with_timeout(&self, timeout: std::time::Duration) -> OTelSdkResult {
+        self.reader.shutdown_with_timeout(timeout)
     }
 
     fn temporality(&self, kind: InstrumentKind) -> Temporality {

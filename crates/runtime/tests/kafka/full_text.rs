@@ -77,7 +77,7 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
 
             run_and_snapshot_query(
                 &rt,
-                &format!("SELECT question_id, title FROM text_search({table}, 'gitignore untracked') ORDER BY score DESC LIMIT 10"),
+                &format!("SELECT question_id, title FROM text_search({table}, 'gitignore untracked') ORDER BY _score DESC LIMIT 10"),
                 &data_snapshot,
             )
             .await?;

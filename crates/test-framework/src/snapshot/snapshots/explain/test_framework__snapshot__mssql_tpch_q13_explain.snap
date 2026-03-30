@@ -32,8 +32,8 @@ description: "Query: tpch_q13"
 |               |                     HashJoinExec: mode=Partitioned, join_type=Left, on=[(c_custkey@0, o_custkey@1)], projection=[c_custkey@0, o_orderkey@1] |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                           |
 |               |                         RepartitionExec: partitioning=Hash([c_custkey@0], 24), input_partitions=24                                          |
-|               |                           RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                             |
-|               |                             BytesProcessedExec                                                                                              |
+|               |                           BytesProcessedExec                                                                                                |
+|               |                             RepartitionExec: partitioning=RoundRobinBatch(24), input_partitions=1                                           |
 |               |                               SqlServerExec sql=SELECT c_custkey FROM customer                                                              |
 |               |                       CoalesceBatchesExec: target_batch_size=8192                                                                           |
 |               |                         RepartitionExec: partitioning=Hash([o_custkey@1], 24), input_partitions=24                                          |

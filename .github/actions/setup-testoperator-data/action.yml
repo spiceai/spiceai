@@ -11,6 +11,7 @@ inputs:
       - 'tpch[parameterized]'
       - 'tpcds'
       - 'clickbench'
+      - 'scenario'
 
 runs:
   using: 'composite'
@@ -34,14 +35,14 @@ runs:
 
     - name: Download DuckDB TPCH Data (Linux/macOS)
       shell: bash
-      if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]') && runner.os != 'Windows'
+      if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]' || inputs.query_set == 'scenario') && runner.os != 'Windows'
       run: |
         cd /opt/spiced/data
         mc cp spice-minio/benchmarks/tpch_sf1/tpch.db ./
 
     - name: Download DuckDB TPCH Data (Windows)
       shell: pwsh
-      if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]') && runner.os == 'Windows'
+      if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]' || inputs.query_set == 'scenario') && runner.os == 'Windows'
       run: |
         $ErrorActionPreference = 'Stop'
         cd C:\spiced\data
@@ -64,14 +65,14 @@ runs:
 
     - name: Download File Connector TPCH Data (Linux/macOS)
       shell: bash
-      if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]') && runner.os != 'Windows'
+      if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]' || inputs.query_set == 'scenario') && runner.os != 'Windows'
       run: |
         cd /opt/spiced/data
         mc cp --recursive spice-minio/benchmarks/tpch_sf1/ ./
 
     - name: Download File Connector TPCH Data (Windows)
       shell: pwsh
-      if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]') && runner.os == 'Windows'
+      if: (inputs.query_set == 'tpch' || inputs.query_set == 'tpch[parameterized]' || inputs.query_set == 'scenario') && runner.os == 'Windows'
       run: |
         $ErrorActionPreference = 'Stop'
         cd C:\spiced\data

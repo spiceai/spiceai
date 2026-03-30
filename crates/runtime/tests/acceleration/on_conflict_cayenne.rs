@@ -24,8 +24,10 @@ use std::{collections::HashMap, sync::Arc};
 
 use app::AppBuilder;
 use arrow::array::RecordBatch;
-use data_components::delete::{DeletionTableProvider, get_deletion_provider};
-use datafusion::{assert_batches_eq, physical_plan::collect, prelude::*, sql::TableReference};
+use datafusion::{
+    assert_batches_eq, datasource::TableProvider, physical_plan::collect, prelude::*,
+    sql::TableReference,
+};
 use futures::TryStreamExt;
 use runtime::{Runtime, accelerated_table::AcceleratedTable};
 use runtime_request_context::{CacheControl, Protocol, RequestContext, UserAgent};
@@ -95,11 +97,12 @@ async fn test_cayenne_on_conflict_upsert() -> Result<(), anyhow::Error> {
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
             // Create the Cayenne table
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+            let ctx = SessionContext::new();
+            let table =
+                CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env())
+                    .await?;
             let table = Arc::new(table);
 
-            // Create a SessionContext and register the table
-            let ctx = SessionContext::new();
             ctx.register_table(
                 "events",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -221,11 +224,12 @@ async fn test_cayenne_on_conflict_drop() -> Result<(), anyhow::Error> {
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
             // Create the Cayenne table
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+            let ctx = SessionContext::new();
+            let table =
+                CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env())
+                    .await?;
             let table = Arc::new(table);
 
-            // Create a SessionContext and register the table
-            let ctx = SessionContext::new();
             ctx.register_table(
                 "events_drop",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -493,7 +497,7 @@ async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
             let expected = ["+-----+", "| cnt |", "+-----+", "| 5   |", "+-----+"];
             assert_batches_eq!(expected, &result);
 
-            // Delete by primary key using DeletionTableProvider::delete_from
+            // Delete by primary key using TableProvider::delete_from
             // (SQL DELETE is not supported through the runtime's SQL interface)
             let table_ref = TableReference::bare("pk_test");
             let table = rt
@@ -509,12 +513,10 @@ async fn test_cayenne_primary_key_delete() -> Result<(), anyhow::Error> {
                 .ok_or_else(|| anyhow::anyhow!("Table is not an AcceleratedTable"))?;
 
             let accelerator = accelerated_table.get_accelerator();
-            let deletion_provider = get_deletion_provider(Arc::clone(&accelerator))
-                .ok_or_else(|| anyhow::anyhow!("Accelerator does not support deletion"))?;
 
             let ctx = rt.datafusion().ctx.state();
             let filter = col("id").eq(lit(3i64));
-            let delete_plan = deletion_provider.delete_from(&ctx, &[filter]).await?;
+            let delete_plan = accelerator.delete_from(&ctx, vec![filter]).await?;
             collect(delete_plan, rt.datafusion().ctx.task_ctx()).await?;
 
             // Verify deletion
@@ -713,11 +715,10 @@ async fn test_cayenne_partitioned_on_conflict_upsert() -> Result<(), anyhow::Err
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
             // Create the Cayenne table
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+            let ctx = SessionContext::new();
+            let table = CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
             let table = Arc::new(table);
 
-            // Create a SessionContext and register the table
-            let ctx = SessionContext::new();
             ctx.register_table(
                 "partitioned_upsert_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -836,11 +837,10 @@ async fn test_cayenne_composite_primary_key() -> Result<(), anyhow::Error> {
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
             // Create the Cayenne table
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+            let ctx = SessionContext::new();
+            let table = CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
             let table = Arc::new(table);
 
-            // Create a SessionContext and register the table
-            let ctx = SessionContext::new();
             ctx.register_table(
                 "composite_pk_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -972,11 +972,12 @@ async fn test_cayenne_primary_key_no_on_conflict() -> Result<(), anyhow::Error> 
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
             // Create the Cayenne table
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+            let ctx = SessionContext::new();
+            let table =
+                CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env())
+                    .await?;
             let table = Arc::new(table);
 
-            // Create a SessionContext and register the table
-            let ctx = SessionContext::new();
             ctx.register_table(
                 "pk_no_conflict_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -1120,14 +1121,14 @@ async fn test_cayenne_on_conflict_runtime_integration() -> Result<(), anyhow::Er
             assert_batches_eq!(expected, &result);
 
             // Insert data with duplicate primary key - should upsert
-            rt.datafusion()
-                .query_builder(
-                    "INSERT INTO events (event_id, event_name, event_timestamp) \
-                     VALUES (2, 'Password Reset', '2024-01-15 09:00:00')",
-                )
-                .build()
-                .run()
-                .await?;
+            // Must use execute_sql to drain the stream,
+            // otherwise DataSinkExec never executes and the write is silently skipped / dropped.
+            execute_sql(
+                &rt,
+                "INSERT INTO events (event_id, event_name, event_timestamp) \
+                 VALUES (2, 'Password Reset', '2024-01-15 09:00:00')",
+            )
+            .await?;
 
             // Verify upsert happened
             let result =
@@ -1196,10 +1197,12 @@ async fn test_cayenne_large_batch_roundtrip() -> Result<(), anyhow::Error> {
             catalog.init().await?;
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+            let ctx = SessionContext::new();
+            let table =
+                CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env())
+                    .await?;
             let table = Arc::new(table);
 
-            let ctx = SessionContext::new();
             ctx.register_table(
                 "large_batch_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -1302,10 +1305,9 @@ async fn test_cayenne_special_characters() -> Result<(), anyhow::Error> {
             catalog.init().await?;
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
-            let table = Arc::new(table);
-
             let ctx = SessionContext::new();
+            let table = CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+            let table = Arc::new(table);
             ctx.register_table(
                 "special_chars_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -1404,10 +1406,9 @@ async fn test_cayenne_null_handling() -> Result<(), anyhow::Error> {
             catalog.init().await?;
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
-            let table = Arc::new(table);
-
             let ctx = SessionContext::new();
+            let table = CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
+            let table = Arc::new(table);
             ctx.register_table(
                 "null_handling_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -1519,10 +1520,11 @@ async fn test_cayenne_upsert_batch_update() -> Result<(), anyhow::Error> {
             catalog.init().await?;
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
-            let table = Arc::new(table);
-
             let ctx = SessionContext::new();
+            let table =
+                CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env())
+                    .await?;
+            let table = Arc::new(table);
             ctx.register_table(
                 "batch_upsert_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -1641,10 +1643,12 @@ async fn test_cayenne_delete_then_insert_new() -> Result<(), anyhow::Error> {
             catalog.init().await?;
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+            let ctx = SessionContext::new();
+            let table =
+                CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env())
+                    .await?;
             let table = Arc::new(table);
 
-            let ctx = SessionContext::new();
             ctx.register_table(
                 "delete_insert_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -1670,9 +1674,9 @@ async fn test_cayenne_delete_then_insert_new() -> Result<(), anyhow::Error> {
             let expected = ["+-----+", "| cnt |", "+-----+", "| 3   |", "+-----+"];
             assert_batches_eq!(expected, &result);
 
-            // Delete row with id=2 using DeletionTableProvider
+            // Delete row with id=2
             let filter = col("id").eq(lit(2i64));
-            let delete_plan = table.delete_from(&ctx.state(), &[filter]).await?;
+            let delete_plan = table.delete_from(&ctx.state(), vec![filter]).await?;
             collect(delete_plan, ctx.task_ctx()).await?;
 
             // Verify deletion
@@ -1766,10 +1770,12 @@ async fn test_cayenne_boundary_values() -> Result<(), anyhow::Error> {
             catalog.init().await?;
             let catalog_arc: Arc<dyn MetadataCatalog> = catalog;
 
-            let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+            let ctx = SessionContext::new();
+            let table =
+                CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env())
+                    .await?;
             let table = Arc::new(table);
 
-            let ctx = SessionContext::new();
             ctx.register_table(
                 "boundary_test",
                 Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -1902,6 +1908,12 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
                     name: "region".to_string(),
                     expression: "region".to_string(),
                 }],
+                // Add retention SQL to trigger deletes
+                retention_sql: Some(
+                    "DELETE FROM partitioned_delete_test WHERE value > 400".to_string(),
+                ),
+                retention_check_interval: Some("1s".to_string()),
+                retention_check_enabled: true,
                 ..Acceleration::default()
             });
 
@@ -1937,6 +1949,31 @@ async fn test_cayenne_partitioned_deletion() -> Result<(), anyhow::Error> {
                 "| region | cnt |",
                 "+--------+-----+",
                 "| asia   | 2   |",
+                "| eu     | 2   |",
+                "| us     | 2   |",
+                "+--------+-----+",
+            ];
+            assert_batches_eq!(expected, &result);
+
+            // Wait for retention to delete rows where value > 400
+            // Retention check interval is 1s, so wait a bit for it to run
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            // Verify data after retention deletion - should have 4 rows remaining
+            let result =
+                execute_sql(&rt, "SELECT COUNT(*) as cnt FROM partitioned_delete_test").await?;
+            let expected = ["+-----+", "| cnt |", "+-----+", "| 4   |", "+-----+"];
+            assert_batches_eq!(expected, &result);
+
+            let result = execute_sql(
+                &rt,
+                "SELECT region, COUNT(*) as cnt FROM partitioned_delete_test GROUP BY region ORDER BY region",
+            )
+            .await?;
+            let expected = [
+                "+--------+-----+",
+                "| region | cnt |",
+                "+--------+-----+",
                 "| eu     | 2   |",
                 "| us     | 2   |",
                 "+--------+-----+",

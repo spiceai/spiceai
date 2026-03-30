@@ -22,6 +22,7 @@ use arrow::{
 };
 use arrow_cast::cast;
 use arrow_schema::Schema;
+use datafusion::common::metadata::ScalarAndMetadata;
 use datafusion::{common::ParamValues, error::DataFusionError, scalar::ScalarValue};
 use snafu::{ResultExt, prelude::*};
 use std::sync::Arc;
@@ -94,6 +95,17 @@ pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<Recor
             }
         })
         .collect::<Result<Vec<Arc<dyn Array>>>>()?;
+
+    // Handle empty schema case (e.g., for aggregate queries like `SELECT COUNT(1) FROM table`).
+    // Arrow requires either columns or an explicit row count when creating a RecordBatch.
+    if cols.is_empty() {
+        return RecordBatch::try_new_with_options(
+            schema,
+            cols,
+            &arrow::array::RecordBatchOptions::new().with_row_count(Some(record_batch.num_rows())),
+        )
+        .context(UnableToConvertRecordBatchSnafu);
+    }
 
     RecordBatch::try_new(schema, cols).context(UnableToConvertRecordBatchSnafu)
 }
@@ -227,7 +239,7 @@ pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFu
 
     // Fast path: empty batch
     if num_columns == 0 {
-        return Ok(ParamValues::List(Vec::new()));
+        return Ok(ParamValues::from(Vec::<ScalarValue>::new()));
     }
 
     let schema = batch.schema_ref();
@@ -274,7 +286,10 @@ pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFu
 
         // Extract just the values (compiler can optimize this to a move)
         Ok(ParamValues::List(
-            list_params.into_iter().map(|(_, value)| value).collect(),
+            list_params
+                .into_iter()
+                .map(|(_, value)| ScalarAndMetadata::from(value))
+                .collect(),
         ))
     } else {
         // Convert list_params back to named if we have mixed types
@@ -288,7 +303,12 @@ pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFu
                 named_params.push((format!("${index}"), value));
             }
         }
-        Ok(ParamValues::Map(named_params.into_iter().collect()))
+        Ok(ParamValues::Map(
+            named_params
+                .into_iter()
+                .map(|(k, v)| (k, ScalarAndMetadata::from(v)))
+                .collect(),
+        ))
     }
 }
 
@@ -398,6 +418,25 @@ mod test {
     fn test_string_to_timestamp_conversion() {
         let result = try_cast_to(batch_input(), to_schema()).expect("converted");
         assert_eq!(3, result.num_rows());
+    }
+
+    /// Test that `try_cast_to` handles empty schema correctly.
+    /// This is needed for aggregate queries like `SELECT COUNT(1) FROM table`
+    /// which have an empty projection (no columns selected from the table).
+    #[test]
+    fn test_try_cast_to_empty_schema() {
+        // Input batch has columns but we want to cast to an empty schema
+        let input_batch = batch_input();
+        assert_eq!(3, input_batch.num_rows());
+        assert_eq!(3, input_batch.num_columns());
+
+        // Target schema has no columns (like projection=[] for COUNT queries)
+        let empty_schema = Arc::new(Schema::empty());
+
+        // This should succeed, preserving the row count
+        let result = try_cast_to(input_batch, empty_schema).expect("should handle empty schema");
+        assert_eq!(3, result.num_rows(), "row count should be preserved");
+        assert_eq!(0, result.num_columns(), "should have no columns");
     }
 
     fn parse_json_to_batch(json_data: &str, schema: SchemaRef) -> RecordBatch {
@@ -528,15 +567,18 @@ mod test {
             (ParamValues::List(result_vec), ParamValues::List(expected_vec)) => {
                 assert_eq!(result_vec.len(), expected_vec.len(), "List lengths differ");
                 for (r, e) in result_vec.iter().zip(expected_vec.iter()) {
-                    assert_eq!(r, e, "ScalarValue mismatch");
+                    // ScalarAndMetadata doesn't impl PartialEq, compare the value field
+                    assert_eq!(r.value(), e.value(), "ScalarValue mismatch");
                 }
             }
             (ParamValues::Map(result_map), ParamValues::Map(expected_map)) => {
                 assert_eq!(result_map.len(), expected_map.len(), "Map lengths differ");
                 for (key, expected_value) in expected_map {
                     let result_value = result_map.get(&key).expect("key in result map");
+                    // ScalarAndMetadata doesn't impl PartialEq, compare the value field
                     assert_eq!(
-                        result_value, &expected_value,
+                        result_value.value(),
+                        expected_value.value(),
                         "ScalarValue mismatch for key {key}",
                     );
                 }
@@ -558,7 +600,7 @@ mod test {
         );
 
         let result = record_to_param_values(&batch).expect("record to param values");
-        let expected = ParamValues::List(vec![
+        let expected = ParamValues::from(vec![
             ScalarValue::Int32(Some(42)),
             ScalarValue::Utf8(Some("hello".to_string())),
         ]);
@@ -577,7 +619,7 @@ mod test {
         );
 
         let result = record_to_param_values(&batch).expect("record to param values");
-        let expected = ParamValues::List(vec![
+        let expected = ParamValues::from(vec![
             ScalarValue::Int32(Some(42)),
             ScalarValue::Utf8(Some("hello".to_string())),
         ]);
@@ -602,7 +644,7 @@ mod test {
             "param2".to_string(),
             ScalarValue::Utf8(Some("world".to_string())),
         );
-        let expected = ParamValues::Map(expected_map);
+        let expected = ParamValues::from(expected_map);
 
         assert_param_values_eq(result, expected);
     }
@@ -625,7 +667,7 @@ mod test {
             "param2".to_string(),
             ScalarValue::Utf8(Some("test".to_string())),
         );
-        let expected = ParamValues::Map(expected_map);
+        let expected = ParamValues::from(expected_map);
 
         assert_param_values_eq(result, expected);
     }
@@ -641,7 +683,7 @@ mod test {
         );
 
         let result = record_to_param_values(&batch).expect("record to param values");
-        let expected = ParamValues::List(vec![
+        let expected = ParamValues::from(vec![
             ScalarValue::Utf8(Some("first".to_string())),
             ScalarValue::Int32(Some(200)),
         ]);
@@ -657,7 +699,7 @@ mod test {
         );
 
         let result = record_to_param_values(&batch).expect("record to param values");
-        let expected = ParamValues::List(vec![ScalarValue::Int32(Some(1))]);
+        let expected = ParamValues::from(vec![ScalarValue::Int32(Some(1))]);
 
         assert_param_values_eq(result, expected);
     }
@@ -675,7 +717,7 @@ mod test {
             "x".to_string(),
             ScalarValue::Utf8(Some("value".to_string())),
         );
-        let expected = ParamValues::Map(expected_map);
+        let expected = ParamValues::from(expected_map);
 
         assert_param_values_eq(result, expected);
     }

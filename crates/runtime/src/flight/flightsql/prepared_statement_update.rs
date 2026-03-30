@@ -32,11 +32,8 @@ use tokio_stream::{StreamExt, adapters::Peekable};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::{
-    datafusion::{
-        request_context_extension::get_current_datafusion,
-        sql_validator::validate_sql_query_operations,
-    },
-    flight::{Service, metrics, to_tonic_err, util::set_flightsql_protocol},
+    datafusion::{query::QueryBuilder, request_context_extension::get_current_datafusion},
+    flight::{Service, handle_query_error, metrics, to_tonic_err, util::set_flightsql_protocol},
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 
@@ -111,38 +108,23 @@ pub(crate) async fn do_get(
 
     let parameters = decode_param_values(&parameters).map_err(error_to_status)?;
 
-    // Execute the update statement
-    // For UPDATE/INSERT/DELETE statements, we need to execute the full logical plan
-    let session = datafusion.ctx.state();
-    let plan = session
-        .create_logical_plan(&sql)
+    // Execute through the standard query path, which handles DELETE and UPDATE
+    // via the runtime's DML interception in Query::run().
+    let query_result = QueryBuilder::new(&sql, datafusion)
+        .parameters(parameters)
+        .build()
+        .run()
         .await
-        .map_err(|e| Status::internal(format!("Failed to create logical plan: {e}")))?;
+        .map_err(handle_query_error)?;
 
-    // Validate the plan to ensure only allowed operations are executed
-    // This prevents SQL injection attacks via prepared statement updates
-    if let Err(e) = validate_sql_query_operations(&plan, &datafusion) {
-        return Err(Status::permission_denied(format!(
-            "Operation not allowed: {e}"
-        )));
-    }
-
-    let plan = if let Some(params) = parameters {
-        plan.with_param_values(params)
-            .map_err(|e| Status::internal(format!("Failed to bind parameters: {e}")))?
-    } else {
-        plan
+    let results: Vec<RecordBatch> = {
+        use futures::TryStreamExt;
+        query_result
+            .data
+            .try_collect()
+            .await
+            .map_err(to_tonic_err)?
     };
-
-    let physical_plan = session
-        .create_physical_plan(&plan)
-        .await
-        .map_err(|e| Status::internal(format!("Failed to create physical plan: {e}")))?;
-
-    // Execute the plan and collect the result (which should be a count for DML statements)
-    let results = datafusion::physical_plan::collect(physical_plan, datafusion.ctx.task_ctx())
-        .await
-        .map_err(|e| Status::internal(format!("Failed to execute statement: {e}")))?;
 
     // Extract affected rows count from the result
     // DML statements typically return a single row with a count column

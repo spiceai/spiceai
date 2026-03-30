@@ -17,6 +17,7 @@ limitations under the License.
 use std::{
     collections::HashMap,
     env,
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
@@ -44,10 +45,12 @@ use object_store::{
 };
 use runtime::{Runtime, status::ComponentStatus};
 use runtime_acceleration::snapshot::{
-    AccelerationEngine, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
+    AccelerationEngine, ForceCreate, SnapshotBehavior as RuntimeSnapshotBehavior, SnapshotManager,
 };
 use serde_json::{Value, json};
-use spicepod::acceleration::SnapshotsCompaction;
+use spicepod::acceleration::{
+    RefreshMode, SnapshotsCompaction, SnapshotsCreationPolicy, SnapshotsTrigger,
+};
 use spicepod::{
     acceleration::{
         Acceleration, Mode, RefreshOnStartup, SnapshotBehavior as DatasetSnapshotBehavior,
@@ -119,7 +122,11 @@ impl SnapshotS3Context {
                 Path::new(filename)
                     .extension()
                     .and_then(std::ffi::OsStr::to_str)
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("db"))
+                    .is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("duckdb")
+                            || ext.eq_ignore_ascii_case("sqlite")
+                            || ext.eq_ignore_ascii_case("cayenne")
+                    })
                     && meta
                         .location
                         .as_ref()
@@ -138,7 +145,6 @@ impl SnapshotS3Context {
         max_wait: Duration,
     ) -> Result<Vec<ObjectMeta>> {
         let deadline = Instant::now() + max_wait;
-
         loop {
             if Instant::now() >= deadline {
                 return Err(anyhow!(
@@ -590,9 +596,9 @@ async fn prepare_sqlite_fixture(test_name: &str) -> Result<SnapshotFixture> {
 fn remove_existing_local_files(path: &Path) {
     let candidates = [
         path.to_path_buf(),
-        PathBuf::from(format!("{}-wal", path.to_string_lossy())),
-        PathBuf::from(format!("{}.wal", path.to_string_lossy())),
-        PathBuf::from(format!("{}-shm", path.to_string_lossy())),
+        path_with_appended_suffix(path, "-wal"),
+        path.with_added_extension("wal"),
+        path_with_appended_suffix(path, "-shm"),
     ];
     for candidate in candidates {
         if let Err(err) = std::fs::remove_file(&candidate)
@@ -604,6 +610,15 @@ fn remove_existing_local_files(path: &Path) {
             );
         }
     }
+}
+
+fn path_with_appended_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .map(OsString::from)
+        .expect("database path should include a file name");
+    file_name.push(suffix);
+    path.with_file_name(file_name)
 }
 
 #[cfg(feature = "duckdb")]
@@ -971,13 +986,16 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
             let manager = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior,
-                runtime_acceleration::snapshot::SnapshotAdapter::file(
+                runtime_acceleration::snapshot::AccelerationLayout::file(
                     fixture.local_db_path.clone(),
                 ),
                 AccelerationEngine::DuckDB,
             )
             .await
-            .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for concurrent test"))?;
+            .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for concurrent test"))?
+            // Use Always policy since this test is about concurrent snapshot creation,
+            // not about the on_change optimization
+            .with_snapshots_creation_policy(SnapshotsCreationPolicy::Always);
 
             let snapshot_results = try_join_all((0..10).map(|_| {
                 let manager_clone = manager.clone();
@@ -986,7 +1004,7 @@ async fn snapshot_int_test6_concurrent_snapshot_writes_retry() -> Result<()> {
                     let mutex = Arc::new(Mutex::new(()));
                     let lock_guard = mutex.lock_owned().await;
                     manager_clone
-                        .create_snapshot(&schema, lock_guard, None)
+                        .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
                         .await
                         .map(|opt| opt.expect("snapshot should be created"))
                 }
@@ -1061,11 +1079,12 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
             let manager = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior,
-                runtime_acceleration::snapshot::SnapshotAdapter::file(fixture.local_db_path.clone()),
+                runtime_acceleration::snapshot::AccelerationLayout::file(fixture.local_db_path.clone()),
                 AccelerationEngine::DuckDB,
             )
             .await
-            .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for metadata test"))?;
+            .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager for metadata test"))?
+            .with_snapshots_creation_policy(SnapshotsCreationPolicy::Always);
 
             let conn = Connection::open(&fixture.local_db_path)
                 .context("Opening DuckDB acceleration file for modification")?;
@@ -1098,7 +1117,7 @@ async fn snapshot_int_test7_respects_current_snapshot_metadata_selection() -> Re
             let lock_guard = mutex.lock_owned().await;
 
             manager
-                .create_snapshot(&schema, lock_guard, None)
+                .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
                 .await
                 .context("Creating modified snapshot after deleting data")?
                 .context("Snapshot should be created")?;
@@ -1296,18 +1315,19 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
             let manager_with_compaction = SnapshotManager::try_new(
                 TAXI_TRIPS_DATASET_NAME.to_string(),
                 snapshot_behavior_with_compaction,
-                runtime_acceleration::snapshot::SnapshotAdapter::file(fixture.local_db_path.clone()),
+                runtime_acceleration::snapshot::AccelerationLayout::file(fixture.local_db_path.clone()),
                 AccelerationEngine::DuckDB,
             )
                 .await
-                .ok_or_else(|| anyhow!("Failed to create SnapshotManager with compaction enabled"))?;
+                .ok_or_else(|| anyhow!("Failed to create SnapshotManager with compaction enabled"))?
+                .with_snapshots_creation_policy(SnapshotsCreationPolicy::Always);
 
             // Create compacted snapshot
             let mutex = Arc::new(Mutex::new(()));
             let lock_guard = mutex.lock_owned().await;
 
             let compacted_location = manager_with_compaction
-                .create_snapshot(&schema, lock_guard, None)
+                .create_snapshot(&schema, lock_guard, None, None, ForceCreate(false))
                 .await
                 .context("Creating snapshot with compaction enabled")?
                 .context("Snapshot should be created")?;
@@ -1424,6 +1444,718 @@ async fn snapshot_int_test8_duckdb_compaction_reduces_snapshot_size() -> Result<
             runtime.shutdown().await;
 
             fixture.cleanup().await
+        })
+        .await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn snapshot_int_test9_onchange_policy_skips_when_no_changes() -> Result<()> {
+    let _guard = init_tracing(Some("integration=debug,info"));
+    let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
+    test_request_context()
+        .scope(async {
+            let fixture = prepare_duckdb_fixture("snapshot_int_test9").await?;
+            let schema = Arc::clone(fixture.schema());
+
+            let dataset = fixture.dataset(
+                DatasetSnapshotBehavior::CreateOnly,
+                RefreshOnStartup::Auto,
+                &[],
+                &[],
+            );
+            let snapshots = fixture.snapshots_config(BootstrapOnFailureBehavior::Warn);
+
+            let app = AppBuilder::new("snapshot_int_test9_onchange")
+                .with_snapshots(snapshots)
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+
+            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime(Arc::clone(&runtime)).await?;
+
+            let runtime_snapshots = runtime
+                .app()
+                .read()
+                .await
+                .as_ref()
+                .and_then(|app| app.snapshots.clone())
+                .ok_or_else(|| anyhow!("Runtime snapshots configuration unavailable"))?;
+
+            let snapshot_behavior = RuntimeSnapshotBehavior::enabled(
+                runtime_snapshots,
+                runtime.secrets_weak(),
+                runtime.tokio_io_runtime(),
+                SnapshotsCompaction::Disabled,
+            );
+
+            let manager = SnapshotManager::try_new(
+                TAXI_TRIPS_DATASET_NAME.to_string(),
+                snapshot_behavior,
+                runtime_acceleration::snapshot::AccelerationLayout::file(fixture.local_db_path.clone()),
+                AccelerationEngine::DuckDB,
+            )
+                .await
+                .ok_or_else(|| anyhow!("Failed to initialize SnapshotManager"))?
+                .with_snapshots_creation_policy(SnapshotsCreationPolicy::OnChange);
+
+            // Create first snapshot with a specific last_updated_at timestamp
+            let last_updated_at = Some(12345i64);
+            let mutex = Arc::new(Mutex::new(()));
+            let lock_guard = Arc::clone(&mutex).lock_owned().await;
+
+            let first_result = manager
+                .create_snapshot(&schema, lock_guard, last_updated_at, None, ForceCreate(false))
+                .await
+                .context("Creating first snapshot with OnChange policy")?;
+
+            assert!(
+                first_result.is_some(),
+                "First snapshot should be created since no prior snapshot exists with this timestamp"
+            );
+
+            // Wait for snapshot to appear in storage
+            let snapshots_after_first = fixture
+                .context
+                .wait_for_snapshot_objects(
+                    TAXI_TRIPS_DATASET_NAME,
+                    fixture.initial_snapshot_count + 1,
+                    Duration::from_secs(60),
+                )
+                .await?;
+
+            // Update metadata to include the new snapshot
+            let updated_metadata = build_metadata_document(
+                &fixture.context,
+                TAXI_TRIPS_DATASET_NAME,
+                &snapshots_after_first,
+                &schema,
+            );
+
+            // Manually set the snapshot_last_updated_at_ms in metadata
+            let mut metadata = updated_metadata;
+            if let Some(dataset_entry) = metadata.get_mut(TAXI_TRIPS_DATASET_NAME)
+                && let Some(snapshots_arr) =
+                    dataset_entry.get_mut("snapshots").and_then(Value::as_array_mut)
+                && let Some(last_snapshot) = snapshots_arr.last_mut()
+                && let Some(obj) = last_snapshot.as_object_mut()
+            {
+                obj.insert("snapshot-last-updated-at-ms".to_string(), json!(12345u64));
+            }
+            fixture.context.write_metadata(&metadata).await?;
+
+            let snapshot_count_after_first = snapshots_after_first.len();
+
+            // Try to create another snapshot with the SAME last_updated_at
+            let lock_guard = Arc::clone(&mutex).lock_owned().await;
+            let second_result = manager
+                .create_snapshot(&schema, lock_guard, last_updated_at, None, ForceCreate(false))
+                .await
+                .context("Attempting second snapshot with same last_updated_at")?;
+
+            assert!(
+                second_result.is_none(),
+                "Second snapshot should be skipped since last_updated_at hasn't changed"
+            );
+
+            // Verify no new snapshot was created
+            sleep(Duration::from_secs(2)).await;
+            let snapshots_after_second = fixture
+                .context
+                .snapshot_objects(TAXI_TRIPS_DATASET_NAME)
+                .await?;
+
+            assert_eq!(
+                snapshots_after_second.len(),
+                snapshot_count_after_first,
+                "No new snapshot should be created when last_updated_at matches"
+            );
+
+            // Now create a snapshot with a DIFFERENT last_updated_at
+            let new_last_updated_at = Some(99999i64);
+            let lock_guard = Arc::clone(&mutex).lock_owned().await;
+            let third_result = manager
+                .create_snapshot(&schema, lock_guard, new_last_updated_at, None, ForceCreate(false))
+                .await
+                .context("Creating snapshot with new last_updated_at")?;
+
+            assert!(
+                third_result.is_some(),
+                "Snapshot should be created when last_updated_at changes"
+            );
+
+            // Wait and verify new snapshot was created
+            let snapshots_after_third = fixture
+                .context
+                .wait_for_snapshot_objects(
+                    TAXI_TRIPS_DATASET_NAME,
+                    snapshot_count_after_first + 1,
+                    Duration::from_secs(60),
+                )
+                .await?;
+
+            assert!(
+                snapshots_after_third.len() > snapshot_count_after_first,
+                "New snapshot should be created when last_updated_at changes"
+            );
+
+            runtime.shutdown().await;
+            fixture.cleanup().await
+        })
+        .await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn snapshot_int_test10_onchange_policy_skips_interval_based_snapshots() -> Result<()> {
+    let _guard = init_tracing(Some("integration=debug,info"));
+    let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
+    test_request_context()
+        .scope(async {
+            // Create a fresh S3 context without any pre-existing snapshots
+            let context = SnapshotS3Context::new("snapshot_int_test10").await?;
+            let temp_dir = TempDir::new().context("Creating temporary directory")?;
+
+            let sample_csv_contents = include_str!("../test_data/taxi_sample.csv");
+            let sample_source_path = temp_dir.path().join("taxi_sample.csv");
+            fs::write(&sample_source_path, sample_csv_contents)
+                .await
+                .context("Writing sample CSV")?;
+
+            let dataset_from = format!("file://{}", sample_source_path.display());
+            let local_db_path = temp_dir.path().join("taxi_trips_test10.duckdb");
+
+            let dataset_params = HashMap::from([
+                ("file_format".to_string(), "csv".to_string()),
+                ("csv_has_header".to_string(), "true".to_string()),
+            ]);
+
+            let mut accel_params = HashMap::new();
+            accel_params.insert(
+                "duckdb_file".to_string(),
+                local_db_path.to_string_lossy().to_string(),
+            );
+
+            // Build dataset WITHOUT creating any initial snapshots
+            let mut dataset = build_dataset(
+                &dataset_from,
+                TAXI_TRIPS_DATASET_NAME,
+                &dataset_params,
+                DatasetSnapshotBehavior::CreateOnly,
+                &accel_params,
+                "duckdb",
+                RefreshOnStartup::Auto,
+            );
+            if let Some(ref mut accel) = dataset.acceleration {
+                accel.snapshots_trigger = Some(SnapshotsTrigger::TimeInterval);
+                accel.snapshots_trigger_threshold = Some("5s".to_string());
+                accel.snapshots_creation_policy = SnapshotsCreationPolicy::OnChange;
+            }
+
+            let snapshots = build_snapshots_config(&context, BootstrapOnFailureBehavior::Warn);
+
+            let app = AppBuilder::new("snapshot_int_test10_initial")
+                .with_snapshots(snapshots)
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+
+            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime(Arc::clone(&runtime)).await?;
+
+            // Verify no snapshots exist yet
+            let initial_snapshots = context
+                .snapshot_objects(TAXI_TRIPS_DATASET_NAME)
+                .await
+                .unwrap_or_default();
+            assert!(
+                initial_snapshots.is_empty(),
+                "Should start with no snapshots in this fresh context"
+            );
+
+            tokio::time::sleep(Duration::from_secs(20)).await;
+
+            // Wait for snapshot to appear
+            let snapshots_after = context
+                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_secs(60))
+                .await?;
+
+            assert_eq!(
+                snapshots_after.len(),
+                1,
+                "Exactly one snapshot should be created"
+            );
+
+            runtime.shutdown().await;
+            context.cleanup().await
+        })
+        .await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn snapshot_int_test11_interval_based_snapshots() -> Result<()> {
+    let _guard = init_tracing(Some("integration=debug,info"));
+    let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
+    test_request_context()
+        .scope(async {
+            // Create a fresh S3 context without any pre-existing snapshots
+            let context = SnapshotS3Context::new("snapshot_int_test10").await?;
+            let temp_dir = TempDir::new().context("Creating temporary directory")?;
+
+            let sample_csv_contents = include_str!("../test_data/taxi_sample.csv");
+            let sample_source_path = temp_dir.path().join("taxi_sample.csv");
+            fs::write(&sample_source_path, sample_csv_contents)
+                .await
+                .context("Writing sample CSV")?;
+
+            let dataset_from = format!("file://{}", sample_source_path.display());
+            let local_db_path = temp_dir.path().join("taxi_trips_test10.duckdb");
+
+            let dataset_params = HashMap::from([
+                ("file_format".to_string(), "csv".to_string()),
+                ("csv_has_header".to_string(), "true".to_string()),
+            ]);
+
+            let mut accel_params = HashMap::new();
+            accel_params.insert(
+                "duckdb_file".to_string(),
+                local_db_path.to_string_lossy().to_string(),
+            );
+
+            // Build dataset WITHOUT creating any initial snapshots
+            let mut dataset = build_dataset(
+                &dataset_from,
+                TAXI_TRIPS_DATASET_NAME,
+                &dataset_params,
+                DatasetSnapshotBehavior::CreateOnly,
+                &accel_params,
+                "duckdb",
+                RefreshOnStartup::Auto,
+            );
+            if let Some(ref mut accel) = dataset.acceleration {
+                accel.snapshots_trigger = Some(SnapshotsTrigger::TimeInterval);
+                accel.snapshots_trigger_threshold = Some("5s".to_string());
+                accel.snapshots_creation_policy = SnapshotsCreationPolicy::Always;
+            }
+
+            let snapshots = build_snapshots_config(&context, BootstrapOnFailureBehavior::Warn);
+
+            let app = AppBuilder::new("snapshot_int_test10_initial")
+                .with_snapshots(snapshots)
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+
+            // Verify no snapshots exist yet
+            let initial_snapshots = context
+                .snapshot_objects(TAXI_TRIPS_DATASET_NAME)
+                .await
+                .unwrap_or_default();
+            assert!(
+                initial_snapshots.is_empty(),
+                "Should start with no snapshots in this fresh context"
+            );
+
+            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime(Arc::clone(&runtime)).await?;
+
+            tokio::time::sleep(Duration::from_secs(20)).await;
+
+            // Wait for snapshot to appear
+            let snapshots_after = context
+                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_secs(60))
+                .await?;
+
+            assert_eq!(
+                snapshots_after.len(),
+                4,
+                "Exactly 4 snapshots should be created"
+            );
+
+            runtime.shutdown().await;
+            context.cleanup().await
+        })
+        .await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn snapshot_int_test12_onchange_policy_skips_refresh_based_snapshots() -> Result<()> {
+    let _guard = init_tracing(Some("integration=debug,info"));
+    let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
+    test_request_context()
+        .scope(async {
+            // Create a fresh S3 context without any pre-existing snapshots
+            let context = SnapshotS3Context::new("snapshot_int_test10").await?;
+            let temp_dir = TempDir::new().context("Creating temporary directory")?;
+
+            let sample_csv_contents = include_str!("../test_data/taxi_sample.csv");
+            let sample_source_path = temp_dir.path().join("taxi_sample.csv");
+            fs::write(&sample_source_path, sample_csv_contents)
+                .await
+                .context("Writing sample CSV")?;
+
+            let dataset_from = format!("file://{}", sample_source_path.display());
+            let local_db_path = temp_dir.path().join("taxi_trips_test10.duckdb");
+
+            let dataset_params = HashMap::from([
+                ("file_format".to_string(), "csv".to_string()),
+                ("csv_has_header".to_string(), "true".to_string()),
+            ]);
+
+            let mut accel_params = HashMap::new();
+            accel_params.insert(
+                "duckdb_file".to_string(),
+                local_db_path.to_string_lossy().to_string(),
+            );
+
+            // Build dataset WITHOUT creating any initial snapshots
+            let mut dataset = build_dataset(
+                &dataset_from,
+                TAXI_TRIPS_DATASET_NAME,
+                &dataset_params,
+                DatasetSnapshotBehavior::CreateOnly,
+                &accel_params,
+                "duckdb",
+                RefreshOnStartup::Auto,
+            );
+            dataset.time_column = Some("tpep_pickup_datetime".to_string());
+            if let Some(ref mut accel) = dataset.acceleration {
+                accel.refresh_mode = Some(RefreshMode::Append);
+                accel.snapshots_trigger = Some(SnapshotsTrigger::RefreshComplete);
+                accel.snapshots_creation_policy = SnapshotsCreationPolicy::OnChange;
+            }
+
+            let snapshots = build_snapshots_config(&context, BootstrapOnFailureBehavior::Warn);
+
+            let app = AppBuilder::new("snapshot_int_test10_initial")
+                .with_snapshots(snapshots)
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+
+            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime(Arc::clone(&runtime)).await?;
+
+            // Verify no snapshots exist yet
+            let initial_snapshots = context
+                .snapshot_objects(TAXI_TRIPS_DATASET_NAME)
+                .await
+                .unwrap_or_default();
+            assert!(
+                initial_snapshots.is_empty(),
+                "Should start with no snapshots in this fresh context"
+            );
+
+            runtime
+                .datafusion()
+                .refresh_table(&TableReference::parse_str("taxi_trips"), None)
+                .await
+                .expect("Table refresh")
+                .expect("Notify")
+                .notified()
+                .await;
+            runtime
+                .datafusion()
+                .refresh_table(&TableReference::parse_str("taxi_trips"), None)
+                .await
+                .expect("Table refresh")
+                .expect("Notify")
+                .notified()
+                .await;
+            runtime
+                .datafusion()
+                .refresh_table(&TableReference::parse_str("taxi_trips"), None)
+                .await
+                .expect("Table refresh")
+                .expect("Notify")
+                .notified()
+                .await;
+            runtime
+                .datafusion()
+                .refresh_table(&TableReference::parse_str("taxi_trips"), None)
+                .await
+                .expect("Table refresh")
+                .expect("Notify")
+                .notified()
+                .await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+
+            // Wait for snapshot to appear
+            let snapshots_after = context
+                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_secs(60))
+                .await?;
+
+            assert_eq!(
+                snapshots_after.len(),
+                1,
+                "Exactly one snapshot should be created"
+            );
+
+            runtime.shutdown().await;
+            context.cleanup().await
+        })
+        .await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn snapshot_int_test13_refresh_based_snapshots() -> Result<()> {
+    let _guard = init_tracing(Some("integration=debug,info"));
+    let _test_lock = SNAPSHOT_TEST_MUTEX.lock().await;
+    test_request_context()
+        .scope(async {
+            // Create a fresh S3 context without any pre-existing snapshots
+            let context = SnapshotS3Context::new("snapshot_int_test10").await?;
+            let temp_dir = TempDir::new().context("Creating temporary directory")?;
+
+            let sample_csv_contents = include_str!("../test_data/taxi_sample.csv");
+            let sample_source_path = temp_dir.path().join("taxi_sample.csv");
+            fs::write(&sample_source_path, sample_csv_contents)
+                .await
+                .context("Writing sample CSV")?;
+
+            let dataset_from = format!("file://{}", sample_source_path.display());
+            let local_db_path = temp_dir.path().join("taxi_trips_test10.duckdb");
+
+            let dataset_params = HashMap::from([
+                ("file_format".to_string(), "csv".to_string()),
+                ("csv_has_header".to_string(), "true".to_string()),
+            ]);
+
+            let mut accel_params = HashMap::new();
+            accel_params.insert(
+                "duckdb_file".to_string(),
+                local_db_path.to_string_lossy().to_string(),
+            );
+
+            // Build dataset WITHOUT creating any initial snapshots
+            let mut dataset = build_dataset(
+                &dataset_from,
+                TAXI_TRIPS_DATASET_NAME,
+                &dataset_params,
+                DatasetSnapshotBehavior::CreateOnly,
+                &accel_params,
+                "duckdb",
+                RefreshOnStartup::Auto,
+            );
+            if let Some(ref mut accel) = dataset.acceleration {
+                accel.snapshots_trigger = Some(SnapshotsTrigger::RefreshComplete);
+                accel.snapshots_creation_policy = SnapshotsCreationPolicy::Always;
+            }
+
+            let snapshots = build_snapshots_config(&context, BootstrapOnFailureBehavior::Warn);
+
+            let app = AppBuilder::new("snapshot_int_test10_initial")
+                .with_snapshots(snapshots)
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+
+            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime(Arc::clone(&runtime)).await?;
+
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            // Verify initial snapshot exists
+            let initial_snapshots = context
+                .snapshot_objects(TAXI_TRIPS_DATASET_NAME)
+                .await
+                .unwrap_or_default();
+            assert_eq!(
+                initial_snapshots.len(),
+                1,
+                "Exactly one snapshot should be created"
+            );
+
+            runtime
+                .datafusion()
+                .refresh_table(&TableReference::parse_str("taxi_trips"), None)
+                .await
+                .expect("Table refresh")
+                .expect("Notify")
+                .notified()
+                .await;
+            runtime
+                .datafusion()
+                .refresh_table(&TableReference::parse_str("taxi_trips"), None)
+                .await
+                .expect("Table refresh")
+                .expect("Notify")
+                .notified()
+                .await;
+            runtime
+                .datafusion()
+                .refresh_table(&TableReference::parse_str("taxi_trips"), None)
+                .await
+                .expect("Table refresh")
+                .expect("Notify")
+                .notified()
+                .await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            // Wait for snapshot to appear
+            let snapshots_after = context
+                .wait_for_snapshot_objects(TAXI_TRIPS_DATASET_NAME, 1, Duration::from_secs(60))
+                .await?;
+
+            assert_eq!(
+                snapshots_after.len(),
+                4,
+                "Exactly fours snapshots should be created"
+            );
+
+            runtime.shutdown().await;
+            context.cleanup().await
+        })
+        .await
+}
+
+/// Test that Cayenne datasets with inconsistent snapshot settings are rejected.
+///
+/// When multiple Cayenne datasets share the same metadata directory, they must all have
+/// the same snapshot configuration (either all enabled or all disabled). This test verifies
+/// that the runtime correctly detects and rejects inconsistent configurations - the datasets
+/// with inconsistent settings will not be loaded.
+#[tokio::test]
+async fn snapshot_int_test_cayenne_inconsistent_snapshots_rejected() -> Result<()> {
+    let _guard = init_tracing(Some(
+        "integration=debug,runtime::dataaccelerator=trace,info",
+    ));
+
+    test_request_context()
+        .scope(async {
+            let temp_dir =
+                TempDir::new().context("Creating temporary directory for Cayenne files")?;
+
+            // Create sample CSV files for two datasets
+            let sample_csv_contents = include_str!("../test_data/taxi_sample.csv");
+            let sample_source_path1 = temp_dir.path().join("taxi_sample1.csv");
+            let sample_source_path2 = temp_dir.path().join("taxi_sample2.csv");
+            fs::write(&sample_source_path1, sample_csv_contents)
+                .await
+                .context("Writing sample CSV for dataset 1")?;
+            fs::write(&sample_source_path2, sample_csv_contents)
+                .await
+                .context("Writing sample CSV for dataset 2")?;
+
+            let dataset_from1 = format!("file://{}", sample_source_path1.display());
+            let dataset_from2 = format!("file://{}", sample_source_path2.display());
+
+            // Create data directories for cayenne (separate data dirs, but shared metadata dir)
+            let data_dir1 = temp_dir.path().join("cayenne_data1");
+            let data_dir2 = temp_dir.path().join("cayenne_data2");
+            let metadata_dir = temp_dir.path().join("cayenne_metadata");
+
+            fs::create_dir_all(&data_dir1)
+                .await
+                .context("Creating data directory 1")?;
+            fs::create_dir_all(&data_dir2)
+                .await
+                .context("Creating data directory 2")?;
+            fs::create_dir_all(&metadata_dir)
+                .await
+                .context("Creating metadata directory")?;
+
+            let dataset_params = HashMap::from([
+                ("file_format".to_string(), "csv".to_string()),
+                ("csv_has_header".to_string(), "true".to_string()),
+            ]);
+
+            // Build dataset 1 WITH snapshots enabled
+            let mut dataset1 = Dataset::new(&dataset_from1, "taxi_trips_1");
+            dataset1.params = Some(Params::from_string_map(dataset_params.clone()));
+            dataset1.acceleration = Some(Acceleration {
+                mode: Mode::File,
+                engine: Some("cayenne".to_string()),
+                params: Some(Params::from_string_map(HashMap::from([
+                    (
+                        "cayenne_file_path".to_string(),
+                        data_dir1.to_string_lossy().to_string(),
+                    ),
+                    (
+                        "cayenne_metadata_dir".to_string(),
+                        metadata_dir.to_string_lossy().to_string(),
+                    ),
+                ]))),
+                refresh_on_startup: RefreshOnStartup::Auto,
+                snapshots: DatasetSnapshotBehavior::Enabled, // ENABLED
+                ..Default::default()
+            });
+
+            // Build dataset 2 WITHOUT snapshots (disabled)
+            let mut dataset2 = Dataset::new(&dataset_from2, "taxi_trips_2");
+            dataset2.params = Some(Params::from_string_map(dataset_params.clone()));
+            dataset2.acceleration = Some(Acceleration {
+                mode: Mode::File,
+                engine: Some("cayenne".to_string()),
+                params: Some(Params::from_string_map(HashMap::from([
+                    (
+                        "cayenne_file_path".to_string(),
+                        data_dir2.to_string_lossy().to_string(),
+                    ),
+                    (
+                        "cayenne_metadata_dir".to_string(),
+                        metadata_dir.to_string_lossy().to_string(),
+                    ),
+                ]))),
+                refresh_on_startup: RefreshOnStartup::Auto,
+                snapshots: DatasetSnapshotBehavior::Disabled, // DISABLED - inconsistent!
+                ..Default::default()
+            });
+
+            // Parse the datasets to create acceleration sources
+            let app = AppBuilder::new("snapshot_inconsistent_test")
+                .with_dataset(dataset1)
+                .with_dataset(dataset2)
+                .build();
+
+            configure_test_datafusion();
+
+            // Build the runtime - the validation happens during dataset loading
+            let runtime = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            // Trigger dataset loading (which runs snapshot consistency validation).
+            // load_components() awaits all spawned loading tasks, so after it returns
+            // we know validation has completed and failed datasets were not registered.
+            Arc::clone(&runtime).load_components().await;
+
+            // The datasets should NOT be registered because validation failed.
+            // Check that neither dataset is available (the validation rejects all datasets
+            // with inconsistent configuration).
+            let taxi_trips_1_result = runtime
+                .datafusion()
+                .query_builder("SELECT COUNT(*) FROM taxi_trips_1")
+                .build()
+                .run()
+                .await;
+            let taxi_trips_2_result = runtime
+                .datafusion()
+                .query_builder("SELECT COUNT(*) FROM taxi_trips_2")
+                .build()
+                .run()
+                .await;
+
+            // Both queries should fail because the datasets were not loaded
+            // due to the validation error
+            assert!(
+                taxi_trips_1_result.is_err() && taxi_trips_2_result.is_err(),
+                "Expected both datasets to be unavailable due to validation failure. \
+                 taxi_trips_1_ok: {}, taxi_trips_2_ok: {}",
+                taxi_trips_1_result.is_ok(),
+                taxi_trips_2_result.is_ok()
+            );
+
+            runtime.shutdown().await;
+
+            Ok(())
         })
         .await
 }

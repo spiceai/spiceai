@@ -22,11 +22,11 @@ use std::{
 
 use crate::{
     init_tracing,
-    utils::{test_request_context, wait_until_true},
+    utils::{register_test_connectors, test_request_context, wait_until_true},
 };
 use arrow_flight::{error::FlightError, flight_service_client::FlightServiceClient};
-use flightrepl::cache_control;
 use rand::Rng;
+use repl::cache_control;
 use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
 use spicepod::component::runtime::ApiKey;
@@ -37,6 +37,7 @@ const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 #[tokio::test]
 async fn test_flight_auth() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -96,7 +97,7 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
                 .expect("to connect to flight endpoint");
             let client = FlightServiceClient::new(channel);
 
-            let result = flightrepl::get_records(
+            let result = repl::get_records(
                 client.clone(),
                 "SELECT 1",
                 Some(&"valid".to_string()),
@@ -106,7 +107,7 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
             .await;
             result.expect("should succeed with valid API key");
 
-            let Err(e) = flightrepl::get_records(
+            let Err(e) = repl::get_records(
                 client,
                 "SELECT 1",
                 None,

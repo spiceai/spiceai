@@ -1,0 +1,19 @@
+[package]
+name = "connector-delta-lake"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Delta Lake data connector for Spice.ai runtime"
+
+[dependencies]
+async-trait.workspace = true
+aws-sdk-credential-bridge = { path = "../../aws-sdk-credential-bridge" }
+data_components = { path = "../../data_components", features = ["delta_lake"] }
+datafusion.workspace = true
+linkme.workspace = true
+paste.workspace = true
+runtime = { path = "../../runtime" }
+snafu.workspace = true
+tokio.workspace = true
+tracing.workspace = true

@@ -1,0 +1,15 @@
+---
+source: crates/runtime/src/accelerated_table/caching.rs
+expression: upsert_pretty
+---
++----+-----------+
+| id | name      |
++----+-----------+
+| 0  | initial_0 |
+| 1  | initial_1 |
+| 2  | updated_2 |
+| 3  | updated_3 |
+| 4  | updated_4 |
+| 5  | new_5     |
+| 6  | new_6     |
++----+-----------+

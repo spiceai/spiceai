@@ -48,21 +48,14 @@ use std::convert::TryInto;
 ///
 /// # When to Use
 ///
-/// **Do NOT call this function directly.** Instead, use the type-specific wrapper functions:
-/// - `convert_to_i64()` - For conversions within `DataFusion` error context
-/// - `convert_to_i64_box()` - For conversions in async/trait methods with boxed errors
-/// - `convert_to_u64_box()` - For conversions to `u64` with boxed errors
+/// Use this function when you need a numeric conversion that returns
+/// `datafusion_common::Result<T>`.
 ///
-/// The wrapper functions provide better type inference and appropriate error type handling
-/// for their specific use cases.
+/// For boxed-error conversions to `u64`, prefer `convert_to_u64_box()`.
 ///
 /// # Examples
 ///
 /// ```ignore
-/// // GOOD - Use wrapper functions
-/// let value = convert_to_i64(batch.num_rows(), "batch size")?;
-///
-/// // BAD - Don't call try_convert directly
 /// let value = try_convert::<usize, i64>(batch.num_rows(), "batch size")?;
 /// ```
 pub fn try_convert<T, U>(value: T, context: &str) -> datafusion_common::Result<U>
@@ -77,66 +70,6 @@ where
             std::any::type_name::<U>()
         ))
     })
-}
-
-/// Convert a numeric value to `i64` with `DataFusion` error type.
-///
-/// Use this function when converting numeric values (typically `usize` or `u64`) to `i64`
-/// within `DataFusion` `TableProvider` implementations or execution plans, where the error
-/// type is `datafusion_common::Result<T>`.
-///
-/// # Arguments
-///
-/// * `value` - The numeric value to convert
-/// * `context` - Description of what the value represents (e.g., "batch size", "row count")
-///
-/// # Examples
-///
-/// ```ignore
-/// // Converting batch size in hot path
-/// let batch_size_i64 = convert_to_i64(batch.num_rows(), "batch size")?;
-///
-/// // Converting row index
-/// let row_offset = convert_to_i64(row_idx, "row index")?;
-/// ```
-pub fn convert_to_i64<T>(value: T, context: &str) -> datafusion_common::Result<i64>
-where
-    T: TryInto<i64> + Copy + std::fmt::Display,
-    T::Error: std::error::Error + Send + Sync + 'static,
-{
-    try_convert(value, context)
-}
-
-/// Convert a numeric value to `i64` with boxed error type.
-///
-/// Use this function when converting numeric values to `i64` in contexts that require
-/// boxed errors, such as:
-/// - Async trait methods (`DeletionSink::delete_from`)
-/// - Functions returning `Result<T, Box<dyn Error>>`
-/// - Code that needs to bridge between different error types
-///
-/// # Arguments
-///
-/// * `value` - The numeric value to convert
-/// * `context` - Description of what the value represents (e.g., "deleted row count")
-///
-/// # Examples
-///
-/// ```ignore
-/// // In deletion sink with boxed error return type
-/// let total_rows_i64 = convert_to_i64_box(total_rows, "total row count")?;
-/// let deleted_count_i64 = convert_to_i64_box(deleted_count, "deleted row count")?;
-/// ```
-pub fn convert_to_i64_box<T>(
-    value: T,
-    context: &str,
-) -> Result<i64, Box<dyn std::error::Error + Send + Sync>>
-where
-    T: TryInto<i64> + Copy + std::fmt::Display,
-    T::Error: std::error::Error + Send + Sync + 'static,
-{
-    convert_to_i64(value, context)
-        .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
 }
 
 /// Convert a numeric value to `u64` with boxed error type.

@@ -82,8 +82,9 @@ mod tests {
 
     struct MockCommitChange;
 
+    #[async_trait]
     impl CommitChange for MockCommitChange {
-        fn commit(&self) -> Result<(), CommitError> {
+        async fn commit(&self) -> Result<(), CommitError> {
             Ok(())
         }
     }

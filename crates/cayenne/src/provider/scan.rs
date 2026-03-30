@@ -19,17 +19,21 @@ use std::{any::Any, sync::Arc};
 use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::{Distribution, OrderingRequirements, PhysicalExpr};
+use futures::TryStreamExt;
+
 use datafusion_physical_plan::{
     execution_plan::{check_default_invariants, CardinalityEffect, InvariantLevel},
+    expressions::PhysicalSortExpr,
     filter_pushdown::{
         ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
     },
     metrics::MetricsSet,
     projection::ProjectionExec,
-    DisplayAs, ExecutionPlan, PlanProperties,
+    DisplayAs, ExecutionPlan, PlanProperties, SortOrderPushdownResult,
 };
 
 /// Wrapper for Cayenne acceleration execution plans.
@@ -146,7 +150,27 @@ impl ExecutionPlan for CayenneAccelerationExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        self.inner.execute(partition, context)
+        let stream = self.inner.execute(partition, context)?;
+        let schema = stream.schema();
+        let mapped = stream.map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("Too many open files") {
+                // Extract the file path from messages like "Unable to open file /path/to/file.vortex: Too many ..."
+                let file_path = msg
+                    .find("Unable to open file ")
+                    .and_then(|start| {
+                        let after = &msg[start + "Unable to open file ".len()..];
+                        after.find(':').map(|end| &after[..end])
+                    })
+                    .unwrap_or("unknown");
+                DataFusionError::External(Box::new(super::Error::TooManyOpenFiles {
+                    file_path: file_path.to_string(),
+                }))
+            } else {
+                e
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, mapped)))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -206,6 +230,13 @@ impl ExecutionPlan for CayenneAccelerationExec {
 
     fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
         None
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        Ok(SortOrderPushdownResult::Unsupported)
     }
 }
 

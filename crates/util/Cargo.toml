@@ -21,5 +21,9 @@ tracing = { workspace = true }
 tracing-subscriber.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
-datafusion.workspace = true
+datafusion = { workspace = true, optional = true }
 parking_lot.workspace = true
+
+[features]
+default = ["datafusion"]
+datafusion = ["dep:datafusion"]

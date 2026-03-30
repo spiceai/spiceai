@@ -4,7 +4,7 @@
 
 Spice is a SQL query, search, and LLM-inference engine in Rust for data apps and agents. Provides federated SQL querying, data acceleration/materialization, search (vector, keyword, full-text), and AI inference via industry-standard APIs.
 
-**Architecture**: Go CLI (`bin/spice`) + Rust runtime daemon (`bin/spiced`). Built on Apache DataFusion, Arrow, and DuckDB.
+**Architecture**: Rust CLI (`bin/spice`) + Rust runtime daemon (`bin/spiced`). Built on Apache DataFusion, Arrow, and DuckDB.
 
 **Core Principle**: Developer Experience First — Bring data and AI/ML to your application, not the other way around.
 
@@ -51,6 +51,13 @@ cargo run -p testoperator -- run bench -p ./test/spicepods/tpch/sf1/federated/du
 
 ## Rust Coding Standards
 
+### Rust Version Baseline
+
+- **Workspace Rust version is 1.93.1**: Treat Rust 1.93.1 as the minimum supported compiler version for workspace code unless a specific crate or integration explicitly documents a different constraint.
+- **Use stable Rust features through 1.93.1**: Prefer stable language, standard library, and Cargo features available in Rust 1.93.1 when they improve correctness, clarity, ergonomics, or maintainability.
+- **Do not code to an older Rust subset by default**: Avoid workarounds for pre-1.93 compilers unless there is a concrete compatibility requirement.
+- **Prefer modern std APIs over manual patterns**: When a newer stable standard-library API expresses the intent more clearly or avoids extra allocation or unsafe code, use it.
+
 ### Error Handling (CRITICAL)
 
 - **Use SNAFU**: Derive `Snafu` and `Debug` on error enums
@@ -79,26 +86,7 @@ fn test() { let value = option.expect("descriptive message"); }
 ### Logging & Streams (CRITICAL)
 
 - **Use `tracing::`** not `log::` (tracing::info!, tracing::error!, etc.)
-- **AVOID `stream!` macro**: Breaks rust-analyzer, hard to debug
-
-### Async/Blocking (CRITICAL)
-
-**Rule**: Async code must reach `.await` within 10-100 microseconds.
-
-**Never block async runtime**:
-
-- ❌ `std::thread::sleep`/`std::fs`/blocking DB → ✅ `tokio::time::sleep`/`tokio::fs`/async pools
-
-**Handling blocking operations**:
-
-1. **Blocking I/O**: `tokio::task::spawn_blocking(move || { /* sync code */ }).await?`
-2. **CPU-bound**: Use `rayon::spawn()` with `oneshot::channel()` for result
-3. **Background tasks**: `std::thread::spawn()`
-
-### Clippy (Enforced in CI)
-
-**Errors**: `clippy::pedantic`, `clippy::unwrap_used`, `clippy::expect_used`, `clippy::clone_on_ref_ptr`  
-**Allowed**: `clippy::module_name_repetitions`, `clippy::large_futures`
+- **AVOID `stream!` macro**: Breaks rust-analyzer, hard to debug. Use manual Stream implementations or `async_stream::stream` sparingly; when unavoidable, document why.
 
 ## Performance & Memory (CRITICAL)
 
@@ -253,13 +241,6 @@ async fn bad(&self) {
 }
 ```
 
-### Connection Pooling & Arc Cloning
-
-### Stream Handling (CRITICAL)
-
-- **AVOID `stream!` macro**: Breaks rust-analyzer IDE hints and makes debugging harder
-- **Use manual Stream implementations or `async_stream::stream` sparingly**: When unavoidable, document why
-
 ### Logging (CRITICAL)
 
 - **Use `tracing::` for logging**: Use `tracing::info!`, `tracing::error!`, `tracing::debug!`, etc.
@@ -324,38 +305,7 @@ tracing::error!(
 
 **Why this matters**: Blocking an async runtime thread prevents other tasks from running, causing cascading delays and poor throughput under load.
 
-### Clippy Rules (Enforced in CI)
-
-The following clippy rules are **errors** in CI (`-Dwarnings`):
-
-- `clippy::pedantic` - All pedantic lints enabled
-- `clippy::unwrap_used` - No `.unwrap()` calls
-- `clippy::expect_used` - No `.expect()` calls (use proper error handling)
-- `clippy::clone_on_ref_ptr` - Don't clone `Arc`/`Rc` unnecessarily
-
-Allowed exceptions:
-
-- `clippy::module_name_repetitions` - OK to have `module_name::ModuleName`
-- `clippy::large_futures` - Allowed due to async complexity
-
-### Performance and Memory Management
-
-#### Zero-Copy Operations
-
-- **Prefer zero-copy** when working with Arrow arrays
-- Use `Arc<dyn Array>` for type-erased arrays (cheap to clone)
-- Avoid unnecessary data copies between Arrow, DataFusion, and connectors
-
-```rust
-// GOOD - zero-copy sharing
-let array: Arc<dyn Array> = Arc::new(Int32Array::from(vec![1, 2, 3]));
-let shared = Arc::clone(&array); // Cheap reference count increment
-
-// BAD - unnecessary copy
-let copied = array.to_data().clone(); // Avoid unless necessary
-```
-
-#### Connection Pooling
+### Connection Pooling
 
 - **Always use connection pools** for database connectors
 - Pool creation should never fail - errors only on `.get()`
@@ -404,7 +354,7 @@ fn process_data(data: &Arc<RecordBatch>) { ... }
 ### Binary Targets
 
 - `bin/spiced/` - Runtime daemon (Rust)
-- `bin/spice/` - CLI (Go)
+- `bin/spice/` - CLI (Rust)
 
 ### Core Crates
 
@@ -442,7 +392,11 @@ testoperator run bench -p test.yaml -s spiced --query-set tpch --validate
 testoperator run throughput -p test.yaml -s spiced --query-set tpch --concurrency 25
 ```
 
-Use `INSTA_UPDATE=1` to regenerate snapshots.
+### Snapshot Testing with Insta
+
+- **NEVER manually edit snapshot files** (`.snap` files): Always use Insta to generate them
+- Run tests with `INSTA_UPDATE=1` to regenerate snapshots: `INSTA_UPDATE=1 cargo test`
+- Review generated snapshots carefully before accepting
 
 ## Feature Flags
 
@@ -452,6 +406,26 @@ Use `INSTA_UPDATE=1` to regenerate snapshots.
 2. Add feature: `newdb = ["runtime/newdb", "data_components/newdb"]`
 3. Gate code: `#[cfg(feature = "newdb")]`
 4. Update Makefile lint targets
+
+### Git Dependencies in Cargo.toml
+
+- **Always use full 40-character SHA hashes** for git dependencies, never abbreviated SHAs
+- Full SHAs ensure reproducible builds and avoid ambiguity
+- **For spiceai forks**: Add a comment with the branch name to track the source
+
+```toml
+# GOOD - full SHA
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0" }
+
+# GOOD - spiceai fork with branch comment
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0" } # branch: spice
+
+# BAD - abbreviated SHA
+datafusion = { git = "https://github.com/apache/datafusion.git", rev = "a1b2c3d" }
+
+# BAD - spiceai fork without branch comment
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0" }
+```
 
 ## Development Workflow
 
@@ -512,9 +486,9 @@ export PATH="$PATH:$HOME/.spice/bin"
 3. Spicepod is YAML config format
 4. Integration tests need credentials (`spice login` or `.env`)
 5. testoperator is the test harness
-6. Workspace uses Rust edition 2024
-7. Allocator customizable (default: snmalloc, can use jemalloc/mimalloc)
-8. New files should include copyright header. The current year is 2026. Required file types: `.rs`, `.go`
+6. Workspace uses Rust edition 2024 and rust-version 1.93.1; use stable Rust features available through 1.93.1 by default
+7. New files should include copyright header. The current year is 2026. Required file types: `.rs`, `.go`
+8. **Spice runtime (Rust) is 64-bit minimum**: The runtime requires at least 64-bit pointer size. Do not add 32-bit compatibility code. Code should assume `usize` is at least 64 bits but not assume it's exactly 64 bits (future 128-bit support).
 
 ## Adding Features Checklist
 

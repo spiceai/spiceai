@@ -61,10 +61,14 @@ impl ResponsesWrapper {
         self.with_system_prompt(req)
     }
 
-    /// Injects a system prompt as the instructions field in the request, if it exists.
+    /// Injects a system prompt into the instructions field in the request, if it exists.
+    /// If the client also provided instructions, the spicepod system prompt is prepended.
     fn with_system_prompt(&self, mut req: CreateResponse) -> CreateResponse {
         if let Some(prompt) = &self.system_prompt {
-            req.instructions = Some(prompt.clone());
+            req.instructions = Some(match req.instructions {
+                Some(existing) => format!("{prompt}\n\n{existing}"),
+                None => prompt.clone(),
+            });
         }
         req
     }
@@ -281,5 +285,108 @@ impl<S> Drop for TracedResponseStream<S> {
                 self.model_public_name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::types::responses::CreateResponse;
+
+    /// Helper to create a [`ResponsesWrapper`] with the given system prompt (no underlying model needed for `with_system_prompt` tests).
+    fn wrapper_with_prompt(prompt: Option<&str>) -> ResponsesWrapper {
+        ResponsesWrapper {
+            public_name: "test-model".to_string(),
+            responses: Arc::new(NoopResponses),
+            system_prompt: prompt.map(ToString::to_string),
+        }
+    }
+
+    /// Minimal no-op implementation of [`Responses`] for unit testing the wrapper logic.
+    struct NoopResponses;
+
+    #[async_trait]
+    impl Responses for NoopResponses {
+        async fn responses_stream(
+            &self,
+            _req: CreateResponse,
+        ) -> Result<ResponseStream, OpenAIError> {
+            Err(OpenAIError::InvalidArgument("noop".into()))
+        }
+
+        async fn health(&self) -> ResponsesResult<()> {
+            Ok(())
+        }
+
+        async fn responses_request(
+            &self,
+            _req: CreateResponse,
+        ) -> Result<async_openai::types::responses::Response, OpenAIError> {
+            Err(OpenAIError::InvalidArgument("noop".into()))
+        }
+
+        async fn run(&self, _prompt: String) -> ResponsesResult<Option<String>> {
+            Ok(None)
+        }
+
+        fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+            None
+        }
+    }
+
+    #[test]
+    fn test_no_system_prompt_preserves_instructions() {
+        let wrapper = wrapper_with_prompt(None);
+        let req = CreateResponse {
+            instructions: Some("client instructions".to_string()),
+            ..CreateResponse::default()
+        };
+        let result = wrapper.with_system_prompt(req);
+        assert_eq!(
+            result.instructions.as_deref(),
+            Some("client instructions"),
+            "Client instructions should be preserved when no system prompt is configured"
+        );
+    }
+
+    #[test]
+    fn test_system_prompt_no_client_instructions() {
+        let wrapper = wrapper_with_prompt(Some("spicepod prompt"));
+        let req = CreateResponse {
+            instructions: None,
+            ..CreateResponse::default()
+        };
+        let result = wrapper.with_system_prompt(req);
+        assert_eq!(
+            result.instructions.as_deref(),
+            Some("spicepod prompt"),
+            "System prompt should become instructions when client provides none"
+        );
+    }
+
+    #[test]
+    fn test_system_prompt_combined_with_client_instructions() {
+        let wrapper = wrapper_with_prompt(Some("spicepod prompt"));
+        let req = CreateResponse {
+            instructions: Some("client instructions".to_string()),
+            ..CreateResponse::default()
+        };
+        let result = wrapper.with_system_prompt(req);
+        assert_eq!(
+            result.instructions.as_deref(),
+            Some("spicepod prompt\n\nclient instructions"),
+            "Spicepod prompt should be prepended to client instructions"
+        );
+    }
+
+    #[test]
+    fn test_no_system_prompt_no_client_instructions() {
+        let wrapper = wrapper_with_prompt(None);
+        let req = CreateResponse::default();
+        let result = wrapper.with_system_prompt(req);
+        assert_eq!(
+            result.instructions, None,
+            "Instructions should remain None when neither is set"
+        );
     }
 }

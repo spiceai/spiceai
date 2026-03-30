@@ -209,6 +209,7 @@ mod tests {
 
         CachedQueryResult::from_batches(
             &[record_batch],
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             Arc::new(input_tables),
             std::time::Instant::now(),
             encoder,

@@ -131,6 +131,8 @@ fn construct_model(
     let model = match prefix {
         ModelSource::OpenAi => openai(model_id, params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
+
+        ModelSource::Xai => xai(model_id.as_deref(), params),
         _ => Err(LlmError::ResponsesNotSupported {
             from: component.get_source().ok_or(LlmError::UnknownModelSource {
                 from: component.from.clone(),
@@ -253,4 +255,13 @@ fn azure(
         entra_token,
         api_key,
     )) as Arc<dyn Responses>)
+}
+
+fn xai(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Responses>, LlmError> {
+    let Some(api_key) = params.get("api_key").expose().ok() else {
+        return Err(LlmError::FailedToLoadModel {
+            source: "No `xai_api_key` provided for xAI model.".into(),
+        });
+    };
+    Ok(Arc::new(llms::xai::Xai::new(model_id, api_key)) as Arc<dyn Responses>)
 }

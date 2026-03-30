@@ -33,7 +33,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     init_tracing,
-    utils::{init_tracing_with_task_history, test_request_context, wait_until_true},
+    utils::{
+        init_tracing_with_task_history, register_test_connectors, test_request_context,
+        wait_until_true,
+    },
 };
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -47,6 +50,7 @@ async fn management_data_export() -> Result<(), anyhow::Error> {
         Some("runtime::flight::do_put=debug,runtime::management=trace,integration=debug,info");
 
     let _tracing = init_tracing(trace_levels);
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

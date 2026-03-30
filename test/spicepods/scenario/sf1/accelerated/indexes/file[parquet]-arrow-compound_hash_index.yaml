@@ -1,0 +1,24 @@
+# Test compound primary keys with hash_index (partsupp has natural compound PK)
+# Also test lineitem with compound PK
+version: v1
+kind: Spicepod
+name: file[parquet]-arrow-compound_hash_index
+datasets:
+  # partsupp has a natural compound primary key (ps_partkey, ps_suppkey)
+  - from: file:data/partsupp.parquet
+    name: partsupp
+    acceleration:
+      enabled: true
+      engine: arrow
+      primary_key: (ps_partkey, ps_suppkey)
+      params:
+        hash_index: enabled
+  # lineitem has a compound primary key (l_orderkey, l_linenumber)
+  - from: file:data/lineitem.parquet
+    name: lineitem
+    acceleration:
+      enabled: true
+      engine: arrow
+      primary_key: (l_orderkey, l_linenumber)
+      params:
+        hash_index: enabled

@@ -26,11 +26,16 @@ use tracing_subscriber::EnvFilter;
 
 mod abfs;
 mod acceleration;
+#[cfg(feature = "adbc")]
+mod adbc;
 mod cache;
 mod catalog;
 mod cayenne;
+#[cfg(not(windows))]
+mod cayenne_catalog_ddl;
 #[cfg(feature = "duckdb")]
 mod clickbench;
+mod cluster;
 mod cors;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta;
@@ -60,11 +65,14 @@ pub mod dynamodb;
 mod endpoint_auth;
 mod file;
 mod flight;
+mod gcs;
 mod github;
 mod glue;
 mod graphql;
+mod http;
 mod iceberg;
 mod iceberg_api;
+mod json;
 
 #[cfg(feature = "kafka")]
 mod kafka;
@@ -103,6 +111,8 @@ mod spiceai;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod tls;
+#[cfg(feature = "postgres-accel")]
+mod tpcds_postgres;
 mod utils;
 mod view;
 

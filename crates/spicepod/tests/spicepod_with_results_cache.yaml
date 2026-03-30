@@ -1,6 +1,6 @@
 version: v1
 kind: Spicepod
-name: spicepod_with_only_search_results
+name: spicepod_with_results_cache
 runtime:
   results_cache:
     enabled: true

@@ -38,16 +38,16 @@ use tokio::task;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Error constructing record batch: {source}"))]
+    #[snafu(display("Failed to process Git repository data: {source}"))]
     UnableToConstructRecordBatchError { source: arrow::error::ArrowError },
 
-    #[snafu(display("Git error: {source}"))]
+    #[snafu(display("Failed to access Git repository: {source}"))]
     GitError { source: git2::Error },
 
-    #[snafu(display("IO error: {source}"))]
+    #[snafu(display("Failed to read file from Git repository: {source}"))]
     IoError { source: std::io::Error },
 
-    #[snafu(display("{message}"))]
+    #[snafu(display("Invalid Git connector configuration: {message}"))]
     InvalidConfiguration { message: String },
 
     #[snafu(display("Failed to spawn blocking task: {source}"))]

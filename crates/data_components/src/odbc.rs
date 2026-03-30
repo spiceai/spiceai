@@ -34,24 +34,24 @@ use crate::Read;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("DbConnectionError: {source}"))]
+    #[snafu(display("Failed to connect to ODBC data source: {source}"))]
     DbConnectionError {
         source: db_connection_pool_datafusion::dbconnection::GenericError,
     },
-    #[snafu(display("The table '{table_name}' doesn't exist in the Postgres server"))]
+    #[snafu(display("The table '{table_name}' doesn't exist in the ODBC data source"))]
     TableDoesntExist { table_name: String },
 
-    #[snafu(display("Unable to get a DB connection from the pool: {source}"))]
+    #[snafu(display("Failed to get a connection from the ODBC connection pool: {source}"))]
     UnableToGetConnectionFromPool {
         source: db_connection_pool_datafusion::Error,
     },
 
-    #[snafu(display("Unable to get schema: {source}"))]
+    #[snafu(display("Failed to retrieve table schema from the ODBC data source: {source}"))]
     UnableToGetSchema {
         source: db_connection_pool_datafusion::dbconnection::Error,
     },
 
-    #[snafu(display("Unable to generate SQL: {source}"))]
+    #[snafu(display("Failed to generate SQL for the ODBC query: {source}"))]
     UnableToGenerateSQL { source: expr::Error },
 }
 

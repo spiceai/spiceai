@@ -13,8 +13,8 @@ models:
     name: o4-mini
     params:
       openai_api_key: ${secrets:SPICE_OPENAI_API_KEY}
-  - from: anthropic:claude-sonnet-4-5-20250929
-    name: claude-sonnet-4-5
+  - from: anthropic:claude-3-5-haiku-20241022
+    name: claude-haiku-3-5
     params:
       anthropic_api_key: ${secrets:SPICE_ANTHROPIC_API_KEY}
   - from: xai:grok-4-1-fast-non-reasoning

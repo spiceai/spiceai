@@ -20,10 +20,7 @@ use datafusion_datasource::sink::{DataSink, DataSinkExec};
 
 use std::{any::Any, fmt, pin::Pin, sync::Arc};
 
-use crate::{
-    component::dataset::{Dataset, acceleration::RefreshMode},
-    register_data_connector,
-};
+use crate::component::dataset::{Dataset, acceleration::RefreshMode};
 use datafusion::{
     catalog::Session,
     common::{Constraint, Constraints, project_schema},
@@ -201,10 +198,17 @@ impl DataSink for SinkDataSink {
 
     async fn write_all(
         &self,
-        _data: SendableRecordBatchStream,
+        mut data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> datafusion::common::Result<u64> {
-        Ok(0)
+        use futures::StreamExt as _;
+        // Drain the stream to satisfy the streaming contract even though
+        // the sink discards the data.
+        let mut rows: u64 = 0;
+        while let Some(batch) = data.next().await {
+            rows += batch?.num_rows() as u64;
+        }
+        Ok(rows)
     }
 }
 

@@ -1,0 +1,18 @@
+---
+source: crates/runtime/tests/metadata/mod.rs
+expression: scalar_upper_location
+---
++---------+-------+-------------------------------------------------------------------------------------------+
+| value   | _size | upper(met_all._location)                                                                  |
++---------+-------+-------------------------------------------------------------------------------------------+
+| value_0 | 2319  | S3://SPICEAI-PUBLIC-DATASETS/HIVE_PARTITIONED_DATA/YEAR=2023/MONTH=2/DAY=2/DATA_1.PARQUET |
+| value_1 | 2319  | S3://SPICEAI-PUBLIC-DATASETS/HIVE_PARTITIONED_DATA/YEAR=2023/MONTH=2/DAY=2/DATA_1.PARQUET |
+| value_2 | 2319  | S3://SPICEAI-PUBLIC-DATASETS/HIVE_PARTITIONED_DATA/YEAR=2023/MONTH=2/DAY=2/DATA_1.PARQUET |
+| value_3 | 2319  | S3://SPICEAI-PUBLIC-DATASETS/HIVE_PARTITIONED_DATA/YEAR=2023/MONTH=2/DAY=2/DATA_1.PARQUET |
+| value_4 | 2319  | S3://SPICEAI-PUBLIC-DATASETS/HIVE_PARTITIONED_DATA/YEAR=2023/MONTH=2/DAY=2/DATA_1.PARQUET |
+| value_5 | 2319  | S3://SPICEAI-PUBLIC-DATASETS/HIVE_PARTITIONED_DATA/YEAR=2023/MONTH=2/DAY=2/DATA_1.PARQUET |
+| value_6 | 2319  | S3://SPICEAI-PUBLIC-DATASETS/HIVE_PARTITIONED_DATA/YEAR=2023/MONTH=2/DAY=2/DATA_1.PARQUET |
+| value_7 | 2319  | S3://SPICEAI-PUBLIC-DATASETS/HIVE_PARTITIONED_DATA/YEAR=2023/MONTH=2/DAY=2/DATA_1.PARQUET |
+| value_8 | 2319  | S3://SPICEAI-PUBLIC-DATASETS/HIVE_PARTITIONED_DATA/YEAR=2023/MONTH=2/DAY=2/DATA_1.PARQUET |
+| value_9 | 2319  | S3://SPICEAI-PUBLIC-DATASETS/HIVE_PARTITIONED_DATA/YEAR=2023/MONTH=2/DAY=2/DATA_1.PARQUET |
++---------+-------+-------------------------------------------------------------------------------------------+

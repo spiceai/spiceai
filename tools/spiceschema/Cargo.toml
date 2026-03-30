@@ -16,4 +16,4 @@ runtime = { path = "../../crates/runtime", features = [
     "mcp",
 ] }
 serde_json.workspace = true
-serde_yaml.workspace = true
+yaml = { path = "../../crates/yaml" }

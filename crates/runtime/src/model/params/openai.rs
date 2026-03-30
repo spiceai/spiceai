@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{COMMON_MODEL_PARAMETERS, PARAM_LEN, concat_arrays};
+use util::concat_arrays;
+
+use super::{COMMON_MODEL_PARAMETERS, PARAM_LEN};
 use crate::parameters::ParameterSpec;
 
 pub const PARAMETERS: &[ParameterSpec] =

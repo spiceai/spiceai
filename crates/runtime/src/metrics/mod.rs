@@ -22,6 +22,7 @@ use opentelemetry::{
 };
 
 pub(crate) mod catalogs;
+pub(crate) mod cluster;
 pub(crate) mod components;
 pub(crate) mod datasets;
 pub(crate) mod embeddings;

@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 pub mod avoid_vector_columns_on_index;
-pub mod distribute_file_scan;
 
 #[macro_export]
 macro_rules! concrete {

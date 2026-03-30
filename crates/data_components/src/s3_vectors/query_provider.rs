@@ -268,7 +268,7 @@ async fn get_vectors_call(
             ..
         } = client
             .get_vectors(
-                GetVectorsInput::builder()
+                &GetVectorsInput::builder()
                     .set_keys(Some(chunk.to_vec()))
                     .set_vector_bucket_name(bucket_name.clone())
                     .set_index_arn(arn.clone())
@@ -317,9 +317,10 @@ async fn query_vectors_call(
     let (arn, bucket_name, index_name) = idx.index_identifier_variables();
     let s3_filter_pre = convert_datafusion_filters_to_s3_vectors(&filters)?;
     let s3_filter: Option<Document> = s3_filter_pre.clone().map(Into::into);
+
     let output = client
         .query_vectors(
-            QueryVectorsInput::builder()
+            &QueryVectorsInput::builder()
                 .query_vector(VectorData::Float32(query))
                 .return_distance(true)
                 .top_k(limit)

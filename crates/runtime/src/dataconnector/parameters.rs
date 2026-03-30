@@ -32,6 +32,7 @@ use super::{
 
 pub(crate) mod aws;
 pub(crate) mod azure;
+pub(crate) mod gcs;
 
 #[async_trait]
 pub(crate) trait Validator {

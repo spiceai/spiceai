@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: resp?
-snapshot_kind: text
 ---
 [
   {
@@ -9,13 +8,13 @@ snapshot_kind: text
     "answer": "\\[\nP(\\text{First faulty and second faulty}) = \\frac{2}{3} \\times \\frac{1}{2} = \\boxed{\\frac{1}{3}}\n\\]",
     "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?",
     "subject": "math",
-    "score": 6.331
+    "_score": 6.331
   },
   {
     "id": 772,
     "answer": "The degree of the differential equation is \\(\\boxed{2}\\), as the highest derivative present is the second derivative \\( y'' \\).",
     "question": "State the degree of the differential equation:\n$$\ny^{\\prime \\prime} = 6x + \\sin x\n$$",
     "subject": "math",
-    "score": 6.192
+    "_score": 6.192
   }
 ]

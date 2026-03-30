@@ -42,10 +42,10 @@ fn extract_text(resp: &OpenAIResponse) -> String {
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/responses",
-    operation_id = "post_chat_responses",
+    operation_id = "post_responses",
     tag = "AI",
     request_body(
-        description = "Create an Open AI Responses API request using a language model.",
+        description = "Create a response using the OpenAI Responses API format. This endpoint provides a more flexible conversation interface compared to Chat Completions.",
         content((
             CreateResponse = "application/json",
             example = json!({
@@ -112,10 +112,10 @@ fn extract_text(resp: &OpenAIResponse) -> String {
             })
         ))),
         (status = 404, description = "The specified model was not found"),
-        (status = 500, description = "An internal server error occurred while processing the chat completion", content((
+        (status = 500, description = "An internal server error occurred while processing the response", content((
             serde_json::Value = "application/json",
             example = json!({
-                "error": "An internal server error occurred while processing the chat completion."
+                "error": "An internal server error occurred while processing the response."
             })
         )))
     )

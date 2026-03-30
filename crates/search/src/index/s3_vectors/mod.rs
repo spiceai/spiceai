@@ -156,7 +156,20 @@ impl SearchIndex for S3Vector {
                 let partitions = partition_batch(&record, physical_expr.as_ref())?;
 
                 let mut data = vec![];
-                for (partition_value, partition_record) in partitions.into_values() {
+                for (partition_values, partition_record) in partitions.into_values() {
+                    // S3 vector search only supports single-column partitioning
+                    if partition_values.is_empty() {
+                        return Err(Box::new(DataFusionError::Execution(
+                            "Expected at least one partition value".to_string(),
+                        )));
+                    }
+                    if partition_values.len() > 1 {
+                        return Err(Box::new(DataFusionError::Configuration(format!(
+                            "S3 vector search partitioning supports exactly one partition column, but {} values were provided",
+                            partition_values.len()
+                        ))));
+                    }
+                    let partition_value = &partition_values[0];
                     // change the index name to a partition name
                     let id = match Arc::unwrap_or_clone(Arc::clone(&self.table.idx)) {
                         S3VectorIdentifier::IndexArn(_) => {
@@ -183,7 +196,7 @@ impl SearchIndex for S3Vector {
                                 &index_name,
                                 &self.embedded_column,
                                 &self.partition_by,
-                                &partition_value,
+                                partition_value,
                             )?;
                             let index_name = partitioned_index_name.to_index_name();
                             tracing::trace!(

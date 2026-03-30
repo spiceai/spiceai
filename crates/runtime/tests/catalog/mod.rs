@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
+use crate::{
+    configure_test_datafusion, init_tracing,
+    utils::{register_test_connectors, test_request_context},
+};
 use app::AppBuilder;
 use arrow::array::RecordBatch;
 use datafusion::assert_batches_eq;
@@ -33,6 +36,7 @@ async fn spiceai_integration_test_catalog() -> Result<(), anyhow::Error> {
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(None);
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -81,6 +85,7 @@ async fn spiceai_integration_test_catalog_include() -> Result<(), anyhow::Error>
         rustls::crypto::aws_lc_rs::default_provider(),
     );
     let _tracing = init_tracing(None);
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

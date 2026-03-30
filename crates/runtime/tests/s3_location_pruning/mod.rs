@@ -40,7 +40,7 @@ fn get_rustfs_hive_dataset_with_location(name: &str, endpoint: &str) -> Dataset 
         .collect(),
     ));
     dataset.metadata.insert(
-        "location".to_string(),
+        "_location".to_string(),
         serde_json::Value::String("enabled".to_string()),
     );
     dataset
@@ -186,7 +186,7 @@ async fn test_location_metadata_preserves_custom_s3_endpoint() -> Result<(), any
     // Before the fix, this would try to use the default AWS S3 endpoint instead of
     // our custom rustfs endpoint, causing the query to fail
     let query =
-        format!("SELECT * FROM hive_local WHERE location = 's3://{TEST_BUCKET}/{TEST_FILE_PATH}'");
+        format!("SELECT * FROM hive_local WHERE _location = 's3://{TEST_BUCKET}/{TEST_FILE_PATH}'");
     let query_result = runtime
         .datafusion()
         .query_builder(&query)

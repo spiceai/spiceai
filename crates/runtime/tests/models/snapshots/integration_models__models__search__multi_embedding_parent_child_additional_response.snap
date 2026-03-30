@@ -1,36 +1,45 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp)
-snapshot_kind: text
+expression: "normalize_search_response_json(resp, true)"
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": "0.03",
       "data": {
         "cp_catalog_number": 1
       },
       "dataset": "multiple_columns",
       "matches": {
-        "cp_department": "DEPARTMENT"
+        "cp_department": [
+          "DEPARTMENT"
+        ],
+        "cp_description": [
+          "In general basic characters welcome. Clearly lively friends conv"
+        ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 2
-      },
-      "score": 0.01
+        "cp_catalog_page_sk": 1
+      }
     },
     {
+      "_score": "0.03",
       "data": {
         "cp_catalog_number": 1
       },
       "dataset": "multiple_columns",
       "matches": {
-        "cp_description": "Programmes receive just likely, key homes. Relevant,"
+        "cp_department": [
+          "DEPARTMENT"
+        ],
+        "cp_description": [
+          "Programmes receive just likely, key homes. Relevant,"
+        ]
       },
       "primary_key": {
         "cp_catalog_page_sk": 11
-      },
-      "score": 0.01
+      }
     }
   ]
 }

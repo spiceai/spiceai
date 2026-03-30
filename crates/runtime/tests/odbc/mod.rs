@@ -24,7 +24,7 @@ use tracing::instrument;
 
 use crate::{
     RecordBatch, init_tracing,
-    utils::{test_request_context, wait_until_true},
+    utils::{register_test_connectors, test_request_context, wait_until_true},
 };
 
 use std::collections::HashMap;
@@ -73,6 +73,7 @@ fn make_databricks_odbc(path: &str, name: &str, acceleration: bool, engine: &str
 )]
 async fn databricks_odbc() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -127,6 +128,7 @@ async fn databricks_odbc() -> Result<(), String> {
 )]
 async fn databricks_odbc_with_acceleration() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

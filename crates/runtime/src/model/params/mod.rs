@@ -22,7 +22,6 @@ pub mod file;
 pub mod google;
 pub mod huggingface;
 pub mod openai;
-pub mod perplexity;
 pub mod xai;
 
 use spicepod::component::model::ModelSource;
@@ -43,31 +42,11 @@ pub fn get_params_spec(source: &ModelSource) -> Option<&'static [ParameterSpec]>
         ModelSource::Databricks => Some(databricks::PARAMETERS),
         ModelSource::HuggingFace => Some(huggingface::PARAMETERS),
         ModelSource::Anthropic => Some(anthropic::PARAMETERS),
-        ModelSource::Perplexity => Some(perplexity::PARAMETERS),
         ModelSource::Xai => Some(xai::PARAMETERS),
         ModelSource::Bedrock => Some(bedrock::PARAMETERS),
         ModelSource::SpiceAI => None,
         ModelSource::Google => Some(google::PARAMETERS),
     }
-}
-
-// Use the const function to reduce the duplicated common model parameters definition in each model provider param spec.
-pub const fn concat_arrays<T: Copy, const N: usize, const M: usize, const S: usize>(
-    a: [T; N],
-    b: [T; M],
-) -> [T; S] {
-    let mut out = [a[0]; S];
-    let mut i = 0;
-    while i < N {
-        out[i] = a[i];
-        i += 1;
-    }
-    let mut j = 0;
-    while j < M {
-        out[N + j] = b[j];
-        j += 1;
-    }
-    out
 }
 
 pub const PARAM_LEN: usize = 44;

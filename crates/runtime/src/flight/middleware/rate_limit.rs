@@ -32,16 +32,22 @@ type DirectRateLimiter = RateLimiter<
 >;
 
 /// Enforces a rate limit on the number of Flight `DoPut` requests the underlying service can handle over a period of time.
+///
+/// When `enabled` is `false`, the layer is a no-op: it does not insert a
+/// [`RateLimiterExtension`] into the request, so downstream handlers skip
+/// the rate-limit check entirely.
 #[derive(Clone)]
 pub struct WriteRateLimitLayer {
     rate_limiter: Arc<DirectRateLimiter>,
+    enabled: bool,
 }
 
 impl WriteRateLimitLayer {
     #[must_use]
-    pub fn new(rate_limiter: DirectRateLimiter) -> Self {
+    pub fn new(rate_limiter: DirectRateLimiter, enabled: bool) -> Self {
         Self {
             rate_limiter: Arc::new(rate_limiter),
+            enabled,
         }
     }
 }
@@ -50,7 +56,7 @@ impl<S> Layer<S> for WriteRateLimitLayer {
     type Service = WriteRateLimitMiddleware<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        WriteRateLimitMiddleware::new(inner, Arc::clone(&self.rate_limiter))
+        WriteRateLimitMiddleware::new(inner, Arc::clone(&self.rate_limiter), self.enabled)
     }
 }
 
@@ -58,13 +64,15 @@ impl<S> Layer<S> for WriteRateLimitLayer {
 pub struct WriteRateLimitMiddleware<S> {
     inner: S,
     rate_limiter: Arc<DirectRateLimiter>,
+    enabled: bool,
 }
 
 impl<S> WriteRateLimitMiddleware<S> {
-    fn new(inner: S, rate_limiter: Arc<DirectRateLimiter>) -> Self {
+    fn new(inner: S, rate_limiter: Arc<DirectRateLimiter>, enabled: bool) -> Self {
         WriteRateLimitMiddleware {
             inner,
             rate_limiter,
+            enabled,
         }
     }
 }
@@ -108,7 +116,7 @@ where
 
     fn call(&mut self, mut req: http::Request<ReqBody>) -> Self::Future {
         // Apply rate limiting to the Flight DoPut only
-        if req.uri().path() != "/arrow.flight.protocol.FlightService/DoPut" {
+        if !self.enabled || req.uri().path() != "/arrow.flight.protocol.FlightService/DoPut" {
             return Box::pin(self.inner.call(req));
         }
 

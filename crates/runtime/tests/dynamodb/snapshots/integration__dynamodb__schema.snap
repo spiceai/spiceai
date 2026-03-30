@@ -2,30 +2,30 @@
 source: crates/runtime/tests/dynamodb/mod.rs
 expression: formatted
 ---
-+-----------------------------------------+--------------------------------------------------------------------------------------------------------------------+-------------+
-| column_name                             | data_type                                                                                                          | is_nullable |
-+-----------------------------------------+--------------------------------------------------------------------------------------------------------------------+-------------+
-| col_binary                              | Binary                                                                                                             | YES         |
-| col_binary_set                          | List(Field { name: "item", data_type: Binary, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} })  | YES         |
-| col_bool                                | Boolean                                                                                                            | YES         |
-| col_date                                | Date32                                                                                                             | YES         |
-| col_list                                | List(Field { name: "item", data_type: Utf8, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} })    | YES         |
-| col_map_fully_unnested.age              | Int64                                                                                                              | YES         |
-| col_map_fully_unnested.balance          | Float64                                                                                                            | YES         |
-| col_map_fully_unnested.is_active        | Boolean                                                                                                            | YES         |
-| col_map_fully_unnested.name             | Utf8                                                                                                               | YES         |
-| col_map_partially_unnested.foo          | Utf8                                                                                                               | YES         |
-| col_map_partially_unnested.nested_lvl_1 | Struct([Field { name: "foo", data_type: Utf8, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }]) | YES         |
-| col_number_float                        | Float64                                                                                                            | YES         |
-| col_number_int                          | Int64                                                                                                              | YES         |
-| col_number_scientific                   | Int64                                                                                                              | YES         |
-| col_number_set_float                    | List(Field { name: "item", data_type: Float64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }) | YES         |
-| col_number_set_int                      | List(Field { name: "item", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} })   | YES         |
-| col_string                              | Utf8                                                                                                               | YES         |
-| col_string_set                          | List(Field { name: "item", data_type: Utf8, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} })    | YES         |
-| col_time                                | Utf8                                                                                                               | YES         |
-| col_timestamp                           | Timestamp(Millisecond, Some("+00:00"))                                                                             | YES         |
-| col_timestamp_tz                        | Timestamp(Millisecond, Some("+05:00"))                                                                             | YES         |
-| id                                      | Int64                                                                                                              | YES         |
-| version                                 | Int64                                                                                                              | YES         |
-+-----------------------------------------+--------------------------------------------------------------------------------------------------------------------+-------------+
++-----------------------------------------+-------------------------+-------------+
+| column_name                             | data_type               | is_nullable |
++-----------------------------------------+-------------------------+-------------+
+| col_binary                              | Binary                  | YES         |
+| col_binary_set                          | List(Binary)            | YES         |
+| col_bool                                | Boolean                 | YES         |
+| col_date                                | Date32                  | YES         |
+| col_list                                | List(Utf8)              | YES         |
+| col_map_fully_unnested.age              | Int64                   | YES         |
+| col_map_fully_unnested.balance          | Float64                 | YES         |
+| col_map_fully_unnested.is_active        | Boolean                 | YES         |
+| col_map_fully_unnested.name             | Utf8                    | YES         |
+| col_map_partially_unnested.foo          | Utf8                    | YES         |
+| col_map_partially_unnested.nested_lvl_1 | Struct("foo": Utf8)     | YES         |
+| col_number_float                        | Float64                 | YES         |
+| col_number_int                          | Int64                   | YES         |
+| col_number_scientific                   | Int64                   | YES         |
+| col_number_set_float                    | List(Float64)           | YES         |
+| col_number_set_int                      | List(Int64)             | YES         |
+| col_string                              | Utf8                    | YES         |
+| col_string_set                          | List(Utf8)              | YES         |
+| col_time                                | Utf8                    | YES         |
+| col_timestamp                           | Timestamp(ms, "+00:00") | YES         |
+| col_timestamp_tz                        | Timestamp(ms, "+05:00") | YES         |
+| id                                      | Int64                   | YES         |
+| version                                 | Int64                   | YES         |
++-----------------------------------------+-------------------------+-------------+

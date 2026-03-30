@@ -26,12 +26,11 @@ use arrow::array::RecordBatch;
 use dashmap::DashMap;
 use futures::TryStreamExt;
 use indicatif::ProgressBar;
-use spiceai::{Client as SpiceClient, SpiceClientError};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::constants::{HTTP_BASE_URL, SQL_ENDPOINT};
+use crate::execution::QueryExecutor;
 use crate::telemetry::streaming::QueryMetricEvent;
 
 use crate::{
@@ -52,16 +51,13 @@ pub(crate) struct SpiceTestQueryWorker {
     pub progress_bar: Option<ProgressBar>,
     validate: bool,
     scale_factor: f64,
-    spice_client: Option<Arc<SpiceClient>>,
-    http_client: Option<reqwest::Client>,
+    executor: Box<dyn QueryExecutor>,
     /// Optional custom validation data for scenario queries
     validation_data: Option<HashMap<Arc<str>, Vec<RecordBatch>>>,
     /// Optional reference schema for validating against known good tables
     reference_schema: Option<String>,
     /// Queries to skip row count validation for (e.g., queries that legitimately return 0 rows)
     skip_row_count_validation: HashSet<String>,
-    /// Whether to validate row counts between HTTP and Flight endpoints, and check for zero rows
-    validate_row_counts: bool,
     shutdown_token: CancellationToken,
     /// Optional sender for streaming query metrics to OTLP
     streaming_metrics_sender: Option<mpsc::Sender<QueryMetricEvent>>,
@@ -111,37 +107,26 @@ impl SpiceTestQueryWorker {
         query_set: Vec<Query>,
         end_condition: EndCondition,
         name: String,
+        executor: Box<dyn QueryExecutor>,
     ) -> Self {
         Self {
             id,
             query_set,
             end_condition,
-            spice_client: None,
+            executor,
             explain_plan_snapshot: false,
             results_snapshot_predicate: None,
             name,
             progress_bar: None,
             validate: false,
             scale_factor: 1.0,
-            http_client: None,
             validation_data: None,
             reference_schema: None,
             skip_row_count_validation: default_row_count_validation_skip_queries(),
-            validate_row_counts: true,
             shutdown_token: CancellationToken::new(),
             streaming_metrics_sender: None,
             query_duration_threshold: None,
         }
-    }
-
-    pub fn with_http_client(mut self, http_client: reqwest::Client) -> Self {
-        self.http_client = Some(http_client);
-        self
-    }
-
-    pub fn with_flight_client(mut self, spice_client: SpiceClient) -> Self {
-        self.spice_client = Some(Arc::new(spice_client));
-        self
     }
 
     pub fn with_scale_factor(mut self, scale_factor: f64) -> Self {
@@ -197,11 +182,6 @@ impl SpiceTestQueryWorker {
 
     pub fn with_reference_schema(mut self, reference_schema: Option<String>) -> Self {
         self.reference_schema = reference_schema;
-        self
-    }
-
-    pub fn with_validate_row_counts(mut self, validate_row_counts: bool) -> Self {
-        self.validate_row_counts = validate_row_counts;
         self
     }
 
@@ -364,11 +344,11 @@ impl SpiceTestQueryWorker {
 
                         if self.explain_plan_snapshot
                             && self.id == 0
-                            && let Some(client) = &self.spice_client
+                            && let Some(client) = self.executor.as_spice_client()
                         {
                             println!("Worker {} - Query '{}' - Explain plan", self.id, query.name);
                             if let Err(e) = record_explain_plan(
-                                Arc::clone(client),
+                                client,
                                 self.name.as_str(),
                                 query,
                                 self.scale_factor,
@@ -516,12 +496,19 @@ impl SpiceTestQueryWorker {
                 query_failure: None,
             }),
             Err(e) => {
-                let flight_error = e.downcast_ref::<flight_client::Error>();
-                if let Some(
-                    flight_client::Error::UnableToConnectToServer { .. }
-                    | flight_client::Error::UnableToPerformHandshake { .. },
-                ) = flight_error
-                {
+                // Check if this is a connection error using typed error checking
+                // This is more reliable than string matching
+                let is_connection_error =
+                    e.downcast_ref::<flight_client::Error>()
+                        .is_some_and(|flight_err| {
+                            matches!(
+                                flight_err,
+                                flight_client::Error::UnableToConnectToServer { .. }
+                                    | flight_client::Error::UnableToPerformHandshake { .. }
+                            )
+                        });
+
+                if is_connection_error {
                     eprintln!(
                         "FAIL - EARLY EXIT - Worker {} - Query '{}' failed: {}",
                         self.id, query.name, e
@@ -549,7 +536,7 @@ impl SpiceTestQueryWorker {
         }
     }
 
-    async fn execute_flight(
+    async fn execute_query(
         &self,
         query: &Query,
         query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
@@ -557,74 +544,18 @@ impl SpiceTestQueryWorker {
         results_snapshot: bool,
         validate: bool,
     ) -> Result<()> {
-        let Some(spice_client) = self.spice_client.as_ref() else {
-            return Ok(());
-        };
+        // Execute query using the configured executor
+        let result = self.executor.execute(query).await?;
 
-        let query_start = Instant::now();
-
-        let mut result_stream = spice_client
-            .query_with_params(&query.sql, query.get_parameters_batch().transpose()?)
-            .await?;
-
-        let mut row_count: usize = 0;
-        let mut limited_records = vec![];
-        let mut validation_records = vec![];
-
-        loop {
-            let batch = result_stream.try_next().await;
-            match batch {
-                Ok(None) => break,
-                Err(e) => {
-                    if let SpiceClientError::ConnectionReset { .. } = e {
-                        row_count = 0;
-                        limited_records.clear();
-                        validation_records.clear();
-                    } else {
-                        let duration = query_start.elapsed();
-                        // Send streaming metric for failed Flight query
-                        self.send_streaming_metric(&query.name, duration, false);
-                        eprintln!(
-                            "{} FAIL - Worker {} - Query '{}' failed: {}",
-                            chrono::Utc::now(),
-                            self.id,
-                            query.name,
-                            e
-                        );
-
-                        query_durations.entry(Arc::clone(&query.name)).or_default();
-                        return Err(e.into());
-                    }
-                }
-                Ok(Some(batch)) => {
-                    if validate {
-                        validation_records.push(batch.clone());
-                    }
-                    if batch.num_rows() == 0 {
-                        println!(
-                            "Worker {} - Query '{}' returned 0 rows",
-                            self.id, query.name
-                        );
-                    }
-                    row_count += batch.num_rows();
-                    if limited_records.len() < 10 {
-                        let required_rows = 10 - limited_records.len();
-                        let end = if batch.num_rows() > required_rows {
-                            required_rows
-                        } else {
-                            batch.num_rows()
-                        };
-                        for i in 0..end {
-                            limited_records.push(batch.slice(i, 1));
-                        }
-                    }
-                }
-            }
-        }
-
-        if validate {
+        // Handle validation if supported and requested
+        if validate
+            && self.executor.supports_validation()
+            && let Some(batches) = &result.batches
+        {
             // Execute reference query if reference_schema is provided
-            let reference_batches = if let Some(ref_schema) = &self.reference_schema {
+            if let Some(ref_schema) = &self.reference_schema
+                && let Some(spice_client) = self.executor.as_spice_client()
+            {
                 let reference_query = query.rewrite_with_reference_schema(ref_schema)?;
                 println!(
                     "Worker {} - Query '{}' - Executing reference query against {}.* tables",
@@ -632,7 +563,7 @@ impl SpiceTestQueryWorker {
                 );
 
                 let mut ref_result_stream = spice_client
-                    .query_with_params(
+                    .sql_with_params(
                         &reference_query.sql,
                         reference_query.get_parameters_batch().transpose()?,
                     )
@@ -642,18 +573,10 @@ impl SpiceTestQueryWorker {
                 while let Some(batch) = ref_result_stream.try_next().await? {
                     ref_batches.push(batch);
                 }
-                Some(ref_batches)
-            } else {
-                None
-            };
 
-            // Validate against reference query results if available
-            if let Some(ref_batches) = reference_batches {
-                let validation_result = validation::validate_with_expected_batches(
-                    &query.name,
-                    &validation_records,
-                    &ref_batches,
-                )?;
+                // Validate against reference query results
+                let validation_result =
+                    validation::validate_with_expected_batches(&query.name, batches, &ref_batches)?;
 
                 if let QueryValidationResult::Fail(validation_reason) = validation_result {
                     eprintln!(
@@ -670,7 +593,7 @@ impl SpiceTestQueryWorker {
                         Err(e) => eprintln!("Failed to format expected batches: {e}"),
                     }
                     eprintln!("\nActual results:");
-                    match arrow::util::pretty::pretty_format_batches(&validation_records) {
+                    match arrow::util::pretty::pretty_format_batches(batches) {
                         Ok(pretty) => eprintln!("{pretty}"),
                         Err(e) => eprintln!("Failed to format actual batches: {e}"),
                     }
@@ -682,7 +605,7 @@ impl SpiceTestQueryWorker {
             }
 
             // Also validate using existing validation logic (TPCH or custom validation data)
-            let validation_result = self.validate_query_results(query, &validation_records)?;
+            let validation_result = self.validate_query_results(query, batches)?;
 
             if let QueryValidationResult::Fail(validation_reason) = validation_result {
                 eprintln!(
@@ -711,7 +634,7 @@ impl SpiceTestQueryWorker {
                 }
 
                 eprintln!("\nActual results:");
-                match arrow::util::pretty::pretty_format_batches(&validation_records) {
+                match arrow::util::pretty::pretty_format_batches(batches) {
                     Ok(pretty) => eprintln!("{pretty}"),
                     Err(e) => eprintln!("Failed to format actual batches: {e}"),
                 }
@@ -723,7 +646,8 @@ impl SpiceTestQueryWorker {
             }
         }
 
-        if results_snapshot {
+        // Handle result snapshots if requested
+        if results_snapshot && let Some(batches) = &result.batches {
             let query_name = Arc::clone(&query.name);
             let name = self.name.clone();
             let snapshot_name = if (self.scale_factor - 1.0).abs() < f64::EPSILON {
@@ -731,6 +655,23 @@ impl SpiceTestQueryWorker {
             } else {
                 format!("{name}_{query_name}_sf{}", self.scale_factor)
             };
+
+            // Limit to first 10 rows for snapshot
+            let mut limited_records = vec![];
+            for batch in batches {
+                if limited_records.len() >= 10 {
+                    break;
+                }
+                let required_rows = 10 - limited_records.len();
+                let end = if batch.num_rows() > required_rows {
+                    required_rows
+                } else {
+                    batch.num_rows()
+                };
+                for i in 0..end {
+                    limited_records.push(batch.slice(i, 1));
+                }
+            }
 
             let records_pretty = arrow::util::pretty::pretty_format_batches(&limited_records)?;
             let result = panic::catch_unwind(|| {
@@ -749,182 +690,41 @@ impl SpiceTestQueryWorker {
             }
         }
 
-        let duration = query_start.elapsed();
+        // Check for zero row count if not in skip list
+        if !self
+            .skip_row_count_validation
+            .contains(&query.name.to_string())
+            && result.row_count == 0
+        {
+            eprintln!(
+                "{} FAIL - Worker {} - Query '{}' returned 0 rows",
+                chrono::Utc::now(),
+                self.id,
+                query.name
+            );
+            return Err(anyhow::anyhow!(
+                "Worker {} - Query '{}' returned 0 rows",
+                self.id,
+                query.name
+            ));
+        }
 
-        // Send streaming metric for real-time OTLP export
-        self.send_streaming_metric(&query.name, duration, true);
+        // Send streaming metric
+        self.send_streaming_metric(&query.name, result.duration, true);
 
+        // Record metrics
         query_durations
             .entry(Arc::clone(&query.name))
             .or_default()
-            .push(duration);
+            .push(result.duration);
 
         row_counts
             .entry(Arc::clone(&query.name))
             .or_default()
-            .push(row_count);
+            .push(result.row_count);
 
         if let Some(pb) = self.progress_bar.as_ref() {
             pb.inc(1);
-        }
-        Ok(())
-    }
-
-    async fn execute_http(
-        &self,
-        query: &Query,
-        query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
-        http_row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
-    ) -> Result<()> {
-        if let Some(http_client) = self.http_client.as_ref() {
-            let query_start = Instant::now();
-            let sql_text = query.to_sql_with_inlined_params();
-            let sql_url = format!("{HTTP_BASE_URL}{SQL_ENDPOINT}");
-            let http_response = http_client
-                .post(&sql_url)
-                .header("Accept", "application/vnd.spiceai.sql.v1+json")
-                .body(sql_text.to_string())
-                .send()
-                .await?;
-
-            let status = http_response.status();
-            let response_text = http_response.text().await.unwrap_or_default();
-
-            if !status.is_success() {
-                eprintln!(
-                    "{} FAIL - Worker {} - Query '{}' HTTP request failed: {status} - {response_text}",
-                    chrono::Utc::now(),
-                    self.id,
-                    query.name,
-                );
-                return Err(anyhow::anyhow!("Query HTTP request failed: {status}",));
-            }
-
-            let duration = query_start.elapsed();
-
-            if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
-                if let Some(row_count) = response_json
-                    .get("row_count")
-                    .and_then(serde_json::Value::as_u64)
-                {
-                    #[expect(clippy::cast_possible_truncation)]
-                    let row_count_usize = row_count as usize;
-                    http_row_counts
-                        .entry(Arc::clone(&query.name))
-                        .or_default()
-                        .push(row_count_usize);
-                } else {
-                    eprintln!(
-                        "Warning: No row_count field in HTTP response for query '{}'",
-                        query.name
-                    );
-                }
-            } else {
-                eprintln!(
-                    "Warning: Failed to parse HTTP response as JSON for query '{}'",
-                    query.name
-                );
-            }
-
-            query_durations
-                .entry(Arc::clone(&query.name))
-                .or_default()
-                .push(duration);
-        }
-
-        Ok(())
-    }
-
-    async fn execute_query(
-        &self,
-        query: &Query,
-        query_durations: Arc<DashMap<Arc<str>, Vec<Duration>>>,
-        row_counts: &mut BTreeMap<Arc<str>, Vec<usize>>,
-        results_snapshot: bool,
-        validate: bool,
-    ) -> Result<()> {
-        let mut http_row_counts: BTreeMap<Arc<str>, Vec<usize>> = BTreeMap::new();
-
-        futures::future::try_join(
-            self.execute_flight(
-                query,
-                Arc::clone(&query_durations),
-                row_counts,
-                results_snapshot,
-                validate,
-            ),
-            self.execute_http(query, Arc::clone(&query_durations), &mut http_row_counts),
-        )
-        .await?;
-
-        // Skip row count validation if disabled or for specific queries that legitimately return 0 rows
-        if !self.validate_row_counts
-            || self
-                .skip_row_count_validation
-                .contains(&query.name.to_string())
-        {
-            return Ok(());
-        }
-
-        // Validate row counts if both HTTP and Flight are available
-        if let Some(http_counts) = http_row_counts.get(&query.name) {
-            if let Some(flight_counts) = row_counts.get(&query.name) {
-                // Compare the last row count from each
-                if let (Some(&http_count), Some(&flight_count)) =
-                    (http_counts.last(), flight_counts.last())
-                {
-                    // Check for zero row counts (indicates potential query execution issue)
-                    if http_count == 0 && flight_count == 0 {
-                        eprintln!(
-                            "{} FAIL - Worker {} - Query '{}' returned 0 rows in both HTTP and Flight",
-                            chrono::Utc::now(),
-                            self.id,
-                            query.name
-                        );
-                        return Err(anyhow::anyhow!(
-                            "Worker {} - Query '{}' returned 0 rows in both HTTP and Flight",
-                            self.id,
-                            query.name
-                        ));
-                    }
-
-                    // Check if row counts match
-                    if http_count != flight_count {
-                        eprintln!(
-                            "{} FAIL - Worker {} - Query '{}' row count mismatch: HTTP={}, Flight={}",
-                            chrono::Utc::now(),
-                            self.id,
-                            query.name,
-                            http_count,
-                            flight_count
-                        );
-                        return Err(anyhow::anyhow!(
-                            "Worker {} - Query '{}' row count mismatch between HTTP ({}) and Flight ({})",
-                            self.id,
-                            query.name,
-                            http_count,
-                            flight_count
-                        ));
-                    }
-                }
-            }
-        } else if let Some(flight_counts) = row_counts.get(&query.name) {
-            // Only Flight available, check for zero rows
-            if let Some(&flight_count) = flight_counts.last()
-                && flight_count == 0
-            {
-                eprintln!(
-                    "{} FAIL - Worker {} - Query '{}' returned 0 rows via Flight",
-                    chrono::Utc::now(),
-                    self.id,
-                    query.name
-                );
-                return Err(anyhow::anyhow!(
-                    "Worker {} - Query '{}' returned 0 rows via Flight",
-                    self.id,
-                    query.name
-                ));
-            }
         }
 
         Ok(())

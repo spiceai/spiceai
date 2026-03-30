@@ -67,12 +67,12 @@ impl DatasetCheckpoint {
             .get_underlying_conn_mut();
 
         let query = format!(
-            "SELECT updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
+            "SELECT epoch_us(timezone('UTC', updated_at::TIMESTAMPTZ)) FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ? LIMIT 1"
         );
         let mut stmt = duckdb_conn.prepare(&query).map_err(Error::external)?;
         let mut rows = stmt.query([&self.dataset_name]).map_err(Error::external)?;
 
-        let checkpoint_time_micros: Option<u64> = rows
+        let checkpoint_time_micros: Option<i64> = rows
             .next()
             .map_err(Error::external)?
             .map(|row| row.get(0))
@@ -80,7 +80,8 @@ impl DatasetCheckpoint {
             .map_err(Error::external)?;
 
         if let Some(checkpoint_time_micros) = checkpoint_time_micros {
-            let duration = Duration::from_micros(checkpoint_time_micros);
+            let micros = u64::try_from(checkpoint_time_micros).map_err(Error::external)?;
+            let duration = Duration::from_micros(micros);
             Ok(Some(UNIX_EPOCH + duration))
         } else {
             Ok(None)

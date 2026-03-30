@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 mod mteb_quora;
-use super::get_app_and_start_request;
+use super::{duration_millis_between, get_app_and_start_request};
 use crate::{args::SearchTestArgs, health::HealthMonitor, wait_test_and_memory};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 use test_framework::{
     TestType, anyhow,
     app::App,
@@ -60,7 +60,7 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         }
     }
 
-    let started_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let started_at = Instant::now();
 
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
     let memory_token = CancellationToken::new();
@@ -72,13 +72,36 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         .wait_for_ready(Duration::from_secs(args.common.ready_wait))
         .await?;
 
-    // Create telemetry early before any metrics calls (e.g., HealthMonitor)
-    // Resource will be set later with set_resource() before emit()
-    let mut telemetry = Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY");
+    // Build resource with attributes known upfront, before creating telemetry.
+    // This ensures the SdkMeterProvider is created with the correct resource.
+    let spiced_commit_sha =
+        std::env::var("SPICED_COMMIT").unwrap_or_else(|_| git::get_commit_sha());
+    let mut search_attributes = vec![
+        KeyValue::new("service.name", "testoperator"),
+        KeyValue::new("type", "search"),
+        KeyValue::new("name", app.name.clone()),
+        KeyValue::new("spiced_version", spiced_instance.version().to_string()),
+        KeyValue::new("spiced_commit_sha", spiced_commit_sha),
+        KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
+        KeyValue::new("branch_name", git::get_branch_name()),
+        KeyValue::new("config_name", app.name.clone()),
+        KeyValue::new(
+            "benchmark_dataset",
+            args.benchmark_dataset.clone().unwrap_or_default(),
+        ),
+    ];
+    search_attributes.extend(quora_mteb_attributes(&app));
+
+    let search_resource = Resource::builder_empty()
+        .with_attributes(search_attributes)
+        .build();
+
+    // Create telemetry with resource upfront, before any metrics calls
+    let telemetry = Telemetry::new_with_resource(&search_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
 
     let health_monitor = HealthMonitor::spawn()?;
 
-    let index_finished_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let index_finished_at = Instant::now();
 
     // Allow Spicepod traces to be fully printed before running the test
     sleep(Duration::from_millis(200)).await;
@@ -91,7 +114,7 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     // retrieve query relevance data
     let qrels = mteb_quora::get_query_relevance_data(&spiced_instance).await?;
 
-    let search_started_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let search_started_at = Instant::now();
 
     let vector_test = SpiceTest::new(
         app.name.clone(),
@@ -103,7 +126,7 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     .start()?;
 
     let test = wait_test_and_memory!(vector_test, memory_token, memory_readings);
-    let finished_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let finished_at = Instant::now();
 
     println!("Search requests completed, calculating results...");
 
@@ -122,39 +145,12 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     metrics.with_memory_usage(max_memory).show_run(None)?; // no additional test pass logic applies
 
-    let spiced_commit_sha = std::env::var("SPICED_COMMIT").unwrap_or(git::get_commit_sha());
-
     // Record benchmark results
-    let mut attributes = vec![
-        KeyValue::new("service.name", "testoperator"),
-        KeyValue::new("type", "search"),
-        KeyValue::new("name", app.name.clone()),
-        KeyValue::new("spiced_version", spiced_instance.version().to_string()),
-        KeyValue::new("spiced_commit_sha", spiced_commit_sha),
-        KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
-        KeyValue::new("branch_name", git::get_branch_name()),
-        KeyValue::new("config_name", app.name.clone()), // use app name as search configuration
-        KeyValue::new(
-            "benchmark_dataset",
-            args.benchmark_dataset.clone().unwrap_or_default(),
-        ),
-    ];
-    // Add mteb_quora specific attributes
-    attributes.extend(quora_mteb_attributes(&app));
-    telemetry.set_resource(
-        Resource::builder_empty()
-            .with_attributes(attributes)
-            .build(),
-    );
-
-    crate::metrics::TEST_DURATION
-        .record(u64::try_from((finished_at - started_at).as_millis())?, &[]);
-    crate::metrics::VECTOR_INDEX_CREATION_DURATION.record(
-        u64::try_from((index_finished_at - started_at).as_millis())?,
-        &[],
-    );
+    crate::metrics::TEST_DURATION.record(duration_millis_between(finished_at, started_at)?, &[]);
+    crate::metrics::VECTOR_INDEX_CREATION_DURATION
+        .record(duration_millis_between(index_finished_at, started_at)?, &[]);
     crate::metrics::SEARCH_DURATION.record(
-        u64::try_from((finished_at - search_started_at).as_millis())?,
+        duration_millis_between(finished_at, search_started_at)?,
         &[],
     );
 

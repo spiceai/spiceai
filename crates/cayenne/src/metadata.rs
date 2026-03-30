@@ -23,10 +23,8 @@ use serde::{Deserialize, Serialize};
 /// Metadata about a table in the catalog.
 #[derive(Debug, Clone)]
 pub struct TableMetadata {
-    /// Unique identifier for this table
-    pub table_id: i64,
-    /// UUID for this table (for external references)
-    pub table_uuid: String,
+    /// Unique identifier for this table (`UUIDv7`)
+    pub table_id: String,
     /// Name of the table
     pub table_name: String,
     /// Path to the table's data directory
@@ -69,10 +67,10 @@ pub struct TableMetadata {
 pub struct DataFile {
     /// Unique identifier for this data file
     pub data_file_id: i64,
-    /// Table this file belongs to
-    pub table_id: i64,
+    /// Table this file belongs to (`UUIDv7`)
+    pub table_id: String,
     /// Partition this file belongs to (None for non-partitioned tables)
-    pub partition_id: Option<i64>,
+    pub partition_id: Option<String>,
     /// Ordering of this file within the table
     pub file_order: i64,
     /// Path to the directory containing the `ListingTable`'s Vortex files
@@ -109,10 +107,10 @@ pub enum DeletionType {
 /// Represents a deletion vector file tracking deleted rows.
 #[derive(Debug, Clone)]
 pub struct DeleteFile {
-    /// Unique identifier for this delete file
-    pub delete_file_id: i64,
-    /// Table this delete file belongs to
-    pub table_id: i64,
+    /// Unique identifier for this delete file (`UUIDv7`)
+    pub delete_file_id: String,
+    /// Table this delete file belongs to (`UUIDv7`)
+    pub table_id: String,
     /// Path of the data file this deletion vector applies to (for position-based deletions).
     /// `None` for key-based deletions which apply to the entire table.
     /// For position-based deletions, row IDs are relative to this specific data file.
@@ -141,16 +139,26 @@ pub struct DeleteFile {
 }
 
 /// Metadata about a partition in a table.
+///
+/// Supports both single and composite partition keys (e.g., `partition_by: [year, month, day]`).
+/// Partition columns and values are stored as ordered lists, where the i-th column name
+/// corresponds to the i-th partition value.
 #[derive(Debug, Clone)]
 pub struct PartitionMetadata {
-    /// Unique identifier for this partition
-    pub partition_id: i64,
-    /// Table this partition belongs to
-    pub table_id: i64,
-    /// Name of the partition column
-    pub partition_column: String,
-    /// Partition value (serialized as string for storage)
-    pub partition_value: String,
+    /// Unique identifier for this partition (`UUIDv7`)
+    pub partition_id: String,
+    /// Table this partition belongs to (`UUIDv7`)
+    pub table_id: String,
+    /// Names of the partition columns (ordered).
+    /// For a single partition column, this is a single-element vector.
+    /// For composite partitions like `partition_by: [year, month]`, this contains
+    /// all column names in order: `["year", "month"]`.
+    pub partition_columns: Vec<String>,
+    /// Partition values (serialized as strings, ordered to match `partition_columns`).
+    /// For a single partition, this is a single-element vector.
+    /// For composite partitions, values are ordered to match columns:
+    /// e.g., `["2025", "10"]` for year=2025, month=10.
+    pub partition_values: Vec<String>,
     /// Path to the partition's data directory
     pub path: String,
     /// Whether the path is relative to the table's base path
@@ -161,8 +169,64 @@ pub struct PartitionMetadata {
     pub file_size_bytes: i64,
 }
 
+impl PartitionMetadata {
+    /// Returns a composite key string for this partition.
+    ///
+    /// For single partitions: returns the single value (e.g., `"us-east-1"`).
+    /// For composite partitions: returns a slash-separated path (e.g., `"2025/10/15"`).
+    ///
+    /// This key uniquely identifies the partition within a table and is used
+    /// for `HashMap` lookups and Hive-style directory naming.
+    #[must_use]
+    pub fn composite_key(&self) -> String {
+        self.partition_values.join("/")
+    }
+
+    /// Creates a new `PartitionMetadata` for a single partition column (legacy compatibility).
+    #[must_use]
+    pub fn new_single(
+        table_id: String,
+        partition_column: String,
+        partition_value: String,
+        path: String,
+        path_is_relative: bool,
+    ) -> Self {
+        Self {
+            partition_id: String::new(),
+            table_id,
+            partition_columns: vec![partition_column],
+            partition_values: vec![partition_value],
+            path,
+            path_is_relative,
+            record_count: 0,
+            file_size_bytes: 0,
+        }
+    }
+
+    /// Creates a new `PartitionMetadata` for composite partition columns.
+    #[must_use]
+    pub fn new_composite(
+        table_id: String,
+        partition_columns: Vec<String>,
+        partition_values: Vec<String>,
+        path: String,
+        path_is_relative: bool,
+    ) -> Self {
+        Self {
+            partition_id: String::new(),
+            table_id,
+            partition_columns,
+            partition_values,
+            path,
+            path_is_relative,
+            record_count: 0,
+            file_size_bytes: 0,
+        }
+    }
+}
+
 /// Which compression strategy to use for the Vortex layout.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompressionStrategy {
     /// Uses the default Vortex Btrblocks compression.
     #[default]
@@ -174,9 +238,13 @@ pub enum CompressionStrategy {
 /// Configuration for Vortex encodings to optimize compression and performance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VortexConfig {
-    /// Footer cache size in MB
+    /// Footer cache size in MB.
+    ///
+    /// Currently ignored in Spice.ai `2.0.0-unstable`.
     pub footer_cache_mb: usize,
-    /// Segment cache size in MB
+    /// Segment cache size in MB.
+    ///
+    /// Currently ignored in Spice.ai `2.0.0-unstable`.
     pub segment_cache_mb: usize,
     /// Target size for individual Vortex files in MB. When writes exceed this size,
     /// a new Vortex file will be created in the same listing directory. This allows
@@ -188,6 +256,15 @@ pub struct VortexConfig {
     /// Compression strategy to use for Vortex files
     /// Defaults to Btrblocks
     pub compression_strategy: CompressionStrategy,
+    /// Maximum number of concurrent file uploads when writing multiple Vortex files.
+    /// Each file uses multipart uploads internally via `object_store`.
+    /// Defaults to 4 for balanced I/O throughput vs resource usage.
+    #[serde(default = "default_upload_concurrency")]
+    pub upload_concurrency: usize,
+}
+
+const fn default_upload_concurrency() -> usize {
+    4
 }
 
 impl Default for VortexConfig {
@@ -201,6 +278,8 @@ impl Default for VortexConfig {
             // No sort columns by default
             sort_columns: Vec::new(),
             compression_strategy: CompressionStrategy::default(),
+            // 4 concurrent uploads balances throughput vs resource usage
+            upload_concurrency: 4,
         }
     }
 }

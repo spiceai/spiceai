@@ -22,7 +22,7 @@ use data_components::mssql::connection_manager::SqlServerConnectionManager;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
-use crate::utils::test_request_context;
+use crate::utils::{register_test_connectors, test_request_context};
 
 pub mod common;
 
@@ -172,6 +172,7 @@ async fn init_mssql_db(port: u16) -> Result<(), anyhow::Error> {
 async fn mssql_integration_test() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

@@ -16,9 +16,17 @@ limitations under the License.
 
 use std::{sync::Arc, time::SystemTime};
 
+use crate::{
+    accelerated_table::{DataRetentionFilter, Retention, refresh},
+    component::dataset::TimeFormat,
+    datafusion::{
+        builder::get_df_default_config,
+        filter_converter::{TimestampFilterConvert, create_timestamp_filter_convert},
+        is_spice_internal_dataset,
+    },
+};
 use arrow::array::UInt64Array;
 use cache::Caching;
-use data_components::delete::get_deletion_provider;
 use datafusion::{
     catalog::TableProvider,
     logical_expr::Operator,
@@ -26,17 +34,9 @@ use datafusion::{
     prelude::{Expr, SessionContext},
     sql::TableReference,
 };
-use tokio::runtime::Handle;
-
-use crate::{
-    accelerated_table::{DataRetentionFilter, Retention, refresh},
-    component::dataset::TimeFormat,
-    datafusion::{
-        builder::get_df_default_config, filter_converter::TimestampFilterConvert,
-        is_spice_internal_dataset,
-    },
-};
 use runtime_object_store::registry::default_runtime_env;
+use tokio::runtime::Handle;
+use tokio::sync::Mutex;
 
 impl super::AcceleratedTable {
     #[expect(clippy::cast_possible_truncation)]
@@ -46,13 +46,17 @@ impl super::AcceleratedTable {
         retention: Retention,
         caching: Option<Arc<Caching>>,
         io_runtime: Handle,
+        accelerator_write_mutex: Arc<Mutex<()>>,
     ) {
         let mut interval_timer = tokio::time::interval(retention.check_interval);
 
         loop {
             interval_timer.tick().await;
 
-            if let Some(deleted_table_provider) = get_deletion_provider(Arc::clone(&accelerator)) {
+            // Lock the accelerator to protect concurrent access to the accelerator during cache/snapshot operations
+            let _lock_guard = accelerator_write_mutex.lock().await;
+
+            {
                 let mut exprs = Vec::new();
 
                 // convert retention filters into data eviction expressions
@@ -113,16 +117,26 @@ impl super::AcceleratedTable {
                     continue;
                 };
 
-                tracing::trace!("[retention] Expr {expr:?}");
+                tracing::trace!("[retention] Expr before simplification: {expr:?}");
+
+                let expr = match util::expr::simplify_expr(expr.clone(), &accelerator.schema()) {
+                    Ok(simplified) => simplified,
+                    Err(e) => {
+                        tracing::error!(
+                            "[retention] Upon checking retention policy for table '{dataset_name}', an error occurred when attempting to simplify the relevant retention expression '{expr:?}'. Error: {e}"
+                        );
+                        continue;
+                    }
+                };
+
+                tracing::debug!("[retention] Expr: {expr:?}");
 
                 let ctx = SessionContext::new_with_config_rt(
                     get_df_default_config(),
                     default_runtime_env(io_runtime.clone()),
                 );
 
-                let plan = deleted_table_provider
-                    .delete_from(&ctx.state(), &[expr])
-                    .await;
+                let plan = accelerator.delete_from(&ctx.state(), vec![expr]).await;
                 match plan {
                     Ok(plan) => match collect(plan, ctx.task_ctx()).await {
                         Err(e) => {
@@ -154,8 +168,6 @@ impl super::AcceleratedTable {
                         tracing::error!("[retention] Error running retention check: {e}");
                     }
                 }
-            } else {
-                tracing::error!("[retention] Accelerated table does not support delete");
             }
         }
     }
@@ -178,7 +190,7 @@ fn create_timestamp_filter_converter(
                 .map(|(_, f)| f)
         });
 
-    TimestampFilterConvert::create(
+    create_timestamp_filter_convert(
         field.cloned(),
         Some(time_column.to_string()),
         time_format,
@@ -216,8 +228,8 @@ mod tests {
         array::{BooleanArray, Int64Array, RecordBatch, StringArray},
         datatypes::{DataType, Field, Schema},
     };
-    use data_components::{arrow::write::MemTable, delete::DeletionTableProviderAdapter};
-    use datafusion::{physical_plan::collect, prelude::SessionContext};
+    use data_components::arrow::write::MemTable;
+    use datafusion::{catalog::TableProvider, physical_plan::collect, prelude::SessionContext};
     use tokio::time::{Duration, sleep};
 
     fn create_test_schema() -> Arc<Schema> {
@@ -291,8 +303,7 @@ mod tests {
         let mem_table =
             MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created");
 
-        let accelerator = Arc::new(DeletionTableProviderAdapter::new(Arc::new(mem_table)))
-            as Arc<dyn TableProvider>;
+        let accelerator = Arc::new(mem_table) as Arc<dyn TableProvider>;
 
         // Create retention configuration
         let retention_delete_expr = retention_sql.map(|sql| {
@@ -325,6 +336,7 @@ mod tests {
             retention,
             caching,
             Handle::current(),
+            Arc::new(Mutex::new(())),
         ));
 
         // Wait for retention to run

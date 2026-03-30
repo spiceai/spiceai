@@ -5,7 +5,9 @@ on:
     branches:
       - trunk
       - release/*
-
+  pull_request:
+    branches:
+      - trunk
   workflow_dispatch:
 
 concurrency:
@@ -17,17 +19,8 @@ jobs:
   make_install:
     name: make install*
     runs-on: spiceai-dev-runners
-    env:
-      GOVER: 1.25.3
-
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-
-      - name: Set up Go
-        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6
-        with:
-          go-version: ${{ env.GOVER }}
-          cache: false
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -59,10 +52,6 @@ jobs:
         run: |
           make install-runtime
 
-      - name: make install-with-models
+      - name: make install-odbc
         run: |
-          make install-with-models
-
-      - name: make install-with-odbc
-        run: |
-          make install-with-odbc
+          make install-odbc

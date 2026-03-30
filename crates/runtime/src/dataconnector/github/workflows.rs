@@ -28,10 +28,11 @@ use datafusion::{
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
+        SortOrderPushdownResult,
         execution_plan::{
             Boundedness, CardinalityEffect, EmissionType, InvariantLevel, check_default_invariants,
         },
-        expressions::Column,
+        expressions::{Column, PhysicalSortExpr},
         filter_pushdown::{
             ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
         },
@@ -344,5 +345,12 @@ impl ExecutionPlan for WorkflowsExecutionPlan {
 
     fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
         None
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        _order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        Ok(SortOrderPushdownResult::Unsupported)
     }
 }

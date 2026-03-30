@@ -32,6 +32,7 @@ use crate::federated_table::FederatedTable;
 use crate::search::full_text::table::add_full_text_search_to_table;
 use crate::search::util::find_concrete_table_provider;
 use futures::StreamExt;
+use tokio::sync::Mutex;
 
 /// A [`DataConnector`] middleware that, for [`Dataset`]s needing full text search capabilies, creates a [`IndexedTableProvider`] using the underlying [`TableProvider`]s and a [`FullTextDatabaseIndex`]. If no full text search capabilities are needed it is not unnecessarily nested.
 #[derive(Debug)]
@@ -152,9 +153,16 @@ impl DataConnector for FullTextConnector {
         &self,
         federated_table: Arc<FederatedTable>,
         dataset: &Dataset,
+        accelerated_table_provider: Arc<dyn TableProvider>,
+        accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> Option<ChangesStream> {
         self.with_indexed_stream(federated_table, |inner, ft| {
-            inner.changes_stream(ft, dataset)
+            inner.changes_stream(
+                ft,
+                dataset,
+                Arc::clone(&accelerated_table_provider),
+                Arc::clone(&accelerator_write_mutex),
+            )
         })
     }
 

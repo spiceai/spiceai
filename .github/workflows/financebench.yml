@@ -64,23 +64,14 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build spiced
-        run: |
-          make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models"
-
-      - name: make spiced executable
-        run: |
-          mv target/release/spiced spiced
-          chmod +x spiced
-
-      - name: Save spice artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: ./.github/actions/build-spiced
         with:
-          name: spiced
-          path: spiced
+          features: 'models'
+          upload_artifact: 'true'
 
   setup-matrix:
     name: Setup matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -155,12 +146,12 @@ jobs:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Download testoperator
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: testoperator-darwin
 
       - name: Download spiced
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: spiced
 

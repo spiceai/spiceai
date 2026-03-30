@@ -403,7 +403,9 @@ impl TextToSqlRunMetric {
 }
 
 /// Calculate the Intersection over Union (`IoU`) between two sets.
-pub(crate) fn intersection_over_union<T: Eq + Hash>(
+#[must_use]
+#[expect(clippy::implicit_hasher)]
+pub fn intersection_over_union<T: Eq + Hash>(
     set_a: &std::collections::HashSet<T>,
     set_b: &std::collections::HashSet<T>,
 ) -> f64 {

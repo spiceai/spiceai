@@ -16,7 +16,7 @@ text-splitter = { git = "https://github.com/spiceai/text-splitter.git", rev = "5
     "tokenizers",
     "tiktoken-rs",
 ] }
-tiktoken-rs = "0.6.0"
+tiktoken-rs = "0.9.1"
 tokenizers.workspace = true
 tracing.workspace = true
 

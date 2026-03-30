@@ -1,0 +1,9 @@
+---
+source: crates/runtime/tests/cluster/distributed_acceleration.rs
+expression: pretty
+---
++------------+-----------+---------+---------+
+| total_rows | avg_score | min_age | max_age |
++------------+-----------+---------+---------+
+| 10         | 85.2      | 26      | 52      |
++------------+-----------+---------+---------+

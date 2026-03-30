@@ -62,7 +62,7 @@ jobs:
 
       - name: Cache cargo-hack binary
         id: cache-cargo-hack
-        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: ~/.cargo/bin/cargo-hack
           key: cargo-hack-${{ runner.os }}-${{ runner.arch }}-0.6.31
@@ -74,10 +74,12 @@ jobs:
       # Use cargo-hack to efficiently check all feature combinations
       # This reuses build artifacts between checks, making it much faster than
       # running individual cargo check commands
+      # Note: --each-feature already includes a run with --no-default-features,
+      # so we don't need to specify it separately
       - name: Check all feature combinations
         run: |
-          cargo hack check --no-default-features --each-feature --profile lint \
-            --exclude-features default,extended_tests,models,cuda,metal,mcp,odbc,release,kafka,iceberg-write,snapshots,tpc-extension,spark,s3_vectors,bedrock
+          cargo hack check --each-feature --profile lint \
+            --exclude-features default,extended_tests,models,cuda,metal,mcp,odbc,release,kafka,iceberg-write,snapshots,tpc-extension,spark,s3_vectors,bedrock,nfs
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}

@@ -15,14 +15,19 @@ limitations under the License.
 */
 
 use super::ClusterTlsConfig;
-use crate::cluster::ClusterServiceImpl;
-use crate::flight::{Error, is_address_in_use_error};
+use super::composite_flight_service::CompositeFlightService;
+use crate::auth::EndpointAuth;
+use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::cluster::{ClusterServiceImpl, SchedulerPeers};
+use crate::flight::middleware::{RequestContextLayer, WriteRateLimitLayer};
+use crate::flight::{Error, Service as SpiceFlightService, is_address_in_use_error, session_auth};
 use crate::{Runtime, metrics as runtime_metrics};
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
-use ballista_executor::flight_service::BallistaFlightService;
+use governor::RateLimiter;
+use runtime_auth::layer::flight::BasicAuthLayer;
 use runtime_proto::cluster_service_server::ClusterServiceServer;
-use std::net::ToSocketAddrs;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Server, ServerTlsConfig};
 
@@ -53,6 +58,8 @@ fn server_with_cluster_mtls(
 pub async fn start_internal_cluster_server(
     rt: Arc<Runtime>,
     shutdown_signal: Option<CancellationToken>,
+    executor_registry: Arc<ExecutorRegistry>,
+    scheduler_peers: Arc<RwLock<SchedulerPeers>>,
 ) -> ClusterServerResult<()> {
     let bind_address = rt.df.cluster_config.node_bind_address();
 
@@ -100,12 +107,31 @@ pub async fn start_internal_cluster_server(
                 .map(str::to_string)
         })
         .unwrap_or_else(|| bind_address.to_string());
-    let cluster_service = ClusterServiceImpl::new(
-        Arc::clone(&rt.app),
-        Arc::clone(&rt.secrets),
-        advertise_address,
-        rt.scheduler_peers(),
-    );
+
+    // Use the shared executor stream registry if available (created during scheduler init).
+    // This allows the scheduler callback to broadcast PollNow to connected executors.
+    let cluster_service = if let Some(executor_streams) = rt.df.executor_stream_registry() {
+        ClusterServiceImpl::with_executor_streams(
+            Arc::clone(&rt.app),
+            Arc::clone(&rt.secrets),
+            advertise_address,
+            scheduler_peers,
+            Arc::clone(&rt.df),
+            Arc::clone(&executor_registry),
+            rt.metrics_reader().cloned(),
+            executor_streams,
+        )
+    } else {
+        ClusterServiceImpl::new(
+            Arc::clone(&rt.app),
+            Arc::clone(&rt.secrets),
+            advertise_address,
+            scheduler_peers,
+            Arc::clone(&rt.df),
+            Arc::clone(&executor_registry),
+            rt.metrics_reader().cloned(),
+        )
+    };
     let cluster_service_server = ClusterServiceServer::new(cluster_service);
 
     let server = server
@@ -135,15 +161,30 @@ pub async fn start_internal_cluster_server(
     Ok(())
 }
 
-/// Starts the executor Ballista Flight server used for receiving query fragments.
+/// Starts the executor Flight server for both Ballista shuffle data and Spice SQL queries.
+///
+/// This server uses a composite Flight service that routes:
+/// - Ballista-format requests (`FetchPartition`, `IO_BLOCK_TRANSPORT`) to `BallistaFlightService`
+/// - SQL and `FlightSQL` requests to Spice's Flight service
 ///
 /// mTLS is optional when `--allow-insecure-connections` is used.
 pub async fn start_executor_flight_server(
     bind_address: std::net::SocketAddr,
     rt: Arc<Runtime>,
+    endpoint_auth: EndpointAuth,
     shutdown_signal: Option<CancellationToken>,
 ) -> ClusterServerResult<()> {
     let tls_config = rt.df.cluster_config.tls_config();
+    let has_flight_auth = endpoint_auth.flight_basic_auth.is_some();
+
+    // In executor mode, never allow unauthenticated Flight DoPut without mTLS.
+    // Scheduler-trusted forwarding mode requires authenticated scheduler identity via mTLS.
+    if !has_flight_auth && tls_config.is_none() {
+        return Err(Error::InsecureConfiguration {
+            message: "Executor Flight server requires either API key auth or cluster mTLS. Configure endpoint auth or enable mTLS for scheduler-trusted forwarding.".to_string(),
+        });
+    }
+
     let mut server = Server::builder();
 
     if let Some(tls_config) = tls_config {
@@ -161,38 +202,69 @@ pub async fn start_executor_flight_server(
         );
     }
 
-    // Executor: serve only BallistaFlightService for receiving query fragments.
-    // No OTel service needed on executors.
+    if !has_flight_auth {
+        tracing::warn!(
+            "Executor Flight API key auth is disabled; accepting scheduler-trusted DoPut requires cluster mTLS"
+        );
+    }
+
+    // Create composite Flight service that handles both Ballista and Spice protocols
+    let spice_service =
+        SpiceFlightService::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
+    let session_store = spice_service.session_store();
+    let composite_service = CompositeFlightService::new(spice_service);
+
+    // Get app for request context
+    let app = rt.app.read().await.as_ref().map(Arc::clone);
+
+    // Wrap the auth in session-awareness to accept session IDs as bearer tokens
+    let session_aware_auth = session_auth::with_session_awareness(
+        endpoint_auth.flight_basic_auth,
+        session_store.clone(),
+    );
+    let auth_layer = tower::ServiceBuilder::new()
+        .layer(BasicAuthLayer::new(session_aware_auth))
+        .into_inner();
+
+    // Get job executor if available (cluster mode)
+    let job_executor = rt.job_executor();
+    let flight_write_rate_limit_enabled = rt.flight_write_rate_limit_enabled();
+
+    // Add middleware layers for request context, auth, and rate limiting
+    let rate_limits = &rt.rate_limits;
+    let mut server = server
+        .layer(
+            RequestContextLayer::new(app, rt.datafusion(), session_store, rt.secrets())
+                .with_job_executor(job_executor),
+        )
+        .layer(auth_layer)
+        .layer(WriteRateLimitLayer::new(
+            RateLimiter::direct(rate_limits.flight_write_limit),
+            flight_write_rate_limit_enabled,
+        ));
+
     let server = server.add_service(
-        arrow_flight::flight_service_server::FlightServiceServer::new(BallistaFlightService::new())
+        arrow_flight::flight_service_server::FlightServiceServer::new(composite_service)
             .max_decoding_message_size(usize::MAX)
             .max_encoding_message_size(usize::MAX),
     );
 
     // Use the executor's bound address if it was dynamically assigned during registration.
     #[expect(clippy::cast_possible_truncation)]
-    let bind_address = rt
-        .df
-        .executor
-        .read()
-        .ok()
-        .and_then(|maybe_executor| {
-            maybe_executor
-                .as_ref()
-                .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port as u16)))
-        })
-        .and_then(|spec| {
-            let (host, port) = &spec;
-            tokio::task::block_in_place(|| match spec.to_socket_addrs() {
-                Ok(sa) => Some(sa),
-                Err(e) => {
-                    tracing::error!("Unable to resolve bound executor host {host}:{port}: {e}");
-                    None
-                }
-            })
-        })
-        .and_then(|mut addrs| addrs.next())
-        .unwrap_or(bind_address);
+    let bind_address = match rt.df.executor.read().ok().and_then(|maybe_executor| {
+        maybe_executor
+            .as_ref()
+            .and_then(|e| e.metadata.host.clone().map(|h| (h, e.metadata.port as u16)))
+    }) {
+        Some((host, port)) => match tokio::net::lookup_host((&*host, port)).await {
+            Ok(mut addrs) => addrs.next().unwrap_or(bind_address),
+            Err(e) => {
+                tracing::error!("Unable to resolve bound executor host {host}:{port}: {e}");
+                bind_address
+            }
+        },
+        None => bind_address,
+    };
 
     tracing::info!("Spice Runtime executor Flight listening on {bind_address}");
     runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);

@@ -186,6 +186,17 @@ impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
 
         validate_identifier(&catalog.name).context(crate::ComponentSnafu)?;
 
+        if catalog
+            .name
+            .eq_ignore_ascii_case(crate::datafusion::SPICE_DEFAULT_CATALOG)
+        {
+            return Err(crate::Error::ComponentError {
+                source: super::Error::ReservedCatalogName {
+                    name: catalog.name.clone(),
+                },
+            });
+        }
+
         Ok(CatalogBuilder {
             provider: provider.to_string(),
             catalog_id,
@@ -214,6 +225,14 @@ impl CatalogBuilder {
     #[expect(clippy::result_large_err)]
     pub fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
         validate_identifier(name).context(crate::ComponentSnafu)?;
+
+        if name.eq_ignore_ascii_case(crate::datafusion::SPICE_DEFAULT_CATALOG) {
+            return Err(crate::Error::ComponentError {
+                source: super::Error::ReservedCatalogName {
+                    name: name.to_string(),
+                },
+            });
+        }
 
         let provider = Catalog::provider(from.as_str());
         let catalog_id = Catalog::catalog_id(from.as_str()).map(String::from);

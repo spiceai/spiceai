@@ -48,7 +48,9 @@ pub enum ListModelsError {
     #[snafu(display("Network error connecting to {provider}: {message}"))]
     NetworkError { provider: String, message: String },
 
-    #[snafu(display("Missing required parameter: {param}"))]
+    #[snafu(display(
+        "Missing required parameter '{param}' for listing models. Verify the model configuration."
+    ))]
     MissingParameter { param: String },
 
     #[snafu(display("Provider {provider} does not support listing models"))]

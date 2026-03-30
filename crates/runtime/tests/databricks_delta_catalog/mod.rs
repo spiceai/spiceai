@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::{
     ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 use app::AppBuilder;
 
@@ -28,6 +28,7 @@ use std::sync::Arc;
 async fn databricks_delta_lake_integration_test_catalog() -> Result<(), anyhow::Error> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(None);
+    register_test_connectors().await;
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );

@@ -2,13 +2,17 @@
 name: integration tests
 
 on:
-  merge_group:
-    types: [checks_requested]
   push:
     branches:
       - trunk
       - release/*
   pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+  merge_group:
     branches:
       - trunk
       - release-*
@@ -50,7 +54,7 @@ jobs:
   # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
   # a success when skipped).
   check_changes:
-    runs-on: spiceai-macos
+    runs-on: spiceai-dev-runners
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
@@ -76,7 +80,7 @@ jobs:
       # Cache Cargo dependencies
       - name: Cache Cargo registry
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
             ~/.cargo/registry/index/
@@ -97,6 +101,11 @@ jobs:
       - name: Set up cc
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up sccache
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -119,7 +128,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,spark,dynamodb,oracle,kafka,mongodb,iceberg-write,snapshots"
+          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,iceberg-write,snapshots,mongodb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
             FEATURES="${FEATURES},extended_tests"
             echo "Including extended_tests"
@@ -128,6 +137,7 @@ jobs:
           fi
 
           cargo nextest archive -p runtime --test integration --features ${FEATURES} --archive-file integration.tar.zst
+          cargo nextest archive -p runtime --test retention_oom --features ${FEATURES} --archive-file retention_oom.tar.zst
           cargo nextest archive -p runtime --test integration_aws_sdk --features databricks,delta_lake --archive-file integration_aws_sdk.tar.zst
           cargo nextest archive -p aws-sdk-credential-bridge --test credential_provider --archive-file integration_aws_sdk_credential_bridge.tar.zst
           cargo nextest archive -p runtime-table-partition --test partition_table_provider --archive-file partition_table_test.tar.zst
@@ -136,15 +146,23 @@ jobs:
       # Upload the test archive as an artifact
       - name: Upload test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: integration-test-archive
           path: ./integration.tar.zst
           retention-days: 1
 
+      - name: Upload retention OOM test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: integration-retention-oom-test-archive
+          path: ./retention_oom.tar.zst
+          retention-days: 1
+
       - name: Upload AWS SDK test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: integration-aws-sdk-test-archive
           path: ./integration_aws_sdk.tar.zst
@@ -152,7 +170,7 @@ jobs:
 
       - name: Upload AWS SDK credential bridge test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: integration-aws-sdk-credential-bridge-test-archive
           path: ./integration_aws_sdk_credential_bridge.tar.zst
@@ -160,7 +178,7 @@ jobs:
 
       - name: Upload partition table test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: integration-partition-table-test-archive
           path: ./partition_table_test.tar.zst
@@ -168,7 +186,7 @@ jobs:
 
       - name: Upload data components test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: integration-data-components-test-archive
           path: ./data_components_hadoop.tar.zst
@@ -207,10 +225,17 @@ jobs:
       # Download the test archive artifact
       - name: Download test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-test-archive
           path: ./integration_test
+
+      - name: Download retention OOM test archive
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: integration-retention-oom-test-archive
+          path: ./retention_oom_test
 
       - name: Set up Nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -218,7 +243,7 @@ jobs:
 
       - name: Login to ACR
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
         with:
           registry: spiceaitestimages.azurecr.io
           username: spiceai-repo-pull
@@ -238,7 +263,7 @@ jobs:
 
       - name: Set up Github Token
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v2
         id: github-app-token
         with:
           app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
@@ -255,6 +280,10 @@ jobs:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
           GITHUB_ORG_TOKEN: ${{ steps.github-app-token.outputs.token }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # MinIO/S3-compatible storage for TPC-DS and other S3 tests
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           # old dbc instance
           TEST_DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           TEST_DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
@@ -283,12 +312,20 @@ jobs:
           ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
           AWS_SNAPSHOT_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
           AWS_SNAPSHOT_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
+          AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
             INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_test/integration.tar.zst
           else
             INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_test/integration.tar.zst --skip spiceai_integration_test
           fi
+
+      - name: Run retention OOM regression test
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
+        run: |
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./retention_oom_test/retention_oom.tar.zst
+
       - name: Upload integration snapshots artifact
         id: create_snapshot_archive
         if: github.event.inputs.update_snapshots == 'always' && needs.check_changes.outputs.relevant_changes == 'true'
@@ -307,7 +344,7 @@ jobs:
         shell: bash
       - name: Store integration snapshots artifact
         if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true' && needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: integration-snapshots-part-${{ matrix.label }}
           path: integration-snapshots-part-${{ matrix.label }}.tar.gz
@@ -321,7 +358,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    runs-on: ubuntu-latest
+    runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -330,7 +367,7 @@ jobs:
       - name: Download integration snapshots artifacts
         id: download_snapshots
         continue-on-error: true
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: integration-snapshots-part-*
           merge-multiple: true
@@ -366,7 +403,7 @@ jobs:
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
-    runs-on: ubuntu-latest
+    runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -376,7 +413,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Download AWS SDK test archive
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-aws-sdk-test-archive
           path: ./integration_aws_sdk_test
@@ -385,7 +422,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -406,7 +443,7 @@ jobs:
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
-    runs-on: ubuntu-latest
+    runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -416,7 +453,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Download AWS SDK credential bridge test archive
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-aws-sdk-credential-bridge-test-archive
           path: ./integration_aws_sdk_credential_bridge_test
@@ -425,7 +462,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -460,7 +497,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Download data components test archive
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-data-components-test-archive
           path: ./data_components_test
@@ -480,7 +517,7 @@ jobs:
     name: Partition Table Integration Tests
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    runs-on: ubuntu-latest
+    runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -489,7 +526,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Download partition table test archive
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: integration-partition-table-test-archive
           path: ./partition_table_test
@@ -498,7 +535,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io

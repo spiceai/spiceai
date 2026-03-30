@@ -26,18 +26,43 @@ use std::{sync::Arc, time::SystemTime};
 use super::{AccelerationConnection, Error, Result, acceleration_connection};
 use crate::dataaccelerator::{AccelerationSource, spice_sys::OpenOption};
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
+#[cfg(any(
+    feature = "sqlite",
+    feature = "duckdb",
+    feature = "postgres-accel",
+    feature = "turso"
+))]
+use datafusion::arrow::datatypes::Schema;
+use datafusion::arrow::datatypes::SchemaRef;
 use runtime_acceleration::{dataset_checkpoint::DatasetCheckpointer, snapshot::SnapshotBehavior};
+#[cfg(any(
+    feature = "sqlite",
+    feature = "duckdb",
+    feature = "postgres-accel",
+    feature = "turso"
+))]
 use serde_json;
 use snafu::ResultExt;
 
+#[cfg(any(
+    feature = "sqlite",
+    feature = "duckdb",
+    feature = "postgres-accel",
+    feature = "turso"
+))]
 const CHECKPOINT_TABLE_NAME: &str = "spice_sys_dataset_checkpoint";
+#[cfg(any(
+    feature = "sqlite",
+    feature = "duckdb",
+    feature = "postgres-accel",
+    feature = "turso"
+))]
 const SCHEMA_MIGRATION_01_STMT: &str =
     "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS schema_json TEXT";
 
 #[cfg(feature = "duckdb")]
 mod duckdb;
-#[cfg(feature = "postgres")]
+#[cfg(feature = "postgres-accel")]
 mod postgres;
 #[cfg(feature = "sqlite")]
 mod sqlite;
@@ -103,10 +128,16 @@ impl DatasetCheckpoint {
 
     async fn init(connection: &AccelerationConnection) -> Result<()> {
         // First create the initial table
+        #[cfg(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        ))]
         match connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => Self::init_duckdb(pool)?,
-            #[cfg(feature = "postgres")]
+            #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => Self::init_postgres(pool).await?,
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => Self::init_sqlite(conn).await?,
@@ -114,20 +145,19 @@ impl DatasetCheckpoint {
             AccelerationConnection::Turso(pool) => Self::init_turso(pool).await?,
             #[cfg(all(not(windows), feature = "sqlite"))]
             AccelerationConnection::Cayenne(conn) => Self::init_sqlite(conn).await?,
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "duckdb",
-                feature = "postgres",
-                feature = "turso"
-            )))]
-            _ => return Err(Error::NoAccelerationConnection),
         }
 
         // Then add the schema column if it doesn't exist
+        #[cfg(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        ))]
         match connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => Self::migrate_duckdb(pool)?,
-            #[cfg(feature = "postgres")]
+            #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => Self::migrate_postgres(pool).await?,
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => Self::migrate_sqlite(conn).await?,
@@ -135,22 +165,44 @@ impl DatasetCheckpoint {
             AccelerationConnection::Turso(pool) => Self::migrate_turso(pool).await?,
             #[cfg(all(not(windows), feature = "sqlite"))]
             AccelerationConnection::Cayenne(conn) => Self::migrate_sqlite(conn).await?,
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "duckdb",
-                feature = "postgres",
-                feature = "turso"
-            )))]
-            _ => return Err(Error::NoAccelerationConnection),
         }
 
+        #[cfg(not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )))]
+        {
+            let _ = connection;
+            Err(Error::NoAccelerationConnection)
+        }
+
+        #[cfg(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        ))]
         Ok(())
     }
 
+    #[cfg(any(
+        feature = "sqlite",
+        feature = "duckdb",
+        feature = "postgres-accel",
+        feature = "turso"
+    ))]
     fn serialize_schema(schema: &SchemaRef) -> Result<String> {
         serde_json::to_string(schema).map_err(Error::external)
     }
 
+    #[cfg(any(
+        feature = "sqlite",
+        feature = "duckdb",
+        feature = "postgres-accel",
+        feature = "turso"
+    ))]
     fn deserialize_schema(schema_json: &str) -> Result<SchemaRef> {
         let schema: Schema = serde_json::from_str(schema_json).map_err(Error::external)?;
         Ok(std::sync::Arc::new(schema))
@@ -160,7 +212,7 @@ impl DatasetCheckpoint {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.exists_duckdb(pool).ok().unwrap_or(false),
-            #[cfg(feature = "postgres")]
+            #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => {
                 self.exists_postgres(pool).await.ok().unwrap_or(false)
             }
@@ -179,7 +231,7 @@ impl DatasetCheckpoint {
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
-                feature = "postgres",
+                feature = "postgres-accel",
                 feature = "turso"
             )))]
             _ => false,
@@ -190,7 +242,7 @@ impl DatasetCheckpoint {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.last_checkpoint_time_duckdb(pool),
-            #[cfg(feature = "postgres")]
+            #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => {
                 self.last_checkpoint_time_postgres(pool).await
             }
@@ -203,7 +255,7 @@ impl DatasetCheckpoint {
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
-                feature = "postgres",
+                feature = "postgres-accel",
                 feature = "turso"
             )))]
             _ => Err(Error::NoAccelerationConnection),
@@ -214,7 +266,7 @@ impl DatasetCheckpoint {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.checkpoint_duckdb(pool, schema),
-            #[cfg(feature = "postgres")]
+            #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.checkpoint_postgres(pool, schema).await,
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.checkpoint_sqlite(conn, schema).await,
@@ -225,7 +277,7 @@ impl DatasetCheckpoint {
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
-                feature = "postgres",
+                feature = "postgres-accel",
                 feature = "turso"
             )))]
             _ => Err(Error::NoAccelerationConnection),
@@ -236,7 +288,7 @@ impl DatasetCheckpoint {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
             AccelerationConnection::DuckDB(pool) => self.get_schema_duckdb(pool),
-            #[cfg(feature = "postgres")]
+            #[cfg(feature = "postgres-accel")]
             AccelerationConnection::Postgres(pool) => self.get_schema_postgres(pool).await,
             #[cfg(feature = "sqlite")]
             AccelerationConnection::SQLite(conn) => self.get_schema_sqlite(conn).await,
@@ -247,7 +299,7 @@ impl DatasetCheckpoint {
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
-                feature = "postgres",
+                feature = "postgres-accel",
                 feature = "turso"
             )))]
             _ => Err(Error::NoAccelerationConnection),

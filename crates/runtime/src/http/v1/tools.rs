@@ -39,10 +39,11 @@ struct ListToolElement {
 
 /// List Tools
 ///
-/// List available tools in the Spice runtime.
+/// Returns a list of all available tools in the Spice runtime. Tools provide reusable functionality that can be invoked programmatically or by AI agents.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/tools",
+    operation_id = "list_tools",
     tag = "Tools",
     responses(
         (
@@ -71,10 +72,11 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
 
 /// Run Tool
 ///
-/// The request body and JSON response formats match the tool’s specification.
+/// Execute a specific tool by name. The request body schema and response format are defined by each individual tool's specification. Use `GET /v1/tools` to discover available tools and their parameter schemas.
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/tools/{name}",
+    operation_id = "run_tool",
     tag = "Tools",
     params(
         ("name" = String, Path, description = "Name of the tool")
@@ -110,7 +112,7 @@ pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
             }]))
         ))),
         (status = 404, description = "Tool not found", body = String, example="Tool no_sql not found"),
-        (status = 500, description = "Error occured whilst calling the tool", body = serde_json::Value,
+        (status = 500, description = "An error occurred while calling the tool", body = serde_json::Value,
             example=json!({"message": "Error calling tool no_sql: No such tool"}))
     )
 ))]

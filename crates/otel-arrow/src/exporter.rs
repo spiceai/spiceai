@@ -18,7 +18,7 @@ use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use opentelemetry_sdk::{
     error::{OTelSdkError, OTelSdkResult},
-    metrics::{MetricError, Temporality, data::ResourceMetrics, exporter::PushMetricExporter},
+    metrics::{Temporality, data::ResourceMetrics, exporter::PushMetricExporter},
 };
 
 use crate::converter::OtelToArrowConverter;
@@ -58,18 +58,17 @@ impl<E: ArrowExporter> OtelArrowExporter<E> {
     }
 }
 
-#[async_trait]
 impl<E: ArrowExporter> PushMetricExporter for OtelArrowExporter<E> {
     #[expect(clippy::manual_async_fn)]
     fn export(
         &self,
-        metrics: &mut ResourceMetrics,
+        metrics: &ResourceMetrics,
     ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
         async move {
-            let mut converter = OtelToArrowConverter::new(metrics.scope_metrics.len());
+            let mut converter = OtelToArrowConverter::new(metrics.scope_metrics().count());
             let batch = converter
                 .convert(metrics)
-                .map_err(|err| metric_error_to_sdk_error(&err))?;
+                .map_err(|err| OTelSdkError::InternalFailure(err.to_string()))?;
 
             self.exporter.export(batch).await
         }
@@ -83,11 +82,11 @@ impl<E: ArrowExporter> PushMetricExporter for OtelArrowExporter<E> {
         self.exporter.shutdown()
     }
 
+    fn shutdown_with_timeout(&self, _timeout: std::time::Duration) -> OTelSdkResult {
+        self.exporter.shutdown()
+    }
+
     fn temporality(&self) -> Temporality {
         Temporality::Cumulative
     }
-}
-
-fn metric_error_to_sdk_error(err: &MetricError) -> OTelSdkError {
-    OTelSdkError::InternalFailure(err.to_string())
 }

@@ -2,4 +2,4 @@
 source: crates/runtime-table-partition/tests/partition_table_provider.rs
 expression: explain_plan
 ---
-PartitionMemTableExec: partition_value=1000, filters=[sales >= Int64(1000), sales < Int64(2000)]
+PartitionMemTableExec: partition_values=[Int64(1000)], filters=[sales >= Int64(1000), sales < Int64(2000)]

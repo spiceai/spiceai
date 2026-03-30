@@ -82,6 +82,11 @@ pub enum Error {
         "Failed to save decrypted private key content as PEM. Verify filesystem permissions, and try again. {source}"
     ))]
     FailedToCreatePem { source: pkcs8::der::Error },
+
+    #[snafu(display(
+        "Both 'snowflake_private_key' and 'snowflake_private_key_path' are specified. Only one of these options can be specified for a given dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/snowflake#auth"
+    ))]
+    MutuallyExclusivePrivateKeyParams,
 }
 
 pub struct SnowflakeConnectionPool {
@@ -214,17 +219,24 @@ fn init_snowflake_api_with_keypair_auth(
     role: Option<&String>,
     params: &HashMap<String, SecretString>,
 ) -> Result<SnowflakeApi, Error> {
-    let private_key_path = params
-        .get("private_key_path")
-        .map(SecretBox::expose_secret)
-        .context(MissingRequiredSecretSnafu {
-            name: "snowflake_private_key_path",
-        })?;
+    let private_key_content = params.get("private_key").map(SecretBox::expose_secret);
+    let private_key_path = params.get("private_key_path").map(SecretBox::expose_secret);
 
-    let mut private_key_pem: String =
-        fs::read_to_string(private_key_path).context(ErrorReadingPrivateKeyFileSnafu {
-            file_path: private_key_path,
-        })?;
+    let mut private_key_pem: String = match (private_key_content, private_key_path) {
+        (Some(_), Some(_)) => {
+            return MutuallyExclusivePrivateKeyParamsSnafu.fail();
+        }
+        (Some(content), None) => content.to_string(),
+        (None, Some(path)) => {
+            fs::read_to_string(path).context(ErrorReadingPrivateKeyFileSnafu { file_path: path })?
+        }
+        (None, None) => {
+            return MissingRequiredSecretSnafu {
+                name: "snowflake_private_key or snowflake_private_key_path",
+            }
+            .fail();
+        }
+    };
 
     let (label, data) =
         SecretDocument::from_pem(&private_key_pem).context(UnableToParsePrivateKeySnafu)?;

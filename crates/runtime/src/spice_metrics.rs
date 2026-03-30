@@ -17,6 +17,7 @@ limitations under the License.
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use crate::datafusion::error::format_datafusion_error;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::sql::TableReference;
@@ -37,10 +38,13 @@ use crate::secrets::Secrets;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Error creating metrics table: {source}"))]
+    #[snafu(display("Failed to create the internal metrics table: {source}"))]
     UnableToCreateMetricsTable { source: InternalTableError },
 
-    #[snafu(display("Error registering metrics table: {source}"))]
+    #[snafu(display(
+        "Failed to register the internal metrics table: {}",
+        format_datafusion_error(source)
+    ))]
     UnableToRegisterToMetricsTable { source: DataFusionError },
 }
 

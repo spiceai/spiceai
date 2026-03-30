@@ -41,7 +41,7 @@ pub enum Error {
     FailedToReadObject { source: object_store::Error },
 
     #[snafu(display("Unable to parse the provided Spicepod. {}", source))]
-    FailedToParseSpicepod { source: serde_yaml::Error },
+    FailedToParseSpicepod { source: yaml::Error },
 
     #[snafu(display("Failed to create zip archive. {}", source))]
     FailedToCreateZip { source: zip::result::ZipError },
@@ -63,7 +63,7 @@ pub enum Error {
     LinkedFileNotAValidPath { source: object_store::path::Error },
 
     #[snafu(display("Failed to parse the provided Spicepod component. {}", source))]
-    UnableToParseSpicepodComponent { source: serde_yaml::Error },
+    UnableToParseSpicepodComponent { source: yaml::Error },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -238,7 +238,7 @@ async fn get_spicepod(
     let cursor = std::io::Cursor::new(spicepod_bytes.clone());
     Ok((
         spicepod_bytes,
-        serde_yaml::from_reader(cursor).context(FailedToParseSpicepodSnafu)?,
+        yaml::from_reader(cursor).context(FailedToParseSpicepodSnafu)?,
     ))
 }
 
@@ -349,8 +349,8 @@ where
             });
 
             let component_rdr = std::io::Cursor::new(component_bytes);
-            let component: ComponentType = serde_yaml::from_reader(component_rdr)
-                .context(UnableToParseSpicepodComponentSnafu)?;
+            let component: ComponentType =
+                yaml::from_reader(component_rdr).context(UnableToParseSpicepodComponentSnafu)?;
             linked_files.extend(extract_linked_files(&component)?);
         } else {
             linked_files.push(PathReference::YmlOrYaml {

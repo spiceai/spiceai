@@ -96,7 +96,6 @@ impl IcebergResponseError {
         }
     }
 
-    #[expect(dead_code)]
     pub fn bad_request(message: String) -> Self {
         Self {
             error: IcebergError {

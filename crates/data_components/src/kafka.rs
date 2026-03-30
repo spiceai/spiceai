@@ -75,7 +75,7 @@ pub enum Error {
     #[snafu(display("The metadata for topic {topic} was not found."))]
     MetadataTopicNotFound { topic: String },
 
-    #[snafu(display("Received empty batch. Retry"))]
+    #[snafu(display("Received empty batch from Kafka topic. The consumer will retry."))]
     EmptyBatch,
 }
 
@@ -498,8 +498,9 @@ impl<'a, K, V> KafkaMessage<'a, K, V> {
     }
 }
 
-impl<K, V> CommitChange for KafkaMessage<'_, K, V> {
-    fn commit(&self) -> Result<(), CommitError> {
+#[async_trait]
+impl<K: Sync, V: Sync> CommitChange for KafkaMessage<'_, K, V> {
+    async fn commit(&self) -> Result<(), CommitError> {
         self.mark_processed()
             .boxed()
             .map_err(|e| cdc::CommitError::UnableToCommitChange { source: e })?;
@@ -540,8 +541,9 @@ impl MessageBatchCommitter {
     }
 }
 
+#[async_trait]
 impl CommitChange for MessageBatchCommitter {
-    fn commit(&self) -> Result<(), CommitError> {
+    async fn commit(&self) -> Result<(), CommitError> {
         for (topic, partition, offset) in &self.offsets {
             self.consumer
                 .store_offset(topic, *partition, *offset)

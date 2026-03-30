@@ -23,15 +23,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::SetOnce;
+
 use app::spicepod::component::runtime::{Runtime as SpicepodRuntime, TelemetryConfig};
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser};
-use flightrepl::ReplConfig;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
 use otel_arrow::OtelArrowExporter;
+use repl::ReplConfig;
 use runtime::cluster::ResolvedClusterConfig;
 use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
@@ -40,7 +42,6 @@ use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use runtime_async::ManagedTokioRuntime;
-use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
@@ -48,10 +49,140 @@ use tokio::runtime::Handle;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
 use util::in_tracing_context;
+use yaml::Value;
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
 mod tls;
+
+/// Registers all external data connectors with the runtime.
+///
+/// This function must be called during runtime initialization to make the
+/// extracted connector crates available. Unlike the built-in connectors in
+/// the runtime crate, external connectors are not automatically registered
+/// via the `linkme` distributed slice pattern.
+pub async fn register_external_connectors() {
+    use runtime::dataconnector::register_connector_factory;
+
+    // Always-compiled connectors (no feature gate)
+    register_connector_factory(
+        connector_graphql::CONNECTOR_NAME,
+        connector_graphql::factory(),
+    )
+    .await;
+
+    // Feature-gated connectors
+    #[cfg(feature = "clickhouse")]
+    register_connector_factory(
+        connector_clickhouse::CONNECTOR_NAME,
+        connector_clickhouse::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "databricks")]
+    register_connector_factory(
+        connector_databricks::CONNECTOR_NAME,
+        connector_databricks::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "delta_lake")]
+    register_connector_factory(
+        connector_delta_lake::CONNECTOR_NAME,
+        connector_delta_lake::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "dremio")]
+    register_connector_factory(
+        connector_dremio::CONNECTOR_NAME,
+        connector_dremio::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "duckdb")]
+    register_connector_factory(
+        connector_duckdb::CONNECTOR_NAME,
+        connector_duckdb::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "flightsql")]
+    register_connector_factory(
+        connector_flightsql::CONNECTOR_NAME,
+        connector_flightsql::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "ftp")]
+    register_connector_factory(connector_ftp::CONNECTOR_NAME, connector_ftp::factory()).await;
+
+    #[cfg(feature = "imap")]
+    register_connector_factory(connector_imap::CONNECTOR_NAME, connector_imap::factory()).await;
+
+    #[cfg(feature = "mongodb")]
+    register_connector_factory(
+        connector_mongodb::CONNECTOR_NAME,
+        connector_mongodb::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "mssql")]
+    register_connector_factory(connector_mssql::CONNECTOR_NAME, connector_mssql::factory()).await;
+
+    #[cfg(feature = "mysql")]
+    register_connector_factory(connector_mysql::CONNECTOR_NAME, connector_mysql::factory()).await;
+
+    #[cfg(feature = "nfs")]
+    register_connector_factory(connector_nfs::CONNECTOR_NAME, connector_nfs::factory()).await;
+
+    #[cfg(feature = "odbc")]
+    register_connector_factory(connector_odbc::CONNECTOR_NAME, connector_odbc::factory()).await;
+
+    #[cfg(feature = "oracle")]
+    register_connector_factory(
+        connector_oracle::CONNECTOR_NAME,
+        connector_oracle::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "postgres")]
+    register_connector_factory(
+        connector_postgres::CONNECTOR_NAME,
+        connector_postgres::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "scylladb")]
+    register_connector_factory(
+        connector_scylladb::CONNECTOR_NAME,
+        connector_scylladb::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "sftp")]
+    register_connector_factory(connector_sftp::CONNECTOR_NAME, connector_sftp::factory()).await;
+
+    #[cfg(feature = "sharepoint")]
+    register_connector_factory(
+        connector_sharepoint::CONNECTOR_NAME,
+        connector_sharepoint::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "smb")]
+    register_connector_factory(connector_smb::CONNECTOR_NAME, connector_smb::factory()).await;
+
+    #[cfg(feature = "snowflake")]
+    register_connector_factory(
+        connector_snowflake::CONNECTOR_NAME,
+        connector_snowflake::factory(),
+    )
+    .await;
+
+    #[cfg(feature = "spark")]
+    register_connector_factory(connector_spark::CONNECTOR_NAME, connector_spark::factory()).await;
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -72,7 +203,7 @@ pub enum Error {
         data_connector: String,
     },
 
-    #[snafu(display("Unable to create data backend: {source}"))]
+    #[snafu(display("Failed to initialize the query engine: {source}"))]
     UnableToCreateBackend {
         source: Box<runtime::datafusion::Error>,
     },
@@ -91,12 +222,12 @@ pub enum Error {
     #[snafu(display("Unable to initialize metrics: {source}"))]
     UnableToInitializeMetrics { source: Box<dyn std::error::Error> },
 
-    #[snafu(display("Unable to initialize the DataFusion Tokio runtime: {source}"))]
+    #[snafu(display("Failed to initialize the query processing runtime: {source}"))]
     UnableToInitializeDatafusionTokioRuntime {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Generic Error: {reason}"))]
+    #[snafu(display("Unexpected runtime error: {reason}"))]
     GenericError { reason: String },
 
     #[snafu(display("Invalid cluster configuration: {source}"))]
@@ -200,6 +331,10 @@ pub struct Args {
 }
 
 pub async fn run(args: Args) -> Result<()> {
+    // Register external data connectors before runtime initialization.
+    // This makes connectors from extracted crates available to the runtime.
+    register_external_connectors().await;
+
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 
     let spicepod_path = args
@@ -229,7 +364,37 @@ pub async fn run(args: Args) -> Result<()> {
     let app_name = app.as_ref().map(|app| app.name.clone());
     let spicepod_tls_config = runtime_config.and_then(|rt| rt.tls.clone());
     let tracing_config = runtime_config.and_then(|rt| rt.tracing.clone());
-    let telemetry_config = runtime_config.map(|rt| rt.telemetry.clone());
+
+    // Anonymous telemetry is a function of two inputs: the CLI flag and the
+    // spicepod `runtime.telemetry` config.  For schedulers and standalone
+    // instances the config is available immediately from the local spicepod.
+    // Executors don't have a spicepod — they fetch the app definition from the
+    // scheduler after joining the cluster — so the config is resolved later.
+    // A `SetOnce` lets `start_anonymous_telemetry` wait for the value.
+    let telemetry_config: Arc<SetOnce<TelemetryConfig>> = Arc::new(SetOnce::new());
+
+    let is_executor = matches!(args.runtime.cluster.role, Some(ClusterRole::Executor))
+        || (args.runtime.cluster.role.is_none()
+            && args.runtime.cluster.scheduler_address.is_some());
+
+    if !is_executor {
+        // Resolve immediately from the local spicepod (or use default).
+        let config = runtime_config
+            .map(|rt| rt.telemetry.clone())
+            .unwrap_or_default();
+        let _ = telemetry_config.set(config);
+    }
+
+    // Configure Flight `DoPut` rate limits from the local spicepod runtime.flight settings.
+    // Executors inherit their effective setting from the scheduler's app definition after they join the cluster.
+    let flight_config = runtime_config.and_then(|rt| rt.flight.clone());
+    let rate_limits = {
+        let mut limits = runtime::flight::RateLimits::default();
+        if let Some(ref flight) = flight_config {
+            limits = limits.with_flight_write_enabled(flight.do_put_rate_limit_enabled);
+        }
+        limits
+    };
 
     let resolved_cluster_config =
         in_tracing_context(|| ResolvedClusterConfig::try_new(args.runtime.cluster.clone()));
@@ -246,14 +411,38 @@ pub async fn run(args: Args) -> Result<()> {
         .with_datasets_health_monitor()
         .with_metrics_server_opt(args.metrics, prometheus_registry.clone())
         .with_runtime_config(args.runtime.clone())
+        .with_rate_limits(rate_limits)
         .with_io_runtime(Handle::current());
 
     // Check for explicit cluster role OR implicit executor role (scheduler_address set without explicit role)
     let is_cluster_mode =
         args.runtime.cluster.role.is_some() || args.runtime.cluster.scheduler_address.is_some();
 
+    // Create MetricsReader for cluster mode to enable on-demand OTLP metrics collection
+    let metrics_reader = if is_cluster_mode {
+        Some(runtime::metrics_reader::MetricsReader::new())
+    } else {
+        None
+    };
+
     match resolved_cluster_config {
         Ok(resolved_cluster_config) => {
+            // Validate that scheduler mode has state_location configured
+            if resolved_cluster_config.effective_role() == Some(ClusterRole::Scheduler) {
+                let has_state_location = app
+                    .as_ref()
+                    .and_then(|a| a.runtime.scheduler.as_ref())
+                    .is_some();
+                if !has_state_location {
+                    return Err(Error::InvalidClusterConfig {
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "Scheduler mode requires `runtime.scheduler.state_location` to be configured in the spicepod. See: https://spiceai.org/docs/features/distributed-query",
+                        ),
+                    });
+                }
+            }
+
             builder = builder.with_resolved_cluster_config(resolved_cluster_config);
         }
         Err(e) if is_cluster_mode => {
@@ -263,6 +452,15 @@ pub async fn run(args: Args) -> Result<()> {
         Err(_) => {
             // No cluster mode specified, silently continue in standalone mode
         }
+    }
+
+    // Add metrics reader to runtime for cluster observability
+    if let Some(ref reader) = metrics_reader {
+        builder = builder.with_metrics_reader(reader.clone());
+    }
+
+    if is_executor {
+        builder = builder.with_telemetry_config(Arc::clone(&telemetry_config));
     }
 
     if args.pods_watcher_enabled && args.spicepod.is_none() {
@@ -337,12 +535,21 @@ pub async fn run(args: Args) -> Result<()> {
 
     if let Some(ref metrics_registry) = prometheus_registry {
         let otel_config = telemetry_config
-            .as_ref()
+            .get()
             .and_then(|c| c.otel_exporter.as_ref())
             .filter(|c| c.enabled);
 
-        init_metrics(&rt.datafusion(), metrics_registry.clone(), otel_config)
-            .context(UnableToInitializeMetricsSnafu)?;
+        init_metrics(
+            &rt.datafusion(),
+            metrics_registry.clone(),
+            otel_config,
+            metrics_reader,
+        )
+        .context(UnableToInitializeMetricsSnafu)?;
+    } else if let Some(reader) = metrics_reader {
+        // In cluster mode without --metrics, we still need to register the MetricsReader
+        // so executors can respond to metrics requests from schedulers
+        init_cluster_metrics_only(reader);
     }
 
     let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
@@ -350,12 +557,12 @@ pub async fn run(args: Args) -> Result<()> {
         .context(UnableToInitializeTlsSnafu)?;
 
     let telemetry_enabled = args.telemetry_enabled;
-    let telemetry_config_clone = telemetry_config.clone();
+    let telemetry_config_clone = Arc::clone(&telemetry_config);
     let app_name_clone = app_name.clone();
     tokio::spawn(async move {
         start_anonymous_telemetry(
             telemetry_enabled,
-            telemetry_config_clone.as_ref(),
+            telemetry_config_clone,
             app_name_clone.as_ref(),
         )
         .await;
@@ -407,6 +614,20 @@ async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)
             && args.runtime.cluster.scheduler_address.is_some());
 
     if is_executor {
+        // If a spicepod is explicitly provided, load just the runtime config (e.g. flight rate
+        // limits, telemetry) while using a default App for datasets/catalogs (those come from
+        // the scheduler via the cluster protocol).
+        if let Some(ref path) = args.spicepod
+            && let Ok(built_app) = AppBuilder::build_from_path(path.clone()).await
+        {
+            let mut app = App::default();
+            // Copy only runtime flight and telemetry config from the spicepod.
+            app.runtime.flight = built_app.runtime.flight;
+            app.runtime.telemetry = built_app.runtime.telemetry;
+            app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
+            tracing::info!("Starting as a cluster executor with runtime config from spicepod.");
+            return Ok((Some(Arc::new(app)), None));
+        }
         tracing::info!(
             "Starting as a cluster executor, without a Spicepod. The runtime will initialize its components upon joining the cluster."
         );
@@ -447,6 +668,7 @@ fn init_metrics(
     df: &Arc<DataFusion>,
     registry: prometheus::Registry,
     otel_config: Option<&app::spicepod::component::runtime::OtelExporterConfig>,
+    metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let resource = Resource::builder().build();
 
@@ -470,6 +692,12 @@ fn init_metrics(
         .with_resource(resource)
         .with_reader(prometheus_exporter)
         .with_reader(spice_metrics_reader);
+
+    // Add cluster metrics reader for on-demand OTLP collection in cluster mode
+    if let Some(reader) = metrics_reader {
+        provider_builder = provider_builder.with_reader(reader);
+        tracing::debug!("Cluster metrics reader enabled for on-demand OTLP collection");
+    }
 
     // Add OTEL push exporter if configured
     if let Some(config) = otel_config {
@@ -496,6 +724,22 @@ fn init_metrics(
     Ok(())
 }
 
+/// Initializes metrics collection for cluster mode without Prometheus.
+///
+/// This is used by executors that don't have `--metrics` enabled but still need to
+/// respond to metrics requests from schedulers via the control stream.
+fn init_cluster_metrics_only(metrics_reader: runtime::metrics_reader::MetricsReader) {
+    let resource = Resource::builder().build();
+
+    let provider = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_reader(metrics_reader)
+        .build();
+
+    global::set_meter_provider(provider);
+    tracing::debug!("Cluster metrics reader enabled for on-demand OTLP collection (no Prometheus)");
+}
+
 /// Creates an OTEL periodic reader from the spicepod config
 fn create_otel_reader(
     config: &app::spicepod::component::runtime::OtelExporterConfig,
@@ -505,7 +749,7 @@ fn create_otel_reader(
 
 async fn start_anonymous_telemetry(
     telemetry_enabled: Option<bool>,
-    spicepod_telemetry_config: Option<&TelemetryConfig>,
+    telemetry_config: Arc<SetOnce<TelemetryConfig>>,
     spicepod_name: Option<&String>,
 ) {
     // Always log hardware info at debug level regardless of telemetry settings
@@ -515,27 +759,32 @@ async fn start_anonymous_telemetry(
         .unwrap_or_else(|_| telemetry::hardware::HardwareInfo::detect());
     hardware_info.log_debug();
 
-    let explicitly_disabled =
-        telemetry_enabled == Some(false) || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
-
-    let telemetry_properties = match spicepod_telemetry_config {
-        Some(config) => config
-            .properties
-            .clone()
-            .into_iter()
-            .map(|(k, v)| KeyValue::new(k, v))
-            .collect(),
-        None => Vec::new(),
-    };
-
-    if !explicitly_disabled {
-        #[cfg(feature = "anonymous_telemetry")]
-        telemetry::anonymous::start(
-            spicepod_name.map_or_else(|| "unknown", String::as_str),
-            telemetry_properties,
-        )
-        .await;
+    // CLI flag takes immediate priority.
+    if telemetry_enabled == Some(false) {
+        return;
     }
+
+    // Wait for the spicepod telemetry config to be resolved.  For schedulers
+    // and standalone instances this is already set; for executors it will be
+    // set once the app definition is fetched from the scheduler.
+    let config = telemetry_config.wait().await;
+
+    if telemetry_enabled != Some(true) && !config.enabled {
+        return;
+    }
+
+    let telemetry_properties: Vec<KeyValue> = config
+        .properties
+        .iter()
+        .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+        .collect();
+
+    #[cfg(feature = "anonymous_telemetry")]
+    telemetry::anonymous::start(
+        spicepod_name.map_or_else(|| "unknown", String::as_str),
+        telemetry_properties,
+    )
+    .await;
 }
 
 fn parse_set_string(s: &str) -> Result<(String, String), String> {
@@ -555,7 +804,7 @@ fn apply_overrides(
         return Ok(runtime_config);
     }
 
-    let mut yaml = match serde_yaml::to_value(runtime_config) {
+    let mut yaml = match yaml::to_value(&runtime_config) {
         Ok(yaml) => yaml,
         Err(e) => {
             return FailedToApplyOverridesGenericSnafu {
@@ -566,8 +815,7 @@ fn apply_overrides(
     };
 
     for (path, value) in overrides {
-        let yaml_value =
-            serde_yaml::from_str(value).unwrap_or_else(|_| Value::String(value.clone()));
+        let yaml_value = yaml::from_str(value).unwrap_or_else(|_| Value::String(value.clone()));
         match apply_override(&mut yaml, path, yaml_value) {
             Ok(()) => (),
             Err(e) => {
@@ -581,7 +829,7 @@ fn apply_overrides(
         }
     }
 
-    match serde_yaml::from_value(yaml) {
+    match yaml::from_value(yaml) {
         Ok(runtime) => Ok(runtime),
         Err(e) => {
             FailedToApplyOverridesGenericSnafu {
@@ -611,7 +859,7 @@ fn apply_override(
                     return Ok(());
                 }
                 Value::Null => {
-                    let mut new_map = serde_yaml::Mapping::new();
+                    let mut new_map = yaml::Mapping::new();
                     new_map.insert(Value::String(part.to_string()), value);
                     *current = Value::Mapping(new_map);
                     return Ok(());
@@ -627,10 +875,10 @@ fn apply_override(
 
         match current {
             Value::Mapping(map) => {
-                if !map.contains_key(Value::String(part.to_string())) {
+                if !map.contains_key(&Value::String(part.to_string())) {
                     map.insert(
                         Value::String(part.to_string()),
-                        Value::Mapping(serde_yaml::Mapping::new()),
+                        Value::Mapping(yaml::Mapping::new()),
                     );
                 }
                 let key = Value::String(part.to_string());

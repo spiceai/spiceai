@@ -18,7 +18,7 @@ use crate::{
     component::dataset::ReadyState,
     metric::Metrics,
     param::Params,
-    partitioning::{PartitionedBy, deserialize_partition_by},
+    partitioning::{PartitionedBy, deserialize_partition_by, serialize_partition_by},
 };
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
@@ -159,27 +159,27 @@ pub enum SnapshotsResetExpiryOnLoad {
 pub enum SnapshotsCreationPolicy {
     Always,
     #[default]
-    Changed,
+    OnChange,
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshot_behavior(b: &SnapshotBehavior) -> bool {
-    *b == SnapshotBehavior::Disabled
+    *b == SnapshotBehavior::default()
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshot_compaction(c: &SnapshotsCompaction) -> bool {
-    *c == SnapshotsCompaction::Disabled
+    *c == SnapshotsCompaction::default()
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshots_reset_expiry_on_load(c: &SnapshotsResetExpiryOnLoad) -> bool {
-    *c == SnapshotsResetExpiryOnLoad::Disabled
+    *c == SnapshotsResetExpiryOnLoad::default()
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_snapshots_creation_policy(c: &SnapshotsCreationPolicy) -> bool {
-    *c == SnapshotsCreationPolicy::Changed
+    *c == SnapshotsCreationPolicy::default()
 }
 
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -305,6 +305,7 @@ pub struct Acceleration {
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_partition_by",
         deserialize_with = "deserialize_partition_by"
     )]
     pub partition_by: Vec<PartitionedBy>,
@@ -395,7 +396,7 @@ impl Default for Acceleration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_yaml;
+    use yaml;
 
     #[test]
     fn test_deserialize_acceleration_on_conflict_string() {
@@ -404,7 +405,7 @@ mod tests {
                   foo: upsert
             ";
         let acceleration: Acceleration =
-            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
         assert_eq!(
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::Upsert)
@@ -418,7 +419,7 @@ mod tests {
                   foo: upsert_dedup
             ";
         let acceleration: Acceleration =
-            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
         assert_eq!(
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::UpsertDedup)
@@ -432,7 +433,7 @@ mod tests {
                   foo: upsert_dedup_by_row_id
             ";
         let acceleration: Acceleration =
-            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
         assert_eq!(
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::UpsertDedupByRowId)
@@ -446,7 +447,7 @@ mod tests {
                   foo: drop
             ";
         let acceleration: Acceleration =
-            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+            yaml::from_str(yaml).expect("Failed to parse Acceleration");
         assert_eq!(
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::Drop)

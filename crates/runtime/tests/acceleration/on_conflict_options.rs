@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
 use std::time::Duration;
-use test_framework::serde_yaml;
+use test_framework::yaml;
 
 /// Builder for creating test `RecordBatches` with specific data patterns
 #[derive(Debug)]
@@ -367,8 +367,7 @@ fn set_duckdb_acceleration(mut dataset: Dataset) -> Dataset {
                 engine: duckdb
                 mode: memory
             ";
-    let acceleration: Acceleration =
-        serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+    let acceleration: Acceleration = yaml::from_str(yaml).expect("Failed to parse Acceleration");
     dataset.acceleration = Some(acceleration);
     dataset
 }

@@ -6,11 +6,11 @@ all: build
 
 .PHONY: build-cli
 build-cli:
-	make -C bin/spice
+	cargo build --release -p spice
 
 .PHONY: build-cli-dev
 build-cli-dev:
-	export DEV=true; make -C bin/spice
+	cargo build -p spice
 
 .PHONY: build-runtime
 build-runtime:
@@ -25,7 +25,7 @@ build: build-cli build-runtime
 
 .PHONY: build-dev
 build-dev:
-	export DEV=true; make -C bin/spice
+	cargo build -p spice
 	export DEV=true; make -C bin/spiced
 
 .PHONY: build-testoperator-dev
@@ -35,6 +35,14 @@ build-testoperator-dev:
 .PHONY: build-testoperator
 build-testoperator:
 	cargo build --release -p testoperator --all-features
+
+.PHONY: build-spidapter-dev
+build-spidapter-dev:
+	cargo build -p spidapter --all-features
+
+.PHONY: build-spidapter
+build-spidapter:
+	cargo build --release -p spidapter --all-features
 
 .PHONY: ci
 ci:
@@ -56,6 +64,7 @@ endif
 .PHONY: nextest
 nextest:
 	@cargo nextest run --all --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
+	@cargo nextest run -p cayenne --tests $(NEXTEST_CARGO_PROFILE)
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
@@ -70,23 +79,23 @@ test-integration-without-spiceai-dataset:
 
 .PHONY: test-integration-models
 test-integration-models:
-	@cargo test -p runtime --test integration_models --features models -- --nocapture
+	@cargo test -p runtime --test integration_models --features models,duckdb -- --nocapture
 
 .PHONY: test-integration-models-without-openai
 test-integration-models-without-openai:
-	@cargo test -p runtime --test integration_models --features models -- --nocapture --skip openai_test
+	@cargo test -p runtime --test integration_models --features models,duckdb -- --nocapture --skip openai_test
 
 .PHONY: test-bench
 test-bench:
 	@cargo bench -p runtime --features postgres,spark,mysql
 
-.PHONY: lint lint-go lint-rust
-lint: lint-go lint-rust
+.PHONY: lint lint-rust
+lint: lint-rust
 
 lint-rust:
 	cargo fmt --all -- --check
-	## All except metal, cuda
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+	## All except metal, cuda, nfs (nfs requires system libnfs library)
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -101,7 +110,7 @@ lint-rust:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+	cargo clippy $(CARGO_PROFILE) --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -117,11 +126,34 @@ lint-rust:
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes \
 		-Aunfulfilled_lint_expectations
+
+## Optional: PACKAGES="pkg1 pkg2" to lint specific packages instead of the whole workspace
+## Optional: FEATURES="feat1,feat2" to override features
+## Feature defaults: when FEATURES is unset, uses aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp for workspace (unless PACKAGES is set, then uses package defaults)
+## Example: make lint-rust-fix PACKAGES="runtime data_components" FEATURES="duckdb,postgres"
+PACKAGES ?=
+FEATURES ?=
+ifdef PACKAGES
+_LINT_PKG_FLAGS := $(foreach p,$(PACKAGES),-p $(p))
+_LINT_WORKSPACE_FLAGS := $(_LINT_PKG_FLAGS)
+_FMT_FLAGS := $(_LINT_PKG_FLAGS)
+else
+_LINT_WORKSPACE_FLAGS := --workspace --exclude libnfs
+_FMT_FLAGS := --all
+endif
+# Apply FEATURES if provided, otherwise default to hardcoded features only for workspace-wide linting
+ifdef FEATURES
+_FEATURES_FLAGS := --features $(FEATURES)
+else ifdef PACKAGES
+_FEATURES_FLAGS :=
+else
+_FEATURES_FLAGS := --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp
+endif
 
 lint-rust-fix:
-	cargo fmt --all
-	## All except metal, cuda
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --fix --allow-dirty --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+	cargo fmt $(_FMT_FLAGS)
+	## All except metal, cuda, nfs (nfs requires system libnfs library)
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --all-targets --fix --allow-dirty $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -136,7 +168,7 @@ lint-rust-fix:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --tests $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -152,14 +184,10 @@ lint-rust-fix:
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes \
 		-Aunfulfilled_lint_expectations
-
-
-lint-go:
-	go vet ./...
-	golangci-lint run
 
 check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features
+	cargo check $(CARGO_PROFILE) --no-default-features --features adbc
 	cargo check $(CARGO_PROFILE) --no-default-features --features duckdb
 	cargo check $(CARGO_PROFILE) --no-default-features --features postgres
 	cargo check $(CARGO_PROFILE) --no-default-features --features sqlite
@@ -214,6 +242,11 @@ display-deps:
 ################################################################################
 # Target: install                                                              #
 ################################################################################
+# Default install includes models. Use -data suffix variants to build without models.
+# Data-only features (default features minus models)
+# Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
+SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,pingora,scylladb
+
 .PHONY: install
 install: build
 	mkdir -p ~/.spice/bin
@@ -223,30 +256,64 @@ install: build
 .PHONY: install-dev
 install-dev: build-dev
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spice ~/.spice/bin/spice
+	install -m 755 target/debug/spice ~/.spice/bin/spice
 	install -m 755 target/debug/spiced ~/.spice/bin/spiced
 
-.PHONY: install-with-models
-install-with-models:
-	make install SPICED_NON_DEFAULT_FEATURES="models"
+# Data-only variants (without models)
+.PHONY: install-data-only
+install-data-only:
+	make install SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES)"
 
-.PHONY: install-with-models-dev
-install-with-models-dev:
-	make install-dev SPICED_NON_DEFAULT_FEATURES="models"
+.PHONY: install-data-only-dev
+install-data-only-dev:
+	make install-dev SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES)"
 
-.PHONY: install-with-models-metal-dev
-install-with-models-metal-dev:
-	make install-dev SPICED_NON_DEFAULT_FEATURES="models,metal"
+# Metal variants (with GPU acceleration)
+.PHONY: install-metal
+install-metal:
+	make install SPICED_NON_DEFAULT_FEATURES="metal"
 
-install-with-models-metal:
-	make install SPICED_NON_DEFAULT_FEATURES="models,metal"
+.PHONY: install-metal-dev
+install-metal-dev:
+	make install-dev SPICED_NON_DEFAULT_FEATURES="metal"
 
-install-with-models-cuda:
-	make install SPICED_NON_DEFAULT_FEATURES="models,cuda"
+.PHONY: install-data-only-metal
+install-data-only-metal:
+	make install SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES),metal"
 
-.PHONY: install-with-odbc
-install-with-odbc:
+.PHONY: install-data-only-metal-dev
+install-data-only-metal-dev:
+	make install-dev SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES),metal"
+
+# CUDA variants
+.PHONY: install-cuda
+install-cuda:
+	make install SPICED_NON_DEFAULT_FEATURES="cuda"
+
+.PHONY: install-data-only-cuda
+install-data-only-cuda:
+	make install SPICED_CUSTOM_FEATURES="$(SPICED_DATA_FEATURES),cuda"
+
+# ODBC variants
+.PHONY: install-odbc
+install-odbc:
 	make install SPICED_NON_DEFAULT_FEATURES="odbc"
+
+# NFS variants
+.PHONY: install-nfs
+install-nfs:
+	make install SPICED_NON_DEFAULT_FEATURES="nfs"
+
+# Install from a CI build artifact (branch or commit SHA)
+# Usage:
+#   make install-build              # Latest build from trunk
+#   make install-build REF=<branch> # Latest build from a branch
+#   make install-build REF=<sha>    # Build for a specific commit
+REF ?= trunk
+
+.PHONY: install-build
+install-build:
+	./install/install-build.sh $(REF)
 
 .PHONY: install-testoperator-dev
 install-testoperator-dev: build-testoperator-dev
@@ -257,6 +324,16 @@ install-testoperator-dev: build-testoperator-dev
 install-testoperator: build-testoperator
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/testoperator ~/.spice/bin/testoperator
+
+.PHONY: install-spidapter-dev
+install-spidapter-dev: build-spidapter-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/debug/spidapter ~/.spice/bin/spidapter
+
+.PHONY: install-spidapter
+install-spidapter: build-spidapter
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/spidapter ~/.spice/bin/spidapter
 
 .PHONY: install-cli
 install-cli: build-cli
@@ -271,17 +348,20 @@ install-runtime: build-runtime
 .PHONY: install-cli-dev
 install-cli-dev: build-cli-dev
 	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spice ~/.spice/bin/spice
+	install -m 755 target/debug/spice ~/.spice/bin/spice
 
 ################################################################################
-# Target: modtidy                                                              #
+# Target: distributed                                                          #
 ################################################################################
-.PHONY: modtidy
-modtidy:
-	go mod tidy
+.PHONY: distributed
+distributed:
+	make install SPICED_NON_DEFAULT_FEATURES="vortex"
+	./scripts/distributed.sh
 
-
-
+.PHONY: distributed-dev
+distributed-dev:
+	make install-dev SPICED_NON_DEFAULT_FEATURES="vortex"
+	./scripts/distributed.sh
 
 ################################################################################
 # Target: generate-acknowledgements                                            #
@@ -291,16 +371,8 @@ ACKNOWLEDGEMENTS_PATH := acknowledgements.md
 .PHONY: generate-acknowledgements
 generate-acknowledgements:
 	echo "# Open Source Acknowledgements\n\nSpice.ai acknowledges the following open source projects for making this project possible:\n\n" > $(ACKNOWLEDGEMENTS_PATH)
-	make generate-acknowledgements-go
 	make generate-acknowledgements-rust
 	make generate-acknowledgements-formatting
-
-.PHONY: generate-acknowledgements-go
-generate-acknowledgements-go:
-	echo "\n## Go Modules\n" >> $(ACKNOWLEDGEMENTS_PATH)
-	go get github.com/google/go-licenses
-	go install github.com/google/go-licenses
-	cd bin/spice && go-licenses report --ignore github.com/spiceai/spiceai . 2>/dev/null >> ../../$(ACKNOWLEDGEMENTS_PATH) && cd ../../
 
 .PHONY: generate-acknowledgements-rust
 generate-acknowledgements-rust:

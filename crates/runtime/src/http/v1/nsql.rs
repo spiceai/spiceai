@@ -511,7 +511,7 @@ async fn table_allowlist(
     model_name: &str,
     rt: &Arc<Runtime>,
 ) -> Result<Option<ResolvedTableAwareAllowlist>, String> {
-    let Some(app) = &*rt.app.read().await else {
+    let Some(app) = rt.read_app().await else {
         return Err("Unexpected internal error. App not prepared in runtime.".to_string());
     };
 

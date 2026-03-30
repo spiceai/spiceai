@@ -30,6 +30,13 @@ pub enum SnapshotEngineError {
     #[snafu(display("DuckDB snapshot error: {source}"))]
     #[cfg(feature = "duckdb")]
     DuckDB { source: duckdb::DuckDBSnapshotError },
+
+    /// Placeholder variant for when no features are enabled
+    #[snafu(display(
+        "No snapshot engine is available. Enable a snapshot engine feature (e.g., 'duckdb')."
+    ))]
+    #[cfg(not(feature = "duckdb"))]
+    Generic,
 }
 
 /// Trait defining engine-specific snapshot operations.
@@ -76,7 +83,8 @@ impl SnapshotEngine for DefaultSnapshotEngine {
 /// Creates a snapshot engine for the given acceleration engine.
 pub fn create_snapshot_engine(
     engine: &AccelerationEngine,
-    compaction_enabled: bool,
+    #[cfg(feature = "duckdb")] compaction_enabled: bool,
+    #[cfg(not(feature = "duckdb"))] _compaction_enabled: bool,
 ) -> Arc<dyn SnapshotEngine> {
     match engine {
         #[cfg(feature = "duckdb")]

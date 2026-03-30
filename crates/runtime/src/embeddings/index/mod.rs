@@ -45,7 +45,7 @@ pub mod tests {
     use datafusion_expr::{LogicalPlan, TableScan};
     use runtime_datafusion_index::Index;
     use search::index::VectorIndex;
-    use search::{generation::util::append_fields, index::SearchIndex};
+    use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields, index::SearchIndex};
     use snafu::ResultExt;
 
     use crate::embedding_col;
@@ -264,7 +264,11 @@ pub mod tests {
         fn query_table_provider(&self, _query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
             let schema = append_fields(
                 &Arc::new(self.schema.clone()),
-                vec![Arc::new(Field::new("score", DataType::Float64, false))],
+                vec![Arc::new(Field::new(
+                    SEARCH_SCORE_COLUMN_NAME,
+                    DataType::Float64,
+                    false,
+                ))],
             );
             Ok(LogicalPlan::TableScan(TableScan::try_new(
                 "explain",

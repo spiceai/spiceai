@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::expect_used)]
+
 use async_openai::types::chat::{
     ChatCompletionMessageToolCalls, ChatCompletionStreamOptions, CreateChatCompletionRequest,
     CreateChatCompletionResponse,
@@ -104,15 +106,6 @@ static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = L
                         create::create_local("microsoft/Phi-3-mini-4k-instruct")
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to create 'microsoft/Phi-3-mini-4k-instruct' from local system: {e}"))
-                    })
-                }),
-            ),
-            (
-                "perplexity",
-                Box::new(|| {
-                    Box::pin(async {
-                        create::create_perplexity()
-                            .map_err(|e| anyhow::anyhow!("failed to create perplexity model: {e}"))
                     })
                 }),
             ),
@@ -232,7 +225,6 @@ async fn test_basic(
         "local_phi3",
         "hf_phi3",
         "bedrock",
-        "perplexity",
         "google"
     )]
     model_name: &str,
@@ -273,7 +265,6 @@ async fn test_usage(
         "local_phi3",
         "hf_phi3",
         "bedrock",
-        "perplexity",
         "google"
     )]
     model_name: &str,

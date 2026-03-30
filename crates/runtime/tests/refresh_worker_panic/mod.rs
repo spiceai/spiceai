@@ -30,7 +30,7 @@ use datafusion::datasource::memory::MemTable;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::TableReference;
-use runtime::accelerated_table::refresh::Refresh;
+use runtime::accelerated_table::refresh::{Refresh, RefreshSQL};
 use runtime::accelerated_table::{Error as AcceleratedError, RefreshTaskRunner};
 use runtime::component::dataset::acceleration::RefreshMode;
 use runtime::federated_table::FederatedTable;
@@ -135,8 +135,14 @@ async fn refresh_worker_recovers_from_panic() -> Result<(), String> {
 
     let dataset_name = TableReference::bare("panic_dataset");
 
-    let refresh_defaults = Refresh::new(RefreshMode::Append)
-        .sql(format!("SELECT value FROM {}", dataset_name.table()));
+    let refresh_defaults = Refresh::new(RefreshMode::Append).refresh_sql(RefreshSQL::new(
+        dataset_name.clone(),
+        runtime::accelerated_table::refresh::RefreshSQLColumns::Named(vec![
+            datafusion::sql::sqlparser::ast::Ident::new("value"),
+        ]),
+        vec![],
+        None,
+    ));
     let refresh_state = Arc::new(RwLock::new(refresh_defaults));
 
     let runtime_status = status::RuntimeStatus::new();

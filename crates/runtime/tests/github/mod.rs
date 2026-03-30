@@ -27,7 +27,7 @@ use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 
 use crate::{
     configure_test_datafusion, init_tracing, run_query_and_check_results,
-    utils::{runtime_ready_check, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check, test_request_context},
 };
 
 enum GithubDatasetType {
@@ -88,6 +88,7 @@ fn make_github_dataset(
 #[tokio::test]
 async fn test_github_issues() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -207,6 +208,7 @@ async fn test_github_issues() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_commits() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -268,6 +270,7 @@ async fn test_github_commits() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_stargazers() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -329,6 +332,7 @@ async fn test_github_stargazers() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_org_members() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -382,6 +386,7 @@ async fn test_github_org_members() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_pull_requests_projection_limit_pushdown() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -439,6 +444,7 @@ async fn test_github_pull_requests_projection_limit_pushdown() -> Result<(), Str
 #[tokio::test]
 async fn test_github_pull_requests_schema_changes() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -518,6 +524,7 @@ async fn test_github_pull_requests_schema_changes() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_pull_requests_schema_no_comments() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -574,6 +581,7 @@ async fn test_github_pull_requests_schema_no_comments() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_pull_requests_schema_review_comments() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -633,6 +641,7 @@ async fn test_github_pull_requests_schema_review_comments() -> Result<(), String
 #[tokio::test]
 async fn test_github_pull_requests_schema_discussion_comments() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -695,6 +704,7 @@ async fn test_github_pull_requests_schema_discussion_comments() -> Result<(), St
 #[tokio::test]
 async fn test_github_pull_requests_schema_all_comments() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -754,6 +764,7 @@ async fn test_github_pull_requests_schema_all_comments() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_workflows() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -809,6 +820,7 @@ async fn test_github_workflows() -> Result<(), String> {
 #[tokio::test]
 async fn test_github_workflow_runs() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

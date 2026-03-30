@@ -13,7 +13,7 @@ serde.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tracing.workspace = true
-util = { path = "../util" }
+util = { path = "../util", features = ["datafusion"] }
 
 [features]
 default = []

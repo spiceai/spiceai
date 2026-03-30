@@ -1,0 +1,15 @@
+[package]
+name = "connector-ftp"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FTP data connector for Spice.ai runtime"
+
+[dependencies]
+linkme.workspace = true
+paste.workspace = true
+runtime = { path = "../../runtime" }
+snafu.workspace = true
+tokio.workspace = true
+url.workspace = true

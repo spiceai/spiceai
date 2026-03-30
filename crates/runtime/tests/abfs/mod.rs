@@ -14,6 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Azure Blob File System (ABFS) connector tests.
+//!
+//! These tests verify the Azure Blob Storage integration, including patches from
+//! the `spiceai/arrow-rs` fork that optimize Parquet reading on Azure.
+
 use crate::{RecordBatch, init_tracing, utils::test_request_context};
 
 use anyhow::anyhow;
@@ -182,6 +187,127 @@ async fn run_queries() -> Result<(), anyhow::Error> {
 
         assert_batches_eq!(&expected_results, &data);
     }
+
+    Ok(())
+}
+
+/// Test that verifies Parquet reading from Azure Blob Storage works correctly.
+///
+/// **Critical for**: `arrow-rs` fork (`spiceai/arrow-rs`, spiceai-57.2)
+///
+/// This test exercises the `ParquetObjectReader::new_with_meta` optimization added
+/// in the arrow-rs fork. This optimization passes `ObjectMeta` directly to avoid
+/// suffix range requests, which are not supported by Azure Blob Storage.
+///
+/// **What happens without the patch**: Reading Parquet files from Azure would fail
+/// or be inefficient because Azure doesn't support suffix range requests (reading
+/// from the end of a file). The patch uses `new_with_meta` which passes the file
+/// size directly, avoiding the need for suffix requests.
+///
+/// **Patches tested**:
+/// - `ParquetObjectReader::new_with_meta` constructor
+/// - Azure-specific handling in data connectors
+#[tokio::test]
+async fn test_azure_parquet_reading_with_object_meta() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    tracing::info!("Starting Azure Parquet optimization test (new_with_meta)");
+    let azurite_container = prepare_container().await?;
+
+    let res = test_request_context()
+        .scope(run_parquet_query_with_meta())
+        .await;
+    tracing::info!("Test completed");
+    azurite_container.stop().await?;
+    azurite_container.remove().await?;
+    res.map_err(|e| anyhow::anyhow!(e))
+}
+
+async fn upload_parquet_file() -> Result<(), anyhow::Error> {
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::parquet::arrow::ArrowWriter;
+
+    let container_client = ClientBuilder::emulator().container_client("testcontainer");
+
+    // Create a simple parquet file in memory
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+    let batch =
+        arrow::record_batch::RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(array)])?;
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer = ArrowWriter::try_new(&mut buffer, Arc::clone(&schema), None)?;
+        writer.write(&batch)?;
+        writer.close()?;
+    }
+
+    let blob_client = container_client.blob_client("test_data.parquet");
+    blob_client
+        .put_block_blob(buffer)
+        .content_type("application/octet-stream")
+        .await?;
+
+    tracing::trace!("Parquet file uploaded to Azure");
+    Ok(())
+}
+
+async fn run_parquet_query_with_meta() -> Result<(), anyhow::Error> {
+    // First upload a parquet file
+    upload_parquet_file().await?;
+
+    let mut emulator_dataset =
+        Dataset::new("abfs://testcontainer/test_data.parquet", "azure_parquet");
+    let emulator_params = DatasetParams::from_string_map(
+        vec![
+            ("abfs_use_emulator".to_string(), "true".to_string()),
+            ("file_format".to_string(), "parquet".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    emulator_dataset.params = Some(emulator_params);
+
+    let app = AppBuilder::new("azure_parquet_test")
+        .with_dataset(emulator_dataset)
+        .build();
+
+    configure_test_datafusion();
+    let rt = Runtime::builder().with_app(app).build().await;
+    let cloned_rt = Arc::new(rt.clone());
+
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            return Err(anyhow!("Timed out waiting for datasets to load"));
+        }
+        () = cloned_rt.load_components() => {}
+    }
+
+    // Query the parquet file - this exercises the new_with_meta optimization
+    // because Azure doesn't support suffix range requests
+    let query = "SELECT * FROM azure_parquet ORDER BY id";
+    let query_result = rt
+        .datafusion()
+        .query_builder(query)
+        .build()
+        .run()
+        .await
+        .map_err(|e| anyhow!(format!("query to plan: {e}")))?;
+
+    let data = query_result
+        .data
+        .try_collect::<Vec<RecordBatch>>()
+        .await
+        .map_err(|e| anyhow!(format!("query to collect: {e}")))?;
+
+    let expected = [
+        "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 3  |", "| 4  |", "| 5  |", "+----+",
+    ];
+    assert_batches_eq!(&expected, &data);
+
+    tracing::info!(
+        "Azure Parquet reading test passed - new_with_meta optimization working correctly"
+    );
 
     Ok(())
 }

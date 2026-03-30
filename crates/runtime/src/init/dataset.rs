@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
+use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
@@ -35,7 +36,9 @@ use crate::{
             builder::DatasetBuilder,
         },
     },
-    dataaccelerator::{AccelerationSource, validate_snapshot_paths},
+    dataaccelerator::{
+        AccelerationSource, validate_cayenne_snapshot_consistency, validate_snapshot_paths,
+    },
     dataconnector::{
         self, ConnectorComponent, DataConnector, DataConnectorError, ODBC_DATACONNECTOR,
         deferred::DeferredConnector,
@@ -53,7 +56,9 @@ use crate::{
 };
 use app::App;
 use datafusion::sql::TableReference;
-use futures::{StreamExt, future::join_all};
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
+use futures::StreamExt;
+use futures::future::join_all;
 use opentelemetry::KeyValue;
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
@@ -61,8 +66,7 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
     pub(crate) async fn load_datasets(self: Arc<Self>) {
-        let app_lock = self.app.read().await;
-        let Some(app) = app_lock.as_ref() else {
+        let Some(app) = self.read_app().await else {
             return;
         };
 
@@ -75,12 +79,34 @@ impl Runtime {
 
         // Before loading datasets, we must initialize views accelerators (if any).
         // This is required for acceleration federation for some engines (e.g. `DuckDB`).
-        let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(true));
+        let valid_views = Arc::clone(&self).get_valid_views(&app, LogErrors(true));
         self.initialize_views_accelerators(&valid_views).await;
 
-        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(true));
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(&app, LogErrors(true));
+
+        // Validate Cayenne snapshot consistency before initializing accelerators.
+        // All Cayenne datasets sharing the same metadata directory must have the same
+        // snapshot configuration (either all enabled or all disabled).
+        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
+            valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
+        if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
+            tracing::error!("{err}");
+            return;
+        }
 
         let init_results = self.initialize_datasets_accelerators(&valid_datasets).await;
+
+        // Validate that no datasets with snapshots share acceleration files
+        let initialized_sources: Vec<Arc<dyn AccelerationSource>> = valid_datasets
+            .iter()
+            .filter(|ds| init_results.get(&ds.name).is_some_and(Result::is_ok))
+            .map(|ds| ds.clone_arc())
+            .collect();
+        if let Err(err) = validate_snapshot_paths(initialized_sources).await {
+            tracing::error!("{err}");
+            return;
+        }
+
         // Create a map of dataset names to their futures
         let mut dataset_futures = HashMap::new();
         let mut localpod_datasets = Vec::new();
@@ -144,8 +170,12 @@ impl Runtime {
                     path_table_ref,
                     path_table_ref
                 );
-                self.status
-                    .update_dataset(&ds.name, status::ComponentStatus::Error);
+                self.status.update_dataset(
+                    &ds.name,
+                    status::ComponentStatus::error_with_message(format!(
+                        "Parent dataset '{path_table_ref}' doesn't exist"
+                    )),
+                );
             }
         }
 
@@ -166,7 +196,7 @@ impl Runtime {
         let _ = join_all(spawned_tasks).await;
 
         // After all datasets have loaded, load the views.
-        Arc::clone(&self).load_views(app);
+        Arc::clone(&self).load_views(&app);
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
@@ -220,8 +250,10 @@ impl Runtime {
             Ok(data_connector) => data_connector,
             Err(err) => {
                 let ds_name = &ds.name;
-                self.status
-                    .update_dataset(ds_name, status::ComponentStatus::Error);
+                self.status.update_dataset(
+                    ds_name,
+                    status::ComponentStatus::error_with_message(err.to_string()),
+                );
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 warn_spaced!(
                     spaced_tracer,
@@ -271,8 +303,10 @@ impl Runtime {
             let ds_name = &ds.name;
             metrics::datasets::LOAD_ERROR.add(1, &[]);
             error_spaced!(spaced_tracer, "{}{err}", "");
-            self.status
-                .update_dataset(ds_name, status::ComponentStatus::Error);
+            self.status.update_dataset(
+                ds_name,
+                status::ComponentStatus::error_with_message(err.to_string()),
+            );
             return;
         }
 
@@ -292,9 +326,10 @@ impl Runtime {
                     }
 
                     let ds_name = &ds.name;
-                    runtime
-                        .status
-                        .update_dataset(ds_name, status::ComponentStatus::Error);
+                    runtime.status.update_dataset(
+                        ds_name,
+                        status::ComponentStatus::error_with_message(err.to_string()),
+                    );
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
                     warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                     return Err(RetryError::transient(err));
@@ -357,8 +392,10 @@ impl Runtime {
                     );
                     federated_table
                 } else {
-                    self.status
-                        .update_dataset(&ds.name, status::ComponentStatus::Error);
+                    self.status.update_dataset(
+                        &ds.name,
+                        status::ComponentStatus::error_with_message(err.to_string()),
+                    );
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
                     if let DataConnectorError::UnsupportedDataType { .. } = err {
                         error_spaced!(spaced_tracer, "{}{err}", "");
@@ -387,6 +424,17 @@ impl Runtime {
             .await
         {
             Ok(()) => {
+                // Log experimental hash_index warning once per dataset at registration
+                if ds
+                    .acceleration
+                    .as_ref()
+                    .is_some_and(Acceleration::is_hash_index_enabled)
+                {
+                    tracing::warn!(
+                        dataset = %ds.name,
+                        "hash_index is enabled for Arrow engine acceleration. Note: hash_index is experimental and may have breaking changes in future releases."
+                    );
+                }
                 tracing::info!(
                     "{}",
                     dataset_registered_trace(
@@ -421,8 +469,10 @@ impl Runtime {
                 Ok(())
             }
             Err(err) => {
-                self.status
-                    .update_dataset(&ds.name, status::ComponentStatus::Error);
+                self.status.update_dataset(
+                    &ds.name,
+                    status::ComponentStatus::error_with_message(err.to_string()),
+                );
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 if let Error::UnableToAttachDataConnector {
                     source: crate::datafusion::Error::RefreshSql { .. },
@@ -517,7 +567,7 @@ impl Runtime {
                     .remove_dataset(ds.name.clone(), ds.acceleration.as_ref())
                     .await;
 
-                if Arc::clone(&self)
+                if let Err(e) = Arc::clone(&self)
                     .register_loaded_dataset(
                         Arc::clone(&ds),
                         Arc::clone(&connector),
@@ -525,16 +575,19 @@ impl Runtime {
                         BootstrapStatus::None,
                     )
                     .await
-                    .is_err()
                 {
-                    self.status
-                        .update_dataset(&ds.name, status::ComponentStatus::Error);
+                    self.status.update_dataset(
+                        &ds.name,
+                        status::ComponentStatus::error_with_message(e.to_string()),
+                    );
                 }
             }
             Err(e) => {
                 tracing::error!("Unable to update dataset {}: {e}", ds.name);
-                self.status
-                    .update_dataset(&ds.name, status::ComponentStatus::Error);
+                self.status.update_dataset(
+                    &ds.name,
+                    status::ComponentStatus::error_with_message(e.to_string()),
+                );
             }
         }
     }
@@ -596,6 +649,7 @@ impl Runtime {
                     federated_table,
                     self.secrets(),
                     BootstrapStatus::None,
+                    vec![],
                 )
                 .await
                 .context(UnableToCreateAcceleratedTableSnafu {
@@ -715,6 +769,35 @@ impl Runtime {
             return Ok(());
         }
 
+        // Apply partition filters if assigned (Executor mode)
+        let mut ds = ds;
+        let mut initial_partition_filters = vec![];
+        // Only apply partition logic if the dataset is configured for partitioning
+        if ds
+            .acceleration
+            .as_ref()
+            .is_some_and(|acc| !acc.partition_by.is_empty())
+            && let Some(assignments) = self.partition_assignments()
+        {
+            let assignments = assignments.read().await;
+            let partition_filters = get_partition_filter_exprs(&ds.name, &assignments);
+            if !partition_filters.is_empty() {
+                tracing::debug!(
+                    "For table={}, extracted {} partition filter(s) for assigned partitions.",
+                    ds.name,
+                    partition_filters.len(),
+                );
+                initial_partition_filters = partition_filters;
+                // Clear partition_by and convert engine to unpartitioned
+                let mut ds_mod = (*ds).clone();
+                if let Some(acc) = ds_mod.acceleration.as_mut() {
+                    acc.partition_by = vec![];
+                    acc.engine = acc.engine.to_unpartitioned();
+                }
+                ds = Arc::new(ds_mod);
+            }
+        }
+
         // ACCELERATED TABLE
         let acceleration_settings =
             ds.acceleration
@@ -759,6 +842,7 @@ impl Runtime {
                     accelerated_table,
                     secrets: self.secrets(),
                     bootstrap_status,
+                    initial_partition_filters,
                 },
             )
             .await
@@ -789,6 +873,15 @@ impl Runtime {
         new_app: &Arc<App>,
     ) {
         let valid_datasets = Arc::clone(&self).get_valid_datasets(new_app, LogErrors(true));
+
+        // Validate Cayenne snapshot consistency before initializing accelerators.
+        let acceleration_sources: Vec<Arc<dyn AccelerationSource>> =
+            valid_datasets.iter().map(|ds| ds.clone_arc()).collect();
+        if let Err(err) = validate_cayenne_snapshot_consistency(&acceleration_sources) {
+            tracing::error!("{err}");
+            return;
+        }
+
         let init_results = self.initialize_datasets_accelerators(&valid_datasets).await;
         let existing_datasets = Arc::clone(&self).get_valid_datasets(current_app, LogErrors(false));
 
@@ -891,7 +984,10 @@ impl Runtime {
                     Ok(accelerator) => accelerator,
                     Err(err) => {
                         let ds_name = &ds.name;
-                        status.update_dataset(ds_name, status::ComponentStatus::Error);
+                        status.update_dataset(
+                            ds_name,
+                            status::ComponentStatus::error_with_message(err.to_string()),
+                        );
                         metrics::datasets::LOAD_ERROR.add(1, &[]);
                         warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                         return (ds.name.clone(), Err(err));
@@ -911,7 +1007,10 @@ impl Runtime {
                     }
                     Err(err) => {
                         let ds_name = &ds.name;
-                        status.update_dataset(ds_name, status::ComponentStatus::Error);
+                        status.update_dataset(
+                            ds_name,
+                            status::ComponentStatus::error_with_message(err.to_string()),
+                        );
                         metrics::datasets::LOAD_ERROR.add(1, &[]);
                         warn_spaced!(spaced_tracer, "{} {err}", ds_name.table());
                         (ds.name.clone(), Err(err))
@@ -924,17 +1023,11 @@ impl Runtime {
         let init_results: HashMap<TableReference, Result<BootstrapStatus>> =
             results.into_iter().collect();
 
-        let initialized_datasets: Vec<Arc<dyn AccelerationSource>> = datasets
-            .iter()
-            .filter(|ds| init_results.get(&ds.name).is_some_and(Result::is_ok))
-            .map(|ds| ds.clone_arc())
-            .collect();
-        validate_snapshot_paths(initialized_datasets).await;
-
         init_results
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
+    #[cfg(any(feature = "duckdb", feature = "sqlite"))]
     pub(crate) async fn get_initialized_datasets(
         self: Arc<Self>,
         app: &Arc<App>,

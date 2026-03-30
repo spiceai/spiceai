@@ -32,13 +32,16 @@ use async_openai::{
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, TryStreamExt};
+use mistralrs::core::{
+    AdapterPaths, AutoDeviceMapParams, DeviceMapSetting, GGMLLoaderBuilder, GGMLSpecificConfig,
+    GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs, MistralRsBuilder,
+    ModelPaths, NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig, Pipeline,
+    RequestMessage, TokenSource,
+};
 use mistralrs::{
-    AdapterPaths, AutoDeviceMapParams, ChatCompletionChunkResponse, ChatCompletionResponse,
-    ChunkChoice, Constraint, Device, DeviceMapSetting, Function, GGMLLoaderBuilder,
-    GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs,
-    MistralRsBuilder, ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline,
-    Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams,
-    TokenSource, Tool, ToolCallResponse, ToolChoice, ToolType,
+    ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice, Constraint, Device, Function,
+    ModelDType, NormalRequest, Request as MistralRequest, Response as MistralResponse,
+    SamplingParams, Tool, ToolCallResponse, ToolChoice, ToolType,
 };
 
 use secrecy::{ExposeSecret, SecretString};
@@ -157,12 +160,12 @@ impl MistralLlama {
         generation_config: Option<&Path>,
     ) -> Box<dyn ModelPaths> {
         Box::new(LocalModelPaths::new(
-            tokenizer.map(Into::into).unwrap_or_default(),
-            config.map(Into::into).unwrap_or_default(),
-            tokenizer_config.map(Into::into),
-            model_weights.iter().map(Into::into).collect(),
+            tokenizer.map(PathBuf::from).unwrap_or_default(),
+            config.map(PathBuf::from).unwrap_or_default(),
+            tokenizer_config.map(PathBuf::from).unwrap_or_default(),
+            model_weights.to_vec(),
             AdapterPaths::None,
-            generation_config.map(Into::into),
+            generation_config.map(PathBuf::from),
             None,
             None,
             None,
@@ -177,7 +180,7 @@ impl MistralLlama {
     ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
         NormalLoaderBuilder::new(
-            mistralrs::NormalSpecificConfig::default(),
+            NormalSpecificConfig::default(),
             chat_template_literal.map(ToString::to_string),
             None,
             model_parts.first().map(ToString::to_string),
@@ -309,13 +312,15 @@ impl MistralLlama {
         arch: Option<&str>,
         hf_token_literal: Option<&SecretString>,
         gguf_filename: Option<PathBuf>,
+        chat_template_literal: Option<&str>,
     ) -> Result<Self> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
+        let chat_template = chat_template_literal.map(ToString::to_string);
 
         // Loading the GGUF directly (as if it is a quantized model, although it need not be quantized).
         let loader: Result<Box<dyn Loader>> = if let Some(gguf) = gguf_filename {
             Ok(GGUFLoaderBuilder::new(
-                None,
+                chat_template.clone(),
                 None,
                 model_parts[0].to_string(),
                 vec![gguf.to_string_lossy().to_string()],
@@ -329,14 +334,14 @@ impl MistralLlama {
             // If not provided, it will be inferred (generally from `.model_type` in a downloaded `config.json`)
             let loader_type = arch
                 .map(|a| {
-                    mistralrs::NormalLoaderType::from_str(a)
+                    NormalLoaderType::from_str(a)
                         .map_err(|e| ChatError::UnsupportedModelType { source: e.into() })
                 })
                 .transpose()?;
 
             let builder = NormalLoaderBuilder::new(
-                mistralrs::NormalSpecificConfig::default(),
-                None,
+                NormalSpecificConfig::default(),
+                chat_template,
                 None,
                 Some(model_parts[0].to_string()),
                 false,
@@ -414,6 +419,7 @@ impl MistralLlama {
             logits_processors: None,
             return_raw_logits: false,
             model_id: None, // Not actually needed.
+            truncate_sequence: false,
         }))
     }
 
@@ -429,6 +435,7 @@ impl MistralLlama {
                 .map(message_to_mistral)
                 .collect::<Vec<_>>(),
             enable_thinking: None,
+            reasoning_effort: None,
         };
 
         let tools: Option<Vec<Tool>> = req.tools.map(|t| t.iter().map(convert_tool).collect());
@@ -442,6 +449,7 @@ impl MistralLlama {
             top_n_logprobs: req.top_logprobs.unwrap_or_default().into(),
             frequency_penalty: req.frequency_penalty,
             presence_penalty: req.presence_penalty,
+            repetition_penalty: None,
             stop_toks: req.stop.map(|s| match s {
                 StopConfiguration::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
                 StopConfiguration::StringArray(s) => mistralrs::StopTokens::Seqs(s),
@@ -678,6 +686,14 @@ fn stream_from_response(
                 },
                 MistralResponse::Raw{..} => {
                     unreachable!("We set `return_raw_logits: false`")
+                },
+                MistralResponse::Embeddings{..} => {
+                    yield Err(OpenAIError::ApiError(ApiError {
+                        message: "Embeddings response is not supported in chat".to_string(),
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    }));
                 }
              }
         }

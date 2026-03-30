@@ -30,8 +30,7 @@ use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 impl Runtime {
     pub(crate) async fn load_tools(self: Arc<Self>) {
-        let app_lock = self.app.read().await;
-        if let Some(app) = app_lock.as_ref() {
+        if let Some(app) = self.read_app().await {
             for tool in &app.tools {
                 tracing::debug!("Loading tool [{}] from {}...", tool.name, tool.from);
                 Arc::clone(&self).load_tool(tool).await;
@@ -111,8 +110,10 @@ impl Runtime {
                 }
                 Err(e) => {
                     metrics::tools::LOAD_ERROR.add(1, &[]);
-                    self.status
-                        .update_tool(&tool.name, status::ComponentStatus::Error);
+                    self.status.update_tool(
+                        &tool.name,
+                        status::ComponentStatus::error_with_message(e.to_string()),
+                    );
                     tracing::warn!(
                         "Unable to load tool '{}' from spicepod. Error: {}",
                         tool.name,

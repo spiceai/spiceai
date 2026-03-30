@@ -188,104 +188,6 @@ pub(crate) struct PreparedStatement {
     pub(super) parameter_schema: Option<Vec<u8>>,
 }
 
-#[expect(dead_code)]
-mod param_values_serde {
-    use arrow::array::RecordBatch;
-    use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
-    use arrow_tools::record_batch::record_to_param_values;
-    use datafusion::common::ParamValues;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::io::Cursor;
-
-    #[expect(clippy::ref_option)]
-    pub fn serialize<S>(params: &Option<ParamValues>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match params {
-            None => Vec::<u8>::new().serialize(serializer),
-            Some(params) => {
-                // Convert ParamValues back to RecordBatch for serialization
-                // This is only done once during do_put, not on every query execution
-                let batch = param_values_to_record(params).map_err(serde::ser::Error::custom)?;
-                let mut writer = StreamWriter::try_new(Vec::new(), &batch.schema())
-                    .map_err(serde::ser::Error::custom)?;
-                writer.write(&batch).map_err(serde::ser::Error::custom)?;
-                writer.finish().map_err(serde::ser::Error::custom)?;
-                let bytes = writer.into_inner().map_err(serde::ser::Error::custom)?;
-                bytes.serialize(serializer)
-            }
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<ParamValues>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let bytes: Vec<u8> = Vec::deserialize(deserializer)?;
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-
-        let cursor = Cursor::new(bytes);
-        let mut reader = StreamReader::try_new(cursor, None).map_err(serde::de::Error::custom)?;
-        let batch = reader
-            .next()
-            .transpose()
-            .map_err(serde::de::Error::custom)?;
-
-        match batch {
-            None => Ok(None),
-            Some(batch) => {
-                // Convert RecordBatch to ParamValues once during deserialization
-                // This is more efficient than doing it on every query execution
-                let params = record_to_param_values(&batch).map_err(serde::de::Error::custom)?;
-                Ok(Some(params))
-            }
-        }
-    }
-
-    // Helper function to convert ParamValues back to RecordBatch
-    fn param_values_to_record(
-        params: &ParamValues,
-    ) -> Result<RecordBatch, arrow::error::ArrowError> {
-        use arrow::array::{ArrayRef, RecordBatch};
-        use arrow::datatypes::{Field, Schema};
-        use std::sync::Arc;
-
-        match params {
-            ParamValues::List(values) => {
-                let fields: Vec<Field> = values
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| Field::new(format!("${}", i + 1), v.data_type(), v.is_null()))
-                    .collect();
-
-                let arrays: Result<Vec<ArrayRef>, _> = values
-                    .iter()
-                    .map(datafusion::scalar::ScalarValue::to_array)
-                    .collect();
-
-                RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays?)
-            }
-            ParamValues::Map(map) => {
-                let mut entries: Vec<_> = map.iter().collect();
-                entries.sort_by_key(|(k, _)| *k);
-
-                let fields: Vec<Field> = entries
-                    .iter()
-                    .map(|(name, v)| Field::new(name.as_str(), v.data_type(), v.is_null()))
-                    .collect();
-
-                let arrays: Result<Vec<ArrayRef>, _> =
-                    entries.iter().map(|(_, v)| v.to_array()).collect();
-
-                RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays?)
-            }
-        }
-    }
-}
-
 /// Create a prepared statement from given SQL statement.
 pub(crate) async fn do_action_create_prepared_statement(
     statement: sql::ActionCreatePreparedStatementRequest,
@@ -929,9 +831,7 @@ mod tests {
         let expected =
             "SELECT a, b FROM t WHERE x = $1 AND y = $2 GROUP BY a ORDER BY b DESC LIMIT $3";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -941,9 +841,7 @@ mod tests {
         let input = "INSERT INTO users (name, age) VALUES (?, ?)";
         let expected = "INSERT INTO users (name, age) VALUES ($1, $2)";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -953,9 +851,7 @@ mod tests {
         let input = "UPDATE users SET age = ? WHERE name = ?";
         let expected = "UPDATE users SET age = $1 WHERE name = $2";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -965,9 +861,7 @@ mod tests {
         let input = "DELETE FROM users WHERE id = ?";
         let expected = "DELETE FROM users WHERE id = $1";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -977,9 +871,7 @@ mod tests {
         let input = "SELECT COUNT(*) FROM users WHERE created_at > ? AND status = ?";
         let expected = "SELECT COUNT(*) FROM users WHERE created_at > $1 AND status = $2";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -989,9 +881,7 @@ mod tests {
         let input = "SELECT * FROM products WHERE price > (SELECT AVG(price) FROM products WHERE category = ?) AND stock > ?";
         let expected = "SELECT * FROM products WHERE price > (SELECT AVG(price) FROM products WHERE category = $1) AND stock > $2";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -1011,9 +901,7 @@ mod tests {
         let input = "SELECT '?', name FROM users WHERE id = ? AND notes LIKE '%??%'";
         let expected = "SELECT '?', name FROM users WHERE id = $1 AND notes LIKE '%??%'";
         assert_eq!(
-            convert_jdbc_parameter_placeholders(input)
-                .expect("should not fail")
-                .as_ref(),
+            convert_jdbc_parameter_placeholders(input).expect("should not fail"),
             expected
         );
     }
@@ -1106,7 +994,7 @@ mod tests {
         let sql = "SELECT CAST($1 AS BIGINT) + CAST($2 AS BIGINT) AS sum, CAST($1 AS BIGINT) * CAST($2 AS BIGINT) AS product";
 
         // Execute the query with first set of parameters (2, 3)
-        let params1 = ParamValues::List(vec![
+        let params1 = ParamValues::from(vec![
             ScalarValue::Int64(Some(2)),
             ScalarValue::Int64(Some(3)),
         ]);
@@ -1144,7 +1032,7 @@ mod tests {
         assert_eq!(product1.value(0), 6, "2 * 3 should equal 6");
 
         // Execute the same query with different parameters (4, 5)
-        let params2 = ParamValues::List(vec![
+        let params2 = ParamValues::from(vec![
             ScalarValue::Int64(Some(4)),
             ScalarValue::Int64(Some(5)),
         ]);
@@ -1179,7 +1067,7 @@ mod tests {
         assert_eq!(product2.value(0), 20, "4 * 5 should equal 20");
 
         // Execute the same query with third set of parameters (10, 20)
-        let params3 = ParamValues::List(vec![
+        let params3 = ParamValues::from(vec![
             ScalarValue::Int64(Some(10)),
             ScalarValue::Int64(Some(20)),
         ]);
@@ -1220,11 +1108,7 @@ mod tests {
         // 4. The parameterized query pattern (used by prepared statements) functions properly
     }
 
-    #[expect(
-        clippy::similar_names,
-        clippy::redundant_closure_for_method_calls,
-        clippy::too_many_lines
-    )]
+    #[expect(clippy::similar_names, clippy::redundant_closure_for_method_calls)]
     #[tokio::test]
     async fn test_prepare_execute_with_dataframe_api() {
         use arrow::array::{Int64Array, RecordBatch, StringArray};
@@ -1545,10 +1429,10 @@ mod tests {
     fn test_rewrite_sql_table_alias_q7_pattern() {
         // This is the exact pattern that was failing in TPC-H Q7 parameterized queries
         let sql = r"
-            SELECT n1.n_name, n2.n_name 
-            FROM nation n1, nation n2 
+            SELECT n1.n_name, n2.n_name
+            FROM nation n1, nation n2
             WHERE (
-                (n1.n_name = $1 AND n2.n_name = $2) 
+                (n1.n_name = $1 AND n2.n_name = $2)
                 OR (n1.n_name = $3 AND n2.n_name = $4)
             )";
 
@@ -1626,12 +1510,12 @@ mod tests {
     fn test_rewrite_sql_cte_workaround_pattern() {
         // CTE pattern
         let sql = r"
-            WITH n1 AS (SELECT * FROM nation), 
-                 n2 AS (SELECT * FROM nation) 
-            SELECT n1.n_name, n2.n_name 
-            FROM n1, n2 
+            WITH n1 AS (SELECT * FROM nation),
+                 n2 AS (SELECT * FROM nation)
+            SELECT n1.n_name, n2.n_name
+            FROM n1, n2
             WHERE (
-                (n1.n_name = $1 AND n2.n_name = $2) 
+                (n1.n_name = $1 AND n2.n_name = $2)
                 OR (n1.n_name = $3 AND n2.n_name = $4)
             )";
 
@@ -1687,10 +1571,10 @@ mod tests {
     fn test_rewrite_sql_table_alias_no_params() {
         // Query with table aliases but no parameters - should pass through unchanged
         let sql = r"
-            SELECT n1.n_name, n2.n_name 
-            FROM nation n1, nation n2 
+            SELECT n1.n_name, n2.n_name
+            FROM nation n1, nation n2
             WHERE (
-                (n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY') 
+                (n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY')
                 OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')
             )";
 
@@ -1730,12 +1614,12 @@ mod tests {
     #[test]
     fn test_rewrite_sql_cte_no_params() {
         let sql = r"
-            WITH n1 AS (SELECT * FROM nation), 
-                 n2 AS (SELECT * FROM nation) 
-            SELECT n1.n_name, n2.n_name 
-            FROM n1, n2 
+            WITH n1 AS (SELECT * FROM nation),
+                 n2 AS (SELECT * FROM nation)
+            SELECT n1.n_name, n2.n_name
+            FROM n1, n2
             WHERE (
-                (n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY') 
+                (n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY')
                 OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')
             )";
 

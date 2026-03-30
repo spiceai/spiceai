@@ -141,3 +141,149 @@ impl std::fmt::Debug for EndpointAuth {
         builder.finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::request::Builder;
+    use runtime_auth::AuthVerdict;
+
+    fn create_request_parts(api_key: Option<&str>) -> axum::http::request::Parts {
+        let mut builder = Builder::new().uri("https://example.com");
+
+        if let Some(key) = api_key {
+            builder = builder.header("X-API-Key", key);
+        }
+
+        let request = builder.body(()).expect("Failed to build request");
+        request.into_parts().0
+    }
+
+    #[tokio::test]
+    async fn test_api_key_secret_replacement() {
+        let mut secrets = Secrets::new();
+        secrets
+            .load_from(&[])
+            .await
+            .expect("to load secrets successfully");
+
+        let secret_key = format!("TEST_API_KEY_SECRET_{}", rand::random::<u64>());
+        let secret_value = "my-super-secret-api-key";
+
+        // SAFETY: Setting environment variable for test purposes only
+        unsafe { std::env::set_var(&secret_key, secret_value) };
+
+        // Test read-write key with secret replacement
+        let api_key_auth_config = SpicepodApiKeyAuth {
+            enabled: true,
+            keys: vec![ApiKey::parse_str(&format!("${{env:{secret_key}}}:rw"))],
+        };
+
+        let auth = api_key_auth(&secrets, &api_key_auth_config).await;
+
+        // Verify the secret was replaced and the key works
+        let parts = create_request_parts(Some(secret_value));
+        let result = auth.http_verify(&parts);
+        assert!(
+            matches!(result, Ok(AuthVerdict::Allow(_))),
+            "API key with secret replacement should authenticate successfully"
+        );
+
+        // Verify the original secret placeholder does NOT work
+        let parts_with_placeholder = create_request_parts(Some(&format!("${{env:{secret_key}}}")));
+        let result_placeholder = auth.http_verify(&parts_with_placeholder);
+        assert!(
+            matches!(result_placeholder, Ok(AuthVerdict::Deny)),
+            "Unexpanded secret placeholder should be denied"
+        );
+
+        // SAFETY: Cleaning up environment variable
+        unsafe { std::env::remove_var(&secret_key) };
+    }
+
+    #[tokio::test]
+    async fn test_api_key_secret_replacement_read_only() {
+        let mut secrets = Secrets::new();
+        secrets
+            .load_from(&[])
+            .await
+            .expect("to load secrets successfully");
+
+        let secret_key = format!("TEST_API_KEY_RO_SECRET_{}", rand::random::<u64>());
+        let secret_value = "my-readonly-api-key";
+
+        // SAFETY: Setting environment variable for test purposes only
+        unsafe { std::env::set_var(&secret_key, secret_value) };
+
+        // Test read-only key with secret replacement (no :rw suffix)
+        let api_key_auth_config = SpicepodApiKeyAuth {
+            enabled: true,
+            keys: vec![ApiKey::parse_str(&format!("${{env:{secret_key}}}:ro"))],
+        };
+
+        let auth = api_key_auth(&secrets, &api_key_auth_config).await;
+
+        // Verify the secret was replaced and the key works
+        let parts = create_request_parts(Some(secret_value));
+        let result = auth.http_verify(&parts);
+        assert!(
+            matches!(result, Ok(AuthVerdict::Allow(_))),
+            "Read-only API key with secret replacement should authenticate successfully"
+        );
+
+        // SAFETY: Cleaning up environment variable
+        unsafe { std::env::remove_var(&secret_key) };
+    }
+
+    #[tokio::test]
+    async fn test_api_key_multiple_secrets_replacement() {
+        let mut secrets = Secrets::new();
+        secrets
+            .load_from(&[])
+            .await
+            .expect("to load secrets successfully");
+
+        let secret_key_1 = format!("TEST_API_KEY_1_{}", rand::random::<u64>());
+        let secret_key_2 = format!("TEST_API_KEY_2_{}", rand::random::<u64>());
+        let secret_value_1 = "first-api-key";
+        let secret_value_2 = "second-api-key";
+
+        // SAFETY: Setting environment variables for test purposes only
+        unsafe {
+            std::env::set_var(&secret_key_1, secret_value_1);
+            std::env::set_var(&secret_key_2, secret_value_2);
+        };
+
+        let api_key_auth_config = SpicepodApiKeyAuth {
+            enabled: true,
+            keys: vec![
+                ApiKey::parse_str(&format!("${{env:{secret_key_1}}}:rw")),
+                ApiKey::parse_str(&format!("${{env:{secret_key_2}}}:ro")),
+            ],
+        };
+
+        let auth = api_key_auth(&secrets, &api_key_auth_config).await;
+
+        // Verify first key works
+        let parts_1 = create_request_parts(Some(secret_value_1));
+        let result_1 = auth.http_verify(&parts_1);
+        assert!(
+            matches!(result_1, Ok(AuthVerdict::Allow(_))),
+            "First API key should authenticate successfully"
+        );
+
+        // Verify second key works
+        let parts_2 = create_request_parts(Some(secret_value_2));
+        let result_2 = auth.http_verify(&parts_2);
+        assert!(
+            matches!(result_2, Ok(AuthVerdict::Allow(_))),
+            "Second API key should authenticate successfully"
+        );
+
+        // SAFETY: Cleaning up environment variables
+        unsafe {
+            std::env::remove_var(&secret_key_1);
+            std::env::remove_var(&secret_key_2);
+        };
+    }
+}

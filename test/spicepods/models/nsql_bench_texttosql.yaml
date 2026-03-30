@@ -1,7 +1,7 @@
 version: v1
 kind: Spicepod
 name: 'nsql_benchmark'
-# Used to run `test/nsql_bench` (or `test/spicepods/models/nsql_bench.yaml` spicepod) but configured to be run under `testoperator run text-to-sql` not `testoperator run evals`
+# Used to run `test/nsql_bench` (or `test/spicepods/models/nsql_bench.yaml` spicepod) but configured to be run under `testoperator run text-to-sql`.
 
 default_acceleration: &default_acceleration
   enabled: true
@@ -60,8 +60,8 @@ models:
       openai_api_key: ${ secrets:SPICE_OPENAI_API_KEY }
       reasoning_effort: high
       system_prompt: *system_prompt
-  - name: claude-sonnet-4-5
-    from: anthropic:claude-sonnet-4-5
+  - name: claude-haiku-3-5
+    from: anthropic:claude-haiku-3-5
     params:
       tools: auto
       anthropic_api_key: ${ secrets:SPICE_ANTHROPIC_API_KEY }

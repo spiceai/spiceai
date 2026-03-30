@@ -135,8 +135,8 @@ impl DuckDBIntermediateIndexMaterializationOptimizer {
 
         // Find the first index we can bind (we can only bind one)
         let bindable_index = indexes.iter().find_map(|(cr, _)| {
-            if cr.columns.iter().all(|c| simple_filter_idents.contains(c)) {
-                Some(cr.columns.iter().cloned().collect::<HashSet<_>>())
+            if cr.iter().all(|c| simple_filter_idents.contains(c)) {
+                Some(cr.iter().map(String::from).collect::<HashSet<_>>())
             } else {
                 None
             }
@@ -447,9 +447,7 @@ mod tests {
 
     fn make_index(columns: &[&str]) -> (ColumnReference, IndexType) {
         (
-            ColumnReference {
-                columns: columns.iter().map(|s| (*s).to_string()).collect(),
-            },
+            ColumnReference::new(columns.iter().map(|s| (*s).to_string()).collect()),
             IndexType::Enabled,
         )
     }

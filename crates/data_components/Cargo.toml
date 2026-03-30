@@ -59,15 +59,17 @@ hash-index = { path = "../hash-index", features = ["metrics"] }
 http.workspace = true
 httpdate.workspace = true
 iceberg.workspace = true
+parquet = { workspace = true }
 iceberg-catalog-rest.workspace = true
 iceberg-datafusion.workspace = true
 imap = { workspace = true, optional = true }
 indexmap.workspace = true
 logos.workspace = true
+mysql_async = { workspace = true, optional = true }
 mailparse = { workspace = true, optional = true }
 num_cpus = "1.16"
 object_store = { workspace = true }
-opendal = "0.54"
+opendal.workspace = true
 oracle = { version = "0.6", optional = true }
 rand.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
@@ -83,9 +85,10 @@ serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
-spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "8b5495f2ed6eaf8b647b09cc1504a39bdb9bbed8", features = [
+spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "75badc149f3c4d783b912c88d10bae443a7330f6", features = [
     "tls",
 ], optional = true } # spiceai
+telemetry = { path = "../telemetry" }
 tiberius = { workspace = true, optional = true }
 token_provider = { path = "../token_provider" }
 tokio.workspace = true
@@ -96,11 +99,12 @@ tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true }
 tracing.workspace = true
 turso = { workspace = true, optional = true }
+turso-shared = { workspace = true, optional = true }
 twox-hash.workspace = true
 url.workspace = true
-util = { path = "../util" }
+util = { path = "../util", features = ["datafusion"] }
 uuid.workspace = true
-zip = "3.0.0"
+zip = "7.2.0"
 tokio-stream.workspace = true
 
 [target.'cfg(windows)'.dependencies]
@@ -108,6 +112,7 @@ rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 
 [features]
 bench = [] # Feature for benchmarking that exposes internal functions
+adbc = ["datafusion-table-providers/adbc-federation"]
 clickhouse = ["dep:clickhouse-rs", "datafusion-table-providers/federation"]
 databricks = [
     "delta_lake",
@@ -136,6 +141,7 @@ kafka = ["dep:rdkafka"]
 mongodb = ["datafusion-table-providers/mongodb"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = [
+    "dep:mysql_async",
     "datafusion-table-providers/mysql",
     "datafusion-table-providers/mysql-federation",
 ]
@@ -156,7 +162,7 @@ sqlite = [
     "datafusion-table-providers/sqlite",
     "datafusion-table-providers/sqlite-federation",
 ]
-turso = ["dep:turso"]
+turso = ["dep:turso", "dep:turso-shared", "datafusion-table-providers/sqlite-federation"]
 
 test_hadoop_catalog_docker = []
 
@@ -167,9 +173,12 @@ aws-smithy-types = { workspace = true }
 chrono = { workspace = true }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
 ctor = "0.6.3"
-iceberg_test_utils = { version = "0.7.0", features = ["tests"] }
+iceberg-storage-opendal.workspace = true
+iceberg_test_utils = { workspace = true, features = ["tests"] }
 insta.workspace = true
 object_store = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
+tokio-stream = { workspace = true, features = ["net"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [[bench]]

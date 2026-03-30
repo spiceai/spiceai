@@ -1,0 +1,11 @@
+---
+source: crates/cayenne/src/provider/mod.rs
+expression: pre_results
+---
++-------------------------+--------------+
+| email                   | items_bought |
++-------------------------+--------------+
+| alice@sample.com        | 101          |
+| bob@umbrellacorp.com    | 201          |
+| clint@bobsumbrellas.com | 301          |
++-------------------------+--------------+

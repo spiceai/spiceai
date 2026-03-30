@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN, concat_arrays};
+use util::concat_arrays;
+
+use super::{COMMON_MODEL_PARAMETERS_WITH_DEPRECATED, PARAM_WITH_DEPRE_LEN};
 use crate::parameters::ParameterSpec;
 
 pub const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
@@ -24,10 +26,12 @@ pub const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     { HF_PARAM_LEN + PARAM_WITH_DEPRE_LEN },
 >(HF_PARAMETERS, COMMON_MODEL_PARAMETERS_WITH_DEPRECATED);
 
-const HF_PARAM_LEN: usize = 2;
+const HF_PARAM_LEN: usize = 3;
 
 pub(crate) const HF_PARAMETERS: [ParameterSpec; HF_PARAM_LEN] = [
     ParameterSpec::runtime("model_type")
         .description("The architecture to load the model as. Supported values: mistral, gemma, mixtral, llama, phi2, phi3, qwen2, gemma2, starcoder2, phi3.5moe, deepseekv2, deepseekv3"),
+    ParameterSpec::runtime("chat_template")
+        .description("Customizes the transformation of OpenAI chat messages into a character stream for the model."),
     ParameterSpec::component("token").description("The Huggingface access token.")
 ];

@@ -26,12 +26,13 @@ itertools.workspace = true
 llms = { path = "../llms", default-features = false, optional = true }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-table-partition = { path = "../runtime-table-partition" }
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true
 tantivy = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
-util = { path = "../util" }
+util = { path = "../util", features = ["datafusion"] }
 
 [features]
 default = ["text_search", "s3_vectors"]

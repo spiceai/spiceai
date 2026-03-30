@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+#![allow(dead_code, clippy::allow_attributes)]
 
 use std::{
     collections::HashMap,
@@ -53,12 +54,10 @@ impl RunningContainer<'_> {
         remove(&self.docker, self.name).await
     }
 
-    #[expect(dead_code)]
     pub async fn stop(&self) -> Result<(), anyhow::Error> {
         stop(&self.docker, self.name).await
     }
 
-    #[expect(dead_code)]
     pub async fn start(&self) -> Result<(), anyhow::Error> {
         start(&self.docker, self.name).await
     }
@@ -115,12 +114,10 @@ pub async fn remove(docker: &Docker, name: &str) -> Result<(), anyhow::Error> {
         .await?)
 }
 
-#[expect(dead_code)]
 pub async fn stop(docker: &Docker, name: &str) -> Result<(), anyhow::Error> {
     Ok(docker.stop_container(name, None).await?)
 }
 
-#[expect(dead_code)]
 pub async fn start(docker: &Docker, name: &str) -> Result<(), anyhow::Error> {
     Ok(docker
         .start_container(name, None::<StartContainerOptions<String>>)
@@ -158,7 +155,6 @@ impl<'a> ContainerRunnerBuilder<'a> {
         self
     }
 
-    #[expect(dead_code)]
     pub fn add_env_var(mut self, key: &str, value: &str) -> Self {
         self.env_vars.push((key.to_string(), value.to_string()));
         self
@@ -373,7 +369,6 @@ impl<'a> ContainerRunner<'a> {
 /// Returns `true` if Docker daemon is accessible, `false` otherwise.
 /// This is useful for tests that require Docker to skip gracefully
 /// when Docker is not available (e.g., on certain CI runners).
-#[expect(dead_code, reason = "Used by tests with kafka feature enabled")]
 pub async fn is_docker_available() -> bool {
     let Ok(docker) = Docker::connect_with_local_defaults() else {
         return false;

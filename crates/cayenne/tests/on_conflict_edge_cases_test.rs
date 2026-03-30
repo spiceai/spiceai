@@ -32,12 +32,18 @@ mod common;
 use std::sync::Arc;
 
 use arrow::array::Int64Array;
+
 use arrow::datatypes::{DataType, Field, Schema};
+
 use arrow::record_batch::RecordBatch;
+
 use cayenne::metadata::CreateTableOptions;
+
 use cayenne::{CayenneTableProvider, MetadataCatalog};
-use data_components::delete::DeletionTableProvider;
+
+use datafusion::datasource::TableProvider;
 use datafusion::prelude::{col, lit, Expr, SessionContext};
+
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
@@ -47,20 +53,18 @@ async fn insert_batch(
     table: &Arc<CayenneTableProvider>,
     batch: RecordBatch,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    let schema = batch.schema();
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream: datafusion_execution::SendableRecordBatchStream =
-        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream));
-    table.insert(boxed_stream).await.map_err(Into::into)
+    common::insert_batch(table.as_ref(), batch)
+        .await
+        .map_err(Into::into)
 }
 
-/// Helper to delete records from a table using the `DeletionTableProvider` API
+/// Helper to delete records from a table using the `delete_from` API
 async fn delete_records(
     table: &Arc<CayenneTableProvider>,
     filter: Expr,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
-    let plan = table.delete_from(&ctx.state(), &[filter]).await?;
+    let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(results
         .first()
@@ -100,10 +104,11 @@ async fn test_delete_then_insert_different_key_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
-    let ctx = SessionContext::new();
     ctx.register_table(
         "delete_insert",
         Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -181,10 +186,11 @@ async fn test_single_upsert_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
-    let ctx = SessionContext::new();
     ctx.register_table(
         "single_upsert",
         Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -248,10 +254,11 @@ async fn test_do_nothing_drops_conflicts_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
-    let ctx = SessionContext::new();
     ctx.register_table(
         "do_nothing",
         Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -327,10 +334,11 @@ async fn test_upsert_composite_pk_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
-    let ctx = SessionContext::new();
     ctx.register_table(
         "composite_upsert",
         Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -396,10 +404,11 @@ async fn test_upsert_large_batch_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
-    let ctx = SessionContext::new();
     ctx.register_table(
         "large_batch",
         Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -493,10 +502,11 @@ async fn test_delete_nonexistent_then_insert_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
-    let ctx = SessionContext::new();
     ctx.register_table(
         "delete_nonexistent",
         Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -560,10 +570,11 @@ async fn test_string_pk_upsert_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
-    let ctx = SessionContext::new();
     ctx.register_table(
         "string_pk",
         Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -625,10 +636,11 @@ async fn test_delete_all_then_insert_new_keys_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
-    let ctx = SessionContext::new();
     ctx.register_table(
         "delete_all_insert",
         Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -709,10 +721,11 @@ async fn test_mixed_conflict_batch_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
-    let ctx = SessionContext::new();
     ctx.register_table(
         "mixed_batch",
         Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,
@@ -798,10 +811,11 @@ async fn test_empty_batch_impl(
     };
 
     let catalog_arc: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-    let table = CayenneTableProvider::create_table(catalog_arc, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog_arc, table_options, ctx.runtime_env()).await?;
     let table = Arc::new(table);
 
-    let ctx = SessionContext::new();
     ctx.register_table(
         "empty_batch",
         Arc::clone(&table) as Arc<dyn datafusion::datasource::TableProvider>,

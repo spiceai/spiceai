@@ -15,13 +15,13 @@ limitations under the License.
 */
 use super::RefreshTask;
 use crate::accelerated_table::refresh::Refresh;
-use crate::datafusion::error::find_datafusion_root;
+use crate::accelerated_table::refresh_task::deletion::build_batch_delete_expr_from_change_batch;
+use crate::datafusion::error::{find_datafusion_root, format_datafusion_error};
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array};
 use arrow::datatypes::DataType;
 use cache::Caching;
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
-use data_components::delete::{DeletionTableProvider, get_deletion_provider};
 #[cfg(feature = "dynamodb")]
 use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
@@ -29,13 +29,15 @@ use data_components::kafka::{
     Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
     rdkafka::types::RDKafkaErrorCode,
 };
+use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
-use datafusion::logical_expr::{Expr, col};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::TableReference;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
 use futures::{StreamExt, stream};
+use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use snafu::{OptionExt, ResultExt};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,7 +81,7 @@ impl RefreshTask {
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = self.dataset_name.clone();
-        let sql = refresh.read().await.sql.clone();
+        let sql = refresh.read().await.display_sql();
 
         self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
@@ -91,7 +93,7 @@ impl RefreshTask {
                         .write_change(change_envelope.change_batch.clone())
                         .await
                     {
-                        Ok(()) => {
+                        Ok(write_result) => {
                             // Mark the dataset as ready if possible
                             if change_envelope.is_dataset_ready() {
                                 initial_load_completed.store(true, Ordering::Relaxed);
@@ -102,13 +104,14 @@ impl RefreshTask {
                                     .await;
                             }
 
-                            if let Err(e) = change_envelope.commit()
+                            if let Err(e) = change_envelope.commit().await
                                 && !self.runtime_status.is_shutdown()
                             {
                                 tracing::error!("Failed to commit CDC change envelope: {e}");
                             }
 
-                            if let Some(cache_provider_ref) = caching.as_ref()
+                            if write_result == WriteChangeResult::DataWritten
+                                && let Some(cache_provider_ref) = caching.as_ref()
                                 && let Some(cache_provider) = cache_provider_ref.upgrade()
                                 && let Err(e) =
                                     cache_provider.invalidate_for_table(dataset_name.clone())
@@ -122,9 +125,10 @@ impl RefreshTask {
                             }
                         }
                         Err(e) => {
+                            let error_message = format_datafusion_error(&e);
                             self.set_refresh_status(
-                                refresh.read().await.sql.clone().as_deref(),
-                                status::ComponentStatus::Error,
+                                refresh.read().await.display_sql().as_deref(),
+                                status::ComponentStatus::error_with_message(error_message),
                             )
                             .await;
                             if !self.runtime_status.is_shutdown() {
@@ -139,9 +143,10 @@ impl RefreshTask {
                         continue;
                     }
 
+                    let error_message = format_datafusion_error(&e);
                     self.set_refresh_status(
-                        refresh.read().await.sql.clone().as_deref(),
-                        status::ComponentStatus::Error,
+                        refresh.read().await.display_sql().as_deref(),
+                        status::ComponentStatus::error_with_message(error_message),
                     )
                     .await;
                 }
@@ -158,10 +163,8 @@ impl RefreshTask {
     async fn write_change(
         &self,
         change_batch: ChangeBatch,
-    ) -> crate::accelerated_table::Result<()> {
+    ) -> crate::accelerated_table::Result<WriteChangeResult> {
         let dataset_name = self.dataset_name.clone();
-        let deletion_provider = get_deletion_provider(Arc::clone(&self.accelerator))
-            .context(crate::accelerated_table::AcceleratedTableDoesntSupportDeleteSnafu)?;
 
         let sub_batches = group_into_sub_batches(&change_batch);
 
@@ -172,15 +175,18 @@ impl RefreshTask {
             sub_batches.len()
         );
 
+        let mut had_change = false;
         for (op_type, row_indices) in sub_batches {
             match op_type {
                 ChangeOperationType::Delete => {
-                    self.process_delete_batch(&change_batch, &row_indices, &deletion_provider)
+                    self.process_delete_batch(&change_batch, &row_indices)
                         .await?;
+                    had_change = true;
                 }
                 ChangeOperationType::Upsert => {
                     self.process_upsert_batch(&change_batch, &row_indices)
                         .await?;
+                    had_change = true;
                 }
                 ChangeOperationType::Truncate => {
                     tracing::warn!("Truncate operation not yet implemented for {dataset_name}");
@@ -197,7 +203,11 @@ impl RefreshTask {
             future.await;
         }
 
-        Ok(())
+        if had_change {
+            Ok(WriteChangeResult::DataWritten)
+        } else {
+            Ok(WriteChangeResult::NoChange)
+        }
     }
 
     async fn process_upsert_batch(
@@ -242,13 +252,18 @@ impl RefreshTask {
         ));
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
+
+        // Wrap with SchemaCastScanExec to ensure data types match the accelerator schema
+        // (e.g., timestamp precision conversion from Millisecond to Microsecond for Cayenne)
+        let target_schema = self.accelerator.schema();
+        let streaming_plan: Arc<dyn ExecutionPlan> =
+            Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream));
+        let cast_plan: Arc<dyn ExecutionPlan> =
+            Arc::new(SchemaCastScanExec::new(streaming_plan, target_schema));
+
         let insert_plan = self
             .accelerator
-            .insert_into(
-                &session_state,
-                Arc::new(StreamingDataUpdateExecutionPlan::new(record_batch_stream)),
-                InsertOp::Append,
-            )
+            .insert_into(&session_state, cast_plan, InsertOp::Append)
             .await
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
@@ -257,6 +272,8 @@ impl RefreshTask {
             .map_err(find_datafusion_root)
             .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
 
+        self.update_last_updated_at();
+
         Ok(())
     }
 
@@ -264,7 +281,6 @@ impl RefreshTask {
         &self,
         change_batch: &ChangeBatch,
         row_indices: &[usize],
-        deletion_provider: &Arc<dyn DeletionTableProvider>,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = &self.dataset_name;
 
@@ -284,8 +300,9 @@ impl RefreshTask {
             let session_state = ctx.state();
 
             let _lock_guard = self.accelerator_write_mutex.lock().await;
-            let delete_plan = deletion_provider
-                .delete_from(&session_state, &[combined])
+            let delete_plan = self
+                .accelerator
+                .delete_from(&session_state, vec![combined])
                 .await
                 .map_err(find_datafusion_root)
                 .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
@@ -295,54 +312,10 @@ impl RefreshTask {
                 .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
         }
 
+        self.update_last_updated_at();
+
         Ok(())
     }
-}
-
-pub fn build_batch_delete_expr<F, G>(
-    row_indices: &[usize],
-    get_primary_keys: F,
-    get_row_data: G,
-    dataset_name: &str,
-) -> crate::accelerated_table::Result<Option<Expr>>
-where
-    F: Fn(usize) -> Vec<String>,
-    G: Fn(usize) -> RecordBatch,
-{
-    if row_indices.is_empty() {
-        return Ok(None);
-    }
-
-    let row_conditions: Vec<Expr> = row_indices
-        .iter()
-        .map(|&row| {
-            let primary_keys = get_primary_keys(row);
-            let row_data = get_row_data(row);
-            let exprs = get_delete_where_expr(&row_data, primary_keys)?;
-            exprs
-                .into_iter()
-                .reduce(datafusion_expr::Expr::and)
-                .ok_or_else(|| crate::accelerated_table::Error::NoPrimaryKeysDefined {
-                    dataset_name: dataset_name.to_string(),
-                })
-        })
-        .collect::<crate::accelerated_table::Result<Vec<_>>>()?;
-
-    Ok(row_conditions.into_iter().reduce(datafusion_expr::Expr::or))
-}
-
-/// Simplified version that works directly with `ChangeBatch`
-pub fn build_batch_delete_expr_from_change_batch(
-    change_batch: &ChangeBatch,
-    row_indices: &[usize],
-    dataset_name: &str,
-) -> crate::accelerated_table::Result<Option<Expr>> {
-    build_batch_delete_expr(
-        row_indices,
-        |row| change_batch.primary_keys(row),
-        |row| change_batch.data(row),
-        dataset_name,
-    )
 }
 
 fn get_primary_key_log_fmt(
@@ -359,21 +332,7 @@ fn get_primary_key_log_fmt(
         .map(|keys| keys.join(", "))
 }
 
-fn get_delete_where_expr(
-    data: &RecordBatch,
-    primary_keys: Vec<String>,
-) -> crate::accelerated_table::Result<Vec<Expr>> {
-    let mut delete_where_exprs: Vec<Expr> = vec![];
-
-    for primary_key in primary_keys {
-        let (_, expr_val) = get_primary_key_value(data, &primary_key)?;
-        delete_where_exprs.push(col(primary_key).eq(expr_val));
-    }
-
-    Ok(delete_where_exprs)
-}
-
-fn get_primary_key_value(
+pub(crate) fn get_primary_key_value(
     data: &RecordBatch,
     key: &str,
 ) -> crate::accelerated_table::Result<(String, Expr)> {
@@ -461,6 +420,12 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
     }
 
     sub_batches
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteChangeResult {
+    DataWritten,
+    NoChange,
 }
 
 // Used to group batch changes into sub-batches
@@ -564,9 +529,10 @@ mod tests {
     use arrow::array::{ArrayRef, Int32Array, ListArray, StringArray, StructArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use data_components::arrow::write::MemTable;
     use data_components::cdc::changes_schema;
-    use datafusion::common::ScalarValue;
-    use datafusion::logical_expr::Operator;
+    use datafusion::datasource::TableProvider;
+
     use std::sync::Arc;
 
     fn create_test_data_schema() -> Schema {
@@ -865,338 +831,66 @@ mod tests {
         assert_eq!(result[3].1, vec![3]);
     }
 
-    fn make_single_row_batch(pk: i64, sk: &str) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("PK", DataType::Int64, false),
-            Field::new("SK", DataType::Utf8, false),
-        ]));
-
-        let pk_array: ArrayRef = Arc::new(Int64Array::from(vec![pk]));
-        let sk_array: ArrayRef = Arc::new(StringArray::from(vec![sk]));
-
-        RecordBatch::try_new(schema, vec![pk_array, sk_array]).expect("record batch")
+    fn make_mem_table() -> Arc<MemTable> {
+        let schema = Arc::new(create_test_data_schema());
+        Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("mem table should be created"))
     }
 
-    fn make_single_key_batch(id: &str) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
-        let id_array: ArrayRef = Arc::new(StringArray::from(vec![id]));
-        RecordBatch::try_new(schema, vec![id_array]).expect("record batch")
-    }
+    fn make_refresh_task(accelerator: Arc<dyn TableProvider>) -> RefreshTask {
+        use crate::accelerated_table::refresh_task::RefreshTaskBuilder;
+        use crate::federated_table::FederatedTable;
+        use tokio::runtime::Handle;
+        use tokio::sync::Mutex;
 
-    #[test]
-    fn test_empty_row_indices_returns_none() {
-        let result = build_batch_delete_expr(
-            &[],
-            |_| vec!["id".to_string()],
-            |_| make_single_key_batch("test"),
-            "test_dataset",
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
+        RefreshTaskBuilder::new(
+            crate::status::RuntimeStatus::new(),
+            datafusion::sql::TableReference::bare("test"),
+            federated,
+            None,
+            accelerator,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
         )
-        .expect("result");
-
-        assert!(result.is_none());
+        .build()
     }
 
-    #[test]
-    fn test_single_row_single_key() {
-        // Single row with single primary key: WHERE id='id-5'
-        let row_indices = vec![0];
-        let result = build_batch_delete_expr(
-            &row_indices,
-            |_| vec!["id".to_string()],
-            |_| make_single_key_batch("id-5"),
-            "test_dataset",
-        )
-        .expect("result")
-        .expect("result");
-
-        // Should be: id = 'id-5' (a single equality expression)
-        if let Expr::BinaryExpr(binary) = &result {
-            assert_eq!(binary.op, Operator::Eq, "Expected Eq operator");
-
-            // Left side should be column "id"
-            if let Expr::Column(col) = binary.left.as_ref() {
-                assert_eq!(col.name, "id");
-            } else {
-                panic!("Expected Column on left side, got: {:?}", binary.left);
-            }
-
-            // Right side should be literal "id-5"
-            if let Expr::Literal(ScalarValue::Utf8(Some(val)), _) = binary.right.as_ref() {
-                assert_eq!(val, "id-5");
-            } else {
-                panic!(
-                    "Expected Utf8 literal on right side, got: {:?}",
-                    binary.right
-                );
-            }
-        } else {
-            panic!("Expected BinaryExpr, got: {result:?}");
-        }
+    #[tokio::test]
+    async fn test_write_change_upsert_returns_data_written() {
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
+        let change_batch =
+            create_test_change_batch(vec!["c"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
+        assert_eq!(
+            task.write_change(change_batch)
+                .await
+                .expect("write_change should succeed"),
+            WriteChangeResult::DataWritten
+        );
     }
 
-    #[test]
-    fn test_multiple_rows_single_key_produces_or() {
-        // Should produce: id='id-5' OR id='id-6' OR id='id-7'
-        let row_indices = vec![0, 1, 2];
-        let ids = ["id-5", "id-6", "id-7"];
-
-        let result = build_batch_delete_expr(
-            &row_indices,
-            |_| vec!["id".to_string()],
-            |row| make_single_key_batch(ids[row]),
-            "test_dataset",
-        )
-        .expect("result")
-        .expect("result");
-
-        // Collect all equality conditions from the OR tree
-        let conditions = collect_or_conditions(&result);
-        assert_eq!(conditions.len(), 3, "Expected 3 OR conditions");
-
-        // Verify each condition is id = 'id-X'
-        let values: Vec<String> = conditions
-            .iter()
-            .map(|expr| extract_eq_value(expr, "id"))
-            .collect();
-
-        assert!(values.contains(&"id-5".to_string()));
-        assert!(values.contains(&"id-6".to_string()));
-        assert!(values.contains(&"id-7".to_string()));
+    #[tokio::test]
+    async fn test_write_change_delete_returns_data_written() {
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
+        let change_batch =
+            create_test_change_batch(vec!["d"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
+        assert_eq!(
+            task.write_change(change_batch)
+                .await
+                .expect("write_change should succeed"),
+            WriteChangeResult::DataWritten
+        );
     }
 
-    #[test]
-    #[expect(clippy::similar_names)]
-    fn test_single_row_composite_key_produces_and() {
-        // Single row with composite key: WHERE pk=1 AND sk='300'
-        let row_indices = vec![0];
-
-        let result = build_batch_delete_expr(
-            &row_indices,
-            |_| vec!["PK".to_string(), "SK".to_string()],
-            |_| make_single_row_batch(1, "300"),
-            "test_dataset",
-        )
-        .expect("result")
-        .expect("result");
-
-        // Should be AND at top level
-        if let Expr::BinaryExpr(binary) = &result {
-            assert_eq!(binary.op, Operator::And, "Expected AND for composite key");
-
-            // Collect the two equality conditions
-            let conditions = collect_and_conditions(&result);
-            assert_eq!(conditions.len(), 2, "Expected 2 AND conditions");
-
-            // Verify we have conditions for both pk and sk
-            let has_pk = conditions.iter().any(|e| is_column_eq(e, "pk"));
-            let has_sk = conditions.iter().any(|e| is_column_eq(e, "sk"));
-            assert!(has_pk, "Expected condition for pk");
-            assert!(has_sk, "Expected condition for sk");
-        } else {
-            panic!("Expected BinaryExpr with AND, got: {result:?}");
-        }
-    }
-
-    #[test]
-    fn test_multiple_rows_composite_key_produces_or_of_ands() {
-        // Should produce: (pk=1 AND sk='300') OR (pk=1 AND sk='400') OR (pk=2 AND sk='100')
-        let row_indices = vec![0, 1, 2];
-        let rows = [(1i64, "300"), (1i64, "400"), (2i64, "100")];
-
-        let result = build_batch_delete_expr(
-            &row_indices,
-            |_| vec!["PK".to_string(), "SK".to_string()],
-            |row| make_single_row_batch(rows[row].0, rows[row].1),
-            "test_dataset",
-        )
-        .expect("result")
-        .expect("result");
-
-        // Collect top-level OR conditions
-        let or_conditions = collect_or_conditions(&result);
-        assert_eq!(or_conditions.len(), 3, "Expected 3 OR conditions");
-
-        // Each OR condition should be an AND of two equality expressions
-        for condition in &or_conditions {
-            if let Expr::BinaryExpr(binary) = condition {
-                assert_eq!(binary.op, Operator::And, "Each OR branch should be AND");
-            } else {
-                panic!("Expected AND expression in OR branch, got: {condition:?}");
-            }
-        }
-
-        // Verify we have the expected (pk, sk) pairs
-        let pairs: Vec<(i64, String)> = or_conditions
-            .iter()
-            .map(|expr| extract_pk_sk_values(expr))
-            .collect();
-
-        assert!(pairs.contains(&(1, "300".to_string())));
-        assert!(pairs.contains(&(1, "400".to_string())));
-        assert!(pairs.contains(&(2, "100".to_string())));
-    }
-
-    #[test]
-    fn test_two_rows_single_key_structure() {
-        // Test the exact structure: id='a' OR id='b'
-        let row_indices = vec![0, 1];
-        let ids = ["a", "b"];
-
-        let result = build_batch_delete_expr(
-            &row_indices,
-            |_| vec!["id".to_string()],
-            |row| make_single_key_batch(ids[row]),
-            "test_dataset",
-        )
-        .expect("result")
-        .expect("result");
-
-        // Collect OR conditions
-        let conditions = collect_or_conditions(&result);
-        assert_eq!(conditions.len(), 2, "Expected 2 OR conditions");
-
-        // Each condition should be a simple equality
-        for cond in &conditions {
-            if let Expr::BinaryExpr(binary) = cond {
-                assert_eq!(binary.op, Operator::Eq, "Each condition should be Eq");
-            } else {
-                panic!("Expected BinaryExpr with Eq, got: {cond:?}");
-            }
-        }
-
-        // Verify the values
-        let values: Vec<String> = conditions
-            .iter()
-            .map(|expr| extract_eq_value(expr, "id"))
-            .collect();
-
-        assert!(values.contains(&"a".to_string()));
-        assert!(values.contains(&"b".to_string()));
-    }
-
-    #[test]
-    fn test_two_rows_composite_key_structure() {
-        // Test: (pk=1 AND sk='a') OR (pk=2 AND sk='b')
-        let row_indices = vec![0, 1];
-        let rows = [(1i64, "a"), (2i64, "b")];
-
-        let result = build_batch_delete_expr(
-            &row_indices,
-            |_| vec!["PK".to_string(), "SK".to_string()],
-            |row| make_single_row_batch(rows[row].0, rows[row].1),
-            "test_dataset",
-        )
-        .expect("result")
-        .expect("result");
-
-        // Collect top-level OR conditions
-        let or_conditions = collect_or_conditions(&result);
-        assert_eq!(or_conditions.len(), 2, "Expected 2 OR conditions");
-
-        // Each OR condition should be an AND
-        for cond in &or_conditions {
-            if let Expr::BinaryExpr(binary) = cond {
-                assert_eq!(binary.op, Operator::And, "Each OR branch should be AND");
-            } else {
-                panic!("Expected AND in OR branch, got: {cond:?}");
-            }
-
-            // Each AND should have 2 equality conditions
-            let and_conditions = collect_and_conditions(cond);
-            assert_eq!(and_conditions.len(), 2, "Expected 2 AND conditions per row");
-        }
-
-        // Verify the (pk, sk) pairs
-        let pairs: Vec<(i64, String)> = or_conditions
-            .iter()
-            .map(|expr| extract_pk_sk_values(expr))
-            .collect();
-
-        assert!(pairs.contains(&(1, "a".to_string())));
-        assert!(pairs.contains(&(2, "b".to_string())));
-    }
-
-    /// Recursively collects all leaf conditions from an OR tree
-    fn collect_or_conditions(expr: &Expr) -> Vec<&Expr> {
-        match expr {
-            Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
-                let mut conditions = collect_or_conditions(&binary.left);
-                conditions.extend(collect_or_conditions(&binary.right));
-                conditions
-            }
-            _ => vec![expr],
-        }
-    }
-
-    /// Recursively collects all leaf conditions from an AND tree
-    fn collect_and_conditions(expr: &Expr) -> Vec<&Expr> {
-        match expr {
-            Expr::BinaryExpr(binary) if binary.op == Operator::And => {
-                let mut conditions = collect_and_conditions(&binary.left);
-                conditions.extend(collect_and_conditions(&binary.right));
-                conditions
-            }
-            _ => vec![expr],
-        }
-    }
-
-    /// Checks if expression is `column_name = <something>`
-    fn is_column_eq(expr: &Expr, column_name: &str) -> bool {
-        if let Expr::BinaryExpr(binary) = expr
-            && binary.op == Operator::Eq
-            && let Expr::Column(col) = binary.left.as_ref()
-        {
-            return col.name == column_name;
-        }
-        false
-    }
-
-    /// Extracts the string value from `column_name = 'value'`
-    fn extract_eq_value(expr: &Expr, column_name: &str) -> String {
-        if let Expr::BinaryExpr(binary) = expr
-            && binary.op == Operator::Eq
-            && let Expr::Column(col) = binary.left.as_ref()
-            && col.name == column_name
-            && let Expr::Literal(ScalarValue::Utf8(Some(val)), _) = binary.right.as_ref()
-        {
-            return val.clone();
-        }
-        panic!("Expected {column_name} = 'value', got: {expr:?}");
-    }
-
-    /// Extracts (pk, sk) values from `pk = N AND sk = 'S'`
-    fn extract_pk_sk_values(expr: &Expr) -> (i64, String) {
-        let conditions = collect_and_conditions(expr);
-
-        let mut pk_value: Option<i64> = None;
-        let mut sk_value: Option<String> = None;
-
-        for cond in conditions {
-            if let Expr::BinaryExpr(binary) = cond
-                && binary.op == Operator::Eq
-                && let Expr::Column(col) = binary.left.as_ref()
-            {
-                match col.name.as_str() {
-                    "pk" => {
-                        if let Expr::Literal(ScalarValue::Int64(Some(v)), _) = binary.right.as_ref()
-                        {
-                            pk_value = Some(*v);
-                        }
-                    }
-                    "sk" => {
-                        if let Expr::Literal(ScalarValue::Utf8(Some(v)), _) = binary.right.as_ref()
-                        {
-                            sk_value = Some(v.clone());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        (
-            pk_value.expect("Expected pk value"),
-            sk_value.expect("Expected sk value"),
-        )
+    #[tokio::test]
+    async fn test_empty_returns_no_change() {
+        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
+        // Any unrecognized op string maps to ChangeOperation::Unknown
+        let change_batch = create_test_change_batch(vec![], &[], vec![], vec![]);
+        assert_eq!(
+            task.write_change(change_batch)
+                .await
+                .expect("write_change should succeed"),
+            WriteChangeResult::NoChange
+        );
     }
 }

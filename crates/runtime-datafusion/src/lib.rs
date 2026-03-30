@@ -15,12 +15,14 @@ limitations under the License.
 */
 
 pub mod allowlist;
+pub mod analyzer_rule;
 pub mod config;
 pub mod execution_plan;
 pub mod extension;
 pub mod join_accumulator;
 pub mod optimizer_rule;
 pub mod schema_provider;
+pub mod url_table;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]

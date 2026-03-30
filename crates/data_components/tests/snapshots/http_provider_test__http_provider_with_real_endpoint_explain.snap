@@ -1,5 +1,6 @@
 ---
 source: crates/data_components/tests/http_provider_test.rs
+assertion_line: 86
 description: HTTP provider - real endpoint with path filter
 ---
 +---------------+--------------------------------------------------------------------------------------------------------------------------------+
@@ -7,10 +8,9 @@ description: HTTP provider - real endpoint with path filter
 +---------------+--------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Filter: httpbin.request_path = Utf8("/json")                                                                                   |
 |               |   TableScan: httpbin projection=[request_path, request_query, content], partial_filters=[httpbin.request_path = Utf8("/json")] |
-| physical_plan | CoalesceBatchesExec: target_batch_size=8192                                                                                    |
-|               |   FilterExec: request_path@0 = /json                                                                                           |
-|               |     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                      |
-|               |       CooperativeExec                                                                                                          |
-|               |         HttpExec: base_url=https://httpbin.org/, format=json, partitions=[(path="/json", query="", body="")]                   |
+| physical_plan | FilterExec: request_path@0 = /json                                                                                             |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1                                                        |
+|               |     CooperativeExec                                                                                                            |
+|               |       HttpExec: base_url=https://httpbin.org/, format=json, partitions=[(path="/json", query="", body="")]                     |
 |               |                                                                                                                                |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------+

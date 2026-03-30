@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/cluster/in_memory_shuffle.rs
+expression: pretty
+---
++-------------+-------+-------------------+
+| city        | count | avg_score         |
++-------------+-------+-------------------+
+| Chicago     | 5     | 89.6              |
+| Los Angeles | 5     | 85.0              |
+| New York    | 6     | 87.66666666666667 |
++-------------+-------+-------------------+

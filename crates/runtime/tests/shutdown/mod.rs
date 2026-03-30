@@ -28,7 +28,7 @@ use tokio::time::sleep;
 
 use crate::{
     configure_test_datafusion, init_tracing,
-    utils::{runtime_ready_check_with_timeout, test_request_context},
+    utils::{register_test_connectors, runtime_ready_check_with_timeout, test_request_context},
 };
 
 pub fn get_s3_dataset(s3_uri: &str, name: &str) -> Dataset {
@@ -52,6 +52,7 @@ const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 #[tokio::test]
 async fn runtime_shutdown_timeout_force() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,runtime=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -140,6 +141,7 @@ async fn runtime_shutdown_timeout_force() -> Result<(), anyhow::Error> {
 #[tokio::test]
 async fn runtime_shutdown_timeout_grace() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,runtime=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

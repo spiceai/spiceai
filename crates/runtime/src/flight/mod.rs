@@ -25,7 +25,7 @@ use crate::{Runtime, metrics as runtime_metrics};
 use app::App;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
-use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator};
+use arrow::ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, PutResult, SchemaResult};
@@ -53,6 +53,7 @@ use snafu::prelude::*;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tokio::sync::broadcast::Sender;
 use tokio_util::sync::CancellationToken;
@@ -60,6 +61,7 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 mod actions;
+mod async_actions;
 mod do_exchange;
 mod do_get;
 mod do_put;
@@ -68,9 +70,9 @@ mod get_flight_info;
 mod get_schema;
 mod handshake;
 mod metrics;
-mod middleware;
+pub mod middleware;
 mod session;
-mod session_auth;
+pub(crate) mod session_auth;
 mod util;
 
 pub use session::SessionStore;
@@ -91,6 +93,12 @@ impl Service {
             basic_auth,
             session_store: SessionStore::new(),
         }
+    }
+
+    /// Returns a clone of the session store.
+    #[must_use]
+    pub fn session_store(&self) -> SessionStore {
+        self.session_store.clone()
     }
 }
 
@@ -203,10 +211,18 @@ impl Service {
     ) -> Result<(Schema, Option<Schema>), Status> {
         let query = QueryBuilder::new(sql, datafusion).build();
 
-        query.get_schema().await.map_err(handle_datafusion_error)
+        let (dataset_schema, parameter_schema) =
+            query.get_schema().await.map_err(handle_datafusion_error)?;
+
+        // The logical plan may report Utf8View/BinaryView, but the physical
+        // execution (with `expand_views_at_output = true`) will produce
+        // LargeUtf8/LargeBinary.  Align the advertised schema so that
+        // `get_flight_info` and `do_get` are consistent.
+        let dataset_schema = arrow_tools::schema::expand_views_schema(&dataset_schema);
+
+        Ok((dataset_schema, parameter_schema))
     }
 
-    #[expect(clippy::result_large_err)]
     fn serialize_schema(schema: &Schema) -> Result<Bytes, Status> {
         let message: IpcMessage = SchemaAsIpc::new(schema, &IpcWriteOptions::default())
             .try_into()
@@ -234,6 +250,7 @@ impl Service {
 
         // Pre-compute schema flight data once
         let mut dict_tracker = DictionaryTracker::new(true); // Set to true to handle dictionaries
+        let mut compression_context = CompressionContext::default();
         let encoder = IpcDataGenerator::default();
         let data = IpcMessage(
             encoder
@@ -263,7 +280,7 @@ impl Service {
                 match batch_result {
                     Ok(batch) => {
                         let (dicts, batch_data) = encoder
-                            .encoded_batch(&batch, &mut dict_tracker, &options)
+                            .encode(&batch, &mut dict_tracker, &options, &mut compression_context)
                             .map_err(|e| Status::internal(e.to_string()))?;
 
                         // Yield dictionaries first
@@ -398,6 +415,7 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
         | DataFusionError::ParquetError(_)
         | DataFusionError::Substrait(_)
         | DataFusionError::Configuration(_)
+        | DataFusionError::Ffi(_)
         | DataFusionError::ExecutionJoin(_) => to_tonic_err(e),
     }
 }
@@ -518,17 +536,20 @@ pub async fn start(
     // Create the OpenTelemetry MetricsService
     let otel_service = create_metrics_service(rt.datafusion());
 
+    // Get job executor if available (cluster mode)
+    let job_executor = rt.job_executor();
+    let flight_write_rate_limit_enabled = rt.flight_write_rate_limit_enabled();
+
     let mut server = server
-        .layer(RequestContextLayer::new(
-            app,
-            rt.datafusion(),
-            session_store,
-            rt.secrets(),
-        ))
-        .layer(WriteRateLimitLayer::new(RateLimiter::direct(
-            rate_limits.flight_write_limit,
-        )))
-        .layer(auth_layer);
+        .layer(
+            RequestContextLayer::new(app, rt.datafusion(), session_store, rt.secrets())
+                .with_job_executor(job_executor),
+        )
+        .layer(auth_layer)
+        .layer(WriteRateLimitLayer::new(
+            RateLimiter::direct(rate_limits.flight_write_limit),
+            flight_write_rate_limit_enabled,
+        ));
 
     let server = server
         .add_service(spice_flight_service)
@@ -560,6 +581,9 @@ pub async fn start(
 
 pub struct RateLimits {
     pub flight_write_limit: Quota,
+    /// Whether write rate limiting is enabled. When `false`, the rate limiter
+    /// layer is still present but the check function always succeeds.
+    flight_write_enabled: AtomicBool,
 }
 
 impl RateLimits {
@@ -573,6 +597,21 @@ impl RateLimits {
         self.flight_write_limit = rate_limit;
         self
     }
+
+    #[must_use]
+    pub fn with_flight_write_enabled(mut self, enabled: bool) -> Self {
+        self.flight_write_enabled = AtomicBool::new(enabled);
+        self
+    }
+
+    #[must_use]
+    pub fn flight_write_enabled(&self) -> bool {
+        self.flight_write_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_flight_write_enabled(&self, enabled: bool) {
+        self.flight_write_enabled.store(enabled, Ordering::Release);
+    }
 }
 
 impl Default for RateLimits {
@@ -582,6 +621,7 @@ impl Default for RateLimits {
             flight_write_limit: Quota::per_minute(
                 NonZeroU32::new(100).unwrap_or_else(|| unreachable!("100 is always non-zero")),
             ),
+            flight_write_enabled: AtomicBool::new(true),
         }
     }
 }

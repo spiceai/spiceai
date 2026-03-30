@@ -22,7 +22,7 @@ use std::{
 
 use crate::{
     init_tracing,
-    utils::{test_request_context, wait_until_true},
+    utils::{register_test_connectors, test_request_context, wait_until_true},
 };
 use rand::Rng;
 use runtime::{Runtime, auth::EndpointAuth, config::Config};
@@ -37,6 +37,7 @@ async fn test_http_auth() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
         rustls::crypto::aws_lc_rs::default_provider(),
     );
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {

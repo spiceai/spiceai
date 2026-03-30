@@ -16,6 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 use data_components::poly::PolyTableProvider;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::{
     catalog::TableProviderFactory, datasource::TableProvider, execution::context::SessionContext,
     logical_expr::CreateExternalTable,
@@ -113,6 +114,7 @@ impl DataAccelerator for PostgresAccelerator {
         mut cmd: CreateExternalTable,
         _source: Option<&dyn AccelerationSource>,
         partition_by: Vec<PartitionedBy>,
+        _runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         ensure!(
             partition_by.is_empty(),
@@ -173,14 +175,13 @@ impl DataAccelerator for PostgresAccelerator {
         let postgres_writer = Arc::new(postgres_writer.clone());
 
         // Wrap with upsert deduplication if needed
-        let (write_provider, delete_provider) =
-            upsert_dedup::wrap_with_upsert_dedup_if_needed(postgres_writer, &cmd.options);
+        let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+            postgres_writer,
+            &cmd.options,
+            cmd.constraints.clone(),
+        );
 
-        let table_provider = Arc::new(PolyTableProvider::new(
-            write_provider,
-            delete_provider,
-            read_provider,
-        ));
+        let table_provider = Arc::new(PolyTableProvider::new(write_provider, read_provider));
 
         Ok(table_provider)
     }

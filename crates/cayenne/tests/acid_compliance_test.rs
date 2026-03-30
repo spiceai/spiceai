@@ -35,16 +35,22 @@ limitations under the License.
 mod common;
 
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+
 use arrow::datatypes::{DataType, Field, Schema};
+
 use cayenne::{
     metadata::CreateTableOptions, CayenneTableProvider, CayenneTableProviderBuilder,
     MetadataCatalog,
 };
+
 use common::TestFixture;
-use data_components::delete::DeletionTableProvider;
+
 use datafusion::datasource::TableProvider;
+
 use datafusion::execution::context::SessionContext;
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -96,8 +102,10 @@ async fn setup_int64_pk_table(
 
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     Ok((table, ctx, schema))
@@ -121,8 +129,10 @@ async fn setup_string_pk_table(
 
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     Ok((table, ctx, schema))
@@ -146,24 +156,24 @@ async fn setup_composite_pk_table(
 
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     Ok((table, ctx, schema))
 }
 
 async fn insert_batch(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> TestResult<u64> {
-    let schema = batch.schema();
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream: datafusion_execution::SendableRecordBatchStream =
-        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream));
-    table.insert(boxed_stream).await.map_err(Into::into)
+    common::insert_batch(table.as_ref(), batch)
+        .await
+        .map_err(Into::into)
 }
 
 async fn delete_records(table: &Arc<CayenneTableProvider>, filter: Expr) -> TestResult<u64> {
     let ctx = SessionContext::new();
-    let plan = table.delete_from(&ctx.state(), &[filter]).await?;
+    let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(results
         .first()
@@ -498,13 +508,13 @@ async fn test_acid_durability_reopen_impl(fixture: TestFixture) -> TestResult<()
     {
         let catalog: Arc<dyn MetadataCatalog> =
             Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+        let ctx2 = SessionContext::new();
         let reopened_table = Arc::new(
-            CayenneTableProviderBuilder::new(catalog)
+            CayenneTableProviderBuilder::new(catalog, ctx2.runtime_env())
                 .open(table_name)
                 .await?,
         );
 
-        let ctx2 = SessionContext::new();
         ctx2.register_table(
             table_name,
             Arc::clone(&reopened_table) as Arc<dyn TableProvider>,
@@ -551,7 +561,10 @@ async fn test_acid_durability_deletions_persist_impl(fixture: TestFixture) -> Te
 
         let catalog: Arc<dyn MetadataCatalog> =
             Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-        let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
+        let ctx = SessionContext::new();
+        let table = Arc::new(
+            CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+        );
 
         let batch1 = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -567,7 +580,6 @@ async fn test_acid_durability_deletions_persist_impl(fixture: TestFixture) -> Te
         delete_records(&table, col("id").eq(lit(2i64))).await?;
         delete_records(&table, col("id").eq(lit(4i64))).await?;
 
-        let ctx = SessionContext::new();
         ctx.register_table(table_name, Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
         // Verify deletions took effect
@@ -580,13 +592,13 @@ async fn test_acid_durability_deletions_persist_impl(fixture: TestFixture) -> Te
     {
         let catalog: Arc<dyn MetadataCatalog> =
             Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
+        let ctx2 = SessionContext::new();
         let reopened_table = Arc::new(
-            CayenneTableProviderBuilder::new(catalog)
+            CayenneTableProviderBuilder::new(catalog, ctx2.runtime_env())
                 .open(table_name)
                 .await?,
         );
 
-        let ctx2 = SessionContext::new();
         ctx2.register_table(
             table_name,
             Arc::clone(&reopened_table) as Arc<dyn TableProvider>,
@@ -1266,10 +1278,12 @@ async fn test_multifile_duplicate_pk_in_batch_impl(fixture: TestFixture) -> Test
 
 // =============================================================================
 // Multi-File Test 8: Position-Based Delete + Insert Across Files
-// Tests that position-based deletion also works correctly with compaction
+// Tests that position-based deletion works correctly with per-file deletion vectors
 // =============================================================================
 
-async fn test_multifile_position_based_upsert_impl(fixture: TestFixture) -> TestResult<()> {
+async fn test_multifile_position_based_delete_reinsert_impl(
+    fixture: TestFixture,
+) -> TestResult<()> {
     // Create table WITHOUT primary key (uses position-based deletion)
     let schema = Arc::new(Schema::new(vec![
         Field::new("category", DataType::Utf8, false),
@@ -1277,10 +1291,10 @@ async fn test_multifile_position_based_upsert_impl(fixture: TestFixture) -> Test
     ]));
 
     let table_options = CreateTableOptions {
-        table_name: "mf_position_upsert".to_string(),
+        table_name: "mf_position_delete_insert".to_string(),
         schema: Arc::clone(&schema),
         primary_key: vec![],
-        on_conflict: None, // No PK = position-based
+        on_conflict: None, // No PK = position-based deletion
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
         vortex_config: cayenne::metadata::VortexConfig::default(),
@@ -1288,14 +1302,16 @@ async fn test_multifile_position_based_upsert_impl(fixture: TestFixture) -> Test
 
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
-    let table = Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
     let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
     ctx.register_table(
-        "mf_position_upsert",
+        "mf_position_delete_insert",
         Arc::clone(&table) as Arc<dyn TableProvider>,
     )?;
 
-    // File 1: Initial data
+    // File 1: Initial data (3 rows)
     let batch1 = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
@@ -1304,14 +1320,15 @@ async fn test_multifile_position_based_upsert_impl(fixture: TestFixture) -> Test
         ],
     )?;
     insert_batch(&table, batch1).await?;
-    assert_eq!(get_row_count(&ctx, "mf_position_upsert").await?, 3);
+    assert_eq!(get_row_count(&ctx, "mf_position_delete_insert").await?, 3);
 
-    // Delete category B
+    // Delete category B (removes B(200) from File 1)
     delete_records(&table, col("category").eq(lit("B"))).await?;
-    assert_eq!(get_row_count(&ctx, "mf_position_upsert").await?, 2);
+    assert_eq!(get_row_count(&ctx, "mf_position_delete_insert").await?, 2);
 
-    // File 2: Insert new data including a "B" again
-    // With position-based + compaction fix, this should work correctly
+    // File 2: Insert new data including a new "B" row
+    // With per-file deletion vectors, new files have no deletions - the B(222) is a new row,
+    // completely separate from the deleted B(200). This is NOT upsert behavior.
     let batch2 = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
@@ -1321,16 +1338,17 @@ async fn test_multifile_position_based_upsert_impl(fixture: TestFixture) -> Test
     )?;
     insert_batch(&table, batch2).await?;
 
-    // Should have 4 rows: A(100), C(300), B(222), D(400)
+    // Should have 4 rows: A(100), C(300) from File 1 + B(222), D(400) from File 2
+    // Note: B(222) is a NEW row, not a replacement - there's no PK to deduplicate
     assert_eq!(
-        get_row_count(&ctx, "mf_position_upsert").await?,
+        get_row_count(&ctx, "mf_position_delete_insert").await?,
         4,
         "Should have 4 rows after position-based delete and re-insert"
     );
 
-    // Verify B has the new value
+    // Verify only one B exists (the new one with value 222)
     let df = ctx
-        .sql("SELECT value FROM mf_position_upsert WHERE category = 'B'")
+        .sql("SELECT value FROM mf_position_delete_insert WHERE category = 'B'")
         .await?;
     let results = df.collect().await?;
     let value = results
@@ -1338,11 +1356,7 @@ async fn test_multifile_position_based_upsert_impl(fixture: TestFixture) -> Test
         .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
         .and_then(|a| a.values().first())
         .copied();
-    assert_eq!(
-        value,
-        Some(222),
-        "Re-inserted category B should have new value"
-    );
+    assert_eq!(value, Some(222), "New B row should have value 222");
 
     Ok(())
 }
@@ -1461,5 +1475,5 @@ test_with_backends!(test_multifile_upsert_composite_pk_impl);
 test_with_backends!(test_multifile_delete_all_readd_all_impl);
 test_with_backends!(test_multifile_interleaved_many_files_impl);
 test_with_backends!(test_multifile_duplicate_pk_in_batch_impl);
-test_with_backends!(test_multifile_position_based_upsert_impl);
+test_with_backends!(test_multifile_position_based_delete_reinsert_impl);
 test_with_backends!(test_multifile_bulk_delete_bulk_reinsert_impl);

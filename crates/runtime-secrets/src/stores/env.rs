@@ -114,3 +114,72 @@ impl SecretStore for EnvSecretStore {
         .transpose()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    /// Test that verifies the dotenvy patch disables variable substitution.
+    ///
+    /// **Patch**: `dotenvy` (spiceai fork)
+    /// **Purpose**: Disable shell-style variable substitution in .env files
+    /// **Tracking Issue**: <https://github.com/allan2/dotenvy/issues/113>
+    ///
+    /// **What happens without this patch**: Values containing `$` characters like
+    /// `API_KEY=sk-abc$123` would be incorrectly parsed as variable references,
+    /// resulting in `sk-abc` (with `$123` treated as an undefined variable).
+    ///
+    /// This test creates a .env file with values containing `$` characters and verifies
+    /// they are preserved literally.
+    #[test]
+    fn test_dotenvy_no_variable_substitution() {
+        // Create a temp directory for the test .env file
+        let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+        let env_file = temp_dir.path().join(".env.test");
+
+        // Write a .env file with values that would be broken by variable substitution
+        let env_content = r"# Test values with $ characters that should NOT be substituted
+TEST_PATCH_API_KEY=sk-abc$123def
+TEST_PATCH_PASSWORD=p@ss$word$123
+TEST_PATCH_DOLLAR_SIGN=value_with_$_in_middle
+TEST_PATCH_CURLY_BRACES=value_${NOT_A_VAR}_here
+TEST_PATCH_MULTIPLE_DOLLARS=$$double$$dollars$$
+";
+
+        let mut file = std::fs::File::create(&env_file).expect("Failed to create test .env file");
+        file.write_all(env_content.as_bytes())
+            .expect("Failed to write test .env file");
+        drop(file);
+
+        // Load the .env file using dotenvy
+        dotenvy::from_path(&env_file).expect("Failed to load .env file");
+
+        // Verify each value is preserved literally (no variable substitution)
+        let test_cases = [
+            ("TEST_PATCH_API_KEY", "sk-abc$123def"),
+            ("TEST_PATCH_PASSWORD", "p@ss$word$123"),
+            ("TEST_PATCH_DOLLAR_SIGN", "value_with_$_in_middle"),
+            ("TEST_PATCH_CURLY_BRACES", "value_${NOT_A_VAR}_here"),
+            ("TEST_PATCH_MULTIPLE_DOLLARS", "$$double$$dollars$$"),
+        ];
+
+        for (key, expected_value) in test_cases {
+            let actual_value =
+                std::env::var(key).unwrap_or_else(|e| panic!("Failed to get {key}: {e}"));
+
+            assert_eq!(
+                actual_value, expected_value,
+                "Dotenvy variable substitution FAILED for {key}: expected '{expected_value}', got '{actual_value}'. \
+                 This indicates the dotenvy patch may be missing. \
+                 See: https://github.com/allan2/dotenvy/issues/113"
+            );
+
+            // Clean up - remove_var is unsafe in Rust 2024 edition because modifying
+            // environment variables while other threads may be reading them is UB.
+            // SAFETY: This is a single-threaded unit test, no other threads are accessing env vars.
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+    }
+}

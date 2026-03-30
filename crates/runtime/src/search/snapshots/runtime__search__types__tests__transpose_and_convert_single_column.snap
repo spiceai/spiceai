@@ -7,13 +7,17 @@ snapshot_kind: text
   [
     [
       "key1",
-      "A"
+      [
+        "A"
+      ]
     ]
   ],
   [
     [
       "key1",
-      "B"
+      [
+        "B"
+      ]
     ]
   ],
   []

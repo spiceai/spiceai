@@ -1,6 +1,5 @@
 ---
 source: crates/runtime/tests/acceleration/file_watcher.rs
-assertion_line: 134
 expression: pretty
 ---
 +----+--------------+-----+--------------+-------+

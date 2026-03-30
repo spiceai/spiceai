@@ -2,11 +2,11 @@
 source: crates/runtime/tests/workers/mod.rs
 expression: pretty
 ---
-+---------------------+---------------------------+-------------------+
-| task                | input                     | captured_output   |
-+---------------------+---------------------------+-------------------+
-| scheduled_worker    | SELECT COUNT(*) FROM item |                   |
-| sql_query           | SELECT COUNT(*) FROM item | [{"count(*)":20}] |
-| accelerated_refresh | item                      |                   |
-| accelerated_refresh | runtime.task_history      |                   |
-+---------------------+---------------------------+-------------------+
++----------------------+---------------------------+-------------------+
+| task                 | input                     | captured_output   |
++----------------------+---------------------------+-------------------+
+| scheduled_worker     | SELECT COUNT(*) FROM item |                   |
+| sql_query            | SELECT COUNT(*) FROM item | [{"count(*)":20}] |
+| acceleration_refresh | item                      |                   |
+| acceleration_refresh | runtime.task_history      |                   |
++----------------------+---------------------------+-------------------+

@@ -1,0 +1,14 @@
+version: v1
+kind: Spicepod
+name: snowflake[catalog]-federated
+catalogs:
+  - from: snowflake:BENCHMARKS
+    name: snowflake
+    include:
+      - 'TPCH_SF1.*'
+    params:
+      snowflake_account: ${secrets:snowflake_account}
+      snowflake_username: ${secrets:snowflake_username}
+      snowflake_password: ${secrets:snowflake_password}
+      snowflake_warehouse: COMPUTE_WH
+      snowflake_role: accountadmin

@@ -17,9 +17,9 @@ limitations under the License.
 //! Benchmarks for deletion vector strategies in Cayenne.
 //!
 //! This benchmarks the three deletion strategies:
-//! 1. Int64Pk - Single Int64 primary key using HashSet<i64>
-//! 2. RowConverterBased - Composite/non-integer PKs using RowConverter
-//! 3. PositionBased - No PK, uses RoaringBitmap
+//! 1. `Int64Pk` - Single Int64 primary key using `HashSet<i64>`
+//! 2. `RowConverterBased` - Composite/non-integer PKs using `RowConverter`
+//! 3. `PositionBased` - No PK, uses `RoaringBitmap`
 //!
 //! Each strategy is tested for:
 //! - Single row deletion
@@ -28,6 +28,7 @@ limitations under the License.
 //! - Insert after deletion
 
 #![allow(clippy::expect_used)]
+#![allow(clippy::cast_possible_wrap)]
 
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -35,9 +36,9 @@ use cayenne::{
     metadata::CreateTableOptions, CayenneCatalog, CayenneTableProvider, MetadataCatalog,
 };
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use data_components::delete::DeletionTableProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::*;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -161,17 +162,31 @@ fn generate_no_pk_batch(schema: Arc<Schema>, size: usize) -> RecordBatch {
 }
 
 async fn insert_batch(table: &Arc<CayenneTableProvider>, batch: RecordBatch) {
+    let ctx = SessionContext::new();
     let schema = batch.schema();
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream: datafusion_execution::SendableRecordBatchStream =
-        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream));
-    table.insert(boxed_stream).await.expect("insert");
+    let input_exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+        &[vec![batch]],
+        schema,
+        None,
+    )
+    .expect("memory exec");
+    let insert_plan = table
+        .insert_into(
+            &ctx.state(),
+            input_exec,
+            datafusion_expr::dml::InsertOp::Append,
+        )
+        .await
+        .expect("insert_into");
+    datafusion_physical_plan::collect(insert_plan, ctx.task_ctx())
+        .await
+        .expect("collect");
 }
 
 async fn delete_records(table: &Arc<CayenneTableProvider>, filter: Expr) -> u64 {
     let ctx = SessionContext::new();
     let plan = table
-        .delete_from(&ctx.state(), &[filter])
+        .delete_from(&ctx.state(), vec![filter])
         .await
         .expect("delete");
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx())
@@ -189,10 +204,7 @@ async fn delete_records(table: &Arc<CayenneTableProvider>, filter: Expr) -> u64 
         .unwrap_or(0)
 }
 
-async fn query_count(table: &Arc<CayenneTableProvider>) -> i64 {
-    let ctx = SessionContext::new();
-    ctx.register_table("t", Arc::clone(table) as Arc<dyn TableProvider>)
-        .expect("register");
+async fn query_count(ctx: &SessionContext) -> i64 {
     let df = ctx.sql("SELECT COUNT(*) FROM t").await.expect("sql");
     let results = df.collect().await.expect("collect");
     results
@@ -229,6 +241,7 @@ fn bench_int64pk_single_delete(c: &mut Criterion) {
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
                                 on_conflict: None,
                             },
+                            Arc::new(RuntimeEnv::default()),
                         )
                         .await
                         .expect("create table"),
@@ -262,6 +275,7 @@ fn bench_int64pk_single_delete(c: &mut Criterion) {
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
                                 on_conflict: None,
                             },
+                            Arc::new(RuntimeEnv::default()),
                         )
                         .await
                         .expect("create table"),
@@ -302,6 +316,7 @@ fn bench_int64pk_batch_delete(c: &mut Criterion) {
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
                                 on_conflict: None,
                             },
+                            Arc::new(RuntimeEnv::default()),
                         )
                         .await
                         .expect("create table"),
@@ -334,9 +349,10 @@ fn bench_int64pk_query_after_delete(c: &mut Criterion) {
     for size in [ROWS_SMALL, ROWS_MEDIUM, ROWS_LARGE] {
         group.bench_with_input(BenchmarkId::new("sqlite", size), &size, |b, &size| {
             // Setup: create and delete, then benchmark query
-            let (table, _fixture) = rt.block_on(async {
+            let (ctx, _fixture) = rt.block_on(async {
                 let fixture = setup_sqlite_fixture_async().await;
                 let schema = create_int64_pk_schema();
+                let ctx = Arc::new(SessionContext::new());
                 let table = Arc::new(
                     CayenneTableProvider::create_table(
                         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
@@ -349,6 +365,7 @@ fn bench_int64pk_query_after_delete(c: &mut Criterion) {
                             vortex_config: cayenne::metadata::VortexConfig::default(),
                             on_conflict: None,
                         },
+                        ctx.runtime_env(),
                     )
                     .await
                     .expect("create table"),
@@ -360,12 +377,15 @@ fn bench_int64pk_query_after_delete(c: &mut Criterion) {
                 // Delete half
                 delete_records(&table, col("id").lt(lit(size as i64 / 2))).await;
 
-                (table, fixture)
+                ctx.register_table("t", table as Arc<dyn TableProvider>)
+                    .expect("register");
+
+                (ctx, fixture)
             });
 
             b.iter(|| {
                 rt.block_on(async {
-                    let count = query_count(&table).await;
+                    let count = query_count(&ctx).await;
                     black_box(count);
                 });
             });
@@ -401,6 +421,7 @@ fn bench_stringpk_single_delete(c: &mut Criterion) {
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
                                 on_conflict: None,
                             },
+                            Arc::new(RuntimeEnv::default()),
                         )
                         .await
                         .expect("create table"),
@@ -434,6 +455,7 @@ fn bench_stringpk_single_delete(c: &mut Criterion) {
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
                                 on_conflict: None,
                             },
+                            Arc::new(RuntimeEnv::default()),
                         )
                         .await
                         .expect("create table"),
@@ -476,6 +498,7 @@ fn bench_stringpk_batch_delete(c: &mut Criterion) {
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
                                 on_conflict: None,
                             },
+                            Arc::new(RuntimeEnv::default()),
                         )
                         .await
                         .expect("create table"),
@@ -502,9 +525,10 @@ fn bench_stringpk_query_after_delete(c: &mut Criterion) {
 
     for size in [ROWS_SMALL, ROWS_MEDIUM, ROWS_LARGE] {
         group.bench_with_input(BenchmarkId::new("sqlite", size), &size, |b, &size| {
-            let (table, _fixture) = rt.block_on(async {
+            let (ctx, _fixture) = rt.block_on(async {
                 let fixture = setup_sqlite_fixture_async().await;
                 let schema = create_string_pk_schema();
+                let ctx = Arc::new(SessionContext::new());
                 let table = Arc::new(
                     CayenneTableProvider::create_table(
                         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
@@ -517,6 +541,7 @@ fn bench_stringpk_query_after_delete(c: &mut Criterion) {
                             vortex_config: cayenne::metadata::VortexConfig::default(),
                             on_conflict: None,
                         },
+                        ctx.runtime_env(),
                     )
                     .await
                     .expect("create table"),
@@ -528,12 +553,15 @@ fn bench_stringpk_query_after_delete(c: &mut Criterion) {
                 // Delete half
                 delete_records(&table, col("value").lt(lit((size as i64 / 2) * 100))).await;
 
-                (table, fixture)
+                ctx.register_table("t", table as Arc<dyn TableProvider>)
+                    .expect("register");
+
+                (ctx, fixture)
             });
 
             b.iter(|| {
                 rt.block_on(async {
-                    let count = query_count(&table).await;
+                    let count = query_count(&ctx).await;
                     black_box(count);
                 });
             });
@@ -569,6 +597,7 @@ fn bench_positionbased_single_delete(c: &mut Criterion) {
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
                                 on_conflict: None,
                             },
+                            Arc::new(RuntimeEnv::default()),
                         )
                         .await
                         .expect("create table"),
@@ -603,6 +632,7 @@ fn bench_positionbased_single_delete(c: &mut Criterion) {
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
                                 on_conflict: None,
                             },
+                            Arc::new(RuntimeEnv::default()),
                         )
                         .await
                         .expect("create table"),
@@ -644,6 +674,7 @@ fn bench_positionbased_batch_delete(c: &mut Criterion) {
                                 vortex_config: cayenne::metadata::VortexConfig::default(),
                                 on_conflict: None,
                             },
+                            Arc::new(RuntimeEnv::default()),
                         )
                         .await
                         .expect("create table"),
@@ -671,9 +702,10 @@ fn bench_positionbased_query_after_delete(c: &mut Criterion) {
 
     for size in [ROWS_SMALL, ROWS_MEDIUM, ROWS_LARGE] {
         group.bench_with_input(BenchmarkId::new("sqlite", size), &size, |b, &size| {
-            let (table, _fixture) = rt.block_on(async {
+            let (ctx, _fixture) = rt.block_on(async {
                 let fixture = setup_sqlite_fixture_async().await;
                 let schema = create_no_pk_schema();
+                let ctx = Arc::new(SessionContext::new());
                 let table = Arc::new(
                     CayenneTableProvider::create_table(
                         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
@@ -686,6 +718,7 @@ fn bench_positionbased_query_after_delete(c: &mut Criterion) {
                             vortex_config: cayenne::metadata::VortexConfig::default(),
                             on_conflict: None,
                         },
+                        ctx.runtime_env(),
                     )
                     .await
                     .expect("create table"),
@@ -697,12 +730,15 @@ fn bench_positionbased_query_after_delete(c: &mut Criterion) {
                 // Delete half
                 delete_records(&table, col("value").lt(lit((size as i64 / 2) * 100))).await;
 
-                (table, fixture)
+                ctx.register_table("t", table as Arc<dyn TableProvider>)
+                    .expect("register");
+
+                (ctx, fixture)
             });
 
             b.iter(|| {
                 rt.block_on(async {
-                    let count = query_count(&table).await;
+                    let count = query_count(&ctx).await;
                     black_box(count);
                 });
             });
@@ -741,6 +777,7 @@ fn bench_strategy_comparison(c: &mut Criterion) {
                             vortex_config: cayenne::metadata::VortexConfig::default(),
                             on_conflict: None,
                         },
+                        Arc::new(RuntimeEnv::default()),
                     )
                     .await
                     .expect("create table"),
@@ -774,6 +811,7 @@ fn bench_strategy_comparison(c: &mut Criterion) {
                             vortex_config: cayenne::metadata::VortexConfig::default(),
                             on_conflict: None,
                         },
+                        Arc::new(RuntimeEnv::default()),
                     )
                     .await
                     .expect("create table"),
@@ -808,6 +846,7 @@ fn bench_strategy_comparison(c: &mut Criterion) {
                             vortex_config: cayenne::metadata::VortexConfig::default(),
                             on_conflict: None,
                         },
+                        Arc::new(RuntimeEnv::default()),
                     )
                     .await
                     .expect("create table"),

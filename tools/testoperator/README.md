@@ -282,15 +282,6 @@ Where `bodies.jsonl` might look like
 {"model": "claude-3-5-sonnet-20241022","max_tokens": 512,"messages": [{"role": "system", "content": "You are god"}, {"role": "user", "content": "Is god real?"}]}
 ```
 
-### Running Evaluation tests
-
-Run model evaluations (evals) test. In addition to the common options, supports specifying:
-
-- `--model <MODEL NAME>`: The language model (as named in Spicepod) to test against. If not specified, the first model from the Spicepod definition will be used.
-- `--eval <EVAL NAME>`: The eval name (as named in Spicepod) to test against. If not specified, the first eval from the Spicepod definition will be used.
-
-`testoperator run evals [OPTIONS]`
-
 ### Running Vector Search Tests
 
 Running search tests with the testoperator is still experimental, and uses statically defined tests within the command file. Vector search tests support the common options.

@@ -71,7 +71,7 @@ impl CandidateGeneration for VectorUDTFGeneration {
 
     fn value_projection_name(&self) -> String {
         if self.is_chunked {
-            "match".to_string()
+            "_match".to_string()
         } else {
             self.embedding_column.clone()
         }

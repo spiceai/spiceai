@@ -103,7 +103,7 @@ pub enum Error {
         data_type: DataType,
     },
 
-    #[snafu(display("Cannot write search index. Could not contruct chunked Array data: {source}"))]
+    #[snafu(display("Failed to write search index: could not construct chunked data: {source}"))]
     WriteFailedConstructRecordBatch { source: ArrowError },
 
     #[snafu(display(

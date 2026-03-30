@@ -17,6 +17,7 @@ use std::fmt::Display;
 pub enum Engine {
     #[default]
     Arrow,
+    PartitionedArrow,
     DuckDB,
     PartitionedDuckDB,
     TableModePartitionedDuckDB,
@@ -26,10 +27,22 @@ pub enum Engine {
     Cayenne,
 }
 
+impl Engine {
+    /// Returns the unpartitioned version of the engine. If an engine is not partitioned, it returns itself.
+    #[must_use]
+    pub fn to_unpartitioned(&self) -> Engine {
+        match self {
+            Engine::PartitionedArrow => Engine::Arrow,
+            Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => Engine::DuckDB,
+            other => *other,
+        }
+    }
+}
+
 impl Display for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Engine::Arrow => write!(f, "arrow"),
+            Engine::Arrow | Engine::PartitionedArrow => write!(f, "arrow"),
             Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
                 write!(f, "duckdb")
             }

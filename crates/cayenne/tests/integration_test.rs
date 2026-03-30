@@ -21,12 +21,19 @@ limitations under the License.
 mod common;
 
 use arrow::array::{Array, Int64Array, StringArray};
+
 use arrow::datatypes::{DataType, Field, Schema};
+
 use arrow::record_batch::RecordBatch;
+
 use cayenne::metadata::CreateTableOptions;
+
 use cayenne::{CayenneTableProvider, MetadataCatalog};
+
 use datafusion::datasource::TableProvider;
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
 
 // Generate test variants for each backend
@@ -58,9 +65,11 @@ async fn test_cayenne_basic_workflow_impl(
     };
 
     // 3. Create Cayenne table provider
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
     println!("✓ Table created");
@@ -72,7 +81,6 @@ async fn test_cayenne_basic_workflow_impl(
     println!("✓ Schema verified");
 
     // 5. Register with DataFusion context
-    let ctx = SessionContext::new();
     ctx.register_table("test_table", Arc::new(table))?;
     println!("✓ Table registered with DataFusion");
 
@@ -375,10 +383,11 @@ async fn test_cayenne_basic_workflow_impl(
     // This simulates what happens when spiced restarts or a new client connects
     let catalog_arc: Arc<dyn cayenne::MetadataCatalog> =
         Arc::<cayenne::CayenneCatalog>::clone(catalog);
-    let fresh_table = CayenneTableProvider::new("test_table", catalog_arc).await?;
+    let fresh_ctx = SessionContext::new();
+    let fresh_table =
+        CayenneTableProvider::new("test_table", catalog_arc, fresh_ctx.runtime_env()).await?;
 
     // Create a fresh context and register the fresh table
-    let fresh_ctx = SessionContext::new();
     fresh_ctx.register_table("test_table", Arc::new(fresh_table))?;
     println!("✓ Fresh table provider created from catalog");
 
@@ -445,17 +454,24 @@ fn verify_sqlite_metadata(
         conn.query_row("SELECT COUNT(*) FROM cayenne_table", [], |row| row.get(0))?;
     assert_eq!(table_count, 1, "Expected 1 table in cayenne_table");
 
-    let (table_id, table_uuid, table_name, path, path_is_relative, schema_json): (
-        i64,
+    let (table_id, table_name, path, path_is_relative, schema_json): (
         String,
         String,
         String,
         bool,
         String,
     ) = conn.query_row(
-        "SELECT table_id, table_uuid, table_name, path, path_is_relative, schema_json FROM cayenne_table",
+        "SELECT table_id, table_name, path, path_is_relative, schema_json FROM cayenne_table",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
     )?;
 
     assert_eq!(
@@ -468,18 +484,12 @@ fn verify_sqlite_metadata(
         "Expected path to match data directory"
     );
     assert!(!path_is_relative, "Expected path_is_relative to be false");
-    assert!(table_id >= 1, "Expected table_id to be at least 1");
-    assert!(
-        !table_uuid.is_empty(),
-        "Expected table_uuid to be non-empty"
-    );
+    assert!(!table_id.is_empty(), "Expected table_id to be non-empty");
     assert!(
         !schema_json.is_empty(),
         "Expected schema_json to be non-empty"
     );
-    println!(
-        "  • Table metadata verified: table_id={table_id}, uuid={table_uuid}, name={table_name}"
-    );
+    println!("  • Table metadata verified: table_id={table_id}, name={table_name}");
 
     // 3. Verify schema_json is base64 encoded (it's stored in Arrow IPC format)
     // We don't fully deserialize it here to avoid complex IPC parsing issues,
@@ -582,9 +592,11 @@ async fn test_cayenne_statistics_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(&catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
     println!("✓ Table created");
@@ -597,7 +609,6 @@ async fn test_cayenne_statistics_impl(
     );
 
     // 4. Register table and insert data
-    let ctx = SessionContext::new();
     ctx.register_table(TableReference::bare("stats_table"), Arc::new(table))?;
 
     ctx.sql("INSERT INTO stats_table VALUES (1, 'test1'), (2, 'test2'), (3, 'test3')")
@@ -696,14 +707,14 @@ async fn test_cayenne_core_data_types_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
+    let ctx = SessionContext::new();
     let table = CayenneTableProvider::create_table(
         Arc::<cayenne::CayenneCatalog>::clone(&catalog),
         table_options,
+        ctx.runtime_env(),
     )
     .await?;
     tracing::info!("✓ Table created with {} columns", schema.fields().len());
-
-    let ctx = SessionContext::new();
     ctx.register_table("types_test", Arc::new(table))?;
 
     // Insert test data with various types
@@ -940,16 +951,19 @@ async fn test_cayenne_sorted_insert_impl(
     };
 
     // Create table with sort configuration
-    let table = CayenneTableProvider::create_table(
-        Arc::<cayenne::CayenneCatalog>::clone(catalog),
-        table_options,
-    )
-    .await?;
+    let ctx = SessionContext::new();
+    let table: Arc<dyn TableProvider> = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::<cayenne::CayenneCatalog>::clone(catalog),
+            table_options,
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
     println!("✓ Table created with sort_columns=['timestamp']");
 
     // Register with DataFusion
-    let ctx = SessionContext::new();
-    ctx.register_table("sorted_table", Arc::new(table))?;
+    ctx.register_table("sorted_table", Arc::clone(&table))?;
     println!("✓ Table registered with DataFusion");
 
     // Insert data in random order - sorting should reorder it
@@ -1015,21 +1029,36 @@ async fn test_cayenne_sorted_insert_impl(
     );
     println!("✓ Data is correctly sorted by timestamp column");
 
-    // Insert more data in random order
-    ctx.sql(
-        "INSERT INTO sorted_table VALUES \
+    // Insert more data in random order via a fresh context to avoid stale state.
+    let write_ctx = SessionContext::new();
+    write_ctx.register_table("sorted_table", Arc::clone(&table))?;
+    write_ctx
+        .sql(
+            "INSERT INTO sorted_table VALUES \
          (8, 800, 'eighth'), \
          (6, 600, 'sixth'), \
          (9, 900, 'ninth'), \
          (7, 700, 'seventh')",
-    )
-    .await?
-    .collect()
-    .await?;
+        )
+        .await?
+        .collect()
+        .await?;
     println!("✓ Inserted 4 more rows in random order");
 
+    // Use a fresh SessionContext and reopen provider to avoid stale table state after writes.
+    let verify_ctx = SessionContext::new();
+    let reopened_table: Arc<dyn TableProvider> = Arc::new(
+        cayenne::CayenneTableProviderBuilder::new(
+            Arc::<cayenne::CayenneCatalog>::clone(catalog),
+            verify_ctx.runtime_env(),
+        )
+        .open("sorted_table")
+        .await?,
+    );
+    verify_ctx.register_table("sorted_table", reopened_table)?;
+
     // Query all data again
-    let df = ctx
+    let df = verify_ctx
         .sql("SELECT timestamp, value, name FROM sorted_table ORDER BY timestamp")
         .await?;
     let results = df.collect().await?;
@@ -1057,7 +1086,7 @@ async fn test_cayenne_sorted_insert_impl(
     println!("✓ All data remains sorted after second insert");
 
     // Test range query - with proper sorting, zone maps should enable efficient pruning
-    let df = ctx
+    let df = verify_ctx
         .sql(
             "SELECT * FROM sorted_table WHERE timestamp >= 3 AND timestamp <= 7 ORDER BY timestamp",
         )

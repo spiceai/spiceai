@@ -49,7 +49,11 @@ impl Anthropic {
         let variant = validate_model_variant(model.unwrap_or(DEFAULT_ANTHROPIC_MODEL))?;
         let cfg = HostedModelConfig::from_url(api_base.unwrap_or(ANTHROPIC_API_BASE))
             .with_auth(auth)
-            .with_header_value("anthropic-version", value);
+            .with_header_value("anthropic-version", value)
+            .with_header_value(
+                "anthropic-beta",
+                HeaderValue::from_static("structured-outputs-2025-11-13"),
+            );
 
         Ok(Self {
             client: Client::<HostedModelConfig>::with_config(cfg),

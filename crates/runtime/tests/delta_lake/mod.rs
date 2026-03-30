@@ -17,7 +17,7 @@ limitations under the License.
 use crate::RecordBatch;
 use crate::configure_test_datafusion;
 use crate::init_tracing;
-use crate::utils::test_request_context;
+use crate::utils::{register_test_connectors, test_request_context};
 use app::AppBuilder;
 use arrow::util::pretty::pretty_format_batches;
 use datafusion::assert_batches_eq;
@@ -114,6 +114,7 @@ async fn run_delta_lake_test(
 #[tokio::test]
 async fn query_delta_lake_with_partitions() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context().scope(async {
         let path = setup_test_data(
@@ -173,6 +174,7 @@ async fn query_delta_lake_with_partitions() -> Result<(), String> {
 #[tokio::test]
 async fn query_delta_lake_with_null_partitions() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -228,6 +230,7 @@ async fn query_delta_lake_with_null_partitions() -> Result<(), String> {
 #[tokio::test]
 async fn query_delta_lake_with_percent_encoded_path() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -266,6 +269,7 @@ async fn query_delta_lake_with_percent_encoded_path() -> Result<(), String> {
 #[tokio::test]
 async fn query_delta_lake_with_partition_pruning() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -317,6 +321,95 @@ async fn query_delta_lake_with_partition_pruning() -> Result<(), String> {
             assert!(pretty_explain_plan.contains("date_col=2030-06-15"));
             assert!(!pretty_explain_plan.contains("date_col=2025-01-01"));
             assert!(!pretty_explain_plan.contains("date_col=2024-02-04"));
+
+            Ok(())
+        })
+        .await
+}
+
+/// Tests min/max file-level pruning on a non-partitioned Delta Lake table with timestamp columns.
+///
+/// Dataset: 500 rows across 10 Parquet files, each file covers one day (2025-01-01 .. 2025-01-10)
+/// with non-overlapping `event_ts` ranges, enabling file-level pruning via Parquet column statistics.
+#[tokio::test]
+async fn query_delta_lake_with_timestamp_pruning() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let path = setup_test_data(
+                "https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/delta_firewall_events.zip",
+                "delta_firewall_events",
+            )
+            .await?;
+            let _hook = FileCleanup { path: path.clone() };
+
+            let app = AppBuilder::new("delta_lake_timestamp_pruning")
+                .with_dataset(make_delta_lake_dataset(
+                    &format!("{path}/firewall_events"),
+                    "events",
+                    false,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            let pruning_queries = [
+                (
+                    "ts_lte_jan03",
+                    "SELECT * FROM events WHERE event_ts <= '2025-01-03'",
+                ),
+                (
+                    "ts_lt_jan03",
+                    "SELECT * FROM events WHERE event_ts < '2025-01-03'",
+                ),
+                (
+                    "ts_gte_jan10",
+                    "SELECT * FROM events WHERE event_ts >= '2025-01-10'",
+                ),
+                (
+                    "ts_between_jan03_jan05",
+                    "SELECT * FROM events WHERE event_ts BETWEEN '2025-01-03' AND '2025-01-05'",
+                ),
+            ];
+
+            // We use `FORMAT TREE` to verify file-level pruning as it reports the number of files to scan in concise aggregated manner: `files: 2`.
+            for (snapshot_name, query) in pruning_queries {
+                let explain_query = format!("EXPLAIN FORMAT TREE {query}");
+                let explain_result = rt
+                    .datafusion()
+                    .query_builder(&explain_query)
+                    .build()
+                    .run()
+                    .await
+                    .map_err(|e| format!("EXPLAIN query failed: {e}"))?
+                    .data
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .map_err(|e| format!("EXPLAIN query results: {e}"))?;
+
+                let explain_plan = pretty_format_batches(&explain_result)
+                    .expect("failed to format explain plan")
+                    .to_string();
+
+                insta::with_settings!({
+                    description => format!("Query: {query}"),
+                    omit_expression => true
+                }, {
+                    insta::assert_snapshot!(snapshot_name, explain_plan);
+                });
+            }
 
             Ok(())
         })

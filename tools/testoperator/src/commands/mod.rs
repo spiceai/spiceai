@@ -14,12 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::args::{CommonArgs, DatasetTestArgs};
 use test_framework::{
     anyhow,
     app::{App, AppBuilder},
+    opentelemetry_sdk::Resource,
     queries::QuerySet,
     spiced::{SpicedInstance, StartRequest},
     spicepod::Spicepod,
@@ -33,25 +38,33 @@ pub(crate) mod append;
 pub(crate) mod bench;
 pub(crate) mod data_consistency;
 pub(crate) mod dispatch;
-pub(crate) mod evals;
 pub(crate) mod load;
 pub(crate) mod query;
+pub(crate) mod schema;
 pub(crate) mod search;
+pub(crate) mod streaming;
 pub(crate) mod text_to_sql;
 pub(crate) mod throughput;
 pub(crate) type RowCounts = BTreeMap<Arc<str>, usize>;
 
+/// Create telemetry with resource attributes known upfront.
+///
+/// This ensures the `SdkMeterProvider` is created with the correct resource,
+/// so metrics recorded after this call will have the proper resource attributes.
 #[must_use]
-pub(crate) fn create_telemetry(common: &CommonArgs) -> Telemetry {
+pub(crate) fn create_telemetry_with_resource(common: &CommonArgs, resource: Resource) -> Telemetry {
     if let Some(endpoint) = &common.otlp_endpoint {
-        return Telemetry::with_otlp(OtlpExporterConfig {
-            endpoint: endpoint.clone().into(),
-            headers: common.otlp_header.clone(),
-            timeout: Duration::from_secs(10),
-        });
+        return Telemetry::with_otlp_resource(
+            OtlpExporterConfig {
+                endpoint: endpoint.clone().into(),
+                headers: common.otlp_header.clone(),
+                timeout: Duration::from_secs(10),
+            },
+            resource,
+        );
     }
 
-    Telemetry::new("SPICEAI_BENCHMARK_METRICS_KEY")
+    Telemetry::new_with_resource(&resource, "SPICEAI_BENCHMARK_METRICS_KEY")
 }
 
 /// Build a test configuration with validation data if applicable
@@ -63,7 +76,7 @@ pub(crate) fn create_telemetry(common: &CommonArgs) -> Telemetry {
 /// 4. Adds reference schema for validation against known good tables
 ///
 /// # Returns
-/// Tuple of (`QuerySet`, Vec<Query>, `NotStarted` builder)
+/// Tuple of (`QuerySet`, `NotStarted` builder)
 pub(crate) async fn build_test_with_validation(
     args: &DatasetTestArgs,
     test_builder: NotStarted,
@@ -125,10 +138,8 @@ pub(crate) async fn run_or_connect_spiced(
 pub(crate) async fn get_app_and_start_request(
     args: &CommonArgs,
 ) -> anyhow::Result<(App, StartRequest)> {
-    if !args.metrics {
-        // call the meter to set telemetry to no-op, because the OnceLock hasn't been set yet
-        test_framework::telemetry::METER_PROVIDER.meter("benchmarks_telemetry");
-    }
+    // When metrics are disabled, no Telemetry is created, so METER_PROVIDER_ONCE
+    // remains unset and all metric operations are no-ops.
 
     let mut spicepod = Spicepod::load_exact(args.spicepod_path.clone()).await?;
     let mut app_builder = AppBuilder::new(spicepod.name.clone()).with_spicepod(spicepod.clone());
@@ -174,6 +185,47 @@ pub(crate) async fn env_export(args: &CommonArgs) -> anyhow::Result<()> {
     std::io::stdin().read_line(&mut String::new())?;
 
     Ok(())
+}
+
+/// Create the appropriate query executor based on command-line arguments
+///
+/// This helper function centralizes the executor creation logic to avoid duplication
+/// across different test commands (bench, throughput, load, query).
+pub(crate) async fn create_query_executor(
+    args: &DatasetTestArgs,
+    spiced_instance: &test_framework::spiced::SpicedInstance,
+) -> anyhow::Result<Box<dyn test_framework::execution::QueryExecutor>> {
+    let executor: Box<dyn test_framework::execution::QueryExecutor> = if args.distributed {
+        let http_client = spiced_instance.http_client()?;
+        let base_url = spiced_instance.http_base_url().to_string();
+        Box::new(test_framework::execution::DistributedExecutor::new(
+            http_client,
+            base_url,
+        ))
+    } else if args.http_clients {
+        let http_client = spiced_instance.http_client()?;
+        let base_url = spiced_instance.http_base_url().to_string();
+        Box::new(test_framework::execution::HttpExecutor::new(
+            http_client,
+            base_url,
+        ))
+    } else {
+        let spice_client = spiced_instance
+            .spice_client(None, args.disable_caching)
+            .await?;
+        Box::new(test_framework::execution::FlightExecutor::new(
+            std::sync::Arc::new(spice_client),
+        ))
+    };
+
+    Ok(executor)
+}
+
+pub(crate) fn duration_millis_between(end: Instant, start: Instant) -> anyhow::Result<u64> {
+    let duration = end
+        .checked_duration_since(start)
+        .ok_or_else(|| anyhow::anyhow!("End time was earlier than start time"))?;
+    Ok(u64::try_from(duration.as_millis())?)
 }
 
 #[macro_export]

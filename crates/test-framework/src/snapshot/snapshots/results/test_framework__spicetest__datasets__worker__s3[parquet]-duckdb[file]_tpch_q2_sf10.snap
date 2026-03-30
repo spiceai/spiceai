@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpch_q2"
+---
++-----------+--------------------+---------+-----------+----------------+-----------------------------------+-----------------+------------------------------------------------------------------------------------------+
+| s_acctbal | s_name             | n_name  | p_partkey | p_mfgr         | s_address                         | s_phone         | s_comment                                                                                |
++-----------+--------------------+---------+-----------+----------------+-----------------------------------+-----------------+------------------------------------------------------------------------------------------+
+| 9994.37   | Supplier#000030084 | GERMANY | 380077    | Manufacturer#5 | gBEvSkyW o1uHea0CV,oHtkTTVW       | 17-519-171-6883 | pinto beans sleep fluffily alongside of the slyly special deposits. slyly pendi          |
+| 9992.54   | Supplier#000099650 | RUSSIA  | 824625    | Manufacturer#3 | ySI FMlh9gHkEDN6gQWf3             | 32-971-481-2533 | ged deposits cajole carefully packages. carefully final ideas affix furiously. regu      |
+| 9987.51   | Supplier#000020657 | ROMANIA | 395653    | Manufacturer#5 | 4pL,8BT3Yun,17QHqAr9 A,ZFyyuH4L   | 29-167-460-7830 | otes. excuses behind the blithely regular packages are furio                             |
+| 9986.40   | Supplier#000082995 | RUSSIA  | 1782994   | Manufacturer#5 | CXiBNZ6DUBjgY                     | 32-510-919-3096 | nding instructions boost. unusual, regular asymptotes above the fluffily express e       |
+| 9984.69   | Supplier#000008875 | ROMANIA | 633856    | Manufacturer#4 | hRdOqKqyU,sHq                     | 29-132-904-4395 | ong the bold pinto beans are furiously blithely slow                                     |
+| 9984.30   | Supplier#000081977 | RUSSIA  | 1356963   | Manufacturer#5 | gemeY46TI2J6ZAt9gjouxB            | 32-569-570-6149 | ng to the furiously special package                                                      |
+| 9983.76   | Supplier#000024757 | RUSSIA  | 599751    | Manufacturer#4 | vJb,kFRqwsv34H5Y6GsRAEJXz0VCZ     | 32-868-781-9721 | nal foxes. theodolites cajole regular, final grouches. unusual, final theodolites lose   |
+| 9980.25   | Supplier#000067392 | RUSSIA  | 192388    | Manufacturer#2 | oEQvrLi316,0I7Z                   | 32-872-236-1034 | nal pinto beans cajole quickly. final excuses about the deposits                         |
+| 9974.93   | Supplier#000072260 | ROMANIA | 397250    | Manufacturer#3 | ijrpECIzgkK,qi83qjKtf0qhMX4O3i17i | 29-745-482-4154 | its above the special deposits engage slyly among the unusual, even asymptotes. carefull |
+| 9971.99   | Supplier#000016715 | FRANCE  | 691708    | Manufacturer#2 | BjEu56DmMNx VHZ                   | 16-401-454-3384 |  even requests; fluffily ironic                                                          |
++-----------+--------------------+---------+-----------+----------------+-----------------------------------+-----------------+------------------------------------------------------------------------------------------+

@@ -24,7 +24,7 @@ mod metrics;
 mod spiced_metrics;
 
 use args::{
-    Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, LoadTestArgs, TestCommands,
+    Commands, DataConsistencyArgs, DatasetTestArgs, LoadTestArgs, SchemaTestArgs, TestCommands,
     TextToSqlArgs,
 };
 
@@ -52,9 +52,9 @@ async fn main() -> anyhow::Result<()> {
                 test_args: DatasetTestArgs { common, .. },
                 ..
             })
-            | TestCommands::Evals(EvalsTestArgs { common, .. })
             | TestCommands::Search(SearchTestArgs { common, .. })
             | TestCommands::TextToSql(TextToSqlArgs { common, .. })
+            | TestCommands::Schema(SchemaTestArgs { common, .. })
             | TestCommands::DataConsistency(DataConsistencyArgs {
                 test_args: DatasetTestArgs { common, .. },
                 ..
@@ -76,9 +76,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Dispatch(args) => {
             commands::dispatch::dispatch(args).await?;
         }
-        Commands::Run(TestCommands::Evals(args)) => {
-            commands::evals::run(&args).await?;
-        }
         #[cfg(feature = "append")]
         Commands::Run(TestCommands::Append(args)) => {
             commands::append::run(&args).await?;
@@ -92,6 +89,25 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Run(TestCommands::TextToSql(args)) => {
             commands::text_to_sql::run(&args).await?;
+        }
+        Commands::Run(TestCommands::StreamingDynamodb(args)) => {
+            commands::streaming::run_benchmark(&args).await?;
+        }
+        Commands::Export(TestCommands::StreamingDynamodb(_)) => {
+            return Err(anyhow::anyhow!(
+                "Export is not supported for streaming-dynamodb (spicepods are transformed at runtime)"
+            ));
+        }
+        Commands::Run(TestCommands::StreamingDynamodbCorrectness(args)) => {
+            commands::streaming::run_correctness(&args).await?;
+        }
+        Commands::Run(TestCommands::Schema(args)) => {
+            commands::schema::run(&args).await?;
+        }
+        Commands::Export(TestCommands::StreamingDynamodbCorrectness(_)) => {
+            return Err(anyhow::anyhow!(
+                "Export is not supported for streaming-dynamodb-correctness (spicepods are transformed at runtime)"
+            ));
         }
         _ => {
             return Err(anyhow::anyhow!("Unsupported command"));

@@ -23,6 +23,7 @@ use test_framework::queries::{QueryOverrides, QuerySet};
 use super::CommonArgs;
 
 #[derive(Parser, Debug, Clone)]
+#[expect(clippy::struct_excessive_bools)]
 pub struct QueryArgs {
     /// The expected scale factor for the test, used in metrics calculation
     #[arg(long)]
@@ -53,9 +54,14 @@ pub struct QueryArgs {
     /// Whether to add HTTP clients for the test
     #[arg(long)]
     pub(crate) http_clients: bool,
+
+    /// Use distributed query mode via /v1/queries API (requires cluster mode with scheduler role)
+    #[arg(long)]
+    pub(crate) distributed: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
+#[expect(clippy::struct_excessive_bools)]
 pub struct DatasetTestArgs {
     #[command(flatten)]
     pub(crate) common: CommonArgs,
@@ -89,6 +95,10 @@ pub struct DatasetTestArgs {
     /// Whether to add HTTP clients for the test
     #[arg(long)]
     pub(crate) http_clients: bool,
+
+    /// Use distributed query mode via /v1/queries API (requires cluster mode with scheduler role)
+    #[arg(long)]
+    pub(crate) distributed: bool,
 
     /// Random parameter set count for parameterized queries (tests with different random parameters each run).
     /// If not specified or 0, fixed parameters are used (no randomization).
@@ -150,11 +160,21 @@ pub enum QueryOverridesArg {
     GlueCatalog,
     #[serde(rename = "databricks-catalog")]
     DatabricksCatalog,
+    #[serde(rename = "postgres-catalog")]
+    PostgresCatalog,
+    #[serde(rename = "mysql-catalog")]
+    MysqlCatalog,
+    #[serde(rename = "mssql-catalog")]
+    MsSqlCatalog,
     #[serde(rename = "spicecloud")]
     Spicecloud,
     #[serde(rename = "dynamodb")]
     #[value(name = "dynamodb")]
     DynamoDB,
+    #[serde(rename = "arrow")]
+    Arrow,
+    #[serde(rename = "turso")]
+    Turso,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -263,6 +283,11 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::GlueCatalog => QueryOverrides::GlueCatalog,
             QueryOverridesArg::IcebergHadoop => QueryOverrides::IcebergHadoop,
             QueryOverridesArg::DynamoDB => QueryOverrides::DynamoDB,
+            QueryOverridesArg::Arrow => QueryOverrides::Arrow,
+            QueryOverridesArg::PostgresCatalog => QueryOverrides::PostgresCatalog,
+            QueryOverridesArg::MysqlCatalog => QueryOverrides::MysqlCatalog,
+            QueryOverridesArg::MsSqlCatalog => QueryOverrides::MSSqlCatalog,
+            QueryOverridesArg::Turso => QueryOverrides::Turso,
         }
     }
 }
@@ -287,6 +312,11 @@ pub struct LoadTestArgs {
     /// Run until manually interrupted; disables duration-based stopping for the load phase
     #[arg(long)]
     pub(crate) run_until_stopped: bool,
+
+    /// API key for authenticating with an external spiced instance.
+    /// Only applicable when --spiced-path is a URL to an already-running instance.
+    #[arg(long)]
+    pub(crate) api_key: Option<String>,
 }
 
 /// Parse a duration string like "500ms", "2s", "1m" into a `Duration`

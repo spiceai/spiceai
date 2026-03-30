@@ -22,7 +22,6 @@ use crate::dataaccelerator::spice_sys::{self, OpenOption, debezium_kafka::Debezi
 use crate::dataconnector::ConnectorComponent;
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
-use crate::register_data_connector;
 use arrow::datatypes::SchemaRef;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -40,6 +39,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -58,7 +58,7 @@ pub enum Error {
     ))]
     MissingKafkaBootstrapServers,
 
-    #[snafu(display("{source}"))]
+    #[snafu(display("Failed to generate Debezium refresh SQL: {source}"))]
     RefreshSql { source: refresh_sql::Error },
 }
 
@@ -372,7 +372,8 @@ impl DataConnector for Debezium {
 
         let refresh_sql = dataset.refresh_sql();
         let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
-            refresh_sql::validate_refresh_sql(dataset.name.clone(), refresh_sql.as_str(), schema)
+            refresh_sql::parse_refresh_sql(dataset.name.clone(), refresh_sql.as_str(), schema)
+                .map(|(_, schema)| schema)
                 .boxed()
                 .map_err(|e| super::DataConnectorError::InvalidConfiguration {
                     dataconnector: "debezium".to_string(),
@@ -402,6 +403,8 @@ impl DataConnector for Debezium {
         &self,
         federated_table: Arc<FederatedTable>,
         _dataset: &Dataset,
+        _accelerated_table_provider: Arc<dyn TableProvider>,
+        _accelerator_write_mutex: Arc<Mutex<()>>,
     ) -> Option<ChangesStream> {
         Some(Box::pin(stream! {
             let table_provider = federated_table.table_provider().await;

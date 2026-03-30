@@ -23,16 +23,24 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
+mod common;
+
 use arrow::array::{Int64Array, RecordBatch, StringArray};
+
 use arrow::datatypes::{DataType, Field, Schema};
+
 use cayenne::{
     metadata::CreateTableOptions, CayenneCatalog, CayenneTableProvider, MetadataCatalog,
 };
-use data_components::delete::DeletionTableProvider;
+
 use datafusion::datasource::TableProvider;
+
 use datafusion::execution::context::SessionContext;
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
+
 use tempfile::TempDir;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -64,10 +72,11 @@ async fn setup_test_table(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table_provider =
-        Arc::new(CayenneTableProvider::create_table(catalog, table_options).await?);
-
     let ctx = SessionContext::new();
+    let table_provider = Arc::new(
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?,
+    );
+
     ctx.register_table(
         "test_table",
         Arc::clone(&table_provider) as Arc<dyn TableProvider>,
@@ -97,16 +106,7 @@ async fn insert_batch(
         ],
     )?;
 
-    let stream = futures::stream::once(async { Ok(batch) });
-    let boxed_stream: datafusion_execution::SendableRecordBatchStream = Box::pin(
-        datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
-            stream,
-        ),
-    );
-
-    table_provider
-        .insert(boxed_stream)
+    common::insert_batch(table_provider.as_ref(), batch)
         .await
         .map_err(Into::into)
 }
@@ -116,7 +116,9 @@ async fn delete_records(
     filter: Expr,
 ) -> TestResult<u64> {
     let ctx = SessionContext::new();
-    let plan = table_provider.delete_from(&ctx.state(), &[filter]).await?;
+    let plan = table_provider
+        .delete_from(&ctx.state(), vec![filter])
+        .await?;
 
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
 

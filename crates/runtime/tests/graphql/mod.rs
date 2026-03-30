@@ -25,13 +25,14 @@ use arrow::array::RecordBatch;
 use async_graphql::{EmptyMutation, EmptySubscription, SimpleObject};
 use async_graphql::{Object, Schema};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
+use axum::http::StatusCode;
 use axum::{Extension, Router, routing::post};
 
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use tokio::net::TcpListener;
 
-use crate::utils::test_request_context;
+use crate::utils::{register_test_connectors, test_request_context};
 use crate::{ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results};
 
 type ServiceSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
@@ -215,13 +216,10 @@ async fn graphql_handler(schema: Extension<ServiceSchema>, req: GraphQLRequest) 
     response.into()
 }
 
-async fn start_server() -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr), String> {
+async fn start_graphql_server(
+    app: Router,
+) -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr), String> {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription).finish();
-
-    let app = Router::new()
-        .route("/graphql", post(graphql_handler))
-        .layer(Extension(schema));
 
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
         tracing::error!("Failed to bind to address: {e}");
@@ -233,15 +231,25 @@ async fn start_server() -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr)
     })?;
 
     tokio::spawn(async move {
-        axum::serve(tcp_listener, app)
+        if let Err(e) = axum::serve(tcp_listener, app)
             .with_graceful_shutdown(async {
                 rx.await.ok();
             })
             .await
-            .unwrap_or_default();
+        {
+            tracing::error!("GraphQL test server failed: {e}");
+        }
     });
 
     Ok((tx, addr))
+}
+
+async fn start_server() -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr), String> {
+    let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription).finish();
+    let app = Router::new()
+        .route("/graphql", post(graphql_handler))
+        .layer(Extension(schema));
+    start_graphql_server(app).await
 }
 
 fn make_graphql_dataset(
@@ -269,6 +277,7 @@ fn make_graphql_dataset(
 async fn test_graphql() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context()
         .scope(async {
@@ -301,9 +310,11 @@ async fn test_graphql() -> Result<(), String> {
                     "SELECT * FROM test_graphql",
                     "select_all",
                     Some(Box::new(|result_batches| {
+                        let total_rows: usize =
+                            result_batches.iter().map(RecordBatch::num_rows).sum();
+                        assert_eq!(total_rows, 4, "total_rows: {total_rows}");
                         for batch in result_batches {
                             assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
-                            assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
                         }
                     })),
                 ),
@@ -311,9 +322,11 @@ async fn test_graphql() -> Result<(), String> {
                     "SELECT posts[1]['title'] from test_graphql",
                     "select_posts_title",
                     Some(Box::new(|result_batches| {
+                        let total_rows: usize =
+                            result_batches.iter().map(RecordBatch::num_rows).sum();
+                        assert_eq!(total_rows, 4, "total_rows: {total_rows}");
                         for batch in result_batches {
                             assert_eq!(batch.num_columns(), 1, "num_cols: {}", batch.num_columns());
-                            assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
                         }
                     })),
                 ),
@@ -344,6 +357,7 @@ async fn test_graphql() -> Result<(), String> {
 async fn test_graphql_pagination() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context().scope(async {
         let (tx, addr) = start_server().await?;
@@ -382,7 +396,6 @@ async fn test_graphql_pagination() -> Result<(), String> {
                     let mut total = 0;
                     for batch in result_batches {
                         assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
-                        assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
                         total += batch.num_rows();
                     }
                     assert_eq!(total, 4);
@@ -395,7 +408,6 @@ async fn test_graphql_pagination() -> Result<(), String> {
                     let mut total = 0;
                     for batch in result_batches {
                         assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
-                        assert_eq!(batch.num_rows(), 1, "num_rows: {}", batch.num_rows());
                         total += batch.num_rows();
                     }
                     assert_eq!(total, 1);
@@ -427,6 +439,7 @@ async fn test_graphql_pagination() -> Result<(), String> {
 #[tokio::test]
 async fn test_graphql_pagination_with_limit() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
 
     test_request_context().scope(async {
         let (tx, addr) = start_server().await?;
@@ -493,4 +506,227 @@ async fn test_graphql_pagination_with_limit() -> Result<(), String> {
         Ok(())
 
     }).await
+}
+
+/// A handler that requires a custom `X-Api-Key` header and returns 401 if missing.
+async fn graphql_handler_with_custom_auth(
+    schema: Extension<ServiceSchema>,
+    headers: axum::http::HeaderMap,
+    req: GraphQLRequest,
+) -> Result<GraphQLResponse, StatusCode> {
+    let api_key = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+
+    match api_key {
+        Some("test-secret-key") => {
+            let response = schema.execute(req.into_inner()).await;
+            Ok(response.into())
+        }
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+async fn start_auth_server() -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr), String> {
+    let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription).finish();
+    let app = Router::new()
+        .route("/graphql", post(graphql_handler_with_custom_auth))
+        .layer(Extension(schema));
+    start_graphql_server(app).await
+}
+
+fn make_graphql_dataset_with_auth(
+    path: &str,
+    name: &str,
+    query: &str,
+    json_pointer: &str,
+    auth_header: &str,
+    auth_token: &str,
+) -> Dataset {
+    let mut dataset = Dataset::new(format!("graphql:{path}"), name.to_string());
+    let params = HashMap::from([
+        ("json_pointer".to_string(), json_pointer.to_string()),
+        ("graphql_query".to_string(), query.to_string()),
+        ("graphql_auth_header".to_string(), auth_header.to_string()),
+        ("graphql_auth_token".to_string(), auth_token.to_string()),
+    ]);
+
+    dataset.params = Some(DatasetParams::from_string_map(params));
+    dataset
+}
+
+#[tokio::test]
+async fn test_graphql_custom_auth_header() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr) = start_auth_server().await?;
+            tracing::debug!("Auth server started at {}", addr);
+
+            let app = AppBuilder::new("graphql_custom_auth_test")
+                .with_dataset(make_graphql_dataset_with_auth(
+                    &format!("http://{addr}/graphql"),
+                    "test_graphql_auth",
+                    "query { users { id name } }",
+                    "/data/users",
+                    "X-Api-Key",
+                    "test-secret-key",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            run_query_and_check_results(
+                &mut rt,
+                "test_graphql_custom_auth_header",
+                "SELECT id, name FROM test_graphql_auth",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let total_rows: usize = result_batches.iter().map(RecordBatch::num_rows).sum();
+                    assert_eq!(total_rows, 4, "Expected 4 users, got {total_rows}");
+                    for batch in result_batches {
+                        assert_eq!(
+                            batch.num_columns(),
+                            2,
+                            "Expected 2 columns (id, name), got {}",
+                            batch.num_columns()
+                        );
+                    }
+                })),
+            )
+            .await?;
+
+            tx.send(()).map_err(|()| {
+                tracing::error!("Failed to send shutdown signal");
+                "Failed to send shutdown signal".to_string()
+            })?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_graphql_json_pointer_combinations() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr) = start_server().await?;
+            tracing::debug!("Server started at {}", addr);
+
+            // Test 1: Root-level json_pointer /data/users with flat query
+            let app = AppBuilder::new("graphql_json_pointer_test")
+                .with_dataset(make_graphql_dataset(
+                    &format!("http://{addr}/graphql"),
+                    "users_flat",
+                    "query { users { id name } }",
+                    "/data/users",
+                    None,
+                ))
+                // Test 2: Nested json_pointer with paginated query
+                .with_dataset(make_graphql_dataset(
+                    &format!("http://{addr}/graphql"),
+                    "users_nested",
+                    "query { paginatedUsers(first: 10) { users { id name posts { id title content } } pageInfo { hasNextPage endCursor } } }",
+                    "/data/paginatedUsers/users",
+                    None,
+                ))
+                // Test 3: Query with unnest_depth
+                .with_dataset(make_graphql_dataset(
+                    &format!("http://{addr}/graphql"),
+                    "users_unnested",
+                    "query { users { id name posts { id title content } } }",
+                    "/data/users",
+                    Some(1),
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            // Test flat query with /data/users pointer returns 4 users with id and name
+            run_query_and_check_results(
+                &mut rt,
+                "test_graphql_json_pointer_flat",
+                "SELECT id, name FROM users_flat",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let total_rows: usize =
+                        result_batches.iter().map(RecordBatch::num_rows).sum();
+                    assert_eq!(total_rows, 4, "Expected 4 users from flat query, got {total_rows}");
+                    for batch in result_batches {
+                        assert_eq!(
+                            batch.num_columns(),
+                            2,
+                            "Expected 2 columns (id, name), got {}",
+                            batch.num_columns()
+                        );
+                    }
+                })),
+            )
+            .await?;
+
+            // Test nested pointer /data/paginatedUsers/users with pagination
+            run_query_and_check_results(
+                &mut rt,
+                "test_graphql_json_pointer_nested",
+                "SELECT * FROM users_nested",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let total_rows: usize =
+                        result_batches.iter().map(RecordBatch::num_rows).sum();
+                    assert_eq!(total_rows, 4, "Expected 4 users from nested paginated query, got {total_rows}");
+                    for batch in &result_batches {
+                        assert!(
+                            batch.num_columns() >= 2,
+                            "Expected at least 2 columns (id, name), got {}",
+                            batch.num_columns()
+                        );
+                    }
+                })),
+            )
+            .await?;
+
+            // Test unnesting with depth=1 flattens post fields to top level
+            run_query_and_check_results(
+                &mut rt,
+                "test_graphql_json_pointer_unnested",
+                "SELECT * FROM users_unnested",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let total_rows: usize =
+                        result_batches.iter().map(RecordBatch::num_rows).sum();
+                    // With unnest_depth=1, nested posts objects are flattened
+                    assert!(total_rows > 0, "Expected results from unnested query, got {total_rows}");
+                })),
+            )
+            .await?;
+
+            tx.send(()).map_err(|()| {
+                tracing::error!("Failed to send shutdown signal");
+                "Failed to send shutdown signal".to_string()
+            })?;
+
+            Ok(())
+        })
+        .await
 }

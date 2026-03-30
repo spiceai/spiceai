@@ -18,7 +18,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use arrow::{
     array::{Array, RecordBatch},
-    datatypes::SchemaRef,
+    datatypes::{Field, Schema, SchemaRef},
 };
 use datafusion::error::Result as DataFusionResult;
 use datafusion::{
@@ -136,12 +136,38 @@ impl ColumnBounds for ExactColumnBounds {
             .map(|sv| Arc::new(Literal::new(sv)) as Arc<dyn PhysicalExpr>)
             .collect::<Vec<_>>();
 
-        let in_expr = Arc::new(InListExpr::new(
+        // Build a schema compatible with `left_expr` so InListExpr::try_new can validate data types.
+        // If `left_expr` is a Column referencing index N, we need at least N+1 fields.
+        // Literals carry their own type, so only the field at the column's index matters.
+        let data_type = expr_values
+            .first()
+            .and_then(|e| {
+                let s = Schema::new(vec![Field::new(
+                    "_",
+                    arrow::datatypes::DataType::Null,
+                    true,
+                )]);
+                e.data_type(&s).ok()
+            })
+            .unwrap_or(arrow::datatypes::DataType::Null);
+
+        let col_index = left_expr
+            .as_any()
+            .downcast_ref::<datafusion::physical_plan::expressions::Column>()
+            .map_or(0, datafusion::physical_expr::expressions::Column::index);
+
+        let mut fields: Vec<Field> = (0..col_index)
+            .map(|i| Field::new(format!("_pad{i}"), arrow::datatypes::DataType::Null, true))
+            .collect();
+        fields.push(Field::new("_col", data_type, true));
+        let dummy_schema = Schema::new(fields);
+
+        let in_expr = Arc::new(InListExpr::try_new(
             left_expr,
             expr_values,
             false, // not negated (IN, not NOT IN)
-            None,  // no static filter optimization
-        ));
+            &dummy_schema,
+        )?);
 
         tracing::debug!(
             "ExactLeftAccumulator created InListExpr with {} values ({} bytes).",

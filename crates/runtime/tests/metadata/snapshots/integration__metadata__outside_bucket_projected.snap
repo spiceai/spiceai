@@ -1,0 +1,6 @@
+---
+source: crates/runtime/tests/metadata/mod.rs
+expression: outside_bucket_projected
+---
+++
+++

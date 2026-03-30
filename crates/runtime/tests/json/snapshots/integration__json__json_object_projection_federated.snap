@@ -1,0 +1,9 @@
+---
+source: crates/runtime/tests/json/mod.rs
+expression: result
+---
++-------+-----+
+| name  | age |
++-------+-----+
+| Alice | 30  |
++-------+-----+

@@ -1,0 +1,9 @@
+---
+source: crates/runtime/tests/dynamodb/streams.rs
+expression: formatted
+---
++--------------------------+----+
+| created_at               | id |
++--------------------------+----+
+| 2025-10-12T23:37:16.345Z | 1  |
++--------------------------+----+

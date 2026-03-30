@@ -2,9 +2,13 @@
 name: pr
 
 on:
-  merge_group:
-    types: [checks_requested]
   pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+  merge_group:
     branches:
       - trunk
       - release-*
@@ -54,7 +58,7 @@ jobs:
   # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
   # a success when skipped).
   check_changes:
-    runs-on: spiceai-macos
+    runs-on: spiceai-dev-runners
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
@@ -67,55 +71,12 @@ jobs:
         id: check
         uses: ./.github/actions/check-code-changes
 
-  # Run Go linting in parallel with Rust linting
-  lint-go:
-    name: Go Lint
-    runs-on: spiceai-dev-runners
-    needs: check_changes
-    env:
-      GOVER: 1.25.5
+      - name: Validate datafusion-table-providers commit
+        run: bash .github/scripts/validate_table_providers_commit.sh
+        env:
+          BRANCH: spiceai-52
 
-    steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        with:
-          fetch-depth: 1
-
-      - name: Cache Go modules
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
-      - name: Set up Go
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6
-        with:
-          go-version: ${{ env.GOVER }}
-          cache: false
-
-      - name: Install golangci-lint
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          # Install golangci-lint v2.8.0+ which supports Go 1.25
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v2.8.0
-
-      - name: Install make
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y make
-
-      - name: Run Go lint
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: make lint-go
-
-  # Run Rust linting in parallel with Go linting
+  # Run Rust linting
   lint-rust:
     name: Rust Lint
     runs-on: spiceai-dev-runners
@@ -129,7 +90,7 @@ jobs:
 
       - name: Cache Cargo registry
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
             ~/.cargo/registry/index/
@@ -172,21 +133,21 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
 
-      - name: Validate datafusion-table-providers commit
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: bash .github/scripts/validate_table_providers_commit.sh
+      - name: Cancel workflow on failure
+        if: failure()
+        run: gh run cancel ${{ github.run_id }}
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
 
-  # Build and test after linting passes
+  # Build and test
   build-test:
     name: Build and Test
     runs-on: spiceai-dev-runners
-    needs: [check_changes, lint-go, lint-rust]
-    env:
-      GOVER: 1.25.5
+    needs: [check_changes]
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -196,7 +157,7 @@ jobs:
 
       - name: Cache Cargo registry
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
             ~/.cargo/registry/index/
@@ -205,13 +166,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-
-      - name: Set up Go
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6
-        with:
-          go-version: ${{ env.GOVER }}
-          cache: false
 
       - name: Set up Rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -268,12 +222,18 @@ jobs:
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots || 'no' }}
 
+      - name: Cancel workflow on failure
+        if: failure()
+        run: gh run cancel ${{ github.run_id }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Build testoperator
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: cargo build -p testoperator --all-features --locked
 
       - name: Show sccache stats
-        if: needs.check_changes.outputs.relevant_changes == 'true'
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
 
       - name: Check if Cargo.lock is updated

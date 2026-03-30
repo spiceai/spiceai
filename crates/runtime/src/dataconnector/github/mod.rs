@@ -16,10 +16,7 @@ limitations under the License.
 
 use crate::dataconnector::github::pull_requests::PullRequestCommentType;
 use crate::token_providers::github_app_token::GitHubAppTokenProvider;
-use crate::{
-    component::dataset::Dataset, dataconnector::github::members::MembersTableArgs,
-    register_data_connector,
-};
+use crate::{component::dataset::Dataset, dataconnector::github::members::MembersTableArgs};
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -67,7 +64,7 @@ use url::Url;
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters, graphql::default_spice_client,
+    ParameterSpec, Parameters, default_spice_client,
 };
 
 mod commits;

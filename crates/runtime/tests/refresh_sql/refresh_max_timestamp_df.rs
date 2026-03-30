@@ -84,6 +84,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -93,7 +94,7 @@ async fn test_refresh_max_timestamp_df() -> anyhow::Result<()> {
                 temporary: false,
             };
             let accelerated_table = engine
-                .create_external_table(cmd, None, vec![])
+                .create_external_table(cmd, None, vec![], None)
                 .await
                 .expect("Failed to create external table");
 
@@ -181,6 +182,7 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
+                or_replace: false,
                 definition: None,
                 order_exprs: vec![],
                 unbounded: false,
@@ -190,7 +192,7 @@ async fn test_accelerator_table_provider() -> anyhow::Result<()> {
                 temporary: false,
             };
             let accelerated_table = engine
-                .create_external_table(cmd, None, vec![])
+                .create_external_table(cmd, None, vec![], None)
                 .await
                 .expect("Failed to create external table");
 

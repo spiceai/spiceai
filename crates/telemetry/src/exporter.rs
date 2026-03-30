@@ -74,7 +74,7 @@ impl TelemetryExporterBuilder {
         let credentials = self.credentials.unwrap_or(Credentials::anonymous());
 
         let endpoint = self.endpoint.ok_or(Error::MissingEndpoint)?;
-        let flight_client = match FlightClient::try_new(endpoint, credentials, None).await {
+        let flight_client = match FlightClient::try_new(endpoint, credentials, None, None).await {
             Ok(client) => Some(client),
             Err(e) => {
                 tracing::trace!("Unable to initialize telemetry: {e}");

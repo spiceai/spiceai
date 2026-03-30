@@ -2,7 +2,7 @@ version: v1
 kind: Spicepod
 name: s3[parquet]-cayenne[file]
 datasets:
-  - from: s3://benchmarks/tpch_sf10/customer/
+  - from: s3://benchmarks/tpch_sf10/customer.parquet
     name: customer
     params: &s3_params
       file_format: parquet
@@ -15,31 +15,31 @@ datasets:
       enabled: true
       engine: cayenne
       mode: file
-  - from: s3://benchmarks/tpch_sf10/lineitem/
+  - from: s3://benchmarks/tpch_sf10/lineitem.parquet
     name: lineitem
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpch_sf10/nation/
+  - from: s3://benchmarks/tpch_sf10/nation.parquet
     name: nation
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpch_sf10/orders/
+  - from: s3://benchmarks/tpch_sf10/orders.parquet
     name: orders
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpch_sf10/part/
+  - from: s3://benchmarks/tpch_sf10/part.parquet
     name: part
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpch_sf10/partsupp/
+  - from: s3://benchmarks/tpch_sf10/partsupp.parquet
     name: partsupp
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpch_sf10/region/
+  - from: s3://benchmarks/tpch_sf10/region.parquet
     name: region
     params: *s3_params
     acceleration: *acceleration
-  - from: s3://benchmarks/tpch_sf10/supplier/
+  - from: s3://benchmarks/tpch_sf10/supplier.parquet
     name: supplier
     params: *s3_params
     acceleration: *acceleration

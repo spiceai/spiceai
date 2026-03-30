@@ -26,7 +26,12 @@ limitations under the License.
 //! - Local file copy operations (lock-release pattern)
 //! - End-to-end snapshot workflow
 
-#![allow(clippy::expect_used)]
+#![allow(
+    clippy::expect_used,
+    clippy::cast_possible_truncation,
+    clippy::uninlined_format_args,
+    clippy::redundant_closure_for_method_calls
+)]
 
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_or_init_sdk_config};
@@ -784,8 +789,8 @@ fn bench_tar_archive_creation(c: &mut Criterion) {
 
     // Benchmark tar creation only (no S3)
     let dirs = vec![
-        (metadata_dir.clone(), "metadata/".to_string()),
-        (data_dir.clone(), "data/".to_string()),
+        (metadata_dir, "metadata/".to_string()),
+        (data_dir, "data/".to_string()),
     ];
 
     group.bench_function("create_tar", |b| {
@@ -847,8 +852,8 @@ fn bench_tar_archive_extraction(c: &mut Criterion) {
 
     // Create tar archive for extraction benchmark
     let dirs = vec![
-        (metadata_dir.clone(), "metadata/".to_string()),
-        (data_dir.clone(), "data/".to_string()),
+        (metadata_dir, "metadata/".to_string()),
+        (data_dir, "data/".to_string()),
     ];
 
     let archive_path = source_temp.path().join("snapshot.tar");
@@ -949,8 +954,8 @@ fn bench_cayenne_end_to_end(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(total_size));
 
     let dirs = vec![
-        (metadata_dir.clone(), "metadata/".to_string()),
-        (data_dir.clone(), "data/".to_string()),
+        (metadata_dir, "metadata/".to_string()),
+        (data_dir, "data/".to_string()),
     ];
 
     group.bench_function("full_workflow", |b| {

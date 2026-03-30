@@ -32,6 +32,7 @@ use datafusion::{
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, SortExpr, col, ident, lit};
 use itertools::Itertools;
 use snafu::{ResultExt, Snafu};
+use util::format_datafusion_error;
 
 use crate::{
     SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME, VectorSearchGenerationResult,
@@ -48,7 +49,8 @@ pub enum Error {
     CandidateAggregationError { source: aggregation::Error },
 
     #[snafu(display(
-        "An unexpected error occurred preparing search request. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues.\nDetails: {source}"
+        "An unexpected error occurred preparing search request. Report an issue on GitHub: https://github.com/spiceai/spiceai/issues. Details: {}",
+        format_datafusion_error(source)
     ))]
     SearchRequestConstructionError { source: DataFusionError },
 
@@ -136,6 +138,7 @@ impl<A: CandidateAggregation> SearchPipeline<A> {
                     tbl,
                     columns,
                     filters,
+                    &primary_keys,
                     Some(limit),
                 )
                 .context(SearchRequestConstructionSnafu)?;
@@ -172,6 +175,7 @@ fn construct_logical_plan(
     name: &TableReference,
     columns: Vec<Expr>,
     filters: Vec<Expr>,
+    primary_keys: &[Column],
     limit: Option<usize>,
 ) -> Result<LogicalPlan, DataFusionError> {
     let mut scan =
@@ -180,11 +184,14 @@ fn construct_logical_plan(
     if let Some(filter) = filters.into_iter().reduce(Expr::and) {
         scan = scan.filter(filter)?;
     }
+    let mut sort_exprs = vec![SortExpr::new(ident(SEARCH_SCORE_COLUMN_NAME), false, false)];
+    sort_exprs.extend(
+        primary_keys
+            .iter()
+            .map(|pk| SortExpr::new(col(pk.clone()), true, true)),
+    );
     scan.project(columns)?
-        .sort_with_limit(
-            vec![SortExpr::new(ident(SEARCH_SCORE_COLUMN_NAME), false, false)],
-            limit,
-        )?
+        .sort_with_limit(sort_exprs, limit)?
         .build()
 }
 

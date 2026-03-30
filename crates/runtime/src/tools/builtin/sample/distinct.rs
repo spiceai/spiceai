@@ -21,6 +21,8 @@ use std::{
     fmt::{Display, Formatter},
     sync::Arc,
 };
+use tracing::Span;
+use tracing_futures::Instrument;
 use util::security::quote_table_reference;
 
 use crate::datafusion::DataFusion;
@@ -141,9 +143,12 @@ impl SampleFrom for DistinctColumnsParams {
 
         let mut result: Vec<ArrayRef> = Vec::with_capacity(columns.len());
 
+        let current_span = Span::current();
+
         let data_sample_futures = columns.iter().map(|column| {
             let tbl = tbl.clone();
             let df = Arc::clone(&df);
+            let span = current_span.clone();
             async move {
                 // Only sample distinctly from columns that are specified in the `cols` field, if `cols` is None and distinct sampling is supported
                 if column_supports_distinct_sampling(column)
@@ -158,6 +163,7 @@ impl SampleFrom for DistinctColumnsParams {
                     Self::sample_from_column(df, &tbl, column.name(), self.limit).await
                 }
             }
+            .instrument(span)
         });
 
         let data_samples = futures::stream::iter(data_sample_futures)

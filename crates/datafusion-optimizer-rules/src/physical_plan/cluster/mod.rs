@@ -15,4 +15,3 @@ limitations under the License.
 */
 
 pub mod ensure_supported_file_scan;
-pub mod union_projection_pushdown;

@@ -1,0 +1,23 @@
+[package]
+description = "Spice OSS Flight cookie test server"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+name = "flight-cookie-server"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow-array.workspace = true
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
+arrow-schema.workspace = true
+bytes.workspace = true
+clap = { workspace = true, features = ["derive"] }
+futures.workspace = true
+prost.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic = { workspace = true, features = ["transport"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

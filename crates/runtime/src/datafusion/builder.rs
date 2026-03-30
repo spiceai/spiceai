@@ -25,8 +25,9 @@ use super::{
     SPICE_RUNTIME_SCHEMA,
 };
 use crate::cluster::ResolvedClusterConfig;
+use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, status};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
-use crate::{metrics::telemetry::track_bytes_processed, status};
 use cache::Caching;
 use datafusion::{
     catalog::{CatalogProvider, MemoryCatalogProvider},
@@ -46,6 +47,7 @@ use datafusion::{
 };
 use datafusion::{config::SpillCompression, physical_planner::ExtensionPlanner};
 use datafusion_federation::{FederatedPlanner, sql::federation_analyzer_rule};
+use runtime_datafusion::analyzer_rule::{PartitionedTableScanRewrite, TablePartitionProvider};
 
 #[cfg(feature = "duckdb")]
 use {
@@ -55,7 +57,9 @@ use {
     datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
 };
 
+#[cfg(feature = "duckdb")]
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+#[cfg(feature = "duckdb")]
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_optimizer_rules::{
     logical_plan::{
@@ -66,6 +70,7 @@ use datafusion_optimizer_rules::{
 use runtime_datafusion::{
     extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
     schema_provider::SpiceSchemaProvider,
+    url_table::{DynamicUrlCatalogList, SpiceUrlTableFactory},
 };
 use runtime_datafusion_index::analyzer::IndexTableScanExtensionPlanner;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
@@ -88,7 +93,7 @@ pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock
         .enable_ident_normalization = false;
 
     df_config.options_mut().optimizer.expand_views_at_output = true;
-    df_config.options_mut().sql_parser.dialect = "PostgreSQL".to_string();
+    df_config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::PostgreSQL;
     df_config
         .options_mut()
         .execution
@@ -123,6 +128,10 @@ pub struct DataFusionBuilder {
     metrics: Option<Metrics>,
     io_runtime: Handle,
     resource_monitor: Option<crate::resource_monitor::ResourceMonitor>,
+    url_tables_enabled: bool,
+    /// Arbitrary additional analyzer rules.
+    additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
+    executor_registry: Option<Arc<ExecutorRegistry>>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -165,6 +174,9 @@ impl DataFusionBuilder {
             metrics: None,
             io_runtime,
             resource_monitor: None,
+            url_tables_enabled: false,
+            additional_analyzer_rules: vec![],
+            executor_registry: None,
         }
     }
 
@@ -234,6 +246,37 @@ impl DataFusionBuilder {
         self
     }
 
+    /// Enable URL-based table resolution (e.g., `SELECT * FROM 's3://bucket/data.parquet'`).
+    ///
+    /// When enabled, queries can directly reference object store URLs as table names.
+    /// This feature is opt-in and disabled by default.
+    ///
+    /// Enable via spicepod.yml:
+    /// ```yaml
+    /// runtime:
+    ///   params:
+    ///     url_tables: enabled
+    /// ```
+    #[must_use]
+    pub fn with_url_tables(mut self, enabled: bool) -> Self {
+        self.url_tables_enabled = enabled;
+        self
+    }
+
+    /// Adds additional analyzer rules to the `DataFusion` instance.
+    #[must_use]
+    pub fn with_analyzer_rules(mut self, rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>) -> Self {
+        self.additional_analyzer_rules = rules;
+        self
+    }
+
+    /// Sets the executor registry for distributed write forwarding (scheduler mode only).
+    #[must_use]
+    pub fn with_executor_registry(mut self, registry: Arc<ExecutorRegistry>) -> Self {
+        self.executor_registry = Some(registry);
+        self
+    }
+
     /// Builds the `DataFusion` instance.
     ///
     /// # Panics
@@ -247,11 +290,17 @@ impl DataFusionBuilder {
             config = config.with_spill_compression(spill_compression);
         }
 
+        let datafusion_ref = super::iceberg_ddl::new_shared_datafusion_ref();
+
         let mut state = SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
             .with_query_planner(Arc::new(
-                ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners()),
+                ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners(
+                    Arc::clone(&datafusion_ref),
+                    self.executor_registry.clone(),
+                    self.io_runtime.clone(),
+                )),
             ))
             .with_runtime_env(runtime_env(
                 self.memory_limit,
@@ -259,6 +308,10 @@ impl DataFusionBuilder {
                 self.io_runtime.clone(),
             ))
             .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
+
+        for rule in self.additional_analyzer_rules {
+            state = state.with_analyzer_rule(rule);
+        }
 
         #[cfg(feature = "duckdb")]
         {
@@ -353,13 +406,80 @@ impl DataFusionBuilder {
 
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
+        // Enable URL-based table resolution (e.g., SELECT * FROM 's3://bucket/data.parquet')
+        // This is opt-in via `runtime.params.url_tables=enabled`
+        if self.url_tables_enabled {
+            let url_table_factory = Arc::new(SpiceUrlTableFactory::new());
+            let current_catalog_list = Arc::clone(ctx.state().catalog_list());
+            let dynamic_catalog_list = Arc::new(DynamicUrlCatalogList::new(
+                current_catalog_list,
+                Arc::clone(&url_table_factory),
+            ));
+            ctx.register_catalog_list(dynamic_catalog_list);
+
+            // Register the session state with the factory so it can infer schemas
+            url_table_factory.with_state(ctx.state_weak_ref());
+        }
+
         let caching = self.caching.unwrap_or(Arc::new(Caching::default()));
+
+        let ddl_enabled_catalogs = Arc::new(RwLock::new(HashSet::new()));
+        let ddl_extension_store = super::ddl::acceleration_options::new_shared_store();
+
+        // Add partitioned table scan rewrite rules for distributed query execution.
+        // Must be added after context creation so the SessionContext (with UDFs) is
+        // available for parsing partition expression strings into Exprs.
+        if let Some(executor_registry) = &self.executor_registry {
+            use crate::cluster::FederatedPartitionProvider;
+
+            // Accelerated tables
+            ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
+                Arc::clone(executor_registry) as Arc<dyn TablePartitionProvider>,
+                &ctx,
+            )));
+
+            // Federated tables (e.g. Cayenne)
+            ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
+                Arc::new(FederatedPartitionProvider::from_registry(executor_registry))
+                    as Arc<dyn TablePartitionProvider>,
+                &ctx,
+            )));
+        }
+
+        // Add the Iceberg DDL analyzer rule after context creation so it can
+        // reference the catalog list and DDL-enabled catalogs.
+        // Uses Weak references to avoid reference cycles (SessionContext owns
+        // the analyzer rules, so Arc refs back would create a cycle).
+        ctx.add_analyzer_rule(Arc::new(
+            super::iceberg_ddl::analyzer_rule::IcebergDdlAnalyzerRule::new(
+                ctx.state().catalog_list(),
+                &ddl_enabled_catalogs,
+                Arc::clone(&ddl_extension_store),
+            ),
+        ));
+
+        // Add the Cayenne DDL analyzer rule.
+        #[cfg(not(windows))]
+        ctx.add_analyzer_rule(Arc::new(
+            super::cayenne_ddl::analyzer_rule::CayenneDdlAnalyzerRule::new(
+                ctx.state_weak_ref(),
+                ctx.state().catalog_list(),
+                &ddl_enabled_catalogs,
+                Arc::clone(&ddl_extension_store),
+                self.cluster_config.as_ref().is_some_and(|cfg| {
+                    matches!(cfg.effective_role(), Some(ClusterRole::Scheduler))
+                }),
+            ),
+        ));
 
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
             writable_catalogs: RwLock::new(HashSet::new()),
+            ddl_enabled_catalogs,
+            ddl_extension_store,
+            datafusion_ref,
             caching,
             pending_sink_tables: TokioRwLock::new(Vec::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
@@ -377,6 +497,8 @@ impl DataFusionBuilder {
             cluster_config: self.cluster_config.unwrap_or_default(),
             scheduler_server: RwLock::new(None),
             executor: RwLock::new(None),
+            executor_stream_registry: RwLock::new(None),
+            executor_registry: self.executor_registry,
         }
     }
 }
@@ -510,11 +632,23 @@ pub(crate) fn runtime_env(
     }
 }
 
-pub(crate) fn default_extension_planners() -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
+pub(crate) fn default_extension_planners(
+    datafusion_ref: super::iceberg_ddl::SharedDataFusionRef,
+    executor_registry: Option<Arc<ExecutorRegistry>>,
+    io_runtime: tokio::runtime::Handle,
+) -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
     vec![
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
+        Arc::new(super::iceberg_ddl::planner::IcebergDdlExtensionPlanner::new(datafusion_ref)),
+        #[cfg(not(windows))]
+        Arc::new(
+            super::cayenne_ddl::planner::CayenneDdlExtensionPlanner::new(
+                executor_registry,
+                Some(io_runtime),
+            ),
+        ),
         #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
     ]

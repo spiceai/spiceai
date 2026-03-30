@@ -25,11 +25,17 @@ limitations under the License.
 mod common;
 
 use arrow::array::TimestampSecondArray;
+
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
 use arrow::record_batch::RecordBatch;
+
 use cayenne::metadata::CreateTableOptions;
+
 use cayenne::{CayenneTableProvider, MetadataCatalog};
+
 use datafusion::prelude::*;
+
 use std::sync::Arc;
 
 // Generate test variants for each backend
@@ -74,11 +80,12 @@ async fn test_scalar_function_in_order_by_impl(
         vortex_config: cayenne::metadata::VortexConfig::default(),
     };
 
-    let table = CayenneTableProvider::create_table(catalog, table_options).await?;
+    let ctx = SessionContext::new();
+    let table =
+        CayenneTableProvider::create_table(catalog, table_options, ctx.runtime_env()).await?;
     println!("✓ Table created");
 
     // Register with DataFusion context
-    let ctx = SessionContext::new();
     ctx.register_table("hits", Arc::new(table))?;
     println!("✓ Table registered with DataFusion");
 
