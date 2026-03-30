@@ -242,15 +242,9 @@ async fn apply_storage_config(
         .update_app(
             app_id,
             &UpdateAppRequest {
-                description: None,
-                visibility: None,
-                replicas: None,
-                image_tag: None,
-                region: None,
-                spicepod: None,
-                resources: None,
                 executor,
                 storage_size_gb: config.app_storage_size_gb,
+                ..UpdateAppRequest::default()
             },
         )
         .await?;
@@ -306,15 +300,8 @@ pub(crate) async fn apply_spicepod_to_app(
         .update_app(
             app_id,
             &UpdateAppRequest {
-                description: None,
-                visibility: None,
-                replicas: None,
-                image_tag: None,
-                region: None,
                 spicepod: Some(spicepod_yaml.to_string()),
-                resources: None,
-                executor: None,
-                storage_size_gb: None,
+                ..UpdateAppRequest::default()
             },
         )
         .await?;
