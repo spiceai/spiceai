@@ -73,7 +73,7 @@ homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
 rust-version = "1.91"
-version = "1.11.4"
+version = "1.11.5"
 
 [workspace.dependencies]
 ahash = "0.8.12"
@@ -360,13 +360,13 @@ datafusion-pruning = { git = "https://github.com/spiceai/datafusion.git", rev = 
 datafusion-session = { git = "https://github.com/spiceai/datafusion.git", rev = "b082895b151a8a0cf65aaefc0994117ebb961295" }               # spiceai-51
 datafusion-sql = { git = "https://github.com/spiceai/datafusion.git", rev = "b082895b151a8a0cf65aaefc0994117ebb961295" }                   # spiceai-51
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "801510b2d7e3c168780ad0e6c1c6b35b32baefde" } # spiceai-51
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "041235f84ba1cff205b6a5003695274627a5a504" } # spiceai-51
 
 # Spiceai fork of datafusion-ballista with Vortex shuffle format support and PollNow interrupt
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "626181fbc04a6f964abc459f99f62cf7742f75b4" }      # branch: spiceai-51
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "626181fbc04a6f964abc459f99f62cf7742f75b4" }  # branch: spiceai-51
 ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "626181fbc04a6f964abc459f99f62cf7742f75b4" } # branch: spiceai-51
-delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "4ce55c37be6f394675457545e806c503c813b34e" } # spiceai-0.17.0
+delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "86998110637f3a0ef241f0e91813deac1e597fbc" } # spiceai-0.17.0
 
 # Patch duckdb for direct dependencies and spiceai_duckdb_fork for datafusion-table-providers
 duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "f4096c7592ed46b9e68755a49252d69783dece96" } # spiceai-1.4.4
