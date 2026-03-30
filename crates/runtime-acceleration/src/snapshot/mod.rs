@@ -1496,15 +1496,15 @@ impl SnapshotManager {
             // Early engine filtering: skip snapshots created by a different engine before
             // attempting any download. This avoids wasting bandwidth on incompatible files
             // (e.g. DuckDB snapshots when the current engine is Cayenne).
-            if let Some(ref snap_engine) = snapshot.snapshot_engine {
-                if !snap_engine.eq_ignore_ascii_case(&current_engine) {
-                    tracing::debug!(
-                        "Skipping snapshot with incompatible engine; attempting next available snapshot. dataset={} snapshot={} snapshot_engine={snap_engine} current_engine={current_engine}",
-                        self.dataset_name,
-                        snapshot.snapshot,
-                    );
-                    continue;
-                }
+            if let Some(ref snap_engine) = snapshot.snapshot_engine
+                && !snap_engine.eq_ignore_ascii_case(&current_engine)
+            {
+                tracing::debug!(
+                    "Skipping snapshot with incompatible engine; attempting next available snapshot. dataset={} snapshot={} snapshot_engine={snap_engine} current_engine={current_engine}",
+                    self.dataset_name,
+                    snapshot.snapshot,
+                );
+                continue;
             }
 
             match self
