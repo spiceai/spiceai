@@ -15,7 +15,8 @@ limitations under the License.
 */
 #![allow(dead_code, clippy::allow_attributes)]
 
-mod streams;
+mod dml;
+pub(super) mod streams;
 
 use std::collections::HashMap;
 use std::sync::Arc;

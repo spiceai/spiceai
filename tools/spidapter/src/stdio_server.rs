@@ -22,7 +22,7 @@ use tokio::process::{Child, Command as TokioCommand};
 
 use arrow::datatypes::DataType;
 use async_trait::async_trait;
-use spice_cloud_client::CloudClient;
+use spice_cloud_client::{CloudClient, types::UpdateAppRequest};
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::ComponentOrReference;
 use spicepod::component::access::AccessMode;
@@ -639,6 +639,37 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] Setting RUNNER secret...");
     commands::secrets::set_secret(&cloud, app_id, "RUNNER", "spidapter").await?;
     eprintln!("[stdio] RUNNER secret set");
+
+    // Apply custom image configuration if any image-related overrides are provided.
+    // This sets the app's registry/image/image_tag/update_channel before creating the deployment,
+    // so the deployment picks up the custom image instead of the default.
+    let has_custom_image = args.image_registry.is_some()
+        || args.image_name.is_some()
+        || args.image_tag.is_some()
+        || args.channel.is_some();
+
+    if has_custom_image {
+        eprintln!(
+            "[stdio] Applying custom image config: registry={:?}, image={:?}, tag={:?}, channel={:?}",
+            args.image_registry, args.image_name, args.image_tag, args.channel
+        );
+        cloud
+            .update_app(
+                app_id,
+                &UpdateAppRequest {
+                    registry: args.image_registry.clone(),
+                    image: args.image_name.clone(),
+                    image_tag: args.image_tag.clone(),
+                    update_channel: args.channel.clone(),
+                    ..UpdateAppRequest::default()
+                },
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to apply custom image config to app '{app_name}': {e}")
+            })?;
+        eprintln!("[stdio] Custom image config applied");
+    }
 
     eprintln!("[stdio] Creating deployment...");
     commands::create_deployment(&cloud, app_id, args.channel.as_deref()).await?;
@@ -1576,6 +1607,9 @@ mod tests {
             spice_cloud_api_url: "https://api.spice.ai".to_string(),
             ready_wait: 600,
             channel: None,
+            image_registry: None,
+            image_name: None,
+            image_tag: None,
             api_key: None,
             backend: BackendMode::Scp,
             flight_url: None,
