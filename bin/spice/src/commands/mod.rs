@@ -23,6 +23,7 @@ pub mod chat;
 pub mod cloud;
 pub mod completions;
 pub mod cluster;
+pub mod completions;
 pub mod connect;
 pub mod dataset;
 pub mod datasets;

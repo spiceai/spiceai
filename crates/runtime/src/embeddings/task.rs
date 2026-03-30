@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{sync::Arc, time::Instant};
+use std::{collections::HashMap, hash::DefaultHasher, sync::Arc, time::Instant};
 
 use async_openai::types::embeddings::{
     CreateEmbeddingRequest, CreateEmbeddingResponse, EmbeddingInput, EncodingFormat,
@@ -23,16 +23,22 @@ use async_trait::async_trait;
 use cache::key::CacheKey;
 use chunking::{Chunker, ChunkingConfig};
 use llms::embeddings::{Embed, Result as EmbedResult, get_or_infer_size};
+use parking_lot::Mutex;
 use runtime_request_context::{AsyncMarker, RequestContext};
+use tokio::sync::OnceCell;
 use tracing::{Instrument, Span};
 
 use super::metrics::{handle_metrics, request_labels, simple_labels};
+
+type InFlightEmbedCell = Arc<OnceCell<Vec<Vec<f32>>>>;
+type InFlightEmbedMap = Arc<Mutex<HashMap<u64, InFlightEmbedCell>>>;
 
 #[derive(Debug)]
 pub struct TaskEmbed {
     name: String,
     inner: Arc<dyn Embed>,
     vector_size: i32,
+    in_flight_embed_requests: InFlightEmbedMap,
 }
 
 impl TaskEmbed {
@@ -42,7 +48,44 @@ impl TaskEmbed {
             name: name.to_string(),
             inner,
             vector_size: size,
+            in_flight_embed_requests: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    fn in_flight_embed_key(&self, input: &EmbeddingInput) -> u64 {
+        CacheKey::from((self.name.as_str(), input))
+            .as_raw_key(DefaultHasher::new())
+            .as_u64()
+    }
+
+    async fn embed_with_coalescing(&self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
+        let raw_key = self.in_flight_embed_key(&input);
+        let cell: InFlightEmbedCell = {
+            let mut in_flight = self.in_flight_embed_requests.lock();
+            Arc::clone(
+                in_flight
+                    .entry(raw_key)
+                    .or_insert_with(|| Arc::new(OnceCell::new())),
+            )
+        };
+
+        let result = cell
+            .get_or_try_init(|| {
+                let input = input.clone();
+                async move { self.inner.embed(input).await }
+            })
+            .await
+            .cloned();
+
+        let mut in_flight = self.in_flight_embed_requests.lock();
+        if in_flight
+            .get(&raw_key)
+            .is_some_and(|current| Arc::ptr_eq(current, &cell))
+        {
+            in_flight.remove(&raw_key);
+        }
+
+        result
     }
 }
 
@@ -62,7 +105,11 @@ impl Embed for TaskEmbed {
         let start = std::time::Instant::now();
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "text_embed", input = to_truncated_string(&input));
 
-        let result = match self.inner.embed(input).instrument(span.clone()).await {
+        let result = match self
+            .embed_with_coalescing(input)
+            .instrument(span.clone())
+            .await
+        {
             Ok(response) => {
                 tracing::info!(target: "task_history", parent: &span, outputs_produced = response.len(), "labels");
                 Ok(response)
@@ -96,7 +143,7 @@ impl Embed for TaskEmbed {
     }
 
     fn embedding_input_cache_key<'a>(&'a self, input: &'a EmbeddingInput) -> Option<CacheKey<'a>> {
-        self.inner.embedding_input_cache_key(input)
+        Some((self.name.as_str(), input).into())
     }
 
     fn size(&self) -> i32 {
@@ -194,6 +241,26 @@ fn format_array<T: serde::Serialize>(arr: &[T]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct CountingEmbed {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Embed for CountingEmbed {
+        async fn embed(&self, _input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(vec![vec![1.0, 2.0]])
+        }
+
+        fn size(&self) -> i32 {
+            2
+        }
+    }
 
     #[test]
     fn test_string() {
@@ -236,5 +303,28 @@ mod tests {
     fn test_array_of_integer_array_over_limit() {
         let input = EmbeddingInput::ArrayOfIntegerArray(vec![vec![1], vec![2], vec![3], vec![4]]);
         assert_eq!(to_truncated_string(&input), "[[1],[2],[3],...]");
+    }
+
+    #[tokio::test]
+    async fn identical_concurrent_embeds_are_coalesced() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task_embed = TaskEmbed::new(
+            "test_model",
+            Arc::new(CountingEmbed {
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .await
+        .expect("task embed should initialize");
+
+        let input = EmbeddingInput::String("same query".to_string());
+        let (left, right) = tokio::join!(
+            task_embed.embed(input.clone()),
+            task_embed.embed(input.clone())
+        );
+
+        left.expect("left embed should succeed");
+        right.expect("right embed should succeed");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
