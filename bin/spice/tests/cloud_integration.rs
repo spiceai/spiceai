@@ -671,10 +671,20 @@ fn test_cloud_deployments_list_empty() {
     let org_app = create_test_app(&name);
 
     let mut cmd = spice_cloud_cmd().expect("credentials required");
-    // A brand-new app may or may not have deployments; the command must succeed.
-    cmd.args(["cloud", "deployments", "--app", &org_app, "-o", "json"])
+    let list_assert = cmd
+        .args(["cloud", "deployments", "--app", &org_app, "-o", "json"])
         .assert()
         .success();
+
+    let list_output: serde_json::Value = serde_json::from_slice(&list_assert.get_output().stdout)
+        .expect("list deployments should produce valid JSON");
+    let deployments = list_output
+        .as_array()
+        .expect("deployments should be an array");
+    assert!(
+        deployments.is_empty(),
+        "newly created app should have no deployments"
+    );
 
     cleanup_app(&org_app);
 }

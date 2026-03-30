@@ -121,4 +121,4 @@ predicates = "3"
 rstest = "0.26.1"
 serde_json.workspace = true
 tempfile.workspace = true
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"] }
