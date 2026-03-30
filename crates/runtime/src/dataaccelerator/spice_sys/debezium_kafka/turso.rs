@@ -78,6 +78,23 @@ impl DebeziumKafkaSys {
         Ok(())
     }
 
+    pub(super) async fn delete_turso(
+        &self,
+        pool: &Arc<TursoConnectionPool>,
+    ) -> Result<()> {
+        let dataset_name = self.dataset_name.clone();
+        let conn = pool.connect().await.map_err(Error::external)?;
+
+        let delete = format!(
+            "DELETE FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
+        );
+        conn.execute(&delete, turso::params![dataset_name])
+            .await
+            .map_err(Error::external)?;
+
+        Ok(())
+    }
+
     pub(super) async fn get_turso(
         &self,
         pool: &Arc<TursoConnectionPool>,

@@ -259,6 +259,40 @@ impl DataConnectorFactory for DebeziumFactory {
 
 register_data_connector!("debezium", DebeziumFactory);
 
+impl Debezium {
+    fn build_debezium_provider(
+        &self,
+        dataset: &Dataset,
+        kafka_consumer: KafkaConsumer,
+        metadata: DebeziumKafkaMetadata,
+        schema: SchemaRef,
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        let refresh_sql = dataset.refresh_sql();
+        let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
+            refresh_sql::parse_refresh_sql(dataset.name.clone(), refresh_sql.as_str(), schema)
+                .map(|(_, schema)| schema)
+                .boxed()
+                .map_err(|e| super::DataConnectorError::InvalidConfiguration {
+                    dataconnector: "debezium".to_string(),
+                    message: format!("The refresh SQL is invalid: {e}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: e,
+                })?
+        } else {
+            schema
+        };
+
+        let debezium_kafka = Arc::new(DebeziumKafka::new(
+            refresh_schema,
+            metadata.primary_keys,
+            kafka_consumer,
+            self.batching,
+        ));
+
+        Ok(debezium_kafka)
+    }
+}
+
 #[async_trait]
 impl DataConnector for Debezium {
     fn as_any(&self) -> &dyn Any {
@@ -351,58 +385,42 @@ impl DataConnector for Debezium {
                 );
 
                 // Check for schema evolution by peeking at the latest Kafka message.
-                // If the schema has changed since we last cached it, update the metadata.
-                let (metadata, schema) = match peek_latest_schema_fields(topic, &self.kafka_config)
-                    .await
+                // If the schema has changed since we last cached it, delete the
+                // cached metadata and fall through to get_metadata_from_kafka() which
+                // will replay from the beginning and rebuild the accelerated table
+                // with the new schema.
+                if let Some((latest_fields, _latest_pks)) =
+                    peek_latest_schema_fields(topic, &self.kafka_config).await
                 {
-                    Some((latest_fields, latest_pks))
-                        if latest_fields != metadata.schema_fields =>
-                    {
-                        tracing::info!(
-                            "Detected schema evolution for dataset {dataset_name}, updating cached schema"
+                    if latest_fields != metadata.schema_fields {
+                        tracing::warn!(
+                            "Debezium schema evolution detected for topic '{topic}'. Cached accelerated data will be rebuilt."
                         );
 
-                        let updated_schema = debezium::arrow::convert_fields_to_arrow_schema(
-                            latest_fields.iter().collect(),
-                        )
-                        .boxed()
-                        .context(super::UnableToGetReadProviderSnafu {
-                            dataconnector: "debezium",
-                            connector_component: ConnectorComponent::from(dataset),
-                        })?;
-
-                        let updated_metadata = DebeziumKafkaMetadata {
-                            consumer_group_id: metadata.consumer_group_id,
-                            topic: metadata.topic,
-                            primary_keys: if latest_pks.is_empty() {
-                                metadata.primary_keys
-                            } else {
-                                latest_pks
-                            },
-                            schema_fields: latest_fields,
-                        };
-
-                        if dataset.is_file_accelerated()
-                            && let Err(e) =
-                                set_metadata_to_accelerator(dataset, &updated_metadata).await
-                        {
-                            tracing::warn!("Failed to persist updated schema metadata: {e}");
+                        if dataset.is_file_accelerated() {
+                            if let Err(e) = delete_metadata_from_accelerator(dataset).await {
+                                tracing::warn!("Failed to delete cached schema metadata during schema evolution rebuild: {e}");
+                            }
                         }
 
-                        (updated_metadata, Arc::new(updated_schema))
+                        // Use get_metadata_from_kafka() which replays from the
+                        // beginning with the new schema and rebuilds the table
+                        let (kafka_consumer, metadata, schema) =
+                            get_metadata_from_kafka(dataset, topic, &self.kafka_config).await?;
+                        return self.build_debezium_provider(
+                            dataset, kafka_consumer, metadata, schema,
+                        );
                     }
-                    _ => {
-                        let cached_schema = debezium::arrow::convert_fields_to_arrow_schema(
-                            metadata.schema_fields.iter().collect(),
-                        )
-                        .boxed()
-                        .context(super::UnableToGetReadProviderSnafu {
-                            dataconnector: "debezium",
-                            connector_component: ConnectorComponent::from(dataset),
-                        })?;
-                        (metadata, Arc::new(cached_schema))
-                    }
-                };
+                }
+
+                let cached_schema = debezium::arrow::convert_fields_to_arrow_schema(
+                    metadata.schema_fields.iter().collect(),
+                )
+                .boxed()
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "debezium",
+                    connector_component: ConnectorComponent::from(dataset),
+                })?;
 
                 kafka_consumer.subscribe(topic).boxed().context(
                     super::UnableToGetReadProviderSnafu {
@@ -411,34 +429,12 @@ impl DataConnector for Debezium {
                     },
                 )?;
 
-                (kafka_consumer, metadata, schema)
+                (kafka_consumer, metadata, Arc::new(cached_schema))
             }
             None => get_metadata_from_kafka(dataset, topic, &self.kafka_config).await?,
         };
 
-        let refresh_sql = dataset.refresh_sql();
-        let refresh_schema = if let Some(refresh_sql) = &refresh_sql {
-            refresh_sql::parse_refresh_sql(dataset.name.clone(), refresh_sql.as_str(), schema)
-                .map(|(_, schema)| schema)
-                .boxed()
-                .map_err(|e| super::DataConnectorError::InvalidConfiguration {
-                    dataconnector: "debezium".to_string(),
-                    message: format!("The refresh SQL is invalid: {e}"),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: e,
-                })?
-        } else {
-            schema
-        };
-
-        let debezium_kafka = Arc::new(DebeziumKafka::new(
-            refresh_schema,
-            metadata.primary_keys,
-            kafka_consumer,
-            self.batching,
-        ));
-
-        Ok(debezium_kafka)
+        self.build_debezium_provider(dataset, kafka_consumer, metadata, schema)
     }
 
     fn supports_changes_stream(&self) -> bool {
@@ -501,12 +497,17 @@ async fn set_metadata_to_accelerator(
     debezium_kafka_sys.upsert(metadata).await
 }
 
+async fn delete_metadata_from_accelerator(dataset: &Dataset) -> Result<(), spice_sys::Error> {
+    let debezium_kafka_sys =
+        DebeziumKafkaSys::try_new(dataset, OpenOption::OpenExisting).await?;
+    debezium_kafka_sys.delete().await
+}
+
 /// Peeks at the latest Kafka message in the topic to detect schema evolution.
 ///
 /// Creates a temporary consumer with a unique group ID, seeks to the last
 /// message in each partition, and reads it to extract the current schema fields.
-/// Returns `None` if no messages are available or on any error (fails silently
-/// since this is a best-effort schema evolution check).
+/// Returns `None` if no messages are available or on any error.
 async fn peek_latest_schema_fields(
     topic: &str,
     kafka_config: &KafkaConfig,
@@ -565,35 +566,74 @@ async fn peek_latest_schema_fields(
                         ssl_endpoint_id_algo.to_string(),
                     );
 
-                let consumer: BaseConsumer = config.create().ok()?;
+                let consumer: BaseConsumer = match config.create() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("Schema evolution check for topic '{topic}': failed to create Kafka consumer: {e}");
+                        return None;
+                    }
+                };
 
-                let metadata = consumer
+                let metadata = match consumer
                     .fetch_metadata(Some(&topic), Duration::from_secs(10))
-                    .ok()?;
+                {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!("Schema evolution check for topic '{topic}': failed to fetch metadata: {e}");
+                        return None;
+                    }
+                };
 
-                let topic_metadata = metadata.topics().iter().find(|t| t.name() == topic)?;
+                let Some(topic_metadata) = metadata.topics().iter().find(|t| t.name() == topic) else {
+                    tracing::warn!("Schema evolution check for topic '{topic}': topic not found in metadata");
+                    return None;
+                };
 
                 let mut tpl = TopicPartitionList::new();
                 let mut has_messages = false;
                 for partition in topic_metadata.partitions() {
-                    let (_, high) = consumer
+                    match consumer
                         .fetch_watermarks(&topic, partition.id(), Duration::from_secs(10))
-                        .ok()?;
-                    if high > 0 {
-                        tpl.add_partition_offset(&topic, partition.id(), Offset::Offset(high - 1))
-                            .ok()?;
-                        has_messages = true;
+                    {
+                        Ok((_, high)) => {
+                            if high > 0 {
+                                if let Err(e) = tpl.add_partition_offset(&topic, partition.id(), Offset::Offset(high - 1)) {
+                                    tracing::warn!("Schema evolution check for topic '{topic}': failed to set partition offset for partition {}: {e}", partition.id());
+                                    return None;
+                                }
+                                has_messages = true;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Schema evolution check for topic '{topic}': failed to fetch watermarks for partition {}: {e}", partition.id());
+                            return None;
+                        }
                     }
                 }
 
                 if !has_messages {
+                    tracing::debug!("Schema evolution check for topic '{topic}': no messages available in topic");
                     return None;
                 }
 
-                consumer.assign(&tpl).ok()?;
+                if let Err(e) = consumer.assign(&tpl) {
+                    tracing::warn!("Schema evolution check for topic '{topic}': failed to assign partitions: {e}");
+                    return None;
+                }
 
                 // Poll for the latest message with a 10-second timeout
-                let msg = consumer.poll(Duration::from_secs(10))?.ok()?;
+                let poll_result = consumer.poll(Duration::from_secs(10));
+                let msg = match poll_result {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(e)) => {
+                        tracing::warn!("Schema evolution check for topic '{topic}': error polling message: {e}");
+                        return None;
+                    }
+                    None => {
+                        tracing::debug!("Schema evolution check for topic '{topic}': no message returned from poll");
+                        return None;
+                    }
+                };
 
                 let primary_keys = msg
                     .key()
@@ -601,16 +641,32 @@ async fn peek_latest_schema_fields(
                     .map(|key| key.get_primary_key())
                     .unwrap_or_default();
 
-                let payload = msg.payload()?;
-                let event: ChangeEvent = serde_json::from_slice(payload).ok()?;
+                let Some(payload) = msg.payload() else {
+                    tracing::debug!("Schema evolution check for topic '{topic}': message has no payload");
+                    return None;
+                };
+                let event: ChangeEvent = match serde_json::from_slice(payload) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::warn!("Schema evolution check for topic '{topic}': failed to deserialize change event: {e}");
+                        return None;
+                    }
+                };
+                let Some(schema_fields_refs) = event.get_schema_fields() else {
+                    tracing::warn!("Schema evolution check for topic '{topic}': get_schema_fields returned None");
+                    return None;
+                };
                 let schema_fields: Vec<change_event::Field> =
-                    event.get_schema_fields()?.into_iter().cloned().collect();
+                    schema_fields_refs.into_iter().cloned().collect();
 
                 Some((schema_fields, primary_keys))
             }
         })
         .await
-        .ok()?;
+        .unwrap_or_else(|e| {
+            tracing::warn!("Schema evolution check for topic '{topic}': spawn_blocking task failed: {e}");
+            None
+        });
 
     peek_result
 }

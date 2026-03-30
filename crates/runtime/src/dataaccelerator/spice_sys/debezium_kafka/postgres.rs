@@ -76,6 +76,23 @@ impl DebeziumKafkaSys {
         Ok(())
     }
 
+    pub(super) async fn delete_postgres(
+        &self,
+        pool: &PostgresConnectionPool,
+    ) -> Result<()> {
+        let conn = pool.connect_direct().await.map_err(Error::external)?;
+
+        let delete = format!(
+            "DELETE FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = $1"
+        );
+        conn.conn
+            .execute(&delete, &[&self.dataset_name])
+            .await
+            .map_err(Error::external)?;
+
+        Ok(())
+    }
+
     pub(super) async fn get_postgres(
         &self,
         pool: &PostgresConnectionPool,
