@@ -30,7 +30,9 @@ pub struct CompletionsArgs {
 /// Generate shell completions and write them to stdout.
 pub fn execute(args: &CompletionsArgs, cmd: &mut clap::Command) {
     let shell = args.shell.or_else(Shell::from_env).unwrap_or_else(|| {
-        eprintln!("Could not detect shell. Please specify one: bash, zsh, fish, elvish, powershell");
+        eprintln!(
+            "Could not detect shell. Please specify one: bash, zsh, fish, elvish, powershell"
+        );
         std::process::exit(1);
     });
     clap_complete::generate(shell, cmd, "spice", &mut std::io::stdout());
