@@ -48,6 +48,9 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set up sccache
+        uses: ./.github/actions/setup-sccache
+
       - name: Install Protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
@@ -57,12 +60,17 @@ jobs:
         uses: ./.github/actions/setup-cc
 
       - name: Run cargo check
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
         run: cargo check --all-targets --features adbc,aws-secrets-manager,keyring-secret-store,models,release,mcp --workspace --exclude libnfs --locked
 
       - name: Validate datafusion-table-providers commit
         run: bash .github/scripts/validate_table_providers_commit.sh
         env:
           BRANCH: spiceai-52
+
+      - name: Show sccache stats
+        run: sccache --show-stats
 
   build-and-test:
     name: Build and Test (Develop)
@@ -75,6 +83,9 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
+
+      - name: Set up sccache
+        uses: ./.github/actions/setup-sccache
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -93,11 +104,17 @@ jobs:
       - name: Build CLI and run nextest
         run: make build-cli nextest
         env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
           NEXTEST_FLAG: "--exclude libnfs --exclude connector-nfs -E 'not (package(aws-sdk-credential-bridge) | package(object_store_occ))'"
 
       - name: Build testoperator
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
         run: cargo build -p testoperator --all-features --locked
+
+      - name: Show sccache stats
+        run: sccache --show-stats
 
       - name: Check if Cargo.lock is updated
         run: |
