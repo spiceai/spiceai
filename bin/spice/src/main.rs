@@ -16,12 +16,12 @@ limitations under the License.
 
 //! Spice.ai CLI - Main entry point.
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use spice::commands::acceleration::{AccelerationArgs, SnapshotArgs, SnapshotsArgs};
 use spice::commands::{
-    acceleration, add, catalogs, chat, cloud, cluster, connect, dataset, datasets, init, install,
-    login, models, nsql, pods, query, refresh, run, search, sql, status, trace, upgrade, version,
-    workers,
+    acceleration, add, catalogs, chat, cloud, cluster, completions, connect, dataset, datasets,
+    init, install, login, models, nsql, pods, query, refresh, run, search, sql, status, trace,
+    upgrade, version, workers,
 };
 use spice::{Result, RuntimeContext};
 use tracing_subscriber::EnvFilter;
@@ -132,6 +132,9 @@ enum Commands {
 
     /// Chat with an LLM
     Chat(chat::ChatArgs),
+
+    /// Generate shell completions
+    Completions(completions::CompletionsArgs),
 }
 
 fn main() {
@@ -151,7 +154,9 @@ fn main() {
         .init();
 
     // Print version header (matching Go CLI behavior), suppressed in JSON mode
-    if !matches!(cli.command, Commands::Version(_)) && !is_json_output(&cli.command) {
+    if !matches!(cli.command, Commands::Version(_) | Commands::Completions(_))
+        && !is_json_output(&cli.command)
+    {
         println!("Spice.ai OSS CLI {}", version::cli_version());
     }
 
@@ -330,6 +335,9 @@ fn run_cli(cli: Cli) -> Result<()> {
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(chat::execute(&ctx, &args))?;
+        }
+        Commands::Completions(args) => {
+            completions::execute(&args, &mut Cli::command());
         }
     }
 
