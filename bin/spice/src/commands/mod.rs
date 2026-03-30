@@ -21,6 +21,7 @@ pub mod add;
 pub mod catalogs;
 pub mod chat;
 pub mod cloud;
+pub mod completions;
 pub mod cluster;
 pub mod connect;
 pub mod dataset;
