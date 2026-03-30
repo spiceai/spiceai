@@ -148,6 +148,8 @@ macro_rules! register_data_connector {
 }
 
 pub mod abfs;
+#[cfg(feature = "adbc")]
+pub mod adbc;
 #[cfg(feature = "debezium")]
 pub mod debezium;
 #[cfg(feature = "dynamodb")]
@@ -732,7 +734,10 @@ mod tests {
                 &self,
                 _params: ConnectorParams,
             ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
-                Box::pin(async { Ok(Arc::new(TestConnector) as Arc<dyn DataConnector>) })
+                Box::pin(async {
+                    let connector: Arc<dyn DataConnector> = Arc::new(TestConnector);
+                    Ok(connector)
+                })
             }
 
             fn prefix(&self) -> &'static str {

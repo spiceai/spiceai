@@ -28,6 +28,7 @@ data_components = { path = "../../data_components" }
 datafusion.workspace = true
 linkme.workspace = true
 paste.workspace = true
+reqwest.workspace = true
 runtime = { path = "../../runtime" }
 snafu.workspace = true
 token_provider = { path = "../../token_provider" }

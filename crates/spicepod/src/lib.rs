@@ -29,8 +29,8 @@ use std::{fmt::Debug, path::PathBuf};
 use std::sync::Arc;
 
 use component::{
-    catalog::Catalog, dataset::Dataset, embeddings::Embeddings, eval::Eval, model::Model,
-    runtime::Runtime, secret::Secret, snapshot::Snapshots, tool::Tool, view::View, worker::Worker,
+    catalog::Catalog, dataset::Dataset, embeddings::Embeddings, model::Model, runtime::Runtime,
+    secret::Secret, snapshot::Snapshots, tool::Tool, view::View, worker::Worker,
 };
 
 use crate::component::Nameable;
@@ -135,8 +135,6 @@ pub struct Spicepod {
     pub dependencies: Vec<String>,
 
     pub embeddings: Vec<Embeddings>,
-
-    pub evals: Vec<Eval>,
 
     pub tools: Vec<Tool>,
 
@@ -271,11 +269,6 @@ impl Spicepod {
         .await
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
-        let resolved_evals =
-            component::resolve_component_references(fs, &path, &spicepod_definition.evals, "evals")
-                .await
-                .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
-
         let resolved_tools =
             component::resolve_component_references(fs, &path, &spicepod_definition.tools, "tools")
                 .await
@@ -295,7 +288,6 @@ impl Spicepod {
         detect_duplicate_component_names("view", &resolved_views[..])?;
         detect_duplicate_component_names("model", &resolved_models[..])?;
         detect_duplicate_component_names("embedding", &resolved_embeddings[..])?;
-        detect_duplicate_component_names("eval", &resolved_evals[..])?;
         detect_duplicate_component_names("tool", &resolved_tools[..])?;
         detect_duplicate_component_names("worker", &resolved_workers[..])?;
 
@@ -307,7 +299,6 @@ impl Spicepod {
             resolved_datasets,
             resolved_views,
             resolved_embeddings,
-            resolved_evals,
             resolved_tools,
             resolved_models,
             resolved_workers,
@@ -396,7 +387,6 @@ fn from_definition(
     datasets: Vec<Dataset>,
     views: Vec<View>,
     embeddings: Vec<Embeddings>,
-    evals: Vec<Eval>,
     tools: Vec<Tool>,
     models: Vec<Model>,
     workers: Vec<Worker>,
@@ -411,7 +401,6 @@ fn from_definition(
         views,
         models,
         embeddings,
-        evals,
         tools,
         workers,
         dependencies: spicepod_definition.dependencies,

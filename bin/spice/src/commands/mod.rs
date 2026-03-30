@@ -25,7 +25,6 @@ pub mod cluster;
 pub mod connect;
 pub mod dataset;
 pub mod datasets;
-pub mod eval;
 pub mod init;
 pub mod install;
 pub mod login;

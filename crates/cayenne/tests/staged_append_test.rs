@@ -379,7 +379,7 @@ async fn test_wal_persists_on_move_failure_impl(
     // has already been written.
     let meta = table.metadata();
     let snapshot_dir = PathBuf::from(&meta.path)
-        .join(meta.table_id.to_string())
+        .join(&meta.table_id)
         .join(&meta.current_snapshot_id);
     std::fs::remove_dir_all(&snapshot_dir)?;
     std::fs::write(&snapshot_dir, b"not a directory")?;
@@ -518,7 +518,7 @@ fn make_batch(ids: &[i64], names: &[&str]) -> RecordBatch {
 fn staging_dir(table: &CayenneTableProvider) -> PathBuf {
     let meta = table.metadata();
     PathBuf::from(&meta.path)
-        .join(meta.table_id.to_string())
+        .join(&meta.table_id)
         .join(STAGING_DIR_NAME)
 }
 

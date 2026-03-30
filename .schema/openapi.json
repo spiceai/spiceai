@@ -170,7 +170,7 @@
           "Datasets"
         ],
         "summary": "List Datasets",
-        "description": "This endpoint returns a list of configured datasets. The response can be formatted as **JSON** or **CSV**,\nand additional filters can be applied using query parameters.\n\nUse `status=true` query parameter to include the current status of each dataset in the response.\nPossible status values: `initializing`, `ready`, `disabled`, `error`, `refreshing`, `shuttingdown`.",
+        "description": "This endpoint returns a list of configured datasets. The response can be formatted as **JSON** or **CSV**,\nand additional filters can be applied using query parameters.\n\nUse `status=true` query parameter to include the current status of each dataset in the response.\nPossible status values: `initializing`, `ready`, `disabled`, `error`, `refreshing`, `shuttingdown`.\nWhen `status=true` and a dataset is in `Error`, the response also includes:\n- `error`: structured code object with `category`, `type`, and stable `code`\n- `error_message`: user-visible details",
         "operationId": "get_datasets",
         "parameters": [
           {
@@ -206,7 +206,7 @@
         ],
         "responses": {
           "200": {
-            "description": "List of datasets. When `status=true` is specified, each dataset includes a `status` field.",
+            "description": "List of datasets. When `status=true` is specified, each dataset includes `status` and error metadata (`error`, `error_message`) when applicable.",
             "content": {
               "application/json": {
                 "schema": {
@@ -218,21 +218,31 @@
                     "name": "daily_journal_accelerated",
                     "replication_enabled": false,
                     "acceleration_enabled": true,
-                    "status": "Ready"
+                    "status": "Ready",
+                    "error": null,
+                    "error_message": null
                   },
                   {
                     "from": "databricks:hive_metastore.default.messages",
                     "name": "messages_accelerated",
                     "replication_enabled": false,
                     "acceleration_enabled": true,
-                    "status": "Refreshing"
+                    "status": "Error",
+                    "error": {
+                      "category": "dataset",
+                      "type": "auth",
+                      "code": "dataset.auth"
+                    },
+                    "error_message": "Unable to authenticate with datasource credentials"
                   },
                   {
                     "from": "postgres:aidemo_messages",
                     "name": "general",
                     "replication_enabled": false,
                     "acceleration_enabled": false,
-                    "status": "Initializing"
+                    "status": "Initializing",
+                    "error": null,
+                    "error_message": null
                   }
                 ]
               },
@@ -240,7 +250,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "example": "\nfrom,name,replication_enabled,acceleration_enabled,status\npostgres:syncs,daily_journal_accelerated,false,true,Ready\ndatabricks:hive_metastore.default.messages,messages_accelerated,false,true,Refreshing\npostgres:aidemo_messages,general,false,false,Initializing\n"
+                "example": "\nfrom,name,replication_enabled,acceleration_enabled,status,error,error_message\npostgres:syncs,daily_journal_accelerated,false,true,Ready,,\ndatabricks:hive_metastore.default.messages,messages_accelerated,false,true,Error,dataset.auth,Unable to authenticate with datasource credentials\npostgres:aidemo_messages,general,false,false,Initializing,,\n"
               }
             }
           },
@@ -498,111 +508,6 @@
         }
       }
     },
-    "/v1/evals": {
-      "get": {
-        "tags": [
-          "Evaluations"
-        ],
-        "summary": "List Evals",
-        "description": "Return all evals available to run in the runtime.",
-        "operationId": "list",
-        "responses": {
-          "200": {
-            "description": "All evals available in the Spice runtime",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/ListEvalElement"
-                  }
-                },
-                "example": [
-                  {
-                    "name": "knows_math",
-                    "description": "Questions from first year, undergraduate math exams",
-                    "dataset": "math_exams",
-                    "scorers": [
-                      "match",
-                      "professor_logical_consistency"
-                    ]
-                  }
-                ]
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/evals/{name}": {
-      "post": {
-        "tags": [
-          "Evaluations"
-        ],
-        "summary": "Run Eval",
-        "description": "Evaluate a model against a eval spice specification",
-        "operationId": "post_eval",
-        "parameters": [
-          {
-            "name": "name",
-            "in": "path",
-            "description": "Name of the evaluation to run",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "description": "Parameters to run the evaluation",
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RunEval"
-              },
-              "example": {
-                "model": "example_model"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Evaluation run successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/EvalRunResponse"
-                },
-                "example": {
-                  "primary_key": "eval_12345",
-                  "time_column": "2024-12-19T12:34:56Z",
-                  "dataset": "my_dataset",
-                  "model": "example_model",
-                  "status": "completed",
-                  "error_message": null,
-                  "scorers": [
-                    "scorer1",
-                    "scorer2"
-                  ],
-                  "metrics": {
-                    "scorer1/accuracy": 0.95,
-                    "scorer2/accuracy": 0.93
-                  }
-                }
-              },
-              "text/csv": {
-                "example": "primary_key,time_column,dataset,model,status,error_message,scorers,metrics\neval_12345,2024-12-19T12:34:56Z,my_dataset,example_model,completed,,\"[\"\"scorer1\"\", \"\"scorer2\"\"]\",\"{\"\"scorer1/accuracy\"\":0.95, \"\"scorer2/accuracy\"\":0.93}\""
-              },
-              "text/plain": {
-                "example": "+-------------+---------------------+-----------+---------------+-----------+----------------+------------------+---------------------------------------+\n            | primary_key | time_column         | dataset   | model         | status    | error_message  |      scorers     | metrics                               |\n            +-------------+---------------------+-----------+---------------+-----------+----------------+------------------+---------------------------------------+\n            | eval_12345  | 2024-12-19T12:34:56Z| my_dataset| example_model | completed |                | scorer1, scorer2 | {\"accuracy\": 0.95, \"precision\": 0.93} |\n            +-------------+---------------------+-----------+---------------+-----------+----------------+------------------+---------------------------------------+"
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/iceberg/config": {
       "get": {
         "tags": [
@@ -745,6 +650,9 @@
           "200": {
             "description": "Namespace exists"
           },
+          "400": {
+            "description": "Invalid namespace format"
+          },
           "404": {
             "description": "Namespace does not exist"
           }
@@ -760,6 +668,9 @@
         "responses": {
           "200": {
             "description": "Namespace exists"
+          },
+          "400": {
+            "description": "Invalid namespace format"
           },
           "404": {
             "description": "Namespace does not exist"
@@ -804,6 +715,9 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Invalid namespace format"
           },
           "404": {
             "description": "Namespace does not exist"
@@ -953,7 +867,7 @@
           "AI"
         ],
         "summary": "List Models",
-        "description": "List all models, both machine learning and language models, available in the runtime.",
+        "description": "List all models, both machine learning and language models, available in the runtime.\nWhen `status=true` and a model is in `Error`, the response also includes:\n- `error`: structured code object with `category`, `type`, and stable `code`\n- `error_message`: user-visible details",
         "operationId": "get_models",
         "parameters": [
           {
@@ -1000,7 +914,9 @@
                       "object": "model",
                       "owned_by": "openai",
                       "datasets": null,
-                      "status": "ready"
+                      "status": "ready",
+                      "error": null,
+                      "error_message": null
                     },
                     {
                       "id": "text-embedding-ada-002",
@@ -1010,7 +926,13 @@
                         "text-dataset-1",
                         "text-dataset-2"
                       ],
-                      "status": "ready"
+                      "status": "error",
+                      "error": {
+                        "category": "model",
+                        "type": "auth",
+                        "code": "model.auth"
+                      },
+                      "error_message": "Invalid API key"
                     }
                   ]
                 }
@@ -1019,7 +941,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "example": "\nid,object,owned_by,datasets,status\ngpt-4,model,openai,,ready\ntext-embedding-ada-002,model,openai-internal,\"text-dataset-1,text-dataset-2\",ready\n"
+                "example": "\nid,object,owned_by,datasets,status,error,error_message\ngpt-4,model,openai,,ready,,\ntext-embedding-ada-002,model,openai-internal,\"text-dataset-1,text-dataset-2\",error,model.auth,Invalid API key\n"
               }
             }
           },
@@ -1585,7 +1507,7 @@
                       "data": {
                         "timestamp": 1724716542
                       },
-                      "score": 0.914321
+                      "_score": 0.914321
                     },
                     {
                       "matches": {
@@ -1598,7 +1520,7 @@
                       "data": {
                         "timestamp": 1724715881
                       },
-                      "score": 0.83221
+                      "_score": 0.83221
                     },
                     {
                       "matches": {
@@ -1611,7 +1533,7 @@
                       "data": {
                         "timestamp": 1724716123
                       },
-                      "score": 0.787654321
+                      "_score": 0.787654321
                     }
                   ],
                   "duration_ms": 42
@@ -2157,7 +2079,7 @@
               "string",
               "null"
             ],
-            "description": "SQL statement used for the refresh. Defaults to the `refresh_sql` specified in the spicepod."
+            "description": "SQL statement used for the refresh. Defaults to current `refresh_sql` configured (either from the spicepod or a previous `refresh_sql` update)."
           }
         }
       },
@@ -4461,16 +4383,49 @@
           }
         }
       },
-      "ComponentStatus": {
+      "ComponentError": {
+        "type": "object",
+        "required": [
+          "category",
+          "type",
+          "code"
+        ],
+        "properties": {
+          "category": {
+            "$ref": "#/components/schemas/ComponentErrorCategory",
+            "description": "High-level component category where the error originated."
+          },
+          "code": {
+            "type": "string",
+            "description": "Stable machine-readable code (`{category}.{type}`), e.g. `dataset.auth`."
+          },
+          "type": {
+            "$ref": "#/components/schemas/ComponentErrorType",
+            "description": "Canonical error type intended for programmatic handling."
+          }
+        }
+      },
+      "ComponentErrorCategory": {
         "type": "string",
-        "description": "Represents the status of a component (e.g. dataset, model, etc).",
         "enum": [
-          "Initializing",
-          "Ready",
-          "Disabled",
-          "Error",
-          "Refreshing",
-          "ShuttingDown"
+          "dataset",
+          "model",
+          "worker",
+          "runtime"
+        ]
+      },
+      "ComponentErrorType": {
+        "type": "string",
+        "enum": [
+          "auth",
+          "connection",
+          "timeout",
+          "validation",
+          "not_found",
+          "permission",
+          "rate_limit",
+          "internal",
+          "unknown"
         ]
       },
       "CompoundFilter": {
@@ -4882,7 +4837,7 @@
             "description": "The name of the connection (e.g., \"http\", \"flight\", \"metrics\", \"opentelemetry\")"
           },
           "status": {
-            "$ref": "#/components/schemas/ComponentStatus",
+            "$ref": "#/components/schemas/String",
             "description": "The status of the component (e.g., Ready, Initializing, Disabled, Error, etc.)"
           }
         }
@@ -5939,6 +5894,24 @@
             "type": "boolean",
             "description": "Whether acceleration is enabled for the dataset"
           },
+          "error": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ComponentError",
+                "description": "An optional error type/code for the dataset status.\nOnly populated when `status=true` and the dataset status is `Error`.\nExample:\n`{ \"category\": \"dataset\", \"type\": \"auth\", \"code\": \"dataset.auth\" }`."
+              }
+            ]
+          },
+          "error_message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An optional error message describing why the dataset entered an error state.\nOnly populated when `status=true`, the dataset status is `Error`, and an error message was recorded.\nThis value is intended for user-visible display."
+          },
           "from": {
             "type": "string",
             "description": "The source where the dataset is located (e.g., `postgres:syncs`)"
@@ -5965,7 +5938,7 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/ComponentStatus",
+                "$ref": "#/components/schemas/String",
                 "description": "The current status of the dataset. Only included when `status=true` query parameter is specified.\nPossible values: `Initializing`, `Ready`, `Disabled`, `Error`, `Refreshing`, `ShuttingDown`."
               }
             ]
@@ -6194,66 +6167,6 @@
           "message": {
             "type": "string",
             "description": "A human-readable description of the error."
-          }
-        }
-      },
-      "EvalRunResponse": {
-        "type": "object",
-        "description": "Represents the response for an evaluation run",
-        "required": [
-          "primary_key",
-          "time_column",
-          "dataset",
-          "model",
-          "status",
-          "scorers",
-          "metrics"
-        ],
-        "properties": {
-          "dataset": {
-            "type": "string",
-            "description": "The name of the dataset used for the evaluation"
-          },
-          "error_message": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The error message if the evaluation failed, otherwise `None`"
-          },
-          "metrics": {
-            "type": "object",
-            "description": "A map of metric names to their corresponding values",
-            "additionalProperties": {
-              "type": "number",
-              "format": "double"
-            },
-            "propertyNames": {
-              "type": "string"
-            }
-          },
-          "model": {
-            "type": "string",
-            "description": "The model used for the evaluation"
-          },
-          "primary_key": {
-            "type": "string",
-            "description": "Unique identifier for the evaluation run"
-          },
-          "scorers": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "List of scorers used in the evaluation"
-          },
-          "status": {
-            "type": "string",
-            "description": "The status of the evaluation (e.g., \"completed\", \"failed\", etc.)"
-          },
-          "time_column": {
-            "type": "string",
-            "description": "Timestamp indicating when the evaluation was created or run"
           }
         }
       },
@@ -8256,34 +8169,6 @@
           }
         }
       },
-      "ListEvalElement": {
-        "type": "object",
-        "required": [
-          "name",
-          "dataset",
-          "scorers"
-        ],
-        "properties": {
-          "dataset": {
-            "type": "string"
-          },
-          "description": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "name": {
-            "type": "string"
-          },
-          "scorers": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          }
-        }
-      },
       "ListTablesResponse": {
         "type": "object",
         "required": [
@@ -8819,10 +8704,15 @@
         "type": "object",
         "required": [
           "matches",
-          "score",
+          "_score",
           "dataset"
         ],
         "properties": {
+          "_score": {
+            "type": "number",
+            "format": "double",
+            "description": "The similarity of the match to the query"
+          },
           "data": {
             "type": "object",
             "description": "Addditional data from the `dataset` requested by the user.",
@@ -8860,11 +8750,6 @@
             "propertyNames": {
               "type": "string"
             }
-          },
-          "score": {
-            "type": "number",
-            "format": "double",
-            "description": "The similarity of the match to the query"
           }
         }
       },
@@ -8934,6 +8819,24 @@
             },
             "description": "The datasets associated with this model, if any"
           },
+          "error": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ComponentError",
+                "description": "An optional error type/code for the model status.\nOnly populated when `status=true` and the model status is `Error`.\nExample:\n`{ \"category\": \"model\", \"type\": \"auth\", \"code\": \"model.auth\" }`."
+              }
+            ]
+          },
+          "error_message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An optional error message describing why the model entered an error state.\nOnly populated when `status=true`, the model status is `Error`, and an error message was recorded.\nThis value is intended for user-visible display."
+          },
           "id": {
             "type": "string",
             "description": "The name/identifier of the model"
@@ -8963,7 +8866,7 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/ComponentStatus",
+                "$ref": "#/components/schemas/String",
                 "description": "The status of the model (e.g., `Ready`, `Initializing`, `Error`)"
               }
             ]
@@ -10475,18 +10378,6 @@
           "developer"
         ]
       },
-      "RunEval": {
-        "type": "object",
-        "description": "Input parameters to start an evaluation run for a given model.",
-        "required": [
-          "model"
-        ],
-        "properties": {
-          "model": {
-            "type": "string"
-          }
-        }
-      },
       "Scroll": {
         "type": "object",
         "description": "A scroll action.",
@@ -10671,6 +10562,63 @@
             }
           }
         ]
+      },
+      "String": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "The component is initializing and not yet ready",
+            "enum": [
+              "Initializing"
+            ]
+          },
+          {
+            "type": "string",
+            "description": "The component is ready to accept connections",
+            "enum": [
+              "Ready"
+            ]
+          },
+          {
+            "type": "string",
+            "description": "The component is disabled and not running",
+            "enum": [
+              "Disabled"
+            ]
+          },
+          {
+            "type": "object",
+            "description": "An error occurred in the component, with an optional error message",
+            "required": [
+              "Error"
+            ],
+            "properties": {
+              "Error": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "An error occurred in the component, with an optional error message"
+              }
+            }
+          },
+          {
+            "type": "string",
+            "description": "The component is in the process of refreshing its state",
+            "enum": [
+              "Refreshing"
+            ]
+          },
+          {
+            "type": "string",
+            "description": "The component is in the process of shutting down",
+            "enum": [
+              "ShuttingDown"
+            ]
+          }
+        ],
+        "description": "Represents the status of a component (e.g. dataset, model, etc).\n\nThe `Error` variant optionally carries a human-readable error message describing\nwhat caused the component to enter the error state. Use [`ComponentStatus::error`]\nfor an error without a message, or [`ComponentStatus::error_with_message`] to\ninclude one.",
+        "example": "Ready"
       },
       "Summary": {
         "type": "object",
@@ -12035,7 +11983,7 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/ComponentStatus",
+                "$ref": "#/components/schemas/String",
                 "description": "The status of the worker (e.g., `Ready`, `Initializing`, `Error`)"
               }
             ]

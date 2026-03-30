@@ -61,7 +61,7 @@ macro_rules! parse_addreses_from_envelope {
                                 segment: stringify!($segment).to_string(),
                             });
                         }
-                        (None, None) => continue,
+                        (None, None) => {}
                     }
                 }
 

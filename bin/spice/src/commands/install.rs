@@ -73,6 +73,8 @@ impl Flavor {
 
 /// Execute the install command.
 pub async fn execute(ctx: &RuntimeContext, args: &InstallArgs) -> Result<()> {
+    ctx.ensure_local_runtime_supported()?;
+
     let parsed = parse_args(&args.args)?;
 
     // Prepare installation directory

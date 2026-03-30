@@ -36,7 +36,7 @@ pub mod backend;
 pub mod lru_cache;
 pub mod metrics;
 mod simple_cache;
-mod utils;
+pub mod utils;
 
 pub mod encoding;
 pub mod key;
@@ -53,6 +53,9 @@ pub use lru_cache::LruCache;
 pub use metrics::CacheMetrics;
 pub use simple_cache::SimpleCache;
 use spicepod::component::caching::SQLResultsCacheConfig;
+pub use utils::RESPONSE_STATUS_COLUMN;
+pub use utils::batches_to_cache;
+pub use utils::filter_transient_error_responses;
 pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
 

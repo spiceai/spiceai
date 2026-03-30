@@ -28,8 +28,6 @@ use cayenne::{
     metadata::CreateTableOptions, CayenneCatalog, CayenneTableProvider, MetadataCatalog,
 };
 
-use data_components::delete::DeletionTableProvider;
-
 use datafusion::datasource::TableProvider;
 
 use datafusion::execution::context::SessionContext;
@@ -114,7 +112,8 @@ async fn delete_records(
     filter: Expr,
 ) -> TestResult<u64> {
     let ctx = SessionContext::new();
-    let plan = DeletionTableProvider::delete_from(table_provider.as_ref(), &ctx.state(), &[filter])
+    let plan = table_provider
+        .delete_from(&ctx.state(), vec![filter])
         .await?;
 
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
@@ -209,7 +208,7 @@ async fn test_get_table_delete_files_works() -> TestResult<()> {
     // Verify no deletion files initially
     let delete_files = table_provider
         .catalog()
-        .get_table_delete_files(table_provider.metadata().table_id)
+        .get_table_delete_files(&table_provider.metadata().table_id)
         .await?;
     assert_eq!(
         delete_files.len(),
@@ -225,7 +224,7 @@ async fn test_get_table_delete_files_works() -> TestResult<()> {
     // Verify deletion file was registered
     let delete_files = table_provider
         .catalog()
-        .get_table_delete_files(table_provider.metadata().table_id)
+        .get_table_delete_files(&table_provider.metadata().table_id)
         .await?;
     assert_eq!(
         delete_files.len(),

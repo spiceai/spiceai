@@ -58,7 +58,9 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
+use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::physical_plan::{collect, execute_stream};
 use datafusion_catalog::TableProvider;
@@ -69,6 +71,7 @@ use datafusion_expr::Expr;
 use datafusion_physical_expr::{create_physical_expr, PhysicalExpr};
 use futures::StreamExt;
 use std::sync::{Arc, RwLock};
+use tokio::sync::Mutex as TokioMutex;
 
 // Position-based deletion methods implemented in sink/position_based.rs
 mod position_based;
@@ -98,6 +101,12 @@ pub struct CayenneDeletionSink {
     pk_column_indices: Vec<usize>,
     /// Additional listing tables from protected snapshots that should also be scanned for deletions.
     protected_snapshot_tables: Vec<Arc<ListingTable>>,
+    /// Shared `RuntimeEnv` for S3 object store access.
+    runtime_env: Arc<RuntimeEnv>,
+    /// Shared write lock to prevent concurrent writes/refreshes from racing with deletions.
+    /// `None` when the caller already holds the write lock (e.g. retention filters applied
+    /// during `write_all_append`).
+    write_lock: Option<Arc<TokioMutex<()>>>,
 }
 
 impl CayenneDeletionSink {
@@ -113,6 +122,8 @@ impl CayenneDeletionSink {
         pk_row_converter: Option<Arc<RowConverter>>,
         pk_column_indices: Vec<usize>,
         protected_snapshot_tables: Vec<Arc<ListingTable>>,
+        runtime_env: Arc<RuntimeEnv>,
+        write_lock: Option<Arc<TokioMutex<()>>>,
     ) -> Self {
         Self {
             table_metadata,
@@ -124,6 +135,8 @@ impl CayenneDeletionSink {
             pk_row_converter,
             pk_column_indices,
             protected_snapshot_tables,
+            runtime_env,
+            write_lock,
         }
     }
 
@@ -470,7 +483,7 @@ impl CayenneDeletionSink {
         } else {
             let sequence = self
                 .catalog
-                .increment_sequence_number(self.table_metadata.table_id)
+                .increment_sequence_number(&self.table_metadata.table_id)
                 .await?;
             *delete_sequence = Some(sequence);
             sequence
@@ -494,7 +507,7 @@ impl CayenneDeletionSink {
         } else {
             let sequence = self
                 .catalog
-                .increment_sequence_number(self.table_metadata.table_id)
+                .increment_sequence_number(&self.table_metadata.table_id)
                 .await?;
             *delete_sequence = Some(sequence);
             sequence
@@ -516,7 +529,7 @@ impl CayenneDeletionSink {
 
         let delete_sequence = self
             .catalog
-            .increment_sequence_number(self.table_metadata.table_id)
+            .increment_sequence_number(&self.table_metadata.table_id)
             .await?;
 
         self.persist_key_based_deletions_with_sequence(filtered_row_keys, delete_sequence)
@@ -634,7 +647,7 @@ impl CayenneDeletionSink {
 
         let delete_sequence = self
             .catalog
-            .increment_sequence_number(self.table_metadata.table_id)
+            .increment_sequence_number(&self.table_metadata.table_id)
             .await?;
 
         self.persist_int64_pk_deletions_with_sequence(filtered_pk_values, delete_sequence)
@@ -764,7 +777,18 @@ impl CayenneDeletionSink {
 #[async_trait]
 impl DeletionSink for CayenneDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let ctx = SessionContext::new();
+        // Acquire write lock (if provided) to prevent racing with concurrent inserts or catalog refreshes.
+        // When called from within write_all_append (e.g. retention filters), the caller already
+        // holds the lock, so write_lock is None to avoid deadlocking the non-reentrant mutex.
+        let _write_guard = match &self.write_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+
+        let ctx = SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            Arc::clone(&self.runtime_env),
+        );
 
         let listing_table = {
             let guard = self.listing_table.read().map_err(|_| Error::LockPoisoned {

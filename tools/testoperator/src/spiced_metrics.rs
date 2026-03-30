@@ -56,8 +56,7 @@ impl SpicedMetrics {
         self.samples
             .get(name)?
             .iter()
-            .filter(|s| s.metric_type == MetricType::Counter)
-            .next_back()
+            .rfind(|s| s.metric_type == MetricType::Counter)
             .map(|s| s.value)
     }
 

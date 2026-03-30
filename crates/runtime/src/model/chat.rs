@@ -21,7 +21,6 @@ use llms::{
     chat::{Chat, Error as LlmError},
     google::Google,
     openai::UsageTier,
-    perplexity::PerplexitySonar,
     xai::Xai,
 };
 use llms::{config::GenericAuthMechanism, openai::DEFAULT_LLM_MODEL};
@@ -147,7 +146,6 @@ pub async fn construct_model(
         }),
         ModelSource::Anthropic => anthropic(model_id.as_deref(), params),
         ModelSource::Google => google(model_id.as_deref(), params),
-        ModelSource::Perplexity => perplexity(model_id.as_deref(), params),
         ModelSource::Azure => azure(model_id, component.name.as_str(), params),
         ModelSource::Xai => xai(model_id.as_deref(), params),
         ModelSource::OpenAi => openai(model_id, params),
@@ -225,14 +223,6 @@ fn xai(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, Llm
         });
     };
     Ok(Arc::new(Xai::new(model_id, api_key)) as Arc<dyn Chat>)
-}
-
-fn perplexity(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {
-    // PerplexitySonar only requires prefixed parameters for constructing the model.
-    let model = PerplexitySonar::from_unprefixed_params(model_id, &params.get_component_params())
-        .map_err(|source| LlmError::FailedToLoadModel { source })?;
-
-    Ok(Arc::new(model) as Arc<dyn Chat>)
 }
 
 fn anthropic(model_id: Option<&str>, params: &Parameters) -> Result<Arc<dyn Chat>, LlmError> {

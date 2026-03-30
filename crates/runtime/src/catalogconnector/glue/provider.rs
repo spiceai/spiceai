@@ -125,6 +125,7 @@ impl GlueCatalogProvider {
             "secret",
             "session_token",
             &parameters.parameters,
+            parameters.parameters.get("iam_role_source").expose().ok(),
         )
         .await
         .context(ConfigurationLoadingFailedSnafu)?

@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@ use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, TimeUnit}
 use logos::{Lexer, Logos};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+const MAX_RECURSION_DEPTH: usize = 100;
 
 #[derive(Logos, Debug, PartialEq, Clone)]
 #[logos(skip r"[ \t\n\f]+")] // Skip whitespace
@@ -111,7 +113,7 @@ impl<'input> Parser<'input> {
     }
 
     pub fn parse(&mut self) -> Result<ArrowDataType, String> {
-        self.parse_data_type()
+        self.parse_data_type_with_depth(0)
     }
 
     fn parse_decimal(&mut self) -> Result<ArrowDataType, String> {
@@ -145,7 +147,13 @@ impl<'input> Parser<'input> {
         })
     }
 
-    fn parse_data_type(&mut self) -> Result<ArrowDataType, String> {
+    fn parse_data_type_with_depth(&mut self, depth: usize) -> Result<ArrowDataType, String> {
+        if depth > MAX_RECURSION_DEPTH {
+            return Err(format!(
+                "Maximum schema recursion depth exceeded ({MAX_RECURSION_DEPTH})"
+            ));
+        }
+
         match self.current.clone() {
             Some(Ok(Token::BigInt)) => {
                 self.advance();
@@ -206,23 +214,23 @@ impl<'input> Parser<'input> {
             Some(Ok(Token::Array)) => {
                 self.advance();
                 self.expect(&Token::LAngle)?;
-                let inner_type = self.parse_data_type()?;
+                let inner_type = self.parse_data_type_with_depth(depth + 1)?;
                 self.expect(&Token::RAngle)?;
                 let field = ArrowField::new("item", inner_type, true);
                 Ok(ArrowDataType::List(Arc::new(field)))
             }
-            Some(Ok(Token::Map)) => self.parse_map(),
-            Some(Ok(Token::Struct)) => self.parse_struct(),
+            Some(Ok(Token::Map)) => self.parse_map_with_depth(depth),
+            Some(Ok(Token::Struct)) => self.parse_struct_with_depth(depth),
             _ => Err(format!("Unexpected token: {:?}", self.current)),
         }
     }
 
-    fn parse_map(&mut self) -> Result<ArrowDataType, String> {
+    fn parse_map_with_depth(&mut self, depth: usize) -> Result<ArrowDataType, String> {
         self.advance();
         self.expect(&Token::LAngle)?;
-        let key_type = self.parse_data_type()?;
+        let key_type = self.parse_data_type_with_depth(depth + 1)?;
         self.expect(&Token::Comma)?;
-        let value_type = self.parse_data_type()?;
+        let value_type = self.parse_data_type_with_depth(depth + 1)?;
         self.expect(&Token::RAngle)?;
         let key_field = Arc::new(ArrowField::new("key", key_type, false));
         let value_field = Arc::new(ArrowField::new("value", value_type, true));
@@ -234,13 +242,13 @@ impl<'input> Parser<'input> {
         Ok(ArrowDataType::Map(entry_struct, false))
     }
 
-    fn parse_struct(&mut self) -> Result<ArrowDataType, String> {
+    fn parse_struct_with_depth(&mut self, depth: usize) -> Result<ArrowDataType, String> {
         self.advance();
         self.expect(&Token::LAngle)?;
         let mut fields = Vec::new();
         if self.current != Some(Ok(Token::RAngle)) {
             loop {
-                let field = self.parse_field()?;
+                let field = self.parse_field_with_depth(depth + 1)?;
                 fields.push(field);
                 if self.current == Some(Ok(Token::Comma)) {
                     self.advance();
@@ -283,7 +291,7 @@ impl<'input> Parser<'input> {
         )
     }
 
-    fn parse_field(&mut self) -> Result<ArrowField, String> {
+    fn parse_field_with_depth(&mut self, depth: usize) -> Result<ArrowField, String> {
         let name = match self.current.clone() {
             Some(Ok(Token::Identifier(name))) => {
                 self.advance();
@@ -297,7 +305,7 @@ impl<'input> Parser<'input> {
             _ => return Err("Expected identifier for field name".to_string()),
         };
         self.expect(&Token::Colon)?;
-        let data_type = self.parse_data_type()?;
+        let data_type = self.parse_data_type_with_depth(depth)?;
         let nullable = if self.current == Some(Ok(Token::Not)) {
             self.advance();
             self.expect(&Token::Null)?;
@@ -420,6 +428,20 @@ mod tests {
             let result = parser.parse().expect("parse success");
             assert_eq!(result, expected, "Failed for input: {input}");
         }
+    }
+
+    #[test]
+    fn test_parse_rejects_excessive_recursion_depth() {
+        let input = format!(
+            "{}INT{}",
+            "ARRAY<".repeat(MAX_RECURSION_DEPTH + 1),
+            ">".repeat(MAX_RECURSION_DEPTH + 1)
+        );
+
+        let mut parser = Parser::new(&input);
+        let err = parser.parse().expect_err("must reject excessive recursion");
+
+        assert!(err.contains("Maximum schema recursion depth exceeded"));
     }
 
     #[test]

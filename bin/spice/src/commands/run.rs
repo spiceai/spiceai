@@ -17,9 +17,11 @@ limitations under the License.
 //! Run command implementation - starts the Spice runtime.
 
 use crate::context::RuntimeContext;
-use crate::error::{ChildProcessIdSnafu, Result, RuntimeExecutionSnafu, SignalHandlerSnafu};
+use crate::error::{
+    ChildProcessIdSnafu, InvalidArgumentSnafu, Result, RuntimeExecutionSnafu, SignalHandlerSnafu,
+};
 use clap::Args;
-use snafu::{OptionExt, ResultExt};
+use snafu::{OptionExt, ResultExt, ensure};
 use std::process::Stdio;
 
 /// Arguments for the run command.
@@ -44,6 +46,12 @@ Examples:
 See more at: https://spiceai.org/docs/"#
 )]
 pub struct RunArgs {
+    /// Specifies the runtime endpoint. The scheme determines the endpoint type:
+    /// http:// or https:// sets the HTTP endpoint, grpc:// or grpc+tls:// sets the Flight endpoint.
+    /// A scheme is required.
+    #[arg(long)]
+    endpoint: Option<String>,
+
     /// Specifies the runtime HTTP endpoint (overrides global --http-endpoint for binding)
     #[arg(long)]
     http_endpoint: Option<String>,
@@ -63,12 +71,21 @@ pub struct RunArgs {
 
 /// Execute the run command.
 pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Result<()> {
+    ctx.ensure_local_runtime_supported()?;
+
     // Auto-install runtime if not present
     if !ctx.is_runtime_installed() {
         tracing::info!("Spice.ai runtime is not installed. Installing now...");
         crate::commands::install::execute(ctx, &crate::commands::install::InstallArgs::default())
             .await?;
     }
+
+    // Route --endpoint to the appropriate endpoint based on scheme
+    let (http_endpoint, flight_endpoint) = resolve_endpoint(
+        args.endpoint.as_deref(),
+        args.http_endpoint.as_deref(),
+        args.flight_endpoint.as_deref(),
+    )?;
 
     tracing::info!("Spice.ai runtime starting...");
 
@@ -81,7 +98,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Res
     }
 
     // Add endpoint flags if specified
-    if let Some(flight) = &args.flight_endpoint {
+    if let Some(flight) = &flight_endpoint {
         spiced_args.push("--flight".to_string());
         spiced_args.push(flight.clone());
     }
@@ -91,7 +108,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &RunArgs, verbosity: u8) -> Res
         spiced_args.push(metrics.clone());
     }
 
-    let std_cmd = ctx.get_run_cmd(&spiced_args, args.http_endpoint.as_deref())?;
+    let std_cmd = ctx.get_run_cmd(&spiced_args, http_endpoint.as_deref())?;
 
     // Convert std::process::Command to tokio::process::Command
     let mut cmd = tokio::process::Command::from(std_cmd);
@@ -156,4 +173,50 @@ async fn run_with_signal_forwarding(
     child: &mut tokio::process::Child,
 ) -> Result<std::process::ExitStatus> {
     child.wait().await.context(RuntimeExecutionSnafu)
+}
+
+/// Resolve `--endpoint` into the appropriate HTTP or Flight endpoint based on its URL scheme.
+///
+/// Returns `(http_endpoint, flight_endpoint)`. If `--endpoint` is provided, it takes precedence
+/// over the corresponding specific endpoint flag. An error is returned if `--endpoint` has no
+/// recognized scheme or conflicts with an already-specified endpoint.
+fn resolve_endpoint(
+    endpoint: Option<&str>,
+    http_endpoint: Option<&str>,
+    flight_endpoint: Option<&str>,
+) -> Result<(Option<String>, Option<String>)> {
+    let Some(ep) = endpoint else {
+        return Ok((
+            http_endpoint.map(String::from),
+            flight_endpoint.map(String::from),
+        ));
+    };
+
+    if ep.starts_with("http://") || ep.starts_with("https://") {
+        ensure!(
+            http_endpoint.is_none(),
+            InvalidArgumentSnafu {
+                message: "--endpoint with http(s):// scheme cannot be combined with --http-endpoint"
+            }
+        );
+        Ok((Some(ep.to_string()), flight_endpoint.map(String::from)))
+    } else if ep.starts_with("grpc://") || ep.starts_with("grpc+tls://") {
+        ensure!(
+            flight_endpoint.is_none(),
+            InvalidArgumentSnafu {
+                message: "--endpoint with grpc:// scheme cannot be combined with --flight-endpoint"
+            }
+        );
+        let addr = ep
+            .trim_start_matches("grpc+tls://")
+            .trim_start_matches("grpc://");
+        Ok((http_endpoint.map(String::from), Some(addr.to_string())))
+    } else {
+        Err(InvalidArgumentSnafu {
+            message: format!(
+                "Unrecognized scheme in --endpoint '{ep}'. Use http://, https://, grpc://, or grpc+tls://"
+            ),
+        }
+        .build())
+    }
 }

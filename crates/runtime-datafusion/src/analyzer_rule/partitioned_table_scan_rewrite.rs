@@ -13,13 +13,16 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    sync::{Arc, Weak},
+};
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
     common::{
-        Result,
+        Result, ToDFSchema,
         tree_node::{Transformed, TransformedResult},
     },
     config::ConfigOptions,
@@ -27,23 +30,40 @@ use datafusion::{
     error::DataFusionError,
     logical_expr::{
         EmptyRelation, Expr, FetchType, Limit, LogicalPlan, LogicalPlanBuilder, SkipType, Sort,
-        TableScan, Union,
+        TableScan, Union, lit
     },
+    execution::SessionState,
     optimizer::AnalyzerRule,
+    prelude::SessionContext,
     sql::TableReference,
 };
+use parking_lot::RwLock;
+
+/// A specific value for partitioning keys.
+/// For example, if a table is partitioned by:
+///  - "date"
+///  - "region"
+///
+/// Unique `PartitionValue`s might be (i.e. `Vec<PartitionValue>`):
+/// ```json
+/// {"date": "2024-01-01", "region": "us-east"}
+/// {"date": "2024-01-01", "region": "us-west"}
+/// {"date": "2024-01-02", "region": "us-east"}
+/// ```
+pub type PartitionValue = HashMap<String, String>;
 
 /// Define how to get partitions for a given table, and how they are partitioned.
 pub trait TablePartitionProvider: Send + Sync + Debug {
     /// Get partitions for a given [`TableReference`].
     ///
     /// `schema`: The schema of the table locally. Expect all returned [`TableProvider`] to conform to this schema.
-    /// Return pairs of [`TableProvider`] and the partition [`Expr`] that they represent/contain.
+    /// Returns pairs of [`TableProvider`] and the partition values (as string key-value maps) that
+    /// they are responsible for. The analyzer rule converts these into filter [`Expr`]s.
     fn get_partitions(
         &self,
         table: &TableReference,
         schema: &SchemaRef,
-    ) -> Vec<(Arc<dyn TableProvider>, Vec<Expr>)>;
+    ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)>;
 
     /// Whether partitioning should be applied to the given table.
     fn should_partition(&self, tbl: &TableScan) -> bool;
@@ -78,11 +98,19 @@ pub trait TablePartitionProvider: Send + Sync + Debug {
 /// ```
 pub struct PartitionedTableScanRewrite {
     partition_provider: Arc<dyn TablePartitionProvider>,
+    // Avoid holding a strong reference to SessionState to prevent circular references (SessionState -> AnalyzerRule -> SessionState). We only need it to parse partition expressions.
+    session_state: Weak<RwLock<SessionState>>,
 }
 
 impl PartitionedTableScanRewrite {
-    pub fn new(partition_provider: Arc<dyn TablePartitionProvider>) -> Self {
-        Self { partition_provider }
+    pub fn new(
+        partition_provider: Arc<dyn TablePartitionProvider>,
+        session_ctx: &SessionContext,
+    ) -> Self {
+        Self {
+            partition_provider,
+            session_state: session_ctx.state_weak_ref(),
+        }
     }
 }
 
@@ -90,7 +118,7 @@ impl Debug for PartitionedTableScanRewrite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PartitionedTableScanRewrite")
             .field("partition_provider", &self.partition_provider)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -106,9 +134,10 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                     return Ok(Transformed::no(plan));
                 }
 
+                let schema = scan.source.schema();
                 let providers = self
                     .partition_provider
-                    .get_partitions(&scan.table_name, &scan.source.schema());
+                    .get_partitions(&scan.table_name, &schema);
 
                 tracing::debug!(
                     "PartitionedTableScanRewrite: {} partitions for '{}' table.",
@@ -116,18 +145,27 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                     scan.table_name
                 );
 
+                // Pre-compute DFSchema for partition expression parsing
+                let df_schema = schema.to_dfschema()?;
+
                 let mut sub_scans = Vec::with_capacity(providers.len());
-                for (provider, partition_filters) in providers {
-                    let source = DefaultTableSource::new(Arc::clone(&provider));
+                for (provider, partition_values) in providers {
                     let mut filters = scan.filters.clone();
 
-                    // Combine partitions with OR.
-                    if let Some(partition_filter) = partition_filters.into_iter().reduce(Expr::or) {
+                    // Convert partition values (HashMap<String, String>) to filter Exprs and combine with OR.
+                    let partition_exprs: Vec<Expr> = partition_values
+                        .iter()
+                        .filter_map(|pv| {
+                            partition_value_to_expr(pv, &df_schema, &self.session_state).transpose()
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+
+                    if let Some(partition_filter) = partition_exprs.into_iter().reduce(Expr::or) {
                         filters.push(partition_filter);
                     }
                     let plan = LogicalPlanBuilder::scan_with_filters(
                         scan.table_name.clone(),
-                        Arc::new(source),
+                        Arc::new(DefaultTableSource::new(Arc::clone(&provider))),
                         scan.projection.clone(),
                         filters,
                     )?
@@ -136,19 +174,28 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                 }
 
                 // If no partitions, return empty relation. This can happen if no partitions match the table (even if we want to partition it).
-                if sub_scans.is_empty() {
+                let Some(first_scan) = sub_scans.first() else {
                     return Ok(Transformed::yes(LogicalPlan::EmptyRelation(
                         EmptyRelation {
                             produce_one_row: false,
                             schema: Arc::clone(plan.schema()),
                         },
                     )));
+                };
+                let first_scan = Arc::unwrap_or_clone(Arc::clone(first_scan));
+                let sub_scans = sub_scans.into_iter().skip(1).collect::<Vec<_>>();
+
+                // Single partition: no Union needed, just return the sub-scan directly.
+                if sub_scans.is_empty() {
+                    return Ok(Transformed::yes(first_scan));
                 }
 
-                return Ok(Transformed::yes(LogicalPlan::Union(Union {
-                    inputs: sub_scans,
-                    schema: Arc::clone(plan.schema()),
-                })));
+                let mut builder = LogicalPlanBuilder::from(first_scan);
+                for scan in sub_scans {
+                    builder = builder.union(Arc::unwrap_or_clone(scan))?;
+                }
+                let result = builder.alias(scan.table_name.clone())?.build()?;
+                return Ok(Transformed::yes(result));
             }
 
             // Push Sort(TopK) into each Union leg when Limit sits above Sort -> Union.
@@ -176,12 +223,25 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
 /// leg. This enables per-executor `TopK`, reducing data transfer from executors to the scheduler.
 ///
 /// The outer `Limit -> Sort` is preserved for correct final merge-sort and limiting.
+///
+/// The union may be wrapped in a `SubqueryAlias` from the partition rewrite
+/// (`.alias(table_name)`). This function handles both cases:
+/// - `Limit -> Sort -> Union`
+/// - `Limit -> Sort -> SubqueryAlias -> Union`
 fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, DataFusionError> {
     let LogicalPlan::Sort(sort) = limit.input.as_ref() else {
         return Ok(Transformed::no(LogicalPlan::Limit(limit)));
     };
-    let LogicalPlan::Union(union_plan) = sort.input.as_ref() else {
-        return Ok(Transformed::no(LogicalPlan::Limit(limit)));
+
+    // The union may be directly under Sort, or wrapped in a SubqueryAlias
+    // from the partition rewrite (which adds .alias(table_name)).
+    let (union_plan, alias_node) = match sort.input.as_ref() {
+        LogicalPlan::Union(u) => (u, None),
+        LogicalPlan::SubqueryAlias(sa) => match sa.input.as_ref() {
+            LogicalPlan::Union(u) => (u, Some(sa)),
+            _ => return Ok(Transformed::no(LogicalPlan::Limit(limit))),
+        },
+        _ => return Ok(Transformed::no(LogicalPlan::Limit(limit))),
     };
 
     let FetchType::Literal(Some(fetch)) = limit.get_fetch_type()? else {
@@ -212,24 +272,61 @@ fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, D
         schema: Arc::clone(&union_plan.schema),
     });
 
+    // Re-wrap in SubqueryAlias if one was present.
+    let sort_child = match alias_node {
+        Some(sa) => LogicalPlanBuilder::from(new_union)
+            .alias(sa.alias.clone())?
+            .build()?,
+        None => new_union,
+    };
+
     Ok(Transformed::yes(LogicalPlan::Limit(Limit {
         skip: limit.skip.clone(),
         fetch: limit.fetch.clone(),
         input: Arc::new(LogicalPlan::Sort(Sort {
             expr: sort.expr.clone(),
-            input: Arc::new(new_union),
+            input: Arc::new(sort_child),
             fetch: sort.fetch,
         })),
     })))
 }
 
+/// Converts a [`PartitionValue`] (e.g. `{"bucket(3, org_id)": "42"}`) into a filter [`Expr`]
+/// (e.g. `bucket(3, org_id) = '42'`). Multiple keys are `AND`ed together.
+fn partition_value_to_expr(
+    pv: &PartitionValue,
+    df_schema: &datafusion::common::DFSchema,
+    state: &Weak<RwLock<SessionState>>,
+) -> Result<Option<Expr>, DataFusionError> {
+    let mut expr: Option<Expr> = None;
+    for (partition_expr_str, val) in pv {
+        let new_expr = state
+            .upgrade()
+            .ok_or_else(|| {
+                DataFusionError::Plan(
+                    "SessionState has been dropped, cannot parse partition expression".to_string(),
+                )
+            })?
+            .read()
+            .create_logical_expr(partition_expr_str, df_schema)?
+            .eq(lit(val.clone()));
+        expr = match expr {
+            Some(existing) => Some(existing.and(new_expr)),
+            None => Some(new_expr),
+        };
+    }
+    Ok(expr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use datafusion::{
         arrow::datatypes::{DataType, Field, Schema},
         datasource::empty::EmptyTable,
-        logical_expr::{LogicalPlanBuilder, SortExpr, col, lit},
+        logical_expr::{LogicalPlanBuilder, SortExpr, col},
+        prelude::SessionContext,
     };
 
     /// A test partition provider that splits any table into two partitions.
@@ -243,12 +340,24 @@ mod tests {
             &self,
             _table: &TableReference,
             _schema: &SchemaRef,
-        ) -> Vec<(Arc<dyn TableProvider>, Vec<Expr>)> {
+        ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
             let p1: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(Arc::clone(&self.schema)));
             let p2: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(Arc::clone(&self.schema)));
             vec![
-                (p1, vec![col("partition_id").eq(lit(0))]),
-                (p2, vec![col("partition_id").eq(lit(1))]),
+                (
+                    p1,
+                    vec![HashMap::from([(
+                        "partition_id".to_string(),
+                        "0".to_string(),
+                    )])],
+                ),
+                (
+                    p2,
+                    vec![HashMap::from([(
+                        "partition_id".to_string(),
+                        "1".to_string(),
+                    )])],
+                ),
             ]
         }
 
@@ -265,10 +374,13 @@ mod tests {
         ]))
     }
 
-    fn make_rule(schema: &SchemaRef) -> PartitionedTableScanRewrite {
-        PartitionedTableScanRewrite::new(Arc::new(TwoPartitionProvider {
-            schema: Arc::clone(schema),
-        }))
+    fn make_rule(schema: &SchemaRef, ctx: &SessionContext) -> PartitionedTableScanRewrite {
+        PartitionedTableScanRewrite::new(
+            Arc::new(TwoPartitionProvider {
+                schema: Arc::clone(schema),
+            }),
+            ctx,
+        )
     }
 
     fn make_table_scan(schema: &SchemaRef) -> LogicalPlan {
@@ -286,26 +398,29 @@ mod tests {
     #[test]
     fn test_table_scan_rewritten_to_union() {
         let schema = test_schema();
-        let rule = make_rule(&schema);
+        let ctx = SessionContext::new();
+        let rule = make_rule(&schema, &ctx);
         let plan = make_table_scan(&schema);
 
         let result = rule
             .analyze(plan, &ConfigOptions::default())
             .expect("analyze failed");
 
-        assert!(
-            matches!(result, LogicalPlan::Union(_)),
-            "Expected Union, got: {result}"
-        );
-        if let LogicalPlan::Union(union_plan) = &result {
-            assert_eq!(union_plan.inputs.len(), 2, "Expected 2 partition sub-scans");
-        }
+        // The partition rewrite wraps the union in a SubqueryAlias.
+        let LogicalPlan::SubqueryAlias(alias) = &result else {
+            panic!("Expected SubqueryAlias, got: {result}");
+        };
+        let LogicalPlan::Union(union_plan) = alias.input.as_ref() else {
+            panic!("Expected Union under SubqueryAlias, got: {}", alias.input);
+        };
+        assert_eq!(union_plan.inputs.len(), 2, "Expected 2 partition sub-scans");
     }
 
     #[test]
     fn test_limit_sort_pushdown_through_union() {
         let schema = test_schema();
-        let rule = make_rule(&schema);
+        let ctx = SessionContext::new();
+        let rule = make_rule(&schema, &ctx);
 
         // Build: Limit(fetch=5) -> Sort(id ASC) -> TableScan
         let scan = make_table_scan(&schema);
@@ -321,15 +436,21 @@ mod tests {
             .analyze(plan, &ConfigOptions::default())
             .expect("analyze failed");
 
-        // Expect: Limit -> Sort -> Union(Sort(fetch=5) -> scan, Sort(fetch=5) -> scan)
+        // Expect: Limit -> Sort -> SubqueryAlias -> Union(Sort(fetch=5) -> scan, Sort(fetch=5) -> scan)
         let LogicalPlan::Limit(limit) = &result else {
             panic!("Expected Limit, got: {result}");
         };
         let LogicalPlan::Sort(outer_sort) = limit.input.as_ref() else {
             panic!("Expected Sort under Limit, got: {}", limit.input);
         };
-        let LogicalPlan::Union(union_plan) = outer_sort.input.as_ref() else {
-            panic!("Expected Union under Sort, got: {}", outer_sort.input);
+        let LogicalPlan::SubqueryAlias(alias) = outer_sort.input.as_ref() else {
+            panic!(
+                "Expected SubqueryAlias under Sort, got: {}",
+                outer_sort.input
+            );
+        };
+        let LogicalPlan::Union(union_plan) = alias.input.as_ref() else {
+            panic!("Expected Union under SubqueryAlias, got: {}", alias.input);
         };
         assert_eq!(union_plan.inputs.len(), 2, "Expected 2 union legs");
 
@@ -348,7 +469,8 @@ mod tests {
     #[test]
     fn test_limit_sort_with_offset_pushdown() {
         let schema = test_schema();
-        let rule = make_rule(&schema);
+        let ctx = SessionContext::new();
+        let rule = make_rule(&schema, &ctx);
 
         // Build: Limit(skip=10, fetch=5) -> Sort(id ASC) -> TableScan
         let scan = make_table_scan(&schema);
@@ -371,8 +493,11 @@ mod tests {
         let LogicalPlan::Sort(outer_sort) = limit.input.as_ref() else {
             panic!("Expected Sort under Limit");
         };
-        let LogicalPlan::Union(union_plan) = outer_sort.input.as_ref() else {
-            panic!("Expected Union under Sort");
+        let LogicalPlan::SubqueryAlias(alias) = outer_sort.input.as_ref() else {
+            panic!("Expected SubqueryAlias under Sort");
+        };
+        let LogicalPlan::Union(union_plan) = alias.input.as_ref() else {
+            panic!("Expected Union under SubqueryAlias");
         };
 
         for (i, input) in union_plan.inputs.iter().enumerate() {
@@ -390,7 +515,8 @@ mod tests {
     #[test]
     fn test_limit_without_sort_no_pushdown() {
         let schema = test_schema();
-        let rule = make_rule(&schema);
+        let ctx = SessionContext::new();
+        let rule = make_rule(&schema, &ctx);
 
         // Build: Limit(fetch=5) -> TableScan (no Sort)
         let scan = make_table_scan(&schema);
@@ -404,12 +530,18 @@ mod tests {
             .analyze(plan, &ConfigOptions::default())
             .expect("analyze failed");
 
-        // Limit -> Union (no inner Sort pushed — DataFusion's optimizer handles Limit through Union)
+        // Limit -> SubqueryAlias -> Union (no inner Sort pushed — DataFusion's optimizer handles Limit through Union)
         let LogicalPlan::Limit(limit) = &result else {
             panic!("Expected Limit, got: {result}");
         };
-        let LogicalPlan::Union(union_plan) = limit.input.as_ref() else {
-            panic!("Expected Union under Limit, got: {}", limit.input);
+        let LogicalPlan::SubqueryAlias(alias) = limit.input.as_ref() else {
+            panic!(
+                "Expected SubqueryAlias under Limit, got: {}",
+                limit.input
+            );
+        };
+        let LogicalPlan::Union(union_plan) = alias.input.as_ref() else {
+            panic!("Expected Union under SubqueryAlias, got: {}", alias.input);
         };
         // Verify no Sort was injected into union legs
         for (i, input) in union_plan.inputs.iter().enumerate() {

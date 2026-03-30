@@ -20,6 +20,7 @@ mod manager;
 mod metadata;
 pub mod scheduler_task;
 mod startup;
+pub(crate) mod write_through;
 
 use std::collections::HashMap;
 
@@ -32,7 +33,7 @@ pub use metadata::{
 use snafu::Snafu;
 pub use startup::{
     accelerated_tables, build_partition_metadata_store, executor_request_initial_partitions,
-    initialize_partition_metadata,
+    initialize_partition_metadata, validate_partition_keys,
 };
 
 #[derive(Debug, Snafu)]
@@ -45,7 +46,7 @@ pub enum Error {
     #[snafu(display("Failed to initialize partition metadata for table {table}: {source}"))]
     PartitionMetadataInit {
         table: String,
-        source: manager::Error,
+        source: Box<manager::Error>,
     },
 
     #[snafu(display("Failed to discover partitions for table {table}: {source}"))]
@@ -85,6 +86,14 @@ pub enum Error {
 
     #[snafu(display("Table {table} is not an accelerated table"))]
     NotAcceleratedTable { table: String },
+
+    #[snafu(display(
+        "Accelerated {component_type} '{name}' has no partition keys configured. Add 'partition_by' to its acceleration config to participate in cluster partition management."
+    ))]
+    MissingPartitionKeys {
+        component_type: &'static str,
+        name: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

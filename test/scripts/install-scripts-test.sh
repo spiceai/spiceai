@@ -100,7 +100,7 @@ skip_test() {
 # Create a temporary directory for test artifacts
 setup_test_env() {
     TEST_TMP_DIR=$(mktemp -d)
-    trap "rm -rf $TEST_TMP_DIR" EXIT
+    trap 'rm -rf "$TEST_TMP_DIR"' EXIT
 }
 
 # =============================================================================
@@ -753,11 +753,11 @@ test_spiced_naming_convention_documented() {
 }
 
 test_spiced_variant_empty_documented() {
-    grep -q 'No variant.*VARIANT=""' "$INSTALL_SPICED_SCRIPT"
+    grep -q 'Default (VARIANT="")' "$INSTALL_SPICED_SCRIPT"
 }
 
 test_spiced_variant_models_documented() {
-    grep -q 'Models.*VARIANT="models".*the default' "$INSTALL_SPICED_SCRIPT"
+    grep -Eq 'Default.*VARIANT="".*includes models' "$INSTALL_SPICED_SCRIPT"
 }
 
 test_spiced_variant_metal_documented() {

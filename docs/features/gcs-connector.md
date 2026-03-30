@@ -4,7 +4,7 @@ The GCS data connector enables querying files stored in Google Cloud Storage buc
 
 ## Features
 
-- **Multiple File Formats**: Supports Parquet, CSV, JSON, and other formats
+- **Multiple File Formats**: Supports Parquet, CSV, JSON (including NDJSON via `json_format` parameter), and other formats
 - **Multiple Authentication Methods**: Service account keys, Application Default Credentials (ADC), or anonymous access for public buckets
 - **URL Schemes**: Supports both `gcs://` and `gs://` URL schemes
 - **Retry Configuration**: Configurable retry behavior with exponential backoff
@@ -64,7 +64,9 @@ datasets:
 
 ### Application Default Credentials (ADC)
 
-Use Google Application Default Credentials. If the `GOOGLE_APPLICATION_CREDENTIALS` environment variable is set, it will use the key file at that path:
+Use Google Application Default Credentials. If the `GOOGLE_APPLICATION_CREDENTIALS` environment variable is set, it will use the key file at that path.
+
+**Note**: When no authentication method is explicitly specified and `gcs_skip_signature` is not `true`, the GCS connector automatically loads credentials from the environment (using `GoogleCloudStorageBuilder::from_env()`). Setting `gcs_application_default_credentials: 'true'` additionally reads from the `GOOGLE_APPLICATION_CREDENTIALS` path if set.
 
 ```yaml
 datasets:
@@ -90,21 +92,24 @@ datasets:
 
 ## Parameters
 
-| Parameter                             | Type    | Default | Description                                                          |
-| ------------------------------------- | ------- | ------- | -------------------------------------------------------------------- |
-| `gcs_service_account_path`            | string  | none    | Path to a GCS service account JSON key file                          |
-| `gcs_service_account_key`             | string  | none    | GCS service account JSON key as a string                             |
-| `gcs_application_default_credentials` | boolean | `false` | Use Google ADC. Uses `GOOGLE_APPLICATION_CREDENTIALS` env var if set |
-| `gcs_skip_signature`                  | boolean | `false` | Skip signing requests. Used for public buckets                       |
-| `allow_http`                          | boolean | `false` | Allow insecure HTTP connections                                      |
-| `gcs_max_retries`                     | integer | `3`     | Maximum number of retries for failed requests                        |
-| `gcs_retry_timeout`                   | string  | none    | Retry timeout duration                                               |
-| `gcs_backoff_initial_duration`        | string  | none    | Initial backoff duration                                             |
-| `gcs_backoff_max_duration`            | string  | none    | Maximum backoff duration                                             |
-| `gcs_backoff_base`                    | float   | none    | Base of the exponential backoff                                      |
-| `client_timeout`                      | string  | none    | Timeout for GCS client operations                                    |
-| `file_format`                         | string  | none    | File format: `parquet`, `csv`, `json`, `ndjson`                      |
-| `hive_partitioning_enabled`           | boolean | `false` | Enable Hive-style partitioning                                       |
+| Parameter                             | Type    | Default | Description                                                                           |
+| ------------------------------------- | ------- | ------- | ------------------------------------------------------------------------------------- |
+| `gcs_service_account_path`            | string  | none    | Path to a GCS service account JSON key file                                           |
+| `gcs_service_account_key`             | string  | none    | GCS service account JSON key as a string                                              |
+| `gcs_application_default_credentials` | boolean | `false` | Use Google ADC. Uses `GOOGLE_APPLICATION_CREDENTIALS` env var if set                  |
+| `gcs_skip_signature`                  | boolean | `false` | Skip signing requests. Used for public buckets                                        |
+| `allow_http`                          | boolean | `false` | Allow insecure HTTP connections                                                       |
+| `gcs_max_retries`                     | integer | `3`     | Maximum number of retries for failed requests                                         |
+| `gcs_retry_timeout`                   | string  | *       | Retry timeout duration                                                                |
+| `gcs_backoff_initial_duration`        | string  | *       | Initial backoff duration                                                              |
+| `gcs_backoff_max_duration`            | string  | *       | Maximum backoff duration                                                              |
+| `gcs_backoff_base`                    | float   | *       | Base of the exponential backoff                                                       |
+| `client_timeout`                      | string  | none    | Timeout for GCS client operations                                                     |
+| `file_format`                         | string  | none    | File format: `parquet`, `csv`, `json`, `jsonl`                                        |
+| `json_format`                         | string  | `jsonl` | JSON sub-format when `file_format` is `json`: `jsonl`, `ndjson`, `ldjson`, or `array` |
+| `hive_partitioning_enabled`           | boolean | `false` | Enable Hive-style partitioning                                                        |
+
+\* Retry/backoff parameters use `object_store` crate defaults when not specified.
 
 ## File Format Parameters
 
@@ -132,12 +137,15 @@ datasets:
 
 ### JSON / NDJSON
 
+For JSON data, use `file_format: json`. By default, `json_format` is `jsonl` (JSON Lines). Supported values: `jsonl`, `ndjson`, `ldjson` (all newline-delimited), or `array` (JSON array format):
+
 ```yaml
 datasets:
   - from: gcs://my-bucket/json-data/
     name: json_data
     params:
-      file_format: ndjson
+      file_format: json
+      json_format: ndjson
 ```
 
 ## Hive Partitioning

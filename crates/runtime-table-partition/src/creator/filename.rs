@@ -88,7 +88,7 @@ pub fn encode_key(key: &ScalarValue) -> Result<String, Error> {
         ScalarValue::TimestampMillisecond(v, _) => v.map(|v| format!("{v}")),
         ScalarValue::TimestampMicrosecond(v, _) => v.map(|v| format!("{v}")),
         ScalarValue::TimestampNanosecond(v, _) => v.map(|v| format!("{v}")),
-        ScalarValue::Utf8(v) | ScalarValue::LargeUtf8(v) => {
+        ScalarValue::Utf8(v) | ScalarValue::LargeUtf8(v) | ScalarValue::Utf8View(v) => {
             v.as_ref().map(std::string::ToString::to_string)
         }
         value => {
@@ -293,6 +293,13 @@ pub fn parse_partition_value(
                 ScalarValue::Utf8(None)
             } else {
                 ScalarValue::Utf8(Some(value_str.to_string()))
+            }
+        }
+        DataType::Utf8View => {
+            if value_str == "none" || value_str == "NULL" {
+                ScalarValue::Utf8View(None)
+            } else {
+                ScalarValue::Utf8View(Some(value_str.to_string()))
             }
         }
         data_type => return Err(Error::UnsupportedType { data_type }),

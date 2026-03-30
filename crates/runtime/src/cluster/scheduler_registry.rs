@@ -451,8 +451,12 @@ pub(super) async fn build_object_store_internal(
             source: Box::new(e),
         })?;
 
+        // Use `LocalConditionalPut` instead of plain `LocalFileSystem` because
+        // `LocalFileSystem` returns `NotImplemented` for `PutMode::Update`.
+        // The scheduler registry heartbeats and job store state transitions
+        // both rely on conditional puts (ETag-based OCC).
         let store: Arc<dyn ObjectStore> = Arc::new(
-            object_store::local::LocalFileSystem::new_with_prefix(&local_path).map_err(|e| {
+            object_store_occ::LocalConditionalPut::new(&local_path).map_err(|e| {
                 Error::LocalFileSystemInit {
                     location: local_path.display().to_string(),
                     source: Box::new(e),

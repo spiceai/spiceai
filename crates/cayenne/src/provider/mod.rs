@@ -138,6 +138,9 @@ pub enum Error {
     #[snafu(display("Internal error in table '{table}': {message}"))]
     Internal { table: String, message: String },
 
+    #[snafu(display("Unable to open Cayenne acceleration file ({file_path}). Too many Cayenne acceleration files are open. Try increasing your system's maximum open file count, or increase the size of generated Cayenne files with the parameter \"cayenne_target_file_size_mb\". For more details, visit: https://spiceai.org/docs/components/data-accelerators/cayenne#params"))]
+    TooManyOpenFiles { file_path: String },
+
     /// A previous write was interrupted, leaving the table in a potentially
     /// inconsistent state. The staging WAL file must be resolved before the
     /// table can be used.
@@ -1015,9 +1018,9 @@ mod tests {
         .expect("to create upsert batch");
         insert_batch(&provider, batch2).await;
 
-        let table_id = provider.table_id();
+        let table_id = provider.table_id().to_string();
         let pre_restart_insert_records = catalog
-            .get_insert_records(table_id)
+            .get_insert_records(&table_id)
             .await
             .expect("Failed to read insert records before restart");
         assert!(
@@ -1041,7 +1044,7 @@ mod tests {
             Arc::clone(&catalog2) as Arc<dyn MetadataCatalog>;
 
         let persisted_insert_records = catalog2
-            .get_insert_records(table_id)
+            .get_insert_records(&table_id)
             .await
             .expect("Failed to read insert records after restart");
         assert!(

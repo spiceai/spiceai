@@ -36,6 +36,7 @@ use data_components::{
 };
 use iceberg::{CatalogBuilder, NamespaceIdent};
 use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
+use iceberg_storage_opendal::OpenDalStorageFactory;
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tonic::metadata::MetadataValue;
@@ -134,6 +135,10 @@ impl SpiceCloudPlatformCatalog {
         props.insert(REST_CATALOG_PROP_URI.to_string(), endpoint.to_string());
         let iceberg_rest_catalog = RestCatalogBuilder::default()
             .with_client(client)
+            .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
+                configured_scheme: "s3".to_string(),
+                customized_credential_load: None,
+            }))
             .load("rest", props)
             .await
             .context(UnableToBuildCatalogSnafu)?;

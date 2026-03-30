@@ -40,7 +40,8 @@ use async_openai::types::chat::{
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionResponseMessage, ChatCompletionResponseStream, ChatCompletionTools,
     CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FunctionCall, FunctionCallStream, FunctionType, Role, StopConfiguration,
+    FunctionCall, FunctionCallStream, FunctionType, ResponseFormat, ResponseFormatJsonSchema, Role,
+    StopConfiguration,
 };
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::error::{BuildError, SdkError};
@@ -56,8 +57,9 @@ use aws_sdk_bedrockruntime::types::{
     ContentBlock, ContentBlockDelta as ContentBlockDeltaType, ContentBlockDeltaEvent,
     ContentBlockStart as ContentBlockStartInner, ContentBlockStartEvent, ConversationRole,
     ConverseStreamMetadataEvent, ConverseStreamOutput as ConverseStreamOutputPacket,
-    GuardrailConfiguration, GuardrailStreamConfiguration, InferenceConfiguration, Message,
-    MessageStartEvent, MessageStopEvent, SystemContentBlock, ToolResultContentBlock,
+    GuardrailConfiguration, GuardrailStreamConfiguration, InferenceConfiguration,
+    JsonSchemaDefinition, Message, MessageStartEvent, MessageStopEvent, OutputConfig, OutputFormat,
+    OutputFormatStructure, OutputFormatType, SystemContentBlock, ToolResultContentBlock,
     ToolResultStatus, ToolUseBlockDelta, ToolUseBlockStart,
 };
 use aws_smithy_types::Document;
@@ -251,6 +253,54 @@ impl BedrockConverse {
                 )),
             })
             .collect::<Result<Vec<_>, _>>()
+            .map(Self::merge_consecutive_tool_result_messages)?
+    }
+
+    /// Bedrock requires all `ToolResult` blocks for a multi-tool-use assistant turn to be
+    /// in a single `User` message. `OpenAI` sends each tool result as a separate `Tool` message,
+    /// which we convert into separate `User` messages. This function merges consecutive `User`
+    /// messages that contain only `ToolResult` content blocks into a single `User` message.
+    fn merge_consecutive_tool_result_messages(
+        messages: Vec<Message>,
+    ) -> Result<Vec<Message>, BuildError> {
+        let mut merged: Vec<Message> = Vec::with_capacity(messages.len());
+
+        for msg in messages {
+            let is_tool_result_user_msg = msg.role == ConversationRole::User
+                && msg
+                    .content
+                    .iter()
+                    .all(|c| matches!(c, ContentBlock::ToolResult(_)));
+
+            if is_tool_result_user_msg {
+                // Check if the previous message is also a tool-result-only User message
+                let should_merge = merged.last().is_some_and(|prev| {
+                    prev.role == ConversationRole::User
+                        && prev
+                            .content
+                            .iter()
+                            .all(|c| matches!(c, ContentBlock::ToolResult(_)))
+                });
+
+                if should_merge {
+                    // Merge into the previous message
+                    if let Some(prev) = merged.last_mut() {
+                        let mut combined = prev.content.clone();
+                        combined.extend(msg.content);
+                        *prev = MessageBuilder::default()
+                            .set_content(Some(combined))
+                            .set_role(Some(ConversationRole::User))
+                            .build()?;
+                    }
+                } else {
+                    merged.push(msg);
+                }
+            } else {
+                merged.push(msg);
+            }
+        }
+
+        Ok(merged)
     }
 
     /// Convert [`ChatCompletionRequestMessage`] that are [`ChatCompletionRequestMessage::System`] or [`ChatCompletionRequestMessage::Developer`] into the Bedrock equivalent [`SystemContentBlock`] format.
@@ -299,6 +349,43 @@ impl BedrockConverse {
             .collect()
     }
 
+    fn output_config(
+        response_format: Option<ResponseFormat>,
+    ) -> Result<Option<OutputConfig>, OpenAIError> {
+        match response_format {
+            Some(ResponseFormat::JsonObject) => Err(to_api_error(
+                "Bedrock does not support 'response_format.type: json_object', only 'json_schema'.",
+            )),
+            Some(ResponseFormat::JsonSchema {
+                json_schema:
+                    ResponseFormatJsonSchema {
+                        name,
+                        schema: Some(schema),
+                        description,
+                        strict: _,
+                    },
+            }) => Ok(Some(
+                OutputConfig::builder()
+                    .text_format(
+                        OutputFormat::builder()
+                            .r#type(OutputFormatType::JsonSchema)
+                            .structure(OutputFormatStructure::JsonSchema(
+                                JsonSchemaDefinition::builder()
+                                    .set_schema(Some(schema.to_string()))
+                                    .name(name)
+                                    .set_description(description)
+                                    .build()
+                                    .map_err(|e| to_api_error(e.to_string()))?,
+                            ))
+                            .build()
+                            .map_err(|e| to_api_error(e.to_string()))?,
+                    )
+                    .build(),
+            )),
+            _ => Ok(None),
+        }
+    }
+
     #[expect(clippy::cast_possible_wrap, deprecated)]
     fn inference_cfg(req: &CreateChatCompletionRequest) -> InferenceConfiguration {
         InferenceConfiguration::builder()
@@ -327,6 +414,7 @@ impl BedrockConverse {
             metadata,
             tool_choice,
             tools,
+            response_format,
             ..
         } = req;
 
@@ -361,6 +449,7 @@ impl BedrockConverse {
             .inference_config(inf_cfg)
             .set_system(Some(system))
             .set_guardrail_config(guardrails)
+            .set_output_config(Self::output_config(response_format)?)
             .set_tool_config(tool_config(tools, tool_choice));
 
         if let Some(metadata) = metadata {
@@ -386,6 +475,7 @@ impl BedrockConverse {
             metadata,
             tools,
             tool_choice,
+            response_format,
             ..
         } = req;
 
@@ -420,6 +510,7 @@ impl BedrockConverse {
             .inference_config(inf_cfg)
             .set_system(Some(system))
             .set_guardrail_config(guardrails)
+            .set_output_config(Self::output_config(response_format)?)
             .set_tool_config(tool_config(tools, tool_choice));
 
         if let Some(metadata) = metadata {

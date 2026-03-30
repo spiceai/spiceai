@@ -7,13 +7,6 @@ name: schema-test-tools
 # TOOLS
 # =============================================================================
 tools:
-  # Web search tool
-  - name: the_internet
-    from: websearch
-    description: "Search the web for information."
-    params:
-      engine: perplexity
-
   # Built-in tools
   - name: list_datasets
     from: builtin:list_datasets

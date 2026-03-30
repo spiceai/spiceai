@@ -81,10 +81,21 @@ pub enum Error {
 
     #[snafu(display("Failed to start a catalog refresh task. The task is already running."))]
     RefreshTaskAlreadyStarted {},
+
+    #[snafu(display(
+        "Failed to read partition metadata for table {schema_name}.{table_name}: {source}"
+    ))]
+    PartitionMetadataRead {
+        schema_name: String,
+        table_name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[cfg(feature = "adbc")]
+pub mod adbc;
 #[cfg(not(windows))]
 pub mod cayenne;
 #[cfg(feature = "databricks")]
@@ -249,6 +260,16 @@ pub async fn register_all() {
             cayenne::PARAMETERS,
         ),
     );
+
+    #[cfg(feature = "adbc")]
+    registry.insert(
+        adbc::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            adbc::AdbcCatalog::new_connector,
+            adbc::PREFIX,
+            adbc::PARAMETERS,
+        ),
+    );
 }
 
 pub async fn unregister_all() {
@@ -305,6 +326,25 @@ pub trait CatalogConnector: Send + Sync {
     fn initialization(&self) -> ComponentInitialization {
         ComponentInitialization::default()
     }
+}
+
+/// Trait for catalog providers that can report partition metadata labels for their tables.
+///
+/// Implementations read partition metadata from the catalog's own persistent storage,
+/// ensuring partition information survives runtime restarts.
+#[async_trait]
+pub trait PartitionAwareCatalog: Send + Sync {
+    /// Returns the partition metadata label for a table, if one was defined at creation time.
+    ///
+    /// The returned string is the partition column/label value as stored in catalog metadata
+    /// (e.g. `"region"` for `PARTITION BY region`).
+    ///
+    /// Returns `Ok(None)` only when no partition metadata is present.
+    async fn table_partition_expr(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<Option<String>>;
 }
 
 pub async fn get_catalog_provider(

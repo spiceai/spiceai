@@ -42,7 +42,6 @@ use std::{
     pin::Pin,
     str::FromStr,
     sync::Arc,
-    time::Duration,
 };
 use token_provider::TokenProvider;
 use util::{
@@ -65,6 +64,11 @@ pub enum Error {
 
     #[snafu(display("Unable to retrieve schema: {reason}"))]
     UnableToRetrieveSchema { reason: String },
+
+    #[snafu(display(
+        "The dataset '{dataset_name}' in Databricks has no columns. Verify the table exists and has at least one column."
+    ))]
+    NoColumnsInDataset { dataset_name: String },
 
     #[snafu(display(
         "Warehouse is not ready (state: '{state}'). Verify the warehouse state and try again later."
@@ -207,7 +211,7 @@ impl FromStr for ResponseStatus {
 
 struct SqlWarehouseApi {
     client: Client,
-    host: String,
+    base_url: String,
     sql_warehouse_id: String,
     token_provider: Arc<dyn TokenProvider>,
 }
@@ -225,7 +229,7 @@ impl SqlWarehouseApi {
 
         Ok(Self {
             client,
-            host: host.to_string(),
+            base_url: format!("https://{host}"),
             sql_warehouse_id: sql_warehouse_id.to_string(),
             token_provider,
         })
@@ -235,7 +239,8 @@ impl SqlWarehouseApi {
         let token = self.token_provider.get_token();
         let payload = self.create_schema_payload(table)?;
         let response = self.execute_sql_statement(&token, &payload).await?;
-        schema_from_json(&response)
+        let response = self.wait_for_statement_completion(&token, response).await?;
+        schema_from_json(&response, &table.to_string())
     }
 
     fn create_schema_payload(&self, table: &TableReference) -> Result<Value, Error> {
@@ -252,16 +257,22 @@ impl SqlWarehouseApi {
         let sql = format!(
             "SELECT column_name, full_data_type, is_nullable FROM information_schema.columns WHERE table_name = '{escaped_table}' AND table_schema = '{escaped_schema}' AND table_catalog = '{escaped_catalog}'"
         );
+        // Databricks SQL Statements API max wait_timeout is 50s.
+        // https://docs.databricks.com/api/workspace/statementexecution/executestatement
         Ok(json!({
             "warehouse_id": self.sql_warehouse_id,
             "catalog": table_catalog,
             "schema": table_schema,
             "statement": sql,
+            "format": "JSON_ARRAY",
+            "disposition": "INLINE",
+            "wait_timeout": "50s",
+            "on_wait_timeout": "CONTINUE",
         }))
     }
 
     async fn execute_sql_statement(&self, token: &str, payload: &Value) -> Result<Value, Error> {
-        let url = format!("https://{}/api/2.0/sql/statements/", self.host);
+        let url = format!("{}/api/2.0/sql/statements/", self.base_url);
         self.client
             .post(&url)
             .bearer_auth(token)
@@ -281,10 +292,7 @@ impl SqlWarehouseApi {
         token: &str,
         statement_id: &str,
     ) -> Result<Value, Error> {
-        let url = format!(
-            "https://{}/api/2.0/sql/statements/{statement_id}",
-            self.host
-        );
+        let url = format!("{}/api/2.0/sql/statements/{statement_id}", self.base_url);
         self.client
             .get(&url)
             .bearer_auth(token)
@@ -339,7 +347,7 @@ impl SqlWarehouseApi {
 
                 let next_link = match link.next_chunk_internal_link {
                     Some(path) => {
-                        let url = format!("https://{}{path}", api.host);
+                        let url = format!("{}{path}", api.base_url);
                         match api
                             .client
                             .get(&url)
@@ -499,6 +507,34 @@ impl SqlWarehouseApi {
         }
     }
 
+    /// Polls the statement status until it reaches a terminal state, with bounded retries.
+    async fn wait_for_statement_completion(
+        &self,
+        token: &str,
+        mut response: Value,
+    ) -> Result<Value, Error> {
+        let mut state = Self::extract_response_status(&response)?;
+        let statement_id = Self::extract_statement_id(&response)?;
+
+        let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(14)).build();
+        while Self::is_async_query(state) {
+            let Some(backoff_duration) = backoff.next_backoff() else {
+                break;
+            };
+            tokio::time::sleep(backoff_duration).await;
+            response = self.get_sql_statement_status(token, &statement_id).await?;
+            state = Self::extract_response_status(&response)?;
+        }
+
+        match state {
+            ResponseStatus::Pending => Err(Error::InvalidWarehouseState {
+                state: state.to_string(),
+            }),
+            ResponseStatus::Running => Err(Error::QueryStillRunning),
+            _ => Ok(response),
+        }
+    }
+
     fn extract_error_message(response: &Value) -> Option<String> {
         response
             .get("status")
@@ -517,7 +553,7 @@ struct ExternalLink {
     next_chunk_internal_link: Option<String>,
 }
 
-fn schema_from_json(json_value: &Value) -> Result<SchemaRef, Error> {
+fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef, Error> {
     tracing::trace!("Parsing schema definition from Databricks JSON response: {json_value}");
 
     SqlWarehouseApi::verify_response_status(json_value)?;
@@ -527,7 +563,10 @@ fn schema_from_json(json_value: &Value) -> Result<SchemaRef, Error> {
         .and_then(|r| r.get("data_array"))
         .and_then(|d| d.as_array())
         .ok_or_else(|| Error::UnableToRetrieveSchema {
-            reason: "result.data_array".to_string(),
+            reason: format!(
+                "The response for dataset '{dataset_name}' is missing 'result.data_array'. \
+                 Verify the table exists and the SQL warehouse is responding correctly."
+            ),
         })?;
 
     let mut fields = Vec::new();
@@ -573,12 +612,18 @@ fn schema_from_json(json_value: &Value) -> Result<SchemaRef, Error> {
             .as_str()
             .map(|s| s.to_lowercase() == "yes")
             .ok_or_else(|| Error::UnableToRetrieveSchema {
-                reason: format!("data_array[{i}][2] is not a boolean"),
+                reason: format!("data_array[{i}][2] is not a string"),
             })?;
 
         let field: Field = Field::new(col_name, data_type, nullable);
 
         fields.push(field);
+    }
+
+    if fields.is_empty() {
+        return Err(Error::NoColumnsInDataset {
+            dataset_name: dataset_name.to_string(),
+        });
     }
 
     Ok(Arc::new(Schema::new(fields)))
@@ -622,7 +667,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
             "warehouse_id": self.api.sql_warehouse_id,
             "format": "ARROW_STREAM",
             "disposition": "EXTERNAL_LINKS",
-            "wait_timeout": "30s",
+            "wait_timeout": "50s",
             "on_wait_timeout": "CONTINUE",
             "statement": query,
         });
@@ -691,33 +736,19 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
             "warehouse_id": self.api.sql_warehouse_id,
             "format": "ARROW_STREAM",
             "disposition": "EXTERNAL_LINKS",
-            "wait_timeout": "30s",
+            "wait_timeout": "50s",
             "on_wait_timeout": "CONTINUE",
             "statement": sql,
         });
 
-        let mut response = self.api.execute_sql_statement(&token, &payload).await?;
+        let response = self.api.execute_sql_statement(&token, &payload).await?;
 
         tracing::trace!("Parsing Databricks JSON response: {response}");
 
-        let mut state = SqlWarehouseApi::extract_response_status(&response)?;
-        let statement_id = SqlWarehouseApi::extract_statement_id(&response)?;
-
-        let mut backoff = FibonacciBackoffBuilder::new()
-            .max_duration(Some(Duration::from_secs(5)))
-            .build();
-        while SqlWarehouseApi::is_async_query(state) {
-            tracing::trace!("Query is still running (state: '{state}')");
-            let Some(backoff_duration) = backoff.next_backoff() else {
-                break;
-            };
-            tokio::time::sleep(backoff_duration).await;
-            response = self
-                .api
-                .get_sql_statement_status(&token, &statement_id)
-                .await?;
-            state = SqlWarehouseApi::extract_response_status(&response)?;
-        }
+        let mut response = self
+            .api
+            .wait_for_statement_completion(&token, response)
+            .await?;
 
         SqlWarehouseApi::verify_response_status(&response)?;
 
@@ -764,5 +795,677 @@ impl crate::Read for DatabricksSqlWarehouse {
                 .create_federated_table_provider()
                 .context(TableProviderCreationFailedSnafu)?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+    use serde_json::json;
+
+    /// Helper to create a valid Databricks schema response JSON.
+    fn make_schema_response(data_array: &Value) -> Value {
+        json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "test-stmt-id",
+            "result": { "data_array": data_array }
+        })
+    }
+
+    #[test]
+    fn test_schema_from_json_basic() {
+        let response = make_schema_response(&json!([
+            ["id", "int", "NO"],
+            ["name", "string", "YES"],
+            ["amount", "double", "NO"]
+        ]));
+
+        let schema = schema_from_json(&response, "test_table").expect("should parse schema");
+        assert_eq!(schema.fields().len(), 3);
+
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert!(!schema.field(0).is_nullable());
+
+        assert_eq!(schema.field(1).name(), "name");
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert!(schema.field(1).is_nullable());
+
+        assert_eq!(schema.field(2).name(), "amount");
+        assert_eq!(schema.field(2).data_type(), &DataType::Float64);
+        assert!(!schema.field(2).is_nullable());
+    }
+
+    #[test]
+    fn test_schema_from_json_many_types() {
+        let response = make_schema_response(&json!([
+            ["col_bigint", "bigint", "NO"],
+            ["col_smallint", "smallint", "YES"],
+            ["col_boolean", "boolean", "NO"],
+            ["col_float", "float", "YES"],
+            ["col_date", "date", "NO"],
+            ["col_timestamp", "timestamp", "YES"],
+            ["col_binary", "binary", "NO"],
+            ["col_decimal", "decimal(10,2)", "YES"]
+        ]));
+
+        let schema = schema_from_json(&response, "test_table").expect("should parse schema");
+        assert_eq!(schema.fields().len(), 8);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(1).data_type(), &DataType::Int16);
+        assert_eq!(schema.field(2).data_type(), &DataType::Boolean);
+        assert_eq!(schema.field(3).data_type(), &DataType::Float32);
+        assert_eq!(schema.field(4).data_type(), &DataType::Date32);
+        assert_eq!(
+            schema.field(5).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(6).data_type(), &DataType::Binary);
+        assert_eq!(schema.field(7).data_type(), &DataType::Decimal128(10, 2));
+    }
+
+    #[test]
+    fn test_schema_from_json_empty_table() {
+        let response = make_schema_response(&json!([]));
+
+        let err = schema_from_json(&response, "my_catalog.my_schema.my_table")
+            .expect_err("should fail on empty schema");
+        assert!(
+            matches!(&err, Error::NoColumnsInDataset { dataset_name } if dataset_name == "my_catalog.my_schema.my_table"),
+            "unexpected error: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my_catalog.my_schema.my_table"),
+            "error should contain dataset name: {msg}"
+        );
+        assert!(
+            msg.contains("has no columns"),
+            "error should mention no columns: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_stops_at_clustering_metadata() {
+        let response = make_schema_response(&json!([
+            ["id", "int", "NO"],
+            ["name", "string", "YES"],
+            ["# Clustering Information", "", ""],
+            ["# col_name", "data_type", "comment"]
+        ]));
+
+        let schema =
+            schema_from_json(&response, "test_table").expect("should stop at clustering marker");
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "name");
+    }
+
+    #[test]
+    fn test_schema_from_json_missing_result() {
+        let response = json!({
+            "status": { "state": "SUCCEEDED" }
+        });
+
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail without result");
+        assert!(
+            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("result.data_array") && reason.contains("test_table")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_missing_data_array() {
+        let response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "result": {}
+        });
+
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail without data_array");
+        assert!(
+            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("result.data_array") && reason.contains("test_table")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_data_array_not_array() {
+        let response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "result": { "data_array": "not_an_array" }
+        });
+
+        let err = schema_from_json(&response, "test_table")
+            .expect_err("should fail when data_array is string");
+        assert!(
+            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("result.data_array") && reason.contains("test_table")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_row_not_array() {
+        let response = make_schema_response(&json!(["not_an_array"]));
+
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail on non-array row");
+        assert!(
+            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("is not an array")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_row_too_short() {
+        let response = make_schema_response(&json!([["id", "int"]]));
+
+        let err = schema_from_json(&response, "test_table").expect_err("should fail on short row");
+        assert!(
+            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("lacks column_name")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_column_name_not_string() {
+        let response = make_schema_response(&json!([[123, "int", "NO"]]));
+
+        let err = schema_from_json(&response, "test_table")
+            .expect_err("should fail on non-string col name");
+        assert!(
+            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("[0] is not a string")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_data_type_not_string() {
+        let response = make_schema_response(&json!([["id", 42, "NO"]]));
+
+        let err = schema_from_json(&response, "test_table")
+            .expect_err("should fail on non-string data type");
+        assert!(
+            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("[1] is not a string")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_nullable_not_string() {
+        let response = make_schema_response(&json!([["id", "int", true]]));
+
+        let err = schema_from_json(&response, "test_table")
+            .expect_err("should fail on non-string nullable");
+        assert!(
+            matches!(&err, Error::UnableToRetrieveSchema { reason } if reason.contains("[2] is not a string")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_nullable_case_insensitive() {
+        let response = make_schema_response(&json!([
+            ["a", "int", "YES"],
+            ["b", "int", "Yes"],
+            ["c", "int", "yes"],
+            ["d", "int", "NO"],
+            ["e", "int", "No"],
+            ["f", "int", "no"],
+            ["g", "int", "anything_else"]
+        ]));
+
+        let schema =
+            schema_from_json(&response, "test_table").expect("should parse nullable variations");
+        assert!(schema.field(0).is_nullable());
+        assert!(schema.field(1).is_nullable());
+        assert!(schema.field(2).is_nullable());
+        assert!(!schema.field(3).is_nullable());
+        assert!(!schema.field(4).is_nullable());
+        assert!(!schema.field(5).is_nullable());
+        assert!(!schema.field(6).is_nullable());
+    }
+
+    #[test]
+    fn test_schema_from_json_failed_status() {
+        let response = json!({
+            "status": {
+                "state": "FAILED",
+                "error": { "message": "table not found" }
+            },
+            "statement_id": "test-stmt-id",
+            "result": { "data_array": [] }
+        });
+
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail on FAILED status");
+        assert!(
+            matches!(&err, Error::QueryFailure { message } if message.contains("table not found")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_pending_status() {
+        let response = json!({
+            "status": { "state": "PENDING" },
+            "statement_id": "test-stmt-id"
+        });
+
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail on PENDING status");
+        assert!(
+            matches!(&err, Error::InvalidWarehouseState { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_unsupported_type() {
+        let response = make_schema_response(&json!([["col", "TOTALLY_FAKE_TYPE", "NO"]]));
+
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail on unsupported type");
+        assert!(
+            matches!(&err, Error::ParseError { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_extra_columns_ignored() {
+        // Rows with more than 3 elements should still work (extra fields ignored)
+        let response =
+            make_schema_response(&json!([["id", "int", "NO", "extra_col", "another_extra"]]));
+
+        let schema =
+            schema_from_json(&response, "test_table").expect("should parse with extra columns");
+        assert_eq!(schema.fields().len(), 1);
+        assert_eq!(schema.field(0).name(), "id");
+    }
+
+    #[test]
+    fn test_schema_from_json_missing_status() {
+        let response = json!({
+            "result": { "data_array": [["id", "int", "NO"]] }
+        });
+
+        let err =
+            schema_from_json(&response, "test_table").expect_err("should fail without status");
+        assert!(
+            matches!(&err, Error::MissingJsonField { field } if field == "status.state"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_create_schema_payload_includes_inline_disposition() {
+        let api = SqlWarehouseApi::new(
+            "host.example.com",
+            "warehouse-123",
+            Arc::new(StaticTokenProvider("token".to_string())),
+        )
+        .expect("should create api");
+        let table = TableReference::full("my_catalog", "my_schema", "my_table");
+
+        let payload = api
+            .create_schema_payload(&table)
+            .expect("should create payload");
+
+        assert_eq!(payload["format"], "JSON_ARRAY");
+        assert_eq!(payload["disposition"], "INLINE");
+        assert_eq!(payload["wait_timeout"], "50s");
+        assert_eq!(payload["on_wait_timeout"], "CONTINUE");
+        assert_eq!(payload["warehouse_id"], "warehouse-123");
+        assert!(
+            payload["statement"]
+                .as_str()
+                .expect("statement should be string")
+                .contains("my_table"),
+            "statement should reference the table"
+        );
+    }
+
+    #[test]
+    fn test_create_schema_payload_missing_schema() {
+        let api = SqlWarehouseApi::new(
+            "host.example.com",
+            "wh-1",
+            Arc::new(StaticTokenProvider("t".to_string())),
+        )
+        .expect("should create api");
+        let table = TableReference::bare("just_table");
+
+        let err = api
+            .create_schema_payload(&table)
+            .expect_err("should fail without schema");
+        assert!(
+            matches!(&err, Error::FullyQualifiedPath { reason } if reason.contains("missing schema")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_create_schema_payload_missing_catalog() {
+        let api = SqlWarehouseApi::new(
+            "host.example.com",
+            "wh-1",
+            Arc::new(StaticTokenProvider("t".to_string())),
+        )
+        .expect("should create api");
+        let table = TableReference::partial("my_schema", "my_table");
+
+        let err = api
+            .create_schema_payload(&table)
+            .expect_err("should fail without catalog");
+        assert!(
+            matches!(&err, Error::FullyQualifiedPath { reason } if reason.contains("missing catalog")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_create_schema_payload_sql_injection_prevention() {
+        let api = SqlWarehouseApi::new(
+            "host.example.com",
+            "wh-1",
+            Arc::new(StaticTokenProvider("t".to_string())),
+        )
+        .expect("should create api");
+        let table = TableReference::full("cat'alog", "sch'ema", "tab'le");
+
+        let payload = api
+            .create_schema_payload(&table)
+            .expect("should create payload");
+        let stmt = payload["statement"]
+            .as_str()
+            .expect("statement should be string");
+
+        // Single quotes should be escaped as double single-quotes
+        assert!(stmt.contains("tab''le"), "table name not escaped: {stmt}");
+        assert!(stmt.contains("sch''ema"), "schema not escaped: {stmt}");
+        assert!(stmt.contains("cat''alog"), "catalog not escaped: {stmt}");
+        // Should NOT contain unescaped single quotes between the SQL string quotes
+        assert!(
+            !stmt.contains("tab'le"),
+            "unescaped table name found: {stmt}"
+        );
+    }
+
+    /// Simple test [`TokenProvider`] for unit tests.
+    #[derive(Debug)]
+    struct StaticTokenProvider(String);
+
+    impl TokenProvider for StaticTokenProvider {
+        fn get_token(&self) -> String {
+            self.0.clone()
+        }
+
+        fn dyn_hash(&self) -> String {
+            self.0.clone()
+        }
+    }
+
+    /// Starts a mock HTTP server that serves JSON responses in order.
+    /// Once the queue is exhausted, `default_response` is returned for all subsequent requests.
+    async fn start_mock_server(responses: Vec<Value>, default_response: Value) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind to a port");
+        let port = listener
+            .local_addr()
+            .expect("should have an address")
+            .port();
+        let responses = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from(
+            responses,
+        )));
+        let default = Arc::new(default_response);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let responses = Arc::clone(&responses);
+                let default = Arc::clone(&default);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+
+                    let response_json = {
+                        let mut q = responses.lock().await;
+                        q.pop_front().unwrap_or_else(|| (*default).clone())
+                    };
+
+                    let body =
+                        serde_json::to_string(&response_json).expect("should serialize response");
+                    let http_response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(http_response.as_bytes()).await;
+                });
+            }
+        });
+
+        port
+    }
+
+    fn create_test_api(port: u16) -> SqlWarehouseApi {
+        let client = ClientBuilder::new().build().expect("should build client");
+        SqlWarehouseApi {
+            client,
+            base_url: format!("http://127.0.0.1:{port}"),
+            sql_warehouse_id: "test-warehouse".to_string(),
+            token_provider: Arc::new(StaticTokenProvider("test-token".to_string())),
+        }
+    }
+
+    fn pending_response() -> Value {
+        json!({"status": {"state": "PENDING"}, "statement_id": "stmt-1"})
+    }
+
+    fn running_response() -> Value {
+        json!({"status": {"state": "RUNNING"}, "statement_id": "stmt-1"})
+    }
+
+    fn succeeded_response() -> Value {
+        json!({"status": {"state": "SUCCEEDED"}, "statement_id": "stmt-1", "result": {"data_array": []}})
+    }
+
+    fn failed_response() -> Value {
+        json!({"status": {"state": "FAILED"}, "statement_id": "stmt-1", "status": {"state": "FAILED", "error": {"message": "table not found"}}})
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_immediate_success() {
+        let port = start_mock_server(vec![], json!({})).await;
+        let api = create_test_api(port);
+
+        let result = api
+            .wait_for_statement_completion("token", succeeded_response())
+            .await;
+        let response = result.expect("SUCCEEDED should return Ok");
+        assert_eq!(response["status"]["state"], "SUCCEEDED");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_immediate_failed() {
+        let port = start_mock_server(vec![], json!({})).await;
+        let api = create_test_api(port);
+
+        let result = api
+            .wait_for_statement_completion("token", failed_response())
+            .await;
+        // FAILED is a terminal state — wait_for_statement_completion returns it as Ok
+        let response = result.expect("FAILED should return Ok (terminal state)");
+        assert_eq!(response["status"]["state"], "FAILED");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_immediate_canceled() {
+        let port = start_mock_server(vec![], json!({})).await;
+        let api = create_test_api(port);
+        let response = json!({"status": {"state": "CANCELED"}, "statement_id": "stmt-1"});
+
+        let result = api.wait_for_statement_completion("token", response).await;
+        let response = result.expect("CANCELED should return Ok (terminal state)");
+        assert_eq!(response["status"]["state"], "CANCELED");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_pending_then_success() {
+        let port = start_mock_server(vec![succeeded_response()], pending_response()).await;
+        let api = create_test_api(port);
+
+        let result = api
+            .wait_for_statement_completion("token", pending_response())
+            .await;
+        let response = result.expect("should eventually succeed");
+        assert_eq!(response["status"]["state"], "SUCCEEDED");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_running_then_success() {
+        let port = start_mock_server(vec![succeeded_response()], running_response()).await;
+        let api = create_test_api(port);
+
+        let result = api
+            .wait_for_statement_completion("token", running_response())
+            .await;
+        let response = result.expect("should eventually succeed");
+        assert_eq!(response["status"]["state"], "SUCCEEDED");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_exhaustion_pending() {
+        let port = start_mock_server(vec![], pending_response()).await;
+        let api = create_test_api(port);
+
+        let result = api
+            .wait_for_statement_completion("token", pending_response())
+            .await;
+        let err = result.expect_err("should fail after exhausting retries");
+        assert!(
+            matches!(&err, Error::InvalidWarehouseState { state } if state == "PENDING"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_exhaustion_running() {
+        let port = start_mock_server(vec![], running_response()).await;
+        let api = create_test_api(port);
+
+        let result = api
+            .wait_for_statement_completion("token", running_response())
+            .await;
+        let err = result.expect_err("should fail after exhausting retries");
+        assert!(
+            matches!(&err, Error::QueryStillRunning),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_missing_status() {
+        let port = start_mock_server(vec![], json!({})).await;
+        let api = create_test_api(port);
+        let response = json!({"statement_id": "stmt-1"});
+
+        let result = api.wait_for_statement_completion("token", response).await;
+        let err = result.expect_err("should fail on missing status");
+        assert!(
+            matches!(&err, Error::MissingJsonField { field } if field == "status.state"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_wait_for_completion_missing_statement_id() {
+        let port = start_mock_server(vec![], json!({})).await;
+        let api = create_test_api(port);
+        let response = json!({"status": {"state": "PENDING"}});
+
+        let result = api.wait_for_statement_completion("token", response).await;
+        let err = result.expect_err("should fail on missing statement_id");
+        assert!(
+            matches!(&err, Error::MissingJsonField { field } if field == "statement_id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_no_columns_error_includes_dataset_name() {
+        let response = make_schema_response(&json!([]));
+
+        let err = schema_from_json(&response, "my_catalog.my_schema.orders")
+            .expect_err("should fail when no columns");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("my_catalog.my_schema.orders"),
+            "error should contain the full dataset name: {msg}"
+        );
+        assert!(
+            msg.contains("has no columns"),
+            "error should mention 'has no columns': {msg}"
+        );
+        assert!(
+            msg.contains("Verify the table exists"),
+            "error should suggest verifying table existence: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_only_clustering_metadata_returns_no_columns_error() {
+        // When the data_array only contains clustering metadata markers,
+        // no real columns are parsed and we should get a NoColumnsInDataset error.
+        let response = make_schema_response(&json!([
+            ["# Clustering Information", "", ""],
+            ["# col_name", "data_type", "comment"]
+        ]));
+
+        let err = schema_from_json(&response, "test_table")
+            .expect_err("should fail when only clustering metadata present");
+        assert!(
+            matches!(&err, Error::NoColumnsInDataset { dataset_name } if dataset_name == "test_table"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_missing_result_error_is_actionable() {
+        let response = json!({
+            "status": { "state": "SUCCEEDED" }
+        });
+
+        let err = schema_from_json(&response, "catalog.schema.my_orders")
+            .expect_err("should fail without result");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("catalog.schema.my_orders"),
+            "error should contain dataset name: {msg}"
+        );
+        assert!(
+            msg.contains("Verify the table exists"),
+            "error should suggest verifying table: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_happy_path_with_dataset_name() {
+        // Ensure the dataset_name parameter doesn't affect successful parsing.
+        let response =
+            make_schema_response(&json!([["id", "int", "NO"], ["name", "string", "YES"]]));
+
+        let schema = schema_from_json(&response, "catalog.schema.users")
+            .expect("should parse schema successfully");
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "name");
     }
 }

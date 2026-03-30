@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use arrow::{
-    array::{ArrayRef, RecordBatch, StringArray},
+    array::{ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
     error::ArrowError,
 };
@@ -134,6 +134,7 @@ struct CachedResponse {
     detected_format: Option<String>,
     response_date: Option<SystemTime>,
     response_status: u16,
+    response_headers: Arc<Vec<(String, String)>>,
 }
 
 impl CachedResponse {
@@ -206,6 +207,7 @@ struct HttpFetchResult {
     detected_format: String,
     response_date: Option<SystemTime>,
     response_status: u16,
+    response_headers: Vec<(String, String)>,
 }
 
 impl HttpFetchResult {
@@ -435,6 +437,21 @@ impl HttpTableProvider {
             Field::new("content", DataType::Utf8, false),
             Field::new("response_status", DataType::UInt16, false),
             Field::new(
+                "response_headers",
+                DataType::Map(
+                    Arc::new(Field::new_struct(
+                        "entries",
+                        vec![
+                            Arc::new(Field::new("keys", DataType::Utf8, false)),
+                            Arc::new(Field::new("values", DataType::Utf8, true)),
+                        ],
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+            Field::new(
                 "fetched_at",
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
                 true,
@@ -653,6 +670,7 @@ impl HttpTableProvider {
             detected_format: Some(result.detected_format.clone()),
             response_date: result.response_date,
             response_status: result.response_status,
+            response_headers: Arc::new(result.response_headers.clone()),
         };
 
         let mut cache_write = self.cache.write().await;
@@ -787,6 +805,13 @@ impl HttpTableProvider {
                 httpdate::parse_http_date(date_str).ok()
             });
 
+        // Capture response headers before consuming the response body
+        let response_headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+
         let content = response
             .text()
             .await
@@ -806,6 +831,7 @@ impl HttpTableProvider {
             detected_format,
             response_date,
             response_status: status_code,
+            response_headers,
         })
     }
 
@@ -874,6 +900,7 @@ impl HttpTableProvider {
                 detected_format: cached_response.detected_format.clone().unwrap_or_default(),
                 response_date: cached_response.response_date,
                 response_status: cached_response.response_status,
+                response_headers: (*cached_response.response_headers).clone(),
             });
         }
 
@@ -1032,6 +1059,7 @@ impl HttpExec {
             content,
             response_date,
             response_status,
+            response_headers,
             ..
         } = result;
 
@@ -1093,6 +1121,27 @@ impl HttpExec {
                 "content" => Ok(Arc::new(StringArray::from(content_rows.clone())) as ArrayRef),
                 "response_status" => {
                     Ok(Arc::new(UInt16Array::from(vec![response_status; num_rows])) as ArrayRef)
+                }
+                "response_headers" => {
+                    let mut builder = MapBuilder::new(
+                        Some(MapFieldNames {
+                            entry: "entries".to_string(),
+                            key: "keys".to_string(),
+                            value: "values".to_string(),
+                        }),
+                        StringBuilder::new(),
+                        StringBuilder::new(),
+                    );
+                    for _ in 0..num_rows {
+                        for (k, v) in &response_headers {
+                            builder.keys().append_value(k);
+                            builder.values().append_value(v);
+                        }
+                        builder
+                            .append(true)
+                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                    }
+                    Ok(Arc::new(builder.finish()) as ArrayRef)
                 }
                 "fetched_at" => {
                     use arrow::array::TimestampNanosecondArray;
@@ -1575,11 +1624,13 @@ impl HttpTableProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::Column;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator, expr::InList};
     use datafusion::scalar::ScalarValue;
     use std::sync::Arc;
+    use std::time::Duration;
     use url::Url;
 
     fn base_provider() -> HttpTableProvider {
@@ -2076,20 +2127,25 @@ mod tests {
     fn test_base_table_schema() {
         let schema = HttpTableProvider::base_table_schema();
 
-        assert_eq!(schema.fields().len(), 6);
+        assert_eq!(schema.fields().len(), 7);
         assert_eq!(schema.field(0).name(), "request_path");
         assert_eq!(schema.field(1).name(), "request_query");
         assert_eq!(schema.field(2).name(), "request_body");
         assert_eq!(schema.field(3).name(), "content");
         assert_eq!(schema.field(4).name(), "response_status");
-        assert_eq!(schema.field(5).name(), "fetched_at");
+        assert_eq!(schema.field(5).name(), "response_headers");
+        assert_eq!(schema.field(6).name(), "fetched_at");
         assert_eq!(*schema.field(0).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(1).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(2).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(3).data_type(), DataType::Utf8);
         assert_eq!(*schema.field(4).data_type(), DataType::UInt16);
+        assert!(matches!(
+            schema.field(5).data_type(),
+            DataType::Map(_, false)
+        ));
         assert_eq!(
-            *schema.field(5).data_type(),
+            *schema.field(6).data_type(),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None)
         );
         assert!(!schema.field(0).is_nullable()); // request_path is not nullable
@@ -2097,7 +2153,74 @@ mod tests {
         assert!(schema.field(2).is_nullable()); // request_body is nullable
         assert!(!schema.field(3).is_nullable()); // content is not nullable
         assert!(!schema.field(4).is_nullable()); // response_status is not nullable
-        assert!(schema.field(5).is_nullable()); // fetched_at is nullable
+        assert!(schema.field(5).is_nullable()); // response_headers is nullable
+        assert!(schema.field(6).is_nullable()); // fetched_at is nullable
+    }
+
+    #[tokio::test]
+    async fn test_fetch_and_create_batch_includes_response_headers() {
+        let provider = Arc::new(base_provider());
+        let fetch_result = HttpFetchResult {
+            content: r#"[{"id":1},{"id":2}]"#.to_string(),
+            max_age: Duration::from_secs(60),
+            detected_format: "json".to_string(),
+            response_date: None,
+            response_status: 200,
+            response_headers: vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("x-request-id".to_string(), "req-123".to_string()),
+            ],
+        };
+        provider
+            .cache_response("/posts", None, None, &fetch_result)
+            .await;
+
+        let exec = HttpExec::new(
+            HttpTableProvider::base_table_schema().into(),
+            Arc::clone(&provider),
+            vec![(Some("/posts".to_string()), None, None)],
+            None,
+        );
+
+        let batch = exec
+            .fetch_and_create_batch(provider.as_ref(), 0)
+            .await
+            .expect("batch should be created from cached response");
+
+        assert_eq!(
+            batch.num_rows(),
+            2,
+            "JSON array content should yield two rows"
+        );
+
+        let headers_col = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<arrow::array::MapArray>()
+            .expect("response_headers should be a MapArray");
+        assert_eq!(headers_col.len(), 2);
+
+        let keys = headers_col
+            .keys()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("header keys should be a StringArray");
+        let values = headers_col
+            .values()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("header values should be a StringArray");
+
+        assert_eq!(keys.len(), 4);
+        assert_eq!(values.len(), 4);
+        assert_eq!(keys.value(0), "content-type");
+        assert_eq!(values.value(0), "application/json");
+        assert_eq!(keys.value(1), "x-request-id");
+        assert_eq!(values.value(1), "req-123");
+        assert_eq!(keys.value(2), "content-type");
+        assert_eq!(values.value(2), "application/json");
+        assert_eq!(keys.value(3), "x-request-id");
+        assert_eq!(values.value(3), "req-123");
     }
 
     #[test]

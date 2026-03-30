@@ -35,6 +35,21 @@ impl Dataset {
             return None;
         }
 
+        let known_metadata_columns: &[&str] = &[
+            MetadataColumn::LastModified.name(),
+            MetadataColumn::Location(None).name(),
+            MetadataColumn::Size.name(),
+        ];
+        for (key, value) in &self.metadata {
+            // Only check "enabled" values — metadata can also contain arbitrary user-defined entries (e.g. instructions).
+            if value == "enabled" && !known_metadata_columns.contains(&key.as_str()) {
+                tracing::warn!(
+                    "Dataset {}: '{key}: enabled' is not a recognized listing table metadata column and will be ignored. If this is a custom metadata entry, no action is needed. Otherwise, supported listing table metadata columns are: {known_metadata_columns:?}",
+                    self.name
+                );
+            }
+        }
+
         let mut columns = Vec::new();
 
         if self.metadata_column_enabled(MetadataColumn::LastModified.name(), schema)
@@ -106,9 +121,9 @@ mod tests {
 
     #[test]
     fn test_metadata_column_names() {
-        assert_eq!(MetadataColumn::LastModified.name(), "last_modified");
-        assert_eq!(MetadataColumn::Location(None).name(), "location");
-        assert_eq!(MetadataColumn::Size.name(), "size");
+        assert_eq!(MetadataColumn::LastModified.name(), "_last_modified");
+        assert_eq!(MetadataColumn::Location(None).name(), "_location");
+        assert_eq!(MetadataColumn::Size.name(), "_size");
     }
 
     #[tokio::test]
@@ -129,7 +144,7 @@ mod tests {
             .expect("to get dataset builder")
             .with_app(test_app())
             .with_runtime(test_runtime().await)
-            .with_time_column("last_modified".to_string())
+            .with_time_column("_last_modified".to_string())
             .build()
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
@@ -155,7 +170,7 @@ mod tests {
             .expect("to get dataset builder")
             .with_app(test_app())
             .with_runtime(test_runtime().await)
-            .with_time_partition_column("last_modified".to_string())
+            .with_time_partition_column("_last_modified".to_string())
             .build()
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
@@ -240,7 +255,7 @@ mod tests {
             .expect("to get dataset builder")
             .with_app(test_app())
             .with_runtime(test_runtime().await)
-            .with_time_column("last_modified".to_string())
+            .with_time_column("_last_modified".to_string())
             .build()
             .expect("to build dataset");
         let schema = Schema::new(vec![Field::new("test", DataType::Utf8, false)]);
@@ -416,7 +431,7 @@ mod tests {
             .expect("to get dataset builder")
             .with_app(test_app())
             .with_runtime(test_runtime().await)
-            .with_time_column("last_modified".to_string())
+            .with_time_column("_last_modified".to_string())
             .with_metadata(HashMap::from([
                 (
                     MetadataColumn::Location(None).name().to_string(),
@@ -475,7 +490,7 @@ mod tests {
             .expect("to get dataset builder")
             .with_app(test_app())
             .with_runtime(test_runtime().await)
-            .with_time_column("last_modified".to_string())
+            .with_time_column("_last_modified".to_string())
             .with_metadata(HashMap::from([(
                 MetadataColumn::LastModified.name().to_string(),
                 "disabled".to_string(),
@@ -496,7 +511,7 @@ mod tests {
             .expect("to get dataset builder")
             .with_app(test_app())
             .with_runtime(test_runtime().await)
-            .with_time_column("last_modified".to_string())
+            .with_time_column("_last_modified".to_string())
             .build()
             .expect("to build dataset");
         let schema = Schema::new(vec![

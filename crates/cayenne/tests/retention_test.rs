@@ -90,7 +90,7 @@ async fn test_retention_filters_apply_on_insert_impl(
     // Retention should have created a delete file containing row IDs 0 and 1.
     let delete_files = table_provider
         .catalog()
-        .get_table_delete_files(table_provider.metadata().table_id)
+        .get_table_delete_files(&table_provider.metadata().table_id)
         .await?;
     assert_eq!(
         delete_files.len(),
@@ -195,7 +195,7 @@ async fn test_retention_filters_skip_when_no_matches_impl(
     // No delete files should have been created.
     let delete_files = table_provider
         .catalog()
-        .get_table_delete_files(table_provider.metadata().table_id)
+        .get_table_delete_files(&table_provider.metadata().table_id)
         .await?;
     assert!(
         delete_files.is_empty(),

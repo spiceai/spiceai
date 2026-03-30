@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
 expression: resp?
-snapshot_kind: text
 ---
 [
   {
@@ -9,7 +8,7 @@ snapshot_kind: text
     "answer": "1. Perform the division: \\(4 \\div 10 = 0.4\\).  \n2. The decimal \\(0.4\\) is expressed in words as \\(\\boxed{\\text{four tenths}}\\).",
     "question": "Perform the division \\(4 \\div 10\\) and express the resulting decimal in words.",
     "subject": "math",
-    "_score": 0.793
+    "_score": 0.796
   },
   {
     "id": 349,
@@ -23,7 +22,7 @@ snapshot_kind: text
     "answer": "The fifth root of 32 is \\(\\boxed{2}\\), because \\(2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\).",
     "question": "What is the fifth root of 32?",
     "subject": "math",
-    "_score": 0.556
+    "_score": 0.557
   },
   {
     "id": 1277,

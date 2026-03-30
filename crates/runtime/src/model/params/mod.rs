@@ -22,7 +22,6 @@ pub mod file;
 pub mod google;
 pub mod huggingface;
 pub mod openai;
-pub mod perplexity;
 pub mod xai;
 
 use spicepod::component::model::ModelSource;
@@ -43,7 +42,6 @@ pub fn get_params_spec(source: &ModelSource) -> Option<&'static [ParameterSpec]>
         ModelSource::Databricks => Some(databricks::PARAMETERS),
         ModelSource::HuggingFace => Some(huggingface::PARAMETERS),
         ModelSource::Anthropic => Some(anthropic::PARAMETERS),
-        ModelSource::Perplexity => Some(perplexity::PARAMETERS),
         ModelSource::Xai => Some(xai::PARAMETERS),
         ModelSource::Bedrock => Some(bedrock::PARAMETERS),
         ModelSource::SpiceAI => None,

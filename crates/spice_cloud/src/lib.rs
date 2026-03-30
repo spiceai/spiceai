@@ -113,7 +113,7 @@ impl SpiceExtension {
         self.manifest
             .params
             .get("metrics")
-            .map_or_else(|| false, |v| v.eq_ignore_ascii_case("true"))
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
     }
 
     fn spice_http_url(&self) -> String {

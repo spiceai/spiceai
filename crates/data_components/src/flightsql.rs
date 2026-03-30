@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::sql_expr::to_sql_preserving_precedence;
 use arrow::{
     array::{Array, RecordBatch, array},
     compute::cast,
@@ -394,8 +395,12 @@ impl TableProvider for FlightSQLTable {
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
         let mut filter_push_down = vec![];
         for filter in filters {
-            match expr::to_sql(filter) {
-                Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
+            match to_sql_preserving_precedence(filter) {
+                Ok(_) => {
+                    // Keep remote filtering for performance, but mark it inexact so
+                    // DataFusion re-applies the predicate locally for correctness.
+                    filter_push_down.push(TableProviderFilterPushDown::Inexact);
+                }
                 Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
             }
         }
@@ -472,7 +477,15 @@ impl FlightSqlExec {
             let filter_expr = self
                 .filters
                 .iter()
-                .map(expr::to_sql)
+                .map(|f| {
+                    to_sql_preserving_precedence(f).map(|sql| {
+                        // Wrap each top-level filter in parentheses to preserve semantics when
+                        // joining with AND, and recursively parenthesize nested binary
+                        // expressions so mixed AND/OR trees inside a single filter keep the
+                        // original DataFusion meaning.
+                        format!("({sql})")
+                    })
+                })
                 .collect::<expr::Result<Vec<_>>>()
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))

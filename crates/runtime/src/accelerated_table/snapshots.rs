@@ -86,7 +86,9 @@ pub fn spawn_snapshot_interval_task(
                     if elapsed >= interval_duration {
                         Duration::ZERO
                     } else {
-                        interval_duration - elapsed
+                        interval_duration
+                            .checked_sub(elapsed)
+                            .unwrap_or(Duration::ZERO)
                     }
                 }
                 Ok(None) | Err(_) => Duration::ZERO,

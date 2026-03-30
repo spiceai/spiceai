@@ -19,10 +19,12 @@ limitations under the License.
 //! This crate provides a typed wrapper around [`object_store::ObjectStore`] that uses
 //! conditional writes (ETags/If-Match headers) to detect concurrent modifications.
 
+pub mod local_conditional_put;
 mod state;
 
 use snafu::Snafu;
 
+pub use local_conditional_put::LocalConditionalPut;
 pub use state::{InsertResult, ObjectState, UpdateResult, WriteResult};
 
 /// Errors that can occur during object state operations.

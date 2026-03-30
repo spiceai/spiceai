@@ -6,6 +6,12 @@ Spice.ai acknowledges the following open source projects for making this project
 
 ## Rust Crates
 
+- adbc_core 0.21.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-adbc
+
+- adbc_driver_manager 0.21.0, Apache-2.0 
+  <br/>https://github.com/apache/arrow-adbc
+
 - aegis 0.9.7, MIT 
   <br/>https://github.com/jedisct1/rust-aegis
 
@@ -117,16 +123,16 @@ Spice.ai acknowledges the following open source projects for making this project
 - aws-sdk-sts 1.99.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-smithy-async 1.2.13, Apache-2.0 
+- aws-smithy-async 1.2.14, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
 - aws-smithy-runtime 1.10.2, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-smithy-runtime-api 1.11.5, Apache-2.0 
+- aws-smithy-runtime-api 1.11.6, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-smithy-types 1.4.5, Apache-2.0 
+- aws-smithy-types 1.4.6, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
 - axum 0.8.8, MIT 
@@ -324,22 +330,22 @@ Spice.ai acknowledges the following open source projects for making this project
 - dashmap 6.1.0, MIT 
   <br/>https://github.com/xacrimon/dashmap
 
-- datafusion 52.2.0, Apache-2.0 
+- datafusion 52.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-catalog 52.2.0, Apache-2.0 
+- datafusion-catalog 52.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-common 52.2.0, Apache-2.0 
+- datafusion-common 52.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-datasource 52.2.0, Apache-2.0 
+- datafusion-datasource 52.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-execution 52.2.0, Apache-2.0 
+- datafusion-execution 52.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-expr 52.2.0, Apache-2.0 
+- datafusion-expr 52.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
 - datafusion-federation 0.4.2, Apache-2.0 
@@ -348,16 +354,16 @@ Spice.ai acknowledges the following open source projects for making this project
 - datafusion-functions-json 0.52.0, Apache-2.0 
   <br/>https://github.com/datafusion-contrib/datafusion-functions-json/
 
-- datafusion-physical-expr 52.2.0, Apache-2.0 
+- datafusion-physical-expr 52.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-physical-plan 52.2.0, Apache-2.0 
+- datafusion-physical-plan 52.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-proto 52.2.0, Apache-2.0 
+- datafusion-proto 52.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-spark 52.2.0, Apache-2.0 
+- datafusion-spark 52.3.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
 - datafusion-table-providers 0.1.0, Apache-2.0 
@@ -390,12 +396,6 @@ Spice.ai acknowledges the following open source projects for making this project
 - either 1.15.0, Apache-2.0 OR MIT 
   <br/>https://github.com/rayon-rs/either
 
-- env_logger 0.11.8, Apache-2.0 OR MIT 
-  <br/>https://github.com/rust-cli/env_logger
-
-- evalconverter 0.1.0, Apache-2.0 
-  <br/>
-
 - flate2 1.1.9, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/flate2-rs
 
@@ -408,7 +408,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - gethostname 1.1.0, Apache-2.0 
   <br/>https://codeberg.org/swsnr/gethostname.rs.git
 
-- git2 0.20.3, Apache-2.0 OR MIT 
+- git2 0.20.4, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/git2-rs
 
 - globset 0.4.18, MIT OR Unlicense 
@@ -495,10 +495,10 @@ Spice.ai acknowledges the following open source projects for making this project
 - indicatif 0.17.11, MIT 
   <br/>https://github.com/console-rs/indicatif
 
-- indicatif 0.18.3, MIT 
+- indicatif 0.18.4, MIT 
   <br/>https://github.com/console-rs/indicatif
 
-- insta 1.46.1, Apache-2.0 
+- insta 1.46.3, Apache-2.0 
   <br/>https://github.com/mitsuhiko/insta
 
 - itertools 0.10.5, Apache-2.0 OR MIT 
@@ -696,7 +696,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - rdkafka 0.39.0, MIT 
   <br/>https://github.com/fede1024/rust-rdkafka
 
-- regex 1.12.2, Apache-2.0 OR MIT 
+- regex 1.12.3, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/regex
 
 - reqwest 0.12.24, Apache-2.0 OR MIT 
@@ -750,7 +750,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - schemars 0.9.0, MIT 
   <br/>https://github.com/GREsau/schemars
 
-- schemars 1.2.0, MIT 
+- schemars 1.2.1, MIT 
   <br/>https://github.com/GREsau/schemars
 
 - scopeguard 1.2.0, Apache-2.0 OR MIT 
@@ -927,7 +927,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - tract-onnx 0.22.0, Apache-2.0 OR MIT 
   <br/>https://github.com/snipsco/tract
 
-- turso 0.4.4, MIT 
+- turso 0.5.1, MIT 
   <br/>https://github.com/tursodatabase/turso
 
 - twox-hash 2.1.2, MIT 

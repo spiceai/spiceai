@@ -109,15 +109,6 @@ static TEST_MODEL_CREATORS: LazyLock<Vec<(&'static str, AsyncModelCreator)>> = L
                     })
                 }),
             ),
-            (
-                "perplexity",
-                Box::new(|| {
-                    Box::pin(async {
-                        create::create_perplexity()
-                            .map_err(|e| anyhow::anyhow!("failed to create perplexity model: {e}"))
-                    })
-                }),
-            ),
         ]
     },
 );
@@ -234,7 +225,6 @@ async fn test_basic(
         "local_phi3",
         "hf_phi3",
         "bedrock",
-        "perplexity",
         "google"
     )]
     model_name: &str,
@@ -275,7 +265,6 @@ async fn test_usage(
         "local_phi3",
         "hf_phi3",
         "bedrock",
-        "perplexity",
         "google"
     )]
     model_name: &str,

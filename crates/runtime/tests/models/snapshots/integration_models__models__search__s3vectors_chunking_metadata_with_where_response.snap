@@ -6,7 +6,7 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": 0.34,
+      "_score": "0.34",
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -18,7 +18,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.3,
+      "_score": "0.30",
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -30,19 +30,7 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": 0.29,
-      "dataset": "qs",
-      "matches": {
-        "answer": [
-          " Late recurrences can occur beyond 10 years, so patients requir"
-        ]
-      },
-      "primary_key": {
-        "id": 551
-      }
-    },
-    {
-      "_score": 0.29,
+      "_score": "0.29",
       "dataset": "qs",
       "matches": {
         "answer": [
@@ -51,6 +39,18 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 1035
+      }
+    },
+    {
+      "_score": "0.28",
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          " Late recurrences can occur beyond 10 years, so patients requir"
+        ]
+      },
+      "primary_key": {
+        "id": 551
       }
     }
   ]

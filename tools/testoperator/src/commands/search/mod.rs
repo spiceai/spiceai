@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 mod mteb_quora;
-use super::get_app_and_start_request;
+use super::{duration_millis_between, get_app_and_start_request};
 use crate::{args::SearchTestArgs, health::HealthMonitor, wait_test_and_memory};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 use test_framework::{
     TestType, anyhow,
     app::App,
@@ -60,7 +60,7 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
         }
     }
 
-    let started_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let started_at = Instant::now();
 
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
     let memory_token = CancellationToken::new();
@@ -101,7 +101,7 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
 
     let health_monitor = HealthMonitor::spawn()?;
 
-    let index_finished_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let index_finished_at = Instant::now();
 
     // Allow Spicepod traces to be fully printed before running the test
     sleep(Duration::from_millis(200)).await;
@@ -114,7 +114,7 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     // retrieve query relevance data
     let qrels = mteb_quora::get_query_relevance_data(&spiced_instance).await?;
 
-    let search_started_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let search_started_at = Instant::now();
 
     let vector_test = SpiceTest::new(
         app.name.clone(),
@@ -126,7 +126,7 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     .start()?;
 
     let test = wait_test_and_memory!(vector_test, memory_token, memory_readings);
-    let finished_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let finished_at = Instant::now();
 
     println!("Search requests completed, calculating results...");
 
@@ -146,14 +146,11 @@ pub(crate) async fn run(args: &SearchTestArgs) -> anyhow::Result<()> {
     metrics.with_memory_usage(max_memory).show_run(None)?; // no additional test pass logic applies
 
     // Record benchmark results
-    crate::metrics::TEST_DURATION
-        .record(u64::try_from((finished_at - started_at).as_millis())?, &[]);
-    crate::metrics::VECTOR_INDEX_CREATION_DURATION.record(
-        u64::try_from((index_finished_at - started_at).as_millis())?,
-        &[],
-    );
+    crate::metrics::TEST_DURATION.record(duration_millis_between(finished_at, started_at)?, &[]);
+    crate::metrics::VECTOR_INDEX_CREATION_DURATION
+        .record(duration_millis_between(index_finished_at, started_at)?, &[]);
     crate::metrics::SEARCH_DURATION.record(
-        u64::try_from((finished_at - search_started_at).as_millis())?,
+        duration_millis_between(finished_at, search_started_at)?,
         &[],
     );
 

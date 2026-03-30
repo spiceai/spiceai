@@ -793,6 +793,14 @@ impl TableProvider for IndexedMemTable {
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
         self.inner.get_column_default(column)
     }
+
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.inner.delete_from(state, filters).await
+    }
 }
 
 #[async_trait]
@@ -957,20 +965,6 @@ impl ExecutionPlan for IndexedLookupExec {
 
     fn metrics(&self) -> Option<datafusion::physical_plan::metrics::MetricsSet> {
         Some(self.metrics.clone_inner())
-    }
-}
-
-// Implement DeletionTableProvider by delegating to inner MemTable
-#[async_trait]
-impl crate::delete::DeletionTableProvider for IndexedMemTable {
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: &[Expr],
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Delegate deletion to inner MemTable
-        // Note: Index should be updated after deletion
-        crate::delete::DeletionTableProvider::delete_from(&self.inner, state, filters).await
     }
 }
 
@@ -2385,7 +2379,6 @@ mod tests {
 
     /// Test `PrimaryKeyValue::matches_batch` for all supported types.
     #[test]
-    #[ignore = "https://github.com/spiceai/spiceai/issues/8961"]
     fn test_primary_key_value_matches_batch() {
         // Test Int64
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));

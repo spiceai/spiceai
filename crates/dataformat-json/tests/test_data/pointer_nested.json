@@ -1,0 +1,13 @@
+{
+  "api_version": "2.0",
+  "response": {
+    "metadata": {
+      "request_id": "abc-123"
+    },
+    "items": [
+      {"id": 1, "name": "first"},
+      {"id": 2, "name": "second"},
+      {"id": 3, "name": "third"}
+    ]
+  }
+}

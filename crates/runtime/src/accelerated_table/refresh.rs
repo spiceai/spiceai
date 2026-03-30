@@ -455,9 +455,11 @@ impl Refresh {
             } else {
                 match refresh_on_startup {
                     // The elapsed time since the last checkpoint is less than the refresh interval, so we need to wait for the refresh interval to pass.
-                    RefreshOnStartup::Auto => {
-                        NextRefresh::WaitFor(check_interval - elapsed_time_since_checkpoint)
-                    }
+                    RefreshOnStartup::Auto => NextRefresh::WaitFor(
+                        check_interval
+                            .checked_sub(elapsed_time_since_checkpoint)
+                            .unwrap_or(Duration::ZERO),
+                    ),
                     // The refresh mode is `Always`, so we need to refresh now.
                     RefreshOnStartup::Always => NextRefresh::WaitFor(Duration::ZERO),
                 }

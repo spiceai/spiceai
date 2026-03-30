@@ -36,6 +36,7 @@ pub struct GraphQLClientBuilder {
     rate_limiter: Option<Arc<dyn RateLimiter>>,
     rate_controller: Option<Arc<RateController>>,
     semaphore: Option<Arc<Semaphore>>,
+    auth_header: Option<reqwest::header::HeaderName>,
 }
 
 impl GraphQLClientBuilder {
@@ -52,6 +53,7 @@ impl GraphQLClientBuilder {
             rate_limiter: None,
             rate_controller: None,
             semaphore: None,
+            auth_header: None,
         }
     }
 
@@ -103,6 +105,12 @@ impl GraphQLClientBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_auth_header(mut self, auth_header: Option<reqwest::header::HeaderName>) -> Self {
+        self.auth_header = auth_header;
+        self
+    }
+
     pub fn build(self, client: reqwest::Client) -> Result<GraphQLClient> {
         GraphQLClient::new(
             client,
@@ -116,6 +124,7 @@ impl GraphQLClientBuilder {
             self.rate_limiter,
             self.rate_controller,
             self.semaphore,
+            self.auth_header,
         )
     }
 }

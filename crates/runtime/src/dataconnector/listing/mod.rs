@@ -55,11 +55,20 @@ pub const LISTING_TABLE_PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("schema_source_path")
         .description("Specify a path to use for schema inference."),
     ParameterSpec::runtime("json_format")
-        .description("jsonl | ndjson | ldjson | array. Defaults to jsonl.")
-        .one_of(&["jsonl", "ndjson", "ldjson", "array"]),
+        .description("json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. When 'file_format' is explicitly 'json', effective default is 'json' (no SODA auto-detection).")
+        .default("auto")
+        .one_of(&["json", "jsonl", "ndjson", "ldjson", "array", "object", "soda", "socrata", "auto"]),
+    ParameterSpec::runtime("json_pointer")
+        .description("An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing."),
+    ParameterSpec::runtime("json_path")
+        .description("Alias for 'json_pointer'. An RFC 6901 JSON Pointer to extract data from within a JSON value."),
     ParameterSpec::runtime("flatten_json")
         .description("Set true to flatten nested structs in JSON as separate columns.")
         .is_boolean(),
+    ParameterSpec::runtime("soda_metadata")
+        .description("Set to 'enabled' to include Socrata internal metadata columns (sid, id, position, etc.) in the schema for SODA format responses. Defaults to disabled.")
+        .default("disabled")
+        .one_of(&["enabled", "disabled"]),
     ParameterSpec::runtime("refresh_skip")
         .description("Control skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Set to 'enabled' (default) or 'disabled'.")
         .default("enabled")

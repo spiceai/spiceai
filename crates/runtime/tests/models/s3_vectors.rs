@@ -903,23 +903,26 @@ pub(crate) mod search {
         index_name: &str,
         predelete_index: bool,
     ) -> Result<VectorStore, anyhow::Error> {
-        let params = spicepod::param::Params::from_string_map(
-            vec![
-                ("s3_vectors_aws_region".to_string(), "us-east-2".to_string()),
-                ("s3_vectors_bucket".to_string(), bucket_name.to_string()),
-                ("s3_vectors_index".to_string(), index_name.to_string()),
-                (
-                    "s3_vectors_aws_access_key_id".to_string(),
-                    "${env:AWS_S3_VECTORS_KEY}".to_string(),
-                ),
-                (
-                    "s3_vectors_aws_secret_access_key".to_string(),
-                    "${env:AWS_S3_VECTORS_SECRET}".to_string(),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        );
+        let mut param_map = vec![
+            ("s3_vectors_aws_region".to_string(), "us-east-2".to_string()),
+            ("s3_vectors_bucket".to_string(), bucket_name.to_string()),
+            ("s3_vectors_index".to_string(), index_name.to_string()),
+            (
+                "s3_vectors_aws_access_key_id".to_string(),
+                "${env:AWS_S3_VECTORS_KEY}".to_string(),
+            ),
+            (
+                "s3_vectors_aws_secret_access_key".to_string(),
+                "${env:AWS_S3_VECTORS_SECRET}".to_string(),
+            ),
+        ];
+        if std::env::var("AWS_SESSION_TOKEN").is_ok() {
+            param_map.push((
+                "s3_vectors_aws_session_token".to_string(),
+                "${env:AWS_SESSION_TOKEN}".to_string(),
+            ));
+        }
+        let params = spicepod::param::Params::from_string_map(param_map.into_iter().collect());
 
         let store = VectorStore {
             enabled: true,
@@ -1038,7 +1041,7 @@ async fn delete_index(
             std::env::var("AWS_S3_VECTORS_SECRET")
                 .ok()
                 .unwrap_or_default(),
-            None,
+            std::env::var("AWS_SESSION_TOKEN").ok(),
             None,
             "S3Vectors",
         ))

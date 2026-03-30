@@ -36,6 +36,8 @@ pub mod arrow;
 #[cfg(feature = "datafusion")]
 pub mod expr;
 #[cfg(feature = "datafusion")]
+pub mod session_state;
+#[cfg(feature = "datafusion")]
 pub mod stream_utils;
 pub mod time_format;
 #[cfg(feature = "datafusion")]
@@ -109,7 +111,7 @@ pub fn pretty_print_number(num: usize) -> String {
 /// ```
 #[must_use]
 pub fn parse_enabled(value: &str) -> bool {
-    value.to_lowercase() == "enabled"
+    value.eq_ignore_ascii_case("enabled")
 }
 
 pub async fn shutdown_signal() {

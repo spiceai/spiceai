@@ -20,6 +20,7 @@ use ::tools::rename::with_name;
 use async_stream::stream;
 use datafusion_expr::Expr;
 use init::scheduler::ScheduleRegistry;
+use spicepod::component::runtime::TelemetryConfig;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::future::Future;
@@ -38,11 +39,8 @@ use worker::WorkerRegistry;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::datafusion::DataFusion;
 use crate::datafusion::error::format_datafusion_error;
-use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::LLMResponsesModelStore;
-use crate::{
-    auth::EndpointAuth, dataconnector::DataConnector, internal_table::Error as InternalTableError,
-};
+use crate::{auth::EndpointAuth, dataconnector::DataConnector};
 
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{TableReference, sqlparser};
@@ -64,13 +62,12 @@ use futures::{
 };
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
-use model::{EmbeddingModelStore, EvalScorerRegistry, LLMChatCompletionsModelStore};
+use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use snafu::prelude::*;
-use spicepod::component::eval::Eval;
 use status::ComponentStatus;
 use tls::TlsConfig;
 
@@ -335,9 +332,6 @@ pub enum Error {
     #[snafu(display("Unable to create metrics table: {}", format_datafusion_error(source)))]
     UnableToCreateMetricsTable { source: DataFusionError },
 
-    #[snafu(display("Unable to create eval runs table: {source}"))]
-    UnableToCreateEvalRunsTable { source: InternalTableError },
-
     #[snafu(display("Unable to register metrics table: {source}"))]
     UnableToRegisterMetricsTable { source: datafusion::Error },
 
@@ -486,8 +480,6 @@ pub struct Runtime {
     workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
     tool_factories: Arc<Mutex<HashMap<String, ToolFactory>>>,
-    evals: Arc<RwLock<Vec<Eval>>>,
-    eval_scorers: EvalScorerRegistry,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     secrets: Arc<RwLock<secrets::Secrets>>,
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
@@ -515,6 +507,12 @@ pub struct Runtime {
     resource_monitor: resource_monitor::ResourceMonitor,
 
     config: Arc<Config>,
+
+    /// Handle for resolving the spicepod `TelemetryConfig` for anonymous
+    /// telemetry. For executors this is set after the app definition is
+    /// fetched from the scheduler; for all other modes it is set before
+    /// the runtime starts.
+    telemetry_config: Option<Arc<tokio::sync::SetOnce<TelemetryConfig>>>,
 }
 
 impl Debug for Runtime {
@@ -543,6 +541,11 @@ impl Runtime {
     #[must_use]
     pub fn config(&self) -> Arc<Config> {
         Arc::clone(&self.config)
+    }
+
+    #[must_use]
+    pub fn flight_write_rate_limit_enabled(&self) -> bool {
+        self.rate_limits.flight_write_enabled()
     }
 
     #[must_use]
@@ -1242,7 +1245,7 @@ impl Runtime {
             }
         });
 
-        let models_and_evals = tokio::spawn({
+        let models = tokio::spawn({
             let self_clone = Arc::clone(&self);
 
             // This cannot be done earlier since we must have a `Arc<Runtime>` to provide to factories.
@@ -1250,33 +1253,10 @@ impl Runtime {
 
             async move {
                 Arc::clone(&self_clone).load_models().await;
-                let app_ref = Arc::clone(&self_clone).app();
-                let app_lock = app_ref.read().await;
-
-                if !cfg!(feature = "models")
-                    && app_lock.as_ref().is_some_and(|s| !s.evals.is_empty())
-                {
-                    tracing::error!(
-                        "Cannot load evals without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}"
-                    );
-                }
 
                 #[cfg(feature = "models")]
                 {
                     Arc::clone(&self_clone).load_workers().await;
-                    let an_eval_exists = app_lock.as_ref().is_some_and(|app| !app.evals.is_empty());
-                    if an_eval_exists {
-                        let () = self_clone.verify_evals().await;
-                        drop(app_lock);
-                        self_clone.load_eval_scorer().await;
-                        if let Err(err) = self_clone.load_eval_tables().await {
-                            tracing::warn!("Failed to create internal eval tables: {err}");
-                        }
-                    } else {
-                        tracing::trace!(
-                            "No eval spice components defined. Therefore not loading eval tables into database."
-                        );
-                    }
                 }
             }
         });
@@ -1298,7 +1278,7 @@ impl Runtime {
             Arc::new(ListUDFTableFunc::new(Arc::clone(ctx))),
         );
 
-        let components = vec![task_history, datasets, catalogs, models_and_evals];
+        let components = vec![task_history, datasets, catalogs, models];
 
         // Signal that the load must be canceled if the runtime is shut down before the components are loaded
         let cancel_loading = CancellationToken::new();

@@ -95,8 +95,6 @@ runs:
     - name: Setup Rust
       if: inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')
       uses: ./.github/actions/setup-rust
-      with:
-        os: ${{ steps.detect-os.outputs.os }}
 
     - name: Setup cc
       if: (inputs.force_rebuild == 'true' || (steps.minio-download.outputs.found != 'true' && steps.cache-validator.outputs.cache-hit != 'true')) && steps.detect-os.outputs.os == 'linux'

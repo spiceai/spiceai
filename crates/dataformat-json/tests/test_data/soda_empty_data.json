@@ -1,0 +1,12 @@
+{
+  "meta": {
+    "view": {
+      "columns": [
+        {"fieldName": ":sid", "dataTypeName": "meta_data"},
+        {"fieldName": "name", "dataTypeName": "text"},
+        {"fieldName": "value", "dataTypeName": "number"}
+      ]
+    }
+  },
+  "data": []
+}

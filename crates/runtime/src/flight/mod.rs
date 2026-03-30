@@ -53,6 +53,7 @@ use snafu::prelude::*;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tokio::sync::broadcast::Sender;
 use tokio_util::sync::CancellationToken;
@@ -537,6 +538,7 @@ pub async fn start(
 
     // Get job executor if available (cluster mode)
     let job_executor = rt.job_executor();
+    let flight_write_rate_limit_enabled = rt.flight_write_rate_limit_enabled();
 
     let mut server = server
         .layer(
@@ -546,7 +548,7 @@ pub async fn start(
         .layer(auth_layer)
         .layer(WriteRateLimitLayer::new(
             RateLimiter::direct(rate_limits.flight_write_limit),
-            rate_limits.flight_write_enabled,
+            flight_write_rate_limit_enabled,
         ));
 
     let server = server
@@ -581,7 +583,7 @@ pub struct RateLimits {
     pub flight_write_limit: Quota,
     /// Whether write rate limiting is enabled. When `false`, the rate limiter
     /// layer is still present but the check function always succeeds.
-    pub flight_write_enabled: bool,
+    flight_write_enabled: AtomicBool,
 }
 
 impl RateLimits {
@@ -598,8 +600,17 @@ impl RateLimits {
 
     #[must_use]
     pub fn with_flight_write_enabled(mut self, enabled: bool) -> Self {
-        self.flight_write_enabled = enabled;
+        self.flight_write_enabled = AtomicBool::new(enabled);
         self
+    }
+
+    #[must_use]
+    pub fn flight_write_enabled(&self) -> bool {
+        self.flight_write_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_flight_write_enabled(&self, enabled: bool) {
+        self.flight_write_enabled.store(enabled, Ordering::Release);
     }
 }
 
@@ -610,7 +621,7 @@ impl Default for RateLimits {
             flight_write_limit: Quota::per_minute(
                 NonZeroU32::new(100).unwrap_or_else(|| unreachable!("100 is always non-zero")),
             ),
-            flight_write_enabled: true,
+            flight_write_enabled: AtomicBool::new(true),
         }
     }
 }

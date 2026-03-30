@@ -41,6 +41,7 @@ use odbc_api::CursorImpl;
 use odbc_api::handles::SqlResult;
 use odbc_api::handles::Statement;
 use odbc_api::handles::StatementImpl;
+use odbc_api::handles::{Diagnostics, Record};
 use odbc_api::parameter::InputParameter;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use snafu::Snafu;
@@ -78,7 +79,7 @@ pub enum Error {
     ArrowODBCError { source: arrow_odbc::Error },
     #[snafu(display("ODBC connection error: {source}"))]
     ODBCAPIError { source: odbc_api::Error },
-    #[snafu(display("ODBC connection error: {message}"))]
+    #[snafu(display("{message}"))]
     ODBCAPIErrorNoSource { message: String },
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
     TryFromError { source: std::num::TryFromIntError },
@@ -218,11 +219,57 @@ where
 
             // StatementImpl<'_>::execute is unsafe, CursorImpl<_>::new is unsafe
             let cursor = unsafe {
-                if let SqlResult::Error { function } = statement.execute() {
-                    return Err(Error::ODBCAPIErrorNoSource {
-                        message: function.to_string(),
+                match statement.execute() {
+                    SqlResult::Success(()) | SqlResult::SuccessWithInfo(()) => {}
+                    SqlResult::Error { function } => {
+                        let detail = odbc_error_message(&statement, function);
+                        return Err(Error::ODBCAPIErrorNoSource {
+                            message: format!("SQLExecute failed: {detail}"),
+                        }
+                        .into());
                     }
-                    .into());
+                    SqlResult::NoData => {
+                        return Err(Error::ODBCAPIErrorNoSource {
+                            message: "Query returned NoData (no result set)".to_string(),
+                        }
+                        .into());
+                    }
+                    state @ (SqlResult::NeedData | SqlResult::StillExecuting) => {
+                        return Err(Error::ODBCAPIErrorNoSource {
+                            message: format!("Unexpected ODBC state after execute: {state:?}"),
+                        }
+                        .into());
+                    }
+                }
+
+                // Verify the statement actually produced a result set before creating a cursor
+                // Reading from an invalid cursor would segfault in the ODBC C driver.
+                match statement.num_result_cols() {
+                    SqlResult::Success(cols) | SqlResult::SuccessWithInfo(cols) => {
+                        if cols == 0 {
+                            return Err(Error::ODBCAPIErrorNoSource {
+                                message:
+                                    "Statement did not produce a result set (0 columns reported)"
+                                        .to_string(),
+                            }
+                            .into());
+                        }
+                    }
+                    SqlResult::Error { function } => {
+                        let detail = odbc_error_message(&statement, function);
+                        return Err(Error::ODBCAPIErrorNoSource {
+                            message: format!("Failed to determine result column count: {detail}"),
+                        }
+                        .into());
+                    }
+                    state => {
+                        return Err(Error::ODBCAPIErrorNoSource {
+                            message: format!(
+                                "Unexpected ODBC state checking result columns: {state:?}"
+                            ),
+                        }
+                        .into());
+                    }
                 }
 
                 Ok::<_, GenericError>(CursorImpl::new(statement.as_stmt_ref()))
@@ -265,10 +312,18 @@ where
                 yield Ok(batch);
             }
 
-            if let Err(e) = join_handle.await {
-                yield Err(DataFusionError::Execution(format!(
-                    "Failed to execute ODBC query: {e}"
-                )))
+            match join_handle.await {
+                Err(e) => {
+                    yield Err(DataFusionError::Execution(format!(
+                        "Failed to execute ODBC query: {e}"
+                    )))
+                }
+                Ok(Err(e)) => {
+                    yield Err(DataFusionError::Execution(format!(
+                        "Failed to execute ODBC query: {e}"
+                    )))
+                }
+                Ok(Ok(())) => {}
             }
         };
 
@@ -287,8 +342,9 @@ where
 
         let row_count = unsafe {
             if let SqlResult::Error { function } = statement.execute() {
+                let detail = odbc_error_message(&statement, function);
                 return Err(Error::ODBCAPIErrorNoSource {
-                    message: format!("Failed to execute statement: {function}"),
+                    message: format!("Failed to execute statement: {detail}"),
                 }
                 .into());
             }
@@ -297,8 +353,9 @@ where
                 SqlResult::Success(count) | SqlResult::SuccessWithInfo(count) => count,
                 SqlResult::NoData => 0,
                 SqlResult::Error { function } => {
+                    let detail = odbc_error_message(&statement, function);
                     return Err(Error::ODBCAPIErrorNoSource {
-                        message: format!("Failed to get row count: {function}"),
+                        message: format!("Failed to get row count: {detail}"),
                     }
                     .into());
                 }
@@ -354,18 +411,47 @@ fn build_odbc_reader<C: Cursor>(
     builder.build(cursor).context(ArrowODBCSnafu)
 }
 
+/// Extracts diagnostic error messages from an ODBC handle after a failed call.
+///
+/// Returns a formatted string containing all diagnostic records, or the function name
+/// if no diagnostic records are available.
+fn odbc_error_message(handle: &(impl Diagnostics + ?Sized), function: &str) -> String {
+    let mut messages = Vec::new();
+    let mut record = Record::with_capacity(512);
+    let mut rec_number: i16 = 1;
+    while record.fill_from(handle, rec_number) {
+        messages.push(format!("{record}"));
+        rec_number += 1;
+
+        if rec_number > 10 {
+            // A failed ODBC call typically produces 1–3 diagnostic records; cap at 10 to guard
+            // against misbehaving drivers that could cause an infinite loop or an overflow.
+            messages.push("...".to_string());
+            break;
+        }
+    }
+    if messages.is_empty() {
+        function.to_string()
+    } else {
+        messages.join("; ")
+    }
+}
+
 /// Binds parameter to an ODBC statement.
 ///
 /// `StatementImpl<'_>::bind_input_parameter` is unsafe.
 fn bind_parameters(statement: &mut StatementImpl, params: &[ODBCParameter]) -> Result<(), Error> {
     for (i, param) in params.iter().enumerate() {
         unsafe {
-            statement
-                .bind_input_parameter(
-                    (i + 1).try_into().context(UnableToBindIntParameterSnafu)?,
-                    param.as_input_parameter(),
-                )
-                .unwrap();
+            let param_index = (i + 1).try_into().context(UnableToBindIntParameterSnafu)?;
+            if let SqlResult::Error { function } =
+                statement.bind_input_parameter(param_index, param.as_input_parameter())
+            {
+                let detail = odbc_error_message(statement, function);
+                return Err(Error::ODBCAPIErrorNoSource {
+                    message: format!("Failed to bind parameter {}: {detail}", i + 1),
+                });
+            }
         }
     }
 

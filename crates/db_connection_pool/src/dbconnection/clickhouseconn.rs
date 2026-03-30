@@ -99,7 +99,6 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
         // Escape single quotes by doubling them to prevent SQL injection
         let escaped_schema = schema.replace('\'', "''");
         let query = format!("SELECT name FROM system.tables WHERE database = '{escaped_schema}'");
-
         let block = conn
             .query(&query)
             .fetch_all()
@@ -107,16 +106,14 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
             .boxed()
             .map_err(|e| dbconnection::Error::UnableToGetTables { source: e })?;
 
-        block
+        let tables = block
             .rows()
-            .map(|row| {
-                let name: String = row
-                    .get("name")
-                    .boxed()
-                    .map_err(|e| dbconnection::Error::UnableToGetTables { source: e })?;
-                Ok(name)
-            })
-            .collect()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Result<Vec<String>, clickhouse_rs::errors::Error>>()
+            .boxed()
+            .map_err(|e| dbconnection::Error::UnableToGetTables { source: e })?;
+
+        Ok(tables)
     }
 
     async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
@@ -124,7 +121,6 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
         let conn = &mut *conn;
 
         let query = "SELECT name FROM system.databases WHERE name NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')";
-
         let block = conn
             .query(query)
             .fetch_all()
@@ -132,16 +128,14 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection 
             .boxed()
             .map_err(|e| dbconnection::Error::UnableToGetSchemas { source: e })?;
 
-        block
+        let schemas = block
             .rows()
-            .map(|row| {
-                let name: String = row
-                    .get("name")
-                    .boxed()
-                    .map_err(|e| dbconnection::Error::UnableToGetSchemas { source: e })?;
-                Ok(name)
-            })
-            .collect()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Result<Vec<String>, clickhouse_rs::errors::Error>>()
+            .boxed()
+            .map_err(|e| dbconnection::Error::UnableToGetSchemas { source: e })?;
+
+        Ok(schemas)
     }
 
     async fn get_schema(

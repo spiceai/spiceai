@@ -116,7 +116,6 @@ Spice simplifies building data-driven AI applications and agents by making it fa
 | **Accelerated Data Access**   | ✅                                       | ―                  | ―          | ―                | ―                             |
 | **Tools/Functions**           | ✅ (MCP HTTP+SSE)                        | ✅                  | ✅          | Limited          | Limited                       |
 | **LLM Memory**                | ✅                                       | ✅                  | ―          | ✅                | ―                             |
-| **Evaluations (Evals)**       | ✅                                       | Limited            | ―          | Limited          | ―                             |
 | **Hybrid Search**             | ✅ (Keyword, Vector, & Full-Text-Search) | ✅                  | ✅          | Limited          | Limited                       |
 | **Caching**                   | ✅ (Query and results caching)           | Limited            | ―          | ―                | ―                             |
 | **Embeddings**                | ✅ (Built-in & pluggable models/DBs)     | ✅                  | ✅          | Limited          | ―                             |
@@ -146,7 +145,6 @@ Limited = Partial or restricted support
 - **Unified Search with Vector Similarity**: Perform efficient vector similarity search across structured and unstructured data sources with native Amazon S3 Vectors integration for petabyte-scale vector storage and querying. The Spice runtime manages the vector lifecycle: ingesting data, embedding it using AWS Bedrock (Amazon Titan, Cohere), HuggingFace models, or Model2Vec (500x faster static embeddings), and storing in S3 Vector buckets or pgvector. Supports cosine similarity, Euclidean distance, or dot product. SQL-integrated search via `vector_search` and `text_search` UDTFs with hybrid search using reciprocal rank fusion (RRF). Example: `SELECT * FROM vector_search(my_table, 'search query', 10) WHERE condition ORDER BY _score;`. [Amazon S3 Vectors Cookbook Recipe](https://github.com/spiceai/cookbook/tree/trunk/vectors/s3/README.md)
 - **Semantic Knowledge Layer**: Define a semantic context model to enrich data for AI. [Semantic Model Feature Documentation](https://spiceai.org/docs/features/semantic-model)
 - **Text-to-SQL**: Convert natural language queries into SQL using built-in NSQL and sampling tools for accurate query. [Text-to-SQL Recipe](https://github.com/spiceai/cookbook/blob/trunk/text-to-sql/README.md)
-- **Model and Data Evaluations**: Assess model performance and data quality with integrated evaluation tools. [Language Model Evaluations Recipe](https://github.com/spiceai/cookbook/blob/trunk/evals/README.md)
 
 ## FAQ
 
@@ -217,8 +215,8 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 
 | Name       | Description                       | Status            | Engine Modes     |
 | ---------- | --------------------------------- | ----------------- | ---------------- |
+| `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Release Candidate | `file`           |
 | `arrow`    | [In-Memory Arrow Records][arrow]  | Stable            | `memory`         |
-| `cayenne`  | [Spice Cayenne (Vortex)][cayenne] | Stable            | `file`           |
 | `duckdb`   | Embedded [DuckDB][duckdb]         | Stable            | `memory`, `file` |
 | `postgres` | Attached [PostgreSQL][postgres]   | Release Candidate | N/A              |
 | `sqlite`   | Embedded [SQLite][sqlite]         | Release Candidate | `memory`, `file` |
