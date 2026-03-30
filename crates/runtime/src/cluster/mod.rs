@@ -1232,6 +1232,40 @@ pub async fn initialize_cluster_executor(
         })
     }));
 
+    let refresh_dataset_handler_rt = Arc::clone(&rt);
+    let refresh_dataset_handler: Option<
+        crate::cluster::control_stream_client::RefreshDatasetHandler,
+    > = Some(Arc::new(move |dataset_name, overrides_json| {
+        let rt = Arc::clone(&refresh_dataset_handler_rt);
+        Box::pin(async move {
+            let dataset_ref =
+                ::datafusion::sql::TableReference::parse_str(&dataset_name);
+            let overrides = overrides_json.and_then(|json| {
+                serde_json::from_str(&json)
+                    .map_err(|e| {
+                        tracing::warn!(
+                            "Failed to deserialize refresh overrides for {dataset_name}: {e}"
+                        );
+                        e
+                    })
+                    .ok()
+            });
+
+            match rt.datafusion().refresh_table(&dataset_ref, overrides).await {
+                Ok(_) => {
+                    tracing::info!(
+                        "Successfully triggered refresh for dataset '{dataset_name}'"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to refresh dataset '{dataset_name}': {e}"
+                    );
+                }
+            }
+        })
+    }));
+
     // Thread to handle:
     //  - periodic refresh of scheduler membership
     //  - spawning/stopping scheduler poll loops as membership changes
@@ -1248,6 +1282,7 @@ pub async fn initialize_cluster_executor(
             control_stream_metrics_reader,
             partition_update_handler,
             Some(Arc::clone(&executor_for_manager)),
+            refresh_dataset_handler,
         );
 
         // Get the shared poll_now notify handle from the control stream manager.

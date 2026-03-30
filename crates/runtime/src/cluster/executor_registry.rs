@@ -224,11 +224,15 @@ impl ExecutorRegistry {
             let tx = connection.request_tx.clone();
             drop(connections);
 
-            tx.send(command).await.map_err(|_| Error::SendFailed {
-                executor_id: executor_id.to_string(),
+            tx.send(command).await.map_err(|e| {
+                tracing::error!("Failed to send command to executor {executor_id}: {e}");
+                Error::SendFailed {
+                    executor_id: executor_id.to_string(),
+                }
             })?;
             Ok(())
         } else {
+            tracing::error!("Failed to send command to executor: missing executor '{executor_id}' in registry");
             Err(Error::SendFailed {
                 executor_id: executor_id.to_string(),
             })
