@@ -241,6 +241,12 @@ impl Service {
         sql: &str,
         parameters: Option<ParamValues>,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
+        // Log incoming FlightSQL queries at info level for distributed query diagnosis.
+        let is_select = sql.trim_start().to_uppercase().starts_with("SELECT");
+        if is_select {
+            tracing::info!(sql = %sql.chars().take(200).collect::<String>(), "Executing FlightSQL query");
+        }
+
         let query_result = QueryBuilder::new(sql, Arc::clone(&datafusion))
             .parameters(parameters)
             .build()
@@ -271,6 +277,7 @@ impl Service {
             ..Default::default()
         };
 
+        let sql_for_log = if is_select { sql.chars().take(200).collect::<String>() } else { String::new() };
         let data_stream = query_result.data;
         let cache_status = query_result.cache_status;
 
@@ -279,10 +286,15 @@ impl Service {
 
             // Use fused stream for better performance
             let mut data_stream = data_stream.fuse();
+            let mut total_rows: u64 = 0;
+            let mut total_batches: u64 = 0;
 
             while let Some(batch_result) = data_stream.next().await {
                 match batch_result {
                     Ok(batch) => {
+                        total_rows += batch.num_rows() as u64;
+                        total_batches += 1;
+
                         let (dicts, batch_data) = encoder
                             .encode(&batch, &mut dict_tracker, &options, &mut compression_context)
                             .map_err(|e| Status::internal(e.to_string()))?;
@@ -298,6 +310,15 @@ impl Service {
                         Err(handle_datafusion_error(e))?;
                     }
                 }
+            }
+
+            if is_select {
+                tracing::info!(
+                    sql = %sql_for_log,
+                    total_rows,
+                    total_batches,
+                    "FlightSQL query completed",
+                );
             }
         };
 

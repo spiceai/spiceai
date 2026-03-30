@@ -484,15 +484,39 @@ impl CayenneSchemaProvider {
                 if Self::refresh_table_provider_in_place(existing_provider, &refreshed_provider)
                     .await
                 {
+                    tracing::debug!(
+                        table = %table_name,
+                        "Cayenne refresh: in-place refresh succeeded, keeping existing provider",
+                    );
                     Arc::clone(existing_provider)
                 } else {
+                    tracing::warn!(
+                        table = %table_name,
+                        existing_type = std::any::type_name_of_val(existing_provider.as_ref()),
+                        refreshed_type = std::any::type_name_of_val(refreshed_provider.as_ref()),
+                        "Cayenne refresh: in-place refresh FAILED, REPLACING provider (partition state may be lost!)",
+                    );
                     refreshed_provider
                 }
             } else {
+                tracing::info!(
+                    table = %table_name,
+                    "Cayenne refresh: new table discovered",
+                );
                 refreshed_provider
             };
 
             merged_tables.insert(table_name, provider_to_use);
+        }
+
+        // Log tables that existed before but are NOT in the refreshed set (will be dropped)
+        for table_name in existing_tables.keys() {
+            if !merged_tables.contains_key(table_name) {
+                tracing::warn!(
+                    table = %table_name,
+                    "Cayenne refresh: table exists in cache but not in refreshed catalog — will be DROPPED",
+                );
+            }
         }
 
         self.replace_tables(merged_tables);
@@ -607,6 +631,11 @@ impl SchemaProvider for CayenneSchemaProvider {
         if let Ok(tables) = self.tables.read()
             && let Some(provider) = tables.get(name)
         {
+            tracing::trace!(
+                table = name,
+                provider_type = std::any::type_name_of_val(provider.as_ref()),
+                "Cayenne schema cache hit",
+            );
             return Ok(Some(Arc::clone(provider)));
         }
 
@@ -614,6 +643,11 @@ impl SchemaProvider for CayenneSchemaProvider {
         let full_name = self.full_table_name(name);
         match Self::load_table(&self.catalog, &full_name, &self.runtime_env).await {
             Ok(Some(provider)) => {
+                tracing::info!(
+                    table = name,
+                    provider_type = std::any::type_name_of_val(provider.as_ref()),
+                    "Cayenne schema cache MISS — lazy-loaded table from catalog (overwrites any existing cache entry)",
+                );
                 if let Ok(mut tables) = self.tables.write() {
                     tables.insert(name.to_string(), Arc::clone(&provider));
                 }
@@ -629,8 +663,22 @@ impl SchemaProvider for CayenneSchemaProvider {
         name: String,
         table: Arc<dyn TableProvider>,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        tracing::info!(
+            table = %name,
+            provider_type = std::any::type_name_of_val(table.as_ref()),
+            "Cayenne schema: registering table provider",
+        );
         match self.tables.write() {
-            Ok(mut tables) => Ok(tables.insert(name, table)),
+            Ok(mut tables) => {
+                let prev = tables.insert(name, table);
+                if let Some(ref prev) = prev {
+                    tracing::info!(
+                        prev_provider_type = std::any::type_name_of_val(prev.as_ref()),
+                        "Cayenne schema: replaced existing table provider",
+                    );
+                }
+                Ok(prev)
+            }
             Err(_) => Err(datafusion::error::DataFusionError::Internal(
                 "Failed to acquire write lock on Cayenne tables".to_string(),
             )),

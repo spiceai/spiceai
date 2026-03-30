@@ -409,7 +409,12 @@ fn create_response_stream(
         let path = path.clone();
         let mut write_future = Box::pin(df.write_streaming_data(&path, streaming_update));
 
+        let mut total_rows_received: u64 = 0;
+        let mut total_batches_received: u64 = 0;
+
         if let Some(first_batch) = first_batch {
+            total_rows_received += first_batch.num_rows() as u64;
+            total_batches_received += 1;
             yield handle_record_batch(first_batch, &batch_tx, &path.to_string()).await;
         }
 
@@ -423,7 +428,12 @@ fn create_response_stream(
             tokio::select! {
                 () = &mut deadline => {
                     let secs = idle_timeout.as_secs();
-                    tracing::error!("Timeout: no record batch received within {secs} seconds");
+                    tracing::error!(
+                        dataset = %path,
+                        total_batches_received,
+                        total_rows_received,
+                        "Timeout: no record batch received within {secs} seconds",
+                    );
                     yield Err(Status::deadline_exceeded(format!("Timeout: no record batch received within {secs} seconds")));
                     break;
                 }
@@ -478,22 +488,38 @@ fn create_response_stream(
                             };
 
                             // Only report errors; a success message is sent as the final step upon successful write completion
-                            if let Err(err) = handle_record_batch(new_batch, &batch_tx, &path.to_string()).await {
+                            if let Err(err) = handle_record_batch(new_batch.clone(), &batch_tx, &path.to_string()).await {
                                 yield Err(err);
                                 break;
                             }
+                            total_rows_received += new_batch.num_rows() as u64;
+                            total_batches_received += 1;
                         }
                         None => {
                             // End of the stream; signal that stream is completed and data write should be finalized
                             drop(batch_tx);
-                            tracing::trace!("No more messages in the stream, finalizing write operation for path: {path}");
+                            tracing::info!(
+                                dataset = %path,
+                                total_batches_received,
+                                total_rows_received,
+                                "DoPut stream ended, finalizing write",
+                            );
 
                             // Wait for the write operation to complete
                             if let Err(e) = write_future.await {
-                                tracing::error!("Write operation failed. Details included in the response.");
+                                tracing::error!(
+                                    dataset = %path,
+                                    total_rows_received,
+                                    error = %e,
+                                    "Write operation failed after DoPut stream",
+                                );
                                 yield Err(Status::internal(format!("Write operation failed: {e}")));
                             }
-                            tracing::debug!("Write operation completed successfully for dataset: {path}");
+                            tracing::info!(
+                                dataset = %path,
+                                total_rows_received,
+                                "Write operation completed successfully",
+                            );
                             yield Ok(PutResult::default())
                             break;
                         }

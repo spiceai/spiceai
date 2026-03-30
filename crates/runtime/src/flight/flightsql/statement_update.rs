@@ -80,6 +80,16 @@ pub(crate) async fn do_put(
     let sql = &cmd.query;
     tracing::trace!("do_put_statement_update: {sql}");
 
+    // Log DML statements at info level so DELETE/UPDATE operations are visible
+    // in production logs for data reconciliation.
+    let is_dml_write = {
+        let upper = sql.trim_start().to_uppercase();
+        upper.starts_with("DELETE") || upper.starts_with("UPDATE") || upper.starts_with("MERGE")
+    };
+    if is_dml_write {
+        tracing::info!(sql = %sql.chars().take(200).collect::<String>(), "Executing DML statement");
+    }
+
     let dml_table = match datafusion.ctx.state().create_logical_plan(sql).await {
         Ok(LogicalPlan::Dml(dml)) => Some(dml.table_name),
         Ok(_) | Err(_) => None,
@@ -111,6 +121,14 @@ pub(crate) async fn do_put(
 
     // Extract affected rows count
     let affected_rows = extract_affected_rows(&results);
+
+    if is_dml_write {
+        tracing::info!(
+            affected_rows,
+            sql = %sql.chars().take(200).collect::<String>(),
+            "DML statement completed",
+        );
+    }
 
     let result = DoPutUpdateResult {
         record_count: affected_rows,
