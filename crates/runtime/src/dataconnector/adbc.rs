@@ -104,31 +104,41 @@ impl Drop for Adbc {
     fn drop(&mut self) {
         if let Some(factory) = self.adbc_factory.take() {
             // Send to the dedicated cleanup thread so we don't stall the Tokio
-            // runtime. If the channel is disconnected (worker has exited), drop
-            // inline as a last resort.
-            match adbc_cleanup_sender().send(factory) {
+            // runtime. If the bounded queue is full or the worker is gone,
+            // drop inline as a last resort.
+            match adbc_cleanup_sender().try_send(factory) {
                 Ok(()) => {}
-                Err(err) => {
+                Err(std::sync::mpsc::TrySendError::Full(factory)) => {
+                    tracing::warn!(
+                        "ADBC cleanup queue full; dropping inline to avoid unbounded backlog"
+                    );
+                    drop(factory);
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(factory)) => {
                     tracing::warn!("ADBC cleanup channel closed; dropping inline");
                     // Explicitly drop the factory so the fallback is unambiguous.
-                    drop(err.0);
+                    drop(factory);
                 }
             }
         }
     }
 }
 
+const ADBC_CLEANUP_QUEUE_CAPACITY: usize = 64;
+
 /// Returns a sender for offloading ADBC factory cleanup to a dedicated
 /// background thread. The worker thread is created once (on first use) and
-/// processes drop work sequentially, avoiding unbounded thread spawns.
+/// processes drop work sequentially with bounded buffering, avoiding both
+/// unbounded thread spawns and unbounded cleanup backlog growth.
 fn adbc_cleanup_sender()
--> &'static std::sync::mpsc::Sender<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>> {
+-> &'static std::sync::mpsc::SyncSender<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>> {
     static SENDER: OnceLock<
-        std::sync::mpsc::Sender<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>,
+        std::sync::mpsc::SyncSender<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>,
     > = OnceLock::new();
     SENDER.get_or_init(|| {
-        let (tx, rx) =
-            std::sync::mpsc::channel::<AdbcTableFactory<adbc_driver_manager::ManagedDatabase>>();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<
+            AdbcTableFactory<adbc_driver_manager::ManagedDatabase>,
+        >(ADBC_CLEANUP_QUEUE_CAPACITY);
         if std::thread::Builder::new()
             .name("adbc-cleanup".to_string())
             .spawn(move || {
@@ -716,7 +726,7 @@ fn is_auth_or_permission_error(error_message: &str) -> bool {
 /// Returns a driver-specific hint for auth/permission errors.
 fn auth_permission_hint(driver_name: &str) -> &'static str {
     if driver_name == "bigquery" {
-        "Verify your BigQuery credentials are valid, not expired, and have the required permissions. See: https://cloud.google.com/bigquery/docs/authentication"
+        "Verify your BigQuery credentials are valid, not expired, and have the required permissions. If you use gcloud user auth, re-run `gcloud auth application-default login`. If you use a service account, confirm its key or workload identity is configured correctly and has BigQuery access. See: https://cloud.google.com/bigquery/docs/authentication"
     } else {
         "Verify the configured credentials are valid and have the required permissions."
     }
@@ -1086,6 +1096,14 @@ mod tests {
         assert!(
             msg.contains("BigQuery credentials"),
             "Expected BigQuery-specific hint, got: {msg}"
+        );
+        assert!(
+            msg.contains("gcloud auth application-default login"),
+            "Expected gcloud re-auth guidance, got: {msg}"
+        );
+        assert!(
+            msg.contains("service account"),
+            "Expected service-account guidance, got: {msg}"
         );
         assert!(
             msg.contains("invalid_grant"),
