@@ -9,6 +9,11 @@ on:
       - release/*
       - feature-*
   merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
   workflow_dispatch:
     inputs:
       profile_option:
