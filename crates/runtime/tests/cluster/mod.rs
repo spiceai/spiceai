@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 mod cancel_tasks;
+mod distributed_cayenne_catalog;
 mod distributed_acceleration;
 pub mod harness;
 mod in_memory_shuffle;
