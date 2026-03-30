@@ -5,6 +5,9 @@ on:
   pull_request:
     branches:
       - develop
+  merge_group:
+    branches:
+      - develop
   workflow_dispatch:
 
 concurrency:
