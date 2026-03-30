@@ -186,7 +186,7 @@ impl IcebergDataConnector {
                     })?
                     .into_custom_loader();
 
-                let configured_scheme = s3_scheme_from_url(source);
+                let configured_scheme = s3_scheme_from_url(&source);
 
                 Some(Arc::new(OpenDalStorageFactory::S3 {
                     configured_scheme,
@@ -302,7 +302,7 @@ impl IcebergDataConnector {
                 Arc::new(OpenDalStorageFactory::Gcs)
             } else if source.starts_with("s3://") || source.starts_with("s3a://") {
                 Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme: s3_scheme_from_url(source),
+                    configured_scheme: s3_scheme_from_url(&source),
                     customized_credential_load: None,
                 })
             } else {
