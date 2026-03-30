@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use std::{
+    cell::Cell,
     collections::HashMap,
     fmt::Debug,
     sync::{Arc, Weak},
@@ -28,11 +29,11 @@ use datafusion::{
     config::ConfigOptions,
     datasource::{DefaultTableSource, TableProvider},
     error::DataFusionError,
+    execution::SessionState,
     logical_expr::{
         EmptyRelation, Expr, FetchType, Limit, LogicalPlan, LogicalPlanBuilder, SkipType, Sort,
-        TableScan, Union, lit
+        TableScan, Union, lit,
     },
-    execution::SessionState,
     optimizer::AnalyzerRule,
     prelude::SessionContext,
     sql::TableReference,
@@ -128,6 +129,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
         plan: LogicalPlan,
         _config: &ConfigOptions,
     ) -> Result<LogicalPlan, DataFusionError> {
+        let mut rewrite_occurred = false; // Cell::new(false);
         plan.transform_up_with_subqueries(|plan| {
             if let LogicalPlan::TableScan(scan) = &plan {
                 if !self.partition_provider.should_partition(scan) {
@@ -195,6 +197,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                     builder = builder.union(Arc::unwrap_or_clone(scan))?;
                 }
                 let result = builder.alias(scan.table_name.clone())?.build()?;
+                rewrite_occurred = true;
                 return Ok(Transformed::yes(result));
             }
 
@@ -202,11 +205,11 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
             // DataFusion's optimizer pushes Limit through Union, but does not push
             // Sort(TopK) through Union. Without this, each executor returns all rows
             // and the scheduler sorts the full merged result.
-            if matches!(&plan, LogicalPlan::Limit(_)) {
-                let LogicalPlan::Limit(limit) = plan else {
-                    unreachable!();
-                };
-                return push_sort_topk_into_union(limit);
+            // Only attempt this when the partition rewrite created a union above.
+            if rewrite_occurred {
+                if let LogicalPlan::Limit(limit) = plan {
+                    return push_sort_topk_into_union(limit);
+                }
             }
 
             Ok(Transformed::no(plan))
@@ -219,37 +222,41 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
     }
 }
 
-/// When `Limit -> Sort -> Union(sub_scans)`, push `Sort(fetch = skip + fetch)` into each union
-/// leg. This enables per-executor `TopK`, reducing data transfer from executors to the scheduler.
+/// When `Limit -> Sort -> [Projection|SubqueryAlias]* -> Union(sub_scans)`, push
+/// `Sort(fetch = skip + fetch)` into each union leg. This enables per-executor `TopK`,
+/// reducing data transfer from executors to the scheduler.
 ///
-/// The outer `Limit -> Sort` is preserved for correct final merge-sort and limiting.
-///
-/// The union may be wrapped in a `SubqueryAlias` from the partition rewrite
-/// (`.alias(table_name)`). This function handles both cases:
-/// - `Limit -> Sort -> Union`
-/// - `Limit -> Sort -> SubqueryAlias -> Union`
+/// The outer `Limit -> Sort` and any intermediate nodes (Projection, SubqueryAlias) are
+/// preserved for correct final merge-sort, projection, and limiting.
 fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, DataFusionError> {
     let LogicalPlan::Sort(sort) = limit.input.as_ref() else {
         return Ok(Transformed::no(LogicalPlan::Limit(limit)));
     };
 
-    // The union may be directly under Sort, or wrapped in a SubqueryAlias
-    // from the partition rewrite (which adds .alias(table_name)).
-    let (union_plan, alias_node) = match sort.input.as_ref() {
-        LogicalPlan::Union(u) => (u, None),
-        LogicalPlan::SubqueryAlias(sa) => match sa.input.as_ref() {
-            LogicalPlan::Union(u) => (u, Some(sa)),
+    // Walk through Projection and SubqueryAlias nodes to find the Union.
+    // These are "transparent" nodes that don't affect sort order.
+    let mut current = sort.input.as_ref();
+    let mut intermediates: Vec<&LogicalPlan> = Vec::new();
+    let union_plan = loop {
+        match current {
+            LogicalPlan::Union(u) => break u,
+            LogicalPlan::Projection(p) => {
+                intermediates.push(current);
+                current = p.input.as_ref();
+            }
+            LogicalPlan::SubqueryAlias(sa) => {
+                intermediates.push(current);
+                current = sa.input.as_ref();
+            }
             _ => return Ok(Transformed::no(LogicalPlan::Limit(limit))),
-        },
-        _ => return Ok(Transformed::no(LogicalPlan::Limit(limit))),
+        }
     };
 
-    let FetchType::Literal(Some(fetch)) = limit.get_fetch_type()? else {
+    let (FetchType::Literal(Some(fetch))) = limit.get_fetch_type()? else {
         return Ok(Transformed::no(LogicalPlan::Limit(limit)));
     };
-    let skip = match limit.get_skip_type()? {
-        SkipType::Literal(s) => s,
-        SkipType::UnsupportedExpr => return Ok(Transformed::no(LogicalPlan::Limit(limit))),
+    let SkipType::Literal(skip) = limit.get_skip_type()? else {
+        return Ok(Transformed::no(LogicalPlan::Limit(limit)));
     };
     let Some(effective_fetch) = skip.checked_add(fetch) else {
         return Ok(Transformed::no(LogicalPlan::Limit(limit)));
@@ -267,25 +274,31 @@ fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, D
         })
         .collect();
 
-    let new_union = LogicalPlan::Union(Union {
+    // Rebuild: new Union → intermediate nodes (reversed) → Sort → Limit.
+    let mut result = LogicalPlan::Union(Union {
         inputs: new_inputs,
         schema: Arc::clone(&union_plan.schema),
     });
 
-    // Re-wrap in SubqueryAlias if one was present.
-    let sort_child = match alias_node {
-        Some(sa) => LogicalPlanBuilder::from(new_union)
-            .alias(sa.alias.clone())?
-            .build()?,
-        None => new_union,
-    };
+    // Re-wrap intermediate nodes in reverse (innermost-first) order.
+    for node in intermediates.into_iter().rev() {
+        result = match node {
+            LogicalPlan::SubqueryAlias(sa) => LogicalPlanBuilder::from(result)
+                .alias(sa.alias.clone())?
+                .build()?,
+            LogicalPlan::Projection(p) => LogicalPlanBuilder::from(result)
+                .project(p.expr.clone())?
+                .build()?,
+            _ => unreachable!("only Projection and SubqueryAlias are collected"),
+        };
+    }
 
     Ok(Transformed::yes(LogicalPlan::Limit(Limit {
         skip: limit.skip.clone(),
         fetch: limit.fetch.clone(),
         input: Arc::new(LogicalPlan::Sort(Sort {
             expr: sort.expr.clone(),
-            input: Arc::new(sort_child),
+            input: Arc::new(result),
             fetch: sort.fetch,
         })),
     })))
@@ -321,13 +334,13 @@ fn partition_value_to_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use datafusion::{
         arrow::datatypes::{DataType, Field, Schema},
         datasource::empty::EmptyTable,
         logical_expr::{LogicalPlanBuilder, SortExpr, col},
         prelude::SessionContext,
     };
+    use std::collections::HashMap;
 
     /// A test partition provider that splits any table into two partitions.
     #[derive(Debug)]
@@ -406,14 +419,12 @@ mod tests {
             .analyze(plan, &ConfigOptions::default())
             .expect("analyze failed");
 
-        // The partition rewrite wraps the union in a SubqueryAlias.
-        let LogicalPlan::SubqueryAlias(alias) = &result else {
-            panic!("Expected SubqueryAlias, got: {result}");
-        };
-        let LogicalPlan::Union(union_plan) = alias.input.as_ref() else {
-            panic!("Expected Union under SubqueryAlias, got: {}", alias.input);
-        };
-        assert_eq!(union_plan.inputs.len(), 2, "Expected 2 partition sub-scans");
+        insta::assert_snapshot!(result.display_indent(), @r#"
+        SubqueryAlias: test_table
+          Union
+            TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+            TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+        "#);
     }
 
     #[test]
@@ -436,34 +447,16 @@ mod tests {
             .analyze(plan, &ConfigOptions::default())
             .expect("analyze failed");
 
-        // Expect: Limit -> Sort -> SubqueryAlias -> Union(Sort(fetch=5) -> scan, Sort(fetch=5) -> scan)
-        let LogicalPlan::Limit(limit) = &result else {
-            panic!("Expected Limit, got: {result}");
-        };
-        let LogicalPlan::Sort(outer_sort) = limit.input.as_ref() else {
-            panic!("Expected Sort under Limit, got: {}", limit.input);
-        };
-        let LogicalPlan::SubqueryAlias(alias) = outer_sort.input.as_ref() else {
-            panic!(
-                "Expected SubqueryAlias under Sort, got: {}",
-                outer_sort.input
-            );
-        };
-        let LogicalPlan::Union(union_plan) = alias.input.as_ref() else {
-            panic!("Expected Union under SubqueryAlias, got: {}", alias.input);
-        };
-        assert_eq!(union_plan.inputs.len(), 2, "Expected 2 union legs");
-
-        for (i, input) in union_plan.inputs.iter().enumerate() {
-            let LogicalPlan::Sort(inner_sort) = input.as_ref() else {
-                panic!("Union leg {i}: expected Sort, got: {input}");
-            };
-            assert_eq!(
-                inner_sort.fetch,
-                Some(5),
-                "Union leg {i}: expected Sort(fetch=5)"
-            );
-        }
+        insta::assert_snapshot!(result.display_indent(), @r#"
+        Limit: skip=0, fetch=5
+          Sort: test_table.id ASC NULLS LAST
+            SubqueryAlias: test_table
+              Union
+                Sort: test_table.id ASC NULLS LAST, fetch=5
+                  TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+                Sort: test_table.id ASC NULLS LAST, fetch=5
+                  TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+        "#);
     }
 
     #[test]
@@ -486,30 +479,51 @@ mod tests {
             .analyze(plan, &ConfigOptions::default())
             .expect("analyze failed");
 
-        // Each inner Sort should have fetch = skip + fetch = 15
-        let LogicalPlan::Limit(limit) = &result else {
-            panic!("Expected Limit, got: {result}");
-        };
-        let LogicalPlan::Sort(outer_sort) = limit.input.as_ref() else {
-            panic!("Expected Sort under Limit");
-        };
-        let LogicalPlan::SubqueryAlias(alias) = outer_sort.input.as_ref() else {
-            panic!("Expected SubqueryAlias under Sort");
-        };
-        let LogicalPlan::Union(union_plan) = alias.input.as_ref() else {
-            panic!("Expected Union under SubqueryAlias");
-        };
+        insta::assert_snapshot!(result.display_indent(), @r#"
+        Limit: skip=10, fetch=5
+          Sort: test_table.id ASC NULLS LAST
+            SubqueryAlias: test_table
+              Union
+                Sort: test_table.id ASC NULLS LAST, fetch=15
+                  TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+                Sort: test_table.id ASC NULLS LAST, fetch=15
+                  TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+        "#);
+    }
 
-        for (i, input) in union_plan.inputs.iter().enumerate() {
-            let LogicalPlan::Sort(inner_sort) = input.as_ref() else {
-                panic!("Union leg {i}: expected Sort");
-            };
-            assert_eq!(
-                inner_sort.fetch,
-                Some(15),
-                "Union leg {i}: expected Sort(fetch=15) for skip=10 + fetch=5"
-            );
-        }
+    #[test]
+    fn test_limit_sort_pushdown_through_projection_and_union() {
+        let schema = test_schema();
+        let ctx = SessionContext::new();
+        let rule = make_rule(&schema, &ctx);
+
+        // Build: Limit(fetch=5) -> Sort(id ASC) -> Projection(id, name) -> TableScan
+        let scan = make_table_scan(&schema);
+        let plan = LogicalPlanBuilder::from(scan)
+            .project(vec![col("id"), col("name")])
+            .expect("project failed")
+            .sort(vec![SortExpr::new(col("id"), true, false)])
+            .expect("sort failed")
+            .limit(0, Some(5))
+            .expect("limit failed")
+            .build()
+            .expect("build failed");
+
+        let result = rule
+            .analyze(plan, &ConfigOptions::default())
+            .expect("analyze failed");
+
+        insta::assert_snapshot!(result.display_indent(), @r#"
+        Limit: skip=0, fetch=5
+          Sort: test_table.id ASC NULLS LAST
+            Projection: test_table.id, test_table.name
+              SubqueryAlias: test_table
+                Union
+                  Sort: test_table.id ASC NULLS LAST, fetch=5
+                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+                  Sort: test_table.id ASC NULLS LAST, fetch=5
+                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+        "#);
     }
 
     #[test]
@@ -530,25 +544,13 @@ mod tests {
             .analyze(plan, &ConfigOptions::default())
             .expect("analyze failed");
 
-        // Limit -> SubqueryAlias -> Union (no inner Sort pushed — DataFusion's optimizer handles Limit through Union)
-        let LogicalPlan::Limit(limit) = &result else {
-            panic!("Expected Limit, got: {result}");
-        };
-        let LogicalPlan::SubqueryAlias(alias) = limit.input.as_ref() else {
-            panic!(
-                "Expected SubqueryAlias under Limit, got: {}",
-                limit.input
-            );
-        };
-        let LogicalPlan::Union(union_plan) = alias.input.as_ref() else {
-            panic!("Expected Union under SubqueryAlias, got: {}", alias.input);
-        };
-        // Verify no Sort was injected into union legs
-        for (i, input) in union_plan.inputs.iter().enumerate() {
-            assert!(
-                !matches!(input.as_ref(), LogicalPlan::Sort(_)),
-                "Union leg {i}: should NOT have Sort pushed (no Sort in original plan)"
-            );
-        }
+        // No Sort in original plan, so no Sort(TopK) should be pushed into union legs.
+        insta::assert_snapshot!(result.display_indent(), @r#"
+        Limit: skip=0, fetch=5
+          SubqueryAlias: test_table
+            Union
+              TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+              TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+        "#);
     }
 }
