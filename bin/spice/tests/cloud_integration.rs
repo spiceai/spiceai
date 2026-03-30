@@ -427,12 +427,12 @@ fn test_cloud_secrets_crud_lifecycle() {
         .success();
     let list_output: serde_json::Value = serde_json::from_slice(&list_assert.get_output().stdout)
         .expect("list secrets should produce valid JSON");
-    let secrets = list_output.as_array().expect("secrets should be an array");
+    let listed_entries = list_output.as_array().expect("listed entries should be an array");
     assert!(
-        secrets
+        listed_entries
             .iter()
             .any(|s| s.get("name").and_then(|v| v.as_str()) == Some("TEST_SECRET")),
-        "list secrets should include TEST_SECRET"
+        "listed entries should include TEST_SECRET"
     );
 
     // --- Overwrite secret ---
@@ -570,13 +570,13 @@ fn test_cloud_multiple_secrets() {
         .success();
     let after_output: serde_json::Value = serde_json::from_slice(&after_assert.get_output().stdout)
         .expect("list secrets should produce valid JSON");
-    let after_secrets = after_output.as_array().expect("secrets should be an array");
+    let remaining_entries = after_output.as_array().expect("remaining entries should be an array");
     assert!(
-        !after_secrets.iter().any(|s| s
+        !remaining_entries.iter().any(|s| s
             .get("name")
             .and_then(|v| v.as_str())
             .is_some_and(|n| n.starts_with("KEY_"))),
-        "all KEY_* secrets should be deleted"
+        "all KEY_* entries should be deleted"
     );
 
     cleanup_app(&org_app);
