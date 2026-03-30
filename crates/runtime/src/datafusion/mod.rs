@@ -1949,14 +1949,16 @@ impl DataFusion {
         overrides: &Option<RefreshOverrides>,
     ) -> Result<Option<Arc<Notify>>> {
         let overrides_json = match overrides {
-            Some(o) => Some(serde_json::to_string(o).map_err(|_| {
-                Error::UnableToTriggerRefresh {
-                    dataset_name: dataset_name.to_string(),
-                    source: crate::accelerated_table::Error::FailedToTriggerRefresh {
-                        source: tokio::sync::mpsc::error::SendError(None),
-                    },
-                }
-            })?),
+            Some(o) => {
+                Some(
+                    serde_json::to_string(o).map_err(|_| Error::UnableToTriggerRefresh {
+                        dataset_name: dataset_name.to_string(),
+                        source: crate::accelerated_table::Error::FailedToTriggerRefresh {
+                            source: tokio::sync::mpsc::error::SendError(None),
+                        },
+                    })?,
+                )
+            }
             None => None,
         };
 
@@ -1985,9 +1987,7 @@ impl DataFusion {
                 .send_command(executor_id, command.clone())
                 .await
             {
-                tracing::warn!(
-                    "Failed to send refresh command to executor {executor_id}: {e}"
-                );
+                tracing::warn!("Failed to send refresh command to executor {executor_id}: {e}");
                 failures.push(executor_id.clone());
             }
         }

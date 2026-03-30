@@ -232,7 +232,9 @@ impl ExecutorRegistry {
             })?;
             Ok(())
         } else {
-            tracing::error!("Failed to send command to executor: missing executor '{executor_id}' in registry");
+            tracing::error!(
+                "Failed to send command to executor: missing executor '{executor_id}' in registry"
+            );
             Err(Error::SendFailed {
                 executor_id: executor_id.to_string(),
             })

@@ -66,9 +66,8 @@ pub type PartitionUpdateHandler = Arc<
 /// The handler takes two arguments:
 /// 1. `dataset_name`: The dataset name to refresh.
 /// 2. `overrides_json`: Optional JSON-serialized `RefreshOverrides`.
-pub type RefreshDatasetHandler = Arc<
-    dyn Fn(String, Option<String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
->;
+pub type RefreshDatasetHandler =
+    Arc<dyn Fn(String, Option<String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Handle for a single control stream connection to a scheduler.
 struct ControlStreamHandle {
@@ -446,9 +445,7 @@ async fn handle_scheduler_message(
             if let Some(handler) = refresh_dataset_handler {
                 handler(cmd.dataset_name, cmd.overrides_json).await;
             } else {
-                tracing::warn!(
-                    "Received RefreshDataset command but no handler is registered"
-                );
+                tracing::warn!("Received RefreshDataset command but no handler is registered");
             }
         }
     }

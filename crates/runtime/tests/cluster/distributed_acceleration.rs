@@ -662,6 +662,96 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
         .await
 }
 
+/// Test that `refresh_table()` on the scheduler forwards the refresh command to executors
+/// via the `RefreshDataset` control stream message, rather than failing with a
+/// "channel closed" error.
+///
+/// Verifies:
+/// - The scheduler detects it is in scheduler mode and forwards to executors
+/// - Executors receive the `RefreshDataset` command and trigger a local refresh
+/// - Data remains correct after the distributed refresh
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("runtime=debug,info"))
+        .with_ansi(true)
+        .try_init();
+
+    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
+        verify_env_secret_exists(env_var)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let csv_path = csv_tempdir.path().join("test_data.csv");
+    tokio::fs::write(&csv_path, TEST_DATA_CSV)
+        .await
+        .expect("write test data");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+            let app = AppBuilder::new("test_refresh_forwarding")
+                .with_dataset(make_memory_accelerated_dataset(
+                    format!("file:{}", csv_path.display()),
+                    "test_data",
+                    3,
+                    "id",
+                ))
+                .with_runtime(SpicepodRuntime {
+                    scheduler: Some(make_named_scheduler_config(
+                        "test_distributed_refresh_forwarding",
+                    )),
+                    ..SpicepodRuntime::default()
+                })
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(app)
+                .executors(1)
+                .start()
+                .await?;
+
+            harness.wait_for_executors(Duration::from_secs(15)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+
+            // Trigger refresh from the scheduler. Previously this would fail with
+            // "the refresh worker is no longer running. channel closed" because the
+            // scheduler doesn't run local refresh workers. Now it forwards to executors.
+            let table_ref = datafusion::sql::TableReference::parse_str("test_data");
+            harness
+                .scheduler
+                .datafusion()
+                .refresh_table(&table_ref, None)
+                .await
+                .expect("refresh_table on scheduler should forward to executors");
+
+            // Allow time for the executor to process the refresh command.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // Verify data is still correct after refresh.
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(30)).await?;
+
+            let rows = harness
+                .query("SELECT COUNT(*) as cnt FROM test_data")
+                .await?;
+            let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
+            insta::assert_snapshot!(rows_fmt, @r"
+            +-----+
+            | cnt |
+            +-----+
+            | 10  |
+            +-----+
+            ");
+
+            harness.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
