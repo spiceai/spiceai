@@ -23,16 +23,16 @@ use std::{
 use datafusion::{
     arrow::datatypes::SchemaRef,
     common::{
-        Result, ToDFSchema,
         tree_node::{Transformed, TransformedResult},
+        Result, ToDFSchema,
     },
     config::ConfigOptions,
     datasource::{DefaultTableSource, TableProvider},
     error::DataFusionError,
     execution::SessionState,
     logical_expr::{
-        EmptyRelation, Expr, FetchType, Limit, LogicalPlan, LogicalPlanBuilder, SkipType, Sort,
-        TableScan, Union, lit,
+        lit, EmptyRelation, Expr, FetchType, Limit, LogicalPlan, LogicalPlanBuilder, SkipType,
+        Sort, TableScan, Union,
     },
     optimizer::AnalyzerRule,
     prelude::SessionContext,
@@ -252,7 +252,7 @@ fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, D
         }
     };
 
-    let (FetchType::Literal(Some(fetch))) = limit.get_fetch_type()? else {
+    let FetchType::Literal(Some(fetch)) = limit.get_fetch_type()? else {
         return Ok(Transformed::no(LogicalPlan::Limit(limit)));
     };
     let SkipType::Literal(skip) = limit.get_skip_type()? else {
@@ -337,7 +337,7 @@ mod tests {
     use datafusion::{
         arrow::datatypes::{DataType, Field, Schema},
         datasource::empty::EmptyTable,
-        logical_expr::{LogicalPlanBuilder, SortExpr, col},
+        logical_expr::{col, LogicalPlanBuilder, SortExpr},
         prelude::SessionContext,
     };
     use std::collections::HashMap;
