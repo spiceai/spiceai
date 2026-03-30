@@ -664,7 +664,7 @@ impl TableProvider for DynamoDBTableProvider {
                 partition_key: self.table_schema.partition_key().to_string(),
                 sort_key: self.table_schema.sort_key().map(ToString::to_string),
                 time_format: self.table_schema.time_format(),
-                filters: filters,
+                filters,
                 parallelism: self.write_parallelism,
             },
         ))))
