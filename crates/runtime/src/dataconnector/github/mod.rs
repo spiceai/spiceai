@@ -87,6 +87,10 @@ static UNAUTHENTICATED_AUTH_CONTEXT: &str = "unauthenticated";
 const GITHUB_CONNECTOR_DOCS_URL: &str =
     "https://spiceai.org/docs/components/data-connectors/github";
 
+fn sanitize_github_validation_body(body: &str) -> String {
+    body.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 async fn get_github_auth_context_rate_controller(auth_context: String) -> Arc<RateController> {
     let rate_controllers = GITHUB_AUTH_CONTEXT_RATE_CONTROLLERS.read().await;
     if let Some(controller) = rate_controllers.get(&auth_context) {
@@ -196,8 +200,8 @@ impl Github {
                 let body = resp
                     .text()
                     .await
-                    .unwrap_or_else(|_| "Unable to read response body".to_string())
-                    .replace('\n', " ");
+                    .unwrap_or_else(|_| "Unable to read response body".to_string());
+                let body = sanitize_github_validation_body(&body);
                 tracing::error!(
                     "GitHub App installation validation failed for {target} (resource: {resource_type}, installation_id: {installation_id}, status: {status}): {body}"
                 );
@@ -209,8 +213,8 @@ impl Github {
                 let body = resp
                     .text()
                     .await
-                    .unwrap_or_else(|_| "Unable to read response body".to_string())
-                    .replace('\n', " ");
+                    .unwrap_or_else(|_| "Unable to read response body".to_string());
+                let body = sanitize_github_validation_body(&body);
                 tracing::error!(
                     "GitHub App installation validation could not find {target} (installation_id: {installation_id}): {body}"
                 );
@@ -223,8 +227,8 @@ impl Github {
                 let body = resp
                     .text()
                     .await
-                    .unwrap_or_else(|_| "Unable to read response body".to_string())
-                    .replace('\n', " ");
+                    .unwrap_or_else(|_| "Unable to read response body".to_string());
+                let body = sanitize_github_validation_body(&body);
                 tracing::error!(
                     "GitHub App installation validation failed for {target} (installation_id: {installation_id}, status: {status}): {body}"
                 );
@@ -1665,7 +1669,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::parse_github_path;
+    use super::{parse_github_path, sanitize_github_validation_body};
+
+    #[test]
+    fn test_sanitize_github_validation_body_normalizes_crlf() {
+        assert_eq!(
+            sanitize_github_validation_body("first line\r\nsecond\nthird\tfourth"),
+            "first line second third fourth"
+        );
+    }
 
     #[test]
     fn test_parse_github_path_preserves_commits_ref_suffix() {

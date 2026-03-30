@@ -358,6 +358,8 @@ async fn test_github_commits() -> Result<(), String> {
                 &mut rt,
                 "test_github_commits_auto",
                 "SELECT * FROM spiceai_commits_auto LIMIT 10",
+                // This live GitHub test can time out during dataset initialization before EXPLAIN
+                // runs, so plan snapshots remain disabled until the setup is made deterministic.
                 false,
                 Some(Box::new(|result_batches| {
                     let mut row_count = 0;
