@@ -12,6 +12,7 @@ on:
       - release-*
       - release/*
       - feature-*
+  merge_group:
 
   workflow_dispatch:
     inputs:
