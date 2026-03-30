@@ -105,19 +105,20 @@ impl Drop for Adbc {
         if let Some(factory) = self.adbc_factory.take() {
             // Send to the dedicated cleanup thread so we don't stall the Tokio
             // runtime. If the bounded queue is full or the worker is gone,
-            // drop inline as a last resort.
+            // offload to a dedicated overflow thread instead of dropping inline.
             match adbc_cleanup_sender().try_send(factory) {
                 Ok(()) => {}
                 Err(std::sync::mpsc::TrySendError::Full(factory)) => {
-                    tracing::warn!(
-                        "ADBC cleanup queue full; dropping inline to avoid unbounded backlog"
+                    offload_adbc_factory_drop(
+                        factory,
+                        "ADBC cleanup queue full; offloading drop to overflow thread",
                     );
-                    drop(factory);
                 }
                 Err(std::sync::mpsc::TrySendError::Disconnected(factory)) => {
-                    tracing::warn!("ADBC cleanup channel closed; dropping inline");
-                    // Explicitly drop the factory so the fallback is unambiguous.
-                    drop(factory);
+                    offload_adbc_factory_drop(
+                        factory,
+                        "ADBC cleanup channel closed; offloading drop to overflow thread",
+                    );
                 }
             }
         }
@@ -125,6 +126,22 @@ impl Drop for Adbc {
 }
 
 const ADBC_CLEANUP_QUEUE_CAPACITY: usize = 64;
+
+fn offload_adbc_factory_drop(
+    factory: AdbcTableFactory<adbc_driver_manager::ManagedDatabase>,
+    reason: &str,
+) {
+    tracing::warn!("{reason}");
+    if std::thread::Builder::new()
+        .name("adbc-cleanup-overflow".to_string())
+        .spawn(move || {
+            drop(factory);
+        })
+        .is_err()
+    {
+        tracing::warn!("Failed to spawn overflow ADBC cleanup thread; dropping inline");
+    }
+}
 
 /// Returns a sender for offloading ADBC factory cleanup to a dedicated
 /// background thread. The worker thread is created once (on first use) and
