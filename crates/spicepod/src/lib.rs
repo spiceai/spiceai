@@ -880,6 +880,7 @@ mod version_tests {
         assert_eq!(pm.max_assignments_per_cycle, 100);
         assert_eq!(pm.max_partitions_per_executor, 1000);
         assert_eq!(pm.discovery_timeout, "60s");
+        assert_eq!(pm.change_watch_interval, "3s");
     }
 
     /// `read_write_create` access mode deserializes.

@@ -740,10 +740,14 @@ pub struct PartitionManagement {
 
     #[serde(default = "default_discovery_timeout")]
     pub discovery_timeout: String,
+
+    /// How often to poll the change signal file for cross-scheduler cache invalidation.
+    #[serde(default = "default_change_watch_interval")]
+    pub change_watch_interval: String,
 }
 
 fn default_partition_management_interval() -> String {
-    "10s".to_string()
+    "30s".to_string()
 }
 
 fn default_max_assignments_per_cycle() -> usize {
@@ -758,6 +762,10 @@ fn default_discovery_timeout() -> String {
     "60s".to_string()
 }
 
+fn default_change_watch_interval() -> String {
+    "3s".to_string()
+}
+
 impl Default for PartitionManagement {
     fn default() -> Self {
         Self {
@@ -765,6 +773,7 @@ impl Default for PartitionManagement {
             max_assignments_per_cycle: default_max_assignments_per_cycle(),
             max_partitions_per_executor: default_max_partitions_per_executor(),
             discovery_timeout: default_discovery_timeout(),
+            change_watch_interval: default_change_watch_interval(),
         }
     }
 }

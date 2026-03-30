@@ -862,6 +862,8 @@ pub(crate) async fn initialize_cluster_scheduler_future(
             rt.status
                 .update_component_status("partition_metadata", ComponentStatus::Initializing);
 
+            let watch_interval = pm_config.change_watch_interval;
+
             let pm_task = PartitionManagementTask::new(
                 rt.app(),
                 rt.datafusion(),
@@ -891,11 +893,11 @@ pub(crate) async fn initialize_cluster_scheduler_future(
             // Start partition change watchers for fast cross-scheduler metadata propagation.
             // Polls lightweight signal files to detect partition changes made by peer schedulers.
             change_watch_handles
-                .push(partition_manager.spawn_change_watcher(Duration::from_secs(3)));
+                .push(partition_manager.spawn_change_watcher(watch_interval));
             change_watch_handles.push(
                 scheduler_executor_registry
                     .federated_partition_manager()
-                    .spawn_change_watcher(Duration::from_secs(3)),
+                    .spawn_change_watcher(watch_interval),
             );
         }
 

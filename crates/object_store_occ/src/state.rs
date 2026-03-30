@@ -450,7 +450,7 @@ where
     ///
     /// [`conditional_refresh`]: Self::conditional_refresh
     pub fn spawn_change_watcher(self: &Arc<Self>, poll_interval: Duration) -> ChangeWatchHandle {
-        let signal_path = Path::from(format!("{}__signal.json", self.prefix));
+        let signal_path = Path::from(format!("{}__signal", self.prefix));
         // Enable signaling: subsequent writes will auto-publish to this path
         *self.signal_path.write() = Some(signal_path.clone());
 
@@ -892,7 +892,7 @@ mod tests {
             Arc::new(ObjectState::new(Arc::clone(&store)).with_prefix("test/"));
 
         // No signal file before watcher is spawned
-        let signal_path = Path::from("test/__signal.json");
+        let signal_path = Path::from("test/__signal");
         assert!(store.head(&signal_path).await.is_err());
 
         // Spawn watcher — this enables signaling

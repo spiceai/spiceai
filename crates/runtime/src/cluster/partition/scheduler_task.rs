@@ -109,6 +109,9 @@ pub struct PartitionManagementConfig {
 
     /// How long to wait for partition discovery before timing out
     pub discovery_timeout: Duration,
+
+    /// How often to poll the change signal file for cross-scheduler cache invalidation
+    pub change_watch_interval: Duration,
 }
 
 #[derive(Debug, Snafu)]
@@ -130,6 +133,17 @@ pub enum ConfigError {
 
     #[snafu(display("Partition management discovery timeout must be greater than zero"))]
     DiscoveryTimeoutIsZero,
+
+    #[snafu(display(
+        "Invalid partition management change watch interval '{interval}': {source}"
+    ))]
+    InvalidChangeWatchInterval {
+        interval: String,
+        source: fundu::ParseError,
+    },
+
+    #[snafu(display("Partition management change watch interval must be greater than zero"))]
+    ChangeWatchIntervalIsZero,
 }
 
 impl TryFrom<spicepod::component::runtime::PartitionManagement> for PartitionManagementConfig {
@@ -156,11 +170,23 @@ impl TryFrom<spicepod::component::runtime::PartitionManagement> for PartitionMan
             return Err(ConfigError::DiscoveryTimeoutIsZero);
         }
 
+        let change_watch_interval =
+            fundu::parse_duration(&config.change_watch_interval).context(
+                InvalidChangeWatchIntervalSnafu {
+                    interval: &config.change_watch_interval,
+                },
+            )?;
+
+        if change_watch_interval.is_zero() {
+            return Err(ConfigError::ChangeWatchIntervalIsZero);
+        }
+
         Ok(Self {
             interval,
             max_assignments_per_cycle: config.max_assignments_per_cycle,
             max_partitions_per_executor: config.max_partitions_per_executor,
             discovery_timeout,
+            change_watch_interval,
         })
     }
 }
@@ -172,6 +198,7 @@ impl Default for PartitionManagementConfig {
             max_assignments_per_cycle: 100,
             max_partitions_per_executor: 1000,
             discovery_timeout: Duration::from_secs(60),
+            change_watch_interval: Duration::from_secs(3),
         }
     }
 }
