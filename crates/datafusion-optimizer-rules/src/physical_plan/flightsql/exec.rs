@@ -469,7 +469,10 @@ fn build_aggregate_sql(
     // WHERE clause from source filters
     let where_clauses: Vec<String> = source_filters
         .iter()
-        .map(|f| expr_to_sql::to_sql(f).map_err(|e| DataFusionError::Internal(e.to_string())))
+        .map(|f| {
+            expr_to_sql::to_sql_preserving_precedence(f)
+                .map_err(|e| DataFusionError::Internal(e.to_string()))
+        })
         .collect::<Result<Vec<_>>>()?;
 
     let stmt = SelectStatement {
