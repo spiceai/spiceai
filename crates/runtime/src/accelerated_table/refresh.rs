@@ -1008,8 +1008,12 @@ impl Refresher {
                 tokio::spawn(async move {
                     runtime_status_clone.wait_for_ready().await;
                     if !bootstrap_status.is_bootstrapped() {
-                        let refresh_sql =
-                            refresh_clone.read().await.sql.as_ref().map(RefreshSQL::to_sql);
+                        let refresh_sql = refresh_clone
+                            .read()
+                            .await
+                            .sql
+                            .as_ref()
+                            .map(RefreshSQL::to_sql);
                         create_checkpoint_and_snapshot(
                             &checkpointer,
                             snapshot_manager_clone.as_ref(),
