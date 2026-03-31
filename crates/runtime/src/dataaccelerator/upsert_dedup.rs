@@ -169,6 +169,15 @@ impl TableProvider for UpsertDedupTableProvider {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         self.inner.delete_from(state, filters).await
     }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.inner.update(state, assignments, filters).await
+    }
 }
 
 /// An execution plan that applies deduplication to batches before passing them downstream.
@@ -341,5 +350,102 @@ pub fn wrap_with_upsert_dedup_if_needed<T: TableProvider + 'static, S: std::hash
         ))
     } else {
         provider
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::Constraints;
+    use datafusion::prelude::SessionContext;
+    use datafusion_table_providers::util::constraints::UpsertOptions;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A mock `TableProvider` that records whether `update()` was called.
+    #[derive(Debug)]
+    struct MockUpdateProvider {
+        schema: SchemaRef,
+        update_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl TableProvider for MockUpdateProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            Err(DataFusionError::NotImplemented("scan".to_string()))
+        }
+        async fn update(
+            &self,
+            _state: &dyn Session,
+            _assignments: Vec<(String, Expr)>,
+            _filters: Vec<Expr>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            self.update_called.store(true, Ordering::SeqCst);
+            Err(DataFusionError::NotImplemented(
+                "mock update reached".to_string(),
+            ))
+        }
+    }
+
+    /// Verify that `UpsertDedupTableProvider` delegates `update()` to the inner
+    /// provider instead of falling through to `DataFusion`'s default.
+    #[tokio::test]
+    async fn test_update_delegates_to_inner() {
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+
+        let update_called = Arc::new(AtomicBool::new(false));
+        let mock = Arc::new(MockUpdateProvider {
+            schema,
+            update_called: Arc::clone(&update_called),
+        });
+
+        let upsert_provider = UpsertDedupTableProvider::new(
+            mock,
+            UpsertOptions {
+                remove_duplicates: true,
+                last_write_wins: false,
+            },
+            Constraints::new_unverified(vec![]),
+        );
+
+        let state = ctx.state();
+        let result = upsert_provider
+            .update(
+                &state,
+                vec![("value".to_string(), datafusion::logical_expr::lit("new"))],
+                vec![],
+            )
+            .await;
+
+        assert!(
+            update_called.load(Ordering::SeqCst),
+            "UpsertDedupTableProvider::update() must delegate to the inner provider"
+        );
+        let err = result.expect_err(
+            "UpsertDedupTableProvider::update() should surface the inner provider error",
+        );
+        assert!(
+            err.to_string().contains("mock update reached"),
+            "Error should come from the mock inner provider, not DataFusion default"
+        );
     }
 }

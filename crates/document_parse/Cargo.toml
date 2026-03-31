@@ -9,7 +9,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-docx-rs = { git = "https://github.com/spiceai/docx-rs", rev="508456cf36bbc1ae5f381d24b03f0a993703e3ee"}
+docx-rs = { git = "https://github.com/spiceai/docx-rs", rev="2a85dce57d0128e2cd7c369545516c347cb8c529"}
 pdf-extract = { git = "https://github.com/spiceai/pdf-extract", rev = "3ca5e2c904cdf5897f3d671e3b2c4b62b1612b0c" }
 snafu.workspace = true
 bytes.workspace = true
