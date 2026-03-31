@@ -134,11 +134,10 @@ async fn test_file_watcher() -> Result<(), anyhow::Error> {
                     break batches;
                 }
 
-                if start.elapsed() > std::time::Duration::from_secs(30) {
-                    panic!(
-                        "Timed out waiting for file watcher refresh (got {row_count} rows, expected 11)"
-                    );
-                }
+                assert!(
+                    start.elapsed() <= std::time::Duration::from_secs(30),
+                    "Timed out waiting for file watcher refresh (got {row_count} rows, expected 11)"
+                );
 
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             };

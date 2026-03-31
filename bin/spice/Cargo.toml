@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 # CLI framework
 clap.workspace = true
+clap_complete = "4"
 
 # Async runtime
 tokio.workspace = true
@@ -119,3 +120,4 @@ assert_cmd = "2"
 predicates = "3"
 rstest = "0.26.1"
 tempfile.workspace = true
+wiremock = "0.6"

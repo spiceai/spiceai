@@ -32,10 +32,30 @@ use arrow::array::{Float64Array, Int64Array, RecordBatch};
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
-use runtime::config::Config;
+use runtime::cluster::ResolvedClusterConfig;
+use runtime::config::{ClusterConfig, ClusterRole, Config};
 use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
 use spicepod::param::Params;
+
+/// Creates a [`ResolvedClusterConfig`] with Executor role for tests.
+///
+/// Cayenne catalogs require distributed mode. Using the Executor role enables
+/// distributed-mode checks in the planner while avoiding scheduler-only
+/// distributed DML rewrites in these tests; Cayenne DDL rewriting via
+/// `CayenneDdlAnalyzerRule` is not gated on the cluster role.
+fn test_cluster_config() -> ResolvedClusterConfig {
+    ResolvedClusterConfig::try_new(ClusterConfig {
+        role: Some(ClusterRole::Executor),
+        allow_insecure_connections: true,
+        node_advertise_address: Some("127.0.0.1".to_string()),
+        ..Default::default()
+    })
+    .expect(
+        "failed to build Cayenne catalog DDL test ResolvedClusterConfig; expected Executor role, \
+         allow_insecure_connections = true, and node_advertise_address to be set",
+    )
+}
 
 /// Helper to run a SQL query against the runtime and collect results.
 async fn run_query(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, String> {
@@ -118,6 +138,7 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -143,8 +164,9 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
                     id BIGINT NOT NULL,
                     name VARCHAR NOT NULL,
                     email VARCHAR,
-                    age BIGINT
-                )",
+                    age BIGINT,
+                    PRIMARY KEY (id)
+                ) PARTITION BY id",
             )
             .await?;
 
@@ -537,6 +559,7 @@ async fn cayenne_catalog_ddl_create_if_not_exists() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -553,7 +576,7 @@ async fn cayenne_catalog_ddl_create_if_not_exists() -> Result<(), String> {
             exec(&rt, "CREATE SCHEMA cat_idempotent.s1").await?;
             exec(
                 &rt,
-                "CREATE TABLE cat_idempotent.s1.t1 (id BIGINT NOT NULL, val BIGINT)",
+                "CREATE TABLE cat_idempotent.s1.t1 (id BIGINT NOT NULL, val BIGINT) PARTITION BY id",
             )
             .await?;
 
@@ -563,7 +586,7 @@ async fn cayenne_catalog_ddl_create_if_not_exists() -> Result<(), String> {
             // CREATE TABLE IF NOT EXISTS should not fail or drop data.
             exec(
                 &rt,
-                "CREATE TABLE IF NOT EXISTS cat_idempotent.s1.t1 (id BIGINT NOT NULL, val BIGINT)",
+                "CREATE TABLE IF NOT EXISTS cat_idempotent.s1.t1 (id BIGINT NOT NULL, val BIGINT) PARTITION BY id",
             )
             .await?;
 
@@ -620,6 +643,7 @@ async fn cayenne_catalog_ddl_multiple_tables() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -642,7 +666,7 @@ async fn cayenne_catalog_ddl_multiple_tables() -> Result<(), String> {
                     product_id BIGINT NOT NULL,
                     name VARCHAR NOT NULL,
                     price DOUBLE NOT NULL
-                )",
+                ) PARTITION BY product_id",
             )
             .await?;
 
@@ -652,7 +676,7 @@ async fn cayenne_catalog_ddl_multiple_tables() -> Result<(), String> {
                     order_id BIGINT NOT NULL,
                     product_id BIGINT NOT NULL,
                     quantity BIGINT NOT NULL
-                )",
+                ) PARTITION BY order_id",
             )
             .await?;
 
@@ -772,6 +796,7 @@ async fn cayenne_catalog_ddl_drop_table() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -788,7 +813,7 @@ async fn cayenne_catalog_ddl_drop_table() -> Result<(), String> {
             exec(&rt, "CREATE SCHEMA cat_drop.ns").await?;
             exec(
                 &rt,
-                "CREATE TABLE cat_drop.ns.ephemeral (id BIGINT NOT NULL)",
+                "CREATE TABLE cat_drop.ns.ephemeral (id BIGINT NOT NULL) PARTITION BY id",
             )
             .await?;
 
@@ -813,7 +838,7 @@ async fn cayenne_catalog_ddl_drop_table() -> Result<(), String> {
             // Re-create the table — should work fine.
             exec(
                 &rt,
-                "CREATE TABLE cat_drop.ns.ephemeral (id BIGINT NOT NULL, val VARCHAR)",
+                "CREATE TABLE cat_drop.ns.ephemeral (id BIGINT NOT NULL, val VARCHAR) PARTITION BY id",
             )
             .await?;
 
@@ -865,6 +890,7 @@ async fn cayenne_catalog_ddl_primary_key_upsert() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -890,7 +916,7 @@ async fn cayenne_catalog_ddl_primary_key_upsert() -> Result<(), String> {
                     name VARCHAR NOT NULL,
                     email VARCHAR,
                     PRIMARY KEY (id)
-                )",
+                ) PARTITION BY id",
             )
             .await?;
 
@@ -1057,6 +1083,7 @@ async fn cayenne_catalog_ddl_multiple_schemas() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -1077,12 +1104,12 @@ async fn cayenne_catalog_ddl_multiple_schemas() -> Result<(), String> {
             // Create tables with the same name in different schemas.
             exec(
                 &rt,
-                "CREATE TABLE cat_schemas.finance.records (id BIGINT NOT NULL, amount DOUBLE)",
+                "CREATE TABLE cat_schemas.finance.records (id BIGINT NOT NULL, amount DOUBLE) PARTITION BY id",
             )
             .await?;
             exec(
                 &rt,
-                "CREATE TABLE cat_schemas.hr.records (id BIGINT NOT NULL, employee VARCHAR)",
+                "CREATE TABLE cat_schemas.hr.records (id BIGINT NOT NULL, employee VARCHAR) PARTITION BY id",
             )
             .await?;
 

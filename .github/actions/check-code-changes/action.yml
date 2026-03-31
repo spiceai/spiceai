@@ -29,6 +29,7 @@ runs:
       with:
         filters: |
           code_changes:
+            - '.github/**'
             - 'crates/**'
             - 'bin/**'
             - 'test/**'

@@ -59,6 +59,7 @@ on:
           - 'mysql-catalog'
           - 'mssql-catalog'
           - 'turso'
+          - 'bigquery'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -496,7 +497,7 @@ jobs:
           **Profile:** \`${{ github.event.inputs.profile_option || 'release' }}\`
           EOF
           )
-              gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base trunk --head ${BRANCH_NAME} --label kind/bug
+              gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base develop --head ${BRANCH_NAME} --label kind/bug
               gh pr merge --squash --auto ${BRANCH_NAME}
             fi
           fi
