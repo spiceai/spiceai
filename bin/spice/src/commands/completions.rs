@@ -50,33 +50,30 @@ pub fn execute(args: &CompletionsArgs, cmd: &mut clap::Command) {
     let mut buf = Vec::new();
     clap_complete::generate(shell, cmd, "spice", &mut buf);
 
-    match completion_path(shell) {
-        Some((path, post_install_msg)) => {
-            if let Some(parent) = path.parent()
-                && let Err(e) = std::fs::create_dir_all(parent)
-            {
-                eprintln!("Failed to create directory {}: {e}", parent.display());
-                std::process::exit(1);
-            }
-
-            if let Err(e) = std::fs::write(&path, &buf) {
-                eprintln!("Failed to write completions to {}: {e}", path.display());
-                std::process::exit(1);
-            }
-
-            println!("Completions for {shell} written to {}", path.display());
-            if let Some(msg) = post_install_msg {
-                println!("\n{msg}");
-            }
+    if let Some((path, post_install_msg)) = completion_path(shell) {
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("Failed to create directory {}: {e}", parent.display());
+            std::process::exit(1);
         }
-        None => {
-            eprintln!("No standard completion directory for {shell}. Printing to stdout.");
-            eprintln!("Add the output to your shell profile to enable completions.\n");
-            std::io::Write::write_all(&mut std::io::stdout(), &buf).unwrap_or_else(|e| {
-                eprintln!("Failed to write to stdout: {e}");
-                std::process::exit(1);
-            });
+
+        if let Err(e) = std::fs::write(&path, &buf) {
+            eprintln!("Failed to write completions to {}: {e}", path.display());
+            std::process::exit(1);
         }
+
+        println!("Completions for {shell} written to {}", path.display());
+        if let Some(msg) = post_install_msg {
+            println!("\n{msg}");
+        }
+    } else {
+        eprintln!("No standard completion directory for {shell}. Printing to stdout.");
+        eprintln!("Add the output to your shell profile to enable completions.\n");
+        std::io::Write::write_all(&mut std::io::stdout(), &buf).unwrap_or_else(|e| {
+            eprintln!("Failed to write to stdout: {e}");
+            std::process::exit(1);
+        });
     }
 }
 
@@ -301,8 +298,7 @@ mod tests {
                 Shell::Elvish,
                 Shell::PowerShell,
             ] {
-                let (_, msg) =
-                    completion_path(shell).expect("completion_path should return Some");
+                let (_, msg) = completion_path(shell).expect("completion_path should return Some");
                 assert!(msg.is_some(), "{shell} should have a post-install message");
             }
         });
