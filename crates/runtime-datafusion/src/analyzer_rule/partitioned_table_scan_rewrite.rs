@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use std::{
-    cell::Cell,
     collections::HashMap,
     fmt::Debug,
     sync::{Arc, Weak},
@@ -23,16 +22,16 @@ use std::{
 use datafusion::{
     arrow::datatypes::SchemaRef,
     common::{
-        tree_node::{Transformed, TransformedResult},
         Result, ToDFSchema,
+        tree_node::{Transformed, TransformedResult},
     },
     config::ConfigOptions,
     datasource::{DefaultTableSource, TableProvider},
     error::DataFusionError,
     execution::SessionState,
     logical_expr::{
-        lit, EmptyRelation, Expr, FetchType, Limit, LogicalPlan, LogicalPlanBuilder, SkipType,
-        Sort, TableScan, Union,
+        EmptyRelation, Expr, FetchType, Limit, LogicalPlan, LogicalPlanBuilder, Projection,
+        SkipType, Sort, SubqueryAlias, TableScan, Union, lit,
     },
     optimizer::AnalyzerRule,
     prelude::SessionContext,
@@ -73,8 +72,9 @@ pub trait TablePartitionProvider: Send + Sync + Debug {
 /// An [`AnalyzerRule`] that rewrites table scans on a single locally registered table as the
 /// `UNION ALL` of one or more partitions of this table (possibly from a different source).
 ///
-/// Additionally, when a `Limit -> Sort -> Union` pattern is created by this rewrite, it pushes
-/// `Sort(TopK)` into each union leg so that each partition returns at most `skip + fetch` rows.
+/// Additionally, when a `Limit -> [Projection|SubqueryAlias]* -> Sort -> [Projection|SubqueryAlias]* -> Union`
+/// pattern is created by this rewrite, it pushes `Sort(TopK)` into each union leg so that each
+/// partition returns at most `skip + fetch` rows.
 ///
 /// For example, suppose we want to partition `sales`. We go from this:
 ///
@@ -206,10 +206,8 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
             // Sort(TopK) through Union. Without this, each executor returns all rows
             // and the scheduler sorts the full merged result.
             // Only attempt this when the partition rewrite created a union above.
-            if rewrite_occurred {
-                if let LogicalPlan::Limit(limit) = plan {
-                    return push_sort_topk_into_union(limit);
-                }
+            if rewrite_occurred && let LogicalPlan::Limit(limit) = plan {
+                return push_sort_topk_into_union(limit);
             }
 
             Ok(Transformed::no(plan))
@@ -222,15 +220,35 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
     }
 }
 
-/// When `Limit -> Sort -> [Projection|SubqueryAlias]* -> Union(sub_scans)`, push
-/// `Sort(fetch = skip + fetch)` into each union leg. This enables per-executor `TopK`,
+/// When `Limit -> [Projection|SubqueryAlias]* -> Sort -> [Projection|SubqueryAlias]* -> Union(sub_scans)`,
+/// push `Sort(fetch = skip + fetch)` into each union leg. This enables per-executor `TopK`,
 /// reducing data transfer from executors to the scheduler.
 ///
-/// The outer `Limit -> Sort` and any intermediate nodes (Projection, SubqueryAlias) are
+/// The outer `Limit -> Sort` and any intermediate nodes (`Projection`, `SubqueryAlias`) are
 /// preserved for correct final merge-sort, projection, and limiting.
+///
+/// Projection nodes may appear between Limit and Sort when the SELECT list differs from
+/// the columns required by ORDER BY (e.g. `SELECT id, name ... ORDER BY score`). The
+/// planner adds a Projection to drop the sort-only column (`score`) above the Sort.
 fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, DataFusionError> {
-    let LogicalPlan::Sort(sort) = limit.input.as_ref() else {
-        return Ok(Transformed::no(LogicalPlan::Limit(limit)));
+    // Walk through Projection and SubqueryAlias to find Sort below Limit.
+    // These nodes may appear between Limit and Sort when the SELECT list
+    // differs from the columns required by ORDER BY.
+    let mut current = limit.input.as_ref();
+    let mut above_sort_intermediates: Vec<&LogicalPlan> = Vec::new();
+    let sort = loop {
+        match current {
+            LogicalPlan::Sort(s) => break s,
+            LogicalPlan::Projection(p) => {
+                above_sort_intermediates.push(current);
+                current = p.input.as_ref();
+            }
+            LogicalPlan::SubqueryAlias(sa) => {
+                above_sort_intermediates.push(current);
+                current = sa.input.as_ref();
+            }
+            _ => return Ok(Transformed::no(LogicalPlan::Limit(limit))),
+        }
     };
 
     // Walk through Projection and SubqueryAlias nodes to find the Union.
@@ -240,13 +258,13 @@ fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, D
     let union_plan = loop {
         match current {
             LogicalPlan::Union(u) => break u,
-            LogicalPlan::Projection(p) => {
+            LogicalPlan::Projection(Projection { input, .. }) => {
                 intermediates.push(current);
-                current = p.input.as_ref();
+                current = input.as_ref();
             }
-            LogicalPlan::SubqueryAlias(sa) => {
+            LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => {
                 intermediates.push(current);
-                current = sa.input.as_ref();
+                current = input.as_ref();
             }
             _ => return Ok(Transformed::no(LogicalPlan::Limit(limit))),
         }
@@ -274,14 +292,34 @@ fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, D
         })
         .collect();
 
-    // Rebuild: new Union → intermediate nodes (reversed) → Sort → Limit.
+    // Rebuild: Union → intermediates (Sort↔Union) → Sort → above_sort intermediates → Limit.
     let mut result = LogicalPlan::Union(Union {
         inputs: new_inputs,
         schema: Arc::clone(&union_plan.schema),
     });
 
-    // Re-wrap intermediate nodes in reverse (innermost-first) order.
+    // Re-wrap intermediate nodes between Sort and Union in reverse (innermost-first) order.
     for node in intermediates.into_iter().rev() {
+        result = match node {
+            LogicalPlan::SubqueryAlias(sa) => LogicalPlanBuilder::from(result)
+                .alias(sa.alias.clone())?
+                .build()?,
+            LogicalPlan::Projection(p) => LogicalPlanBuilder::from(result)
+                .project(p.expr.clone())?
+                .build()?,
+            _ => unreachable!("only Projection and SubqueryAlias are collected"),
+        };
+    }
+
+    // Re-add the Sort node.
+    result = LogicalPlan::Sort(Sort {
+        expr: sort.expr.clone(),
+        input: Arc::new(result),
+        fetch: sort.fetch,
+    });
+
+    // Re-wrap nodes between Limit and Sort in reverse (innermost-first) order.
+    for node in above_sort_intermediates.into_iter().rev() {
         result = match node {
             LogicalPlan::SubqueryAlias(sa) => LogicalPlanBuilder::from(result)
                 .alias(sa.alias.clone())?
@@ -296,11 +334,7 @@ fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, D
     Ok(Transformed::yes(LogicalPlan::Limit(Limit {
         skip: limit.skip.clone(),
         fetch: limit.fetch.clone(),
-        input: Arc::new(LogicalPlan::Sort(Sort {
-            expr: sort.expr.clone(),
-            input: Arc::new(result),
-            fetch: sort.fetch,
-        })),
+        input: Arc::new(result),
     })))
 }
 
@@ -337,7 +371,7 @@ mod tests {
     use datafusion::{
         arrow::datatypes::{DataType, Field, Schema},
         datasource::empty::EmptyTable,
-        logical_expr::{col, LogicalPlanBuilder, SortExpr},
+        logical_expr::{LogicalPlanBuilder, SortExpr, col},
         prelude::SessionContext,
     };
     use std::collections::HashMap;
@@ -522,6 +556,127 @@ mod tests {
                   Sort: test_table.id ASC NULLS LAST, fetch=5
                     TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
                   Sort: test_table.id ASC NULLS LAST, fetch=5
+                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+        "#);
+    }
+
+    /// Regression test for distributed queries with column projections.
+    ///
+    /// When `SELECT id, name FROM table ORDER BY score DESC LIMIT 3` is planned,
+    /// the planner creates `Limit -> Projection(id, name) -> Sort(score) -> TableScan`
+    /// because `score` is needed for ordering but not in the output. The Projection
+    /// between Limit and Sort must not prevent Sort(TopK) from being pushed into
+    /// union legs.
+    #[test]
+    fn test_limit_projection_above_sort_pushdown() {
+        let schema = test_schema();
+        let ctx = SessionContext::new();
+        let rule = make_rule(&schema, &ctx);
+
+        // Build: Limit(fetch=3) -> Projection(id, name) -> Sort(partition_id DESC) -> TableScan
+        // This represents: SELECT id, name FROM table ORDER BY partition_id DESC LIMIT 3
+        let scan = make_table_scan(&schema);
+        let plan = LogicalPlanBuilder::from(scan)
+            .sort(vec![SortExpr::new(col("partition_id"), false, true)])
+            .expect("sort failed")
+            .project(vec![col("id"), col("name")])
+            .expect("project failed")
+            .limit(0, Some(3))
+            .expect("limit failed")
+            .build()
+            .expect("build failed");
+
+        let result = rule
+            .analyze(plan, &ConfigOptions::default())
+            .expect("analyze failed");
+
+        // Sort(TopK) should be pushed into each union leg despite the Projection
+        // between Limit and Sort.
+        insta::assert_snapshot!(result.display_indent(), @r#"
+        Limit: skip=0, fetch=3
+          Projection: test_table.id, test_table.name
+            Sort: test_table.partition_id DESC NULLS FIRST
+              SubqueryAlias: test_table
+                Union
+                  Sort: test_table.partition_id DESC NULLS FIRST, fetch=3
+                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+                  Sort: test_table.partition_id DESC NULLS FIRST, fetch=3
+                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+        "#);
+    }
+
+    /// Test with both Projection above Sort AND Projection below Sort.
+    #[test]
+    fn test_limit_projection_above_and_below_sort_pushdown() {
+        let schema = test_schema();
+        let ctx = SessionContext::new();
+        let rule = make_rule(&schema, &ctx);
+
+        // Build: Limit(fetch=5) -> Projection(id) -> Sort(name ASC) -> Projection(id, name) -> TableScan
+        let scan = make_table_scan(&schema);
+        let plan = LogicalPlanBuilder::from(scan)
+            .project(vec![col("id"), col("name")])
+            .expect("inner project failed")
+            .sort(vec![SortExpr::new(col("name"), true, false)])
+            .expect("sort failed")
+            .project(vec![col("id")])
+            .expect("outer project failed")
+            .limit(0, Some(5))
+            .expect("limit failed")
+            .build()
+            .expect("build failed");
+
+        let result = rule
+            .analyze(plan, &ConfigOptions::default())
+            .expect("analyze failed");
+
+        insta::assert_snapshot!(result.display_indent(), @r#"
+        Limit: skip=0, fetch=5
+          Projection: test_table.id
+            Sort: test_table.name ASC NULLS LAST
+              Projection: test_table.id, test_table.name
+                SubqueryAlias: test_table
+                  Union
+                    Sort: test_table.name ASC NULLS LAST, fetch=5
+                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+                    Sort: test_table.name ASC NULLS LAST, fetch=5
+                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+        "#);
+    }
+
+    /// Test with offset and Projection above Sort.
+    #[test]
+    fn test_limit_with_offset_projection_above_sort_pushdown() {
+        let schema = test_schema();
+        let ctx = SessionContext::new();
+        let rule = make_rule(&schema, &ctx);
+
+        // Build: Limit(skip=5, fetch=3) -> Projection(id, name) -> Sort(partition_id DESC) -> TableScan
+        let scan = make_table_scan(&schema);
+        let plan = LogicalPlanBuilder::from(scan)
+            .sort(vec![SortExpr::new(col("partition_id"), false, true)])
+            .expect("sort failed")
+            .project(vec![col("id"), col("name")])
+            .expect("project failed")
+            .limit(5, Some(3))
+            .expect("limit failed")
+            .build()
+            .expect("build failed");
+
+        let result = rule
+            .analyze(plan, &ConfigOptions::default())
+            .expect("analyze failed");
+
+        // fetch pushed into union legs should be skip + fetch = 5 + 3 = 8
+        insta::assert_snapshot!(result.display_indent(), @r#"
+        Limit: skip=5, fetch=3
+          Projection: test_table.id, test_table.name
+            Sort: test_table.partition_id DESC NULLS FIRST
+              SubqueryAlias: test_table
+                Union
+                  Sort: test_table.partition_id DESC NULLS FIRST, fetch=8
+                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+                  Sort: test_table.partition_id DESC NULLS FIRST, fetch=8
                     TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
         "#);
     }
