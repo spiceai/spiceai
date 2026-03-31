@@ -643,4 +643,70 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Reproduces the exact bug from issue #9782: a stale cached schema causes
+    /// `ColumnNotFoundInSource` when the refresh SQL references a column that
+    /// was added after the schema was first cached.
+    #[test]
+    fn test_schema_evolution_refresh_sql_validation() {
+        let table: TableReference = "test_dataset".into();
+
+        // Stale cached schema — does not include the "resources" column
+        let stale_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        // Refresh SQL references "resources" which doesn't exist in the stale schema
+        let sql = "SELECT id, name, resources FROM test_dataset";
+        let result = parse_refresh_sql(table.clone(), sql, stale_schema);
+        assert!(
+            result.is_err(),
+            "Stale schema should fail when refresh SQL references a new column"
+        );
+
+        // Evolved schema — includes the "resources" column
+        let evolved_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("resources", DataType::Utf8, true),
+        ]));
+
+        let result = parse_refresh_sql(table, sql, evolved_schema);
+        assert!(
+            result.is_ok(),
+            "Evolved schema should pass when refresh SQL references all columns"
+        );
+    }
+
+    /// Verifies that `SELECT *` works correctly with both old and new schemas
+    /// (wildcard doesn't reference specific columns, so it won't fail on schema change).
+    #[test]
+    fn test_schema_evolution_wildcard_refresh_sql() {
+        let table: TableReference = "test_dataset".into();
+
+        let stale_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let sql = "SELECT * FROM test_dataset";
+        let result = parse_refresh_sql(table.clone(), sql, stale_schema);
+        assert!(
+            result.is_ok(),
+            "Wildcard SELECT should work with any schema"
+        );
+
+        let evolved_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("resources", DataType::Utf8, true),
+        ]));
+
+        let result = parse_refresh_sql(table, sql, evolved_schema);
+        assert!(
+            result.is_ok(),
+            "Wildcard SELECT should work with evolved schema"
+        );
+    }
 }

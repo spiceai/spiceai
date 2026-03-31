@@ -324,3 +324,434 @@ fn val_list_str<'a>(rb: &'a RecordBatch, col: usize, list_row: usize) -> &'a str
     // Safety: We know the value is valid for the lifetime of the record batch
     unsafe { std::mem::transmute::<&str, &'a str>(value) }
 }
+
+#[test]
+fn field_equality_same() {
+    use crate::debezium::change_event::Field;
+
+    let field_a = Field {
+        field_type: "int32".to_string(),
+        fields: None,
+        optional: false,
+        name: None,
+        field: Some("id".to_string()),
+        version: None,
+        parameters: None,
+        items: None,
+    };
+    let field_b = Field {
+        field_type: "int32".to_string(),
+        fields: None,
+        optional: false,
+        name: None,
+        field: Some("id".to_string()),
+        version: None,
+        parameters: None,
+        items: None,
+    };
+    assert_eq!(field_a, field_b);
+}
+
+#[test]
+fn field_equality_different_name() {
+    use crate::debezium::change_event::Field;
+
+    let field_a = Field {
+        field_type: "int32".to_string(),
+        fields: None,
+        optional: false,
+        name: None,
+        field: Some("id".to_string()),
+        version: None,
+        parameters: None,
+        items: None,
+    };
+    let field_b = Field {
+        field_type: "int32".to_string(),
+        fields: None,
+        optional: false,
+        name: None,
+        field: Some("user_id".to_string()),
+        version: None,
+        parameters: None,
+        items: None,
+    };
+    assert_ne!(field_a, field_b);
+}
+
+#[test]
+fn field_equality_different_type() {
+    use crate::debezium::change_event::Field;
+
+    let field_a = Field {
+        field_type: "int32".to_string(),
+        fields: None,
+        optional: false,
+        name: None,
+        field: Some("id".to_string()),
+        version: None,
+        parameters: None,
+        items: None,
+    };
+    let field_b = Field {
+        field_type: "int64".to_string(),
+        fields: None,
+        optional: false,
+        name: None,
+        field: Some("id".to_string()),
+        version: None,
+        parameters: None,
+        items: None,
+    };
+    assert_ne!(field_a, field_b);
+}
+
+#[test]
+fn detect_schema_evolution_added_column() {
+    use crate::debezium::change_event::Field;
+
+    let original_fields = vec![
+        Field {
+            field_type: "int32".to_string(),
+            fields: None,
+            optional: false,
+            name: None,
+            field: Some("id".to_string()),
+            version: None,
+            parameters: None,
+            items: None,
+        },
+        Field {
+            field_type: "string".to_string(),
+            fields: None,
+            optional: true,
+            name: None,
+            field: Some("name".to_string()),
+            version: None,
+            parameters: None,
+            items: None,
+        },
+    ];
+
+    // Source table adds a new column "resources"
+    let evolved_fields = vec![
+        Field {
+            field_type: "int32".to_string(),
+            fields: None,
+            optional: false,
+            name: None,
+            field: Some("id".to_string()),
+            version: None,
+            parameters: None,
+            items: None,
+        },
+        Field {
+            field_type: "string".to_string(),
+            fields: None,
+            optional: true,
+            name: None,
+            field: Some("name".to_string()),
+            version: None,
+            parameters: None,
+            items: None,
+        },
+        Field {
+            field_type: "string".to_string(),
+            fields: None,
+            optional: true,
+            name: None,
+            field: Some("resources".to_string()),
+            version: None,
+            parameters: None,
+            items: None,
+        },
+    ];
+
+    assert_ne!(original_fields, evolved_fields);
+}
+
+#[test]
+fn detect_schema_evolution_removed_column() {
+    use crate::debezium::change_event::Field;
+
+    let original_fields = vec![
+        Field {
+            field_type: "int32".to_string(),
+            fields: None,
+            optional: false,
+            name: None,
+            field: Some("id".to_string()),
+            version: None,
+            parameters: None,
+            items: None,
+        },
+        Field {
+            field_type: "string".to_string(),
+            fields: None,
+            optional: true,
+            name: None,
+            field: Some("name".to_string()),
+            version: None,
+            parameters: None,
+            items: None,
+        },
+        Field {
+            field_type: "string".to_string(),
+            fields: None,
+            optional: true,
+            name: None,
+            field: Some("deprecated_col".to_string()),
+            version: None,
+            parameters: None,
+            items: None,
+        },
+    ];
+
+    // Source table removes the "deprecated_col" column
+    let evolved_fields = vec![
+        Field {
+            field_type: "int32".to_string(),
+            fields: None,
+            optional: false,
+            name: None,
+            field: Some("id".to_string()),
+            version: None,
+            parameters: None,
+            items: None,
+        },
+        Field {
+            field_type: "string".to_string(),
+            fields: None,
+            optional: true,
+            name: None,
+            field: Some("name".to_string()),
+            version: None,
+            parameters: None,
+            items: None,
+        },
+    ];
+
+    assert_ne!(original_fields, evolved_fields);
+}
+
+#[test]
+fn no_false_schema_evolution_detection() {
+    use crate::debezium::change_event::Field;
+
+    let fields_a = vec![
+        Field {
+            field_type: "int32".to_string(),
+            fields: None,
+            optional: false,
+            name: None,
+            field: Some("id".to_string()),
+            version: None,
+            parameters: None,
+            items: None,
+        },
+        Field {
+            field_type: "string".to_string(),
+            fields: None,
+            optional: true,
+            name: None,
+            field: Some("name".to_string()),
+            version: None,
+            parameters: None,
+            items: None,
+        },
+    ];
+
+    let fields_b = fields_a.clone();
+    assert_eq!(fields_a, fields_b);
+}
+
+#[test]
+fn schema_evolution_arrow_conversion_with_new_column() {
+    let original_json = r#"{
+        "schema": {
+            "type": "struct",
+            "fields": [
+                {
+                    "type": "struct",
+                    "fields": [
+                        {"type": "int32", "optional": false, "field": "id"},
+                        {"type": "string", "optional": true, "field": "name"}
+                    ],
+                    "optional": true,
+                    "name": "Value",
+                    "field": "after"
+                }
+            ],
+            "optional": false,
+            "name": "Envelope"
+        },
+        "payload": {
+            "before": null,
+            "after": {"id": 1, "name": "test"},
+            "source": {"version": "2.0", "connector": "postgresql", "name": "test", "ts_ms": 0, "snapshot": "false", "db": "test", "table": "test"},
+            "op": "c",
+            "ts_ms": 0,
+            "transaction": null
+        }
+    }"#;
+
+    let evolved_json = r#"{
+        "schema": {
+            "type": "struct",
+            "fields": [
+                {
+                    "type": "struct",
+                    "fields": [
+                        {"type": "int32", "optional": false, "field": "id"},
+                        {"type": "string", "optional": true, "field": "name"},
+                        {"type": "string", "optional": true, "field": "resources"}
+                    ],
+                    "optional": true,
+                    "name": "Value",
+                    "field": "after"
+                }
+            ],
+            "optional": false,
+            "name": "Envelope"
+        },
+        "payload": {
+            "before": null,
+            "after": {"id": 2, "name": "test2", "resources": "new_resource"},
+            "source": {"version": "2.0", "connector": "postgresql", "name": "test", "ts_ms": 0, "snapshot": "false", "db": "test", "table": "test"},
+            "op": "c",
+            "ts_ms": 0,
+            "transaction": null
+        }
+    }"#;
+
+    let original_event: ChangeEvent =
+        serde_json::from_str(original_json).expect("to deserialize original event");
+    let evolved_event: ChangeEvent =
+        serde_json::from_str(evolved_json).expect("to deserialize evolved event");
+
+    let original_fields = original_event
+        .get_schema_fields()
+        .expect("to get original schema fields");
+    let evolved_fields = evolved_event
+        .get_schema_fields()
+        .expect("to get evolved schema fields");
+
+    // Schema fields should be different
+    assert_ne!(original_fields, evolved_fields);
+
+    // Both should produce valid Arrow schemas
+    let original_arrow =
+        convert_fields_to_arrow_schema(original_fields).expect("to convert original schema");
+    let evolved_arrow =
+        convert_fields_to_arrow_schema(evolved_fields).expect("to convert evolved schema");
+
+    assert_eq!(original_arrow.fields().len(), 2);
+    assert_eq!(evolved_arrow.fields().len(), 3);
+    assert_eq!(evolved_arrow.field(2).name(), "resources");
+}
+
+#[test]
+fn append_value_handles_missing_nullable_field() {
+    use super::arrow::to_record_batch;
+
+    // Schema has 3 columns: id (required), name (nullable), resources (nullable)
+    let event_json = r#"{
+        "schema": {
+            "type": "struct",
+            "fields": [
+                {
+                    "type": "struct",
+                    "fields": [
+                        {"type": "int32", "optional": false, "field": "id"},
+                        {"type": "string", "optional": true, "field": "name"},
+                        {"type": "string", "optional": true, "field": "resources"}
+                    ],
+                    "optional": true,
+                    "name": "Value",
+                    "field": "after"
+                }
+            ],
+            "optional": false,
+            "name": "Envelope"
+        },
+        "payload": {
+            "before": null,
+            "after": {"id": 1, "name": "test", "resources": "res1"},
+            "source": {"version": "2.0", "connector": "postgresql", "name": "test", "ts_ms": 0, "snapshot": "false", "db": "test", "table": "test"},
+            "op": "c",
+            "ts_ms": 0,
+            "transaction": null
+        }
+    }"#;
+    let event: ChangeEvent =
+        serde_json::from_str(event_json).expect("to deserialize event");
+    let fields = event
+        .get_schema_fields()
+        .expect("to get schema fields");
+    let arrow_schema =
+        convert_fields_to_arrow_schema(fields).expect("to convert schema");
+
+    // Value is missing the "resources" field (simulates a message from before the column was added)
+    let value_missing_field = serde_json::json!({"id": 2, "name": "test2"});
+
+    let result = to_record_batch(vec![value_missing_field], &arrow_schema);
+    assert!(
+        result.is_ok(),
+        "Should succeed with null for missing nullable field, got: {:?}",
+        result.err()
+    );
+    let rb = result.expect("record batch");
+    assert_eq!(rb.num_rows(), 1);
+    // The "resources" column should be null
+    assert!(rb.column(2).is_null(0));
+}
+
+#[test]
+fn append_value_errors_on_missing_required_field() {
+    use super::arrow::to_record_batch;
+
+    // Schema with a required (non-nullable) field "id"
+    let event_json = r#"{
+        "schema": {
+            "type": "struct",
+            "fields": [
+                {
+                    "type": "struct",
+                    "fields": [
+                        {"type": "int32", "optional": false, "field": "id"},
+                        {"type": "string", "optional": true, "field": "name"}
+                    ],
+                    "optional": true,
+                    "name": "Value",
+                    "field": "after"
+                }
+            ],
+            "optional": false,
+            "name": "Envelope"
+        },
+        "payload": {
+            "before": null,
+            "after": {"id": 1, "name": "test"},
+            "source": {"version": "2.0", "connector": "postgresql", "name": "test", "ts_ms": 0, "snapshot": "false", "db": "test", "table": "test"},
+            "op": "c",
+            "ts_ms": 0,
+            "transaction": null
+        }
+    }"#;
+    let event: ChangeEvent =
+        serde_json::from_str(event_json).expect("to deserialize event");
+    let fields = event
+        .get_schema_fields()
+        .expect("to get schema fields");
+    let arrow_schema =
+        convert_fields_to_arrow_schema(fields).expect("to convert schema");
+
+    // Value is missing the required "id" field
+    let value_missing_required = serde_json::json!({"name": "test_no_id"});
+
+    let result = to_record_batch(vec![value_missing_required], &arrow_schema);
+    assert!(
+        result.is_err(),
+        "Should error on missing required (non-nullable) field"
+    );
+}

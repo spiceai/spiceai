@@ -144,7 +144,7 @@ pub struct Source {
     pub table: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Schema {
     #[serde(rename = "type")]
     pub schema_type: String,
@@ -153,7 +153,7 @@ pub struct Schema {
     pub name: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Field {
     #[serde(rename = "type")]
     pub field_type: String,

@@ -327,16 +327,6 @@ impl DataConnector for Debezium {
                     );
                 }
 
-                let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
-                    &metadata.consumer_group_id,
-                    &self.kafka_config,
-                )
-                .boxed()
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "debezium",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?;
-
                 ensure!(
                     topic == metadata.topic,
                     super::InvalidConfigurationNoSourceSnafu {
@@ -344,28 +334,49 @@ impl DataConnector for Debezium {
                         message: format!(
                             "The topic has changed from {} to {topic}. The existing accelerator data may be out of date.",
                             metadata.topic
-                        ), // TODO: what action can a user take from this error?
+                        ),
                         connector_component: ConnectorComponent::from(dataset),
                     }
                 );
 
-                let schema = debezium::arrow::convert_fields_to_arrow_schema(
-                    metadata.schema_fields.iter().collect(),
-                )
-                .boxed()
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "debezium",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?;
-
-                kafka_consumer.subscribe(topic).boxed().context(
-                    super::UnableToGetReadProviderSnafu {
+                // Validate cached schema against the current Kafka topic schema.
+                // If schema evolution is detected, clear cached metadata and rebuild from Kafka.
+                if has_schema_evolved(dataset, topic, &self.kafka_config, &metadata).await {
+                    tracing::info!(
+                        "Source schema evolution detected for dataset {}. Rebuilding accelerated table with updated schema.",
+                        dataset.name
+                    );
+                    delete_metadata_from_accelerator(dataset).await;
+                    get_metadata_from_kafka(dataset, topic, &self.kafka_config).await?
+                } else {
+                    let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
+                        &metadata.consumer_group_id,
+                        &self.kafka_config,
+                    )
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
                         dataconnector: "debezium",
                         connector_component: ConnectorComponent::from(dataset),
-                    },
-                )?;
+                    })?;
 
-                (kafka_consumer, metadata, Arc::new(schema))
+                    let schema = debezium::arrow::convert_fields_to_arrow_schema(
+                        metadata.schema_fields.iter().collect(),
+                    )
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?;
+
+                    kafka_consumer.subscribe(topic).boxed().context(
+                        super::UnableToGetReadProviderSnafu {
+                            dataconnector: "debezium",
+                            connector_component: ConnectorComponent::from(dataset),
+                        },
+                    )?;
+
+                    (kafka_consumer, metadata, Arc::new(schema))
+                }
             }
             None => get_metadata_from_kafka(dataset, topic, &self.kafka_config).await?,
         };
@@ -560,4 +571,97 @@ async fn get_metadata_from_kafka(
         })?;
 
     Ok((kafka_consumer, metadata, Arc::new(schema)))
+}
+
+/// Peek at the latest Kafka message using a temporary consumer to detect schema evolution.
+///
+/// Returns `true` if the source schema differs from the cached schema, indicating that
+/// the accelerated table needs to be rebuilt with the updated schema.
+async fn has_schema_evolved(
+    dataset: &Dataset,
+    topic: &str,
+    kafka_config: &KafkaConfig,
+    cached_metadata: &DebeziumKafkaMetadata,
+) -> bool {
+    let peek_result = peek_latest_schema_fields(dataset, topic, kafka_config).await;
+    match peek_result {
+        Some(current_fields) => current_fields != cached_metadata.schema_fields,
+        None => {
+            // Could not peek at the topic (e.g., no messages yet, timeout, or Kafka unavailable).
+            // Fall back to trusting the cached schema.
+            false
+        }
+    }
+}
+
+/// Create a temporary Kafka consumer to peek at the first message and extract schema fields.
+///
+/// Uses a unique consumer group to avoid affecting the main consumer's offsets.
+/// Applies a timeout to avoid blocking indefinitely if no messages are available.
+async fn peek_latest_schema_fields(
+    dataset: &Dataset,
+    topic: &str,
+    kafka_config: &KafkaConfig,
+) -> Option<Vec<change_event::Field>> {
+    let dataset_name = format!("{}_schema_peek", dataset.name);
+    let peek_consumer =
+        match KafkaConsumer::create_for_dataset(&dataset_name, None, kafka_config) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to create schema peek consumer: {e}");
+                return None;
+            }
+        };
+
+    if let Err(e) = peek_consumer.subscribe(topic) {
+        tracing::warn!("Failed to subscribe schema peek consumer to topic {topic}: {e}");
+        return None;
+    }
+
+    let msg = match tokio::time::timeout(
+        Duration::from_secs(30),
+        peek_consumer.next_json::<ChangeEventKey, ChangeEvent>(),
+    )
+    .await
+    {
+        Ok(Ok(Some(msg))) => msg,
+        Ok(Ok(None)) => {
+            tracing::warn!("No messages available on topic {topic} for schema validation");
+            return None;
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("Error reading message from topic {topic} for schema validation: {e}");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(
+                "Timed out waiting for message on topic {topic} for schema validation"
+            );
+            return None;
+        }
+    };
+
+    let fields = msg.value().get_schema_fields();
+    match fields {
+        Some(fields) => Some(fields.into_iter().cloned().collect()),
+        None => {
+            tracing::warn!(
+                "Could not extract schema fields from Kafka message on topic {topic}"
+            );
+            None
+        }
+    }
+}
+
+async fn delete_metadata_from_accelerator(dataset: &Dataset) {
+    match DebeziumKafkaSys::try_new(dataset, OpenOption::OpenExisting).await {
+        Ok(sys) => {
+            if let Err(e) = sys.delete().await {
+                tracing::warn!("Failed to delete stale Debezium metadata: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to open accelerator for metadata deletion: {e}");
+        }
+    }
 }

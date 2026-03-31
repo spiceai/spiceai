@@ -163,12 +163,16 @@ pub fn append_value_to_struct_builder(
     builder.append(true);
 
     for (idx, field) in builder.fields().iter().enumerate() {
-        let Some(field_value) = value.get(field.name()) else {
-            return MissingFieldInValueSnafu {
-                field_name: field.name().clone(),
-                value,
+        let field_value = match value.get(field.name()) {
+            Some(v) => v,
+            None if field.is_nullable() => &Json::Null,
+            None => {
+                return MissingFieldInValueSnafu {
+                    field_name: field.name().clone(),
+                    value,
+                }
+                .fail();
             }
-            .fail();
         };
 
         let field_builder = builder.field_builder_array(idx);
