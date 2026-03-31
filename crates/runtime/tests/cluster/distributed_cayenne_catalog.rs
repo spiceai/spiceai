@@ -167,7 +167,7 @@ async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
                             name VARCHAR NOT NULL,
                             email VARCHAR,
                             age BIGINT
-                        )",
+                        ) PARTITION BY id",
                     )
                     .await?;
 
@@ -424,7 +424,7 @@ async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
 
                 // Re-create with different schema and insert.
                 harness
-                    .query("CREATE TABLE tcat.myschema.users (id BIGINT NOT NULL, val VARCHAR)")
+                    .query("CREATE TABLE tcat.myschema.users (id BIGINT NOT NULL, val VARCHAR) PARTITION BY id")
                     .await?;
 
                 harness
@@ -507,7 +507,7 @@ async fn test_distributed_cayenne_multi_table_join() -> Result<(), anyhow::Error
                             product_id BIGINT NOT NULL,
                             name VARCHAR NOT NULL,
                             price DOUBLE NOT NULL
-                        )",
+                        ) PARTITION BY product_id",
                     )
                     .await?;
 
@@ -517,7 +517,7 @@ async fn test_distributed_cayenne_multi_table_join() -> Result<(), anyhow::Error
                             order_id BIGINT NOT NULL,
                             product_id BIGINT NOT NULL,
                             quantity BIGINT NOT NULL
-                        )",
+                        ) PARTITION BY order_id",
                     )
                     .await?;
 
@@ -663,10 +663,10 @@ async fn test_distributed_cayenne_schema_isolation() -> Result<(), anyhow::Error
 
                 // Create tables with the same name in different schemas.
                 harness
-                    .query("CREATE TABLE scat.finance.records (id BIGINT NOT NULL, amount DOUBLE)")
+                    .query("CREATE TABLE scat.finance.records (id BIGINT NOT NULL, amount DOUBLE) PARTITION BY id")
                     .await?;
                 harness
-                    .query("CREATE TABLE scat.hr.records (id BIGINT NOT NULL, employee VARCHAR)")
+                    .query("CREATE TABLE scat.hr.records (id BIGINT NOT NULL, employee VARCHAR) PARTITION BY id")
                     .await?;
 
                 // Insert data into both.
@@ -800,7 +800,7 @@ async fn test_distributed_cayenne_primary_key_upsert() -> Result<(), anyhow::Err
                             name VARCHAR NOT NULL,
                             email VARCHAR,
                             PRIMARY KEY (id)
-                        )",
+                        ) PARTITION BY id",
                     )
                     .await?;
 
@@ -976,7 +976,7 @@ async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(),
                             id BIGINT NOT NULL,
                             label VARCHAR,
                             value BIGINT
-                        )",
+                        ) PARTITION BY id",
                     )
                     .await?;
 
@@ -1065,4 +1065,6 @@ async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(),
             .await
         })
         .await
+}
+await
 }
