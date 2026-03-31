@@ -547,9 +547,7 @@ impl CayenneSchemaProvider {
                             .as_any()
                             .downcast_ref::<CayenneTableProvider>()
                     })
-                    .or_else(|| {
-                        provider.as_any().downcast_ref::<CayenneTableProvider>()
-                    })
+                    .or_else(|| provider.as_any().downcast_ref::<CayenneTableProvider>())
                 else {
                     tracing::warn!(
                         "Partition sub-provider is not a CayenneTableProvider, skipping refresh"
@@ -557,9 +555,7 @@ impl CayenneSchemaProvider {
                     continue;
                 };
                 if let Err(err) = cayenne.refresh(cayenne).await {
-                    tracing::warn!(
-                        "Failed to refresh partitioned Cayenne table in place: {err}"
-                    );
+                    tracing::warn!("Failed to refresh partitioned Cayenne table in place: {err}");
                     // Fail safely: keep the existing partitioned provider rather than
                     // signaling failure that would cause it to be replaced by a
                     // non-partitioned provider.

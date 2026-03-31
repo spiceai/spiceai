@@ -79,17 +79,20 @@ pub use session::SessionStore;
 
 /// Sentinel value in [`FlightData::app_metadata`] that marks a message as a
 /// keepalive heartbeat. Write-through forwarding tasks send these periodically
-/// to prevent the executor's DoPut idle timeout from firing on streams that
+/// to prevent the executor's `DoPut` idle timeout from firing on streams that
 /// receive data in bursts with long idle gaps between them.
 pub const KEEPALIVE_APP_METADATA: &[u8] = b"spice-keepalive";
 
-/// Returns the DoPut idle timeout.  Override with the
+/// Returns the `DoPut` idle timeout.  Override with the
 /// `SPICE_DO_PUT_IDLE_TIMEOUT_SECS` env-var (useful for tests).
 pub fn do_put_idle_timeout() -> std::time::Duration {
     std::env::var("SPICE_DO_PUT_IDLE_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map_or(std::time::Duration::from_secs(120), std::time::Duration::from_secs)
+        .map_or(
+            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs,
+        )
 }
 
 pub struct Service {

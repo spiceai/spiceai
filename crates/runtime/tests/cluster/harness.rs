@@ -137,7 +137,7 @@ pub struct ClusterHarness {
     /// Background server handles — aborted on drop.
     handles: Vec<JoinHandle<RuntimeResult<()>>>,
     executor_manager: ExecutorManager,
-    /// The scheduler's Flight bind address (for external DoPut tests).
+    /// The scheduler's Flight bind address (for external `DoPut` tests).
     scheduler_flight_addr: SocketAddr,
 }
 
@@ -156,6 +156,7 @@ impl ClusterHarness {
     }
 
     /// Returns the scheduler's Flight address for direct client connections.
+    #[expect(dead_code)]
     pub fn scheduler_flight_addr(&self) -> SocketAddr {
         self.scheduler_flight_addr
     }
