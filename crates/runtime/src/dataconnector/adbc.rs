@@ -595,12 +595,10 @@ impl DataConnectorFactory for AdbcFactory {
     }
 }
 
-/// Cached set of secret parameter names — built once from the static PARAMETERS.
-static SECRET_PARAMS: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
-
 /// Computes a deterministic cache key from the ADBC connection parameters.
 /// Datasets with identical ADBC configuration produce the same key and share
-/// a single connector instance.
+/// a single connector instance.  The key is a fixed-size BLAKE3 hex digest
+/// over all identity-relevant parameters.
 fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
     // All ADBC configuration parameters that determine connection identity,
     // listed alphabetically for deterministic output.
@@ -618,31 +616,15 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
         "username",
     ];
 
-    let secret_params = SECRET_PARAMS.get_or_init(|| {
-        PARAMETERS
-            .iter()
-            .filter(|p| p.secret)
-            .map(|p| p.name)
-            .collect()
-    });
-
-    let mut key = String::new();
+    let mut hasher = blake3::Hasher::new();
     for k in &keys {
         let v = params.parameters.get(k).expose().ok().unwrap_or("");
-        key.push_str(k);
-        key.push('\0');
-        if secret_params.contains(k) || *k == "driver_options" || *k == "uri" {
-            // Use BLAKE3 for secret values, driver_options (which can contain
-            // sensitive values like tokens), and URIs (which frequently embed
-            // credentials) so plaintext secrets are not retained in memory.
-            let digest = blake3::hash(v.as_bytes());
-            let _ = write!(key, "{digest}");
-        } else {
-            key.push_str(v);
-        }
-        key.push('\0');
+        hasher.update(k.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(v.as_bytes());
+        hasher.update(b"\0");
     }
-    key
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Builds the list of ADBC database options from connector parameters.
