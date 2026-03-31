@@ -13,7 +13,6 @@ runs:
       if: runner.os == 'macOS' || inputs.minio_endpoint != ''
       shell: bash
       run: |
-        echo "SCCACHE_CACHE_SIZE=200G" >> $GITHUB_ENV
         echo "SCCACHE_DIRECT=true" >> $GITHUB_ENV
         echo "SCCACHE_IDLE_TIMEOUT=0" >> $GITHUB_ENV
         echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
@@ -27,6 +26,7 @@ runs:
         wget -q https://github.com/mozilla/sccache/releases/download/v0.9.1/sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
         tar -xzf sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
         sudo mv sccache-v0.9.1-x86_64-unknown-linux-musl/sccache /usr/local/bin
+        echo "SCCACHE_CACHE_SIZE=4T" >> $GITHUB_ENV
         rm -rf ~/.config/sccache/config
         mkdir -p ~/.config/sccache
         cat <<EOF > ~/.config/sccache/config
@@ -58,8 +58,10 @@ runs:
           SCCACHE_ENDPOINT="http://127.0.0.1:8333"
           SCCACHE_REGION="us-west-1"
           SCCACHE_NO_CREDS="true"
+          echo "SCCACHE_CACHE_SIZE=2T" >> $GITHUB_ENV
           echo "Using spiceio at $SCCACHE_ENDPOINT"
         else
+          echo "SCCACHE_CACHE_SIZE=200G" >> $GITHUB_ENV
           echo "spiceio not available, using local MinIO"
         fi
 
