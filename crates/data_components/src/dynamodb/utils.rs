@@ -71,8 +71,24 @@ pub fn scalar_to_attribute_value(
         ScalarValue::UInt16(Some(i)) => Ok(AttributeValue::N(i.to_string())),
         ScalarValue::UInt32(Some(i)) => Ok(AttributeValue::N(i.to_string())),
         ScalarValue::UInt64(Some(i)) => Ok(AttributeValue::N(i.to_string())),
-        ScalarValue::Float32(Some(f)) => Ok(AttributeValue::N(f.to_string())),
-        ScalarValue::Float64(Some(f)) => Ok(AttributeValue::N(f.to_string())),
+        ScalarValue::Float32(Some(f)) => {
+            if f.is_finite() {
+                Ok(AttributeValue::N(f.to_string()))
+            } else {
+                Err(DataFusionError::Execution(format!(
+                    "Cannot write non-finite Float32 value ({f}) to DynamoDB"
+                )))
+            }
+        }
+        ScalarValue::Float64(Some(f)) => {
+            if f.is_finite() {
+                Ok(AttributeValue::N(f.to_string()))
+            } else {
+                Err(DataFusionError::Execution(format!(
+                    "Cannot write non-finite Float64 value ({f}) to DynamoDB"
+                )))
+            }
+        }
         ScalarValue::Decimal128(Some(v), _precision, scale) => {
             let scale = *scale;
             let s = if scale > 0 {
@@ -84,6 +100,13 @@ pub fn scalar_to_attribute_value(
                 // the sign would be lost. Emit an explicit "-" prefix.
                 let sign = if *v < 0 && whole == 0 { "-" } else { "" };
                 format!("{sign}{whole}.{frac:0>width$}", width = scale_u32 as usize)
+            } else if scale < 0 {
+                // Negative scale means multiply by 10^|scale| (e.g. value 123
+                // with scale -2 represents 12300).
+                let abs_scale = u32::try_from(scale.unsigned_abs()).unwrap_or(0);
+                let multiplier = 10_i128.pow(abs_scale);
+                v.checked_mul(multiplier)
+                    .map_or_else(|| v.to_string(), |result| result.to_string())
             } else {
                 v.to_string()
             };
@@ -108,6 +131,12 @@ pub fn scalar_to_attribute_value(
                     "{sign}{whole}.{frac_str:0>width$}",
                     width = scale_u32 as usize
                 )
+            } else if scale < 0 {
+                // Negative scale means multiply by 10^|scale|.
+                let abs_scale = u32::try_from(scale.unsigned_abs()).unwrap_or(0);
+                let multiplier = arrow::datatypes::i256::from_i128(10_i128.pow(abs_scale));
+                let result = v.wrapping_mul(multiplier);
+                format!("{result}")
             } else {
                 format!("{v}")
             };
@@ -126,7 +155,10 @@ pub fn scalar_to_attribute_value(
         }
         // Date64: ms since 1970-01-01
         ScalarValue::Date64(Some(ms)) => {
-            let days = *ms / 86_400_000;
+            // Use div_euclid to floor toward negative infinity for pre-epoch dates.
+            // Truncating division (`/`) would give the wrong day for negative ms
+            // values with a non-zero sub-day component (e.g. -1 ms → day 0 instead of -1).
+            let days = ms.div_euclid(86_400_000);
             match NaiveDate::from_ymd_opt(1970, 1, 1)
                 .and_then(|d| d.checked_add_signed(chrono::Duration::days(days)))
             {
@@ -381,5 +413,94 @@ mod tests {
         let v = arrow::datatypes::i256::from_i128(0);
         let scalar = ScalarValue::Decimal256(Some(v), 20, 3);
         assert_number(&scalar, "0.000");
+    }
+
+    // -----------------------------------------------------------------------
+    // Negative scale regression tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decimal128_negative_scale() {
+        // 123 with scale -2 → 12300
+        let scalar = ScalarValue::Decimal128(Some(123), 10, -2);
+        assert_number(&scalar, "12300");
+    }
+
+    #[test]
+    fn decimal128_negative_scale_negative_value() {
+        // -5 with scale -3 → -5000
+        let scalar = ScalarValue::Decimal128(Some(-5), 10, -3);
+        assert_number(&scalar, "-5000");
+    }
+
+    #[test]
+    fn decimal256_negative_scale() {
+        let v = arrow::datatypes::i256::from_i128(123);
+        let scalar = ScalarValue::Decimal256(Some(v), 20, -2);
+        assert_number(&scalar, "12300");
+    }
+
+    // -----------------------------------------------------------------------
+    // Date64 pre-epoch regression tests
+    // -----------------------------------------------------------------------
+
+    fn assert_date(scalar: &ScalarValue, expected: &str) {
+        let result = scalar_to_attribute_value(scalar, "%Y-%m-%dT%H:%M:%S%z")
+            .expect("scalar_to_attribute_value should convert date scalars");
+        match result {
+            AttributeValue::S(s) => assert_eq!(s, expected, "for scalar {scalar:?}"),
+            other => panic!("Expected AttributeValue::S, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn date64_epoch() {
+        let scalar = ScalarValue::Date64(Some(0));
+        assert_date(&scalar, "1970-01-01");
+    }
+
+    #[test]
+    fn date64_pre_epoch_exact_day() {
+        // Exactly -1 day = -86_400_000 ms
+        let scalar = ScalarValue::Date64(Some(-86_400_000));
+        assert_date(&scalar, "1969-12-31");
+    }
+
+    #[test]
+    fn date64_pre_epoch_sub_day() {
+        // -1 ms should floor to the previous day (1969-12-31), not truncate to epoch day
+        let scalar = ScalarValue::Date64(Some(-1));
+        assert_date(&scalar, "1969-12-31");
+    }
+
+    // -----------------------------------------------------------------------
+    // Float NaN/inf rejection tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn float32_nan_rejected() {
+        let scalar = ScalarValue::Float32(Some(f32::NAN));
+        let result = scalar_to_attribute_value(&scalar, "%Y-%m-%dT%H:%M:%S%z");
+        assert!(result.is_err(), "NaN should be rejected");
+    }
+
+    #[test]
+    fn float64_infinity_rejected() {
+        let scalar = ScalarValue::Float64(Some(f64::INFINITY));
+        let result = scalar_to_attribute_value(&scalar, "%Y-%m-%dT%H:%M:%S%z");
+        assert!(result.is_err(), "Infinity should be rejected");
+    }
+
+    #[test]
+    fn float64_neg_infinity_rejected() {
+        let scalar = ScalarValue::Float64(Some(f64::NEG_INFINITY));
+        let result = scalar_to_attribute_value(&scalar, "%Y-%m-%dT%H:%M:%S%z");
+        assert!(result.is_err(), "Negative infinity should be rejected");
+    }
+
+    #[test]
+    fn float64_finite_accepted() {
+        let scalar = ScalarValue::Float64(Some(3.14));
+        assert_number(&scalar, "3.14");
     }
 }

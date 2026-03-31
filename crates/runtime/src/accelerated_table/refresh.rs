@@ -483,7 +483,9 @@ fn validate_time_partition_format(
 ) -> Result<(), Error> {
     let mut invalid = false;
     match data_type {
-        arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8 => {
+        arrow::datatypes::DataType::Utf8
+        | arrow::datatypes::DataType::LargeUtf8
+        | arrow::datatypes::DataType::Utf8View => {
             if time_format != TimeFormat::ISO8601 {
                 invalid = true;
             }
@@ -529,7 +531,6 @@ fn validate_time_partition_format(
         | arrow::datatypes::DataType::FixedSizeBinary(_)
         | arrow::datatypes::DataType::LargeBinary
         | arrow::datatypes::DataType::BinaryView
-        | arrow::datatypes::DataType::Utf8View
         | arrow::datatypes::DataType::List(_)
         | arrow::datatypes::DataType::ListView(_)
         | arrow::datatypes::DataType::FixedSizeList(_, _)
