@@ -53,7 +53,7 @@ runs:
         SCCACHE_REGION="us-east-1"
         SCCACHE_NO_CREDS="false"
 
-        # Use spiceio if it's running (started by setup-spiceio action)
+        # Use spiceio if it's running (started by spiceai/spiceio setup action)
         if curl -sf -o /dev/null --connect-timeout 1 --max-time 2 "http://127.0.0.1:8333/" 2>/dev/null; then
           SCCACHE_ENDPOINT="http://127.0.0.1:8333"
           SCCACHE_REGION="us-west-1"
