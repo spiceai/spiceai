@@ -85,10 +85,7 @@ impl DebeziumKafkaSys {
             .map_err(Error::external)
     }
 
-    pub(super) async fn delete_sqlite(
-        &self,
-        pool: &SqliteConnectionPool,
-    ) -> Result<()> {
+    pub(super) async fn delete_sqlite(&self, pool: &SqliteConnectionPool) -> Result<()> {
         let dataset_name = self.dataset_name.clone();
 
         let conn_sync = pool.connect_sync();
@@ -100,9 +97,8 @@ impl DebeziumKafkaSys {
 
         conn.conn
             .call(move |conn| {
-                let delete = format!(
-                    "DELETE FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?"
-                );
+                let delete =
+                    format!("DELETE FROM {DEBEZIUM_KAFKA_TABLE_NAME} WHERE dataset_name = ?");
                 conn.execute(&delete, [dataset_name])?;
                 Ok::<(), rusqlite::Error>(())
             })

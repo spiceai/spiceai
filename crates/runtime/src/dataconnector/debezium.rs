@@ -604,14 +604,13 @@ async fn peek_latest_schema_fields(
     kafka_config: &KafkaConfig,
 ) -> Option<Vec<change_event::Field>> {
     let dataset_name = format!("{}_schema_peek", dataset.name);
-    let peek_consumer =
-        match KafkaConsumer::create_for_dataset(&dataset_name, None, kafka_config) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("Failed to create schema peek consumer: {e}");
-                return None;
-            }
-        };
+    let peek_consumer = match KafkaConsumer::create_for_dataset(&dataset_name, None, kafka_config) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Failed to create schema peek consumer: {e}");
+            return None;
+        }
+    };
 
     if let Err(e) = peek_consumer.subscribe(topic) {
         tracing::warn!("Failed to subscribe schema peek consumer to topic {topic}: {e}");
@@ -634,9 +633,7 @@ async fn peek_latest_schema_fields(
             return None;
         }
         Err(_) => {
-            tracing::warn!(
-                "Timed out waiting for message on topic {topic} for schema validation"
-            );
+            tracing::warn!("Timed out waiting for message on topic {topic} for schema validation");
             return None;
         }
     };

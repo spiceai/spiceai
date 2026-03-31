@@ -683,13 +683,9 @@ fn append_value_handles_missing_nullable_field() {
             "transaction": null
         }
     }"#;
-    let event: ChangeEvent =
-        serde_json::from_str(event_json).expect("to deserialize event");
-    let fields = event
-        .get_schema_fields()
-        .expect("to get schema fields");
-    let arrow_schema =
-        convert_fields_to_arrow_schema(fields).expect("to convert schema");
+    let event: ChangeEvent = serde_json::from_str(event_json).expect("to deserialize event");
+    let fields = event.get_schema_fields().expect("to get schema fields");
+    let arrow_schema = convert_fields_to_arrow_schema(fields).expect("to convert schema");
 
     // Value is missing the "resources" field (simulates a message from before the column was added)
     let value_missing_field = serde_json::json!({"id": 2, "name": "test2"});
@@ -738,13 +734,9 @@ fn append_value_errors_on_missing_required_field() {
             "transaction": null
         }
     }"#;
-    let event: ChangeEvent =
-        serde_json::from_str(event_json).expect("to deserialize event");
-    let fields = event
-        .get_schema_fields()
-        .expect("to get schema fields");
-    let arrow_schema =
-        convert_fields_to_arrow_schema(fields).expect("to convert schema");
+    let event: ChangeEvent = serde_json::from_str(event_json).expect("to deserialize event");
+    let fields = event.get_schema_fields().expect("to get schema fields");
+    let arrow_schema = convert_fields_to_arrow_schema(fields).expect("to convert schema");
 
     // Value is missing the required "id" field
     let value_missing_required = serde_json::json!({"name": "test_no_id"});
