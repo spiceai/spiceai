@@ -52,7 +52,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up spiceio
-        uses: spiceai/spiceio/.github/actions/setup@c6f862c24430ea058b464815437cd9e47c32d280 # trunk
+        uses: spiceai/spiceio/.github/actions/setup@f964d0fc0c7c60f1463c35971636493b8186a7e2 # v0.2.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -97,7 +97,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up spiceio
-        uses: spiceai/spiceio/.github/actions/setup@c6f862c24430ea058b464815437cd9e47c32d280 # trunk
+        uses: spiceai/spiceio/.github/actions/setup@f964d0fc0c7c60f1463c35971636493b8186a7e2 # v0.2.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}

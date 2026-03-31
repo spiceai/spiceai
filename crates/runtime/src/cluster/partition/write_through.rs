@@ -17,7 +17,12 @@ limitations under the License.
 //! Forwards writes to each relevant executor based on their assigned partitions.
 //! This is used for partitioned tables that are written to via the coordinator.
 
-use std::{collections::HashMap, pin::Pin, sync::Arc, sync::atomic::{AtomicU64, Ordering}};
+use std::{
+    collections::HashMap,
+    pin::Pin,
+    sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use arrow::array::{Array, RecordBatch};
 use arrow_flight::{
@@ -232,8 +237,10 @@ pub(crate) async fn forward_federated_partitioned_write(
     )]))))
 }
 
-/// If the first `FlightData` message contains a non-empty body, decode it as the first `RecordBatch` to be forwarded.
-/// The first `FlightData` message could be schema-only with an empty body, or it could contain both schema and data - we support both cases.
+/// If the first `FlightData` message contains a non-empty body, decode it as
+/// the first `RecordBatch` to be forwarded.
+/// The first `FlightData` message could be schema-only with an empty body, or
+/// it could contain both schema and data; we support both cases.
 fn maybe_read_first_batch(
     first_message: &FlightData,
     schema: SchemaRef,
@@ -410,8 +417,7 @@ async fn route_batch_and_assign_unseen(
     // Partition rows by executor filter, collecting (executor_id, batch) pairs
     // without sending yet. All sends happen concurrently at the end to avoid
     // head-of-line blocking when one executor's channel is full.
-    let (unmatched, mut pending_sends) =
-        partition_matched_rows(batch, executor_filters, senders)?;
+    let (unmatched, mut pending_sends) = partition_matched_rows(batch, executor_filters, senders)?;
     if unmatched.num_rows() == 0 {
         send_all_concurrent(senders, pending_sends, path).await?;
         return Ok(());
@@ -540,7 +546,7 @@ async fn route_batch_and_assign_unseen(
         // Queue the rows for concurrent send.
         if !senders.contains_key(&executor_id) {
             return Err(Error::NoSenderForExecutor {
-                executor_id: executor_id.clone(),
+                executor_id,
                 table: path.to_string(),
             });
         }
@@ -663,7 +669,7 @@ fn partition_matched_rows(
                 "Skipping send to disconnected executor; rows will be re-assigned"
             );
             continue;
-        };
+        }
 
         let filtered =
             arrow::compute::filter_record_batch(&remaining, mask).context(FilterBatchSnafu)?;
@@ -947,6 +953,8 @@ async fn forward_batches_to_executor(
         request.metadata_mut().insert("authorization", val);
     }
 
+    let elapsed_ms = || u64::try_from(forward_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
     let mut inner_client = client.into_inner();
     let response = match inner_client.do_put(request).await {
         Ok(r) => r,
@@ -958,7 +966,7 @@ async fn forward_batches_to_executor(
             tracing::error!(
                 executor = %executor_id,
                 table = %table_label,
-                elapsed_ms = forward_start.elapsed().as_millis() as u64,
+                elapsed_ms = elapsed_ms(),
                 batches = batches_forwarded.load(Ordering::Relaxed),
                 keepalives = keepalives_sent.load(Ordering::Relaxed),
                 error = %e,
@@ -973,7 +981,7 @@ async fn forward_batches_to_executor(
         tracing::error!(
             executor = %executor_id,
             table = %table_label,
-            elapsed_ms = forward_start.elapsed().as_millis() as u64,
+            elapsed_ms = elapsed_ms(),
             batches = batches_forwarded.load(Ordering::Relaxed),
             keepalives = keepalives_sent.load(Ordering::Relaxed),
             error = %e,
@@ -985,7 +993,7 @@ async fn forward_batches_to_executor(
     tracing::info!(
         executor = %executor_id,
         table = %table_label,
-        elapsed_ms = forward_start.elapsed().as_millis() as u64,
+        elapsed_ms = elapsed_ms(),
         batches = batches_forwarded.load(Ordering::Relaxed),
         keepalives = keepalives_sent.load(Ordering::Relaxed),
         "Executor forwarding task completed successfully",
