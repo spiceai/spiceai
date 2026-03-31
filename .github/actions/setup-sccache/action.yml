@@ -3,7 +3,7 @@ description: 'composite action'
 
 inputs:
   minio_endpoint:
-    description: 'MinIO endpoint (used for Linux and self-hosted macOS)'
+    description: 'MinIO endpoint (used for Linux and Windows)'
     required: false
 
 runs:
@@ -13,11 +13,11 @@ runs:
       if: runner.os == 'macOS' || inputs.minio_endpoint != ''
       shell: bash
       run: |
-        echo "SCCACHE_CACHE_SIZE=200G" >> $GITHUB_ENV
         echo "SCCACHE_DIRECT=true" >> $GITHUB_ENV
         echo "SCCACHE_IDLE_TIMEOUT=0" >> $GITHUB_ENV
         echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
         echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+        echo "SCCACHE_CONF=${HOME}/.config/sccache/config" >> $GITHUB_ENV
 
     - name: Set up sccache (Linux)
       if: runner.os == 'Linux' && inputs.minio_endpoint != ''
@@ -27,17 +27,10 @@ runs:
         wget -q https://github.com/mozilla/sccache/releases/download/v0.9.1/sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
         tar -xzf sccache-v0.9.1-x86_64-unknown-linux-musl.tar.gz
         sudo mv sccache-v0.9.1-x86_64-unknown-linux-musl/sccache /usr/local/bin
+        echo "SCCACHE_CACHE_SIZE=4T" >> $GITHUB_ENV
         rm -rf ~/.config/sccache/config
         mkdir -p ~/.config/sccache
-        cat <<EOF > ~/.config/sccache/config
-        [cache.s3]
-        bucket = "sccache"
-        endpoint = "${{ inputs.minio_endpoint }}"
-        use_ssl = false
-        server_side_encryption = false
-        no_credentials = false
-        region = "us-east-1"
-        EOF
+        printf '[cache.s3]\nbucket = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = false\nregion = "us-east-1"\n' "${{ inputs.minio_endpoint }}" > ~/.config/sccache/config
 
     - name: Set up sccache (macOS)
       if: runner.os == 'macOS'
@@ -49,17 +42,25 @@ runs:
         fi
         sccache --version
 
+        SCCACHE_ENDPOINT="http://localhost:9000"
+        SCCACHE_REGION="us-east-1"
+        SCCACHE_NO_CREDS="false"
+
+        # Use spiceio if it's running (started by spiceai/spiceio setup action)
+        if curl -sf -o /dev/null --connect-timeout 1 --max-time 2 "http://127.0.0.1:8333/" 2>/dev/null; then
+          SCCACHE_ENDPOINT="http://127.0.0.1:8333"
+          SCCACHE_REGION="us-west-1"
+          SCCACHE_NO_CREDS="true"
+          echo "SCCACHE_CACHE_SIZE=2T" >> $GITHUB_ENV
+          echo "Using spiceio at $SCCACHE_ENDPOINT"
+        else
+          echo "SCCACHE_CACHE_SIZE=200G" >> $GITHUB_ENV
+          echo "spiceio not available, using local MinIO"
+        fi
+
         rm -rf ~/.config/sccache/config
         mkdir -p ~/.config/sccache
-        cat <<EOF > ~/.config/sccache/config
-        [cache.s3]
-        bucket = "sccache"
-        endpoint = "http://localhost:9000"
-        use_ssl = false
-        server_side_encryption = false
-        no_credentials = false
-        region = "us-east-1"
-        EOF
+        printf '[cache.s3]\nbucket = "sccache"\nkey_prefix = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = %s\nregion = "%s"\n' "$SCCACHE_ENDPOINT" "$SCCACHE_NO_CREDS" "$SCCACHE_REGION" > ~/.config/sccache/config
 
     - name: Set up sccache (Windows)
       if: runner.os == 'Windows' && inputs.minio_endpoint != ''
@@ -86,13 +87,5 @@ runs:
         # Configure sccache
         $configDir = "$env:APPDATA\Mozilla\sccache"
         New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-        $config = @"
-        [cache.s3]
-        bucket = "sccache"
-        endpoint = "${{ inputs.minio_endpoint }}"
-        use_ssl = false
-        server_side_encryption = false
-        no_credentials = false
-        region = "us-east-1"
-        "@
+        $config = "[cache.s3]`nbucket = `"sccache`"`nendpoint = `"${{ inputs.minio_endpoint }}`"`nuse_ssl = false`nserver_side_encryption = false`nno_credentials = false`nregion = `"us-east-1`""
         $config | Out-File -FilePath "$configDir\config" -Encoding utf8
