@@ -17,6 +17,7 @@ runs:
         echo "SCCACHE_IDLE_TIMEOUT=0" >> $GITHUB_ENV
         echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
         echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+        echo "SCCACHE_CONF=${HOME}/.config/sccache/config" >> $GITHUB_ENV
 
     - name: Set up sccache (Linux)
       if: runner.os == 'Linux' && inputs.minio_endpoint != ''
