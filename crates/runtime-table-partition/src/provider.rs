@@ -86,7 +86,7 @@ pub enum Error {
 /// For multiple partition expressions, this is a path-like string (e.g., "2025/10/15").
 pub(crate) type CompositePartitionKey = String;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PartitionTableProvider {
     creator: Arc<dyn PartitionCreator>,
     /// The partition expressions. For hierarchical partitions like
@@ -410,6 +410,61 @@ impl TableProvider for PartitionTableProvider {
         ));
 
         Ok(Arc::new(DeletionExec::new(deletion_sink)))
+    }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let schema = self.schema();
+        let table_source = Arc::new(datafusion::datasource::DefaultTableSource::new(Arc::new(
+            self.clone(),
+        )));
+        let mut plan = datafusion::logical_expr::LogicalPlanBuilder::scan(
+            "__update_source",
+            table_source,
+            None,
+        )?
+        .build()?;
+
+        if let Some(combined) = filters.clone().into_iter().reduce(Expr::and) {
+            plan = datafusion::logical_expr::LogicalPlanBuilder::from(plan)
+                .filter(combined)?
+                .build()?;
+        }
+
+        let mut proj_exprs = Vec::new();
+        for field in schema.fields() {
+            let col_name = field.name();
+            if let Some((_, expr)) = assignments.iter().find(|(name, _)| name == col_name) {
+                proj_exprs.push(expr.clone().alias(col_name));
+            } else {
+                proj_exprs.push(datafusion::logical_expr::col(col_name));
+            }
+        }
+        plan = datafusion::logical_expr::LogicalPlanBuilder::from(plan)
+            .project(proj_exprs)?
+            .build()?;
+
+        let source_plan = state.create_physical_plan(&plan).await?;
+        let session_state = state
+            .as_any()
+            .downcast_ref::<datafusion::execution::SessionState>()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(
+                    "Session is not a SessionState".to_string(),
+                )
+            })?
+            .clone();
+
+        Ok(Arc::new(data_components::update::UpdateExec::new(
+            source_plan,
+            Arc::new(self.clone()),
+            session_state,
+            filters,
+        )))
     }
 }
 
