@@ -15,64 +15,24 @@ limitations under the License.
 */
 use crate::dynamodb::table_schema::DynamoDBTableSchema;
 use aws_sdk_dynamodb::types::AttributeValue;
-use chrono::{DateTime, FixedOffset, NaiveDate};
+use chrono::{DateTime, FixedOffset};
 use datafusion::common::tree_node::{TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::common::{DataFusionError, ScalarValue};
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
 use util::time_format::format_datetime;
-
-fn timestamp_to_attribute(
-    millis: i64,
-    tz_opt: Option<&Arc<str>>,
-    time_format: &str,
-) -> datafusion::error::Result<AttributeValue> {
-    let Some(dt_utc) = DateTime::from_timestamp_millis(millis) else {
-        return Err(DataFusionError::Internal(format!(
-            "Failed to convert timestamp in millis to DateTime: {millis}"
-        )));
-    };
-
-    let dt: DateTime<FixedOffset> = match tz_opt {
-        Some(tz_str) => {
-            let tz = FixedOffset::from_str(tz_str).map_err(|e| {
-                DataFusionError::Internal(format!("Failed to parse TimeZone \"{tz_str}\": {e}"))
-            })?;
-            dt_utc.with_timezone(&tz)
-        }
-        None => dt_utc.fixed_offset(),
-    };
-
-    let Some(formatted) = format_datetime(dt, time_format) else {
-        return Err(DataFusionError::Internal(format!(
-            "Failed to parse timestamp. Verify format is valid: \"{time_format}\""
-        )));
-    };
-
-    Ok(AttributeValue::S(formatted))
-}
 
 pub fn scalar_to_attribute_value(
     scalar: &ScalarValue,
     time_format: &str,
 ) -> datafusion::error::Result<AttributeValue> {
     match scalar {
-        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
-            Ok(AttributeValue::S(s.clone()))
-        }
-        ScalarValue::Utf8View(Some(s)) => Ok(AttributeValue::S(s.clone())),
-        ScalarValue::Int8(Some(i)) => Ok(AttributeValue::N(i.to_string())),
-        ScalarValue::Int16(Some(i)) => Ok(AttributeValue::N(i.to_string())),
-        ScalarValue::Int32(Some(i)) => Ok(AttributeValue::N(i.to_string())),
+        ScalarValue::Utf8(Some(s)) => Ok(AttributeValue::S(s.clone())),
         ScalarValue::Int64(Some(i)) => Ok(AttributeValue::N(i.to_string())),
-        ScalarValue::UInt8(Some(i)) => Ok(AttributeValue::N(i.to_string())),
-        ScalarValue::UInt16(Some(i)) => Ok(AttributeValue::N(i.to_string())),
-        ScalarValue::UInt32(Some(i)) => Ok(AttributeValue::N(i.to_string())),
-        ScalarValue::UInt64(Some(i)) => Ok(AttributeValue::N(i.to_string())),
-        ScalarValue::Float32(Some(f)) => Ok(AttributeValue::N(f.to_string())),
+        ScalarValue::Int32(Some(i)) => Ok(AttributeValue::N(i.to_string())),
         ScalarValue::Float64(Some(f)) => Ok(AttributeValue::N(f.to_string())),
+        ScalarValue::Float32(Some(f)) => Ok(AttributeValue::N(f.to_string())),
         ScalarValue::Decimal128(Some(v), _precision, scale) => {
             let scale = *scale;
             let s = if scale > 0 {
@@ -104,56 +64,47 @@ pub fn scalar_to_attribute_value(
                 };
                 // i256::Display does not forward fill/width, so convert first.
                 let frac_str = format!("{frac}");
-                format!("{sign}{whole}.{frac_str:0>width$}", width = scale_u32 as usize)
+                format!(
+                    "{sign}{whole}.{frac_str:0>width$}",
+                    width = scale_u32 as usize
+                )
             } else {
                 format!("{v}")
             };
             Ok(AttributeValue::N(s))
         }
         ScalarValue::Boolean(Some(b)) => Ok(AttributeValue::Bool(*b)),
-        ScalarValue::Date32(Some(days)) => {
-            match NaiveDate::from_ymd_opt(1970, 1, 1)
-                .and_then(|d| d.checked_add_signed(chrono::Duration::days(i64::from(*days))))
-            {
-                Some(date) => Ok(AttributeValue::S(date.format("%Y-%m-%d").to_string())),
-                None => Err(DataFusionError::Execution(format!(
-                    "Invalid Date32 value: {days}"
-                ))),
-            }
-        }
-        // Date64: ms since 1970-01-01
-        ScalarValue::Date64(Some(ms)) => {
-            let days = *ms / 86_400_000;
-            match NaiveDate::from_ymd_opt(1970, 1, 1)
-                .and_then(|d| d.checked_add_signed(chrono::Duration::days(days)))
-            {
-                Some(date) => Ok(AttributeValue::S(date.format("%Y-%m-%d").to_string())),
-                None => Err(DataFusionError::Execution(format!(
-                    "Invalid Date64 value: {ms}"
-                ))),
-            }
-        }
-        ScalarValue::Binary(Some(b)) | ScalarValue::LargeBinary(Some(b)) => Ok(AttributeValue::B(
-            aws_sdk_dynamodb::primitives::Blob::new(b.clone()),
-        )),
-        ScalarValue::TimestampSecond(Some(s), tz_opt) => {
-            timestamp_to_attribute(*s * 1_000, tz_opt.as_ref(), time_format)
-        }
-        ScalarValue::TimestampMillisecond(Some(ms), tz_opt) => {
-            timestamp_to_attribute(*ms, tz_opt.as_ref(), time_format)
-        }
-        ScalarValue::TimestampMicrosecond(Some(us), tz_opt) => {
-            timestamp_to_attribute(*us / 1_000, tz_opt.as_ref(), time_format)
-        }
-        ScalarValue::TimestampNanosecond(Some(ns), tz_opt) => {
-            timestamp_to_attribute(*ns / 1_000_000, tz_opt.as_ref(), time_format)
+        ScalarValue::TimestampMillisecond(Some(timestamp_in_millis), tz_opt) => {
+            let Some(dt_utc) = DateTime::from_timestamp_millis(*timestamp_in_millis) else {
+                return Err(DataFusionError::Internal(format!(
+                    "Failed to convert timestamp in millis to DateTime: {timestamp_in_millis}"
+                )));
+            };
+
+            let dt: DateTime<FixedOffset> = match tz_opt {
+                Some(tz_str) => {
+                    let tz = FixedOffset::from_str(tz_str).map_err(|e| {
+                        DataFusionError::Internal(format!(
+                            "Failed to parse TimeZone \"{tz_str}\": {e}"
+                        ))
+                    })?;
+                    dt_utc.with_timezone(&tz)
+                }
+                None => dt_utc.fixed_offset(),
+            };
+
+            let Some(formatted) = format_datetime(dt, time_format) else {
+                return Err(DataFusionError::Internal(format!(
+                    "Failed to parse timestamp. Verify format is valid: \"{time_format}\""
+                )));
+            };
+
+            Ok(AttributeValue::S(formatted))
         }
         ScalarValue::Null => Ok(AttributeValue::Null(true)),
-        t => Err(DataFusionError::NotImplemented(format!(
-            "ScalarValue type not supported: type={}, value={}",
-            t.data_type(),
-            t
-        ))),
+        _ => Err(DataFusionError::NotImplemented(
+            "ScalarValue type not supported".to_string(),
+        )),
     }
 }
 
@@ -278,7 +229,8 @@ mod tests {
     use aws_sdk_dynamodb::types::AttributeValue;
 
     fn assert_number(scalar: &ScalarValue, expected: &str) {
-        let result = scalar_to_attribute_value(scalar, "%Y-%m-%dT%H:%M:%S%z").unwrap();
+        let result = scalar_to_attribute_value(scalar, "%Y-%m-%dT%H:%M:%S%z")
+            .expect("scalar_to_attribute_value should convert decimal scalars to numbers");
         match result {
             AttributeValue::N(n) => assert_eq!(n, expected, "for scalar {scalar:?}"),
             other => panic!("Expected AttributeValue::N, got {other:?}"),
