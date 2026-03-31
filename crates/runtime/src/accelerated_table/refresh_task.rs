@@ -1070,7 +1070,7 @@ impl RefreshTask {
 
     fn get_filter_converter(&self, refresh: &Refresh) -> Option<TimestampFilterConvert> {
         let schema = self.federated.schema();
-        Self::build_filter_converter(schema, refresh)
+        Self::build_filter_converter(&schema, refresh)
     }
 
     fn get_accelerator_filter_converter(
@@ -1078,11 +1078,11 @@ impl RefreshTask {
         refresh: &Refresh,
     ) -> Option<TimestampFilterConvert> {
         let schema = self.accelerator.schema();
-        Self::build_filter_converter(schema, refresh)
+        Self::build_filter_converter(&schema, refresh)
     }
 
     fn build_filter_converter(
-        schema: SchemaRef,
+        schema: &SchemaRef,
         refresh: &Refresh,
     ) -> Option<TimestampFilterConvert> {
         let column = refresh.time_column.as_deref().unwrap_or_default();
@@ -2066,8 +2066,9 @@ mod tests {
             ]))],
         )
         .expect("batch");
-        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
-            as Arc<dyn TableProvider>;
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
         let val = collect_iso_string_from_max_df(&mem, "t").await;
         assert_eq!(val.as_deref(), Some("2024-06-15T12:30:00"));
     }
@@ -2091,8 +2092,9 @@ mod tests {
             ]))],
         )
         .expect("batch");
-        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
-            as Arc<dyn TableProvider>;
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
         let val = collect_iso_string_from_max_df(&mem, "t").await;
         assert_eq!(val.as_deref(), Some("2024-06-15T12:30:00"));
     }
@@ -2116,8 +2118,9 @@ mod tests {
             ]))],
         )
         .expect("batch");
-        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
-            as Arc<dyn TableProvider>;
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
         let val = collect_iso_string_from_max_df(&mem, "t").await;
         assert_eq!(val.as_deref(), Some("2024-06-15T12:30:00"));
     }
@@ -2188,8 +2191,9 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![100, 300, 200]))],
         )
         .expect("batch");
-        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
-            as Arc<dyn TableProvider>;
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
         assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
     }
 
@@ -2204,8 +2208,9 @@ mod tests {
             vec![Arc::new(UInt64Array::from(vec![100u64, 300, 200]))],
         )
         .expect("batch");
-        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
-            as Arc<dyn TableProvider>;
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
         assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
     }
 
@@ -2220,8 +2225,9 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![100, 300, 200]))],
         )
         .expect("batch");
-        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
-            as Arc<dyn TableProvider>;
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
         assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
     }
 
@@ -2236,8 +2242,9 @@ mod tests {
             vec![Arc::new(UInt32Array::from(vec![100u32, 300, 200]))],
         )
         .expect("batch");
-        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
-            as Arc<dyn TableProvider>;
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
         assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
     }
 
@@ -2252,8 +2259,9 @@ mod tests {
             vec![Arc::new(Float64Array::from(vec![100.0, 300.0, 200.0]))],
         )
         .expect("batch");
-        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
-            as Arc<dyn TableProvider>;
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
         assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
     }
 
@@ -2276,8 +2284,9 @@ mod tests {
             ]))],
         )
         .expect("batch");
-        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
-            as Arc<dyn TableProvider>;
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
         assert_eq!(
             collect_numeric_from_max_df(&mem, "t").await,
             Some(3_000_000_000)

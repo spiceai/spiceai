@@ -197,10 +197,15 @@ impl TimestampFilterConvert {
 ///
 /// Returns a string like `2024-01-25T20:43:41.000000000`.
 #[must_use]
-#[expect(clippy::cast_possible_wrap)]
 pub fn nanos_to_iso8601_string(nanos: u128) -> String {
-    let secs = (nanos / 1_000_000_000) as i64;
-    let subsec_nanos = (nanos % 1_000_000_000) as u32;
+    let Ok(secs) = i64::try_from(nanos / 1_000_000_000) else {
+        return chrono::DateTime::<chrono::Utc>::default()
+            .format("%Y-%m-%dT%H:%M:%S%.9f")
+            .to_string();
+    };
+    let Ok(subsec_nanos) = u32::try_from(nanos % 1_000_000_000) else {
+        unreachable!("nanosecond remainder always fits in u32")
+    };
     chrono::DateTime::from_timestamp(secs, subsec_nanos)
         .unwrap_or_default()
         .format("%Y-%m-%dT%H:%M:%S%.9f")
@@ -360,6 +365,14 @@ mod tests {
         assert_eq!(
             nanos_to_iso8601_string(1_706_215_421_123_456_789),
             "2024-01-25T20:43:41.123456789"
+        );
+    }
+
+    #[test]
+    fn test_nanos_to_iso8601_string_out_of_range_does_not_truncate() {
+        assert_eq!(
+            nanos_to_iso8601_string(u128::MAX),
+            "1970-01-01T00:00:00.000000000"
         );
     }
 
