@@ -229,7 +229,8 @@ mod tests {
     use aws_sdk_dynamodb::types::AttributeValue;
 
     fn assert_number(scalar: &ScalarValue, expected: &str) {
-        let result = scalar_to_attribute_value(scalar, "%Y-%m-%dT%H:%M:%S%z").unwrap();
+        let result = scalar_to_attribute_value(scalar, "%Y-%m-%dT%H:%M:%S%z")
+            .expect("scalar_to_attribute_value should convert decimal scalars to numbers");
         match result {
             AttributeValue::N(n) => assert_eq!(n, expected, "for scalar {scalar:?}"),
             other => panic!("Expected AttributeValue::N, got {other:?}"),
