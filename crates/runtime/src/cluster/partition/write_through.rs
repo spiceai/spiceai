@@ -17,7 +17,7 @@ limitations under the License.
 //! Forwards writes to each relevant executor based on their assigned partitions.
 //! This is used for partitioned tables that are written to via the coordinator.
 
-use std::{collections::HashMap, pin::Pin, sync::Arc};
+use std::{collections::HashMap, pin::Pin, sync::Arc, sync::atomic::{AtomicU64, Ordering}};
 
 use arrow::array::{Array, RecordBatch};
 use arrow_flight::{
@@ -407,9 +407,13 @@ async fn route_batch_and_assign_unseen(
     partition_manager: &Arc<PartitionManager>,
     path: &TableReference,
 ) -> Result<()> {
-    // Route matched rows to known executors.
-    let unmatched = route_matched_and_collect_unmatched(batch, executor_filters, senders).await?;
+    // Partition rows by executor filter, collecting (executor_id, batch) pairs
+    // without sending yet. All sends happen concurrently at the end to avoid
+    // head-of-line blocking when one executor's channel is full.
+    let (unmatched, mut pending_sends) =
+        partition_matched_rows(batch, executor_filters, senders)?;
     if unmatched.num_rows() == 0 {
+        send_all_concurrent(senders, pending_sends, path).await?;
         return Ok(());
     }
 
@@ -533,17 +537,19 @@ async fn route_batch_and_assign_unseen(
             }
         }
 
-        // Forward the rows.
-        let tx = senders
-            .get(&executor_id)
-            .ok_or_else(|| Error::NoSenderForExecutor {
+        // Queue the rows for concurrent send.
+        if !senders.contains_key(&executor_id) {
+            return Err(Error::NoSenderForExecutor {
                 executor_id: executor_id.clone(),
                 table: path.to_string(),
-            })?;
-        tx.send(sub_batch).await.map_err(|_| Error::SendBatch {
-            executor_id: executor_id.clone(),
-        })?;
+            });
+        }
+
+        pending_sends.push((executor_id.clone(), sub_batch));
     }
+
+    // Send all pending batches (matched + newly assigned) concurrently.
+    send_all_concurrent(senders, pending_sends, path).await?;
 
     Ok(())
 }
@@ -563,17 +569,57 @@ fn scalar_to_sql_literal(scalar: &ScalarValue) -> String {
     }
 }
 
-/// Routes matched rows to known executors and returns the unmatched rows.
+/// Sends all pending `(executor_id, batch)` pairs concurrently so that one
+/// slow executor cannot block sends to the others (no head-of-line blocking).
+async fn send_all_concurrent(
+    senders: &HashMap<ExecutorId, Sender<RecordBatch>>,
+    pending: Vec<(ExecutorId, RecordBatch)>,
+    path: &TableReference,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let futures: Vec<_> = pending
+        .into_iter()
+        .map(|(executor_id, batch)| {
+            let tx = senders.get(&executor_id).cloned();
+            async move {
+                let Some(tx) = tx else {
+                    return Err(Error::NoSenderForExecutor {
+                        executor_id: executor_id.clone(),
+                        table: path.to_string(),
+                    });
+                };
+                tx.send(batch).await.map_err(|_| Error::SendBatch {
+                    executor_id: executor_id.clone(),
+                })?;
+                Ok(())
+            }
+        })
+        .collect();
+
+    let results = futures::future::join_all(futures).await;
+    for result in results {
+        result?;
+    }
+
+    Ok(())
+}
+
+/// Partitions rows by executor filter, returning `(unmatched_rows, pending_sends)`.
 ///
-/// Partitions are non-overlapping, so each row matches at most one executor.
-/// We progressively shrink the remaining batch as rows get matched, avoiding
-/// redundant filter evaluations and data copies on already-routed rows.
-async fn route_matched_and_collect_unmatched(
+/// Evaluates each executor's filter predicate against the batch and collects
+/// matched rows into `pending_sends` without sending them. This is a pure
+/// compute step — all sends happen concurrently afterwards in
+/// [`send_all_concurrent`] to avoid head-of-line blocking.
+fn partition_matched_rows(
     batch: &RecordBatch,
     executor_filters: &[ExecutorFilter],
     senders: &HashMap<ExecutorId, Sender<RecordBatch>>,
-) -> Result<RecordBatch> {
+) -> Result<(RecordBatch, Vec<(ExecutorId, RecordBatch)>)> {
     let mut remaining = batch.clone();
+    let mut pending_sends: Vec<(ExecutorId, RecordBatch)> = Vec::new();
 
     for (executor_id, filter_expr) in executor_filters {
         if remaining.num_rows() == 0 {
@@ -610,7 +656,7 @@ async fn route_matched_and_collect_unmatched(
         // If there is no active sender for this executor (e.g. it disconnected),
         // leave the matched rows in `remaining` so they are treated as unmatched
         // and re-assigned to a connected executor. This prevents silent data loss.
-        let Some(tx) = senders.get(executor_id) else {
+        if !senders.contains_key(executor_id) {
             tracing::warn!(
                 executor_id,
                 rows = matched_count,
@@ -621,13 +667,12 @@ async fn route_matched_and_collect_unmatched(
 
         let filtered =
             arrow::compute::filter_record_batch(&remaining, mask).context(FilterBatchSnafu)?;
-        tx.send(filtered).await.map_err(|_| Error::SendBatch {
-            executor_id: executor_id.clone(),
-        })?;
+
+        pending_sends.push((executor_id.clone(), filtered));
 
         // If every remaining row was matched, nothing left to process.
         if matched_count == remaining.num_rows() {
-            return Ok(RecordBatch::new_empty(batch.schema()));
+            return Ok((RecordBatch::new_empty(batch.schema()), pending_sends));
         }
 
         // Shrink remaining to only unmatched rows for subsequent executors.
@@ -636,15 +681,7 @@ async fn route_matched_and_collect_unmatched(
             arrow::compute::filter_record_batch(&remaining, &negated).context(FilterBatchSnafu)?;
     }
 
-    if remaining.num_rows() > 0 {
-        tracing::debug!(
-            total_rows = batch.num_rows(),
-            unmatched_rows = remaining.num_rows(),
-            "Some rows did not match any executor filter; routing to new partition assignments"
-        );
-    }
-
-    Ok(remaining)
+    Ok((remaining, pending_sends))
 }
 
 /// Parses partition-by SQL expression strings into logical + physical expression pairs.
@@ -771,7 +808,7 @@ async fn spawn_executor_forwarding_tasks(
 
     for (executor_id, client) in executor_clients {
         let (tx, rx) = mpsc::channel::<RecordBatch>(64);
-        senders.insert(executor_id, tx);
+        senders.insert(executor_id.clone(), tx);
 
         join_handles.push(io_runtime.spawn(forward_batches_to_executor(
             client,
@@ -780,6 +817,7 @@ async fn spawn_executor_forwarding_tasks(
             tbl.clone(),
             auth_header.clone(),
             io_runtime.clone(),
+            executor_id,
         )));
     }
 
@@ -795,14 +833,34 @@ async fn forward_batches_to_executor(
     tbl: ResolvedTableReference,
     auth_header: Option<String>,
     io_runtime: tokio::runtime::Handle,
+    executor_id: String,
 ) -> Result<()> {
+    let forward_start = std::time::Instant::now();
+    let batches_forwarded = Arc::new(AtomicU64::new(0));
+    let keepalives_sent = Arc::new(AtomicU64::new(0));
+    let table_label = tbl.to_string();
+    tracing::info!(
+        executor = %executor_id,
+        table = %table_label,
+        "Executor forwarding task started",
+    );
     let (tx, flight_rx) = mpsc::channel::<arrow_flight::FlightData>(64);
     let (encode_result_tx, encode_result_rx) =
         tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
 
     let encoder_schema = Arc::clone(&schema);
     let adapt_schema = Arc::clone(&schema);
-    io_runtime.spawn(async move {
+
+    // Keepalive interval: send a heartbeat at 1/3 of the executor idle timeout
+    // so the executor never reaches its deadline while a write-through is active.
+    // Clamp to a minimum non-zero duration to avoid a tight loop when the
+    // idle timeout is very small (e.g. in tests with 1-2s timeouts).
+    let keepalive_interval =
+        (crate::flight::do_put_idle_timeout() / 3).max(std::time::Duration::from_millis(100));
+
+    let encoder_batches = Arc::clone(&batches_forwarded);
+    let encoder_keepalives = Arc::clone(&keepalives_sent);
+    let encoder_handle = io_runtime.spawn(async move {
         let mut flight_data_encoder = Box::pin(
             arrow_flight::encode::FlightDataEncoderBuilder::new()
                 .with_schema(encoder_schema)
@@ -824,25 +882,59 @@ async fn forward_batches_to_executor(
             tbl.schema.to_string(),
             tbl.table.to_string(),
         ]);
+
+        let keepalive_sleep = tokio::time::sleep(keepalive_interval);
+        tokio::pin!(keepalive_sleep);
+
         loop {
-            match flight_data_encoder.next().await {
-                Some(Ok(mut fdata)) => {
+            tokio::select! {
+                biased;
+                data = flight_data_encoder.next() => {
+                    match data {
+                        Some(Ok(mut fdata)) => {
+                            if is_first {
+                                fdata.flight_descriptor = Some(fd.clone());
+                                is_first = false;
+                            }
+                            // Reset keepalive timer after each real message.
+                            keepalive_sleep.as_mut().reset(tokio::time::Instant::now() + keepalive_interval);
+                            if tx.send(fdata).await.is_err() {
+                                let _ = encode_result_tx.send(Ok(()));
+                                return;
+                            }
+                            encoder_batches.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Some(Err(e)) => {
+                            let _ = encode_result_tx.send(Err(e.to_string()));
+                            return;
+                        }
+                        None => {
+                            let _ = encode_result_tx.send(Ok(()));
+                            return;
+                        }
+                    }
+                }
+                () = &mut keepalive_sleep => {
+                    // Only send keepalives after the first real FlightData
+                    // (which carries the schema/descriptor) has been sent.
+                    // Sending a keepalive before the schema would confuse
+                    // the executor's DoPut handler.
                     if is_first {
-                        fdata.flight_descriptor = Some(fd.clone());
-                        is_first = false;
+                        keepalive_sleep.as_mut().reset(tokio::time::Instant::now() + keepalive_interval);
+                        continue;
                     }
-                    if tx.send(fdata).await.is_err() {
+                    // No data for a while — send a keepalive to prevent the
+                    // executor's DoPut idle timeout from firing.
+                    let keepalive = arrow_flight::FlightData {
+                        app_metadata: bytes::Bytes::from_static(crate::flight::KEEPALIVE_APP_METADATA),
+                        ..Default::default()
+                    };
+                    if tx.send(keepalive).await.is_err() {
                         let _ = encode_result_tx.send(Ok(()));
-                        break;
+                        return;
                     }
-                }
-                Some(Err(e)) => {
-                    let _ = encode_result_tx.send(Err(e.to_string()));
-                    break;
-                }
-                None => {
-                    let _ = encode_result_tx.send(Ok(()));
-                    break;
+                    encoder_keepalives.fetch_add(1, Ordering::Relaxed);
+                    keepalive_sleep.as_mut().reset(tokio::time::Instant::now() + keepalive_interval);
                 }
             }
         }
@@ -859,15 +951,45 @@ async fn forward_batches_to_executor(
     let response = match inner_client.do_put(request).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!("DoPut to executor failed: {e}");
+            // Abort the encoder task so its `rx` is dropped promptly.
+            // This prevents the routing loop from queuing data into a dead
+            // channel and eventually stalling.
+            encoder_handle.abort();
+            tracing::error!(
+                executor = %executor_id,
+                table = %table_label,
+                elapsed_ms = forward_start.elapsed().as_millis() as u64,
+                batches = batches_forwarded.load(Ordering::Relaxed),
+                keepalives = keepalives_sent.load(Ordering::Relaxed),
+                error = %e,
+                "`DoPut` to executor failed",
+            );
             return Err(Error::DoPut { source: e });
         }
     };
 
     if let Err(e) = response.into_inner().try_collect::<Vec<_>>().await {
-        tracing::error!("Executor DoPut acknowledgement failed: {e}");
+        encoder_handle.abort();
+        tracing::error!(
+            executor = %executor_id,
+            table = %table_label,
+            elapsed_ms = forward_start.elapsed().as_millis() as u64,
+            batches = batches_forwarded.load(Ordering::Relaxed),
+            keepalives = keepalives_sent.load(Ordering::Relaxed),
+            error = %e,
+            "Executor `DoPut` acknowledgement failed",
+        );
         return Err(Error::DoPutAck { source: e });
     }
+
+    tracing::info!(
+        executor = %executor_id,
+        table = %table_label,
+        elapsed_ms = forward_start.elapsed().as_millis() as u64,
+        batches = batches_forwarded.load(Ordering::Relaxed),
+        keepalives = keepalives_sent.load(Ordering::Relaxed),
+        "Executor forwarding task completed successfully",
+    );
 
     match encode_result_rx.await {
         Ok(Ok(())) | Err(_) => Ok(()),
