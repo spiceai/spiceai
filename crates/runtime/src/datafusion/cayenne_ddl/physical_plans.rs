@@ -1203,11 +1203,8 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
             }
             forward_dml_to_executors(registry, &sql).await?;
 
-            RecordBatch::try_new(
-                result_schema,
-                vec![Arc::new(UInt64Array::from(vec![0u64]))],
-            )
-            .map_err(Into::into)
+            RecordBatch::try_new(result_schema, vec![Arc::new(UInt64Array::from(vec![0u64]))])
+                .map_err(Into::into)
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -1341,11 +1338,8 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
             }
             forward_dml_to_executors(registry, &sql).await?;
 
-            RecordBatch::try_new(
-                result_schema,
-                vec![Arc::new(UInt64Array::from(vec![0u64]))],
-            )
-            .map_err(Into::into)
+            RecordBatch::try_new(result_schema, vec![Arc::new(UInt64Array::from(vec![0u64]))])
+                .map_err(Into::into)
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
