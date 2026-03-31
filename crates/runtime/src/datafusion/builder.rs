@@ -88,6 +88,8 @@ use tokio::{
 pub static DEFAULT_DATAFUSION_CONFIG: LazyLock<RwLock<SessionConfig>> = LazyLock::new(|| {
     let mut df_config = SessionConfig::new();
 
+    df_config.options_mut().optimizer.prefer_hash_join = false;
+
     // Prevents DataFusion from lowercasing identifiers, i.e. "SELECT MyColumn FROM my_table" would be "SELECT mycolumn FROM mytable" without this.
     // This improves the UX for data sources where column names are case-sensitive, since they no longer need to be quoted.
     df_config
