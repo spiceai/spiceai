@@ -165,7 +165,7 @@ impl CayenneDataSink {
         let target_size = self.context.target_file_size_bytes();
         let (total_rows, _files_written) = self
             .table
-            .chunk_and_write_parallel_to_snapshot(data, target_size, &new_snapshot_id)
+            .write_to_snapshot(data, target_size, &new_snapshot_id)
             .await
             .map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(

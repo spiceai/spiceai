@@ -1099,96 +1099,14 @@ impl CayenneTableProvider {
 
     /// Insert data from a record batch stream.
     ///
-    /// This method writes data to the Vortex `ListingTable`. The actual file writing is
-    /// delegated to `DataFusion`'s `ListingTable` via `insert_into`, which uses `VortexSink`
-    /// to create Vortex files in the table directory.
-    ///
-    /// # Implementation Notes
-    ///
-    /// The insert operation is handled by the underlying `ListingTable`, which:
-    /// 1. Receives the record batch stream
-    /// 2. Writes Vortex files to the table directory
-    /// 3. Returns the number of rows written
-    ///
-    /// Note: Currently this doesn't create per-file virtual file entries in the Cayenne
-    /// catalog. In a future enhancement, we could track individual Vortex files as
-    /// separate `DataFile` entries by:
-    /// - Intercepting the `VortexSink` output to discover written files
-    /// - Creating unique subdirectories per "virtual file"
-    /// - Adding one `DataFile` entry per subdirectory to the catalog
-    ///
-    /// For now, the data is successfully written to the `ListingTable`'s directory and
-    /// will be readable on the next scan, even though we're not tracking individual
-    /// files in the Cayenne catalog metadata yet.
-    ///
-    /// # Size-Based File Chunking
-    ///
-    /// This method implements size-based chunking to control Vortex file sizes:
-    /// - Batches are accumulated until the target file size is reached
-    /// - Each chunk is written as a separate Vortex file in parallel
-    /// - Each file maintains proper statistics for `DataFusion` pushdown and pruning
-    ///
-    /// The target file size is configurable via `VortexConfig.target_vortex_file_size_mb`
-    /// and defaults to 128 MB.
-    ///
-    /// # Performance Optimizations
-    ///
-    /// - **Streaming**: Processes chunks as they're formed, avoiding buffering all data
-    /// - **Parallel writes**: Multiple chunks written concurrently with bounded parallelism
-    /// - **Zero-copy**: Reuses `RecordBatch` Arc references, no data copying
-    /// - **Pre-allocation**: Reserves capacity to minimize reallocations
-    ///
-    /// # Concurrency Safety
-    ///
-    /// This method uses an internal write lock to serialize insert operations on the same table.
-    /// Multiple concurrent `insert()` calls will block, ensuring that:
-    /// - Only one insert runs at a time per table
-    /// - All parallel chunk writes complete before the listing table is refreshed
-    /// - Retention filters are applied atomically after all writes
-    /// - Table statistics remain consistent
-    ///
-    /// **Within a single insert**, chunks are written in parallel with bounded concurrency
-    /// (configurable via `VortexConfig.upload_concurrency`, default 4) for optimal I/O throughput.
-    /// The serialization only applies across different `insert()` calls.
-    ///
-    /// This design ensures correctness while maintaining high performance for individual inserts.
-    /// If you need higher write concurrency, consider partitioning your data across multiple tables.
-    ///
     /// # Errors
     ///
     /// Returns an error if the data cannot be inserted.
     pub(crate) async fn insert(&self, stream: SendableRecordBatchStream) -> CatalogResult<u64> {
-        // Acquire write lock to serialize inserts and prevent concurrent write races.
-        // This ensures listing table refresh happens after all parallel chunk writes complete
-        // and retention filters are applied atomically.
         let _write_guard = self.write_lock.lock().await;
 
-        // Check for pending deletions based on the deletion strategy.
-        //
-        // POSITION-BASED STRATEGY: No compaction needed on insert.
-        // Deletion vectors are tracked per-file (HashMap<file_path, RoaringBitmap>), so each
-        // file's deletion bitmap is independent. Adding new files doesn't affect existing
-        // deletion vectors - the new files simply have no entries in the deletion cache.
-        // Compaction would be wasteful here and can cause issues if retention filters
-        // re-run on the compacted data.
-        //
-        // PK-BASED STRATEGIES (Int64Pk, RowConverterBased): Use anti-deletions to avoid compaction.
-        // New data is written to a new snapshot with higher sequence number, ensuring proper
-        // Iceberg-style ordering where deletions only apply to earlier snapshots.
         let has_pending_deletions = self.has_pending_deletions()?;
 
-        // For PK-based strategies with pending deletions, we need to write to a NEW snapshot
-        // with a higher sequence number. This ensures proper Iceberg-style ordering:
-        // - Deletions apply to snapshots with sequence <= delete_sequence
-        // - New data in snapshots with sequence > delete_sequence is visible
-        //
-        // We still need to run validate_on_conflict() on the incoming stream
-        // to handle upserts for PKs that already exist in the table. Without this,
-        // duplicate PKs would appear in query results.
-        //
-        // NOTE: This block only applies to PK-based strategies. PositionBased strategy
-        // doesn't need special handling - new files are simply added to the current snapshot
-        // and existing per-file deletion vectors remain valid.
         if has_pending_deletions && self.pk_deletion_strategy != PkDeletionStrategy::PositionBased {
             let new_sequence = self
                 .catalog
@@ -1209,12 +1127,10 @@ impl CayenneTableProvider {
                 deleted_pk_i64.len()
             );
 
-            // Write to new snapshot with the prepared (deduplicated) stream
             let total_rows = self
                 .insert_to_new_snapshot_with_sequence(prepared_stream, new_sequence)
                 .await?;
 
-            // Update deletion caches for the upserted PKs
             self.apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
                 .await?;
 
@@ -1223,8 +1139,6 @@ impl CayenneTableProvider {
 
         let target_size_bytes = self.context.target_file_size_bytes();
 
-        // If a primary key is configured, enforce on_conflict behavior by materializing
-        // the incoming stream, validating keys, and preparing deletion vectors.
         let (prepared_stream, delete_specs, deleted_pk_i64, deleted_row_keys) =
             self.prepare_stream_for_insert(stream).await?;
 
@@ -1234,39 +1148,20 @@ impl CayenneTableProvider {
             deleted_pk_i64.len()
         );
 
-        // Process stream in chunks and write them in parallel with bounded concurrency
-        let (total_rows, chunk_count) = self
-            .chunk_and_write_parallel(prepared_stream, target_size_bytes)
+        let current_snapshot_id = self.get_current_snapshot_id()?;
+        let (total_rows, writer_ops) = self
+            .write_to_snapshot(prepared_stream, target_size_bytes, &current_snapshot_id)
             .await?;
 
         tracing::debug!(
-            "Insert completed, wrote {} rows to Vortex in {} chunk(s)",
+            "Insert completed, wrote {} rows to Vortex in {} writer operation(s)",
             total_rows,
-            chunk_count
+            writer_ops
         );
 
-        // Apply any deletion vectors generated by on_conflict handling before retention.
         self.apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
             .await?;
 
-        // Apply retention filters before refreshing the listing table so any rows matching the
-        // configured predicate are captured in deletion vector files within this refresh.
-        //
-        // ACID GUARANTEES: The write lock ensures atomicity:
-        // 1. All chunk writes complete before retention filters are evaluated
-        // 2. Retention filters are applied before the write lock is released
-        // 3. The listing table is refreshed atomically after retention
-        // 4. Other inserts are blocked until the entire operation completes
-        //
-        // This provides ACID semantics: either all data is written with retention applied,
-        // or the operation fails and nothing is visible. There is a small visibility window
-        // (milliseconds) between file write and retention filter application where newly
-        // written data is queryable before deletion vectors are created, but this window is
-        // bounded by the write lock and cannot be observed by other insert operations.
-        //
-        // This is the correct design for retention filters - they are table-wide predicates
-        // that must scan all data, not per-chunk predicates. Applying them atomically after
-        // the write completes ensures consistency without write amplification.
         if !self.retention_filters.is_empty() {
             match self.apply_retention_filters().await {
                 Ok(deleted) => {
@@ -1292,26 +1187,12 @@ impl CayenneTableProvider {
             }
         }
 
-        // If sort_columns is configured, sort the data on disk after retention filters.
-        // This operates on the listing table data (the complete corpus after retention),
-        // ensuring optimal zone maps with non-overlapping min/max ranges.
-        // Sorting uses DataFusion's SortExec with:
-        // - Automatic disk spilling for datasets larger than available memory
-        // - Streaming external merge sort for efficient memory usage
-        // - SIMD-optimized kernels (NEON on arm64, AVX2/AVX-512 on amd64)
-        // - Configurable compression for spill files (zstd, lz4_frame, uncompressed)
         if self.context.has_sort_columns() {
             self.sort_and_rewrite_data(target_size_bytes).await?;
         }
 
-        // Refresh the listing table to pick up new/rewritten files and update statistics.
-        // This ensures that query plans have access to up-to-date table statistics
-        // after the insert operation completes. The write lock ensures this refresh
-        // happens after all parallel chunk writes are complete and no other insert
-        // can interfere.
         self.refresh_listing_table()?;
 
-        // Write lock is released here, allowing the next insert to proceed
         Ok(total_rows)
     }
 
@@ -1335,7 +1216,7 @@ impl CayenneTableProvider {
 
         // Write data to the new snapshot
         let (total_rows, chunk_count) = self
-            .chunk_and_write_parallel_to_snapshot(stream, target_size_bytes, &new_snapshot_id)
+            .write_to_snapshot(stream, target_size_bytes, &new_snapshot_id)
             .await?;
 
         tracing::debug!(
@@ -1401,239 +1282,27 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Process stream in chunks and write them in parallel with bounded concurrency.
+    /// Write a stream of record batches to a specific snapshot directory.
     ///
-    /// This method optimizes throughput by:
-    /// - Streaming chunk formation (no buffering of all chunks)
-    /// - Parallel writes with bounded concurrency (configurable via `VortexConfig.upload_concurrency`)
-    /// - Zero-copy batch handling (Arc references)
-    ///
-    /// # Returns
-    ///
-    /// Returns a tuple of `(total_rows, chunk_count)` where:
-    /// - `total_rows` is the total number of rows written
-    /// - `chunk_count` is the number of Vortex files created
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any chunk write fails.
-    async fn chunk_and_write_parallel(
-        &self,
-        mut stream: SendableRecordBatchStream,
-        target_size_bytes: usize,
-    ) -> CatalogResult<(u64, usize)> {
-        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-        use std::time::Instant;
-
-        // Bounded parallelism: configurable concurrent writes to optimize I/O
-        let semaphore = Arc::clone(self.context.upload_semaphore());
-
-        // Progress tracking for S3 Express uploads
-        let is_s3_storage = self.table_metadata.path.starts_with("s3://");
-        let start_time = Instant::now();
-        let last_progress_ms = Arc::new(AtomicU64::new(0));
-        let total_bytes_written = Arc::new(AtomicUsize::new(0));
-        let files_written = Arc::new(AtomicUsize::new(0));
-        let mut write_tasks = tokio::task::JoinSet::new();
-
-        // Log when starting S3 upload process
-        if is_s3_storage {
-            tracing::info!(
-                "Starting S3 upload for table {} (target chunk size: {})",
-                self.table_metadata.table_name,
-                format_bytes(target_size_bytes)
-            );
-        }
-
-        // Pre-allocate chunk vector with estimated capacity
-        // Estimate: average batch ~8MB, so reserve for a few batches per chunk
-        let estimated_batches_per_chunk = (target_size_bytes / (8 * 1024 * 1024)).max(1);
-        let mut current_chunk = Vec::with_capacity(estimated_batches_per_chunk);
-        let mut current_size = 0usize;
-        let mut total_rows = 0u64;
-        let mut chunk_count = 0usize;
-
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result.map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to read batch from stream.".to_string(),
-                source: Box::new(e),
-            })?;
-
-            let batch_size = batch.get_array_memory_size();
-
-            // If adding this batch would exceed target size and we have data, write current chunk
-            if current_size + batch_size > target_size_bytes && !current_chunk.is_empty() {
-                // Acquire semaphore permit before spawning write task
-                let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|e| {
-                    CatalogError::InvalidOperation {
-                        message: "Failed to acquire write permit.".to_string(),
-                        source: Box::new(e),
-                    }
-                })?;
-
-                // Move chunk to write task (zero-copy via mem::take)
-                let chunk_to_write = std::mem::replace(
-                    &mut current_chunk,
-                    Vec::with_capacity(estimated_batches_per_chunk),
-                );
-                let chunk_size = current_size;
-                current_size = 0;
-                chunk_count += 1;
-
-                // Clone self and progress trackers for the async task
-                let self_clone = self.clone_for_write();
-                let total_bytes = Arc::clone(&total_bytes_written);
-                let files_count = Arc::clone(&files_written);
-                let progress_time = Arc::clone(&last_progress_ms);
-                let is_s3 = is_s3_storage;
-                let table_name = self.table_metadata.table_name.clone();
-                let start = start_time;
-                let current_chunk_num = chunk_count;
-
-                // Log when starting a chunk upload (before the slow I/O operation)
-                if is_s3 {
-                    tracing::info!(
-                        "Starting S3 upload for {} chunk {} ({})...",
-                        table_name,
-                        current_chunk_num,
-                        format_bytes(chunk_size)
-                    );
-                }
-
-                write_tasks.spawn(async move {
-                    let result = self_clone.write_chunk(chunk_to_write).await;
-
-                    // Track progress for S3 uploads
-                    if is_s3 {
-                        total_bytes.fetch_add(chunk_size, Ordering::Relaxed);
-                        let file_num = files_count.fetch_add(1, Ordering::Relaxed) + 1;
-
-                        // Log progress every 10 seconds or when a file completes
-                        let elapsed = start.elapsed();
-                        // Use saturating conversion since elapsed time in real usage won't exceed u64::MAX milliseconds
-                        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-                        let last_logged = progress_time.load(Ordering::Relaxed);
-                        let should_log =
-                            elapsed_ms.saturating_sub(last_logged) >= 10_000 || result.is_ok();
-                        if should_log {
-                            let bytes_so_far = total_bytes.load(Ordering::Relaxed);
-                            let throughput = if elapsed.as_secs_f64() > 0.0 {
-                                #[expect(clippy::cast_precision_loss)]
-                                let bytes_per_sec = bytes_so_far as f64 / elapsed.as_secs_f64();
-                                format_bytes_per_sec(bytes_per_sec)
-                            } else {
-                                "calculating...".to_string()
-                            };
-                            tracing::info!(
-                                "S3 upload for {}: {} files completed ({}) in {:.1}s, {}",
-                                table_name,
-                                file_num,
-                                format_bytes(bytes_so_far),
-                                elapsed.as_secs_f64(),
-                                throughput
-                            );
-                            progress_time.store(elapsed_ms, Ordering::Relaxed);
-                        }
-                    }
-
-                    drop(permit); // Release permit after write completes
-                    result
-                });
-            }
-
-            current_size += batch_size;
-            current_chunk.push(batch);
-        }
-
-        // Write final chunk if non-empty
-        if !current_chunk.is_empty() {
-            let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|e| {
-                CatalogError::InvalidOperation {
-                    message: "Failed to acquire write permit for final chunk.".to_string(),
-                    source: Box::new(e),
-                }
-            })?;
-
-            chunk_count += 1;
-            let final_chunk_size = current_size;
-
-            let self_clone = self.clone_for_write();
-            let total_bytes = Arc::clone(&total_bytes_written);
-            let files_count = Arc::clone(&files_written);
-            let is_s3 = is_s3_storage;
-
-            write_tasks.spawn(async move {
-                let result = self_clone.write_chunk(current_chunk).await;
-
-                // Track final chunk for S3 uploads
-                if is_s3 {
-                    total_bytes.fetch_add(final_chunk_size, Ordering::Relaxed);
-                    files_count.fetch_add(1, Ordering::Relaxed);
-                }
-
-                drop(permit);
-                result
-            });
-        }
-
-        // Wait for all writes to complete and collect row counts
-        while let Some(result) = write_tasks.join_next().await {
-            let row_count = result.map_err(|e| CatalogError::InvalidOperation {
-                message: "Write task panicked.".to_string(),
-                source: Box::new(e),
-            })??;
-            total_rows += row_count;
-        }
-
-        // Log final summary for S3 Express uploads
-        if is_s3_storage {
-            let elapsed = start_time.elapsed();
-            let total_bytes = total_bytes_written.load(Ordering::Relaxed);
-            let files_count = files_written.load(Ordering::Relaxed);
-            let throughput = if elapsed.as_secs_f64() > 0.0 {
-                #[expect(clippy::cast_precision_loss)]
-                let bytes_per_sec = total_bytes as f64 / elapsed.as_secs_f64();
-                format_bytes_per_sec(bytes_per_sec)
-            } else {
-                "N/A".to_string()
-            };
-            tracing::info!(
-                "Completed S3 upload for {}: {} rows in {} files ({}) in {:.1}s, {}",
-                self.table_metadata.table_name,
-                total_rows,
-                files_count,
-                format_bytes(total_bytes),
-                elapsed.as_secs_f64(),
-                throughput
-            );
-        }
-
-        Ok((total_rows, chunk_count))
-    }
-
-    /// Write a stream of record batches to a specific snapshot directory, chunking into
-    /// parallel writes for efficiency.
-    ///
-    /// This is similar to `chunk_and_write_parallel` but writes to a specified snapshot
-    /// directory rather than the current listing table's location. This is used during
-    /// compaction operations where data needs to be written to a new snapshot.
+    /// This is used during compaction operations where data needs to be persisted
+    /// to a new snapshot.
     ///
     /// # Arguments
     ///
     /// * `stream` - The stream of record batches to write
-    /// * `target_size_bytes` - Target size for each output file in bytes
+    /// * `target_size_bytes` - Configured writer target file size (for write behavior/logging)
     /// * `snapshot_id` - The snapshot ID to write to
     ///
     /// # Returns
     ///
-    /// A tuple of (total rows written, number of files written)
+    /// A tuple of (total rows written, number of writer operations)
     ///
     /// # Errors
     ///
     /// Returns an error if the write operation fails.
-    pub(crate) async fn chunk_and_write_parallel_to_snapshot(
+    pub(crate) async fn write_to_snapshot(
         &self,
-        mut stream: SendableRecordBatchStream,
+        stream: SendableRecordBatchStream,
         target_size_bytes: usize,
         snapshot_id: &str,
     ) -> CatalogResult<(u64, usize)> {
@@ -1656,95 +1325,45 @@ impl CayenneTableProvider {
             &self.cached_deleted_row_ids,
         )?;
 
-        // Bounded parallelism: configurable concurrent writes to optimize I/O
-        let semaphore = Arc::clone(self.context.upload_semaphore());
+        // Create session context once with object store registered (if S3).
+        let session_state = Arc::new(self.create_session_context().state());
 
         // Progress tracking for S3 Express uploads
         let is_s3_storage = self.table_metadata.path.starts_with("s3://");
         let start_time = Instant::now();
         let last_progress_ms = Arc::new(AtomicU64::new(0));
         let total_bytes_written = Arc::new(AtomicUsize::new(0));
-        let files_written = Arc::new(AtomicUsize::new(0));
-        let mut write_tasks = tokio::task::JoinSet::new();
+        let total_rows_written = Arc::new(AtomicU64::new(0));
 
         // Log when starting S3 upload process
         if is_s3_storage {
             tracing::info!(
-                "Starting S3 upload to snapshot {} for table {} (target chunk size: {})",
+                "Starting S3 upload to snapshot {} for table {} (writer target file size: {})",
                 snapshot_id,
                 self.table_metadata.table_name,
                 format_bytes(target_size_bytes)
             );
         }
 
-        // Pre-allocate chunk vector with estimated capacity
-        let estimated_batches_per_chunk = (target_size_bytes / (8 * 1024 * 1024)).max(1);
-        let mut current_chunk = Vec::with_capacity(estimated_batches_per_chunk);
-        let mut current_size = 0usize;
-        let mut total_rows = 0u64;
-        let mut chunk_count = 0usize;
+        let tracked_schema = Arc::clone(&self.table_metadata.schema);
+        let tracked_stream = {
+            let total_bytes_written = Arc::clone(&total_bytes_written);
+            let total_rows_written = Arc::clone(&total_rows_written);
+            let last_progress_ms = Arc::clone(&last_progress_ms);
+            let table_name = self.table_metadata.table_name.clone();
+            let start = start_time;
 
-        let snapshot_listing_table = Arc::new(snapshot_listing_table);
+            stream.map(move |batch_result| {
+                if let Ok(batch) = &batch_result {
+                    total_bytes_written.fetch_add(batch.get_array_memory_size(), Ordering::Relaxed);
+                    total_rows_written.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
 
-        while let Some(batch_result) = stream.next().await {
-            let batch = batch_result.map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to read batch from stream.".to_string(),
-                source: Box::new(e),
-            })?;
-
-            let batch_size = batch.get_array_memory_size();
-
-            // If adding this batch would exceed target size and we have data, write current chunk
-            if current_size + batch_size > target_size_bytes && !current_chunk.is_empty() {
-                let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|e| {
-                    CatalogError::InvalidOperation {
-                        message: "Failed to acquire write permit.".to_string(),
-                        source: Box::new(e),
-                    }
-                })?;
-
-                let chunk_to_write = std::mem::replace(
-                    &mut current_chunk,
-                    Vec::with_capacity(estimated_batches_per_chunk),
-                );
-                let chunk_size = current_size;
-                current_size = 0;
-                chunk_count += 1;
-
-                let listing_table_clone = Arc::clone(&snapshot_listing_table);
-                let total_bytes = Arc::clone(&total_bytes_written);
-                let files_count = Arc::clone(&files_written);
-                let progress_time = Arc::clone(&last_progress_ms);
-                let is_s3 = is_s3_storage;
-                let table_name = self.table_metadata.table_name.clone();
-                let start = start_time;
-                let current_chunk_num = chunk_count;
-
-                if is_s3 {
-                    tracing::info!(
-                        "Starting S3 upload for {} chunk {} ({})...",
-                        table_name,
-                        current_chunk_num,
-                        format_bytes(chunk_size)
-                    );
-                }
-
-                write_tasks.spawn(async move {
-                    let result =
-                        Self::write_chunk_to_listing_table(&listing_table_clone, chunk_to_write)
-                            .await;
-
-                    if is_s3 {
-                        total_bytes.fetch_add(chunk_size, Ordering::Relaxed);
-                        let file_num = files_count.fetch_add(1, Ordering::Relaxed) + 1;
-
+                    if is_s3_storage {
                         let elapsed = start.elapsed();
                         let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-                        let last_logged = progress_time.load(Ordering::Relaxed);
-                        let should_log =
-                            elapsed_ms.saturating_sub(last_logged) >= 10_000 || result.is_ok();
-                        if should_log {
-                            let bytes_so_far = total_bytes.load(Ordering::Relaxed);
+                        let last_logged = last_progress_ms.load(Ordering::Relaxed);
+                        if elapsed_ms.saturating_sub(last_logged) >= 10_000 {
+                            let bytes_so_far = total_bytes_written.load(Ordering::Relaxed);
                             let throughput = if elapsed.as_secs_f64() > 0.0 {
                                 #[expect(clippy::cast_precision_loss)]
                                 let bytes_per_sec = bytes_so_far as f64 / elapsed.as_secs_f64();
@@ -1753,71 +1372,46 @@ impl CayenneTableProvider {
                                 "calculating...".to_string()
                             };
                             tracing::info!(
-                                "S3 upload for {}: {} files completed ({}) in {:.1}s, {}",
+                                "S3 upload for {}: streamed {} in {:.1}s, {}",
                                 table_name,
-                                file_num,
                                 format_bytes(bytes_so_far),
                                 elapsed.as_secs_f64(),
                                 throughput
                             );
-                            progress_time.store(elapsed_ms, Ordering::Relaxed);
+                            last_progress_ms.store(elapsed_ms, Ordering::Relaxed);
                         }
                     }
-
-                    drop(permit);
-                    result
-                });
-            }
-
-            current_size += batch_size;
-            current_chunk.push(batch);
-        }
-
-        // Write final chunk if non-empty
-        if !current_chunk.is_empty() {
-            let permit = Arc::clone(&semaphore).acquire_owned().await.map_err(|e| {
-                CatalogError::InvalidOperation {
-                    message: "Failed to acquire write permit for final chunk.".to_string(),
-                    source: Box::new(e),
                 }
+                batch_result
+            })
+        };
+
+        let tracked_stream =
+            RecordBatchStreamAdapter::new(Arc::clone(&tracked_schema), tracked_stream);
+        let stream_exec = Arc::new(StreamingExec::new(tracked_schema, Box::pin(tracked_stream)));
+
+        let insert_plan = snapshot_listing_table
+            .insert_into(session_state.as_ref(), stream_exec, InsertOp::Append)
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to create insert plan for snapshot write.".to_string(),
+                source: Box::new(e),
             })?;
 
-            chunk_count += 1;
-            let final_chunk_size = current_size;
-
-            let listing_table_clone = Arc::clone(&snapshot_listing_table);
-            let total_bytes = Arc::clone(&total_bytes_written);
-            let files_count = Arc::clone(&files_written);
-            let is_s3 = is_s3_storage;
-
-            write_tasks.spawn(async move {
-                let result =
-                    Self::write_chunk_to_listing_table(&listing_table_clone, current_chunk).await;
-
-                if is_s3 {
-                    total_bytes.fetch_add(final_chunk_size, Ordering::Relaxed);
-                    files_count.fetch_add(1, Ordering::Relaxed);
-                }
-
-                drop(permit);
-                result
-            });
-        }
-
-        // Wait for all writes to complete and collect row counts
-        while let Some(result) = write_tasks.join_next().await {
-            let row_count = result.map_err(|e| CatalogError::InvalidOperation {
-                message: "Write task panicked.".to_string(),
+        collect(insert_plan, session_state.task_ctx())
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to execute insert for snapshot write.".to_string(),
                 source: Box::new(e),
-            })??;
-            total_rows += row_count;
-        }
+            })?;
+
+        let total_rows = total_rows_written.load(Ordering::Relaxed);
+        let writer_ops = usize::from(total_rows > 0); // 1 writer op if we wrote any rows, otherwise 0
 
         // Log final summary for S3 Express uploads
         if is_s3_storage {
             let elapsed = start_time.elapsed();
             let total_bytes = total_bytes_written.load(Ordering::Relaxed);
-            let files_count = files_written.load(Ordering::Relaxed);
             let throughput = if elapsed.as_secs_f64() > 0.0 {
                 #[expect(clippy::cast_precision_loss)]
                 let bytes_per_sec = total_bytes as f64 / elapsed.as_secs_f64();
@@ -1826,62 +1420,18 @@ impl CayenneTableProvider {
                 "N/A".to_string()
             };
             tracing::info!(
-                "Completed S3 upload for {} to snapshot {}: {} rows in {} files ({}) in {:.1}s, {}",
+                "Completed S3 upload for {} to snapshot {}: {} rows across {} writer operation(s) ({}) in {:.1}s, {}",
                 self.table_metadata.table_name,
                 snapshot_id,
                 total_rows,
-                files_count,
+                writer_ops,
                 format_bytes(total_bytes),
                 elapsed.as_secs_f64(),
                 throughput
             );
         }
 
-        Ok((total_rows, chunk_count))
-    }
-
-    /// Write a chunk of record batches to a specific `ListingTable`.
-    ///
-    /// This is a static helper method for `chunk_and_write_parallel_to_snapshot`.
-    async fn write_chunk_to_listing_table(
-        listing_table: &ListingTable,
-        chunk: Vec<RecordBatch>,
-    ) -> CatalogResult<u64> {
-        if chunk.is_empty() {
-            return Ok(0);
-        }
-
-        let schema = chunk[0].schema();
-        let row_count: u64 = chunk.iter().map(|b| b.num_rows() as u64).sum();
-
-        // Create a stream from the chunk batches
-        let batch_stream = futures::stream::iter(chunk.into_iter().map(Ok));
-        let chunk_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), batch_stream);
-
-        let stream_exec = Arc::new(StreamingExec::new(
-            Arc::clone(&schema),
-            Box::pin(chunk_stream),
-        ));
-
-        let ctx = SessionContext::new();
-        let state = ctx.state();
-
-        let insert_plan = listing_table
-            .insert_into(&state, stream_exec, InsertOp::Append)
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to create insert plan for chunk.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        collect(insert_plan, state.task_ctx()).await.map_err(|e| {
-            CatalogError::InvalidOperation {
-                message: "Failed to execute insert for chunk.".to_string(),
-                source: Box::new(e),
-            }
-        })?;
-
-        Ok(row_count)
+        Ok((total_rows, writer_ops))
     }
 
     /// Create a clone of necessary fields for parallel write tasks.
@@ -2899,7 +2449,7 @@ impl CayenneTableProvider {
 
         // Write the sorted data back in chunks
         let (total_rows, chunk_count) = self
-            .chunk_and_write_parallel(sorted_stream, target_size_bytes)
+            .write_to_snapshot(sorted_stream, target_size_bytes, &current_snapshot)
             .await?;
 
         tracing::info!(
@@ -2967,64 +2517,6 @@ impl CayenneTableProvider {
         }
 
         ctx
-    }
-
-    /// Write a single chunk of record batches as a Vortex file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the chunk cannot be written.
-    async fn write_chunk(&self, chunk: Vec<RecordBatch>) -> CatalogResult<u64> {
-        if chunk.is_empty() {
-            return Ok(0);
-        }
-
-        let schema = chunk[0].schema();
-        let row_count: u64 = chunk.iter().map(|b| b.num_rows() as u64).sum();
-
-        // Create a stream from the chunk batches
-        let batch_stream = futures::stream::iter(chunk.into_iter().map(Ok));
-        let chunk_stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), batch_stream);
-
-        let stream_exec = Arc::new(StreamingExec::new(
-            Arc::clone(&schema),
-            Box::pin(chunk_stream),
-        ));
-
-        // Create a session context for executing the insert (with object store if needed)
-        let ctx = self.create_session_context();
-        let state = ctx.state();
-
-        // Delegate to ListingTable's insert_into to write Vortex files
-        // Clone the Arc and drop the lock before awaiting
-        let listing_table = {
-            let guard = self
-                .listing_table
-                .read()
-                .map_err(|_| CatalogError::LockPoisoned {
-                    operation: "write_chunk (read listing table)".to_string(),
-                })?;
-            Arc::clone(&guard)
-        };
-        let insert_plan = listing_table
-            .insert_into(&state, stream_exec, InsertOp::Append)
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to create insert plan for chunk.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        // Execute the insert plan
-        collect(insert_plan, state.task_ctx()).await.map_err(|e| {
-            CatalogError::InvalidOperation {
-                message: "Failed to execute insert for chunk.".to_string(),
-                source: Box::new(e),
-            }
-        })?;
-
-        tracing::debug!("Wrote chunk with {} rows to Vortex", row_count);
-
-        Ok(row_count)
     }
 
     async fn apply_retention_filters(&self) -> CatalogResult<u64> {

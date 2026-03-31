@@ -127,9 +127,22 @@ impl CayenneContext {
         let vortex_session = VortexSession::default();
 
         // Configure VortexFormat - it creates its own VortexFileCache internally
+        let default_config = VortexConfig::default();
+        if config.footer_cache_mb != default_config.footer_cache_mb {
+            tracing::warn!(
+                footer_cache_mb = config.footer_cache_mb,
+                "Vortex config `footer_cache_mb` is currently ignored in Spice.ai 2.0.0-unstable"
+            );
+        }
+        if config.segment_cache_mb != default_config.segment_cache_mb {
+            tracing::warn!(
+                segment_cache_mb = config.segment_cache_mb,
+                "Vortex config `segment_cache_mb` is currently ignored in Spice.ai 2.0.0-unstable"
+            );
+        }
+
         let vortex_opts = VortexOptions {
-            footer_cache_size_mb: config.footer_cache_mb,
-            segment_cache_size_mb: config.segment_cache_mb,
+            target_file_size_mb: config.target_vortex_file_size_mb,
             ..VortexOptions::default()
         };
 
