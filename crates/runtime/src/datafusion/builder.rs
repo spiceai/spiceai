@@ -343,9 +343,10 @@ impl DataFusionBuilder {
                 Arc::new(Box::new(track_bytes_processed)),
             )));
 
-        if let Some(ClusterRole::Scheduler) =
-            self.cluster_config.as_ref().and_then(|cfg| cfg.role())
-        {
+        if matches!(
+            self.cluster_config.as_ref().and_then(|cfg| cfg.role()),
+            Some(ClusterRole::Scheduler)
+        ) {
             state = state.with_physical_optimizer_rule(FlightSQLPartialAggregatePushdown::new());
         }
 
