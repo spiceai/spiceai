@@ -645,9 +645,7 @@ async fn peek_latest_schema_fields(
     match fields {
         Some(fields) => Some(fields.into_iter().cloned().collect()),
         None => {
-            tracing::warn!(
-                "Could not extract schema fields from Kafka message on topic {topic}"
-            );
+            tracing::warn!("Could not extract schema fields from Kafka message on topic {topic}");
             None
         }
     }
