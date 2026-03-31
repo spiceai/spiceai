@@ -52,11 +52,11 @@ pub fn execute(args: &CompletionsArgs, cmd: &mut clap::Command) {
 
     match completion_path(shell) {
         Some((path, post_install_msg)) => {
-            if let Some(parent) = path.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    eprintln!("Failed to create directory {}: {e}", parent.display());
-                    std::process::exit(1);
-                }
+            if let Some(parent) = path.parent()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                eprintln!("Failed to create directory {}: {e}", parent.display());
+                std::process::exit(1);
             }
 
             if let Err(e) = std::fs::write(&path, &buf) {
