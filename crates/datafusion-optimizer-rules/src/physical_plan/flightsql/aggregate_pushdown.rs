@@ -631,8 +631,8 @@ mod tests {
         AggregateExec: mode=Final, gby=[l_returnflag@0 as l_returnflag], aggr=[avg(l_quantity)]
           CoalescePartitionsExec
             UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0", COUNT("l_quantity") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0", COUNT("l_quantity") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", COUNT("l_quantity") AS "__agg_0", SUM("l_quantity") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", COUNT("l_quantity") AS "__agg_0", SUM("l_quantity") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
         "#);
 
         Ok(())
@@ -1250,8 +1250,8 @@ mod tests {
         AggregateExec: mode=Final, gby=[], aggr=[avg(l_quantity)]
           CoalescePartitionsExec
             UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT SUM("l_quantity") AS "__agg_0", COUNT("l_quantity") AS "__agg_1" FROM foo.foo.lineitem
-              PartialAggregationFlightSqlExec sql=SELECT SUM("l_quantity") AS "__agg_0", COUNT("l_quantity") AS "__agg_1" FROM foo.foo.lineitem
+              PartialAggregationFlightSqlExec sql=SELECT COUNT("l_quantity") AS "__agg_0", SUM("l_quantity") AS "__agg_1" FROM foo.foo.lineitem
+              PartialAggregationFlightSqlExec sql=SELECT COUNT("l_quantity") AS "__agg_0", SUM("l_quantity") AS "__agg_1" FROM foo.foo.lineitem
         "#);
 
         // AVG partial state is (count: UInt64, sum: <input_type>) — DataFusion's

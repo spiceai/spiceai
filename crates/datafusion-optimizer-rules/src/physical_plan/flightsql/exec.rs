@@ -414,21 +414,51 @@ fn build_aggregate_sql(
                 physical_expr_to_sql(&exprs[0], column_substitutions).ok_or_else(|| {
                     DataFusionError::Internal("Failed to convert avg arg to SQL".to_string())
                 })?;
-            // AVG decomposes into SUM + COUNT.
-            // Use SUM(col) (no CAST) as the dedup key so it merges with an
-            // existing explicit SUM(col). The local side casts the Decimal
-            // result to Float64 via remap_batch.
+            // AVG decomposes into SUM + COUNT. The partial state has exactly
+            // two fields, but their ORDER depends on the specific AVG accumulator
+            // implementation (DataFusion's built-in uses `[count, sum]`, but
+            // custom accumulators may use `[sum, count]`).
+            //
+            // We read the actual state fields from the aggregate expression and
+            // emit SQL fragments in the matching order so that `column_mapping`
+            // correctly routes remote columns to the output positions expected
+            // by `AggregateExec(Final)`.
             let stripped = strip_outer_cast(&arg_sql);
-            all_fragments.push(SqlFragment {
-                sql: format!("SUM({arg_sql})"),
-                dedup_key: format!("SUM({stripped})"),
-                needs_alias: true,
-            });
-            all_fragments.push(SqlFragment {
-                sql: format!("COUNT({arg_sql})"),
-                dedup_key: format!("COUNT({stripped})"),
-                needs_alias: true,
-            });
+
+            let state_fields = aggr.state_fields().map_err(|e| {
+                DataFusionError::Internal(format!("Failed to get AVG state fields: {e}"))
+            })?;
+            if state_fields.len() != 2 {
+                return Err(DataFusionError::Internal(format!(
+                    "Expected 2 state fields for avg, got {}",
+                    state_fields.len()
+                )));
+            }
+
+            for field in &state_fields {
+                let name_lower = field.name().to_lowercase();
+                if name_lower.contains("count") {
+                    all_fragments.push(SqlFragment {
+                        sql: format!("COUNT({arg_sql})"),
+                        dedup_key: format!("COUNT({stripped})"),
+                        needs_alias: true,
+                    });
+                } else if name_lower.contains("sum") {
+                    // Use SUM(col) (no CAST) as the dedup key so it merges with an
+                    // existing explicit SUM(col). The local side casts the Decimal
+                    // result to Float64 via remap_batch.
+                    all_fragments.push(SqlFragment {
+                        sql: format!("SUM({arg_sql})"),
+                        dedup_key: format!("SUM({stripped})"),
+                        needs_alias: true,
+                    });
+                } else {
+                    return Err(DataFusionError::Internal(format!(
+                        "Unrecognized AVG state field '{}' — expected name containing 'count' or 'sum'",
+                        field.name()
+                    )));
+                }
+            }
         } else {
             return Err(DataFusionError::Internal(format!(
                 "Unsupported aggregate function for pushdown: {func_name}"
@@ -474,8 +504,7 @@ fn build_aggregate_sql(
     let where_clauses: Vec<String> = source_filters
         .iter()
         .map(|f| {
-            to_sql_preserving_precedence(f)
-                .map_err(|e| DataFusionError::Internal(e.to_string()))
+            to_sql_preserving_precedence(f).map_err(|e| DataFusionError::Internal(e.to_string()))
         })
         .collect::<Result<Vec<_>>>()?;
 

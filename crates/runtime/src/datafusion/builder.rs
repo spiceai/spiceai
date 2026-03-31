@@ -339,10 +339,15 @@ impl DataFusionBuilder {
 
         state = state
             .with_physical_optimizer_rule(Arc::new(EmptyHashJoinExecPhysicalOptimization {}))
-            .with_physical_optimizer_rule(FlightSQLPartialAggregatePushdown::new())
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
                 Arc::new(Box::new(track_bytes_processed)),
             )));
+
+        if let Some(ClusterRole::Scheduler) =
+            self.cluster_config.as_ref().and_then(|cfg| cfg.role())
+        {
+            state = state.with_physical_optimizer_rule(FlightSQLPartialAggregatePushdown::new());
+        }
 
         let mut state = state.build();
 
