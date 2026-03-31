@@ -90,7 +90,6 @@ pub mod imap;
 pub mod index_maintenance;
 pub mod object;
 pub mod poly;
-pub mod update;
 
 #[async_trait]
 pub trait Read: Send + Sync {
