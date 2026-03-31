@@ -403,7 +403,7 @@ mod tests {
     }
 
     /// Verify that `UpsertDedupTableProvider` delegates `update()` to the inner
-    /// provider instead of falling through to DataFusion's default.
+    /// provider instead of falling through to `DataFusion`'s default.
     #[tokio::test]
     async fn test_update_delegates_to_inner() {
         let ctx = SessionContext::new();
@@ -440,12 +440,11 @@ mod tests {
             update_called.load(Ordering::SeqCst),
             "UpsertDedupTableProvider::update() must delegate to the inner provider"
         );
-        assert!(result.is_err());
+        let err = result.expect_err(
+            "UpsertDedupTableProvider::update() should surface the inner provider error",
+        );
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("mock update reached"),
+            err.to_string().contains("mock update reached"),
             "Error should come from the mock inner provider, not DataFusion default"
         );
     }
