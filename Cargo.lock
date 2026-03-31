@@ -15964,6 +15964,7 @@ dependencies = [
  "ballista-scheduler",
  "base64 0.22.1",
  "bcder",
+ "blake3",
  "bollard",
  "byte-unit",
  "bytes",
