@@ -321,7 +321,7 @@ impl FederatedTable {
                             dataset.name,
                         );
                     }
-                    tracing::info!("Connection to source re-established for {dataset_name}.",);
+                    tracing::info!("Connection to source re-established for {dataset_name}.");
                 }
                 Err(e) => {
                     tracing::error!(

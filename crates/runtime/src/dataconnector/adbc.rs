@@ -186,6 +186,11 @@ struct ConnectorCacheEntry {
     notify: tokio::sync::Notify,
 }
 
+struct ConnectorInitializationGuard {
+    entry: Arc<ConnectorCacheEntry>,
+    active: bool,
+}
+
 impl ConnectorCacheState {
     fn should_retain(&self) -> bool {
         match self {
@@ -206,6 +211,43 @@ impl ConnectorCacheEntry {
 
     fn should_retain(&self) -> bool {
         self.state.lock().should_retain()
+    }
+}
+
+impl ConnectorInitializationGuard {
+    fn new(entry: Arc<ConnectorCacheEntry>) -> Self {
+        Self {
+            entry,
+            active: true,
+        }
+    }
+
+    fn complete(&mut self, result: &super::NewDataConnectorResult) {
+        {
+            let mut state = self.entry.state.lock();
+            *state = match result {
+                Ok(connector) => ConnectorCacheState::Ready(Arc::downgrade(connector)),
+                Err(_) => ConnectorCacheState::Vacant,
+            };
+        }
+        self.active = false;
+        self.entry.notify.notify_waiters();
+    }
+}
+
+impl Drop for ConnectorInitializationGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+
+        {
+            let mut state = self.entry.state.lock();
+            if matches!(&*state, ConnectorCacheState::Initializing) {
+                *state = ConnectorCacheState::Vacant;
+            }
+        }
+        self.entry.notify.notify_waiters();
     }
 }
 
@@ -532,17 +574,9 @@ impl DataConnectorFactory for AdbcFactory {
                 match action {
                     CacheAction::Return(connector) => return Ok(connector),
                     CacheAction::Initialize => {
+                        let mut init_guard = ConnectorInitializationGuard::new(Arc::clone(&entry));
                         let result = Self::init_connector(params.clone()).await;
-                        {
-                            let mut state = entry.state.lock();
-                            *state = match &result {
-                                Ok(connector) => {
-                                    ConnectorCacheState::Ready(Arc::downgrade(connector))
-                                }
-                                Err(_) => ConnectorCacheState::Vacant,
-                            };
-                        }
-                        entry.notify.notify_waiters();
+                        init_guard.complete(&result);
                         return result;
                     }
                     CacheAction::Wait => notified.await,
@@ -1286,6 +1320,20 @@ mod tests {
         *entry.state.lock() = ConnectorCacheState::Initializing;
 
         assert!(entry.should_retain());
+    }
+
+    #[tokio::test]
+    async fn test_connector_initialization_guard_resets_state_on_drop() {
+        let entry = Arc::new(ConnectorCacheEntry::new());
+        *entry.state.lock() = ConnectorCacheState::Initializing;
+
+        let notified = entry.notify.notified();
+        let guard = ConnectorInitializationGuard::new(Arc::clone(&entry));
+        drop(guard);
+
+        notified.await;
+
+        assert!(matches!(&*entry.state.lock(), ConnectorCacheState::Vacant));
     }
 
     fn make_params(pairs: Vec<(&str, &str)>) -> Parameters {
