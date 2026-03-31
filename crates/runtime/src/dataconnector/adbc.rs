@@ -165,7 +165,9 @@ fn adbc_cleanup_sender()
             })
             .is_err()
         {
-            tracing::warn!("Failed to spawn ADBC cleanup thread; cleanup will happen inline.");
+            tracing::warn!(
+                "Failed to spawn ADBC cleanup worker thread; subsequent cleanup will use the overflow thread path or be performed inline as a last resort"
+            );
         }
         tx
     })
