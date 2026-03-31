@@ -137,8 +137,6 @@ pub struct ClusterHarness {
     /// Background server handles — aborted on drop.
     handles: Vec<JoinHandle<RuntimeResult<()>>>,
     executor_manager: ExecutorManager,
-    /// The scheduler's Flight bind address (for external DoPut tests).
-    scheduler_flight_addr: SocketAddr,
 }
 
 impl Drop for ClusterHarness {
@@ -155,10 +153,6 @@ impl ClusterHarness {
         ClusterHarnessBuilder::new()
     }
 
-    /// Returns the scheduler's Flight address for direct client connections.
-    pub fn scheduler_flight_addr(&self) -> SocketAddr {
-        self.scheduler_flight_addr
-    }
     /// Block until exactly `n` executors have registered with the scheduler,
     /// or return an error after `timeout`.
     pub async fn wait_for_executors(&self, timeout: Duration) -> Result<(), anyhow::Error> {
@@ -435,7 +429,6 @@ impl ClusterHarnessBuilder {
             executors: executor_rts,
             handles,
             executor_manager,
-            scheduler_flight_addr: scheduler_ports.flight_addr(),
         })
     }
 }

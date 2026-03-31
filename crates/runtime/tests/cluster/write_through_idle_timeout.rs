@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Regression test for write-through `DoPut` idle timeout keepalive.
 //!
-//! Verifies that keepalive FlightData messages (app_metadata = "spice-keepalive")
+//! Verifies that keepalive `FlightData` messages (`app_metadata` = "spice-keepalive")
 //! prevent the executor's `DoPut` idle timeout from firing.
 //!
 //! Uses a minimal Flight server stub that mirrors the idle-timeout behavior
