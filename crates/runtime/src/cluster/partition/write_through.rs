@@ -196,7 +196,7 @@ pub(crate) async fn forward_federated_partitioned_write(
     // Decode the first message and build a streaming iterator that yields
     // each subsequent FlightData message as a RecordBatch without buffering.
     let first_batch =
-        maybe_read_first_batch(first_message, Arc::clone(&schema), &dictionaries_by_id)?;
+        maybe_read_first_batch(&first_message, Arc::clone(&schema), &dictionaries_by_id)?;
 
     let decode_schema = Arc::clone(&schema);
     let batch_stream = async_stream::try_stream! {
@@ -232,17 +232,17 @@ pub(crate) async fn forward_federated_partitioned_write(
     )]))))
 }
 
-/// If the first FlightData message contains a non-empty body, decode it as the first RecordBatch to be forwarded.
-/// The first FlightData message could be schema-only with an empty body, or it could contain both schema and data - we support both cases.
+/// If the first `FlightData` message contains a non-empty body, decode it as the first `RecordBatch` to be forwarded.
+/// The first `FlightData` message could be schema-only with an empty body, or it could contain both schema and data - we support both cases.
 fn maybe_read_first_batch(
-    first_message: FlightData,
+    first_message: &FlightData,
     schema: SchemaRef,
     dictionaries_by_id: &Arc<HashMap<i64, Arc<dyn Array>>>,
 ) -> Result<Option<RecordBatch>> {
     if first_message.data_body.is_empty() {
         Ok(None)
     } else {
-        let batch = flight_data_to_arrow_batch(&first_message, schema, dictionaries_by_id)
+        let batch = flight_data_to_arrow_batch(first_message, schema, dictionaries_by_id)
             .context(DecodeBatchSnafu)?;
         Ok(Some(batch))
     }
@@ -788,118 +788,6 @@ async fn spawn_executor_forwarding_tasks(
 
 /// Encodes `RecordBatch`es from `rx` as `FlightData` and sends them via `DoPut`
 /// to a specific executor.
-#[cfg(test)]
-#[expect(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-    use arrow::array::Int32Array;
-    use arrow::datatypes::{Field, Schema};
-    use arrow_flight::utils::batches_to_flight_data;
-
-    fn test_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]))
-    }
-
-    fn encode_batch_to_flight_data(schema: &SchemaRef, batch: &RecordBatch) -> Vec<FlightData> {
-        let flight_data =
-            batches_to_flight_data(schema, vec![batch.clone()]).expect("encode flight data");
-        flight_data
-    }
-
-    #[test]
-    fn test_maybe_read_first_batch_empty_body_returns_none() {
-        let schema = test_schema();
-        let dictionaries_by_id = Arc::new(HashMap::new());
-
-        // Build a FlightData with schema header but empty body (schema-only message).
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )
-        .expect("should create batch");
-        let flight_data = encode_batch_to_flight_data(&schema, &batch);
-
-        // The schema-only message should have an empty data_body.
-        assert!(
-            flight_data[0].data_body.is_empty(),
-            "schema message should have empty body"
-        );
-
-        let result = maybe_read_first_batch(
-            flight_data[0].clone(),
-            Arc::clone(&schema),
-            &dictionaries_by_id,
-        )
-        .expect("should succeed");
-        assert!(result.is_none(), "empty body should return None");
-    }
-
-    #[test]
-    fn test_maybe_read_first_batch_with_data_returns_some() {
-        let schema = test_schema();
-        let dictionaries_by_id = Arc::new(HashMap::new());
-
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
-        )
-        .expect("should create batch");
-
-        let flight_data = encode_batch_to_flight_data(&schema, &batch);
-        assert!(
-            !flight_data.is_empty(),
-            "should have at least one data message"
-        );
-
-        let data_fd = flight_data
-            .into_iter()
-            .nth(1)
-            .expect("should have data message");
-        assert!(
-            !data_fd.data_body.is_empty(),
-            "data message should have non-empty body"
-        );
-
-        let result = maybe_read_first_batch(data_fd, Arc::clone(&schema), &dictionaries_by_id)
-            .expect("should succeed");
-
-        let decoded = result.expect("non-empty body should return Some");
-        assert_eq!(decoded.num_rows(), 3);
-        assert_eq!(decoded.num_columns(), 1);
-
-        let col = decoded
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("column should be Int32Array");
-        assert_eq!(col.values().as_ref(), &[10, 20, 30]);
-    }
-
-    #[test]
-    fn test_maybe_read_first_batch_single_row() {
-        let schema = test_schema();
-        let dictionaries_by_id = Arc::new(HashMap::new());
-
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int32Array::from(vec![42]))],
-        )
-        .expect("should create batch");
-
-        let flight_data = encode_batch_to_flight_data(&schema, &batch);
-        let data_fd = flight_data
-            .into_iter()
-            .nth(1)
-            .expect("should have data message");
-
-        let result = maybe_read_first_batch(data_fd, Arc::clone(&schema), &dictionaries_by_id)
-            .expect("should succeed");
-
-        let decoded = result.expect("should return Some for single row");
-        assert_eq!(decoded.num_rows(), 1);
-    }
-}
-
 async fn forward_batches_to_executor(
     client: data_components::flightsql::FlightSqlClient,
     rx: mpsc::Receiver<RecordBatch>,
@@ -984,5 +872,112 @@ async fn forward_batches_to_executor(
     match encode_result_rx.await {
         Ok(Ok(())) | Err(_) => Ok(()),
         Ok(Err(message)) => Err(Error::Encode { message }),
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{Field, Schema};
+    use arrow_flight::utils::batches_to_flight_data;
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]))
+    }
+
+    fn encode_batch_to_flight_data(schema: &SchemaRef, batch: &RecordBatch) -> Vec<FlightData> {
+        batches_to_flight_data(schema, vec![batch.clone()]).expect("encode flight data")
+    }
+
+    #[test]
+    fn test_maybe_read_first_batch_empty_body_returns_none() {
+        let schema = test_schema();
+        let dictionaries_by_id = Arc::new(HashMap::new());
+
+        // Build a FlightData with schema header but empty body (schema-only message).
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("should create batch");
+        let flight_data = encode_batch_to_flight_data(&schema, &batch);
+
+        // The schema-only message should have an empty data_body.
+        assert!(
+            flight_data[0].data_body.is_empty(),
+            "schema message should have empty body"
+        );
+
+        let result =
+            maybe_read_first_batch(&flight_data[0], Arc::clone(&schema), &dictionaries_by_id)
+                .expect("should succeed");
+        assert!(result.is_none(), "empty body should return None");
+    }
+
+    #[test]
+    fn test_maybe_read_first_batch_with_data_returns_some() {
+        let schema = test_schema();
+        let dictionaries_by_id = Arc::new(HashMap::new());
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+        )
+        .expect("should create batch");
+
+        let flight_data = encode_batch_to_flight_data(&schema, &batch);
+        assert!(
+            !flight_data.is_empty(),
+            "should have at least one data message"
+        );
+
+        let data_fd = flight_data
+            .into_iter()
+            .nth(1)
+            .expect("should have data message");
+        assert!(
+            !data_fd.data_body.is_empty(),
+            "data message should have non-empty body"
+        );
+
+        let result = maybe_read_first_batch(&data_fd, Arc::clone(&schema), &dictionaries_by_id)
+            .expect("should succeed");
+
+        let decoded = result.expect("non-empty body should return Some");
+        assert_eq!(decoded.num_rows(), 3);
+        assert_eq!(decoded.num_columns(), 1);
+
+        let col = decoded
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("column should be Int32Array");
+        assert_eq!(col.values().as_ref(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn test_maybe_read_first_batch_single_row() {
+        let schema = test_schema();
+        let dictionaries_by_id = Arc::new(HashMap::new());
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![42]))],
+        )
+        .expect("should create batch");
+
+        let flight_data = encode_batch_to_flight_data(&schema, &batch);
+        let data_fd = flight_data
+            .into_iter()
+            .nth(1)
+            .expect("should have data message");
+
+        let result = maybe_read_first_batch(&data_fd, Arc::clone(&schema), &dictionaries_by_id)
+            .expect("should succeed");
+
+        let decoded = result.expect("should return Some for single row");
+        assert_eq!(decoded.num_rows(), 1);
     }
 }
