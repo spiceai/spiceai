@@ -104,7 +104,7 @@ twox-hash.workspace = true
 url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 uuid.workspace = true
-zip = "7.2.0"
+zip = "8.3.0"
 tokio-stream.workspace = true
 
 [target.'cfg(windows)'.dependencies]
