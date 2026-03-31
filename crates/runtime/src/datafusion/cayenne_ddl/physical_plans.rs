@@ -37,7 +37,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{RecordBatch, StringArray};
+use arrow::array::{RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::CayenneTableProviderBuilder;
 use cayenne::metadata::CreateTableOptions;
@@ -1116,7 +1116,7 @@ impl DistributedCayenneDeleteExec {
         filter_sql: Option<String>,
         input: Arc<dyn ExecutionPlan>,
     ) -> Self {
-        let schema = ddl_result_schema();
+        let schema = dml_count_schema();
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
@@ -1179,7 +1179,7 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
         let table_name = self.table_name.clone();
         let executor_registry = self.executor_registry.clone();
         let filter_sql = self.filter_sql.clone();
-        let result_schema = ddl_result_schema();
+        let result_schema = dml_count_schema();
 
         let stream = futures::stream::once(async move {
             let Some(ref registry) = executor_registry else {
@@ -1195,15 +1195,13 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
 
             RecordBatch::try_new(
                 result_schema,
-                vec![Arc::new(StringArray::from(vec![format!(
-                    "DELETE from '{table_name}' forwarded"
-                )]))],
+                vec![Arc::new(UInt64Array::from(vec![0u64]))],
             )
             .map_err(Into::into)
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            ddl_result_schema(),
+            dml_count_schema(),
             stream,
         )))
     }
@@ -1243,7 +1241,7 @@ impl DistributedCayenneUpdateExec {
         assignments_sql: Vec<(String, String)>,
         input: Arc<dyn ExecutionPlan>,
     ) -> Self {
-        let schema = ddl_result_schema();
+        let schema = dml_count_schema();
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
@@ -1309,7 +1307,7 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
         let executor_registry = self.executor_registry.clone();
         let filter_sql = self.filter_sql.clone();
         let assignments_sql = self.assignments_sql.clone();
-        let result_schema = ddl_result_schema();
+        let result_schema = dml_count_schema();
 
         let stream = futures::stream::once(async move {
             let Some(ref registry) = executor_registry else {
@@ -1335,15 +1333,13 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
 
             RecordBatch::try_new(
                 result_schema,
-                vec![Arc::new(StringArray::from(vec![format!(
-                    "UPDATE on '{table_name}' forwarded"
-                )]))],
+                vec![Arc::new(UInt64Array::from(vec![0u64]))],
             )
             .map_err(Into::into)
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            ddl_result_schema(),
+            dml_count_schema(),
             stream,
         )))
     }
