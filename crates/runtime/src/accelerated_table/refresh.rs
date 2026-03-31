@@ -449,7 +449,7 @@ impl Refresh {
         if let Some(ref checkpointer) = last_checkpoint {
             match checkpointer.get_refresh_sql().await {
                 Ok(stored_refresh_sql) => {
-                    let current_refresh_sql = self.sql.as_ref().map(|s| s.to_sql());
+                    let current_refresh_sql = self.sql.as_ref().map(RefreshSQL::to_sql);
                     if stored_refresh_sql != current_refresh_sql {
                         tracing::info!(
                             "refresh_sql has changed since last checkpoint, triggering refresh"
@@ -1009,7 +1009,7 @@ impl Refresher {
                     runtime_status_clone.wait_for_ready().await;
                     if !bootstrap_status.is_bootstrapped() {
                         let refresh_sql =
-                            refresh_clone.read().await.sql.as_ref().map(|s| s.to_sql());
+                            refresh_clone.read().await.sql.as_ref().map(RefreshSQL::to_sql);
                         create_checkpoint_and_snapshot(
                             &checkpointer,
                             snapshot_manager_clone.as_ref(),
@@ -1091,7 +1091,7 @@ impl Refresher {
                             }
 
                             if checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
-                                let refresh_sql = refresh.read().await.sql.as_ref().map(|s| s.to_sql());
+                                let refresh_sql = refresh.read().await.sql.as_ref().map(RefreshSQL::to_sql);
                                 create_checkpoint_and_snapshot(
                                     checkpointer,
                                     snapshot_manager.as_ref(),

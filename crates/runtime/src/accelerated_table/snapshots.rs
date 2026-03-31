@@ -103,7 +103,7 @@ pub fn spawn_snapshot_interval_task(
             tokio::time::sleep(initial_delay).await;
         }
 
-        let refresh_sql = refresh.read().await.sql.as_ref().map(|s| s.to_sql());
+        let refresh_sql = refresh.read().await.sql.as_ref().map(super::refresh::RefreshSQL::to_sql);
         create_checkpoint_and_snapshot(
             &checkpointer,
             Some(&snapshot_manager),
@@ -129,7 +129,7 @@ pub fn spawn_snapshot_interval_task(
             // Wait for the next snapshot interval (accounting for time spent during previous snapshot creation)
             ticker.tick().await;
 
-            let refresh_sql = refresh.read().await.sql.as_ref().map(|s| s.to_sql());
+            let refresh_sql = refresh.read().await.sql.as_ref().map(super::refresh::RefreshSQL::to_sql);
             create_checkpoint_and_snapshot(
                 &checkpointer,
                 Some(&snapshot_manager),
@@ -192,7 +192,7 @@ pub fn create_periodic_snapshot_callback(
             tokio::spawn(async move {
                 runtime_status.wait_for_ready().await;
                 if !bootstrap_status.is_bootstrapped() {
-                    let refresh_sql = refresh_clone.read().await.sql.as_ref().map(|s| s.to_sql());
+                    let refresh_sql = refresh_clone.read().await.sql.as_ref().map(super::refresh::RefreshSQL::to_sql);
                     create_checkpoint_and_snapshot(
                         &checkpointer_clone,
                         Some(&snapshot_manager_clone),
@@ -236,7 +236,7 @@ pub fn create_periodic_snapshot_callback(
                     if *batches_processed_value >= batches {
                         *batches_processed_value = 0;
 
-                        let refresh_sql = refresh.read().await.sql.as_ref().map(|s| s.to_sql());
+                        let refresh_sql = refresh.read().await.sql.as_ref().map(super::refresh::RefreshSQL::to_sql);
                         create_checkpoint_and_snapshot(
                             &checkpointer,
                             Some(&snapshot_manager),

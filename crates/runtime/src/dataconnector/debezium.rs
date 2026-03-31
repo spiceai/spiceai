@@ -638,13 +638,11 @@ async fn peek_latest_schema_fields(
         }
     };
 
-    let fields = msg.value().get_schema_fields();
-    match fields {
-        Some(fields) => Some(fields.into_iter().cloned().collect()),
-        None => {
-            tracing::warn!("Could not extract schema fields from Kafka message on topic {topic}");
-            None
-        }
+    if let Some(fields) = msg.value().get_schema_fields() {
+        Some(fields.into_iter().cloned().collect())
+    } else {
+        tracing::warn!("Could not extract schema fields from Kafka message on topic {topic}");
+        None
     }
 }
 
