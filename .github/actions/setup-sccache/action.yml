@@ -29,15 +29,7 @@ runs:
         echo "SCCACHE_CACHE_SIZE=4T" >> $GITHUB_ENV
         rm -rf ~/.config/sccache/config
         mkdir -p ~/.config/sccache
-        cat <<EOF > ~/.config/sccache/config
-        [cache.s3]
-        bucket = "sccache"
-        endpoint = "${{ inputs.minio_endpoint }}"
-        use_ssl = false
-        server_side_encryption = false
-        no_credentials = false
-        region = "us-east-1"
-        EOF
+        printf '[cache.s3]\nbucket = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = false\nregion = "us-east-1"\n' "${{ inputs.minio_endpoint }}" > ~/.config/sccache/config
 
     - name: Set up sccache (macOS)
       if: runner.os == 'macOS'
@@ -67,15 +59,7 @@ runs:
 
         rm -rf ~/.config/sccache/config
         mkdir -p ~/.config/sccache
-        cat <<EOF > ~/.config/sccache/config
-        [cache.s3]
-        bucket = "sccache"
-        endpoint = "$SCCACHE_ENDPOINT"
-        use_ssl = false
-        server_side_encryption = false
-        no_credentials = $SCCACHE_NO_CREDS
-        region = "$SCCACHE_REGION"
-        EOF
+        printf '[cache.s3]\nbucket = "sccache"\nendpoint = "%s"\nuse_ssl = false\nserver_side_encryption = false\nno_credentials = %s\nregion = "%s"\n' "$SCCACHE_ENDPOINT" "$SCCACHE_NO_CREDS" "$SCCACHE_REGION" > ~/.config/sccache/config
 
     - name: Set up sccache (Windows)
       if: runner.os == 'Windows' && inputs.minio_endpoint != ''
@@ -102,13 +86,5 @@ runs:
         # Configure sccache
         $configDir = "$env:APPDATA\Mozilla\sccache"
         New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-        $config = @"
-        [cache.s3]
-        bucket = "sccache"
-        endpoint = "${{ inputs.minio_endpoint }}"
-        use_ssl = false
-        server_side_encryption = false
-        no_credentials = false
-        region = "us-east-1"
-        "@
+        $config = "[cache.s3]`nbucket = `"sccache`"`nendpoint = `"${{ inputs.minio_endpoint }}`"`nuse_ssl = false`nserver_side_encryption = false`nno_credentials = false`nregion = `"us-east-1`""
         $config | Out-File -FilePath "$configDir\config" -Encoding utf8
