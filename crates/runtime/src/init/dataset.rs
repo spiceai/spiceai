@@ -313,7 +313,17 @@ impl Runtime {
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
         let runtime = Arc::clone(&self);
-        let _ = retry(retry_strategy, || async {
+        let shutdown_token = runtime.status.shutdown_token();
+        let retry_fut = retry(retry_strategy, || async {
+            // Exit immediately if the runtime is shutting down (e.g. after a backoff sleep completes).
+            if runtime.status.is_shutdown() {
+                return Err(RetryError::permanent(
+                    crate::Error::UnableToInitializeDataConnector {
+                        source: "Runtime is shutting down".into(),
+                    },
+                ));
+            }
+
             let connector = match Arc::clone(&runtime)
                 .load_dataset_connector(Arc::clone(&ds))
                 .await
@@ -336,6 +346,15 @@ impl Runtime {
                 }
             };
 
+            // Check shutdown between connector load and registration.
+            if runtime.status.is_shutdown() {
+                return Err(RetryError::permanent(
+                    crate::Error::UnableToInitializeDataConnector {
+                        source: "Runtime is shutting down".into(),
+                    },
+                ));
+            }
+
             if let Err(err) = Arc::clone(&runtime)
                 .register_loaded_dataset(Arc::clone(&ds), connector, None, bootstrap_status.clone())
                 .await
@@ -348,8 +367,14 @@ impl Runtime {
             }
 
             Ok(())
-        })
-        .await;
+        });
+
+        // Use tokio::select! so that backoff sleeps inside `retry` are immediately
+        // interrupted when the runtime begins shutting down (e.g. on ctrl-c).
+        tokio::select! {
+            _ = retry_fut => {},
+            () = shutdown_token.cancelled() => {},
+        }
     }
 
     async fn register_loaded_dataset(
@@ -377,13 +402,23 @@ impl Runtime {
         // Test dataset connectivity by attempting to get a read provider.
         let federated_table = match data_connector.read_provider(&ds).await {
             Ok(provider) => {
-                FederatedTable::new(Arc::clone(&ds), provider, Arc::clone(&data_connector)).await
+                FederatedTable::new(
+                    Arc::clone(&ds),
+                    provider,
+                    Arc::clone(&data_connector),
+                    self.status.shutdown_token(),
+                )
+                .await
             }
             Err(err) => {
                 // We couldn't connect to the federated table. If the dataset has an existing
                 // accelerated table, we can defer the federated table creation.
-                if let Some(federated_table) =
-                    FederatedTable::new_deferred(Arc::clone(&ds), Arc::clone(&data_connector)).await
+                if let Some(federated_table) = FederatedTable::new_deferred(
+                    Arc::clone(&ds),
+                    Arc::clone(&data_connector),
+                    self.status.shutdown_token(),
+                )
+                .await
                 {
                     tracing::warn!(
                         "Failed to connect to the source for dataset {}. Serving data from the existing acceleration for {} while retrying the connection. {err}",
@@ -632,8 +667,13 @@ impl Runtime {
             }
             .build()
         })?;
-        let federated_table =
-            FederatedTable::new(Arc::clone(&ds), read_table, Arc::clone(&connector)).await;
+        let federated_table = FederatedTable::new(
+            Arc::clone(&ds),
+            read_table,
+            Arc::clone(&connector),
+            self.status.shutdown_token(),
+        )
+        .await;
 
         // Remove the schedule if the dataset has one, to prevent scheduling while the dataset is being updated.
         Arc::clone(&self)

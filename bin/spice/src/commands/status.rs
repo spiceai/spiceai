@@ -17,7 +17,7 @@ limitations under the License.
 //! Status command implementation.
 
 use crate::context::RuntimeContext;
-use crate::error::{InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
+use crate::error::{self, InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
 use crate::output::{OutputFormat, write_json};
 use clap::Args;
 use serde::{Deserialize, Serialize};
@@ -47,12 +47,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &StatusArgs) -> Result<()> {
         .build()
     })?;
 
-    if !response.status().is_success() {
-        return Err(RuntimeUnavailableSnafu {
-            endpoint: ctx.http_endpoint().to_string(),
-        }
-        .build());
-    }
+    let response = error::check_response(response, ctx.http_endpoint()).await?;
 
     let components: Vec<ComponentStatus> = response.json().await.map_err(|e| {
         InvalidResponseSnafu {

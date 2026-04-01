@@ -140,7 +140,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &UpgradeArgs) -> Result<()> {
 
         // Get possible runtime asset names (handles version-specific naming)
         // Default flavor auto-detects accelerator (Metal on macOS, CUDA on Linux)
-        let asset_names = SystemType::this_pc().runtime_asset_names("default");
+        let asset_names = SystemType::this_pc().runtime_asset_names("default", target_version);
         tracing::info!("Upgrading Spice runtime to {target_version}...");
 
         let downloaded_asset = download_release_asset_with_fallback(
