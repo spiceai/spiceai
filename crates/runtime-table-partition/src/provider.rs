@@ -19,7 +19,7 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 use arrow::array::{Array, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use data_components::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
+use data_components::delete::{DeletionExec, DeletionSink};
 use datafusion::{
     catalog::{Session, TableProvider},
     common::{Constraints, DFSchema, Statistics, project_schema},
@@ -391,16 +391,11 @@ impl TableProvider for PartitionTableProvider {
             .execute_insert(input, insert_op, &ctx)
             .await
     }
-}
 
-/// Implement `DeletionTableProvider` to support retention checks and delete operations
-/// on partitioned tables. Deletion is applied to all partitions.
-#[async_trait]
-impl DeletionTableProvider for PartitionTableProvider {
     async fn delete_from(
         &self,
         state: &dyn Session,
-        filters: &[Expr],
+        filters: Vec<Expr>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         // Collect all partitions that need deletion
         let partitions = self.partitions.read().await;
@@ -410,11 +405,11 @@ impl DeletionTableProvider for PartitionTableProvider {
         // Create a deletion sink that will iterate over all partitions
         let deletion_sink = Arc::new(PartitionedDeletionSink::new(
             partition_list,
-            filters.to_vec(),
+            filters,
             state.task_ctx(),
         ));
 
-        Ok(Arc::new(DeletionExec::new(deletion_sink, &self.schema)))
+        Ok(Arc::new(DeletionExec::new(deletion_sink)))
     }
 }
 
@@ -441,46 +436,30 @@ impl DeletionSink for PartitionedDeletionSink {
         let mut total_deleted = 0u64;
 
         for partition in &self.partitions {
-            // Try to downcast the partition's table provider to DeletionTableProvider
-            // The partition's table provider might be a CayenneTableProvider or similar
-            // that implements DeletionTableProvider
-            let deletion_provider = data_components::delete::get_deletion_provider(Arc::clone(
-                &partition.table_provider,
-            ));
+            // Create a simple session state for executing the deletion
+            let session_ctx = datafusion::execution::context::SessionContext::new();
+            let state = session_ctx.state();
 
-            if let Some(deletion_provider) = deletion_provider {
-                // Create a simple session state for executing the deletion
-                let session_ctx = datafusion::execution::context::SessionContext::new();
-                let state = session_ctx.state();
-
-                // Execute deletion on this partition
-                let plan = DeletionTableProvider::delete_from(
-                    deletion_provider.as_ref(),
-                    &state,
-                    &self.filters,
-                )
+            // Execute deletion on this partition using native TableProvider::delete_from
+            let plan = partition
+                .table_provider
+                .delete_from(&state, self.filters.clone())
                 .await?;
 
-                // Execute the deletion plan
-                let results = collect(plan, Arc::clone(&self.task_ctx)).await?;
+            // Execute the deletion plan
+            let results = collect(plan, Arc::clone(&self.task_ctx)).await?;
 
-                // Extract the count from results
-                for batch in results {
-                    if let Some(count_col) = batch.column_by_name("count")
-                        && let Some(uint_array) = count_col.as_any().downcast_ref::<UInt64Array>()
-                    {
-                        for i in 0..uint_array.len() {
-                            if !uint_array.is_null(i) {
-                                total_deleted += uint_array.value(i);
-                            }
+            // Extract the count from results
+            for batch in results {
+                if let Some(count_col) = batch.column_by_name("count")
+                    && let Some(uint_array) = count_col.as_any().downcast_ref::<UInt64Array>()
+                {
+                    for i in 0..uint_array.len() {
+                        if !uint_array.is_null(i) {
+                            total_deleted += uint_array.value(i);
                         }
                     }
                 }
-            } else {
-                tracing::warn!(
-                    partition_values = ?partition.partition_values,
-                    "Partition table provider does not support deletion. Skipping."
-                );
             }
         }
 
