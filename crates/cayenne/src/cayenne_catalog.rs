@@ -29,8 +29,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use turso_shared::{
-    is_retryable_write_conflict_message, retry_backoff_delay, BEGIN_CONCURRENT_SQL,
-    BEGIN_TRANSACTION_SQL, COMMIT_SQL, DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS,
+    is_retryable_write_conflict_message, retry_backoff_delay, DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS,
 };
 
 struct ExistingDeleteFileRecord {
@@ -52,18 +51,6 @@ pub(crate) enum MetastoreImpl {
 }
 
 impl MetastoreImpl {
-    #[must_use]
-    pub(crate) fn is_turso(&self) -> bool {
-        #[cfg(feature = "turso")]
-        {
-            matches!(self, Self::Turso(_))
-        }
-        #[cfg(not(feature = "turso"))]
-        {
-            false
-        }
-    }
-
     /// Helper to query a single row from metastore, working with both `SQLite` and Turso
     pub(crate) async fn query_row_helper<F, T>(
         &self,
@@ -90,18 +77,6 @@ impl MetastoreImpl {
         }
     }
 
-    /// Helper to execute a batch of SQL statements.
-    ///
-    /// Callers that require atomicity must include explicit `BEGIN ... COMMIT`
-    /// statements in the SQL they pass to this helper.
-    pub(crate) async fn execute_batch_helper(&self, sql: &str) -> CatalogResult<()> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.execute_batch(sql).await,
-            #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.execute_batch(sql).await,
-        }
-    }
-
     /// Helper to query multiple rows from metastore, working with both `SQLite` and Turso
     pub(crate) async fn query_helper<F, T>(
         &self,
@@ -125,6 +100,21 @@ impl MetastoreImpl {
             MetastoreImpl::Sqlite(m) => m.shutdown().await,
             #[cfg(feature = "turso")]
             MetastoreImpl::Turso(m) => m.shutdown().await,
+        }
+    }
+
+    /// Begin a transaction on the underlying metastore.
+    ///
+    /// Each backend sends the appropriate BEGIN statement (e.g. `BEGIN TRANSACTION`
+    /// for `SQLite`, `BEGIN CONCURRENT` for Turso). The returned transaction object
+    /// holds exclusive access to the connection.
+    pub(crate) async fn begin_transaction(
+        &self,
+    ) -> CatalogResult<Box<dyn super::metastore::MetastoreTransaction>> {
+        match self {
+            MetastoreImpl::Sqlite(m) => m.begin_transaction().await,
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(m) => m.begin_transaction().await,
         }
     }
 }
@@ -239,6 +229,25 @@ impl CayenneCatalog {
         pk_bytes_list: Vec<Vec<u8>>,
         sequence_number: i64,
     ) -> CatalogResult<()> {
+        let (sql, params) =
+            Self::build_insert_records_chunk_sql(table_id, pk_bytes_list, sequence_number);
+
+        self.metastore
+            .execute_helper(ExecuteParams { sql: &sql, params })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to add insert record entries in batch".to_string(),
+                source: Box::new(e),
+            })?;
+        Ok(())
+    }
+
+    /// Build the SQL and parameters for a single chunk of insert records.
+    fn build_insert_records_chunk_sql(
+        table_id: &str,
+        pk_bytes_list: Vec<Vec<u8>>,
+        sequence_number: i64,
+    ) -> (String, Vec<MetastoreValue>) {
         let mut values_parts = Vec::with_capacity(pk_bytes_list.len());
         let mut params = Vec::with_capacity(pk_bytes_list.len() * 4);
         let table_id = table_id.to_string();
@@ -264,14 +273,7 @@ impl CayenneCatalog {
             values_parts.join(", ")
         );
 
-        self.metastore
-            .execute_helper(ExecuteParams { sql: &sql, params })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to add insert record entries in batch".to_string(),
-                source: Box::new(e),
-            })?;
-        Ok(())
+        (sql, params)
     }
 }
 
@@ -847,40 +849,29 @@ impl MetadataCatalog for CayenneCatalog {
                 .await;
         }
 
-        // Multiple chunks required — wrap in a transaction for atomicity.
-        let begin = if self.metastore.is_turso() {
-            BEGIN_CONCURRENT_SQL
-        } else {
-            BEGIN_TRANSACTION_SQL
-        };
-        self.metastore
-            .execute_batch_helper(begin)
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
+        // Multiple chunks required — use a proper transaction for atomicity.
+        // The transaction holds exclusive access to the connection, preventing
+        // concurrent operations from interleaving BEGIN/COMMIT boundaries.
+        let tx = self.metastore.begin_transaction().await.map_err(|e| {
+            CatalogError::InvalidOperation {
                 message: "Failed to begin transaction for batch insert records".to_string(),
                 source: Box::new(e),
-            })?;
+            }
+        })?;
 
         for chunk in pk_bytes_list.chunks(MAX_ROWS_PER_CHUNK) {
-            if let Err(e) = self
-                .insert_records_chunk(table_id, chunk.to_vec(), sequence_number)
-                .await
-            {
-                // Best-effort rollback; if it fails, the connection will
-                // auto-rollback when the next statement runs.
-                let _ = self
-                    .metastore
-                    .execute_helper(ExecuteParams {
-                        sql: "ROLLBACK",
-                        params: vec![],
-                    })
-                    .await;
-                return Err(e);
+            let (sql, params) =
+                Self::build_insert_records_chunk_sql(table_id, chunk.to_vec(), sequence_number);
+            if let Err(e) = tx.execute(ExecuteParams { sql: &sql, params }).await {
+                // Transaction auto-rolls-back on drop.
+                return Err(CatalogError::InvalidOperation {
+                    message: "Failed to add insert record entries in batch".to_string(),
+                    source: Box::new(e),
+                });
             }
         }
 
-        self.metastore
-            .execute_batch_helper(COMMIT_SQL)
+        tx.commit()
             .await
             .map_err(|e| CatalogError::InvalidOperation {
                 message: "Failed to commit transaction for batch insert records".to_string(),
@@ -1040,9 +1031,7 @@ impl MetadataCatalog for CayenneCatalog {
             }
         }
 
-        // Execute all operations atomically using a transaction batch.
-        // Atomicity is provided by explicit BEGIN ... COMMIT statements in `batch_sql`,
-        // ensuring either all statements succeed or none takes effect.
+        // Execute all operations atomically using a proper transaction.
         //
         // Order matters for crash safety:
         // 1. Clear delete files first - they reference the old snapshot's data
@@ -1054,30 +1043,19 @@ impl MetadataCatalog for CayenneCatalog {
         // If interrupted between these, the old snapshot remains active with
         // no delete files, which is safe (just loses the pending deletions,
         // but data is not corrupted).
-        let begin_transaction = if self.metastore.is_turso() {
-            BEGIN_CONCURRENT_SQL
-        } else {
-            BEGIN_TRANSACTION_SQL
-        };
-
         let table_id_literal = sql_text_literal(table_id);
         let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
         let batch_sql = format!(
-            "{begin_transaction}; \
-             DELETE FROM cayenne_delete_file WHERE table_id = {table_id_literal}; \
+            "DELETE FROM cayenne_delete_file WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_insert_record WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_snapshot_sequence WHERE table_id = {table_id_literal}; \
-             UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal}; \
-             {COMMIT_SQL};"
+             UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal};"
         );
 
-        // BEGIN CONCURRENT may fail with SQLITE_BUSY/SQLITE_LOCKED conflicts at commit time.
-        // Retry a few times with backoff to improve throughput under concurrent writers.
-        let max_attempts = if self.metastore.is_turso() {
-            DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS
-        } else {
-            1
-        };
+        // The transaction may fail with SQLITE_BUSY/SQLITE_LOCKED conflicts at
+        // commit time (especially with Turso's BEGIN CONCURRENT). Retry a few
+        // times with backoff.
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         if max_attempts == 0 {
             return Err(CatalogError::InvalidOperationNoSource {
                 message: "commit_compaction requires at least one attempt".to_string(),
@@ -1085,25 +1063,33 @@ impl MetadataCatalog for CayenneCatalog {
         }
 
         for attempt in 1..=max_attempts {
-            match self.metastore.execute_batch_helper(&batch_sql).await {
-                Ok(()) => return Ok(()),
-                Err(e)
-                    if self.metastore.is_turso()
-                        && attempt < max_attempts
-                        && is_retryable_turso_write_conflict(&e) =>
-                {
-                    rollback_failed_compaction_transaction(&self.metastore).await;
-                    let delay = retry_backoff_delay(attempt);
-                    tracing::debug!(
-                        attempt,
-                        max_attempts,
-                        ?delay,
-                        "Retrying Turso BEGIN CONCURRENT compaction transaction after conflict"
-                    );
-                    tokio::time::sleep(delay).await;
+            let tx = self.metastore.begin_transaction().await.map_err(|e| {
+                CatalogError::FailedToSetCurrentSnapshot {
+                    source: Box::new(e),
                 }
+            })?;
+
+            match tx.execute_batch(&batch_sql).await {
+                Ok(()) => match tx.commit().await {
+                    Ok(()) => return Ok(()),
+                    Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
+                        let delay = retry_backoff_delay(attempt);
+                        tracing::debug!(
+                            attempt,
+                            max_attempts,
+                            ?delay,
+                            "Retrying compaction transaction after commit conflict"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(e) => {
+                        return Err(CatalogError::FailedToSetCurrentSnapshot {
+                            source: Box::new(e),
+                        });
+                    }
+                },
                 Err(e) => {
-                    rollback_failed_compaction_transaction(&self.metastore).await;
+                    // Transaction auto-rolls-back on drop.
                     return Err(CatalogError::FailedToSetCurrentSnapshot {
                         source: Box::new(e),
                     });
@@ -1358,7 +1344,7 @@ impl MetadataCatalog for CayenneCatalog {
     }
 }
 
-fn is_retryable_turso_write_conflict(error: &CatalogError) -> bool {
+fn is_retryable_write_conflict(error: &CatalogError) -> bool {
     match error {
         CatalogError::Database { message } => is_retryable_write_conflict_message(message),
         _ => false,
@@ -1440,27 +1426,6 @@ async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResul
     tokio::fs::create_dir_all(&snapshot_dir)
         .await
         .map_err(|e| CatalogError::Io { source: e })
-}
-
-async fn rollback_failed_compaction_transaction(metastore: &MetastoreImpl) {
-    if let Err(error) = metastore
-        .execute_helper(ExecuteParams {
-            sql: "ROLLBACK",
-            params: vec![],
-        })
-        .await
-    {
-        let backend = if metastore.is_turso() {
-            "Turso"
-        } else {
-            "SQLite"
-        };
-        tracing::debug!(
-            backend,
-            ?error,
-            "Failed to rollback compaction transaction after batch error"
-        );
-    }
 }
 
 /// Checks if the existing stored configuration matches the new [`CreateTableOptions`].
@@ -2904,37 +2869,6 @@ mod tests {
         for message in messages {
             assert!(!is_partition_unique_constraint_violation_message(message));
         }
-    }
-
-    #[tokio::test]
-    async fn test_rollback_failed_compaction_transaction_cleans_up_sqlite_batch_error() {
-        let test_db = format!(
-            "sqlite://./.test_compaction_rollback_{}.db",
-            uuid::Uuid::now_v7()
-        );
-        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
-        catalog.init().await.expect("Failed to initialize catalog");
-
-        let batch_result = catalog
-            .metastore
-            .execute_batch_helper(
-                "BEGIN TRANSACTION; INSERT INTO missing_table VALUES (1); COMMIT;",
-            )
-            .await;
-        assert!(batch_result.is_err(), "Expected batch execution to fail");
-
-        rollback_failed_compaction_transaction(&catalog.metastore).await;
-
-        catalog
-            .metastore
-            .execute_batch_helper("BEGIN TRANSACTION; COMMIT;")
-            .await
-            .expect("Expected rollback helper to clear the failed SQLite transaction");
-
-        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
-        let _ = std::fs::remove_file(db_path);
-        let _ = std::fs::remove_file(format!("{db_path}-shm"));
-        let _ = std::fs::remove_file(format!("{db_path}-wal"));
     }
 
     /// Helper to create a [`TableMetadata`] for unit tests.
