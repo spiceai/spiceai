@@ -24,7 +24,6 @@ use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArr
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use cayenne::{metadata::CreateTableOptions, CayenneTableProvider, MetadataCatalog};
 use common::TestFixture;
-use data_components::delete::DeletionTableProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::prelude::{col, lit, Expr};
@@ -114,7 +113,7 @@ async fn get_ids(ctx: &SessionContext, table_name: &str) -> TestResult<Vec<i64>>
 
 async fn delete_records(table: &Arc<CayenneTableProvider>, filter: Expr) -> TestResult<u64> {
     let ctx = SessionContext::new();
-    let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
+    let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(results
         .first()
