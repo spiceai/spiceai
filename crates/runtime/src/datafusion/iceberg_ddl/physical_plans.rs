@@ -294,7 +294,9 @@ impl ExecutionPlan for IcebergCreateTableExec {
                             raw_provider,
                         );
                     let adapted: Arc<dyn datafusion::datasource::TableProvider> =
-                        Arc::new(deletion_provider);
+                        Arc::new(data_components::delete::DeletionTableProviderAdapter::new(
+                            Arc::new(deletion_provider),
+                        ));
                     schema_provider.register_table(table_name.clone(), adapted)?;
                     Ok(())
                 };

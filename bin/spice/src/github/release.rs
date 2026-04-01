@@ -354,12 +354,14 @@ impl SystemType {
     ///
     /// Returns a list of possible asset names to try, in order of preference.
     /// This handles the naming change between versions:
+    /// - v2.0+: models built-in, no `models_` variant exists
     /// - v1.11+/trunk: `spiced_metal_...` (models included by default)
     /// - v1.11 and earlier: `spiced_models_metal_...` (models suffix explicit)
     ///
     /// # Arguments
     /// * `flavor` - The flavor to install: "default" (auto-detect), or "cuda" (explicit CUDA)
-    pub fn runtime_asset_names(&self, flavor: &str) -> Vec<String> {
+    /// * `target_version` - The release tag (e.g. "v2.0.0-rc.1") to determine naming strategy
+    pub fn runtime_asset_names(&self, flavor: &str, target_version: &str) -> Vec<String> {
         let mut names = Vec::new();
 
         // Determine the accelerator based on flavor
@@ -392,12 +394,15 @@ impl SystemType {
             ));
 
             // Old naming (v1.11 and earlier): with "models_" prefix
-            names.push(format!(
-                "{prefix}_models_{accel}_{os}_{arch}.tar.gz",
-                prefix = self.runtime_asset_prefix(),
-                os = self.os_type_name(),
-                arch = self.arch()
-            ));
+            // v2+ no longer publishes a models variant, so skip it
+            if !is_v2_or_later(target_version) {
+                names.push(format!(
+                    "{prefix}_models_{accel}_{os}_{arch}.tar.gz",
+                    prefix = self.runtime_asset_prefix(),
+                    os = self.os_type_name(),
+                    arch = self.arch()
+                ));
+            }
         }
 
         // Fallback: base runtime without accelerator
@@ -420,6 +425,19 @@ impl SystemType {
             arch = self.arch()
         )
     }
+}
+
+/// Check if a version tag represents v2.0 or later.
+///
+/// Parses the major version from tags like "v2.0.0", "v2.0.0-rc.1", "v10.1.0".
+/// Returns `false` for unparseable tags (conservative fallback keeps old behavior).
+fn is_v2_or_later(tag: &str) -> bool {
+    let version_str = tag.strip_prefix('v').unwrap_or(tag);
+    version_str
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major >= 2)
 }
 
 /// Map Go arch names to Rust target names.
@@ -586,8 +604,20 @@ mod tests {
         #[case] expected: &str,
     ) {
         // In test environment, no accelerator is detected, so the list contains only the base name
-        let names = os_type.runtime_asset_names(flavor);
+        let names = os_type.runtime_asset_names(flavor, "v1.0.0");
         // The last entry should always be the fallback base name
         assert!(names.last().is_some_and(|n| n == expected));
+    }
+
+    #[test]
+    fn test_is_v2_or_later() {
+        assert!(!is_v2_or_later("v1.0.0"));
+        assert!(!is_v2_or_later("v1.11.0"));
+        assert!(!is_v2_or_later("v1.99.9-rc.1"));
+        assert!(is_v2_or_later("v2.0.0"));
+        assert!(is_v2_or_later("v2.0.0-rc.1"));
+        assert!(is_v2_or_later("v2.1.0"));
+        assert!(is_v2_or_later("v10.0.0"));
+        assert!(!is_v2_or_later("invalid"));
     }
 }

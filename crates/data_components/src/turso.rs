@@ -148,7 +148,7 @@ use snafu::prelude::*;
 use turso::{Builder, Connection, Database, Value as TursoValue};
 use turso_shared::{BEGIN_CONCURRENT_SQL, COMMIT_SQL, JOURNAL_MODE_SQL_LITERAL};
 
-use crate::delete::{DeletionExec, DeletionSink};
+use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 
 /// Conversion constants for timestamp storage and conversion.
 ///
@@ -1199,15 +1199,23 @@ impl TableProvider for TursoTableProvider {
         // Wrap in DataSinkExec to execute the insertion
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
+}
 
+#[async_trait]
+impl DeletionTableProvider for TursoTableProvider {
     async fn delete_from(
         &self,
         _state: &dyn Session,
-        filters: Vec<Expr>,
+        filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DeletionExec::new(Arc::new(
-            TursoDeletionSink::new(Arc::clone(&self.pool), self.table_name.clone(), &filters),
-        ))))
+        Ok(Arc::new(DeletionExec::new(
+            Arc::new(TursoDeletionSink::new(
+                Arc::clone(&self.pool),
+                self.table_name.clone(),
+                filters,
+            )),
+            &self.schema(),
+        )))
     }
 }
 

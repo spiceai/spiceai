@@ -420,7 +420,7 @@ impl TableProvider for FlightSQLTable {
 }
 
 #[derive(Clone)]
-struct FlightSqlExec {
+pub struct FlightSqlExec {
     projected_schema: SchemaRef,
     table_reference: TableReference,
     client: FlightSqlClient,
@@ -431,7 +431,7 @@ struct FlightSqlExec {
 }
 
 impl FlightSqlExec {
-    fn new(
+    pub fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
         table_reference: &TableReference,
@@ -457,7 +457,44 @@ impl FlightSqlExec {
         })
     }
 
-    fn sql(&self) -> Result<String> {
+    /// Returns a reference to the underlying `FlightSqlClient`.
+    #[must_use]
+    pub fn client(&self) -> &FlightSqlClient {
+        &self.client
+    }
+
+    /// Returns a reference to the table reference.
+    #[must_use]
+    pub fn table_reference(&self) -> &TableReference {
+        &self.table_reference
+    }
+
+    /// Returns a reference to the cookie store.
+    #[must_use]
+    pub fn cookie_store(&self) -> &Arc<CookieStore> {
+        &self.cookie_store
+    }
+
+    /// Returns a reference to the projected schema.
+    #[must_use]
+    pub fn projected_schema(&self) -> &SchemaRef {
+        &self.projected_schema
+    }
+
+    /// Returns the filter expressions.
+    #[must_use]
+    pub fn filters(&self) -> &[Expr] {
+        &self.filters
+    }
+
+    /// Returns the limit.
+    #[must_use]
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
+    /// Returns the SQL query that this exec will send to the `FlightSQL` endpoint.
+    pub fn sql(&self) -> Result<String> {
         let columns = self
             .projected_schema
             .fields()
@@ -595,7 +632,7 @@ fn coerce_batch_to_schema(
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
-fn query_to_stream(
+pub fn query_to_stream(
     mut client: FlightSqlClient,
     sql: String,
     cookie_store: Arc<CookieStore>,

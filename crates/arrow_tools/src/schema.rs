@@ -186,6 +186,8 @@ fn data_type_contains_dictionary(data_type: &DataType) -> bool {
         DataType::Dictionary(_, _) => true,
         DataType::List(field)
         | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
         | DataType::FixedSizeList(field, _)
         | DataType::Map(field, _) => data_type_contains_dictionary(field.data_type()),
         DataType::Struct(fields) => fields
@@ -194,6 +196,9 @@ fn data_type_contains_dictionary(data_type: &DataType) -> bool {
         DataType::Union(fields, _) => fields
             .iter()
             .any(|(_, f)| data_type_contains_dictionary(f.data_type())),
+        DataType::RunEndEncoded(_, values_field) => {
+            data_type_contains_dictionary(values_field.data_type())
+        }
         _ => false,
     }
 }
@@ -217,6 +222,14 @@ fn normalize_dictionary_data_type(data_type: &DataType) -> DataType {
                 Arc::new(field.as_ref().clone().with_data_type(inner)),
                 *size,
             )
+        }
+        DataType::ListView(field) => {
+            let inner = normalize_dictionary_data_type(field.data_type());
+            DataType::ListView(Arc::new(field.as_ref().clone().with_data_type(inner)))
+        }
+        DataType::LargeListView(field) => {
+            let inner = normalize_dictionary_data_type(field.data_type());
+            DataType::LargeListView(Arc::new(field.as_ref().clone().with_data_type(inner)))
         }
         DataType::Map(field, sorted) => {
             let inner = normalize_dictionary_data_type(field.data_type());
@@ -245,6 +258,13 @@ fn normalize_dictionary_data_type(data_type: &DataType) -> DataType {
                 .collect(),
             *mode,
         ),
+        DataType::RunEndEncoded(run_ends_field, values_field) => {
+            let inner = normalize_dictionary_data_type(values_field.data_type());
+            DataType::RunEndEncoded(
+                Arc::clone(run_ends_field),
+                Arc::new(values_field.as_ref().clone().with_data_type(inner)),
+            )
+        }
         other => other.clone(),
     }
 }
@@ -743,5 +763,111 @@ mod tests {
             false,
         )]);
         assert!(!has_dictionary_types(&no_dict_schema));
+    }
+
+    #[test]
+    fn test_normalize_nested_dictionary_in_list_view() {
+        let schema = Schema::new(vec![Field::new(
+            "tags",
+            DataType::ListView(Arc::new(Field::new(
+                "item",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ))),
+            false,
+        )]);
+
+        let normalized = normalize_dictionary_types(&schema);
+        let expected = DataType::ListView(Arc::new(Field::new("item", DataType::Utf8, true)));
+        assert_eq!(normalized.field(0).data_type(), &expected);
+    }
+
+    #[test]
+    fn test_normalize_nested_dictionary_in_large_list_view() {
+        let schema = Schema::new(vec![Field::new(
+            "tags",
+            DataType::LargeListView(Arc::new(Field::new(
+                "item",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::LargeUtf8)),
+                true,
+            ))),
+            false,
+        )]);
+
+        let normalized = normalize_dictionary_types(&schema);
+        let expected =
+            DataType::LargeListView(Arc::new(Field::new("item", DataType::LargeUtf8, true)));
+        assert_eq!(normalized.field(0).data_type(), &expected);
+    }
+
+    #[test]
+    fn test_normalize_nested_dictionary_in_run_end_encoded() {
+        let schema = Schema::new(vec![Field::new(
+            "encoded",
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new(
+                    "values",
+                    DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                    true,
+                )),
+            ),
+            false,
+        )]);
+
+        let normalized = normalize_dictionary_types(&schema);
+        let expected = DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            Arc::new(Field::new("values", DataType::Utf8, true)),
+        );
+        assert_eq!(normalized.field(0).data_type(), &expected);
+    }
+
+    #[test]
+    fn test_has_dictionary_types_in_list_view() {
+        let dict_schema = Schema::new(vec![Field::new(
+            "tags",
+            DataType::ListView(Arc::new(Field::new(
+                "item",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ))),
+            false,
+        )]);
+        assert!(has_dictionary_types(&dict_schema));
+
+        let no_dict = Schema::new(vec![Field::new(
+            "tags",
+            DataType::ListView(Arc::new(Field::new("item", DataType::Utf8, true))),
+            false,
+        )]);
+        assert!(!has_dictionary_types(&no_dict));
+    }
+
+    #[test]
+    fn test_has_dictionary_types_in_run_end_encoded() {
+        let dict_schema = Schema::new(vec![Field::new(
+            "encoded",
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new(
+                    "values",
+                    DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                    true,
+                )),
+            ),
+            false,
+        )]);
+        assert!(has_dictionary_types(&dict_schema));
+
+        let no_dict = Schema::new(vec![Field::new(
+            "encoded",
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new("values", DataType::Utf8, true)),
+            ),
+            false,
+        )]);
+        assert!(!has_dictionary_types(&no_dict));
     }
 }

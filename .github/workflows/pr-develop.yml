@@ -51,6 +51,15 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set up spiceio
+        uses: spiceai/spiceio/.github/actions/setup@f964d0fc0c7c60f1463c35971636493b8186a7e2 # v0.2.0
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
 
@@ -86,6 +95,15 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
+
+      - name: Set up spiceio
+        uses: spiceai/spiceio/.github/actions/setup@f964d0fc0c7c60f1463c35971636493b8186a7e2 # v0.2.0
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
 
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache

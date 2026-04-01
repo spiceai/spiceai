@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 # CLI framework
 clap.workspace = true
+clap_complete = "4"
 
 # Async runtime
 tokio.workspace = true
@@ -122,3 +123,4 @@ rstest = "0.26.1"
 serde_json.workspace = true
 tempfile.workspace = true
 uuid = { workspace = true, features = ["v4"] }
+wiremock = "0.6"
