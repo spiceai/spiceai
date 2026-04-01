@@ -1944,12 +1944,11 @@ impl DataFusion {
         if matches!(
             self.cluster_config.effective_role(),
             Some(crate::config::ClusterRole::Scheduler)
-        ) {
-            if let Some(executor_registry) = &self.executor_registry {
-                return self
-                    .forward_refresh_to_executors(executor_registry, dataset_name, &overrides)
-                    .await;
-            }
+        ) && let Some(executor_registry) = &self.executor_registry
+        {
+            return self
+                .forward_refresh_to_executors(executor_registry, dataset_name, overrides.as_ref())
+                .await;
         }
 
         let table = self
@@ -1977,7 +1976,7 @@ impl DataFusion {
         &self,
         executor_registry: &ExecutorRegistry,
         dataset_name: &TableReference,
-        overrides: &Option<RefreshOverrides>,
+        overrides: Option<&RefreshOverrides>,
     ) -> Result<Option<Arc<Notify>>> {
         let overrides_json = match overrides {
             Some(o) => {
