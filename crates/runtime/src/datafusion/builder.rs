@@ -65,7 +65,10 @@ use datafusion_optimizer_rules::{
     logical_plan::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
     },
-    physical_plan::EmptyHashJoinExecPhysicalOptimization,
+    physical_plan::{
+        EmptyHashJoinExecPhysicalOptimization,
+        flightsql::aggregate_pushdown::FlightSQLPartialAggregatePushdown,
+    },
 };
 use runtime_datafusion::{
     extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
@@ -339,6 +342,13 @@ impl DataFusionBuilder {
             .with_physical_optimizer_rule(Arc::new(BytesProcessedPhysicalOptimizer::new(
                 Arc::new(Box::new(track_bytes_processed)),
             )));
+
+        if matches!(
+            self.cluster_config.as_ref().and_then(|cfg| cfg.role()),
+            Some(ClusterRole::Scheduler)
+        ) {
+            state = state.with_physical_optimizer_rule(FlightSQLPartialAggregatePushdown::new());
+        }
 
         let mut state = state.build();
 

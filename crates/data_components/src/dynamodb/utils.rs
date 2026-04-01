@@ -60,14 +60,9 @@ pub fn scalar_to_attribute_value(
     time_format: &str,
 ) -> datafusion::error::Result<AttributeValue> {
     match scalar {
-        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => {
-            Ok(AttributeValue::S(s.clone()))
-        }
-        ScalarValue::Utf8View(Some(s)) => Ok(AttributeValue::S(s.clone())),
-        ScalarValue::Int8(Some(i)) => Ok(AttributeValue::N(i.to_string())),
-        ScalarValue::Int16(Some(i)) => Ok(AttributeValue::N(i.to_string())),
-        ScalarValue::Int32(Some(i)) => Ok(AttributeValue::N(i.to_string())),
+        ScalarValue::Utf8(Some(s)) => Ok(AttributeValue::S(s.clone())),
         ScalarValue::Int64(Some(i)) => Ok(AttributeValue::N(i.to_string())),
+        ScalarValue::Int32(Some(i)) => Ok(AttributeValue::N(i.to_string())),
         ScalarValue::UInt8(Some(i)) => Ok(AttributeValue::N(i.to_string())),
         ScalarValue::UInt16(Some(i)) => Ok(AttributeValue::N(i.to_string())),
         ScalarValue::UInt32(Some(i)) => Ok(AttributeValue::N(i.to_string())),
@@ -185,11 +180,9 @@ pub fn scalar_to_attribute_value(
             timestamp_to_attribute(*ns / 1_000_000, tz_opt.as_ref(), time_format)
         }
         ScalarValue::Null => Ok(AttributeValue::Null(true)),
-        t => Err(DataFusionError::NotImplemented(format!(
-            "ScalarValue type not supported: type={}, value={}",
-            t.data_type(),
-            t
-        ))),
+        _ => Err(DataFusionError::NotImplemented(
+            "ScalarValue type not supported".to_string(),
+        )),
     }
 }
 

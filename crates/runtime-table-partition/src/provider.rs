@@ -19,7 +19,7 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 use arrow::array::{Array, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use data_components::delete::{DeletionExec, DeletionSink};
+use data_components::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use datafusion::{
     catalog::{Session, TableProvider},
     common::{Constraints, DFSchema, Statistics, project_schema},
@@ -86,7 +86,7 @@ pub enum Error {
 /// For multiple partition expressions, this is a path-like string (e.g., "2025/10/15").
 pub(crate) type CompositePartitionKey = String;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PartitionTableProvider {
     creator: Arc<dyn PartitionCreator>,
     /// The partition expressions. For hierarchical partitions like
@@ -391,11 +391,16 @@ impl TableProvider for PartitionTableProvider {
             .execute_insert(input, insert_op, &ctx)
             .await
     }
+}
 
+/// Implement `DeletionTableProvider` to support retention checks and delete operations
+/// on partitioned tables. Deletion is applied to all partitions.
+#[async_trait]
+impl DeletionTableProvider for PartitionTableProvider {
     async fn delete_from(
         &self,
         state: &dyn Session,
-        filters: Vec<Expr>,
+        filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         // Collect all partitions that need deletion
         let partitions = self.partitions.read().await;
@@ -405,66 +410,11 @@ impl TableProvider for PartitionTableProvider {
         // Create a deletion sink that will iterate over all partitions
         let deletion_sink = Arc::new(PartitionedDeletionSink::new(
             partition_list,
-            filters,
+            filters.to_vec(),
             state.task_ctx(),
         ));
 
-        Ok(Arc::new(DeletionExec::new(deletion_sink)))
-    }
-
-    async fn update(
-        &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let schema = self.schema();
-        let table_source = Arc::new(datafusion::datasource::DefaultTableSource::new(Arc::new(
-            self.clone(),
-        )));
-        let mut plan = datafusion::logical_expr::LogicalPlanBuilder::scan(
-            "__update_source",
-            table_source,
-            None,
-        )?
-        .build()?;
-
-        if let Some(combined) = filters.clone().into_iter().reduce(Expr::and) {
-            plan = datafusion::logical_expr::LogicalPlanBuilder::from(plan)
-                .filter(combined)?
-                .build()?;
-        }
-
-        let mut proj_exprs = Vec::new();
-        for field in schema.fields() {
-            let col_name = field.name();
-            if let Some((_, expr)) = assignments.iter().find(|(name, _)| name == col_name) {
-                proj_exprs.push(expr.clone().alias(col_name));
-            } else {
-                proj_exprs.push(datafusion::logical_expr::col(col_name));
-            }
-        }
-        plan = datafusion::logical_expr::LogicalPlanBuilder::from(plan)
-            .project(proj_exprs)?
-            .build()?;
-
-        let source_plan = state.create_physical_plan(&plan).await?;
-        let session_state = state
-            .as_any()
-            .downcast_ref::<datafusion::execution::SessionState>()
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Internal(
-                    "Session is not a SessionState".to_string(),
-                )
-            })?
-            .clone();
-
-        Ok(Arc::new(data_components::update::UpdateExec::new(
-            source_plan,
-            Arc::new(self.clone()),
-            session_state,
-            filters,
-        )))
+        Ok(Arc::new(DeletionExec::new(deletion_sink, &self.schema)))
     }
 }
 
@@ -491,30 +441,46 @@ impl DeletionSink for PartitionedDeletionSink {
         let mut total_deleted = 0u64;
 
         for partition in &self.partitions {
-            // Create a simple session state for executing the deletion
-            let session_ctx = datafusion::execution::context::SessionContext::new();
-            let state = session_ctx.state();
+            // Try to downcast the partition's table provider to DeletionTableProvider
+            // The partition's table provider might be a CayenneTableProvider or similar
+            // that implements DeletionTableProvider
+            let deletion_provider = data_components::delete::get_deletion_provider(Arc::clone(
+                &partition.table_provider,
+            ));
 
-            // Execute deletion on this partition using native TableProvider::delete_from
-            let plan = partition
-                .table_provider
-                .delete_from(&state, self.filters.clone())
+            if let Some(deletion_provider) = deletion_provider {
+                // Create a simple session state for executing the deletion
+                let session_ctx = datafusion::execution::context::SessionContext::new();
+                let state = session_ctx.state();
+
+                // Execute deletion on this partition
+                let plan = DeletionTableProvider::delete_from(
+                    deletion_provider.as_ref(),
+                    &state,
+                    &self.filters,
+                )
                 .await?;
 
-            // Execute the deletion plan
-            let results = collect(plan, Arc::clone(&self.task_ctx)).await?;
+                // Execute the deletion plan
+                let results = collect(plan, Arc::clone(&self.task_ctx)).await?;
 
-            // Extract the count from results
-            for batch in results {
-                if let Some(count_col) = batch.column_by_name("count")
-                    && let Some(uint_array) = count_col.as_any().downcast_ref::<UInt64Array>()
-                {
-                    for i in 0..uint_array.len() {
-                        if !uint_array.is_null(i) {
-                            total_deleted += uint_array.value(i);
+                // Extract the count from results
+                for batch in results {
+                    if let Some(count_col) = batch.column_by_name("count")
+                        && let Some(uint_array) = count_col.as_any().downcast_ref::<UInt64Array>()
+                    {
+                        for i in 0..uint_array.len() {
+                            if !uint_array.is_null(i) {
+                                total_deleted += uint_array.value(i);
+                            }
                         }
                     }
                 }
+            } else {
+                tracing::warn!(
+                    partition_values = ?partition.partition_values,
+                    "Partition table provider does not support deletion. Skipping."
+                );
             }
         }
 
