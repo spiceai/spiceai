@@ -61,7 +61,7 @@ pub mod s3_single_file_cached;
 pub mod s3_vectors;
 #[cfg(feature = "scylladb")]
 pub mod scylladb;
-pub(crate) mod sql_expr;
+pub mod sql_expr;
 
 #[cfg(feature = "sharepoint")]
 pub mod sharepoint;
@@ -90,7 +90,6 @@ pub mod imap;
 pub mod index_maintenance;
 pub mod object;
 pub mod poly;
-pub mod update;
 
 #[async_trait]
 pub trait Read: Send + Sync {

@@ -186,7 +186,7 @@ impl IcebergDataConnector {
                     })?
                     .into_custom_loader();
 
-                let configured_scheme = s3_scheme_from_url(&source);
+                let configured_scheme = s3_scheme_from_url(source);
 
                 Some(Arc::new(OpenDalStorageFactory::S3 {
                     configured_scheme,
@@ -302,7 +302,7 @@ impl IcebergDataConnector {
                 Arc::new(OpenDalStorageFactory::Gcs)
             } else if source.starts_with("s3://") || source.starts_with("s3a://") {
                 Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme: s3_scheme_from_url(&source),
+                    configured_scheme: s3_scheme_from_url(source),
                     customized_credential_load: None,
                 })
             } else {
@@ -380,14 +380,18 @@ impl DataConnector for IcebergDataConnector {
             Err(e) => return Some(Err(e)),
         };
 
-        // Wrap in IcebergDeletionProvider for DELETE FROM support.
+        // Wrap in IcebergDeletionProvider for DELETE FROM support, then in
+        // DeletionTableProviderAdapter so get_deletion_provider can find it.
         let deletion_provider = data_components::iceberg::delete::IcebergDeletionProvider::new(
             parts.catalog,
             parts.namespace,
             parts.table_name,
             parts.provider,
         );
-        Some(Ok(Arc::new(deletion_provider)))
+        let adapted: Arc<dyn TableProvider> = Arc::new(
+            data_components::delete::DeletionTableProviderAdapter::new(Arc::new(deletion_provider)),
+        );
+        Some(Ok(adapted))
     }
 }
 

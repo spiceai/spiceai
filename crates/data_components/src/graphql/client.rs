@@ -416,7 +416,12 @@ impl PaginationParameters {
                 }
                 graphql_parser::query::Selection::Field(field) => {
                     let field_name = field.name.as_ref();
-                    let new_path = format!("{current_path}/{field_name}");
+                    // Use alias when present — the JSON response uses aliases as keys.
+                    let response_key = field
+                        .alias
+                        .as_ref()
+                        .map_or_else(|| field_name, |a| a.as_ref());
+                    let new_path = format!("{current_path}/{response_key}");
 
                     // End of recursion, `pageInfo` field found
                     if field_name == "pageInfo" {
@@ -444,8 +449,13 @@ impl PaginationParameters {
                             );
                         }
 
-                        let json_pointer =
-                            data_field.map(|f| format!("/data{current_path}/{}", f.name.as_ref()));
+                        let json_pointer = data_field.map(|f| {
+                            let key = f
+                                .alias
+                                .as_ref()
+                                .map_or_else(|| f.name.as_ref(), |a| a.as_ref());
+                            format!("/data{current_path}/{key}")
+                        });
 
                         let pagination_argument =
                             match TryInto::<PaginationArgument>::try_into(parent_field) {
@@ -843,6 +853,11 @@ impl GraphQLClient {
             rate_controller,
             semaphore,
         })
+    }
+
+    #[must_use]
+    pub(crate) fn configured_schema(&self) -> Option<SchemaRef> {
+        self.schema.as_ref().map(Arc::clone)
     }
 
     #[expect(clippy::too_many_lines)]
@@ -1325,6 +1340,16 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
         .unwrap_or("No message provided")
         .to_string();
 
+        let message_lower = message.to_ascii_lowercase();
+
+        if status == StatusCode::TOO_MANY_REQUESTS || message_lower.contains("rate limit") {
+            return Err(Error::RateLimited {
+                message: format!(
+                    "The API rate limited the request (HTTP {status}). Retry later or reduce request concurrency. Details: {message}"
+                ),
+            });
+        }
+
         return match status {
             StatusCode::UNAUTHORIZED => Err(Error::InvalidCredentialsOrPermissions {
                 message: format!(
@@ -1448,7 +1473,7 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
             if error_type.to_lowercase() == "not_found" {
                 return Err(Error::ResourceNotFound {
                     message: format!(
-                        "The API returned a 'NOT_FOUND' error. Verify the requsted resource exists and is accessible. {message}"
+                        "The API returned a 'NOT_FOUND' error. Verify the requested resource exists and is accessible. {message}"
                     ),
                 });
             }
@@ -1647,6 +1672,42 @@ mod tests {
                         ],
                     }),
                     Some("/data/paginatedUsers/users".into()),
+                ),
+            },
+            TestPaginationParseCase {
+                name: "Aliased field with pageInfo uses alias in path",
+                query: r#"
+                    query {
+                        repository(owner: "org", name: "repo") {
+                            selected_ref: defaultBranchRef {
+                                target {
+                                    ... on Commit {
+                                        history(first: 100) {
+                                            pageInfo {
+                                                hasNextPage
+                                                endCursor
+                                            }
+                                            nodes {
+                                                oid
+                                                message
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                "#,
+                expected: (
+                    Some(PaginationParameters {
+                        resource_name: "history".to_owned(),
+                        pagination_argument: super::PaginationArgument::First(100),
+                        page_info_path: Some(
+                            "/repository/selected_ref/target/history/pageInfo".to_owned(),
+                        ),
+                        other_arguments: vec![],
+                    }),
+                    Some("/data/repository/selected_ref/target/history/nodes".into()),
                 ),
             },
         ];
@@ -1872,6 +1933,19 @@ mod tests {
             Err(e) => {
                 assert!(e.to_string().contains(message));
             }
+        }
+
+        let rate_limited_response =
+            serde_json::from_str(r#"{"message": "API rate limit exceeded for user"}"#)
+                .expect("Failed to construct json");
+        let rate_limited_result = handle_http_error(StatusCode::FORBIDDEN, &rate_limited_response);
+        match rate_limited_result {
+            Ok(()) => panic!("Expected rate-limited error"),
+            Err(super::Error::RateLimited { message }) => {
+                assert!(message.contains("rate limited"));
+                assert!(message.contains("HTTP 403"));
+            }
+            Err(other) => panic!("Expected rate-limited error, got {other}"),
         }
     }
 

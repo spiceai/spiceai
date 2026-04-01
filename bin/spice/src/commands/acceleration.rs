@@ -17,7 +17,7 @@ limitations under the License.
 //! Acceleration command implementation - manage dataset acceleration features.
 
 use crate::context::RuntimeContext;
-use crate::error::{InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
+use crate::error::{self, InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
 use crate::output::{OutputFormat, TableRow, write_json, write_table};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -200,12 +200,8 @@ async fn execute_snapshots(ctx: &RuntimeContext, args: &SnapshotsArgs) -> Result
         .build()
     })?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        tracing::error!("Failed to list snapshots: {} - {}", status, body);
-        return Ok(());
-    }
+    // Check for authentication errors before other status handling
+    let response = error::check_response(response, ctx.http_endpoint()).await?;
 
     let summary: SnapshotSummary = response.json().await.map_err(|e| {
         InvalidResponseSnafu {
@@ -274,12 +270,7 @@ async fn execute_snapshot(ctx: &RuntimeContext, args: &SnapshotArgs) -> Result<(
         .build()
     })?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        tracing::error!("Failed to get snapshot: {} - {}", status, body);
-        return Ok(());
-    }
+    let response = error::check_response(response, ctx.http_endpoint()).await?;
 
     let snapshot: SnapshotInfo = response.json().await.map_err(|e| {
         InvalidResponseSnafu {
@@ -333,12 +324,7 @@ async fn execute_set_snapshot(ctx: &RuntimeContext, args: &SetSnapshotArgs) -> R
         .build()
     })?;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        tracing::error!("Failed to set current snapshot: {} - {}", status, body);
-        return Ok(());
-    }
+    let response = error::check_response(response, ctx.http_endpoint()).await?;
 
     let result: MessageResponse = response.json().await.map_err(|e| {
         InvalidResponseSnafu {
