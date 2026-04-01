@@ -11,6 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::accelerated_table::SnapshotCreateTrigger;
+use crate::accelerated_table::refresh::Refresh;
 use crate::status::RuntimeStatus;
 use arrow_schema::Schema;
 use datafusion::common::TableReference;
@@ -64,6 +65,7 @@ pub fn spawn_snapshot_interval_task(
     bootstrap_status: crate::dataaccelerator::BootstrapStatus,
     last_updated_at: Arc<AtomicI64>,
     accelerator: Option<Arc<dyn TableProvider>>,
+    refresh: Arc<RwLock<Refresh>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let interval_duration = snapshots_create_interval?;
     let checkpointer = checkpointer?;
@@ -101,6 +103,7 @@ pub fn spawn_snapshot_interval_task(
             tokio::time::sleep(initial_delay).await;
         }
 
+        let refresh_sql = refresh.read().await.sql.as_ref().map(|s| s.to_sql());
         create_checkpoint_and_snapshot(
             &checkpointer,
             Some(&snapshot_manager),
@@ -114,6 +117,7 @@ pub fn spawn_snapshot_interval_task(
             // Consider use case: periodic
             ForceCreate(initial_delay.is_zero()),
             accelerator.as_ref(),
+            refresh_sql.as_deref(),
         )
         .await;
 
@@ -125,6 +129,7 @@ pub fn spawn_snapshot_interval_task(
             // Wait for the next snapshot interval (accounting for time spent during previous snapshot creation)
             ticker.tick().await;
 
+            let refresh_sql = refresh.read().await.sql.as_ref().map(|s| s.to_sql());
             create_checkpoint_and_snapshot(
                 &checkpointer,
                 Some(&snapshot_manager),
@@ -134,6 +139,7 @@ pub fn spawn_snapshot_interval_task(
                 &last_updated_at,
                 ForceCreate(false),
                 accelerator.as_ref(),
+                refresh_sql.as_deref(),
             )
             .await;
         }
@@ -156,6 +162,7 @@ pub fn create_periodic_snapshot_callback(
     bootstrap_status: crate::dataaccelerator::BootstrapStatus,
     last_updated_at: Arc<AtomicI64>,
     accelerator: Option<Arc<dyn TableProvider>>,
+    refresh: Arc<RwLock<Refresh>>,
 ) -> Option<SnapshotCallback> {
     match (checkpointer, snapshot_manager) {
         (Some(checkpointer), Some(snapshot_manager)) => {
@@ -181,9 +188,11 @@ pub fn create_periodic_snapshot_callback(
             let federated_schema_clone = Arc::clone(&federated_schema);
             let accelerator_write_mutex_clone = Arc::clone(&accelerator_write_mutex);
             let accelerator_clone = accelerator.clone();
+            let refresh_clone = Arc::clone(&refresh);
             tokio::spawn(async move {
                 runtime_status.wait_for_ready().await;
                 if !bootstrap_status.is_bootstrapped() {
+                    let refresh_sql = refresh_clone.read().await.sql.as_ref().map(|s| s.to_sql());
                     create_checkpoint_and_snapshot(
                         &checkpointer_clone,
                         Some(&snapshot_manager_clone),
@@ -193,6 +202,7 @@ pub fn create_periodic_snapshot_callback(
                         &last_updated_at_clone,
                         ForceCreate(true),
                         accelerator_clone.as_ref(),
+                        refresh_sql.as_deref(),
                     )
                     .await;
                 }
@@ -212,6 +222,7 @@ pub fn create_periodic_snapshot_callback(
                 let checkpoint_counting_enabled = Arc::clone(&checkpoint_counting_enabled);
                 let last_updated_at = Arc::clone(&last_updated_at);
                 let accelerator = accelerator.clone();
+                let refresh = Arc::clone(&refresh);
 
                 Box::pin(async move {
                     let mut batches_processed_value = batches_processed.write().await;
@@ -225,6 +236,7 @@ pub fn create_periodic_snapshot_callback(
                     if *batches_processed_value >= batches {
                         *batches_processed_value = 0;
 
+                        let refresh_sql = refresh.read().await.sql.as_ref().map(|s| s.to_sql());
                         create_checkpoint_and_snapshot(
                             &checkpointer,
                             Some(&snapshot_manager),
@@ -234,6 +246,7 @@ pub fn create_periodic_snapshot_callback(
                             &last_updated_at,
                             ForceCreate(false),
                             accelerator.as_ref(),
+                            refresh_sql.as_deref(),
                         )
                         .await;
                     }
@@ -257,9 +270,10 @@ pub async fn create_checkpoint_and_snapshot(
     last_updated_at: &Arc<AtomicI64>,
     force_create: ForceCreate,
     accelerator: Option<&Arc<dyn TableProvider>>,
+    refresh_sql: Option<&str>,
 ) {
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
-    if let Err(e) = checkpointer.checkpoint(federated_schema).await {
+    if let Err(e) = checkpointer.checkpoint(federated_schema, refresh_sql).await {
         tracing::warn!("Failed to checkpoint dataset {dataset_name}: {e}");
         return;
     }

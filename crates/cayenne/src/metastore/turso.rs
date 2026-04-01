@@ -18,21 +18,23 @@ limitations under the License.
 
 use super::{
     duplicate_delete_file_index_error_message, ExecuteParams, MetastoreBackend, MetastoreGetValue,
-    MetastoreRow, MetastoreValue, QueryParams, QueryRowParams,
+    MetastoreRow, MetastoreTransaction, MetastoreValue, QueryParams, QueryRowParams,
 };
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::{fmt::Debug, path::Path};
-use tokio::sync::Mutex;
-use turso::{Builder, Connection, Database, Value as TursoValue};
+use tokio::sync::{Mutex, OwnedMutexGuard};
+use turso::{Builder, Connection, Value as TursoValue};
 use turso_shared::JOURNAL_MODE_SQL_LITERAL;
 
 const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_delete_file_table_path ON cayenne_delete_file(table_id, path)";
 
 /// Turso-based metastore backend.
+///
+/// The connection is behind a [`Mutex`] to ensure exclusive access during
+/// multi-statement transactions, matching the `SQLite` metastore design.
 pub struct TursoMetastore {
-    db: Arc<Mutex<Option<Database>>>,
     conn: Arc<Mutex<Option<Connection>>>,
     connection_string: String,
 }
@@ -49,7 +51,6 @@ impl TursoMetastore {
     /// Create a new Turso metastore.
     pub fn new(connection_string: impl Into<String>) -> Self {
         Self {
-            db: Arc::new(Mutex::new(None)),
             conn: Arc::new(Mutex::new(None)),
             connection_string: connection_string.into(),
         }
@@ -62,89 +63,75 @@ impl TursoMetastore {
             .unwrap_or(&self.connection_string)
     }
 
-    /// Get or create the database connection.
-    async fn get_db(&self) -> CatalogResult<Database> {
-        let mut db_guard = self.db.lock().await;
+    /// Get or create the database connection, returning the mutex-guarded wrapper.
+    ///
+    /// Callers acquire the lock before using the connection.
+    async fn get_conn(&self) -> CatalogResult<Arc<Mutex<Option<Connection>>>> {
+        // Initialize connection if needed
+        {
+            let mut conn_guard = self.conn.lock().await;
+            if conn_guard.is_none() {
+                let db_path = self.db_path();
 
-        if let Some(db) = db_guard.as_ref() {
-            return Ok(db.clone());
-        }
-
-        // Create the database
-        let db_path = self.db_path();
-
-        // Create parent directory if it doesn't exist
-        let db_dir =
-            Path::new(db_path)
-                .parent()
-                .ok_or_else(|| CatalogError::InvalidDatabasePath {
-                    path: db_path.to_string(),
+                // Create parent directory if it doesn't exist
+                let db_dir = Path::new(db_path).parent().ok_or_else(|| {
+                    CatalogError::InvalidDatabasePath {
+                        path: db_path.to_string(),
+                    }
                 })?;
 
-        if !db_dir.exists() {
-            tokio::fs::create_dir_all(db_dir).await?;
+                if !db_dir.exists() {
+                    tokio::fs::create_dir_all(db_dir).await?;
+                }
+
+                let db = Builder::new_local(db_path).build().await.map_err(|e| {
+                    CatalogError::Database {
+                        message: format!("Failed to open Turso database: {e}"),
+                    }
+                })?;
+
+                let conn = db.connect().map_err(|e| CatalogError::Database {
+                    message: format!("Failed to connect to Turso database: {e}"),
+                })?;
+
+                // Set busy timeout to wait for locks instead of immediately returning SQLITE_BUSY.
+                conn.busy_timeout(std::time::Duration::from_secs(5))
+                    .map_err(|e| CatalogError::Database {
+                        message: format!("Failed to set busy timeout: {e}"),
+                    })?;
+
+                // BEGIN CONCURRENT requires MVCC journal mode for concurrent writers.
+                conn.pragma_update("journal_mode", JOURNAL_MODE_SQL_LITERAL)
+                    .await
+                    .map_err(|e| CatalogError::Database {
+                        message: format!("Failed to set journal mode: {e}"),
+                    })?;
+
+                conn.execute("PRAGMA foreign_keys = ON", ())
+                    .await
+                    .map_err(|e| CatalogError::Database {
+                        message: format!("Failed to enable foreign keys: {e}"),
+                    })?;
+
+                // NORMAL synchronous mode: safe with MVCC, more performant than FULL
+                conn.execute("PRAGMA synchronous = NORMAL", ())
+                    .await
+                    .map_err(|e| CatalogError::Database {
+                        message: format!("Failed to set synchronous mode: {e}"),
+                    })?;
+
+                // 32MB cache size (negative value = kilobytes in SQLite/libSQL)
+                conn.execute("PRAGMA cache_size = -32768", ())
+                    .await
+                    .map_err(|e| CatalogError::Database {
+                        message: format!("Failed to set cache size: {e}"),
+                    })?;
+
+                *conn_guard = Some(conn);
+            }
         }
 
-        let db = Builder::new_local(db_path)
-            .build()
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to open Turso database: {e}"),
-            })?;
-
-        *db_guard = Some(db.clone());
-        Ok(db)
-    }
-
-    /// Get or create a cached connection from the database.
-    async fn get_conn(&self) -> CatalogResult<Connection> {
-        let mut conn_guard = self.conn.lock().await;
-
-        if let Some(conn) = conn_guard.as_ref() {
-            return Ok(conn.clone());
-        }
-
-        let db = self.get_db().await?;
-        let conn = db.connect().map_err(|e| CatalogError::Database {
-            message: format!("Failed to connect to Turso database: {e}"),
-        })?;
-
-        // Set busy timeout to wait for locks instead of immediately returning SQLITE_BUSY.
-        // This fixes issue #8826 where concurrent transactions to the same database fail.
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to set busy timeout: {e}"),
-            })?;
-
-        // BEGIN CONCURRENT requires MVCC journal mode for concurrent writers.
-        conn.pragma_update("journal_mode", JOURNAL_MODE_SQL_LITERAL)
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to set journal mode: {e}"),
-            })?;
-
-        conn.execute("PRAGMA foreign_keys = ON", ())
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to enable foreign keys: {e}"),
-            })?;
-
-        // NORMAL synchronous mode: safe with MVCC, more performant than FULL
-        conn.execute("PRAGMA synchronous = NORMAL", ())
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to set synchronous mode: {e}"),
-            })?;
-
-        // 32MB cache size (negative value = kilobytes in SQLite/libSQL)
-        conn.execute("PRAGMA cache_size = -32768", ())
-            .await
-            .map_err(|e| CatalogError::Database {
-                message: format!("Failed to set cache size: {e}"),
-            })?;
-
-        *conn_guard = Some(conn.clone());
-        Ok(conn)
+        Ok(Arc::clone(&self.conn))
     }
 
     /// Schema for the `cayenne_table` table.
@@ -348,7 +335,11 @@ fn convert_turso_error(e: turso::Error) -> CatalogError {
 #[async_trait]
 impl MetastoreBackend for TursoMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
-        let conn = self.get_conn().await?;
+        let conn_arc = self.get_conn().await?;
+        let guard = conn_arc.lock().await;
+        let conn = guard.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Turso connection not initialized".to_string(),
+        })?;
 
         // Create tables
         let schema_sql = format!(
@@ -384,11 +375,8 @@ impl MetastoreBackend for TursoMetastore {
 
         // Validate that existing tables match the expected schema.
         // This catches incompatible metadata databases from previous versions.
-        // We query table_info for each expected table using a fresh connection per table
-        // since turso::Connection is not Clone.
         for expected in super::EXPECTED_TABLES {
-            let table_conn = self.get_conn().await?;
-            let mut rows = table_conn
+            let mut rows = conn
                 .query(&format!("PRAGMA table_info('{}')", expected.name), ())
                 .await
                 .map_err(|e| CatalogError::Database {
@@ -439,7 +427,11 @@ impl MetastoreBackend for TursoMetastore {
     }
 
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
-        let conn = self.get_conn().await?;
+        let conn_arc = self.get_conn().await?;
+        let guard = conn_arc.lock().await;
+        let conn = guard.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Turso connection not initialized".to_string(),
+        })?;
 
         let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
 
@@ -455,7 +447,11 @@ impl MetastoreBackend for TursoMetastore {
     }
 
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()> {
-        let conn = self.get_conn().await?;
+        let conn_arc = self.get_conn().await?;
+        let guard = conn_arc.lock().await;
+        let conn = guard.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Turso connection not initialized".to_string(),
+        })?;
 
         conn.execute_batch(sql)
             .await
@@ -471,7 +467,11 @@ impl MetastoreBackend for TursoMetastore {
         F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let conn = self.get_conn().await?;
+        let conn_arc = self.get_conn().await?;
+        let guard = conn_arc.lock().await;
+        let conn = guard.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Turso connection not initialized".to_string(),
+        })?;
 
         let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
 
@@ -514,7 +514,11 @@ impl MetastoreBackend for TursoMetastore {
         F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let conn = self.get_conn().await?;
+        let conn_arc = self.get_conn().await?;
+        let guard = conn_arc.lock().await;
+        let conn = guard.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Turso connection not initialized".to_string(),
+        })?;
 
         let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
 
@@ -560,9 +564,139 @@ impl MetastoreBackend for TursoMetastore {
         Ok(results)
     }
 
+    async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>> {
+        let conn_arc = self.get_conn().await?;
+        let guard = conn_arc.lock_owned().await;
+
+        {
+            let conn = guard.as_ref().ok_or_else(|| CatalogError::Database {
+                message: "Turso connection not initialized".to_string(),
+            })?;
+            conn.execute("BEGIN CONCURRENT", ())
+                .await
+                .map_err(|e| CatalogError::Database {
+                    message: format!("Failed to begin concurrent transaction: {e}"),
+                })?;
+        }
+
+        Ok(Box::new(TursoTransaction { conn: Some(guard) }))
+    }
+
     async fn shutdown(&self) -> CatalogResult<()> {
         // Turso handles cleanup automatically
         tracing::info!("Shutting down Turso metastore");
+        Ok(())
+    }
+}
+
+/// A transaction on a Turso metastore connection.
+///
+/// Holds an [`OwnedMutexGuard`] on the underlying connection, ensuring
+/// exclusive access for the lifetime of the transaction.
+///
+/// If neither [`commit`](MetastoreTransaction::commit) nor
+/// [`rollback`](MetastoreTransaction::rollback) is called, the transaction
+/// is automatically rolled back on drop via a best-effort `ROLLBACK`.
+pub struct TursoTransaction {
+    /// Exclusive lock on the connection. `None` after commit/rollback.
+    conn: Option<OwnedMutexGuard<Option<Connection>>>,
+}
+
+impl Drop for TursoTransaction {
+    fn drop(&mut self) {
+        if let Some(guard) = self.conn.take() {
+            // Spawn a best-effort async rollback while holding the owned guard.
+            // The guard (and its mutex lock) is moved into the spawned task and
+            // released after the ROLLBACK completes or fails.
+            tokio::spawn(async move {
+                tracing::debug!(
+                    "TursoTransaction dropped without explicit commit or rollback; \
+                     attempting auto-rollback"
+                );
+                if let Some(conn) = guard.as_ref() {
+                    if let Err(err) = conn.execute("ROLLBACK", ()).await {
+                        tracing::error!("Failed to auto-rollback TursoTransaction on drop: {err}");
+                    }
+                }
+                // `guard` is dropped here, releasing the connection lock.
+            });
+        }
+    }
+}
+
+#[async_trait]
+impl MetastoreTransaction for TursoTransaction {
+    async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
+        let guard = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Transaction already completed".to_string(),
+        })?;
+        let conn = guard.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Turso connection not initialized".to_string(),
+        })?;
+
+        let turso_params: Vec<TursoValue> = params.params.iter().map(to_turso_value).collect();
+
+        let mut stmt = conn
+            .prepare_cached(params.sql)
+            .await
+            .map_err(convert_turso_error)?;
+        stmt.execute(turso_params)
+            .await
+            .map_err(convert_turso_error)?;
+
+        Ok(())
+    }
+
+    async fn execute_batch(&self, sql: &str) -> CatalogResult<()> {
+        let guard = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Transaction already completed".to_string(),
+        })?;
+        let conn = guard.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Turso connection not initialized".to_string(),
+        })?;
+
+        conn.execute_batch(sql)
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to execute batch in transaction: {e}"),
+            })?;
+
+        Ok(())
+    }
+
+    async fn commit(mut self: Box<Self>) -> CatalogResult<()> {
+        let guard = self.conn.take().ok_or_else(|| CatalogError::Database {
+            message: "Transaction already completed".to_string(),
+        })?;
+        let conn = guard.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Turso connection not initialized".to_string(),
+        })?;
+
+        if let Err(e) = conn.execute("COMMIT", ()).await {
+            // Best-effort rollback to leave the connection in a clean state.
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(CatalogError::Database {
+                message: format!("Failed to commit transaction: {e}"),
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn rollback(mut self: Box<Self>) -> CatalogResult<()> {
+        let guard = self.conn.take().ok_or_else(|| CatalogError::Database {
+            message: "Transaction already completed".to_string(),
+        })?;
+        let conn = guard.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Turso connection not initialized".to_string(),
+        })?;
+
+        conn.execute("ROLLBACK", ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to rollback transaction: {e}"),
+            })?;
+
         Ok(())
     }
 }

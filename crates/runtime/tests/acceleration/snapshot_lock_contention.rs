@@ -78,6 +78,7 @@ impl DatasetCheckpointer for DelayedMockCheckpointer {
     async fn checkpoint(
         &self,
         _schema: &arrow::datatypes::SchemaRef,
+        _refresh_sql: Option<&str>,
     ) -> runtime_acceleration::dataset_checkpoint::Result<()> {
         // Simulate checkpoint work
         tokio::time::sleep(self.checkpoint_delay).await;
@@ -93,6 +94,12 @@ impl DatasetCheckpointer for DelayedMockCheckpointer {
     async fn last_checkpoint_time(
         &self,
     ) -> runtime_acceleration::dataset_checkpoint::Result<Option<SystemTime>> {
+        Ok(None)
+    }
+
+    async fn get_refresh_sql(
+        &self,
+    ) -> runtime_acceleration::dataset_checkpoint::Result<Option<String>> {
         Ok(None)
     }
 }
@@ -377,7 +384,7 @@ async fn run_snapshot_workload(
         let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
 
         // Create checkpoint
-        if checkpointer.checkpoint(federated_schema).await.is_err() {
+        if checkpointer.checkpoint(federated_schema, None).await.is_err() {
             metrics.record_failure();
             continue;
         }
