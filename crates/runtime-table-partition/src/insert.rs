@@ -30,7 +30,7 @@ use datafusion::physical_plan::{
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::RwLock;
 
 use datafusion::{
     arrow::record_batch::RecordBatch,
@@ -50,26 +50,6 @@ use crate::creator::PartitionCreator;
 use crate::creator::filename::encode_composite_key;
 use crate::expression::PartitionedBy;
 use crate::provider::CompositePartitionKey;
-
-/// Global semaphore limiting concurrent partition write tasks across all tables.
-///
-/// Each partition write (one per partition bucket per batch) acquires a permit before
-/// starting its `insert_into` + execution pipeline. This prevents large partitioned
-/// tables (e.g. lineitem with 10 buckets) from spawning too many concurrent tasks
-/// that overwhelm CPU, memory, and the metastore mutex.
-///
-/// Capacity is set to the number of available CPU cores.
-static PARTITION_WRITE_SEMAPHORE: std::sync::LazyLock<Semaphore> =
-    std::sync::LazyLock::new(|| {
-        let cpus = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        tracing::info!(
-            concurrency = cpus,
-            "Partition write semaphore initialized"
-        );
-        Semaphore::new(cpus)
-    });
 
 /// Returns the schema that `DataFusion` expects from INSERT execution plans:
 /// a single non-null `count: UInt64` field.
@@ -259,11 +239,6 @@ impl ExecutionPlan for PartitionerExec {
                             let context = Arc::clone(&context);
                             let exec = PartitionInputExec::new(rx, Arc::clone(&schema));
                             let handle = tokio::spawn(async move {
-                                let _permit = PARTITION_WRITE_SEMAPHORE.acquire().await
-                                    .map_err(|e| DataFusionError::Execution(
-                                        format!("partition write semaphore closed: {e}"),
-                                    ))?;
-
                                 let plan = new_provider
                                     .insert_into(&state, Arc::new(exec), insert_op)
                                     .await?;
