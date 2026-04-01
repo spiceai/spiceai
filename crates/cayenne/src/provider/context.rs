@@ -131,13 +131,13 @@ impl CayenneContext {
         if config.footer_cache_mb != default_config.footer_cache_mb {
             tracing::warn!(
                 footer_cache_mb = config.footer_cache_mb,
-                "Vortex config `footer_cache_mb` is currently ignored in Spice.ai 2.0.0-unstable"
+                "Vortex config parameter `footer_cache_mb` is not currently supported and will be ignored"
             );
         }
         if config.segment_cache_mb != default_config.segment_cache_mb {
             tracing::warn!(
                 segment_cache_mb = config.segment_cache_mb,
-                "Vortex config `segment_cache_mb` is currently ignored in Spice.ai 2.0.0-unstable"
+                "Vortex config parameter `segment_cache_mb` is not currently supported and will be ignored"
             );
         }
 
