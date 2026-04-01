@@ -21,12 +21,13 @@ limitations under the License.
 
 use super::{
     duplicate_delete_file_index_error_message, ExecuteParams, MetastoreBackend, MetastoreGetValue,
-    MetastoreRow, MetastoreValue, QueryParams, QueryRowParams,
+    MetastoreRow, MetastoreTransaction, MetastoreValue, QueryParams, QueryRowParams,
 };
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
 use std::path::Path;
-use tokio::sync::OnceCell;
+use std::sync::Arc;
+use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 
 const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayenne_delete_file_table_path ON cayenne_delete_file(table_id, path)";
 
@@ -36,9 +37,16 @@ const DELETE_FILE_TABLE_UNIQUE_INDEX_DDL: &str = "CREATE UNIQUE INDEX IF NOT EXI
 /// eliminating the overhead of opening/closing connections for each operation.
 pub struct SqliteMetastore {
     connection_string: String,
-    /// Cached connection - lazily initialized on first use via `OnceCell`
-    /// ensuring exactly one connection is created even under concurrent access.
-    conn: OnceCell<tokio_rusqlite::Connection>,
+    /// Cached connection behind a mutex.
+    ///
+    /// The [`Mutex`] ensures exclusive access to the underlying
+    /// `tokio_rusqlite::Connection`. Every operation acquires the mutex,
+    /// which prevents interleaving of multi-statement transactions
+    /// (e.g. `BEGIN ... INSERT ... COMMIT`) when multiple tasks share the
+    /// same metastore.
+    ///
+    /// Lazily initialized on first use via [`OnceCell`].
+    conn: OnceCell<Arc<Mutex<tokio_rusqlite::Connection>>>,
 }
 
 /// Convert a `tokio_rusqlite::Error` to a `CatalogError`, distinguishing constraint violations.
@@ -86,7 +94,7 @@ impl SqliteMetastore {
             .unwrap_or(&self.connection_string)
     }
 
-    /// Get or create the persistent connection.
+    /// Get or create the persistent connection (mutex-guarded).
     ///
     /// The connection is configured with performance optimizations:
     /// - WAL mode for non-blocking reads/writes
@@ -97,7 +105,9 @@ impl SqliteMetastore {
     ///
     /// Uses `OnceCell` to ensure the connection is created exactly once,
     /// even when multiple tasks call this method concurrently.
-    async fn get_conn(&self) -> CatalogResult<tokio_rusqlite::Connection> {
+    /// Returns an `Arc<Mutex<..>>` so callers acquire the mutex before
+    /// using the connection.
+    async fn get_conn(&self) -> CatalogResult<Arc<Mutex<tokio_rusqlite::Connection>>> {
         self.conn
             .get_or_try_init(|| async {
                 // Create parent directory if it doesn't exist
@@ -148,10 +158,10 @@ impl SqliteMetastore {
                     },
                 )?;
 
-                Ok(conn)
+                Ok(Arc::new(Mutex::new(conn)))
             })
             .await
-            .cloned()
+            .map(Arc::clone)
     }
 
     /// Schema for the `cayenne_table` table.
@@ -345,53 +355,59 @@ fn to_sqlite_value(value: &MetastoreValue) -> rusqlite::types::Value {
 impl MetastoreBackend for SqliteMetastore {
     async fn init_schema(&self) -> CatalogResult<()> {
         let conn = self.get_conn().await?;
+        let guard = conn.lock().await;
 
-        conn.call(|conn| {
-            // Create tables in a transaction
-            conn.execute_batch(&format!(
-                "{}; {}; {}; {}; {}; {};",
-                Self::TABLE_TABLE_DDL,
-                Self::TABLE_NAME_UNIQUE_INDEX_DDL,
-                Self::DELETE_FILE_TABLE_DDL,
-                Self::PARTITION_TABLE_DDL,
-                Self::INSERT_RECORD_TABLE_DDL,
-                Self::SNAPSHOT_SEQUENCE_TABLE_DDL
-            ))?;
+        guard
+            .call(|conn| {
+                // Create tables in a transaction
+                conn.execute_batch(&format!(
+                    "{}; {}; {}; {}; {}; {};",
+                    Self::TABLE_TABLE_DDL,
+                    Self::TABLE_NAME_UNIQUE_INDEX_DDL,
+                    Self::DELETE_FILE_TABLE_DDL,
+                    Self::PARTITION_TABLE_DDL,
+                    Self::INSERT_RECORD_TABLE_DDL,
+                    Self::SNAPSHOT_SEQUENCE_TABLE_DDL
+                ))?;
 
-            // Backfill new columns for existing deployments (SQLite doesn't support IF NOT EXISTS for ALTER TABLE until v3.35)
-            // Ignore errors when the column already exists to keep init idempotent.
-            let _ = conn.execute(
-                "ALTER TABLE cayenne_table ADD COLUMN on_conflict_json TEXT",
-                [],
-            );
+                // Backfill new columns for existing deployments (SQLite doesn't support IF NOT EXISTS for ALTER TABLE until v3.35)
+                // Ignore errors when the column already exists to keep init idempotent.
+                let _ = conn.execute(
+                    "ALTER TABLE cayenne_table ADD COLUMN on_conflict_json TEXT",
+                    [],
+                );
 
-            Ok::<_, rusqlite::Error>(())
-        })
-        .await
-        .map_err(
-            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                message: format!("Failed to initialize schema: {e}"),
-            },
-        )?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to initialize schema: {e}"),
+                },
+            )?;
 
-        conn.call(|conn| {
-            conn.execute(DELETE_FILE_TABLE_UNIQUE_INDEX_DDL, [])?;
-            Ok::<_, rusqlite::Error>(())
-        })
-        .await
-        .map_err(
-            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                message: duplicate_delete_file_index_error_message("SQLite", e),
-            },
-        )?;
+        guard
+            .call(|conn| {
+                conn.execute(DELETE_FILE_TABLE_UNIQUE_INDEX_DDL, [])?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: duplicate_delete_file_index_error_message("SQLite", e),
+                },
+            )?;
 
         // Validate that existing tables match the expected schema.
         // This catches incompatible metadata databases from previous versions.
+        // Drop the guard before validation — the callback acquires it per-table.
+        drop(guard);
         let validate_conn = self.get_conn().await?;
         super::validate_existing_schema(|table_name| {
-            let conn = validate_conn.clone();
+            let conn = Arc::clone(&validate_conn);
             async move {
-                conn.call(move |conn| {
+                let g = conn.lock().await;
+                g.call(move |conn| {
                     let mut stmt = conn.prepare(&format!("PRAGMA table_info('{table_name}')"))?;
                     let columns: Vec<String> = stmt
                         .query_map([], |row| row.get::<_, String>(1))?
@@ -413,38 +429,42 @@ impl MetastoreBackend for SqliteMetastore {
 
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
         let conn = self.get_conn().await?;
+        let guard = conn.lock().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.iter().map(to_sqlite_value).collect();
 
-        conn.call(move |conn| {
-            let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
-                .iter()
-                .map(|v| v as &dyn rusqlite::ToSql)
-                .collect();
-            conn.prepare_cached(&sql)?.execute(params_refs.as_slice())?;
-            Ok::<_, rusqlite::Error>(())
-        })
-        .await
-        .map_err(|e| convert_tokio_rusqlite_error(e, "Failed to execute statement"))?;
+        guard
+            .call(move |conn| {
+                let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
+                    .iter()
+                    .map(|v| v as &dyn rusqlite::ToSql)
+                    .collect();
+                conn.prepare_cached(&sql)?.execute(params_refs.as_slice())?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .map_err(|e| convert_tokio_rusqlite_error(e, "Failed to execute statement"))?;
 
         Ok(())
     }
 
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()> {
         let conn = self.get_conn().await?;
+        let guard = conn.lock().await;
         let sql_owned = sql.to_string();
 
-        conn.call(move |conn| {
-            conn.execute_batch(&sql_owned)?;
-            Ok::<_, rusqlite::Error>(())
-        })
-        .await
-        .map_err(
-            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                message: format!("Failed to execute batch: {e}"),
-            },
-        )?;
+        guard
+            .call(move |conn| {
+                conn.execute_batch(&sql_owned)?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await
+            .map_err(
+                |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                    message: format!("Failed to execute batch: {e}"),
+                },
+            )?;
 
         Ok(())
     }
@@ -455,12 +475,13 @@ impl MetastoreBackend for SqliteMetastore {
         T: Send + 'static,
     {
         let conn = self.get_conn().await?;
+        let guard = conn.lock().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.iter().map(to_sqlite_value).collect();
 
         // Execute query and extract row values inside the closure
-        let row_values = conn
+        let row_values = guard
             .call(move |conn| {
                 let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
                     .iter()
@@ -498,12 +519,13 @@ impl MetastoreBackend for SqliteMetastore {
         T: Send + 'static,
     {
         let conn = self.get_conn().await?;
+        let guard = conn.lock().await;
         let sql = params.sql.to_string();
         let param_values: Vec<rusqlite::types::Value> =
             params.params.iter().map(to_sqlite_value).collect();
 
         // Execute query and collect all row values inside the closure
-        let all_row_values = conn
+        let all_row_values = guard
             .call(move |conn| {
                 let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
                     .iter()
@@ -547,39 +569,60 @@ impl MetastoreBackend for SqliteMetastore {
         Ok(results)
     }
 
-    async fn shutdown(&self) -> CatalogResult<()> {
-        // Get the existing connection if it was initialized
-        if let Some(conn) = self.conn.get() {
-            conn.call(|conn| {
-                // Check if WAL mode is enabled
-                let journal_mode: String =
-                    conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>> {
+        let conn = self.get_conn().await?;
+        let guard = conn.lock_owned().await;
 
-                if journal_mode.eq_ignore_ascii_case("wal") {
-                    tracing::info!("Truncating Cayenne catalog WAL log");
-                    // Truncate the WAL log to persist changes and reduce file size
-                    // wal_checkpoint returns results (busy, log, checkpointed), so we use query_row
-                    let _: (i32, i32, i32) =
-                        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                        })?;
-                }
-
-                // Run optimize to improve query performance for future connections
-                // PRAGMA optimize may return rows indicating what was optimized
-                tracing::info!("Running optimize on Cayenne catalog");
-                let mut stmt = conn.prepare("PRAGMA optimize")?;
-                let mut rows = stmt.query([])?;
-                while rows.next()?.is_some() {} // Consume all results to ensure PRAGMA completes
-
+        guard
+            .call(|conn| {
+                conn.execute_batch("BEGIN TRANSACTION")?;
                 Ok::<_, rusqlite::Error>(())
             })
             .await
             .map_err(
                 |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
-                    message: format!("Failed to shutdown catalog: {e}"),
+                    message: format!("Failed to begin transaction: {e}"),
                 },
             )?;
+
+        Ok(Box::new(SqliteTransaction { conn: Some(guard) }))
+    }
+
+    async fn shutdown(&self) -> CatalogResult<()> {
+        // Get the existing connection if it was initialized
+        if let Some(conn) = self.conn.get() {
+            let guard = conn.lock().await;
+            guard
+                .call(|conn| {
+                    // Check if WAL mode is enabled
+                    let journal_mode: String =
+                        conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+
+                    if journal_mode.eq_ignore_ascii_case("wal") {
+                        tracing::info!("Truncating Cayenne catalog WAL log");
+                        // Truncate the WAL log to persist changes and reduce file size
+                        // wal_checkpoint returns results (busy, log, checkpointed), so we use query_row
+                        let _: (i32, i32, i32) =
+                            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                            })?;
+                    }
+
+                    // Run optimize to improve query performance for future connections
+                    // PRAGMA optimize may return rows indicating what was optimized
+                    tracing::info!("Running optimize on Cayenne catalog");
+                    let mut stmt = conn.prepare("PRAGMA optimize")?;
+                    let mut rows = stmt.query([])?;
+                    while rows.next()?.is_some() {} // Consume all results to ensure PRAGMA completes
+
+                    Ok::<_, rusqlite::Error>(())
+                })
+                .await
+                .map_err(
+                    |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                        message: format!("Failed to shutdown catalog: {e}"),
+                    },
+                )?;
 
             // Note: We intentionally do not explicitly close the connection here.
             // Closing a cloned handle would leave a closed connection stored in the
@@ -587,6 +630,135 @@ impl MetastoreBackend for SqliteMetastore {
             // connection and fail. Instead, we rely on normal drop semantics to
             // clean up the background connection when the metastore is dropped.
         }
+
+        Ok(())
+    }
+}
+
+/// A transaction on a `SQLite` metastore connection.
+///
+/// Holds an [`OwnedMutexGuard`] on the underlying connection, ensuring
+/// exclusive access for the lifetime of the transaction. The guard is
+/// released when the transaction is committed, rolled back, or dropped.
+///
+/// If neither [`commit`](MetastoreTransaction::commit) nor
+/// [`rollback`](MetastoreTransaction::rollback) is called, the transaction
+/// is automatically rolled back on drop via a best-effort `ROLLBACK`.
+pub struct SqliteTransaction {
+    /// Exclusive lock on the connection. `None` after commit/rollback.
+    conn: Option<OwnedMutexGuard<tokio_rusqlite::Connection>>,
+}
+
+impl Drop for SqliteTransaction {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            // Best-effort rollback — fire and forget since we're in drop.
+            // tokio_rusqlite::Connection::call sends a closure to the bg
+            // thread; it will execute even after this Drop returns.
+            // We spawn a task to await the future properly.
+            tokio::spawn(async move {
+                let _ = conn
+                    .call(|conn| {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        Ok::<_, rusqlite::Error>(())
+                    })
+                    .await;
+            });
+        }
+    }
+}
+
+#[async_trait]
+impl MetastoreTransaction for SqliteTransaction {
+    async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()> {
+        let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Transaction already completed".to_string(),
+        })?;
+        let sql = params.sql.to_string();
+        let param_values: Vec<rusqlite::types::Value> =
+            params.params.iter().map(to_sqlite_value).collect();
+
+        conn.call(move |conn| {
+            let params_refs: Vec<&dyn rusqlite::ToSql> = param_values
+                .iter()
+                .map(|v| v as &dyn rusqlite::ToSql)
+                .collect();
+            conn.prepare_cached(&sql)?.execute(params_refs.as_slice())?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .map_err(|e| {
+            convert_tokio_rusqlite_error(e, "Failed to execute statement in transaction")
+        })?;
+
+        Ok(())
+    }
+
+    async fn execute_batch(&self, sql: &str) -> CatalogResult<()> {
+        let conn = self.conn.as_ref().ok_or_else(|| CatalogError::Database {
+            message: "Transaction already completed".to_string(),
+        })?;
+        let sql_owned = sql.to_string();
+
+        conn.call(move |conn| {
+            conn.execute_batch(&sql_owned)?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .map_err(
+            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                message: format!("Failed to execute batch in transaction: {e}"),
+            },
+        )?;
+
+        Ok(())
+    }
+
+    async fn commit(mut self: Box<Self>) -> CatalogResult<()> {
+        let conn = self.conn.take().ok_or_else(|| CatalogError::Database {
+            message: "Transaction already completed".to_string(),
+        })?;
+
+        let commit_result = conn
+            .call(|conn| {
+                conn.execute_batch("COMMIT")?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await;
+
+        match commit_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Best-effort rollback to leave the connection in a clean state.
+                let _ = conn
+                    .call(|conn| {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        Ok::<_, rusqlite::Error>(())
+                    })
+                    .await;
+
+                Err(CatalogError::Database {
+                    message: format!("Failed to commit transaction: {e}"),
+                })
+            }
+        }
+    }
+
+    async fn rollback(mut self: Box<Self>) -> CatalogResult<()> {
+        let conn = self.conn.take().ok_or_else(|| CatalogError::Database {
+            message: "Transaction already completed".to_string(),
+        })?;
+
+        conn.call(|conn| {
+            conn.execute_batch("ROLLBACK")?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .map_err(
+            |e: tokio_rusqlite::Error<rusqlite::Error>| CatalogError::Database {
+                message: format!("Failed to rollback transaction: {e}"),
+            },
+        )?;
 
         Ok(())
     }
