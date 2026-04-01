@@ -150,4 +150,8 @@ pub struct StdioArgs {
     /// Spice Cloud organization tag to apply to created app
     #[arg(long, env = "SPIDAPTER_ORGANIZATION_TAG")]
     pub organization_tag: Option<String>,
+
+    /// Query memory limit to apply to `runtime.query.memory_limit` spicepod configuration (e.g. `150Gi`).
+    #[arg(long, env = "SPIDAPTER_QUERY_MEMORY_LIMIT")]
+    pub query_memory_limit: Option<String>,
 }

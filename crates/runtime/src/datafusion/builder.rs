@@ -34,7 +34,7 @@ use datafusion::{
     execution::{
         DiskManager, SessionStateBuilder,
         disk_manager::DiskManagerMode,
-        memory_pool::{FairSpillPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool},
+        memory_pool::{GreedyMemoryPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
     optimizer::{
@@ -617,7 +617,7 @@ pub(crate) fn runtime_env(
             unreachable!("Memory pool TopN must be greater than 0");
         };
 
-        Arc::new(TrackConsumersPool::new(FairSpillPool::new(limit), topn))
+        Arc::new(TrackConsumersPool::new(GreedyMemoryPool::new(limit), topn))
     } else {
         let Some(topn) = NonZeroUsize::new(5) else {
             unreachable!("Memory pool TopN must be greater than 0");
