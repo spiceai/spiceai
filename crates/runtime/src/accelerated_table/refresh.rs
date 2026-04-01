@@ -245,6 +245,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum NextRefresh {
     WaitFor(Duration),
     Disabled,
@@ -408,7 +409,7 @@ impl Refresh {
         let previous_checkpoint = match self.mode {
             RefreshMode::Full => {
                 // If there is no checkpoint, we need to start a refresh.
-                let Some(last_checkpoint) = last_checkpoint else {
+                let Some(ref last_checkpoint) = last_checkpoint else {
                     return NextRefresh::WaitFor(Duration::ZERO);
                 };
                 last_checkpoint.last_checkpoint_time().await.ok().flatten()
@@ -442,6 +443,28 @@ impl Refresh {
         let Some(prev_checkpoint_time) = previous_checkpoint else {
             return NextRefresh::WaitFor(Duration::ZERO);
         };
+
+        // Check if the refresh_sql has changed since the last checkpoint.
+        // If it has, we need to re-run the refresh to apply the new SQL.
+        if let Some(ref checkpointer) = last_checkpoint {
+            match checkpointer.get_refresh_sql().await {
+                Ok(stored_refresh_sql) => {
+                    let current_refresh_sql = self.sql.as_ref().map(|s| s.to_sql());
+                    if stored_refresh_sql != current_refresh_sql {
+                        tracing::info!(
+                            "refresh_sql has changed since last checkpoint, triggering refresh"
+                        );
+                        return NextRefresh::WaitFor(Duration::ZERO);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to retrieve stored refresh_sql from checkpoint, triggering refresh: {e}"
+                    );
+                    return NextRefresh::WaitFor(Duration::ZERO);
+                }
+            }
+        }
 
         // If the refresh interval is set, we need to start a refresh if the elapsed time since the last checkpoint is greater than the refresh interval.
         // Otherwise, we don't need to start a refresh.
@@ -856,6 +879,7 @@ impl Refresher {
                             self.bootstrap_status.clone(),
                             Arc::clone(&self.last_updated_at),
                             Some(Arc::clone(&self.accelerator)),
+                            Arc::clone(&self.refresh),
                         ),
                         None,
                     ),
@@ -872,6 +896,7 @@ impl Refresher {
                             self.bootstrap_status.clone(),
                             Arc::clone(&self.last_updated_at),
                             Some(Arc::clone(&self.accelerator)),
+                            Arc::clone(&self.refresh),
                         ),
                     ),
                 };
@@ -950,6 +975,7 @@ impl Refresher {
                         self.bootstrap_status.clone(),
                         Arc::clone(&self.last_updated_at),
                         Some(Arc::clone(&self.accelerator)),
+                        Arc::clone(&self.refresh),
                     ),
                     false,
                 ),
@@ -977,10 +1003,13 @@ impl Refresher {
                 let dataset_name_clone = dataset_name.clone();
                 let last_updated_at_clone = Arc::clone(&self.last_updated_at);
                 let accelerator_clone = Arc::clone(&self.accelerator);
+                let refresh_clone = Arc::clone(&self.refresh);
 
                 tokio::spawn(async move {
                     runtime_status_clone.wait_for_ready().await;
                     if !bootstrap_status.is_bootstrapped() {
+                        let refresh_sql =
+                            refresh_clone.read().await.sql.as_ref().map(|s| s.to_sql());
                         create_checkpoint_and_snapshot(
                             &checkpointer,
                             snapshot_manager_clone.as_ref(),
@@ -990,6 +1019,7 @@ impl Refresher {
                             &last_updated_at_clone,
                             ForceCreate(true),
                             Some(&accelerator_clone),
+                            refresh_sql.as_deref(),
                         )
                         .await;
                     }
@@ -1061,6 +1091,7 @@ impl Refresher {
                             }
 
                             if checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
+                                let refresh_sql = refresh.read().await.sql.as_ref().map(|s| s.to_sql());
                                 create_checkpoint_and_snapshot(
                                     checkpointer,
                                     snapshot_manager.as_ref(),
@@ -1070,6 +1101,7 @@ impl Refresher {
                                     &last_updated_at,
                                     ForceCreate(false),
                                     Some(&accelerator),
+                                    refresh_sql.as_deref(),
                                 ).await;
                             }
                         }
@@ -1227,6 +1259,7 @@ mod tests {
     struct MockCheckpointer {
         exists_value: bool,
         last_checkpoint_time: Option<SystemTime>,
+        stored_refresh_sql: Option<String>,
     }
 
     impl MockCheckpointer {
@@ -1237,6 +1270,19 @@ mod tests {
             Arc::new(Self {
                 exists_value,
                 last_checkpoint_time,
+                stored_refresh_sql: None,
+            })
+        }
+
+        fn new_arc_with_refresh_sql(
+            exists_value: bool,
+            last_checkpoint_time: Option<SystemTime>,
+            stored_refresh_sql: Option<String>,
+        ) -> Arc<dyn DatasetCheckpointer> {
+            Arc::new(Self {
+                exists_value,
+                last_checkpoint_time,
+                stored_refresh_sql,
             })
         }
     }
@@ -1250,6 +1296,7 @@ mod tests {
         async fn checkpoint(
             &self,
             _schema: &SchemaRef,
+            _refresh_sql: Option<&str>,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // Not needed for this test
             Ok(())
@@ -1266,6 +1313,12 @@ mod tests {
             &self,
         ) -> Result<Option<SystemTime>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(self.last_checkpoint_time)
+        }
+
+        async fn get_refresh_sql(
+            &self,
+        ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.stored_refresh_sql.clone())
         }
     }
 
@@ -2410,6 +2463,76 @@ mod tests {
                 case.description
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_startup_next_refresh_sql_change_detection() {
+        let now = SystemTime::now();
+
+        // Build a simple RefreshSQL using RefreshSQL::new
+        let table_ref = TableReference::bare("test_table");
+        let refresh_sql = RefreshSQL::new(table_ref.clone(), RefreshSQLColumns::All, vec![], None);
+
+        // Case 1: stored refresh_sql matches current → no forced refresh (should wait or be disabled)
+        let stored_sql = refresh_sql.to_sql();
+        let checkpoint_matching = MockCheckpointer::new_arc_with_refresh_sql(
+            true,
+            Some(now),
+            Some(stored_sql.clone()),
+        );
+        let mut refresh_with_matching_sql = Refresh::new(RefreshMode::Full);
+        refresh_with_matching_sql = refresh_with_matching_sql.refresh_sql(refresh_sql.clone());
+        let result = refresh_with_matching_sql
+            .startup_next_refresh(RefreshOnStartup::Auto, Some(checkpoint_matching))
+            .await;
+        assert!(
+            matches!(result, NextRefresh::Disabled),
+            "When stored refresh_sql matches current, should not force immediate refresh; got {result:?}"
+        );
+
+        // Case 2: stored refresh_sql differs from current → forced refresh
+        let checkpoint_different = MockCheckpointer::new_arc_with_refresh_sql(
+            true,
+            Some(now),
+            Some("SELECT * FROM other_table".to_string()),
+        );
+        let mut refresh_with_changed_sql = Refresh::new(RefreshMode::Full);
+        refresh_with_changed_sql = refresh_with_changed_sql.refresh_sql(refresh_sql.clone());
+        let result = refresh_with_changed_sql
+            .startup_next_refresh(RefreshOnStartup::Auto, Some(checkpoint_different))
+            .await;
+        assert!(
+            matches!(result, NextRefresh::WaitFor(d) if d.is_zero()),
+            "When stored refresh_sql differs from current, should trigger immediate refresh; got {result:?}"
+        );
+
+        // Case 3: stored refresh_sql is Some, current is None → forced refresh
+        let checkpoint_had_sql = MockCheckpointer::new_arc_with_refresh_sql(
+            true,
+            Some(now),
+            Some(stored_sql),
+        );
+        let refresh_no_sql = Refresh::new(RefreshMode::Full);
+        let result = refresh_no_sql
+            .startup_next_refresh(RefreshOnStartup::Auto, Some(checkpoint_had_sql))
+            .await;
+        assert!(
+            matches!(result, NextRefresh::WaitFor(d) if d.is_zero()),
+            "When stored refresh_sql is Some but current is None, should trigger immediate refresh; got {result:?}"
+        );
+
+        // Case 4: stored refresh_sql is None, current is Some → forced refresh
+        let checkpoint_no_sql =
+            MockCheckpointer::new_arc_with_refresh_sql(true, Some(now), None);
+        let mut refresh_with_sql = Refresh::new(RefreshMode::Full);
+        refresh_with_sql = refresh_with_sql.refresh_sql(refresh_sql);
+        let result = refresh_with_sql
+            .startup_next_refresh(RefreshOnStartup::Auto, Some(checkpoint_no_sql))
+            .await;
+        assert!(
+            matches!(result, NextRefresh::WaitFor(d) if d.is_zero()),
+            "When stored refresh_sql is None but current is Some, should trigger immediate refresh; got {result:?}"
+        );
     }
 
     #[tokio::test]
