@@ -1066,5 +1066,3 @@ async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(),
         })
         .await
 }
-await
-}
