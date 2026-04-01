@@ -638,6 +638,95 @@ mod tests {
         Ok(())
     }
 
+    /// Regression test: column names containing "count" or "sum" as a
+    /// substring (e.g. `l_dis`**`count`**) must not confuse the AVG state
+    /// field classification. Both `COUNT` and `SUM` must appear in the
+    /// pushed-down SQL.
+    #[tokio::test]
+    async fn test_pushdown_avg_column_name_contains_count() -> Result<()> {
+        let schema = lineitem_schema();
+        let union_input = make_union(vec![
+            make_flight_exec(&schema, "foo.foo.lineitem", &[]),
+            make_flight_exec(&schema, "foo.foo.lineitem", &[]),
+        ]);
+
+        // l_discount is at index 2 in lineitem_schema — its name contains "count"
+        let avg_expr =
+            AggregateExprBuilder::new(avg_udaf(), vec![Arc::new(Column::new("l_discount", 2))])
+                .schema(Arc::clone(&schema))
+                .alias("avg(l_discount)")
+                .build()?;
+
+        let plan = full_aggregate(
+            union_input,
+            &[(3, "l_returnflag")],
+            vec![Arc::new(avg_expr)],
+        )?;
+
+        let optimized = optimize(plan)?;
+        // Must produce both COUNT and SUM, not two COUNTs
+        insta::assert_snapshot!(plan_display(&optimized), @r#"
+        AggregateExec: mode=Final, gby=[l_returnflag@0 as l_returnflag], aggr=[avg(l_discount)]
+          CoalescePartitionsExec
+            UnionExec
+              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", COUNT("l_discount") AS "__agg_0", SUM("l_discount") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", COUNT("l_discount") AS "__agg_0", SUM("l_discount") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+        "#);
+
+        Ok(())
+    }
+
+    /// Regression test: end-to-end correctness for `avg(l_discount)` where
+    /// the column name contains "count" as a substring. Verifies the Final
+    /// aggregate computes `SUM / COUNT`, not `COUNT / COUNT`.
+    #[tokio::test]
+    async fn test_result_avg_column_name_contains_count() -> Result<()> {
+        let schema = lineitem_schema();
+        let union_input = make_union(vec![
+            make_flight_exec(&schema, "foo.foo.lineitem", &[]),
+            make_flight_exec(&schema, "foo.foo.lineitem", &[]),
+        ]);
+
+        // l_discount at index 2
+        let avg_expr =
+            AggregateExprBuilder::new(avg_udaf(), vec![Arc::new(Column::new("l_discount", 2))])
+                .schema(Arc::clone(&schema))
+                .alias("avg(l_discount)")
+                .build()?;
+
+        let plan = full_aggregate(union_input, &[], vec![Arc::new(avg_expr)])?;
+        let optimized = optimize(plan)?;
+
+        let partial_schema = optimized.children()[0].children()[0].schema();
+        assert_eq!(
+            partial_schema.fields().len(),
+            2,
+            "AVG partial state must have exactly 2 fields (count, sum), got schema: {partial_schema}"
+        );
+
+        // Partition 1: [0.04, 0.06, 0.10] → COUNT=3, SUM=0.20 (20 in cents)
+        // Partition 2: [0.08, 0.02]        → COUNT=2, SUM=0.10 (10 in cents)
+        // Correct AVG = 0.30 / 5 = 0.06
+        // Wrong   AVG = COUNT/COUNT = 1.0  (if SUM field got COUNT value)
+        let mut data = vec![
+            vec![make_scalar_partial_batch(&partial_schema, 3, 0, 0.0, 20)?],
+            vec![make_scalar_partial_batch(&partial_schema, 2, 0, 0.0, 10)?],
+        ]
+        .into_iter();
+        let executable = replace_pushdown_with_memory(optimized, &mut data)?;
+        let result = execute_plan(executable).await?;
+
+        insta::assert_snapshot!(pretty(&result), @r"
+        +-----------------+
+        | avg(l_discount) |
+        +-----------------+
+        | 0.060000        |
+        +-----------------+
+        ");
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_pushdown_single_partition_no_union() -> Result<()> {
         let schema = lineitem_schema();
