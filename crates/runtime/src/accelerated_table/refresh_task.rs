@@ -1345,12 +1345,11 @@ impl RefreshTask {
             }
             match accelerated_field.data_type() {
                 DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                    let arr = arrow::compute::cast(col_array, &DataType::Int64)
-                        .map_err(|e| super::Error::FailedToFindLatestTimestamp {
-                            reason: format!(
-                                "Failed to cast integer time column to Int64: {e}"
-                            ),
-                        })?;
+                    let arr = arrow::compute::cast(col_array, &DataType::Int64).map_err(|e| {
+                        super::Error::FailedToFindLatestTimestamp {
+                            reason: format!("Failed to cast integer time column to Int64: {e}"),
+                        }
+                    })?;
                     let arr = arr
                         .as_any()
                         .downcast_ref::<arrow::array::Int64Array>()
@@ -1371,18 +1370,20 @@ impl RefreshTask {
                     })?
                 }
                 DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                    let arr = arrow::compute::cast(col_array, &DataType::UInt64)
-                        .map_err(|e| super::Error::FailedToFindLatestTimestamp {
+                    let arr = arrow::compute::cast(col_array, &DataType::UInt64).map_err(|e| {
+                        super::Error::FailedToFindLatestTimestamp {
                             reason: format!(
                                 "Failed to cast unsigned integer time column to UInt64: {e}"
                             ),
-                        })?;
+                        }
+                    })?;
                     let arr = arr
                         .as_any()
                         .downcast_ref::<arrow::array::UInt64Array>()
                         .ok_or_else(|| super::Error::FailedToFindLatestTimestamp {
-                            reason: "Failed to downcast unsigned integer time column to UInt64Array."
-                                .to_string(),
+                            reason:
+                                "Failed to downcast unsigned integer time column to UInt64Array."
+                                    .to_string(),
                         })?;
                     if arr.is_null(0) {
                         return Ok(None);
@@ -1391,9 +1392,7 @@ impl RefreshTask {
                 }
                 other => {
                     return Err(super::Error::FailedToFindLatestTimestamp {
-                        reason: format!(
-                            "Unexpected data type {other} for integer time column."
-                        ),
+                        reason: format!("Unexpected data type {other} for integer time column."),
                     });
                 }
             }
@@ -2012,16 +2011,13 @@ mod tests {
     /// (e.g. `unix_seconds` / `unix_millis` time formats) without casting to a Timestamp type.
     #[tokio::test]
     async fn test_max_timestamp_df_integer_time_column() {
-        async fn run_test(
-            data_type: DataType,
-            array: Arc<dyn arrow::array::Array>,
-        ) -> RecordBatch {
+        async fn run_test(data_type: DataType, array: Arc<dyn arrow::array::Array>) -> RecordBatch {
             let schema = Arc::new(Schema::new(vec![Field::new("ts", data_type, false)]));
             let batch =
                 RecordBatch::try_new(Arc::clone(&schema), vec![array]).expect("batch created");
-            let mem_table = Arc::new(
-                MemTable::try_new(schema, vec![vec![batch]]).expect("mem table created"),
-            ) as Arc<dyn TableProvider>;
+            let mem_table =
+                Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("mem table created"))
+                    as Arc<dyn TableProvider>;
 
             let ctx = SessionContext::new();
             let df = max_timestamp_df(&mem_table, ctx.clone(), "ts").expect("df created");
