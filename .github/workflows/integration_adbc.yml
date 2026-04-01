@@ -8,6 +8,7 @@ on:
       - release/*
   pull_request:
     branches:
+      - trunk
       - release-*
       - release/*
       - feature-*
@@ -29,7 +30,7 @@ env:
 
 jobs:
   check_changes:
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:

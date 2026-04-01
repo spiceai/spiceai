@@ -379,18 +379,14 @@ impl DataConnector for IcebergDataConnector {
             Err(e) => return Some(Err(e)),
         };
 
-        // Wrap in IcebergDeletionProvider for DELETE FROM support, then in
-        // DeletionTableProviderAdapter so get_deletion_provider can find it.
+        // Wrap in IcebergDeletionProvider for DELETE FROM support.
         let deletion_provider = data_components::iceberg::delete::IcebergDeletionProvider::new(
             parts.catalog,
             parts.namespace,
             parts.table_name,
             parts.provider,
         );
-        let adapted: Arc<dyn TableProvider> = Arc::new(
-            data_components::delete::DeletionTableProviderAdapter::new(Arc::new(deletion_provider)),
-        );
-        Some(Ok(adapted))
+        Some(Ok(Arc::new(deletion_provider)))
     }
 }
 

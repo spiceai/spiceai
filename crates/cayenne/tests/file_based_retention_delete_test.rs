@@ -17,7 +17,7 @@ limitations under the License.
 //! Integration tests for file-based retention deletion.
 //!
 //! When a Cayenne table uses **position-based deletion** (no primary key) with
-//! **time-based retention**, the [`DeletionTableProvider::delete_from`] path
+//! **time-based retention**, the `delete_from` path
 //! prefers whole-file deletion over per-row deletion vectors.
 //!
 //! These tests verify that:
@@ -38,7 +38,6 @@ use cayenne::{
     STAGING_DIR_NAME,
 };
 use common::TestFixture;
-use data_components::delete::DeletionTableProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::*;
@@ -1106,7 +1105,7 @@ async fn execute_delete(
     filter: Expr,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
-    let plan = DeletionTableProvider::delete_from(table, &ctx.state(), &[filter]).await?;
+    let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
     let results = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(results
         .first()
