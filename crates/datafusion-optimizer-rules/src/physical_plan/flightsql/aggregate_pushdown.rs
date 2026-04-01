@@ -393,7 +393,7 @@ mod tests {
         )?))
     }
 
-    /// Build the full two-phase aggregate plan that DataFusion produces:
+    /// Build the full two-phase aggregate plan that `DataFusion` produces:
     ///
     /// ```text
     /// AggregateExec(mode=Final)
@@ -403,7 +403,7 @@ mod tests {
     /// ```
     ///
     /// Both aggregates share the same `input_schema` (the original scan schema),
-    /// matching DataFusion's own Partial→Final split convention.
+    /// matching `DataFusion`'s own Partial→Final split convention.
     fn full_aggregate(
         input: Arc<dyn ExecutionPlan>,
         group_by_indices: &[(usize, &str)],
@@ -443,10 +443,10 @@ mod tests {
     /// `PartialAggregationFlightSqlExec` nodes in optimized plans so the full
     /// `AggregateExec(Final)` can be executed with deterministic mock data.
     fn make_memory_exec(
-        partitions: Vec<Vec<RecordBatch>>,
+        partitions: &[Vec<RecordBatch>],
         schema: SchemaRef,
     ) -> Arc<dyn ExecutionPlan> {
-        MemorySourceConfig::try_new_exec(&partitions, schema, None)
+        MemorySourceConfig::try_new_exec(partitions, schema, None)
             .expect("build MemorySourceConfig")
     }
 
@@ -471,7 +471,7 @@ mod tests {
                     "ran out of mock data for pushdown replacement".to_string(),
                 )
             })?;
-            return Ok(make_memory_exec(vec![partition_data], schema));
+            return Ok(make_memory_exec(&[partition_data], schema));
         }
         let children = plan.children();
         if children.is_empty() {
@@ -1105,7 +1105,7 @@ mod tests {
 
     /// Format a [`RecordBatch`] as a pretty-printed table string via Arrow.
     fn pretty(batch: &RecordBatch) -> String {
-        arrow::util::pretty::pretty_format_batches(&[batch.clone()])
+        arrow::util::pretty::pretty_format_batches(std::slice::from_ref(batch))
             .expect("pretty format")
             .to_string()
     }
