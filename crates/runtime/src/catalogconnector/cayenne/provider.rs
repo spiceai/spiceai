@@ -39,7 +39,6 @@ use crate::component::catalog::Catalog;
 use crate::parameters::Parameters;
 use crate::spice_data_base_path;
 use data_components::RefreshableCatalogProvider;
-use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
 use runtime_table_partition::provider::PartitionTableProvider;
 
 use crate::catalogconnector::PartitionAwareCatalog;
@@ -519,36 +518,17 @@ impl CayenneSchemaProvider {
             return true;
         }
 
-        // Case 2: PartitionTableProvider (wrapped in DeletionTableProviderAdapter)
-        // — refresh each partition's inner CayenneTableProvider from itself (reloads
-        // deletion vectors, protected snapshots, snapshot ID, and listing table from
-        // the catalog).
+        // Case 2: PartitionTableProvider — refresh each partition's inner
+        // CayenneTableProvider from itself (reloads deletion vectors, protected
+        // snapshots, snapshot ID, and listing table from the catalog).
         let partition_provider = existing_provider
             .as_any()
-            .downcast_ref::<DeletionTableProviderAdapter>()
-            .and_then(|adapter| {
-                adapter
-                    .source()
-                    .as_any()
-                    .downcast_ref::<PartitionTableProvider>()
-            });
+            .downcast_ref::<PartitionTableProvider>();
 
         if let Some(partition_provider) = partition_provider {
             let providers = partition_provider.partition_table_providers().await;
             for provider in &providers {
-                // Each partition's inner provider is a DeletionTableProviderAdapter
-                // wrapping a CayenneTableProvider.
-                let Some(cayenne) = provider
-                    .as_any()
-                    .downcast_ref::<DeletionTableProviderAdapter>()
-                    .and_then(|adapter| {
-                        adapter
-                            .source()
-                            .as_any()
-                            .downcast_ref::<CayenneTableProvider>()
-                    })
-                    .or_else(|| provider.as_any().downcast_ref::<CayenneTableProvider>())
-                else {
+                let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>() else {
                     tracing::warn!(
                         "Partition sub-provider is not a CayenneTableProvider, skipping refresh"
                     );
@@ -571,13 +551,7 @@ impl CayenneSchemaProvider {
     fn cayenne_table_from_provider(
         provider: &Arc<dyn TableProvider>,
     ) -> Option<&CayenneTableProvider> {
-        let adapter = provider
-            .as_any()
-            .downcast_ref::<DeletionTableProviderAdapter>()?;
-        adapter
-            .source()
-            .as_any()
-            .downcast_ref::<CayenneTableProvider>()
+        provider.as_any().downcast_ref::<CayenneTableProvider>()
     }
 
     fn clear_tables(&self) {
@@ -614,13 +588,7 @@ impl CayenneSchemaProvider {
                     CayenneTableProviderBuilder::new(Arc::clone(catalog), Arc::clone(runtime_env));
 
                 match builder.open(table_name).await {
-                    Ok(provider) => {
-                        let provider = Arc::new(provider);
-                        let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
-                        Ok(Some(Arc::new(DeletionTableProviderAdapter::new(
-                            deletion_provider,
-                        ))))
-                    }
+                    Ok(provider) => Ok(Some(Arc::new(provider) as Arc<dyn TableProvider>)),
                     Err(e) => {
                         tracing::warn!("Failed to open Cayenne table '{table_name}': {e}");
                         Ok(None)
