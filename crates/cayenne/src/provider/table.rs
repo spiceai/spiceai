@@ -3533,7 +3533,7 @@ impl CayenneTableProvider {
                 // Filter to only include deletions with seq > min_delete_seq_to_apply
                 let filtered_deletions: HashMap<i64, i64> = all_deleted_pks
                     .iter()
-                    .filter(|(_pk, &seq)| seq > min_delete_seq_to_apply)
+                    .filter(|(_, seq)| **seq > min_delete_seq_to_apply)
                     .map(|(&pk, &seq)| (pk, seq))
                     .collect();
 
@@ -3575,7 +3575,7 @@ impl CayenneTableProvider {
                     // Filter to only include deletions with seq > min_delete_seq_to_apply
                     let filtered_deletions: HashMap<Box<[u8]>, i64> = all_deleted_keys
                         .iter()
-                        .filter(|(_key, &seq)| seq > min_delete_seq_to_apply)
+                        .filter(|(_, seq)| **seq > min_delete_seq_to_apply)
                         .map(|(key, &seq)| (key.clone(), seq))
                         .collect();
 

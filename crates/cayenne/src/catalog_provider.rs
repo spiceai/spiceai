@@ -141,6 +141,8 @@ impl CayenneCatalogProvider {
         // Initialize local file storage
         let data_dir = config
             .data_dir
+            .as_ref()
+            .cloned()
             .unwrap_or_else(|| format!("{spice_data_base_path}/cayenne_{catalog_name}/data"));
 
         std::fs::create_dir_all(&data_dir).map_err(|e| Error::InvalidConfiguration {
@@ -235,8 +237,8 @@ impl CayenneCatalogProvider {
         if let Some(v) = provider_config.target_file_size_mb {
             config.target_vortex_file_size_mb = v;
         }
-        if let Some(v) = provider_config.compression_strategy {
-            config.compression_strategy = v;
+        if let Some(v) = provider_config.compression_strategy.as_ref() {
+            config.compression_strategy = v.clone();
         }
         config
     }
