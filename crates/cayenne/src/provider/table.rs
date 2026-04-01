@@ -1892,7 +1892,7 @@ impl CayenneTableProvider {
         );
         let validate_start = std::time::Instant::now();
         let validation_result = self
-            .validate_on_conflict(stream, &pk_indices, &converter, &mut existing_keys)
+            .validate_on_conflict(stream, pk_indices, converter, existing_keys)
             .await?;
         let validate_ms = validate_start.elapsed().as_millis() as u64;
         tracing::info!(target: "runtime",
@@ -1926,200 +1926,70 @@ impl CayenneTableProvider {
     ///
     /// Returns filtered batches (with dropped rows removed) and a map of deletion vector specs
     /// keyed by `data_file_id`.
+    ///
+    /// The CPU-heavy per-row validation (RowConverter + HashMap lookups) is offloaded to a
+    /// blocking thread via `spawn_blocking` to avoid starving the tokio async runtime.
+    /// Batches are streamed to the blocking thread via a channel.
     async fn validate_on_conflict(
         &self,
         mut stream: SendableRecordBatchStream,
-        pk_indices: &[usize],
-        converter: &RowConverter,
-        existing_keys: &mut HashMap<OwnedRow, RowLocation>,
+        pk_indices: Vec<usize>,
+        converter: RowConverter,
+        existing_keys: HashMap<OwnedRow, RowLocation>,
     ) -> Result<OnConflictValidationResult> {
-        let mut incoming_keys: HashSet<OwnedRow> = HashSet::with_capacity(1024);
-        let mut filtered_batches = Vec::new();
-        let mut delete_specs: HashMap<i64, Vec<i64>> = HashMap::new();
-        let mut all_deleted_pk_i64: Vec<i64> = Vec::new();
-        let mut all_deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
-
-        // Use configured on_conflict or default to DoNothingAll (silently drops duplicates).
-        // When a primary key is configured without explicit on_conflict, this ensures
-        // inserts succeed without unique constraint errors.
+        // Clone the small bits of self needed by the blocking thread.
+        let table_name = self.table_metadata.table_name.clone();
         let on_conflict = self
             .table_metadata
             .on_conflict
             .clone()
             .unwrap_or(OnConflict::DoNothingAll);
-        let upsert_options = on_conflict.get_upsert_options();
+        let pk_deletion_strategy_is_int64 = self.pk_deletion_strategy.is_int64_pk();
+        let pk_deletion_strategy_variant = match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { .. } => PkStrategyKind::Int64Pk,
+            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
+                PkStrategyKind::RowConverterBased
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => PkStrategyKind::PositionBased,
+        };
 
+        let (batch_tx, batch_rx) = tokio::sync::mpsc::channel::<RecordBatch>(4);
+        let (result_tx, result_rx) =
+            tokio::sync::oneshot::channel::<Result<OnConflictValidationResult>>();
+
+        // Spawn blocking thread to process batches with CPU-heavy validation.
+        task::spawn_blocking(move || {
+            let result = validate_on_conflict_blocking(
+                batch_rx,
+                pk_indices,
+                converter,
+                existing_keys,
+                &table_name,
+                &on_conflict,
+                pk_deletion_strategy_is_int64,
+                pk_deletion_strategy_variant,
+            );
+            let _ = result_tx.send(result);
+        });
+
+        // Async: stream batches to the blocking thread.
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result?;
-
             if batch.num_rows() == 0 {
                 continue;
             }
-
-            let mut ctx = OnConflictContext {
-                pk_indices,
-                converter,
-                on_conflict: &on_conflict,
-                upsert_options: &upsert_options,
-                existing_keys,
-                incoming_keys: &incoming_keys,
-            };
-
-            let BatchValidationResult {
-                filtered_batch,
-                delete_specs: batch_delete_specs,
-                kept_keys,
-                deleted_pk_i64,
-                deleted_row_keys,
-            } = self.apply_on_conflict_to_batch(batch, &mut ctx)?;
-
-            for (data_file_id, rows) in batch_delete_specs {
-                delete_specs.entry(data_file_id).or_default().extend(rows);
-            }
-
-            all_deleted_pk_i64.extend(deleted_pk_i64);
-            all_deleted_row_keys.extend(deleted_row_keys);
-
-            incoming_keys.extend(kept_keys);
-
-            if let Some(batch) = filtered_batch {
-                filtered_batches.push(batch);
+            if batch_tx.send(batch).await.is_err() {
+                // Blocking thread exited early (error). Drop the sender and
+                // collect the error from result_rx below.
+                break;
             }
         }
+        drop(batch_tx);
 
-        Ok(OnConflictValidationResult {
-            filtered_batches,
-            delete_specs,
-            deleted_pk_i64: all_deleted_pk_i64,
-            deleted_row_keys: all_deleted_row_keys,
-        })
-    }
-
-    fn apply_on_conflict_to_batch(
-        &self,
-        batch: RecordBatch,
-        ctx: &mut OnConflictContext<'_>,
-    ) -> Result<BatchValidationResult> {
-        use arrow::array::Int64Array;
-
-        let pk_columns: Vec<_> = ctx
-            .pk_indices
-            .iter()
-            .map(|idx| Arc::clone(batch.column(*idx)))
-            .collect();
-
-        let rows = ctx.converter.convert_columns(&pk_columns)?;
-
-        // For Int64Pk strategy, get direct access to the PK column for value extraction
-        let int64_pk_array: Option<&Int64Array> =
-            if self.pk_deletion_strategy.is_int64_pk() && pk_columns.len() == 1 {
-                pk_columns[0].as_any().downcast_ref::<Int64Array>()
-            } else {
-                None
-            };
-
-        let mut keep_mask = Vec::with_capacity(batch.num_rows());
-        let mut row_keys: Vec<OwnedRow> = Vec::with_capacity(batch.num_rows());
-        let mut delete_specs: HashMap<i64, Vec<i64>> = HashMap::new();
-        let mut deleted_pk_i64: Vec<i64> = Vec::new();
-        let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
-
-        for row_idx in 0..batch.num_rows() {
-            let has_null = pk_columns.iter().any(|col| col.is_null(row_idx));
-            if has_null {
-                return Err(Error::DataValidation {
-                    table: self.table_metadata.table_name.clone(),
-                    message: "Primary key values must be non-null".to_string(),
-                });
-            }
-
-            let key = rows.row(row_idx).owned();
-            if ctx.incoming_keys.contains(&key) {
-                return Err(Error::DataValidation {
-                    table: self.table_metadata.table_name.clone(),
-                    message: "Incoming data contains duplicate primary key across batches"
-                        .to_string(),
-                });
-            }
-
-            if let Some(existing) = ctx.existing_keys.get(&key) {
-                match ctx.on_conflict {
-                    OnConflict::DoNothingAll | OnConflict::DoNothing(_) => {
-                        keep_mask.push(false);
-                    }
-                    OnConflict::Upsert(_) => {
-                        delete_specs
-                            .entry(existing.data_file_id)
-                            .or_default()
-                            .push(existing.row_id);
-
-                        // Track the PK value being deleted for cache updates
-                        match &self.pk_deletion_strategy {
-                            PkDeletionStrategyWithCache::Int64Pk { .. } => {
-                                if let Some(arr) = int64_pk_array {
-                                    deleted_pk_i64.push(arr.value(row_idx));
-                                }
-                            }
-                            PkDeletionStrategyWithCache::RowConverterBased { .. } => {
-                                deleted_row_keys.push(key.as_ref().to_vec().into_boxed_slice());
-                            }
-                            PkDeletionStrategyWithCache::PositionBased { .. } => {
-                                // Position-based doesn't need PK values
-                            }
-                        }
-
-                        ctx.existing_keys.insert(
-                            key.clone(),
-                            RowLocation {
-                                data_file_id: DEFAULT_DATA_FILE_ID,
-                                row_id: -1,
-                            },
-                        );
-                        keep_mask.push(true);
-                    }
-                }
-            } else {
-                keep_mask.push(true);
-            }
-
-            row_keys.push(key);
-        }
-
-        if !ctx.upsert_options.is_default() {
-            let mut seen: HashMap<OwnedRow, usize> = HashMap::new();
-            for (row_idx, key) in row_keys.iter().enumerate() {
-                if !keep_mask[row_idx] {
-                    continue;
-                }
-
-                if let Some(existing_idx) = seen.get(key) {
-                    if ctx.upsert_options.last_write_wins {
-                        keep_mask[*existing_idx] = false;
-                        seen.insert(key.clone(), row_idx);
-                    } else if ctx.upsert_options.remove_duplicates {
-                        keep_mask[row_idx] = false;
-                    } else {
-                        return Err(Error::DataValidation {
-                            table: self.table_metadata.table_name.clone(),
-                            message: "Duplicate primary key found in batch".to_string(),
-                        });
-                    }
-                } else {
-                    seen.insert(key.clone(), row_idx);
-                }
-            }
-        }
-
-        let (filtered_batch, kept_keys) =
-            Self::filter_validated_batch(batch, keep_mask, &row_keys)?;
-
-        Ok(BatchValidationResult {
-            filtered_batch,
-            delete_specs: delete_specs.into_iter().collect(),
-            kept_keys,
-            deleted_pk_i64,
-            deleted_row_keys,
-        })
+        result_rx.await.map_err(|_| Error::DataValidation {
+            table: self.table_metadata.table_name.clone(),
+            message: "on-conflict validation thread terminated unexpectedly".to_string(),
+        })?
     }
 
     fn filter_validated_batch(
@@ -4135,6 +4005,213 @@ impl DeletionTableProvider for CayenneTableProvider {
         // Default path: deletion vectors via CayenneDeletionSink
         self.delete_using_deletion_vectors(filters)
     }
+}
+
+/// Which PK deletion tracking strategy is in use, without carrying the cache state.
+/// Used to communicate the strategy kind to the blocking validation thread.
+#[derive(Debug, Clone, Copy)]
+enum PkStrategyKind {
+    Int64Pk,
+    RowConverterBased,
+    PositionBased,
+}
+
+/// Blocking worker for on-conflict validation. Runs on a blocking thread
+/// (via `spawn_blocking`), receives batches from a channel, performs
+/// CPU-heavy per-row `RowConverter` + `HashMap` lookups, and returns
+/// the accumulated validation result.
+fn validate_on_conflict_blocking(
+    batch_rx: tokio::sync::mpsc::Receiver<RecordBatch>,
+    pk_indices: Vec<usize>,
+    converter: RowConverter,
+    mut existing_keys: HashMap<OwnedRow, RowLocation>,
+    table_name: &str,
+    on_conflict: &OnConflict,
+    pk_deletion_strategy_is_int64: bool,
+    pk_strategy_kind: PkStrategyKind,
+) -> Result<OnConflictValidationResult> {
+    let upsert_options = on_conflict.get_upsert_options();
+    let mut incoming_keys: HashSet<OwnedRow> = HashSet::with_capacity(1024);
+    let mut filtered_batches = Vec::new();
+    let mut delete_specs: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut all_deleted_pk_i64: Vec<i64> = Vec::new();
+    let mut all_deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
+    let mut batch_rx = batch_rx;
+
+    while let Some(batch) = batch_rx.blocking_recv() {
+        let mut ctx = OnConflictContext {
+            pk_indices: &pk_indices,
+            converter: &converter,
+            on_conflict,
+            upsert_options: &upsert_options,
+            existing_keys: &mut existing_keys,
+            incoming_keys: &incoming_keys,
+        };
+
+        let BatchValidationResult {
+            filtered_batch,
+            delete_specs: batch_delete_specs,
+            kept_keys,
+            deleted_pk_i64,
+            deleted_row_keys,
+        } = apply_on_conflict_to_batch_impl(
+            batch,
+            &mut ctx,
+            table_name,
+            pk_deletion_strategy_is_int64,
+            pk_strategy_kind,
+        )?;
+
+        for (data_file_id, rows) in batch_delete_specs {
+            delete_specs.entry(data_file_id).or_default().extend(rows);
+        }
+
+        all_deleted_pk_i64.extend(deleted_pk_i64);
+        all_deleted_row_keys.extend(deleted_row_keys);
+        incoming_keys.extend(kept_keys);
+
+        if let Some(batch) = filtered_batch {
+            filtered_batches.push(batch);
+        }
+    }
+
+    Ok(OnConflictValidationResult {
+        filtered_batches,
+        delete_specs,
+        deleted_pk_i64: all_deleted_pk_i64,
+        deleted_row_keys: all_deleted_row_keys,
+    })
+}
+
+/// Per-batch on-conflict validation logic, extracted as a free function so it
+/// can be called from both the `CayenneTableProvider` method (for non-streaming
+/// callers) and the blocking validation thread.
+fn apply_on_conflict_to_batch_impl(
+    batch: RecordBatch,
+    ctx: &mut OnConflictContext<'_>,
+    table_name: &str,
+    pk_deletion_strategy_is_int64: bool,
+    pk_strategy_kind: PkStrategyKind,
+) -> Result<BatchValidationResult> {
+    use arrow::array::Int64Array;
+
+    let pk_columns: Vec<_> = ctx
+        .pk_indices
+        .iter()
+        .map(|idx| Arc::clone(batch.column(*idx)))
+        .collect();
+
+    let rows = ctx.converter.convert_columns(&pk_columns)?;
+
+    // For Int64Pk strategy, get direct access to the PK column for value extraction
+    let int64_pk_array: Option<&Int64Array> =
+        if pk_deletion_strategy_is_int64 && pk_columns.len() == 1 {
+            pk_columns[0].as_any().downcast_ref::<Int64Array>()
+        } else {
+            None
+        };
+
+    let mut keep_mask = Vec::with_capacity(batch.num_rows());
+    let mut row_keys: Vec<OwnedRow> = Vec::with_capacity(batch.num_rows());
+    let mut delete_specs: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut deleted_pk_i64: Vec<i64> = Vec::new();
+    let mut deleted_row_keys: Vec<Box<[u8]>> = Vec::new();
+
+    for row_idx in 0..batch.num_rows() {
+        let has_null = pk_columns.iter().any(|col| col.is_null(row_idx));
+        if has_null {
+            return Err(Error::DataValidation {
+                table: table_name.to_string(),
+                message: "Primary key values must be non-null".to_string(),
+            });
+        }
+
+        let key = rows.row(row_idx).owned();
+        if ctx.incoming_keys.contains(&key) {
+            return Err(Error::DataValidation {
+                table: table_name.to_string(),
+                message: "Incoming data contains duplicate primary key across batches".to_string(),
+            });
+        }
+
+        if let Some(existing) = ctx.existing_keys.get(&key) {
+            match ctx.on_conflict {
+                OnConflict::DoNothingAll | OnConflict::DoNothing(_) => {
+                    keep_mask.push(false);
+                }
+                OnConflict::Upsert(_) => {
+                    delete_specs
+                        .entry(existing.data_file_id)
+                        .or_default()
+                        .push(existing.row_id);
+
+                    // Track the PK value being deleted for cache updates
+                    match pk_strategy_kind {
+                        PkStrategyKind::Int64Pk => {
+                            if let Some(arr) = int64_pk_array {
+                                deleted_pk_i64.push(arr.value(row_idx));
+                            }
+                        }
+                        PkStrategyKind::RowConverterBased => {
+                            deleted_row_keys.push(key.as_ref().to_vec().into_boxed_slice());
+                        }
+                        PkStrategyKind::PositionBased => {
+                            // Position-based doesn't need PK values
+                        }
+                    }
+
+                    ctx.existing_keys.insert(
+                        key.clone(),
+                        RowLocation {
+                            data_file_id: DEFAULT_DATA_FILE_ID,
+                            row_id: -1,
+                        },
+                    );
+                    keep_mask.push(true);
+                }
+            }
+        } else {
+            keep_mask.push(true);
+        }
+
+        row_keys.push(key);
+    }
+
+    if !ctx.upsert_options.is_default() {
+        let mut seen: HashMap<OwnedRow, usize> = HashMap::new();
+        for (row_idx, key) in row_keys.iter().enumerate() {
+            if !keep_mask[row_idx] {
+                continue;
+            }
+
+            if let Some(existing_idx) = seen.get(key) {
+                if ctx.upsert_options.last_write_wins {
+                    keep_mask[*existing_idx] = false;
+                    seen.insert(key.clone(), row_idx);
+                } else if ctx.upsert_options.remove_duplicates {
+                    keep_mask[row_idx] = false;
+                } else {
+                    return Err(Error::DataValidation {
+                        table: table_name.to_string(),
+                        message: "Duplicate primary key found in batch".to_string(),
+                    });
+                }
+            } else {
+                seen.insert(key.clone(), row_idx);
+            }
+        }
+    }
+
+    let (filtered_batch, kept_keys) =
+        CayenneTableProvider::filter_validated_batch(batch, keep_mask, &row_keys)?;
+
+    Ok(BatchValidationResult {
+        filtered_batch,
+        delete_specs: delete_specs.into_iter().collect(),
+        kept_keys,
+        deleted_pk_i64,
+        deleted_row_keys,
+    })
 }
 
 impl CayenneTableProvider {
