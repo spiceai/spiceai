@@ -2021,9 +2021,14 @@ mod tests {
 
             let ctx = SessionContext::new();
             let df = max_timestamp_df(&mem_table, ctx.clone(), "ts").expect("df created");
-            let results = collect(df.create_physical_plan().await.unwrap(), ctx.task_ctx())
-                .await
-                .expect("query succeeded");
+            let results = collect(
+                df.create_physical_plan()
+                    .await
+                    .expect("physical plan created"),
+                ctx.task_ctx(),
+            )
+            .await
+            .expect("query succeeded");
             results.into_iter().next().expect("at least one batch")
         }
 

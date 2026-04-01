@@ -17,6 +17,7 @@ limitations under the License.
 //! CREATE TABLE `spice_sys_dataset_checkpoint` (
 //!     `dataset_name` TEXT PRIMARY KEY,
 //!     `schema_json` TEXT,
+//!     `refresh_sql` TEXT,
 //!     `created_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP`,
 //!     `updated_at` TIMESTAMP DEFAULT `CURRENT_TIMESTAMP` ON UPDATE `CURRENT_TIMESTAMP`,
 //! );
@@ -59,6 +60,8 @@ const CHECKPOINT_TABLE_NAME: &str = "spice_sys_dataset_checkpoint";
 ))]
 const SCHEMA_MIGRATION_01_STMT: &str =
     "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS schema_json TEXT";
+const REFRESH_SQL_MIGRATION_STMT: &str =
+    "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS refresh_sql TEXT";
 
 #[cfg(feature = "duckdb")]
 mod duckdb;
@@ -78,8 +81,9 @@ impl DatasetCheckpointer for DatasetCheckpoint {
     async fn checkpoint(
         &self,
         schema: &SchemaRef,
+        refresh_sql: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.checkpoint(schema).await.boxed()
+        self.checkpoint(schema, refresh_sql).await.boxed()
     }
 
     async fn get_schema(
@@ -92,6 +96,12 @@ impl DatasetCheckpointer for DatasetCheckpoint {
         &self,
     ) -> Result<Option<SystemTime>, Box<dyn std::error::Error + Send + Sync>> {
         self.last_checkpoint_time().await.boxed()
+    }
+
+    async fn get_refresh_sql(
+        &self,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        self.get_refresh_sql().await.boxed()
     }
 }
 
@@ -262,18 +272,28 @@ impl DatasetCheckpoint {
         }
     }
 
-    pub async fn checkpoint(&self, schema: &SchemaRef) -> Result<()> {
+    pub async fn checkpoint(&self, schema: &SchemaRef, refresh_sql: Option<&str>) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.checkpoint_duckdb(pool, schema),
+            AccelerationConnection::DuckDB(pool) => {
+                self.checkpoint_duckdb(pool, schema, refresh_sql)
+            }
             #[cfg(feature = "postgres-accel")]
-            AccelerationConnection::Postgres(pool) => self.checkpoint_postgres(pool, schema).await,
+            AccelerationConnection::Postgres(pool) => {
+                self.checkpoint_postgres(pool, schema, refresh_sql).await
+            }
             #[cfg(feature = "sqlite")]
-            AccelerationConnection::SQLite(conn) => self.checkpoint_sqlite(conn, schema).await,
+            AccelerationConnection::SQLite(conn) => {
+                self.checkpoint_sqlite(conn, schema, refresh_sql).await
+            }
             #[cfg(feature = "turso")]
-            AccelerationConnection::Turso(pool) => self.checkpoint_turso(pool, schema).await,
+            AccelerationConnection::Turso(pool) => {
+                self.checkpoint_turso(pool, schema, refresh_sql).await
+            }
             #[cfg(all(not(windows), feature = "sqlite"))]
-            AccelerationConnection::Cayenne(conn) => self.checkpoint_sqlite(conn, schema).await,
+            AccelerationConnection::Cayenne(conn) => {
+                self.checkpoint_sqlite(conn, schema, refresh_sql).await
+            }
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
@@ -296,6 +316,28 @@ impl DatasetCheckpoint {
             AccelerationConnection::Turso(pool) => self.get_schema_turso(pool).await,
             #[cfg(all(not(windows), feature = "sqlite"))]
             AccelerationConnection::Cayenne(conn) => self.get_schema_sqlite(conn).await,
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres-accel",
+                feature = "turso"
+            )))]
+            _ => Err(Error::NoAccelerationConnection),
+        }
+    }
+
+    pub async fn get_refresh_sql(&self) -> Result<Option<String>> {
+        match &self.acceleration_connection {
+            #[cfg(feature = "duckdb")]
+            AccelerationConnection::DuckDB(pool) => self.get_refresh_sql_duckdb(pool),
+            #[cfg(feature = "postgres-accel")]
+            AccelerationConnection::Postgres(pool) => self.get_refresh_sql_postgres(pool).await,
+            #[cfg(feature = "sqlite")]
+            AccelerationConnection::SQLite(conn) => self.get_refresh_sql_sqlite(conn).await,
+            #[cfg(feature = "turso")]
+            AccelerationConnection::Turso(pool) => self.get_refresh_sql_turso(pool).await,
+            #[cfg(all(not(windows), feature = "sqlite"))]
+            AccelerationConnection::Cayenne(conn) => self.get_refresh_sql_sqlite(conn).await,
             #[cfg(not(any(
                 feature = "sqlite",
                 feature = "duckdb",
