@@ -1872,16 +1872,37 @@ impl CayenneTableProvider {
         };
 
         let converter = self.build_pk_converter(&pk_indices)?;
+        tracing::info!(
+            table = %self.table_metadata.table_name,
+            "prepare_stream_for_insert: loading existing keyset",
+        );
+        let keyset_start = std::time::Instant::now();
         let mut existing_keys = self.load_existing_keyset(&pk_indices, &converter).await?;
-        tracing::debug!(
-            "prepare_stream_for_insert: loaded {} existing keys for table {}",
-            existing_keys.len(),
-            self.table_metadata.table_name
+        let keyset_ms = keyset_start.elapsed().as_millis() as u64;
+        tracing::info!(
+            table = %self.table_metadata.table_name,
+            existing_keys = existing_keys.len(),
+            keyset_load_ms = keyset_ms,
+            "prepare_stream_for_insert: keyset loaded",
         );
 
+        tracing::info!(
+            table = %self.table_metadata.table_name,
+            "prepare_stream_for_insert: validate_on_conflict starting",
+        );
+        let validate_start = std::time::Instant::now();
         let validation_result = self
             .validate_on_conflict(stream, &pk_indices, &converter, &mut existing_keys)
             .await?;
+        let validate_ms = validate_start.elapsed().as_millis() as u64;
+        tracing::info!(
+            table = %self.table_metadata.table_name,
+            filtered_batches = validation_result.filtered_batches.len(),
+            delete_specs_files = validation_result.delete_specs.len(),
+            deleted_pk_count = validation_result.deleted_pk_i64.len(),
+            validate_ms,
+            "prepare_stream_for_insert: validate_on_conflict done",
+        );
 
         // Build a new stream from the validated batches.
         let schema = validation_result.filtered_batches.first().map_or_else(

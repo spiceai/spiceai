@@ -504,11 +504,29 @@ async fn handle_record_batch(
     metrics::DO_PUT_ROWS_WRITTEN.add(batch.num_rows() as u64, &labels);
     metrics::DO_PUT_BYTES_WRITTEN.add(batch.get_array_memory_size() as u64, &labels);
 
+    // Log when channel is near-full before attempting send
+    let capacity = batch_tx.capacity();
+    if capacity == 0 {
+        tracing::warn!(
+            dataset = path,
+            "DoPut batch_tx channel full (capacity=0), will block until write catches up",
+        );
+    }
+    let send_start = std::time::Instant::now();
     if let Err(e) = batch_tx.send(Ok(batch)).await {
         tracing::error!("Error sending record batch to write channel: {e}");
         return Err(Status::internal(format!(
             "Error sending record batch to write channel: {e}"
         )));
+    }
+    let send_ms = send_start.elapsed().as_millis() as u64;
+    if send_ms > 1000 {
+        tracing::warn!(
+            dataset = path,
+            send_ms,
+            channel_capacity = batch_tx.capacity(),
+            "DoPut batch_tx.send completed after blocking (write backpressure)",
+        );
     }
     Ok(PutResult::default())
 }
