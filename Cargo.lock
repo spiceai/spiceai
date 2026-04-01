@@ -3510,6 +3510,7 @@ dependencies = [
  "roaring",
  "rstest 0.26.1",
  "runtime-datafusion",
+ "runtime-table-partition",
  "rusqlite",
  "serde",
  "serde_json",

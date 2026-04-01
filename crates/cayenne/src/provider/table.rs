@@ -48,19 +48,19 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::{Constraints, DFSchema};
+use datafusion_execution::SendableRecordBatchStream;
 use datafusion_execution::cache::TableScopedPath;
 use datafusion_execution::config::SessionConfig;
-use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{Expr, LogicalPlan, Operator, TableProviderFilterPushDown, TableType};
+use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::collect;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::union::UnionExec;
-use datafusion_physical_plan::ExecutionPlan;
 use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::{StreamExt, TryStreamExt};
@@ -4348,8 +4348,8 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::metadata::VortexConfig;
     use crate::CayenneCatalog;
+    use crate::metadata::VortexConfig;
 
     use super::*;
 
@@ -4359,8 +4359,8 @@ mod tests {
     use datafusion::common::{Constraints, ToDFSchema};
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::execution::context::SessionContext;
-    use datafusion::logical_expr::dml::InsertOp;
     use datafusion::logical_expr::CreateExternalTable;
+    use datafusion::logical_expr::dml::InsertOp;
     use datafusion::physical_plan::collect;
     use datafusion_common::DataFusionError;
     use datafusion_federation::schema_cast::record_convert::try_cast_to;
@@ -4399,7 +4399,7 @@ mod tests {
                 _ => {
                     return Err(DataFusionError::Execution(format!(
                         "Unsupported cayenne_metastore type: {metastore_type}"
-                    )))
+                    )));
                 }
             };
 

@@ -819,8 +819,8 @@ async fn notify_scheduler_executor_shutdown(
 /// for Cayenne tables are forwarded to the executor.
 #[cfg(not(windows))]
 async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
-    use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
     use crate::datafusion::cayenne_ddl::is_cayenne_catalog;
+    use cayenne::CayenneSchemaProvider;
 
     let mut tables = Vec::new();
     let mut seen = HashSet::new();

@@ -20,8 +20,8 @@ limitations under the License.
 //! avoiding the overhead of opening a new connection for each operation.
 
 use super::{
-    duplicate_delete_file_index_error_message, ExecuteParams, MetastoreBackend, MetastoreGetValue,
-    MetastoreRow, MetastoreTransaction, MetastoreValue, QueryParams, QueryRowParams,
+    ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreTransaction,
+    MetastoreValue, QueryParams, QueryRowParams, duplicate_delete_file_index_error_message,
 };
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;

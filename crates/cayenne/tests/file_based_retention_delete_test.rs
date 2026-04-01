@@ -34,8 +34,8 @@ use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray, UInt64Arr
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use cayenne::metadata::CreateTableOptions;
 use cayenne::{
-    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, TimeRetentionFilterBuilder,
-    STAGING_DIR_NAME,
+    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, STAGING_DIR_NAME,
+    TimeRetentionFilterBuilder,
 };
 use common::TestFixture;
 use datafusion::datasource::TableProvider;
@@ -1004,7 +1004,7 @@ async fn create_pk_retention_table(
 
     let on_conflict = if with_upsert {
         Some(OnConflict::Upsert(ColumnReference::new(vec![
-            "id".to_string()
+            "id".to_string(),
         ])))
     } else {
         None

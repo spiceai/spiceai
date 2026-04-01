@@ -43,8 +43,8 @@ use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 
 use cayenne::{
-    metadata::CreateTableOptions, CayenneTableProvider, CayenneTableProviderBuilder,
-    MetadataCatalog,
+    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
+    metadata::CreateTableOptions,
 };
 
 use common::TestFixture;

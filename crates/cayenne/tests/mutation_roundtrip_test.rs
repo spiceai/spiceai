@@ -38,7 +38,7 @@ use arrow::array::{
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
-use cayenne::{metadata::CreateTableOptions, CayenneTableProvider, MetadataCatalog};
+use cayenne::{CayenneTableProvider, MetadataCatalog, metadata::CreateTableOptions};
 
 use common::TestFixture;
 
