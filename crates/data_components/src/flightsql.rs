@@ -51,6 +51,7 @@ use datafusion::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream,
         execution_plan::{Boundedness, EmissionType},
+        metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet},
         project_schema,
         stream::RecordBatchStreamAdapter,
     },
@@ -428,6 +429,7 @@ pub struct FlightSqlExec {
     limit: Option<usize>,
     properties: PlanProperties,
     cookie_store: Arc<CookieStore>,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl FlightSqlExec {
@@ -454,6 +456,7 @@ impl FlightSqlExec {
                 Boundedness::Bounded,
             ),
             cookie_store,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 
@@ -578,19 +581,42 @@ impl ExecutionPlan for FlightSqlExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let sql = self.sql().map_err(to_execution_error)?;
         let target_schema = self.schema();
 
-        let stream = query_to_stream(self.client.clone(), sql, Arc::clone(&self.cookie_store)).map(
+        let first_batch_time =
+            MetricBuilder::new(&self.metrics).subset_time("first_batch_time", partition);
+        let fetch_time = MetricBuilder::new(&self.metrics).subset_time("fetch_time", partition);
+
+        let baseline = datafusion::common::instant::Instant::now();
+        let mut first_batch_recorded = false;
+
+        let inner = query_to_stream(self.client.clone(), sql, Arc::clone(&self.cookie_store)).map(
             move |result| result.and_then(|batch| coerce_batch_to_schema(&batch, &target_schema)),
         );
 
-        let stream_adapter = RecordBatchStreamAdapter::new(self.schema(), stream);
+        let timed_stream = stream! {
+            futures::pin_mut!(inner);
+            while let Some(item) = inner.next().await {
+                if !first_batch_recorded {
+                    first_batch_time.add_elapsed(baseline);
+                    first_batch_recorded = true;
+                }
+                yield item;
+            }
+            fetch_time.add_elapsed(baseline);
+        };
+
+        let stream_adapter = RecordBatchStreamAdapter::new(self.schema(), timed_stream);
 
         Ok(Box::pin(stream_adapter))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 }
 
