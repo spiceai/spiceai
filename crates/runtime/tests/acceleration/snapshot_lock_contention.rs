@@ -384,7 +384,11 @@ async fn run_snapshot_workload(
         let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
 
         // Create checkpoint
-        if checkpointer.checkpoint(federated_schema, None).await.is_err() {
+        if checkpointer
+            .checkpoint(federated_schema, None)
+            .await
+            .is_err()
+        {
             metrics.record_failure();
             continue;
         }
