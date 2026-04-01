@@ -1287,6 +1287,26 @@ impl RefreshTask {
 
         let col_array = result.column(0);
 
+        let schema = &self.accelerator.schema();
+        let Ok(accelerated_field) = schema.field_with_name(&column) else {
+            return Err(super::Error::FailedToFindLatestTimestamp {
+                reason: "Failed to get the latest timestamp. The `time_column` parameter must be specified."
+                    .to_string(),
+            });
+        };
+
+        let is_integer_time_column = matches!(
+            accelerated_field.data_type(),
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+        );
+
         // Extract the max timestamp value based on the column's data type.
         // - String columns (ISO8601): parse the ISO string back to nanos
         // - Integer columns (UnixSeconds/UnixMillis): read raw integer value
@@ -1317,17 +1337,65 @@ impl RefreshTask {
                     ),
                 },
             )?
-        } else if let Some(v) = arrow::compute::cast(col_array.as_ref(), &DataType::Int64)
-            .ok()
-            .and_then(|arr| {
-                let int_array = arr.as_any().downcast_ref::<arrow::array::Int64Array>()?;
-                if int_array.is_null(0) {
-                    return None;
+        } else if is_integer_time_column {
+            // Integer time columns are returned as-is (not cast to Timestamp)
+            // to avoid DuckDB cast errors. Extract the integer value directly.
+            if col_array.is_empty() {
+                return Ok(None);
+            }
+            match accelerated_field.data_type() {
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                    let arr = arrow::compute::cast(col_array, &DataType::Int64).map_err(|e| {
+                        super::Error::FailedToFindLatestTimestamp {
+                            reason: format!("Failed to cast integer time column to Int64: {e}"),
+                        }
+                    })?;
+                    let arr = arr
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .ok_or_else(|| super::Error::FailedToFindLatestTimestamp {
+                            reason: "Failed to downcast integer time column to Int64Array."
+                                .to_string(),
+                        })?;
+                    if arr.is_null(0) {
+                        return Ok(None);
+                    }
+                    let int_val = arr.value(0);
+                    u128::try_from(int_val).map_err(|_| {
+                        super::Error::FailedToFindLatestTimestamp {
+                            reason: format!(
+                                "Integer time column value {int_val} is negative and cannot be used as a timestamp."
+                            ),
+                        }
+                    })?
                 }
-                Some(int_array.value(0) as u128)
-            })
-        {
-            v
+                DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+                    let arr = arrow::compute::cast(col_array, &DataType::UInt64).map_err(|e| {
+                        super::Error::FailedToFindLatestTimestamp {
+                            reason: format!(
+                                "Failed to cast unsigned integer time column to UInt64: {e}"
+                            ),
+                        }
+                    })?;
+                    let arr = arr
+                        .as_any()
+                        .downcast_ref::<arrow::array::UInt64Array>()
+                        .ok_or_else(|| super::Error::FailedToFindLatestTimestamp {
+                            reason:
+                                "Failed to downcast unsigned integer time column to UInt64Array."
+                                    .to_string(),
+                        })?;
+                    if arr.is_null(0) {
+                        return Ok(None);
+                    }
+                    u128::from(arr.value(0))
+                }
+                other => {
+                    return Err(super::Error::FailedToFindLatestTimestamp {
+                        reason: format!("Unexpected data type {other} for integer time column."),
+                    });
+                }
+            }
         } else {
             let array = col_array
                 .as_any()
@@ -1343,23 +1411,7 @@ impl RefreshTask {
             array.value(0) as u128
         };
 
-        let schema = &self.accelerator.schema();
-        let Ok(accelerated_field) = schema.field_with_name(&column) else {
-            return Err(super::Error::FailedToFindLatestTimestamp {
-                reason: "Failed to get the latest timestamp. The `time_column` parameter must be specified."
-                    .to_string(),
-            });
-        };
-
-        if let arrow::datatypes::DataType::Int8
-        | arrow::datatypes::DataType::Int16
-        | arrow::datatypes::DataType::Int32
-        | arrow::datatypes::DataType::Int64
-        | arrow::datatypes::DataType::UInt8
-        | arrow::datatypes::DataType::UInt16
-        | arrow::datatypes::DataType::UInt32
-        | arrow::datatypes::DataType::UInt64 = accelerated_field.data_type()
-        {
+        if is_integer_time_column {
             match refresh.time_format {
                 Some(TimeFormat::UnixMillis) => {
                     value *= 1_000_000;
@@ -1866,8 +1918,11 @@ fn schema_evolution_mismatch_refresh_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int32Array;
+    use arrow::array::{Int32Array, Int64Array, UInt32Array, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
+    use data_components::arrow::write::MemTable;
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::SessionContext;
     use std::sync::Arc;
 
     #[test]
@@ -1950,6 +2005,71 @@ mod tests {
         };
 
         assert!(schema_evolution_mismatch_refresh_message("dataset", "nation", &error).is_none());
+    }
+
+    /// Tests that `max_timestamp_df` returns the maximum value for integer time columns
+    /// (e.g. `unix_seconds` / `unix_millis` time formats) without casting to a Timestamp type.
+    #[tokio::test]
+    async fn test_max_timestamp_df_integer_time_column() {
+        async fn run_test(data_type: DataType, array: Arc<dyn arrow::array::Array>) -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![Field::new("ts", data_type, false)]));
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), vec![array]).expect("batch created");
+            let mem_table =
+                Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("mem table created"))
+                    as Arc<dyn TableProvider>;
+
+            let ctx = SessionContext::new();
+            let df = max_timestamp_df(&mem_table, ctx.clone(), "ts").expect("df created");
+            let results = collect(df.create_physical_plan().await.unwrap(), ctx.task_ctx())
+                .await
+                .expect("query succeeded");
+            results.into_iter().next().expect("at least one batch")
+        }
+
+        // Signed Int64: column is returned as Int64.
+        let signed_vals = Int64Array::from(vec![100_i64, 200, 50]);
+        let batch = run_test(DataType::Int64, Arc::new(signed_vals)).await;
+        let max_val = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64Array")
+            .value(0);
+        assert_eq!(max_val, 200, "Int64: expected max value 200");
+
+        // Signed Int32: column is returned as Int32.
+        let signed_vals = Int32Array::from(vec![10_i32, 30, 20]);
+        let batch = run_test(DataType::Int32, Arc::new(signed_vals)).await;
+        let max_val = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .expect("Int32Array")
+            .value(0);
+        assert_eq!(max_val, 30, "Int32: expected max value 30");
+
+        // Unsigned UInt64: column is returned as UInt64.
+        let unsigned_vals = UInt64Array::from(vec![1_000_u64, 5_000, 3_000]);
+        let batch = run_test(DataType::UInt64, Arc::new(unsigned_vals)).await;
+        let max_val = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("UInt64Array")
+            .value(0);
+        assert_eq!(max_val, 5_000, "UInt64: expected max value 5000");
+
+        // Unsigned UInt32: column is returned as UInt32.
+        let unsigned_vals = UInt32Array::from(vec![7_u32, 42, 3]);
+        let batch = run_test(DataType::UInt32, Arc::new(unsigned_vals)).await;
+        let max_val = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("UInt32Array")
+            .value(0);
+        assert_eq!(max_val, 42, "UInt32: expected max value 42");
     }
 
     /// Verifies that `max_timestamp_df` uses sort+limit on raw string (no CAST)

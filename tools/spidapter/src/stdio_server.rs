@@ -29,7 +29,7 @@ use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{
-    ApiKey, ApiKeyAuth, Auth, Flight, Runtime, Scheduler, TelemetryConfig,
+    ApiKey, ApiKeyAuth, Auth, Flight, Query, Runtime, Scheduler, TelemetryConfig,
 };
 use spicepod::param::{ParamValue, Params};
 use spicepod::spec::SpicepodDefinition;
@@ -1508,6 +1508,13 @@ fn generate_adbc_spicepod(
             do_put_rate_limit_enabled: false,
             ..Flight::default()
         }),
+        query: Some(Query {
+            memory_limit: args
+                .query_memory_limit
+                .clone()
+                .or(Some("150Gi".to_string())),
+            ..Query::default()
+        }),
         ..Runtime::default()
     };
 
@@ -1631,6 +1638,7 @@ mod tests {
             cayenne_metadata_dir: None,
             ephemeral_storage_limit_gb: None,
             organization_tag: None,
+            query_memory_limit: None,
         }
     }
 
