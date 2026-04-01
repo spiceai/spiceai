@@ -565,10 +565,7 @@ impl CayenneSchemaProvider {
             let providers = partition_provider.partition_table_providers().await;
             for provider in &providers {
                 // Each partition's inner provider is a CayenneTableProvider.
-                let Some(cayenne) = provider
-                    .as_any()
-                    .downcast_ref::<CayenneTableProvider>()
-                else {
+                let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>() else {
                     tracing::warn!(
                         "Partition sub-provider is not a CayenneTableProvider, skipping refresh"
                     );

@@ -282,6 +282,37 @@ fn normalize_create_table_clause_order(sql: &str) -> Option<String> {
     ))
 }
 
+/// Strip the `REPLICATED` keyword from a `CREATE TABLE` SQL statement.
+///
+/// `sqlparser` does not recognize `REPLICATED` in this position, so it must be
+/// removed before parsing and recorded separately. Returns the (possibly modified)
+/// SQL and whether `REPLICATED` was found.
+fn strip_replicated_keyword(sql: &str) -> (String, bool) {
+    let upper = sql.to_uppercase();
+    let Some(idx) = upper.rfind("REPLICATED") else {
+        return (sql.to_string(), false);
+    };
+
+    // Verify the match is a standalone keyword (not part of an identifier).
+    if idx > 0 {
+        let before = sql.as_bytes()[idx - 1];
+        if before.is_ascii_alphanumeric() || before == b'_' {
+            return (sql.to_string(), false);
+        }
+    }
+    let after_idx = idx + "REPLICATED".len();
+    if after_idx < sql.len() {
+        let after = sql.as_bytes()[after_idx];
+        if after.is_ascii_alphanumeric() || after == b'_' {
+            return (sql.to_string(), false);
+        }
+    }
+
+    let before = sql[..idx].trim_end();
+    let after = &sql[after_idx..];
+    (format!("{before}{after}"), true)
+}
+
 pub type OptionsClassification = (Vec<(String, String)>, Vec<SqlOption>);
 
 /// Classify `WITH` options into recognized (`acceleration.*`/`dataset.*`) and other options.
