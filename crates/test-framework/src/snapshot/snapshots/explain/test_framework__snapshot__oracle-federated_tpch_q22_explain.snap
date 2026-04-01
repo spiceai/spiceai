@@ -5,7 +5,7 @@ description: "Query: tpch_q22"
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                                             |
 +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: CAST(CUSTSALE.CNTRYCODE AS LargeUtf8), NUMCUST, TOTACCTBAL                                                                                                                           |
+| logical_plan  | Projection: CAST(CUSTSALE.CNTRYCODE AS LargeUtf8) AS CNTRYCODE, NUMCUST, TOTACCTBAL                                                                                                              |
 |               |   Sort: CUSTSALE.CNTRYCODE ASC NULLS LAST                                                                                                                                                        |
 |               |     Projection: CUSTSALE.CNTRYCODE, count(Int64(1)) AS NUMCUST, sum(CUSTSALE.C_ACCTBAL) AS TOTACCTBAL                                                                                            |
 |               |       Aggregate: groupBy=[[CUSTSALE.CNTRYCODE]], aggr=[[count(Int64(1)), sum(CUSTSALE.C_ACCTBAL)]]                                                                                               |
@@ -24,7 +24,7 @@ description: "Query: tpch_q22"
 |               |                     Projection: customer.C_ACCTBAL                                                                                                                                               |
 |               |                       Filter: substr(customer.C_PHONE, Int64(1), Int64(2)) IN ([Utf8View("13"), Utf8View("31"), Utf8View("23"), Utf8View("29"), Utf8View("30"), Utf8View("18"), Utf8View("17")]) |
 |               |                         TableScan: customer projection=[C_PHONE, C_ACCTBAL], full_filters=[customer.C_ACCTBAL > Decimal128(Some(0),12,2)]                                                        |
-| physical_plan | ProjectionExec: expr=[CAST(CNTRYCODE@0 AS LargeUtf8) as CUSTSALE.CNTRYCODE, NUMCUST@1 as NUMCUST, TOTACCTBAL@2 as TOTACCTBAL]                                                                    |
+| physical_plan | ProjectionExec: expr=[CAST(CNTRYCODE@0 AS LargeUtf8) as CNTRYCODE, NUMCUST@1 as NUMCUST, TOTACCTBAL@2 as TOTACCTBAL]                                                                             |
 |               |   RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                                                                                          |
 |               |     SortPreservingMergeExec: [CNTRYCODE@0 ASC NULLS LAST]                                                                                                                                        |
 |               |       SortExec: expr=[CNTRYCODE@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                                  |
