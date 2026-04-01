@@ -583,52 +583,40 @@ pub(crate) fn runtime_env(
         DiskManager::builder()
     };
 
-    // If no memory limit is specified, default to 70% of total memory (container-aware)
-    let effective_memory_limit = memory_limit.or_else(|| {
-        let total_memory = crate::resource_monitor::get_total_memory();
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let default_limit = (total_memory as f64 * 0.70) as u64;
+    // let memory_limit = memory_limit.unwrap_or_else(|| {
+    //     let total_memory = crate::resource_monitor::get_total_memory();
+    //     #[expect(
+    //         clippy::cast_possible_truncation,
+    //         clippy::cast_sign_loss,
+    //         clippy::cast_precision_loss
+    //     )]
+    //     let default_limit = (total_memory as f64 * 0.70) as u64;
 
-        tracing::debug!(
-            "No memory limit specified, defaulting to 70% of total memory: {}",
-            {
-                #[expect(clippy::cast_possible_truncation)]
-                util::human_readable_bytes(default_limit as usize)
-            }
-        );
-        Some(default_limit)
-    });
+    //     tracing::debug!(
+    //         "No memory limit specified, defaulting to 70% of total memory: {}",
+    //         {
+    //             #[expect(clippy::cast_possible_truncation)]
+    //             util::human_readable_bytes(default_limit as usize)
+    //         }
+    //     );
 
-    let memory_pool: Arc<dyn MemoryPool> = if let Some(limit) = effective_memory_limit {
-        let limit = if let Ok(limit) = limit.try_into() {
-            limit
-        } else {
-            tracing::warn!(
-                "Memory limit {limit} is too large for the memory pool.\n Defaulting to a maximum sized pool of {}.",
-                usize::MAX
-            );
+    //     default_limit
+    // });
 
-            usize::MAX
-        };
+    let Some(topn) = NonZeroUsize::new(5) else {
+        unreachable!("Memory pool TopN must be greater than 0");
+    };
 
-        let Some(topn) = NonZeroUsize::new(5) else {
-            unreachable!("Memory pool TopN must be greater than 0");
-        };
-
-        Arc::new(TrackConsumersPool::new(FairSpillPool::new(limit), topn))
+    let memory_pool = if let Some(limit) = memory_limit {
+        Arc::new(TrackConsumersPool::new(
+            FairSpillPool::new(limit as usize),
+            topn,
+        )) as Arc<dyn MemoryPool + Send + Sync>
     } else {
-        let Some(topn) = NonZeroUsize::new(5) else {
-            unreachable!("Memory pool TopN must be greater than 0");
-        };
-
         Arc::new(TrackConsumersPool::new(
             UnboundedMemoryPool::default(),
             topn,
-        ))
+        )) as Arc<dyn MemoryPool + Send + Sync>
     };
 
     match RuntimeEnvBuilder::default()
