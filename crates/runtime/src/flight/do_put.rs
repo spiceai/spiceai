@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
 use arrow::array::RecordBatch;
 use arrow_flight::{
@@ -392,15 +392,22 @@ fn create_response_stream(
 
         // Use a single pinned Sleep future that is reset on each received message,
         // rather than creating a new timer allocation on every loop iteration.
-        let idle_timeout = Duration::from_secs(120);
+        let idle_timeout = crate::flight::do_put_idle_timeout();
         let deadline = tokio::time::sleep(idle_timeout);
         tokio::pin!(deadline);
 
         loop {
             tokio::select! {
                 () = &mut deadline => {
-                    tracing::error!("Timeout: no record batch received within 120 seconds");
-                    yield Err(Status::deadline_exceeded("Timeout: no record batch received within 120 seconds"));
+                    tracing::error!(
+                        dataset = %path,
+                        "Timeout: no record batch received within {} seconds",
+                        idle_timeout.as_secs()
+                    );
+                    yield Err(Status::deadline_exceeded(format!(
+                        "Timeout: no record batch received within {} seconds",
+                        idle_timeout.as_secs()
+                    )));
                     break;
                 }
                 // Poll the writing task to check if it has completed with an error while processing the data
@@ -432,6 +439,12 @@ fn create_response_stream(
                         Some(Ok(message)) => {
                             // Reset the idle timeout on each received message
                             deadline.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+
+                            // Skip keepalive messages — these are heartbeats from
+                            // write-through forwarding to prevent the idle timeout.
+                            if message.app_metadata.as_ref() == crate::flight::KEEPALIVE_APP_METADATA {
+                                continue;
+                            }
 
                             let new_batch = match flight_data_to_arrow_batch(
                                 &message,
