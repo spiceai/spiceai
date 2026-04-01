@@ -36,6 +36,14 @@ build-testoperator-dev:
 build-testoperator:
 	cargo build --release -p testoperator --all-features
 
+.PHONY: build-distributed-dev
+build-distributed-dev:
+	cargo build -p distributed
+
+.PHONY: build-distributed
+build-distributed:
+	cargo build --release -p distributed
+
 .PHONY: build-spidapter-dev
 build-spidapter-dev:
 	cargo build -p spidapter --all-features
@@ -395,6 +403,16 @@ install-testoperator: build-testoperator
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/testoperator ~/.spice/bin/testoperator
 
+.PHONY: install-distributed-dev
+install-distributed-dev: build-distributed-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/debug/distributed ~/.spice/bin/distributed
+
+.PHONY: install-distributed
+install-distributed: build-distributed
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/distributed ~/.spice/bin/distributed
+
 .PHONY: install-spidapter-dev
 install-spidapter-dev: build-spidapter-dev
 	mkdir -p ~/.spice/bin
@@ -404,6 +422,7 @@ install-spidapter-dev: build-spidapter-dev
 install-spidapter: build-spidapter
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spidapter ~/.spice/bin/spidapter
+
 
 .PHONY: install-cli
 install-cli: build-cli

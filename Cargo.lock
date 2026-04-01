@@ -6601,6 +6601,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8975ffdaa0ef3661bfe02dbdcc06c9f829dfafe6a3c474de366a8d5e44276921"
 
 [[package]]
+name = "distributed"
+version = "2.0.0-enterprise-beta"
+dependencies = [
+ "ansi_colors",
+ "anyhow",
+ "chrono",
+ "clap",
+ "dirs",
+ "nix 0.30.1",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "sysinfo 0.37.2",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "dlib"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
