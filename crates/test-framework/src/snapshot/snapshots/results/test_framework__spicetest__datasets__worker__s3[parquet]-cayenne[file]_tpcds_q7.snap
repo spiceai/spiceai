@@ -1,0 +1,18 @@
+---
+source: crates/test-framework/src/spicetest/datasets/worker.rs
+description: "Query: tpcds_q7"
+---
++------------------+------+-------------------+---------+--------+
+| i_item_id        | agg1 | agg2              | agg3    | agg4   |
++------------------+------+-------------------+---------+--------+
+| AAAAAAAAAAABAAAA | 8.5  | 128.765           | 58.625  | 45.005 |
+| AAAAAAAAAAACAAAA | 51.0 | 10.86             | 62.65   | 1.95   |
+| AAAAAAAAAAAEAAAA | 46.0 | 110.43            | 265.515 | 38.97  |
+| AAAAAAAAAABEAAAA | 25.0 | 98.53999999999999 | 66.185  | 78.24  |
+| AAAAAAAAAACDAAAA | 18.0 | 57.8              | 0.0     | 51.44  |
+| AAAAAAAAAADBAAAA | 89.0 | 157.08            | 0.0     | 149.22 |
+| AAAAAAAAAAEDAAAA | 39.0 | 64.32000000000001 | 0.0     | 48.36  |
+| AAAAAAAAAAEEAAAA | 22.0 | 161.52            | 0.0     | 19.38  |
+| AAAAAAAAAAFDAAAA | 88.0 | 10.5              | 0.0     | 8.61   |
+| AAAAAAAAAAGBAAAA | 78.0 | 2.52              | 0.0     | 0.95   |
++------------------+------+-------------------+---------+--------+
