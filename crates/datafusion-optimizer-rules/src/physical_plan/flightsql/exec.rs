@@ -437,13 +437,14 @@ fn build_aggregate_sql(
 
             for field in &state_fields {
                 let name_lower = field.name().to_lowercase();
-                if name_lower.contains("count") {
+                // Match on the `[count]` / `[sum]` suffix produced by `format_state_name`.
+                if name_lower.ends_with("[count]") {
                     all_fragments.push(SqlFragment {
                         sql: format!("COUNT({arg_sql})"),
                         dedup_key: format!("COUNT({stripped})"),
                         needs_alias: true,
                     });
-                } else if name_lower.contains("sum") {
+                } else if name_lower.ends_with("[sum]") {
                     // Use SUM(col) (no CAST) as the dedup key so it merges with an
                     // existing explicit SUM(col). The local side casts the Decimal
                     // result to Float64 via remap_batch.
@@ -454,7 +455,7 @@ fn build_aggregate_sql(
                     });
                 } else {
                     return Err(DataFusionError::Internal(format!(
-                        "Unrecognized AVG state field '{}' — expected name containing 'count' or 'sum'",
+                        "Unrecognized AVG state field '{}' — expected name ending with '[count]' or '[sum]'",
                         field.name()
                     )));
                 }
