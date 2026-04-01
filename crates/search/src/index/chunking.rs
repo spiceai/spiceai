@@ -283,15 +283,12 @@ impl SearchIndex for ChunkedSearchIndex {
             .map(|(i, arr)| {
                 let field = schema.field(i).clone();
                 if i == search_field_idx {
-                    let values: Vec<String> = flatten_chunks
-                        .iter()
-                        .map(|s| (*s).to_string())
-                        .collect();
+                    let values: Vec<String> =
+                        flatten_chunks.iter().map(|s| (*s).to_string()).collect();
                     let chunked_array: ArrayRef = match field.data_type() {
                         DataType::LargeUtf8 => Arc::new(LargeStringArray::from(values)),
                         DataType::Utf8View => {
-                            let refs: Vec<&str> =
-                                values.iter().map(String::as_str).collect();
+                            let refs: Vec<&str> = values.iter().map(String::as_str).collect();
                             Arc::new(StringViewArray::from(refs))
                         }
                         _ => Arc::new(StringArray::from(values)),

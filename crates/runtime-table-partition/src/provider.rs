@@ -411,6 +411,26 @@ impl TableProvider for PartitionTableProvider {
 
         Ok(Arc::new(DeletionExec::new(deletion_sink)))
     }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let partitions = self.partitions.read().await;
+        let partition_list: Vec<_> = partitions.values().cloned().collect();
+        drop(partitions);
+
+        let update_sink = Arc::new(PartitionedUpdateSink::new(
+            partition_list,
+            assignments,
+            filters,
+            state.task_ctx(),
+        ));
+
+        Ok(Arc::new(DeletionExec::new(update_sink)))
+    }
 }
 
 /// A deletion sink that applies deletion filters to all partitions in a partitioned table.
@@ -464,6 +484,63 @@ impl DeletionSink for PartitionedDeletionSink {
         }
 
         Ok(total_deleted)
+    }
+}
+
+/// An update sink that applies update operations to all partitions in a partitioned table.
+struct PartitionedUpdateSink {
+    partitions: Vec<Partition>,
+    assignments: Vec<(String, Expr)>,
+    filters: Vec<Expr>,
+    task_ctx: Arc<TaskContext>,
+}
+
+impl PartitionedUpdateSink {
+    fn new(
+        partitions: Vec<Partition>,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+        task_ctx: Arc<TaskContext>,
+    ) -> Self {
+        Self {
+            partitions,
+            assignments,
+            filters,
+            task_ctx,
+        }
+    }
+}
+
+#[async_trait]
+impl DeletionSink for PartitionedUpdateSink {
+    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let mut total_updated = 0u64;
+
+        for partition in &self.partitions {
+            let session_ctx = datafusion::execution::context::SessionContext::new();
+            let state = session_ctx.state();
+
+            let plan = partition
+                .table_provider
+                .update(&state, self.assignments.clone(), self.filters.clone())
+                .await?;
+
+            let results = collect(plan, Arc::clone(&self.task_ctx)).await?;
+
+            for batch in results {
+                if let Some(count_col) = batch.column_by_name("count")
+                    && let Some(uint_array) = count_col.as_any().downcast_ref::<UInt64Array>()
+                {
+                    for i in 0..uint_array.len() {
+                        if !uint_array.is_null(i) {
+                            total_updated += uint_array.value(i);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(total_updated)
     }
 }
 
