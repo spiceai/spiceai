@@ -1872,21 +1872,21 @@ impl CayenneTableProvider {
         };
 
         let converter = self.build_pk_converter(&pk_indices)?;
-        tracing::info!(
+        tracing::info!(target: "runtime",
             table = %self.table_metadata.table_name,
             "prepare_stream_for_insert: loading existing keyset",
         );
         let keyset_start = std::time::Instant::now();
         let mut existing_keys = self.load_existing_keyset(&pk_indices, &converter).await?;
         let keyset_ms = keyset_start.elapsed().as_millis() as u64;
-        tracing::info!(
+        tracing::info!(target: "runtime",
             table = %self.table_metadata.table_name,
             existing_keys = existing_keys.len(),
             keyset_load_ms = keyset_ms,
             "prepare_stream_for_insert: keyset loaded",
         );
 
-        tracing::info!(
+        tracing::info!(target: "runtime",
             table = %self.table_metadata.table_name,
             "prepare_stream_for_insert: validate_on_conflict starting",
         );
@@ -1895,7 +1895,7 @@ impl CayenneTableProvider {
             .validate_on_conflict(stream, &pk_indices, &converter, &mut existing_keys)
             .await?;
         let validate_ms = validate_start.elapsed().as_millis() as u64;
-        tracing::info!(
+        tracing::info!(target: "runtime",
             table = %self.table_metadata.table_name,
             filtered_batches = validation_result.filtered_batches.len(),
             delete_specs_files = validation_result.delete_specs.len(),

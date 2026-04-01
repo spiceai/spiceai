@@ -145,7 +145,7 @@ impl DataSink for CayenneDataSink {
     ) -> DFResult<u64> {
         // Acquire write lock to serialize all writes (append and overwrite) and
         // prevent concurrent races on catalog state, snapshot IDs, and listing table.
-        tracing::info!(table = self.table.table_name(), "Cayenne write lock: acquiring");
+        tracing::info!(target: "runtime", table = self.table.table_name(), "Cayenne write lock: acquiring");
         let lock_wait_start = std::time::Instant::now();
         let _write_guard = self.table.write_lock().lock().await;
         let lock_wait_ms = lock_wait_start.elapsed().as_millis() as u64;
@@ -187,7 +187,7 @@ impl CayenneDataSink {
     async fn write_all_append(&self, data: SendableRecordBatchStream) -> super::Result<u64> {
         let pipeline_start = std::time::Instant::now();
         let table_name = self.table.table_name().to_string();
-        tracing::info!(table = %table_name, "write_all_append: started");
+        tracing::info!(target: "runtime", table = %table_name, "write_all_append: started");
 
         // Ensure no incomplete write from a previous crash before proceeding.
         self.table.ensure_no_incomplete_write().await?;
@@ -223,12 +223,12 @@ impl CayenneDataSink {
         // validate_on_conflict() (via prepare_stream_for_insert) on the incoming stream
         // to handle upserts for PKs that already exist in the table. Without this,
         // duplicate PKs would appear in query results.
-        tracing::info!(table = %table_name, "write_all_append: prepare_stream_for_insert starting");
+        tracing::info!(target: "runtime", table = %table_name, "write_all_append: prepare_stream_for_insert starting");
         let step_start = std::time::Instant::now();
         let (prepared_stream, delete_specs, deleted_pk_i64, deleted_row_keys) =
             self.table.prepare_stream_for_insert(data).await?;
         let prepare_ms = step_start.elapsed().as_millis() as u64;
-        tracing::info!(table = %table_name, prepare_ms, "write_all_append: prepare_stream_for_insert done");
+        tracing::info!(target: "runtime", table = %table_name, prepare_ms, "write_all_append: prepare_stream_for_insert done");
 
         let has_on_conflict_deletions = !delete_specs.is_empty();
 
@@ -254,15 +254,15 @@ impl CayenneDataSink {
         let step_start = std::time::Instant::now();
         let total_rows = if needs_new_snapshot {
             // Apply on-conflict deletion vectors BEFORE creating the protected snapshot.
-            tracing::info!(table = %table_name, "write_all_append: apply_on_conflict_deletions starting");
+            tracing::info!(target: "runtime", table = %table_name, "write_all_append: apply_on_conflict_deletions starting");
             self.table
                 .apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
                 .await?;
             let deletions_ms = step_start.elapsed().as_millis() as u64;
-            tracing::info!(table = %table_name, deletions_ms, "write_all_append: apply_on_conflict_deletions done");
+            tracing::info!(target: "runtime", table = %table_name, deletions_ms, "write_all_append: apply_on_conflict_deletions done");
 
             // Write to a NEW snapshot with a higher sequence number
-            tracing::info!(table = %table_name, "write_all_append: increment_sequence_number starting");
+            tracing::info!(target: "runtime", table = %table_name, "write_all_append: increment_sequence_number starting");
             let seq_start = std::time::Instant::now();
             let new_sequence = self
                 .table
@@ -270,9 +270,9 @@ impl CayenneDataSink {
                 .increment_sequence_number(self.table.table_id())
                 .await?;
             let seq_ms = seq_start.elapsed().as_millis() as u64;
-            tracing::info!(table = %table_name, seq_ms, new_sequence, "write_all_append: increment_sequence_number done");
+            tracing::info!(target: "runtime", table = %table_name, seq_ms, new_sequence, "write_all_append: increment_sequence_number done");
 
-            tracing::info!(table = %table_name, "write_all_append: insert_to_new_snapshot starting");
+            tracing::info!(target: "runtime", table = %table_name, "write_all_append: insert_to_new_snapshot starting");
             let write_start = std::time::Instant::now();
             let rows = self.table
                 .insert_to_new_snapshot_with_sequence(prepared_stream, new_sequence)
@@ -295,7 +295,7 @@ impl CayenneDataSink {
 
             self.table.clear_staging_dir().await?;
 
-            tracing::info!(table = %table_name, "write_all_append: write_to_snapshot starting");
+            tracing::info!(target: "runtime", table = %table_name, "write_all_append: write_to_snapshot starting");
             let write_start = std::time::Instant::now();
             let (rows, writer_ops) = match self
                 .table
@@ -314,23 +314,23 @@ impl CayenneDataSink {
                 }
             };
             let write_ms = write_start.elapsed().as_millis() as u64;
-            tracing::info!(table = %table_name, rows, writer_ops, write_ms, "write_all_append: write_to_snapshot done");
+            tracing::info!(target: "runtime", table = %table_name, rows, writer_ops, write_ms, "write_all_append: write_to_snapshot done");
 
-            tracing::info!(table = %table_name, "write_all_append: staging move starting");
+            tracing::info!(target: "runtime", table = %table_name, "write_all_append: staging move starting");
             let move_start = std::time::Instant::now();
             self.table.write_staging_wal().await?;
             self.table.move_files_to_current_snapshot().await?;
             self.table.remove_staging_wal().await?;
             let move_ms = move_start.elapsed().as_millis() as u64;
-            tracing::info!(table = %table_name, move_ms, "write_all_append: staging move done");
+            tracing::info!(target: "runtime", table = %table_name, move_ms, "write_all_append: staging move done");
 
-            tracing::info!(table = %table_name, "write_all_append: apply_on_conflict_deletions starting");
+            tracing::info!(target: "runtime", table = %table_name, "write_all_append: apply_on_conflict_deletions starting");
             let deletions_start = std::time::Instant::now();
             self.table
                 .apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
                 .await?;
             let deletions_ms = deletions_start.elapsed().as_millis() as u64;
-            tracing::info!(table = %table_name, deletions_ms, "write_all_append: apply_on_conflict_deletions done");
+            tracing::info!(target: "runtime", table = %table_name, deletions_ms, "write_all_append: apply_on_conflict_deletions done");
 
             tracing::info!(
                 table = %table_name,
@@ -348,11 +348,11 @@ impl CayenneDataSink {
         };
 
         // Refresh the listing table before retention/sort so newly written files are visible.
-        tracing::info!(table = %table_name, "write_all_append: refresh_listing_table starting");
+        tracing::info!(target: "runtime", table = %table_name, "write_all_append: refresh_listing_table starting");
         let refresh_start = std::time::Instant::now();
         self.table.refresh_listing_table()?;
         let refresh_ms = refresh_start.elapsed().as_millis() as u64;
-        tracing::info!(table = %table_name, refresh_ms, "write_all_append: refresh_listing_table done");
+        tracing::info!(target: "runtime", table = %table_name, refresh_ms, "write_all_append: refresh_listing_table done");
 
         // Apply retention filters, sort, and refresh listing table.
         self.apply_retention_if_configured().await?;

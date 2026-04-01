@@ -571,13 +571,13 @@ impl MetastoreBackend for SqliteMetastore {
 
     async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>> {
         let conn = self.get_conn().await?;
-        tracing::info!("Metastore: acquiring mutex for begin_transaction");
+        tracing::info!(target: "runtime", "Metastore: acquiring mutex for begin_transaction");
         let lock_start = std::time::Instant::now();
         let guard = conn.lock_owned().await;
         let lock_wait_ms = lock_start.elapsed().as_millis() as u64;
-        tracing::info!(lock_wait_ms, "Metastore: mutex acquired for begin_transaction");
+        tracing::info!(target: "runtime", lock_wait_ms, "Metastore: mutex acquired for begin_transaction");
 
-        tracing::info!("Metastore: executing BEGIN TRANSACTION");
+        tracing::info!(target: "runtime", "Metastore: executing BEGIN TRANSACTION");
         guard
             .call(|conn| {
                 conn.execute_batch("BEGIN TRANSACTION")?;
@@ -724,7 +724,7 @@ impl MetastoreTransaction for SqliteTransaction {
             message: "Transaction already completed".to_string(),
         })?;
 
-        tracing::info!("Metastore: committing transaction");
+        tracing::info!(target: "runtime", "Metastore: committing transaction");
         let commit_result = conn
             .call(|conn| {
                 conn.execute_batch("COMMIT")?;
@@ -734,7 +734,7 @@ impl MetastoreTransaction for SqliteTransaction {
 
         match commit_result {
             Ok(()) => {
-                tracing::info!("Metastore: transaction committed successfully");
+                tracing::info!(target: "runtime", "Metastore: transaction committed successfully");
                 Ok(())
             }
             Err(e) => {
