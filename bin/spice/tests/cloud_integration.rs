@@ -543,8 +543,7 @@ fn test_cloud_multiple_secrets() {
         .len();
     assert!(
         entries_count >= 3,
-        "should have at least 3 entries, got {}",
-        entries_count
+        "should have at least 3 entries"
     );
 
     for i in 0..3 {
