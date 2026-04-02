@@ -42,19 +42,29 @@ pub struct DatasetOptions {
     pub time_format: Option<SpicepodTimeFormat>,
 }
 
+/// How a table's data is distributed across executors in a distributed catalog.
+#[derive(Debug, Clone)]
+pub enum TableDistribution {
+    /// Table data is partitioned across executors using the given SQL expression
+    /// from a `PARTITION BY` clause.
+    PartitionBy(Box<SqlParserExpr>),
+    /// Table data is replicated (broadcast) to all executors.
+    Replicated,
+}
+
 /// Extensions extracted from a `CREATE TABLE` statement.
 ///
-/// Bundles `WITH (...)` options (`acceleration.*` and `dataset.*`) and
-/// `PARTITION BY` expressions extracted during SQL pre-processing.
+/// Bundles `WITH (...)` options (`acceleration.*` and `dataset.*`), and
+/// distribution mode (`PARTITION BY` or `REPLICATED`) extracted during
+/// SQL pre-processing.
 #[derive(Debug, Clone, Default)]
 pub struct CreateTableStatementExtension {
     /// Acceleration options, if any `acceleration.*` keys were present in `WITH (...)`.
     pub acceleration: Option<Acceleration>,
     /// Dataset-level options, if any `dataset.*` keys were present in `WITH (...)`.
     pub dataset: DatasetOptions,
-    /// Partitioning expression from a `PARTITION BY` clause.
-    /// The raw SQL expression as parsed by sqlparser.
-    pub partition_by: Option<Box<SqlParserExpr>>,
+    /// Distribution mode: partitioned (`PARTITION BY`) or replicated (`REPLICATED`).
+    pub distribution: Option<TableDistribution>,
 }
 
 /// Stores DDL extensions extracted from `CREATE TABLE` statements.
@@ -108,7 +118,7 @@ pub fn new_shared_store() -> SharedDdlExtensionStore {
 /// )
 /// ```
 ///
-/// The returned extension will have an empty `partition_by` — partitioning
+/// The returned extension will have `distribution: None` — distribution
 /// expressions are handled separately during pre-processing.
 ///
 /// # Errors
@@ -143,7 +153,7 @@ pub fn parse_ddl_table_options(
     Ok(CreateTableStatementExtension {
         acceleration,
         dataset,
-        partition_by: None,
+        distribution: None,
     })
 }
 
@@ -470,7 +480,7 @@ mod tests {
             ddl_opts.dataset.time_format,
             Some(SpicepodTimeFormat::Timestamptz)
         );
-        assert!(ddl_opts.partition_by.is_none());
+        assert!(ddl_opts.distribution.is_none());
     }
 
     #[test]
@@ -488,6 +498,6 @@ mod tests {
         let ddl_opts = parse_ddl_table_options(&options).expect("should parse");
         assert!(ddl_opts.acceleration.is_none());
         assert_eq!(ddl_opts.dataset.time_column.as_deref(), Some("created_at"));
-        assert!(ddl_opts.partition_by.is_none());
+        assert!(ddl_opts.distribution.is_none());
     }
 }

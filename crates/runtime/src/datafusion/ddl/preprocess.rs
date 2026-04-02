@@ -50,7 +50,8 @@ use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 
 use super::acceleration_options::{
-    CreateTableStatementExtension, SharedDdlExtensionStore, parse_ddl_table_options,
+    CreateTableStatementExtension, SharedDdlExtensionStore, TableDistribution,
+    parse_ddl_table_options,
 };
 
 /// Result of pre-processing: either the original SQL unchanged, or modified SQL
@@ -109,14 +110,17 @@ pub fn preprocess_create_table_with_options(
 ) -> DFResult<PreprocessResult> {
     // Quick check: if the SQL doesn't contain keywords we care about, skip parsing
     let upper = sql.to_uppercase();
-    if !upper.contains("WITH") && !upper.contains("PARTITION") {
+    if !upper.contains("WITH") && !upper.contains("PARTITION") && !upper.contains("REPLICATED") {
         return Ok(PreprocessResult::Unchanged);
     }
 
+    // Strip REPLICATED keyword before parsing (sqlparser doesn't recognize it).
+    let (effective_sql, is_replicated) = strip_replicated_keyword(sql);
+
     let dialect = PostgreSqlDialect {};
-    let statements = if let Ok(statements) = Parser::parse_sql(&dialect, sql) {
+    let statements = if let Ok(statements) = Parser::parse_sql(&dialect, &effective_sql) {
         statements
-    } else if let Some(normalized_sql) = normalize_create_table_clause_order(sql) {
+    } else if let Some(normalized_sql) = normalize_create_table_clause_order(&effective_sql) {
         let Ok(statements) = Parser::parse_sql(&dialect, &normalized_sql) else {
             // If sqlparser still can't parse it, let `DataFusion` handle the error.
             return Ok(PreprocessResult::Unchanged);
@@ -141,6 +145,14 @@ pub fn preprocess_create_table_with_options(
     // Extract PARTITION BY expression if present
     let partition_by_expr = create_table.partition_by.clone();
 
+    // Validate mutual exclusion: REPLICATED and PARTITION BY cannot be combined.
+    if is_replicated && partition_by_expr.is_some() {
+        return Err(DataFusionError::Plan(
+            "Cannot use both REPLICATED and PARTITION BY in CREATE TABLE. Use one or the other."
+                .to_string(),
+        ));
+    }
+
     // Limitation: In distributed mode, primary keys must include the partitioning key
     // to ensure correct on-conflict behavior. When data is partitioned across different
     // executor nodes, on-conflict checks cannot work correctly if the partition key is
@@ -157,7 +169,7 @@ pub fn preprocess_create_table_with_options(
     let has_with_options = with_options.is_some();
     let has_partition_by = partition_by_expr.is_some();
 
-    if !has_with_options && !has_partition_by {
+    if !has_with_options && !has_partition_by && !is_replicated {
         return Ok(PreprocessResult::Unchanged);
     }
 
@@ -165,7 +177,7 @@ pub fn preprocess_create_table_with_options(
     let mut extension = if let Some(ref options) = with_options {
         let (recognized_opts, other_opts) = classify_with_options(options);
 
-        if recognized_opts.is_empty() && !has_partition_by {
+        if recognized_opts.is_empty() && !has_partition_by && !is_replicated {
             return Ok(PreprocessResult::Unchanged);
         }
 
@@ -190,16 +202,20 @@ pub fn preprocess_create_table_with_options(
         CreateTableStatementExtension::default()
     };
 
-    // Attach partition_by expression
-    extension.partition_by = partition_by_expr;
+    // Set distribution mode
+    extension.distribution = if is_replicated {
+        Some(TableDistribution::Replicated)
+    } else {
+        partition_by_expr.map(TableDistribution::PartitionBy)
+    };
 
     // Check if we actually have anything to extract
     let has_recognized_with = extension.acceleration.is_some()
         || extension.dataset.time_column.is_some()
         || extension.dataset.time_format.is_some();
-    let has_partition = extension.partition_by.is_some();
+    let has_distribution = extension.distribution.is_some();
 
-    if !has_recognized_with && !has_partition {
+    if !has_recognized_with && !has_distribution {
         return Ok(PreprocessResult::Unchanged);
     }
 
@@ -224,7 +240,7 @@ pub fn preprocess_create_table_with_options(
     }
 
     // Remove PARTITION BY if we extracted it
-    if has_partition {
+    if has_partition_by {
         modified.partition_by = None;
     }
 
@@ -264,6 +280,37 @@ fn normalize_create_table_clause_order(sql: &str) -> Option<String> {
     Some(format!(
         "{before_partition} {with_clause} {partition_clause}"
     ))
+}
+
+/// Strip the `REPLICATED` keyword from a `CREATE TABLE` SQL statement.
+///
+/// `sqlparser` does not recognize `REPLICATED` in this position, so it must be
+/// removed before parsing and recorded separately. Returns the (possibly modified)
+/// SQL and whether `REPLICATED` was found.
+fn strip_replicated_keyword(sql: &str) -> (String, bool) {
+    let upper = sql.to_uppercase();
+    let Some(idx) = upper.rfind("REPLICATED") else {
+        return (sql.to_string(), false);
+    };
+
+    // Verify the match is a standalone keyword (not part of an identifier).
+    if idx > 0 {
+        let before = sql.as_bytes()[idx - 1];
+        if before.is_ascii_alphanumeric() || before == b'_' {
+            return (sql.to_string(), false);
+        }
+    }
+    let after_idx = idx + "REPLICATED".len();
+    if after_idx < sql.len() {
+        let after = sql.as_bytes()[after_idx];
+        if after.is_ascii_alphanumeric() || after == b'_' {
+            return (sql.to_string(), false);
+        }
+    }
+
+    let before = sql[..idx].trim_end();
+    let after = &sql[after_idx..];
+    (format!("{before}{after}"), true)
 }
 
 pub type OptionsClassification = (Vec<(String, String)>, Vec<SqlOption>);
@@ -483,7 +530,7 @@ mod tests {
         let accel = ddl_ext.acceleration.expect("acceleration should be Some");
         assert_eq!(accel.engine.as_deref(), Some("arrow"));
         assert_eq!(accel.mode, spicepod::acceleration::Mode::Memory);
-        assert!(ddl_ext.partition_by.is_none());
+        assert!(ddl_ext.distribution.is_none());
     }
 
     #[test]
@@ -518,7 +565,7 @@ mod tests {
             ddl_ext.dataset.time_format,
             Some(spicepod::component::dataset::TimeFormat::Timestamp)
         );
-        assert!(ddl_ext.partition_by.is_none());
+        assert!(ddl_ext.distribution.is_none());
     }
 
     #[test]
@@ -537,7 +584,7 @@ mod tests {
         let accel = ddl_ext.acceleration.expect("acceleration should be Some");
         assert_eq!(accel.engine.as_deref(), Some("arrow"));
         assert_eq!(ddl_ext.dataset.time_column.as_deref(), Some("ts"));
-        assert!(ddl_ext.partition_by.is_none());
+        assert!(ddl_ext.distribution.is_none());
     }
 
     #[test]
@@ -603,7 +650,7 @@ mod tests {
             .remove(&TableReference::parse_str("foo"))
             .expect("should have extensions for 'foo'");
         assert!(ddl_ext.acceleration.is_none());
-        assert!(ddl_ext.partition_by.is_some());
+        assert!(ddl_ext.distribution.is_some());
     }
 
     #[test]
@@ -637,7 +684,7 @@ mod tests {
             .remove(&TableReference::parse_str("foo"))
             .expect("should have extensions for 'foo'");
         assert!(ddl_ext.acceleration.is_some());
-        assert!(ddl_ext.partition_by.is_some());
+        assert!(ddl_ext.distribution.is_some());
     }
 
     #[test]

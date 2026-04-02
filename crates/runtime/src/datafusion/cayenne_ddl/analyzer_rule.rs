@@ -43,7 +43,9 @@ use super::logical_nodes::{
     CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode,
     DistributedCayenneDeleteNode, DistributedCayenneInsertNode, DistributedCayenneUpdateNode,
 };
-use crate::datafusion::ddl::acceleration_options::SharedDdlExtensionStore;
+use crate::datafusion::ddl::acceleration_options::{
+    SharedDdlExtensionStore, TableDistribution,
+};
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 /// Extract primary key column names from `DataFusion` [`Constraints`] using the
@@ -186,23 +188,24 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                     let ext = store.remove(&TableReference::parse_str(&extension_key));
 
                     if let Some(ext) = ext {
-                        if let Some(partition_by_expr) = ext.partition_by {
-                            let partition_expr_sql = partition_by_expr.to_string();
-                            let state = self.session_state.upgrade().ok_or_else(|| {
-                                DataFusionError::Execution(
-                                    "Session state is no longer available".to_string(),
-                                )
-                            })?;
-                            let state_guard = state.read();
-                            let df_schema = arrow_schema.as_ref().clone().to_dfschema()?;
-                            let partition_expr = parse_and_validate_partition_expression(
-                                &partition_expr_sql,
-                                &state_guard,
-                                &df_schema,
-                            )?;
-                            (Some(partition_expr), Some(partition_expr_sql))
-                        } else {
-                            (None, None)
+                        match ext.distribution {
+                            Some(TableDistribution::PartitionBy(partition_by_expr)) => {
+                                let partition_expr_sql = partition_by_expr.to_string();
+                                let state = self.session_state.upgrade().ok_or_else(|| {
+                                    DataFusionError::Execution(
+                                        "Session state is no longer available".to_string(),
+                                    )
+                                })?;
+                                let state_guard = state.read();
+                                let df_schema = arrow_schema.as_ref().clone().to_dfschema()?;
+                                let partition_expr = parse_and_validate_partition_expression(
+                                    &partition_expr_sql,
+                                    &state_guard,
+                                    &df_schema,
+                                )?;
+                                (Some(partition_expr), Some(partition_expr_sql))
+                            }
+                            Some(TableDistribution::Replicated) | None => (None, None),
                         }
                     } else {
                         (None, None)
