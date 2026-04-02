@@ -1074,7 +1074,7 @@ mod tests {
 
         let first = stream.next().await;
         assert!(first.is_some());
-        assert!(first.expect("item should exist").is_err());
+        first.expect("item should exist").expect_err("item should be an error");
 
         drop(stream);
 

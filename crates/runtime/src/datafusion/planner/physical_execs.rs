@@ -17,7 +17,7 @@ limitations under the License.
 //! Physical execution plans for Cayenne DML operations.
 //!
 //! Currently empty — local DELETE is handled by Cayenne's `TableProvider`
-//! implementation through DataFusion's standard physical planning, and
+//! implementation through `DataFusion`'s standard physical planning, and
 //! distributed DELETE reuses `DistributedCayenneDeleteExec` from `cayenne_ddl`.
 //!
 //! Future DML operations (UPDATE, MERGE) will add execution plans here.

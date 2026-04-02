@@ -2601,7 +2601,7 @@ impl DataFusion {
     }
 
     /// Route SQL through the planner, which intercepts DDL extensions and
-    /// Cayenne DML at the statement level, or falls back to DataFusion's
+    /// Cayenne DML at the statement level, or falls back to `DataFusion`'s
     /// standard planner.
     #[cfg(not(windows))]
     pub(crate) async fn create_logical_plan(

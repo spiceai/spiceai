@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn float64_finite_accepted() {
-        let scalar = ScalarValue::Float64(Some(3.14));
-        assert_number(&scalar, "3.14");
+        let scalar = ScalarValue::Float64(Some(2.718));
+        assert_number(&scalar, "2.718");
     }
 }

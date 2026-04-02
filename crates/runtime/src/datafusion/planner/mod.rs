@@ -16,21 +16,21 @@ limitations under the License.
 
 //! Unified SQL statement planner.
 //!
-//! Intercepts SQL statements at the AST level, before DataFusion's standard
+//! Intercepts SQL statements at the AST level, before `DataFusion`'s standard
 //! planner, for two purposes:
 //!
 //! 1. **DDL extensions** — `CREATE TABLE` with `WITH (...)` options
 //!    (`acceleration.*`, `dataset.*`) and `PARTITION BY` clauses that
-//!    DataFusion's `SqlToRel` does not support. Extensions are extracted from
+//!    `DataFusion`'s `SqlToRel` does not support. Extensions are extracted from
 //!    the AST, stored in the [`DdlExtensionStore`], and stripped before
-//!    delegating to DataFusion.
+//!    delegating to `DataFusion`.
 //!
 //! 2. **DML interception** — DELETE and UPDATE statements targeting Cayenne
 //!    catalog tables are converted into [`LogicalPlan::Extension`] nodes
 //!    directly for distributed mode. Support for additional DML types
 //!    (INSERT, MERGE) may be added in the future.
 //!
-//! For everything else, the planner delegates to DataFusion's standard
+//! For everything else, the planner delegates to `DataFusion`'s standard
 //! `session.statement_to_plan()` path.
 
 mod create_table;
@@ -59,7 +59,7 @@ pub enum CatalogMode {
     /// DML targeting Cayenne tables is intercepted at the statement level.
     Cayenne,
     /// No Cayenne catalogs are registered. All statements are delegated
-    /// to DataFusion's standard planner.
+    /// to `DataFusion`'s standard planner.
     Standard,
 }
 
@@ -126,7 +126,7 @@ pub async fn create_logical_plan(
 /// Plan a DML statement (DELETE or UPDATE), producing either a local or
 /// distributed Cayenne extension node.
 ///
-/// For local mode, returns the standard DataFusion plan unchanged — Cayenne's
+/// For local mode, returns the standard `DataFusion` plan unchanged — Cayenne's
 /// `TableProvider` implementation handles DML natively.
 ///
 /// For distributed (scheduler) mode, wraps the plan into a distributed
