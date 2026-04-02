@@ -16,14 +16,24 @@ limitations under the License.
 
 //! Unified SQL statement planner.
 //!
-//! All DML statements (DELETE, UPDATE, INSERT) targeting Cayenne catalog tables
-//! are intercepted at the statement level and converted into
-//! [`LogicalPlan::Extension`] nodes directly, instead of relying on
-//! DataFusion's DML planning followed by post-hoc interception.
+//! Intercepts SQL statements at the AST level, before DataFusion's standard
+//! planner, for two purposes:
+//!
+//! 1. **DDL extensions** — `CREATE TABLE` with `WITH (...)` options
+//!    (`acceleration.*`, `dataset.*`) and `PARTITION BY` clauses that
+//!    DataFusion's `SqlToRel` does not support. Extensions are extracted from
+//!    the AST, stored in the [`DdlExtensionStore`], and stripped before
+//!    delegating to DataFusion.
+//!
+//! 2. **DML interception** — DELETE statements targeting Cayenne catalog
+//!    tables are converted into [`LogicalPlan::Extension`] nodes directly
+//!    for distributed mode. Support for additional DML types (UPDATE,
+//!    INSERT, MERGE) may be added in the future.
 //!
 //! For everything else, the planner delegates to DataFusion's standard
 //! `session.statement_to_plan()` path.
 
+mod create_table;
 mod delete;
 pub mod logical_nodes;
 pub mod physical_execs;
@@ -35,6 +45,7 @@ use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::Statement as SQLStatement;
 
 use crate::config::ClusterRole;
+use crate::datafusion::ddl::acceleration_options::SharedDdlExtensionStore;
 
 use super::SPICE_DEFAULT_CATALOG;
 
@@ -51,37 +62,50 @@ pub enum CatalogMode {
 
 /// Context for the statement planner, carrying catalog and cluster information.
 pub struct PlannerContext {
-    /// The catalog mode determines whether DML interception is active.
+    /// The catalog mode determines whether statement-level interception is active.
     pub catalog_mode: CatalogMode,
 
     /// The cluster role, if any. When `Some(ClusterRole::Scheduler)`, Cayenne
     /// DML is rewritten into distributed extension nodes that forward operations
     /// to executor nodes.
     pub cluster_role: Option<ClusterRole>,
+
+    /// Shared store for DDL extensions extracted from `CREATE TABLE` statements.
+    /// Populated by the planner, consumed by the analyzer rules.
+    pub ddl_extension_store: SharedDdlExtensionStore,
 }
 
-/// Create a [`LogicalPlan`] from SQL, intercepting Cayenne DML at the statement level.
+/// Create a [`LogicalPlan`] from SQL, intercepting DDL extensions and
+/// Cayenne DML at the statement level.
 pub async fn create_logical_plan(
     sql: &str,
     session: &SessionState,
     ctx: &PlannerContext,
 ) -> DFResult<LogicalPlan> {
-    // Fast path: if Cayenne is not active, skip statement-level parsing and
-    // delegate entirely to DataFusion.
-    if ctx.catalog_mode != CatalogMode::Cayenne {
-        return session.create_logical_plan(sql).await;
-    }
-
-    // Step 1: Parse SQL into a DataFusion Statement (wraps sqlparser AST)
+    // Step 1: Parse SQL into a DataFusion Statement (wraps sqlparser AST).
     let dialect = session.config().options().sql_parser.dialect;
     let statement = session.sql_to_statement(sql, &dialect)?;
 
-    // Step 2: Check if this is a DML statement we should intercept
+    // Step 2: Dispatch based on statement type
     if let Statement::Statement(ref sql_stmt) = statement {
         match sql_stmt.as_ref() {
-            SQLStatement::Delete(_) => {
+            // DDL: CREATE TABLE with extensions (WITH options, PARTITION BY).
+            // Intercepted regardless of catalog mode — extensions apply to
+            // all catalog types (Cayenne, Iceberg, etc.).
+            SQLStatement::CreateTable(ct) if create_table::has_ddl_extensions(ct) => {
+                return create_table::plan_create_table(
+                    statement,
+                    session,
+                    &ctx.ddl_extension_store,
+                )
+                .await;
+            }
+
+            // DML: DELETE on Cayenne tables (only when Cayenne is active)
+            SQLStatement::Delete(_) if ctx.catalog_mode == CatalogMode::Cayenne => {
                 return plan_cayenne_delete(statement, session, ctx).await;
             }
+
             // Future: SQLStatement::Update { .. }, SQLStatement::Merge { .. }
             _ => {}
         }
