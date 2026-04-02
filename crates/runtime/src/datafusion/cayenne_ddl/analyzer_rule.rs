@@ -43,7 +43,7 @@ use super::logical_nodes::{
     CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode,
     DistributedCayenneDeleteNode, DistributedCayenneInsertNode, DistributedCayenneUpdateNode,
 };
-use crate::datafusion::ddl::acceleration_options::SharedDdlExtensionStore;
+use crate::datafusion::ddl::acceleration_options::{SharedDdlExtensionStore, TableDistribution};
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 /// Extract primary key column names from `DataFusion` [`Constraints`] using the
@@ -186,7 +186,9 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                     let ext = store.remove(&TableReference::parse_str(&extension_key));
 
                     if let Some(ext) = ext {
-                        if let Some(partition_by_expr) = ext.partition_by {
+                        if let Some(TableDistribution::PartitionBy(partition_by_expr)) =
+                            ext.distribution
+                        {
                             let partition_expr_sql = partition_by_expr.to_string();
                             let state = self.session_state.upgrade().ok_or_else(|| {
                                 DataFusionError::Execution(
