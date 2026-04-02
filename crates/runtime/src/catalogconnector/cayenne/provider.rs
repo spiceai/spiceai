@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use cayenne::CayenneCatalogProvider;
+pub use cayenne::CayenneCatalogProvider;
 
 use crate::catalogconnector::PartitionAwareCatalog;
 
