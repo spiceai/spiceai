@@ -126,6 +126,8 @@ pub mod iceberg_ddl;
 pub mod job_executor_context_extension;
 pub mod managed_runtime;
 pub mod param_utils;
+#[cfg(not(windows))]
+pub mod planner;
 pub mod refresh_sql;
 pub mod request_context_extension;
 pub mod retention_sql;
@@ -924,6 +926,26 @@ impl DataFusion {
             .read()
             .await
             .contains(table_reference)
+    }
+
+    /// Returns `true` if any DDL-enabled catalog is Cayenne-backed.
+    #[cfg(not(windows))]
+    fn has_cayenne_catalog(&self) -> bool {
+        match self.ddl_enabled_catalogs.read() {
+            Ok(cats) => cats.iter().any(|name| {
+                self.ctx
+                    .catalog(name)
+                    .is_some_and(|c| cayenne_ddl::is_cayenne_catalog(c.as_ref()))
+            }),
+            Err(err) => {
+                tracing::error!(
+                    "Failed to acquire read lock for ddl_enabled_catalogs; \
+                     assuming Cayenne-backed catalogs are present to avoid \
+                     silently disabling distributed DELETE planning: {err}"
+                );
+                true
+            }
+        }
     }
 
     /// Returns `true` if the given table reference resolves to a Cayenne-backed catalog.
@@ -2578,7 +2600,7 @@ impl DataFusion {
             ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
         };
 
-        let plan = match session.create_logical_plan(effective_sql).await {
+        let plan = match self.create_logical_plan(session, effective_sql).await {
             Ok(plan) => plan,
             Err(e) => {
                 if let Some(store_key) = store_key {
@@ -2599,6 +2621,37 @@ impl DataFusion {
         }
 
         Ok(plan)
+    }
+
+    /// Route SQL through the planner, which intercepts Cayenne DML
+    /// at the statement level, or falls back to DataFusion's standard planner.
+    #[cfg(not(windows))]
+    async fn create_logical_plan(
+        &self,
+        session: &SessionState,
+        sql: &str,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        let ctx = planner::PlannerContext {
+            catalog_mode: if self.has_cayenne_catalog() {
+                planner::CatalogMode::Cayenne
+            } else {
+                planner::CatalogMode::Standard
+            },
+            cluster_role: self.cluster_config.effective_role(),
+        };
+
+        planner::create_logical_plan(sql, session, &ctx).await
+    }
+
+    /// On Windows the `planner` module is not available, so delegate
+    /// directly to DataFusion's standard logical planner.
+    #[cfg(windows)]
+    async fn create_logical_plan(
+        &self,
+        session: &SessionState,
+        sql: &str,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        session.create_logical_plan(sql).await
     }
 
     pub(crate) async fn clear_cached_plans(&self) {
