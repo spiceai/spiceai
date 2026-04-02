@@ -385,6 +385,7 @@ impl DataAccelerator for DuckDBAccelerator {
                         &source.name().to_string(),
                         runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(&path)),
                         AccelerationEngine::DuckDB,
+                        Arc::new(arrow_schema::Schema::empty()),
                     )
                     .await;
 
@@ -579,20 +580,28 @@ impl DataAccelerator for DuckDBAccelerator {
         source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::new(self.get_shared_pool(source).await?);
-        let mut conn = pool.connect_sync()?;
-        let duckdb_conn = DuckDB::duckdb_conn(&mut conn).boxed()?;
-        let drop_sql = format!("DROP TABLE IF EXISTS \"{table_name}\"");
-        duckdb_conn
-            .get_underlying_conn_mut()
-            .execute(&drop_sql, [])
-            .boxed()?;
-        // Also drop any internal DuckDB tables associated with this table
-        let internal_drop = format!("DROP TABLE IF EXISTS \"__data_{table_name}\"");
-        let _ = duckdb_conn
-            .get_underlying_conn_mut()
-            .execute(&internal_drop, []);
-        tracing::info!("Dropped DuckDB table '{table_name}' for schema recreation (file_update mode)");
-        Ok(())
+        let table_name = table_name.to_owned();
+
+        tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let mut conn = pool.connect_sync()?;
+            let duckdb_conn = DuckDB::duckdb_conn(&mut conn).boxed()?;
+            let escaped = table_name.replace('"', "\"\"");
+            let drop_sql = format!("DROP TABLE IF EXISTS \"{escaped}\"");
+            duckdb_conn
+                .get_underlying_conn_mut()
+                .execute(&drop_sql, [])
+                .boxed()?;
+            // Also drop any internal DuckDB tables associated with this table
+            let internal_name = format!("__data_{table_name}").replace('"', "\"\"");
+            let internal_drop = format!("DROP TABLE IF EXISTS \"{internal_name}\"");
+            let _ = duckdb_conn
+                .get_underlying_conn_mut()
+                .execute(&internal_drop, []);
+            tracing::info!("Dropped DuckDB table '{table_name}' for schema recreation (file_update mode)");
+            Ok(())
+        })
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
     }
 }
 

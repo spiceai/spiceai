@@ -122,6 +122,7 @@ pub(crate) async fn snapshot_before_recreate(
     dataset_name: &str,
     layout: AccelerationLayout,
     engine: AccelerationEngine,
+    schema: Arc<arrow_schema::Schema>,
 ) {
     if !acceleration.snapshot_behavior.create_enabled() {
         return;
@@ -142,11 +143,8 @@ pub(crate) async fn snapshot_before_recreate(
     let mutex = Arc::new(tokio::sync::Mutex::new(()));
     let lock_guard = mutex.lock_owned().await;
 
-    // Use an empty schema — the snapshot is a backup of the raw file; schema metadata is secondary.
-    let empty_schema = Arc::new(arrow_schema::Schema::empty());
-
     match manager
-        .create_snapshot(&empty_schema, lock_guard, None, None, ForceCreate(true))
+        .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
         .await
     {
         Ok(Some(path)) => {

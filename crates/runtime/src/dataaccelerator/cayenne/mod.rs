@@ -1006,6 +1006,7 @@ impl DataAccelerator for CayenneAccelerator {
                     &source.name().to_string(),
                     snapshot_layout,
                     AccelerationEngine::Cayenne,
+                    Arc::new(arrow_schema::Schema::empty()),
                 )
                 .await;
 

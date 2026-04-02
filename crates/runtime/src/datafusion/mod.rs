@@ -432,13 +432,6 @@ fn validate_distributed_engine(
     Ok(())
 }
 
-/// Remap constraint column indices from the source schema to the refresh schema.
-///
-/// When `refresh_sql` selects a subset or reordered set of columns, the primary key
-/// column indices in the source constraints no longer match the refresh schema.
-/// This function maps column names from source indices to their positions in the
-/// refresh schema. Returns `None` if any primary key column is missing from the
-/// refresh schema.
 /// Converts a runtime `Engine` to a snapshot `AccelerationEngine`.
 ///
 /// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow, PostgreSQL).
@@ -460,16 +453,17 @@ fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
 /// `existing_schema` (from the current accelerated file).
 ///
 /// Additive compatibility means every field in `existing_schema` is present in `new_schema`
-/// with the same data type.  Additional fields in `new_schema` are allowed (they are new columns).
+/// with the same field definition (name, data type, nullability, and metadata).
+/// Additional fields in `new_schema` are allowed (they are new columns).
 ///
 /// Returns `true` if the schemas are compatible and the acceleration can be used as-is.
-/// Returns `false` if there is a breaking change (column removed, renamed, or type changed)
-/// that requires the acceleration to be recreated.
+/// Returns `false` if there is a breaking change (column removed, renamed, or any field
+/// attribute changed) that requires the acceleration to be recreated.
 fn is_schema_additively_compatible(existing_schema: &Schema, new_schema: &Schema) -> bool {
     for field in existing_schema.fields() {
         match new_schema.field_with_name(field.name()) {
             Ok(new_field) => {
-                if field.data_type() != new_field.data_type() {
+                if field.as_ref() != new_field {
                     return false;
                 }
             }
@@ -482,6 +476,13 @@ fn is_schema_additively_compatible(existing_schema: &Schema, new_schema: &Schema
     true
 }
 
+/// Remap constraint column indices from the source schema to the refresh schema.
+///
+/// When `refresh_sql` selects a subset or reordered set of columns, the primary key
+/// column indices in the source constraints no longer match the refresh schema.
+/// This function maps column names from source indices to their positions in the
+/// refresh schema. Returns `None` if any primary key column is missing from the
+/// refresh schema.
 fn remap_constraints_to_refresh_schema(
     source_constraints: &Constraints,
     source_schema: &SchemaRef,
@@ -1549,11 +1550,27 @@ impl DataFusion {
         // For file_update mode: compare the existing acceleration's schema against the
         // source/refresh schema. If the change is not additive (columns removed, renamed,
         // or types changed), snapshot the current file and recreate the acceleration.
+        //
+        // Normalize Dictionary types in refresh_schema the same way create_accelerator_table
+        // does, so that Dictionary→value type normalization doesn't trigger a false mismatch.
         if acceleration_settings.mode == Mode::FileUpdate
             && refresh_mode != RefreshMode::Disabled
         {
             let existing_schema = accelerated_table_provider.schema();
-            if !is_schema_additively_compatible(&existing_schema, &refresh_schema) {
+            let needs_dict_normalization = matches!(
+                acceleration_settings.engine.to_unpartitioned(),
+                Engine::DuckDB | Engine::Sqlite | Engine::Turso
+            );
+            let normalized_refresh_schema = if needs_dict_normalization
+                && arrow_tools::schema::has_dictionary_types(&refresh_schema)
+            {
+                Arc::new(arrow_tools::schema::normalize_dictionary_types(
+                    &refresh_schema,
+                ))
+            } else {
+                Arc::clone(&refresh_schema)
+            };
+            if !is_schema_additively_compatible(&existing_schema, &normalized_refresh_schema) {
                 tracing::warn!(
                     "Dataset {} has a non-additive schema change in file_update mode; snapshotting and recreating acceleration",
                     dataset.name
@@ -1568,6 +1585,7 @@ impl DataFusion {
                         &dataset.name.to_string(),
                         layout,
                         accel_engine,
+                        Arc::clone(&existing_schema),
                     )
                     .await;
                 }
@@ -3749,6 +3767,17 @@ mod tests {
                 ("age", DataType::Int32),
             ]);
             assert!(is_schema_additively_compatible(&existing, &new));
+        }
+
+        #[test]
+        fn nullability_changed_is_incompatible() {
+            let existing = Schema::new(vec![
+                Field::new("id", DataType::Int64, true),
+            ]);
+            let new = Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+            ]);
+            assert!(!is_schema_additively_compatible(&existing, &new));
         }
     }
 

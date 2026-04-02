@@ -463,6 +463,7 @@ impl DataAccelerator for TursoAccelerator {
                         &source.name().to_string(),
                         runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(&path)),
                         AccelerationEngine::Turso,
+                        Arc::new(arrow_schema::Schema::empty()),
                     )
                     .await;
 
@@ -693,7 +694,8 @@ impl DataAccelerator for TursoAccelerator {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let pool = self.get_shared_pool(source).await?;
         let conn = pool.connect().await?;
-        let drop_sql = format!("DROP TABLE IF EXISTS \"{table_name}\"");
+        let escaped = table_name.replace('"', "\"\"");
+        let drop_sql = format!("DROP TABLE IF EXISTS \"{escaped}\"");
         conn.execute(&drop_sql, ()).await.map_err(|e| {
             Box::new(e) as Box<dyn std::error::Error + Send + Sync>
         })?;

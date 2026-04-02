@@ -271,6 +271,7 @@ impl DataAccelerator for SqliteAccelerator {
                         &source.name().to_string(),
                         runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(&path)),
                         AccelerationEngine::Sqlite,
+                        Arc::new(arrow_schema::Schema::empty()),
                     )
                     .await;
 
@@ -400,9 +401,10 @@ impl DataAccelerator for SqliteAccelerator {
             return Err("Failed to downcast to SqliteConnection".into());
         };
         let table = table_name.to_string();
+        let escaped = table.replace('"', "\"\"");
         conn.conn
             .call(move |conn| {
-                conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), [])?;
+                conn.execute(&format!("DROP TABLE IF EXISTS \"{escaped}\""), [])?;;
                 Ok::<(), rusqlite::Error>(())
             })
             .await
