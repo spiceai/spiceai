@@ -61,18 +61,32 @@ pub struct CayenneCatalogProviderConfig {
     pub compression_strategy: Option<CompressionStrategy>,
 }
 
+/// Errors that can occur when interacting with a Cayenne catalog.
 #[derive(Debug, Snafu)]
 pub enum Error {
+    /// Failed to initialize the Cayenne catalog.
     #[snafu(display("Failed to initialize Cayenne catalog: {source}"))]
-    CatalogInit { source: CatalogError },
+    CatalogInit {
+        /// The underlying catalog error.
+        source: CatalogError,
+    },
 
+    /// The Cayenne catalog configuration is invalid.
     #[snafu(display("Invalid Cayenne catalog configuration: {message}"))]
-    InvalidConfiguration { message: String },
+    InvalidConfiguration {
+        /// A description of the configuration problem.
+        message: String,
+    },
 
+    /// Failed to create a table provider from the Cayenne catalog.
     #[snafu(display("Failed to create Cayenne table provider: {source}"))]
-    TableProvider { source: CatalogError },
+    TableProvider {
+        /// The underlying catalog error.
+        source: CatalogError,
+    },
 }
 
+/// A specialized [`Result`](std::result::Result) type for Cayenne catalog operations.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Default catalog name used when no catalog ID is specified.
