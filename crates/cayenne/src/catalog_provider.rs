@@ -39,8 +39,8 @@ use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::prelude::*;
 
 use crate::catalog::CatalogError;
-use crate::metadata::VortexConfig;
-use crate::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
+use crate::metadata::{CompressionStrategy, VortexConfig};
+use crate::{CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 
 /// Configuration for constructing a [`CayenneCatalogProvider`].
 #[derive(Debug, Clone)]
