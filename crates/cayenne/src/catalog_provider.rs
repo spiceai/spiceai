@@ -28,6 +28,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+
 use data_components::RefreshableCatalogProvider;
 use data_components::poly::PolyTableProvider;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
@@ -38,8 +39,8 @@ use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::prelude::*;
 
 use crate::catalog::CatalogError;
-use crate::metadata::{CompressionStrategy, VortexConfig};
-use crate::{CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use crate::metadata::VortexConfig;
+use crate::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
 
 /// Configuration for constructing a [`CayenneCatalogProvider`].
 #[derive(Debug, Clone)]
@@ -123,6 +124,7 @@ impl CayenneCatalogProvider {
         // Resolve metadata directory
         let metadata_dir = config
             .metadata_dir
+            .clone()
             .unwrap_or_else(|| format!("{spice_data_base_path}/cayenne_{catalog_name}/metadata"));
 
         // Ensure metadata directory exists
@@ -132,9 +134,8 @@ impl CayenneCatalogProvider {
 
         // Initialize SQLite catalog
         let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
-        let catalog = Arc::new(
-            CayenneCatalog::new(connection_string).map_err(|e| Error::CatalogInit { source: e })?,
-        ) as Arc<dyn MetadataCatalog>;
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).context(CatalogInitSnafu)?)
+            as Arc<dyn MetadataCatalog>;
 
         catalog.init().await.context(CatalogInitSnafu)?;
 
@@ -520,38 +521,35 @@ impl CayenneSchemaProvider {
             return false;
         }
 
+        // Case 2b: PartitionTableProvider inside PolyTableProvider — refresh each
+        // partition's inner CayenneTableProvider from itself (reloads deletion
+        // vectors, protected snapshots, snapshot ID, and listing table from the
+        // catalog).
         #[cfg(feature = "partition-table-provider")]
+        if let Some(partition_provider) = existing_writer
+            .as_any()
+            .downcast_ref::<PartitionTableProvider>()
         {
-            // Case 2b: PartitionTableProvider inside PolyTableProvider — refresh each
-            // partition's inner CayenneTableProvider from itself (reloads deletion
-            // vectors, protected snapshots, snapshot ID, and listing table from the
-            // catalog).
-            if let Some(partition_provider) = existing_writer
-                .as_any()
-                .downcast_ref::<PartitionTableProvider>()
-            {
-                let providers = partition_provider.partition_table_providers().await;
-                for provider in &providers {
-                    // Each partition's inner provider is a CayenneTableProvider.
-                    let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>()
-                    else {
-                        tracing::warn!(
-                            "Partition sub-provider is not a CayenneTableProvider, skipping refresh"
-                        );
-                        continue;
-                    };
-                    if let Err(err) = cayenne.refresh(cayenne).await {
-                        tracing::warn!(
-                            "Failed to refresh partitioned Cayenne table in place: {err}"
-                        );
-                        // Fail safely: keep the existing partitioned provider rather than
-                        // signaling failure that would cause it to be replaced by a
-                        // non-partitioned provider.
-                        return true;
-                    }
+            let providers = partition_provider.partition_table_providers().await;
+            for provider in &providers {
+                // Each partition's inner provider is a CayenneTableProvider.
+
+                use crate::CayenneTableProvider;
+                let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>() else {
+                    tracing::warn!(
+                        "Partition sub-provider is not a CayenneTableProvider, skipping refresh"
+                    );
+                    continue;
+                };
+                if let Err(err) = cayenne.refresh(cayenne).await {
+                    tracing::warn!("Failed to refresh partitioned Cayenne table in place: {err}");
+                    // Fail safely: keep the existing partitioned provider rather than
+                    // signaling failure that would cause it to be replaced by a
+                    // non-partitioned provider.
+                    return true;
                 }
-                return true;
             }
+            return true;
         }
 
         false
