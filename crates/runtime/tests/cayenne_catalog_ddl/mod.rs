@@ -32,10 +32,30 @@ use arrow::array::{Float64Array, Int64Array, RecordBatch};
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
-use runtime::config::Config;
+use runtime::cluster::ResolvedClusterConfig;
+use runtime::config::{ClusterConfig, ClusterRole, Config};
 use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
 use spicepod::param::Params;
+
+/// Creates a [`ResolvedClusterConfig`] with Executor role for tests.
+///
+/// Cayenne catalogs require distributed mode. Using the Executor role enables
+/// distributed-mode checks in the planner while avoiding scheduler-only
+/// distributed DML rewrites in these tests; Cayenne DDL rewriting via
+/// `CayenneDdlAnalyzerRule` is not gated on the cluster role.
+fn test_cluster_config() -> ResolvedClusterConfig {
+    ResolvedClusterConfig::try_new(ClusterConfig {
+        role: Some(ClusterRole::Executor),
+        allow_insecure_connections: true,
+        node_advertise_address: Some("127.0.0.1".to_string()),
+        ..Default::default()
+    })
+    .expect(
+        "failed to build Cayenne catalog DDL test ResolvedClusterConfig; expected Executor role, \
+         allow_insecure_connections = true, and node_advertise_address to be set",
+    )
+}
 
 /// Helper to run a SQL query against the runtime and collect results.
 async fn run_query(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, String> {
@@ -118,6 +138,7 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -145,7 +166,7 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
                     email VARCHAR,
                     age BIGINT,
                     PRIMARY KEY (id)
-                )",
+                ) PARTITION BY id",
             )
             .await?;
 
@@ -269,121 +290,10 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             );
 
             // -----------------------------------------------------------------
-            // Step 6: UPDATE single row — modify a column value
+            // Step 6: INSERT after deletes — verify correctness
             // -----------------------------------------------------------------
-            exec(
-                &rt,
-                "UPDATE test_cat.myschema.users SET age = 31 WHERE id = 1",
-            )
-            .await?;
-
-            // Alice's age should now be 31 (was 30).
-            let batches = run_query(
-                &rt,
-                "SELECT id, name, age FROM test_cat.myschema.users WHERE id = 1",
-            )
-            .await?;
-            assert_batches_eq!(
-                &[
-                    "+----+-------+-----+",
-                    "| id | name  | age |",
-                    "+----+-------+-----+",
-                    "| 1  | Alice | 31  |",
-                    "+----+-------+-----+",
-                ],
-                &batches
-            );
-
-            // Row count should remain the same after UPDATE.
-            let count =
-                query_scalar_i64(&rt, "SELECT COUNT(*) FROM test_cat.myschema.users").await?;
-            assert_eq!(count, 4, "UPDATE should not change row count");
-
-            // -----------------------------------------------------------------
-            // Step 7: UPDATE multiple rows — bulk modification
-            // -----------------------------------------------------------------
-            exec(
-                &rt,
-                "UPDATE test_cat.myschema.users SET age = age + 10 WHERE age > 30",
-            )
-            .await?;
-
-            // Alice(31→41), Diana(28 unchanged), Frank(40→50), Grace(33→43)
-            let batches = run_query(
-                &rt,
-                "SELECT id, name, age FROM test_cat.myschema.users ORDER BY id",
-            )
-            .await?;
-            assert_batches_eq!(
-                &[
-                    "+----+-------+-----+",
-                    "| id | name  | age |",
-                    "+----+-------+-----+",
-                    "| 1  | Alice | 41  |",
-                    "| 4  | Diana | 28  |",
-                    "| 6  | Frank | 50  |",
-                    "| 7  | Grace | 43  |",
-                    "+----+-------+-----+",
-                ],
-                &batches
-            );
-
-            // -----------------------------------------------------------------
-            // Step 8: UPDATE with NULL — set a column to NULL
-            // -----------------------------------------------------------------
-            exec(
-                &rt,
-                "UPDATE test_cat.myschema.users SET email = NULL WHERE id = 4",
-            )
-            .await?;
-
-            let batches = run_query(
-                &rt,
-                "SELECT id, name, email FROM test_cat.myschema.users WHERE id = 4",
-            )
-            .await?;
-            assert_batches_eq!(
-                &[
-                    "+----+-------+-------+",
-                    "| id | name  | email |",
-                    "+----+-------+-------+",
-                    "| 4  | Diana |       |",
-                    "+----+-------+-------+",
-                ],
-                &batches
-            );
-
-            // -----------------------------------------------------------------
-            // Step 9: UPDATE multiple columns at once
-            // -----------------------------------------------------------------
-            exec(
-                &rt,
-                "UPDATE test_cat.myschema.users SET name = 'Grace Updated', age = 99 WHERE id = 7",
-            )
-            .await?;
-
-            let batches = run_query(
-                &rt,
-                "SELECT id, name, age FROM test_cat.myschema.users WHERE id = 7",
-            )
-            .await?;
-            assert_batches_eq!(
-                &[
-                    "+----+---------------+-----+",
-                    "| id | name          | age |",
-                    "+----+---------------+-----+",
-                    "| 7  | Grace Updated | 99  |",
-                    "+----+---------------+-----+",
-                ],
-                &batches
-            );
-
-            // Restore ages for subsequent steps: Alice=41, Diana=28, Frank=50, Grace=99
-            // Overall state: 4 rows
-
-            // -----------------------------------------------------------------
-            // Step 10: INSERT after UPDATE — verify correctness
-            // -----------------------------------------------------------------
+            // Note: UPDATE support is not yet available for partitioned Cayenne
+            // tables (reverted in #10061). Steps 6-9 test INSERT/DELETE only.
             exec(
                 &rt,
                 "INSERT INTO test_cat.myschema.users VALUES
@@ -396,8 +306,9 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             assert_eq!(count, 5, "Expected 5 rows after inserting Heidi");
 
             // -----------------------------------------------------------------
-            // Step 11: Aggregation queries — validate computations
+            // Step 7: Aggregation queries — validate computations
             // -----------------------------------------------------------------
+            // Remaining: Alice(30), Diana(28), Frank(40), Grace(33), Heidi(29)
             let avg_age = {
                 let batches = run_query(
                     &rt,
@@ -412,16 +323,15 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
                     .expect("avg_age column")
                     .value(0)
             };
-            // Remaining: Alice(41), Diana(28), Frank(50), Grace Updated(99), Heidi(29)
-            // Average = (41 + 28 + 50 + 99 + 29) / 5 = 247 / 5 = 49.4
+            // Average = (30 + 28 + 40 + 33 + 29) / 5 = 160 / 5 = 32.0
             assert!(
-                (avg_age - 49.4).abs() < f64::EPSILON,
-                "Expected AVG(age) = 49.4, got {avg_age}"
+                (avg_age - 32.0).abs() < f64::EPSILON,
+                "Expected AVG(age) = 32.0, got {avg_age}"
             );
 
             let max_age =
                 query_scalar_i64(&rt, "SELECT MAX(age) FROM test_cat.myschema.users").await?;
-            assert_eq!(max_age, 99, "Expected MAX(age) = 99 (Grace Updated)");
+            assert_eq!(max_age, 40, "Expected MAX(age) = 40 (Frank)");
 
             let min_age =
                 query_scalar_i64(&rt, "SELECT MIN(age) FROM test_cat.myschema.users").await?;
@@ -429,10 +339,10 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
 
             let sum_age =
                 query_scalar_i64(&rt, "SELECT SUM(age) FROM test_cat.myschema.users").await?;
-            assert_eq!(sum_age, 247, "Expected SUM(age) = 247");
+            assert_eq!(sum_age, 160, "Expected SUM(age) = 160");
 
             // -----------------------------------------------------------------
-            // Step 12: NULL handling validation
+            // Step 8: NULL handling validation
             // -----------------------------------------------------------------
             exec(
                 &rt,
@@ -447,10 +357,10 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
 
             let count_email =
                 query_scalar_i64(&rt, "SELECT COUNT(email) FROM test_cat.myschema.users").await?;
-            // Ivan has NULL email, Diana has NULL email (set in Step 8); all others have emails.
+            // Ivan has NULL email; all others have emails.
             assert_eq!(
-                count_email, 4,
-                "COUNT(email) should be 4 (Ivan and Diana have NULL email)"
+                count_email, 5,
+                "COUNT(email) should be 5 (only Ivan has NULL email)"
             );
 
             // Query rows where email IS NULL.
@@ -461,18 +371,17 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             .await?;
             assert_batches_eq!(
                 &[
-                    "+----+-------+",
-                    "| id | name  |",
-                    "+----+-------+",
-                    "| 4  | Diana |",
-                    "| 9  | Ivan  |",
-                    "+----+-------+",
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 9  | Ivan |",
+                    "+----+------+",
                 ],
                 &batches
             );
 
             // -----------------------------------------------------------------
-            // Step 13: DELETE all remaining rows
+            // Step 9: DELETE all remaining rows
             // -----------------------------------------------------------------
             exec(&rt, "DELETE FROM test_cat.myschema.users WHERE true").await?;
 
@@ -481,7 +390,7 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             assert_eq!(count, 0, "Table should be empty after DELETE WHERE true");
 
             // -----------------------------------------------------------------
-            // Step 14: INSERT into empty table after full delete
+            // Step 10: INSERT into empty table after full delete
             // -----------------------------------------------------------------
             exec(
                 &rt,
@@ -538,6 +447,7 @@ async fn cayenne_catalog_ddl_create_if_not_exists() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -554,7 +464,7 @@ async fn cayenne_catalog_ddl_create_if_not_exists() -> Result<(), String> {
             exec(&rt, "CREATE SCHEMA cat_idempotent.s1").await?;
             exec(
                 &rt,
-                "CREATE TABLE cat_idempotent.s1.t1 (id BIGINT NOT NULL, val BIGINT)",
+                "CREATE TABLE cat_idempotent.s1.t1 (id BIGINT NOT NULL, val BIGINT) PARTITION BY id",
             )
             .await?;
 
@@ -564,7 +474,7 @@ async fn cayenne_catalog_ddl_create_if_not_exists() -> Result<(), String> {
             // CREATE TABLE IF NOT EXISTS should not fail or drop data.
             exec(
                 &rt,
-                "CREATE TABLE IF NOT EXISTS cat_idempotent.s1.t1 (id BIGINT NOT NULL, val BIGINT)",
+                "CREATE TABLE IF NOT EXISTS cat_idempotent.s1.t1 (id BIGINT NOT NULL, val BIGINT) PARTITION BY id",
             )
             .await?;
 
@@ -621,6 +531,7 @@ async fn cayenne_catalog_ddl_multiple_tables() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -643,7 +554,7 @@ async fn cayenne_catalog_ddl_multiple_tables() -> Result<(), String> {
                     product_id BIGINT NOT NULL,
                     name VARCHAR NOT NULL,
                     price DOUBLE NOT NULL
-                )",
+                ) PARTITION BY product_id",
             )
             .await?;
 
@@ -653,7 +564,7 @@ async fn cayenne_catalog_ddl_multiple_tables() -> Result<(), String> {
                     order_id BIGINT NOT NULL,
                     product_id BIGINT NOT NULL,
                     quantity BIGINT NOT NULL
-                )",
+                ) PARTITION BY order_id",
             )
             .await?;
 
@@ -773,6 +684,7 @@ async fn cayenne_catalog_ddl_drop_table() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -789,7 +701,7 @@ async fn cayenne_catalog_ddl_drop_table() -> Result<(), String> {
             exec(&rt, "CREATE SCHEMA cat_drop.ns").await?;
             exec(
                 &rt,
-                "CREATE TABLE cat_drop.ns.ephemeral (id BIGINT NOT NULL)",
+                "CREATE TABLE cat_drop.ns.ephemeral (id BIGINT NOT NULL) PARTITION BY id",
             )
             .await?;
 
@@ -814,7 +726,7 @@ async fn cayenne_catalog_ddl_drop_table() -> Result<(), String> {
             // Re-create the table — should work fine.
             exec(
                 &rt,
-                "CREATE TABLE cat_drop.ns.ephemeral (id BIGINT NOT NULL, val VARCHAR)",
+                "CREATE TABLE cat_drop.ns.ephemeral (id BIGINT NOT NULL, val VARCHAR) PARTITION BY id",
             )
             .await?;
 
@@ -866,6 +778,7 @@ async fn cayenne_catalog_ddl_primary_key_upsert() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -891,7 +804,7 @@ async fn cayenne_catalog_ddl_primary_key_upsert() -> Result<(), String> {
                     name VARCHAR NOT NULL,
                     email VARCHAR,
                     PRIMARY KEY (id)
-                )",
+                ) PARTITION BY id",
             )
             .await?;
 
@@ -1058,6 +971,7 @@ async fn cayenne_catalog_ddl_multiple_schemas() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -1078,12 +992,12 @@ async fn cayenne_catalog_ddl_multiple_schemas() -> Result<(), String> {
             // Create tables with the same name in different schemas.
             exec(
                 &rt,
-                "CREATE TABLE cat_schemas.finance.records (id BIGINT NOT NULL, amount DOUBLE)",
+                "CREATE TABLE cat_schemas.finance.records (id BIGINT NOT NULL, amount DOUBLE) PARTITION BY id",
             )
             .await?;
             exec(
                 &rt,
-                "CREATE TABLE cat_schemas.hr.records (id BIGINT NOT NULL, employee VARCHAR)",
+                "CREATE TABLE cat_schemas.hr.records (id BIGINT NOT NULL, employee VARCHAR) PARTITION BY id",
             )
             .await?;
 

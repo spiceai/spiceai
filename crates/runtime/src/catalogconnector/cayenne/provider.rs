@@ -39,6 +39,8 @@ use crate::component::catalog::Catalog;
 use crate::parameters::Parameters;
 use crate::spice_data_base_path;
 use data_components::RefreshableCatalogProvider;
+use data_components::poly::PolyTableProvider;
+use runtime_table_partition::provider::PartitionTableProvider;
 
 use crate::catalogconnector::PartitionAwareCatalog;
 
@@ -501,19 +503,86 @@ impl CayenneSchemaProvider {
         existing_provider: &Arc<dyn TableProvider>,
         refreshed_provider: &Arc<dyn TableProvider>,
     ) -> bool {
-        let Some(existing_cayenne) = Self::cayenne_table_from_provider(existing_provider) else {
-            return false;
-        };
-        let Some(refreshed_cayenne) = Self::cayenne_table_from_provider(refreshed_provider) else {
+        // Case 1: Non-partitioned CayenneTableProvider — refresh in place from the
+        // freshly-loaded provider.
+        if let Some(existing_cayenne) = Self::cayenne_table_from_provider(existing_provider) {
+            let Some(refreshed_cayenne) = Self::cayenne_table_from_provider(refreshed_provider)
+            else {
+                return false;
+            };
+
+            if let Err(err) = existing_cayenne.refresh(refreshed_cayenne).await {
+                tracing::warn!("Failed to refresh Cayenne table provider in place: {err}");
+                return false;
+            }
+
+            return true;
+        }
+
+        // Case 2: PolyTableProvider — extract the writer and check its inner type.
+        let Some(poly) = existing_provider
+            .as_any()
+            .downcast_ref::<PolyTableProvider>()
+        else {
             return false;
         };
 
-        if let Err(err) = existing_cayenne.refresh(refreshed_cayenne).await {
-            tracing::warn!("Failed to refresh Cayenne table provider in place: {err}");
+        let existing_writer = poly.writer();
+
+        // Case 2a: Non-partitioned CayenneTableProvider inside PolyTableProvider.
+        if let Some(existing_cayenne) = existing_writer
+            .as_any()
+            .downcast_ref::<CayenneTableProvider>()
+        {
+            let refreshed_writer = refreshed_provider
+                .as_any()
+                .downcast_ref::<PolyTableProvider>()
+                .map(PolyTableProvider::writer);
+
+            let refreshed_cayenne = refreshed_writer
+                .as_ref()
+                .and_then(|w| w.as_any().downcast_ref::<CayenneTableProvider>());
+
+            if let Some(refreshed) = refreshed_cayenne {
+                if let Err(err) = existing_cayenne.refresh(refreshed).await {
+                    tracing::warn!("Failed to refresh Cayenne table provider in place: {err}");
+                    return false;
+                }
+                return true;
+            }
+
             return false;
         }
 
-        true
+        // Case 2b: PartitionTableProvider inside PolyTableProvider — refresh each
+        // partition's inner CayenneTableProvider from itself (reloads deletion
+        // vectors, protected snapshots, snapshot ID, and listing table from the
+        // catalog).
+        if let Some(partition_provider) = existing_writer
+            .as_any()
+            .downcast_ref::<PartitionTableProvider>()
+        {
+            let providers = partition_provider.partition_table_providers().await;
+            for provider in &providers {
+                // Each partition's inner provider is a CayenneTableProvider.
+                let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>() else {
+                    tracing::warn!(
+                        "Partition sub-provider is not a CayenneTableProvider, skipping refresh"
+                    );
+                    continue;
+                };
+                if let Err(err) = cayenne.refresh(cayenne).await {
+                    tracing::warn!("Failed to refresh partitioned Cayenne table in place: {err}");
+                    // Fail safely: keep the existing partitioned provider rather than
+                    // signaling failure that would cause it to be replaced by a
+                    // non-partitioned provider.
+                    return true;
+                }
+            }
+            return true;
+        }
+
+        false
     }
 
     fn cayenne_table_from_provider(

@@ -34,7 +34,7 @@ use datafusion::{
     execution::{
         DiskManager, SessionStateBuilder,
         disk_manager::DiskManagerMode,
-        memory_pool::{FairSpillPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool},
+        memory_pool::{GreedyMemoryPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
     optimizer::{
@@ -65,7 +65,10 @@ use datafusion_optimizer_rules::{
     logical_plan::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
     },
-    physical_plan::EmptyHashJoinExecPhysicalOptimization,
+    physical_plan::{
+        EmptyHashJoinExecPhysicalOptimization,
+        flightsql::aggregate_pushdown::FlightSQLPartialAggregatePushdown,
+    },
 };
 use runtime_datafusion::{
     extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
@@ -340,6 +343,13 @@ impl DataFusionBuilder {
                 Arc::new(Box::new(track_bytes_processed)),
             )));
 
+        if matches!(
+            self.cluster_config.as_ref().and_then(|cfg| cfg.role()),
+            Some(ClusterRole::Scheduler)
+        ) {
+            state = state.with_physical_optimizer_rule(FlightSQLPartialAggregatePushdown::new());
+        }
+
         let mut state = state.build();
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
@@ -607,7 +617,7 @@ pub(crate) fn runtime_env(
             unreachable!("Memory pool TopN must be greater than 0");
         };
 
-        Arc::new(TrackConsumersPool::new(FairSpillPool::new(limit), topn))
+        Arc::new(TrackConsumersPool::new(GreedyMemoryPool::new(limit), topn))
     } else {
         let Some(topn) = NonZeroUsize::new(5) else {
             unreachable!("Memory pool TopN must be greater than 0");

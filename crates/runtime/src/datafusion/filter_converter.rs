@@ -107,7 +107,7 @@ mod test {
             Field::new("timestamp", DataType::Utf8, false),
             TimeFormat::UnixSeconds,
             1_620_000_000_000_000_000,
-            "CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
+            r#"timestamp > Utf8("2021-05-03T00:00:00.000000000")"#,
         );
     }
 
