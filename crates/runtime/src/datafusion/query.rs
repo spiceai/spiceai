@@ -1320,11 +1320,20 @@ fn extract_dml_target_table(plan: &LogicalPlan) -> Option<TableReference> {
         LogicalPlan::Dml(dml) => Some(dml.table_name.clone()),
         #[cfg(not(windows))]
         LogicalPlan::Extension(ext) => {
-            use super::cayenne_ddl::logical_nodes::DistributedCayenneDeleteNode;
+            use super::cayenne_ddl::logical_nodes::{
+                DistributedCayenneDeleteNode, DistributedCayenneUpdateNode,
+            };
             if let Some(n) = ext
                 .node
                 .as_any()
                 .downcast_ref::<DistributedCayenneDeleteNode>()
+            {
+                return Some(n.table_name.clone());
+            }
+            if let Some(n) = ext
+                .node
+                .as_any()
+                .downcast_ref::<DistributedCayenneUpdateNode>()
             {
                 return Some(n.table_name.clone());
             }
@@ -1341,11 +1350,21 @@ fn extract_dml_target_table(plan: &LogicalPlan) -> Option<TableReference> {
 fn is_dml_extension(plan: &LogicalPlan) -> bool {
     #[cfg(not(windows))]
     if let LogicalPlan::Extension(ext) = plan {
-        use super::cayenne_ddl::logical_nodes::DistributedCayenneDeleteNode;
+        use super::cayenne_ddl::logical_nodes::{
+            DistributedCayenneDeleteNode, DistributedCayenneUpdateNode,
+        };
         if ext
             .node
             .as_any()
             .downcast_ref::<DistributedCayenneDeleteNode>()
+            .is_some()
+        {
+            return true;
+        }
+        if ext
+            .node
+            .as_any()
+            .downcast_ref::<DistributedCayenneUpdateNode>()
             .is_some()
         {
             return true;

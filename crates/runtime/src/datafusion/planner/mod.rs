@@ -25,10 +25,10 @@ limitations under the License.
 //!    the AST, stored in the [`DdlExtensionStore`], and stripped before
 //!    delegating to DataFusion.
 //!
-//! 2. **DML interception** — DELETE statements targeting Cayenne catalog
-//!    tables are converted into [`LogicalPlan::Extension`] nodes directly
-//!    for distributed mode. Support for additional DML types (UPDATE,
-//!    INSERT, MERGE) may be added in the future.
+//! 2. **DML interception** — DELETE and UPDATE statements targeting Cayenne
+//!    catalog tables are converted into [`LogicalPlan::Extension`] nodes
+//!    directly for distributed mode. Support for additional DML types
+//!    (INSERT, MERGE) may be added in the future.
 //!
 //! For everything else, the planner delegates to DataFusion's standard
 //! `session.statement_to_plan()` path.
@@ -37,12 +37,15 @@ mod create_table;
 mod delete;
 pub mod logical_nodes;
 pub mod physical_execs;
+mod update;
 
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::sql::TableReference;
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::Statement as SQLStatement;
+use datafusion_expr::WriteOp;
 
 use crate::config::ClusterRole;
 use crate::datafusion::ddl::acceleration_options::SharedDdlExtensionStore;
@@ -103,10 +106,15 @@ pub async fn create_logical_plan(
 
             // DML: DELETE on Cayenne tables (only when Cayenne is active)
             SQLStatement::Delete(_) if ctx.catalog_mode == CatalogMode::Cayenne => {
-                return plan_cayenne_delete(statement, session, ctx).await;
+                return plan_cayenne_dml(statement, session, ctx, WriteOp::Delete).await;
             }
 
-            // Future: SQLStatement::Update { .. }, SQLStatement::Merge { .. }
+            // DML: UPDATE on Cayenne tables (only when Cayenne is active)
+            SQLStatement::Update { .. } if ctx.catalog_mode == CatalogMode::Cayenne => {
+                return plan_cayenne_dml(statement, session, ctx, WriteOp::Update).await;
+            }
+
+            // Future: SQLStatement::Merge { .. }
             _ => {}
         }
     }
@@ -115,57 +123,69 @@ pub async fn create_logical_plan(
     session.statement_to_plan(statement).await
 }
 
-/// Plan a DELETE statement, producing either a local or distributed Cayenne
-/// extension node.
+/// Plan a DML statement (DELETE or UPDATE), producing either a local or
+/// distributed Cayenne extension node.
 ///
 /// For local mode, returns the standard DataFusion plan unchanged — Cayenne's
-/// `TableProvider` implementation handles DELETE natively via `DeletionExec`.
+/// `TableProvider` implementation handles DML natively.
 ///
-/// For distributed (scheduler) mode, wraps the plan into a
-/// `DistributedCayenneDeleteNode` that forwards the operation to executors.
-async fn plan_cayenne_delete(
+/// For distributed (scheduler) mode, wraps the plan into a distributed
+/// extension node that forwards the operation to executors.
+async fn plan_cayenne_dml(
     statement: Statement,
     session: &SessionState,
     ctx: &PlannerContext,
+    expected_op: WriteOp,
 ) -> DFResult<LogicalPlan> {
-    // Let DataFusion plan the DELETE to get the validated DmlStatement
+    // Let DataFusion plan the DML to get the validated DmlStatement
     let df_plan = session.statement_to_plan(statement).await?;
 
-    // If not in distributed mode, Cayenne's TableProvider handles DELETE
+    // If not in distributed mode, Cayenne's TableProvider handles DML
     // natively through DataFusion's standard physical planning. Return as-is.
     if !matches!(ctx.cluster_role, Some(ClusterRole::Scheduler)) {
         return Ok(df_plan);
     }
 
     let LogicalPlan::Dml(dml) = &df_plan else {
-        return Err(DataFusionError::Internal(
-            "Expected LogicalPlan::Dml for DELETE statement".to_string(),
-        ));
+        return Err(DataFusionError::Internal(format!(
+            "Expected LogicalPlan::Dml for {expected_op:?} statement"
+        )));
     };
 
-    if !matches!(&dml.op, datafusion::logical_expr::WriteOp::Delete) {
+    if !matches_write_op(&dml.op, &expected_op) {
         return Err(DataFusionError::Internal(format!(
-            "Expected WriteOp::Delete, got {:?}",
+            "Expected WriteOp::{expected_op:?}, got {:?}",
             dml.op
         )));
     }
 
     // Check if the target table is in a Cayenne catalog
-    let catalog_name = dml.table_name.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
-
-    let is_cayenne = {
-        let catalog_list = session.catalog_list();
-        if let Some(catalog) = catalog_list.catalog(catalog_name) {
-            super::cayenne_ddl::is_cayenne_catalog(catalog.as_ref())
-        } else {
-            false
-        }
-    };
-
-    // If not a Cayenne table, return the standard DF plan unchanged
-    if !is_cayenne {
+    if !is_cayenne_table(session, &dml.table_name) {
         return Ok(df_plan);
     }
 
-    delete::plan_distributed_delete(dml)
+    match expected_op {
+        WriteOp::Delete => delete::plan_distributed_delete(dml),
+        WriteOp::Update => update::plan_distributed_update(dml),
+        _ => Err(DataFusionError::Internal(format!(
+            "Unsupported DML operation: {expected_op:?}"
+        ))),
+    }
+}
+
+/// Check if a table is in a Cayenne-backed catalog.
+fn is_cayenne_table(session: &SessionState, table_name: &TableReference) -> bool {
+    let catalog_name = table_name.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
+    let catalog_list = session.catalog_list();
+    if let Some(catalog) = catalog_list.catalog(catalog_name) {
+        super::cayenne_ddl::is_cayenne_catalog(catalog.as_ref())
+    } else {
+        false
+    }
+}
+
+/// Check if `WriteOp` matches the expected operation.
+/// `Insert` variants carry data, so use discriminant-level matching.
+fn matches_write_op(actual: &WriteOp, expected: &WriteOp) -> bool {
+    std::mem::discriminant(actual) == std::mem::discriminant(expected)
 }
