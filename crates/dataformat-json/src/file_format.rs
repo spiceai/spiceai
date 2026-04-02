@@ -845,4 +845,279 @@ mod tests {
         assert!(schema.field_with_name("a").is_ok());
         assert!(schema.field_with_name("b").is_ok());
     }
+
+    #[test]
+    fn test_infer_schema_auto_object_with_nested_array() {
+        // A single JSON object containing an array field (common API response shape)
+        let buf = br#"{
+  "airports": [
+    {"code": "ATL", "name": "Hartsfield-Jackson Atlanta International"},
+    {"code": "PEK", "name": "Beijing Capital International"}
+  ]
+}"#;
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(buf, Format::Auto, &mut take)
+            .expect("Auto should infer schema from object with nested array");
+        assert_eq!(schema.fields().len(), 1);
+        assert!(schema.field_with_name("airports").is_ok());
+    }
+
+    #[test]
+    fn test_infer_schema_object_with_nested_array() {
+        let buf = br#"{
+  "airports": [
+    {"code": "ATL", "name": "Hartsfield-Jackson Atlanta International"},
+    {"code": "PEK", "name": "Beijing Capital International"}
+  ]
+}"#;
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(buf, Format::Object, &mut take)
+            .expect("Object should infer schema from object with nested array");
+        assert_eq!(schema.fields().len(), 1);
+        assert!(schema.field_with_name("airports").is_ok());
+    }
+
+    // ----------------------------------------------------------------
+    // File-based schema inference tests using committed JSON fixtures
+    // ----------------------------------------------------------------
+
+    const TEST_DATA_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/test_data/");
+
+    fn load_fixture(name: &str) -> Vec<u8> {
+        let path = format!("{TEST_DATA_DIR}{name}");
+        std::fs::read(&path).unwrap_or_else(|e| panic!("Failed to read fixture {path}: {e}"))
+    }
+
+    // ---- JSONL fixtures ----
+
+    #[test]
+    fn test_fixture_jsonl_standard_schema() {
+        let data = load_fixture("jsonl_standard.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Jsonl, &mut take)
+            .expect("Jsonl schema from jsonl_standard.json");
+        assert_eq!(schema.fields().len(), 3);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+        assert!(schema.field_with_name("active").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_jsonl_standard_auto_schema() {
+        let data = load_fixture("jsonl_standard.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
+            .expect("Auto schema from jsonl_standard.json");
+        assert_eq!(schema.fields().len(), 3);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+        assert!(schema.field_with_name("active").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_jsonl_crlf_schema() {
+        let data = load_fixture("jsonl_crlf.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Jsonl, &mut take)
+            .expect("Jsonl schema from jsonl_crlf.json");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("id").is_ok());
+        assert!(schema.field_with_name("status").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_jsonl_nested_schema() {
+        let data = load_fixture("jsonl_nested.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Jsonl, &mut take)
+            .expect("Jsonl schema from jsonl_nested.json");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("user").is_ok());
+        assert!(schema.field_with_name("scores").is_ok());
+    }
+
+    // ---- Array fixtures ----
+
+    #[test]
+    fn test_fixture_array_standard_schema() {
+        let data = load_fixture("array_standard.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
+            .expect("Array schema from array_standard.json");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_array_standard_auto_schema() {
+        let data = load_fixture("array_standard.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
+            .expect("Auto schema from array_standard.json");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_array_pretty_schema() {
+        let data = load_fixture("array_pretty.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
+            .expect("Array schema from array_pretty.json");
+        assert_eq!(schema.fields().len(), 3);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+        assert!(schema.field_with_name("city").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_array_single_schema() {
+        let data = load_fixture("array_single.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
+            .expect("Array schema from array_single.json");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("only").is_ok());
+        assert!(schema.field_with_name("value").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_array_nested_schema() {
+        let data = load_fixture("array_nested.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
+            .expect("Array schema from array_nested.json");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("tags").is_ok());
+        assert!(schema.field_with_name("meta").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_array_mixed_types_schema() {
+        let data = load_fixture("array_mixed_types.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
+            .expect("Array schema from array_mixed_types.json");
+        assert_eq!(schema.fields().len(), 7);
+        assert!(schema.field_with_name("str").is_ok());
+        assert!(schema.field_with_name("int").is_ok());
+        assert!(schema.field_with_name("float").is_ok());
+        assert!(schema.field_with_name("bool").is_ok());
+        assert!(schema.field_with_name("null_val").is_ok());
+        assert!(schema.field_with_name("nested").is_ok());
+        assert!(schema.field_with_name("arr").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_array_empty_schema() {
+        let data = load_fixture("array_empty.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
+            .expect("Array schema from array_empty.json");
+        assert_eq!(schema.fields().len(), 0);
+    }
+
+    // ---- Object fixtures ----
+
+    #[test]
+    fn test_fixture_object_single_schema() {
+        let data = load_fixture("object_single.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
+            .expect("Object schema from object_single.json");
+        assert_eq!(schema.fields().len(), 4);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+        assert!(schema.field_with_name("active").is_ok());
+        assert!(schema.field_with_name("scores").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_object_pretty_schema() {
+        let data = load_fixture("object_pretty.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
+            .expect("Object schema from object_pretty.json");
+        assert_eq!(schema.fields().len(), 4);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+        assert!(schema.field_with_name("address").is_ok());
+        assert!(schema.field_with_name("tags").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_object_pretty_auto_schema() {
+        // Key test: Auto should handle pretty-printed multi-line object
+        let data = load_fixture("object_pretty.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
+            .expect("Auto schema from object_pretty.json");
+        assert_eq!(schema.fields().len(), 4);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+        assert!(schema.field_with_name("address").is_ok());
+        assert!(schema.field_with_name("tags").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_object_nulls_schema() {
+        let data = load_fixture("object_nulls.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
+            .expect("Object schema from object_nulls.json");
+        assert_eq!(schema.fields().len(), 4);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("middle_name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+        assert!(schema.field_with_name("nickname").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_object_empty_schema() {
+        let data = load_fixture("object_empty.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
+            .expect("Object schema from object_empty.json");
+        assert_eq!(schema.fields().len(), 0);
+    }
+
+    // ---- Airports fixture (pretty-printed multi-line object with nested array) ----
+
+    #[test]
+    fn test_fixture_airports_object_schema() {
+        let data = load_fixture("object_airports.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
+            .expect("Object schema from object_airports.json");
+        assert_eq!(schema.fields().len(), 3);
+        assert!(schema.field_with_name("airports").is_ok());
+        assert!(schema.field_with_name("count").is_ok());
+        assert!(schema.field_with_name("source").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_airports_auto_schema() {
+        let data = load_fixture("object_airports.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
+            .expect("Auto schema from object_airports.json");
+        assert_eq!(schema.fields().len(), 3);
+        assert!(schema.field_with_name("airports").is_ok());
+        assert!(schema.field_with_name("count").is_ok());
+        assert!(schema.field_with_name("source").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_airports_json_schema() {
+        let data = load_fixture("object_airports.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Json, &mut take)
+            .expect("Json schema from object_airports.json");
+        assert_eq!(schema.fields().len(), 3);
+        assert!(schema.field_with_name("airports").is_ok());
+        assert!(schema.field_with_name("count").is_ok());
+        assert!(schema.field_with_name("source").is_ok());
+    }
 }
