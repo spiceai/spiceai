@@ -1313,7 +1313,7 @@ fn reconcile_stream_nullability(
 
 /// Extract the target table reference from a DML logical plan.
 ///
-/// Handles both standard DataFusion `LogicalPlan::Dml` nodes and
+/// Handles both standard `DataFusion` `LogicalPlan::Dml` nodes and
 /// distributed Cayenne DML extension nodes.
 fn extract_dml_target_table(plan: &LogicalPlan) -> Option<TableReference> {
     match plan {

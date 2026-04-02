@@ -20,7 +20,7 @@ limitations under the License.
 //! that forwards the DELETE to executor nodes.
 //!
 //! In local mode, DELETE is handled by Cayenne's `TableProvider` implementation
-//! through DataFusion's standard physical planning — no interception needed.
+//! through `DataFusion`'s standard physical planning — no interception needed.
 
 use std::sync::Arc;
 
@@ -31,11 +31,11 @@ use datafusion_expr::DmlStatement;
 use crate::datafusion::cayenne_ddl::analyzer_rule::extract_filter_sql;
 use crate::datafusion::cayenne_ddl::logical_nodes::DistributedCayenneDeleteNode;
 
-/// Wrap a DataFusion `DmlStatement` (DELETE) into a distributed Cayenne
+/// Wrap a `DataFusion` `DmlStatement` (DELETE) into a distributed Cayenne
 /// extension node for forwarding to executor nodes.
 ///
 /// This is only called in distributed (scheduler) mode. In local mode,
-/// the standard DataFusion plan is returned unchanged by the caller.
+/// the standard `DataFusion` plan is returned unchanged by the caller.
 pub(super) fn plan_distributed_delete(dml: &DmlStatement) -> DFResult<LogicalPlan> {
     let filter_sql = extract_filter_sql(&dml.input)?;
 

@@ -20,7 +20,7 @@ limitations under the License.
 //! (`acceleration.*`, `dataset.*`) and/or `PARTITION BY` clauses. Extracts
 //! these extensions from the AST, stores them in the [`DdlExtensionStore`]
 //! for the analyzer rule to consume, strips them from the statement, and
-//! delegates the cleaned statement to DataFusion's standard planner.
+//! delegates the cleaned statement to `DataFusion`'s standard planner.
 
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
@@ -90,14 +90,13 @@ pub(super) async fn plan_create_table(
         Ok(plan) => Ok(plan),
         Err(e) => {
             // Clean up the store entry if planning fails.
-            if let Some(ref key) = store_key {
-                if let Err(cleanup_err) = cleanup_store_entry(ddl_store, key) {
+            if let Some(ref key) = store_key
+                && let Err(cleanup_err) = cleanup_store_entry(ddl_store, key) {
                     tracing::warn!(
                         "Failed to clean up DDL extension store entry for {key} \
                          after planning failure: {cleanup_err}"
                     );
                 }
-            }
             Err(e)
         }
     }
@@ -534,7 +533,7 @@ mod tests {
             "CREATE TABLE foo (id INT, p TEXT, PRIMARY KEY (id, p)) PARTITION BY p",
         );
         let store = new_shared_store();
-        assert!(extract_and_store_extensions(ct, &store).is_ok());
+        extract_and_store_extensions(ct, &store).unwrap();
     }
 
     #[test]
@@ -546,7 +545,7 @@ mod tests {
         let err = extract_and_store_extensions(ct, &store)
             .expect_err("should error")
             .to_string();
-        assert!(err.contains("p"), "should mention missing column: {err}");
+        assert!(err.contains('p'), "should mention missing column: {err}");
         assert!(
             err.to_lowercase().contains("primary key"),
             "should mention primary key: {err}"
@@ -560,14 +559,14 @@ mod tests {
         let err = extract_and_store_extensions(ct, &store)
             .expect_err("should error")
             .to_string();
-        assert!(err.contains("p"));
+        assert!(err.contains('p'));
     }
 
     #[test]
     fn test_partition_by_no_primary_key_ok() {
         let ct = parse_create_table("CREATE TABLE foo (id INT, p TEXT) PARTITION BY p");
         let store = new_shared_store();
-        assert!(extract_and_store_extensions(ct, &store).is_ok());
+        extract_and_store_extensions(ct, &store).unwrap();
     }
 
     #[test]
@@ -576,7 +575,7 @@ mod tests {
             "CREATE TABLE foo (a INT, b TEXT, c VARCHAR, PRIMARY KEY (a, b)) PARTITION BY b",
         );
         let store = new_shared_store();
-        assert!(extract_and_store_extensions(ct, &store).is_ok());
+        extract_and_store_extensions(ct, &store).unwrap();
     }
 
     #[test]
@@ -585,7 +584,7 @@ mod tests {
             "CREATE TABLE foo (id INT, region TEXT, PRIMARY KEY (id, region)) PARTITION BY bucket(4, region)",
         );
         let store = new_shared_store();
-        assert!(extract_and_store_extensions(ct, &store).is_ok());
+        extract_and_store_extensions(ct, &store).unwrap();
     }
 
     #[test]
