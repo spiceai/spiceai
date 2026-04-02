@@ -41,7 +41,7 @@ use runtime_table_partition::expression::validate_partition_expression;
 use super::is_cayenne_catalog;
 use super::logical_nodes::{
     CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode,
-    DistributedCayenneDeleteNode, DistributedCayenneInsertNode, DistributedCayenneUpdateNode,
+    DistributedCayenneInsertNode,
 };
 use crate::datafusion::ddl::acceleration_options::SharedDdlExtensionStore;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
@@ -253,72 +253,6 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                     drop.if_exists,
                     catalog_name,
                     schema_name,
-                );
-
-                Ok(LogicalPlan::Extension(Extension {
-                    node: Arc::new(node),
-                }))
-            }
-            LogicalPlan::Dml(DmlStatement {
-                input,
-                table_name,
-                op: WriteOp::Delete,
-                output_schema,
-                ..
-            }) => {
-                let catalog_name = table_name
-                    .catalog()
-                    .unwrap_or(SPICE_DEFAULT_CATALOG)
-                    .to_string();
-
-                if !self.is_ddl_enabled(&catalog_name) || !self.is_cayenne_backed(&catalog_name) {
-                    return Ok(plan);
-                }
-
-                if !self.apply_distributed_nodes {
-                    return Ok(plan);
-                }
-
-                let filter_sql = extract_filter_sql(input)?;
-
-                Ok(LogicalPlan::Extension(Extension {
-                    node: Arc::new(DistributedCayenneDeleteNode::new(
-                        table_name.clone(),
-                        Arc::clone(input),
-                        Arc::clone(output_schema),
-                        filter_sql,
-                    )),
-                }))
-            }
-            LogicalPlan::Dml(DmlStatement {
-                input,
-                table_name,
-                op: WriteOp::Update,
-                output_schema,
-                ..
-            }) => {
-                let catalog_name = table_name
-                    .catalog()
-                    .unwrap_or(SPICE_DEFAULT_CATALOG)
-                    .to_string();
-
-                if !self.is_ddl_enabled(&catalog_name) || !self.is_cayenne_backed(&catalog_name) {
-                    return Ok(plan);
-                }
-
-                if !self.apply_distributed_nodes {
-                    return Ok(plan);
-                }
-
-                let filter_sql = extract_filter_sql(input)?;
-                let assignments_sql = extract_update_assignments(input, table_name)?;
-
-                let node = DistributedCayenneUpdateNode::new(
-                    table_name.clone(),
-                    Arc::clone(input),
-                    Arc::clone(output_schema),
-                    filter_sql,
-                    assignments_sql,
                 );
 
                 Ok(LogicalPlan::Extension(Extension {

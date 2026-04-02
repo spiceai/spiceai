@@ -87,54 +87,58 @@ pub fn scalar_to_attribute_value(
         }
         ScalarValue::Decimal128(Some(v), _precision, scale) => {
             let scale = *scale;
-            let s = if scale > 0 {
-                let scale_u32 = u32::try_from(scale).unwrap_or(0);
-                let divisor = 10_i128.pow(scale_u32);
-                let whole = v / divisor;
-                let frac = (v % divisor).unsigned_abs();
-                // When the value is negative but |v| < divisor, whole is 0 and
-                // the sign would be lost. Emit an explicit "-" prefix.
-                let sign = if *v < 0 && whole == 0 { "-" } else { "" };
-                format!("{sign}{whole}.{frac:0>width$}", width = scale_u32 as usize)
-            } else if scale < 0 {
-                // Negative scale means multiply by 10^|scale| (e.g. value 123
-                // with scale -2 represents 12300).
-                let abs_scale = u32::try_from(scale.unsigned_abs()).unwrap_or(0);
-                let multiplier = 10_i128.pow(abs_scale);
-                v.checked_mul(multiplier)
-                    .map_or_else(|| v.to_string(), |result| result.to_string())
-            } else {
-                v.to_string()
+            let s = match scale.cmp(&0) {
+                std::cmp::Ordering::Greater => {
+                    let scale_u32 = u32::from(scale.unsigned_abs());
+                    let divisor = 10_i128.pow(scale_u32);
+                    let whole = v / divisor;
+                    let frac = (v % divisor).unsigned_abs();
+                    // When the value is negative but |v| < divisor, whole is 0 and
+                    // the sign would be lost. Emit an explicit "-" prefix.
+                    let sign = if *v < 0 && whole == 0 { "-" } else { "" };
+                    format!("{sign}{whole}.{frac:0>width$}", width = scale_u32 as usize)
+                }
+                std::cmp::Ordering::Less => {
+                    // Negative scale means multiply by 10^|scale| (e.g. value 123
+                    // with scale -2 represents 12300).
+                    let abs_scale = u32::from(scale.unsigned_abs());
+                    let multiplier = 10_i128.pow(abs_scale);
+                    v.checked_mul(multiplier)
+                        .map_or_else(|| v.to_string(), |result| result.to_string())
+                }
+                std::cmp::Ordering::Equal => v.to_string(),
             };
             Ok(AttributeValue::N(s))
         }
         ScalarValue::Decimal256(Some(v), _precision, scale) => {
             let scale = *scale;
-            let s = if scale > 0 {
-                let scale_u32 = u32::try_from(scale).unwrap_or(0);
-                let divisor = arrow::datatypes::i256::from_i128(10_i128.pow(scale_u32));
-                let whole = v.wrapping_div(divisor);
-                let frac = v.wrapping_rem(divisor).wrapping_abs();
-                // Same sign-loss fix as Decimal128.
-                let sign = if v.is_negative() && whole == arrow::datatypes::i256::ZERO {
-                    "-"
-                } else {
-                    ""
-                };
-                // i256::Display does not forward fill/width, so convert first.
-                let frac_str = format!("{frac}");
-                format!(
-                    "{sign}{whole}.{frac_str:0>width$}",
-                    width = scale_u32 as usize
-                )
-            } else if scale < 0 {
-                // Negative scale means multiply by 10^|scale|.
-                let abs_scale = u32::try_from(scale.unsigned_abs()).unwrap_or(0);
-                let multiplier = arrow::datatypes::i256::from_i128(10_i128.pow(abs_scale));
-                let result = v.wrapping_mul(multiplier);
-                format!("{result}")
-            } else {
-                format!("{v}")
+            let s = match scale.cmp(&0) {
+                std::cmp::Ordering::Greater => {
+                    let scale_u32 = u32::from(scale.unsigned_abs());
+                    let divisor = arrow::datatypes::i256::from_i128(10_i128.pow(scale_u32));
+                    let whole = v.wrapping_div(divisor);
+                    let frac = v.wrapping_rem(divisor).wrapping_abs();
+                    // Same sign-loss fix as Decimal128.
+                    let sign = if v.is_negative() && whole == arrow::datatypes::i256::ZERO {
+                        "-"
+                    } else {
+                        ""
+                    };
+                    // i256::Display does not forward fill/width, so convert first.
+                    let frac_str = format!("{frac}");
+                    format!(
+                        "{sign}{whole}.{frac_str:0>width$}",
+                        width = scale_u32 as usize
+                    )
+                }
+                std::cmp::Ordering::Less => {
+                    // Negative scale means multiply by 10^|scale|.
+                    let abs_scale = u32::from(scale.unsigned_abs());
+                    let multiplier = arrow::datatypes::i256::from_i128(10_i128.pow(abs_scale));
+                    let result = v.wrapping_mul(multiplier);
+                    format!("{result}")
+                }
+                std::cmp::Ordering::Equal => format!("{v}"),
             };
             Ok(AttributeValue::N(s))
         }
@@ -494,7 +498,7 @@ mod tests {
 
     #[test]
     fn float64_finite_accepted() {
-        let scalar = ScalarValue::Float64(Some(3.14));
-        assert_number(&scalar, "3.14");
+        let scalar = ScalarValue::Float64(Some(2.718));
+        assert_number(&scalar, "2.718");
     }
 }
