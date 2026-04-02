@@ -56,7 +56,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
+    dataaccelerator::{FilePathError, snapshots::{download_snapshot_if_needed, snapshot_before_recreate}},
     datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
     parameters::ParameterSpec,
@@ -454,10 +454,18 @@ impl DataAccelerator for TursoAccelerator {
                 .into());
             }
 
-            // If mode is FileCreate, delete the existing file to start fresh
+            // If mode is FileCreate, snapshot the existing file (if enabled) then delete it to start fresh
             if acceleration.mode == Mode::FileCreate {
                 let file_path = std::path::Path::new(&path);
                 if file_path.exists() {
+                    snapshot_before_recreate(
+                        acceleration,
+                        &source.name().to_string(),
+                        runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(&path)),
+                        AccelerationEngine::Turso,
+                    )
+                    .await;
+
                     tracing::warn!(
                         "Turso acceleration mode is 'file_create', removing existing file: {}",
                         path
@@ -676,6 +684,21 @@ impl DataAccelerator for TursoAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    async fn drop_table(
+        &self,
+        table_name: &str,
+        source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let pool = self.get_shared_pool(source).await?;
+        let conn = pool.connect().await?;
+        let drop_sql = format!("DROP TABLE IF EXISTS \"{table_name}\"");
+        conn.execute(&drop_sql, ()).await.map_err(|e| {
+            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        tracing::info!("Dropped Turso table '{table_name}' for schema recreation (file_update mode)");
+        Ok(())
     }
 }
 

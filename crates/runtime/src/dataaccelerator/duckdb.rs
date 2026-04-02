@@ -24,7 +24,7 @@ use crate::{
         },
         view::View,
     },
-    dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
+    dataaccelerator::{FilePathError, snapshots::{download_snapshot_if_needed, snapshot_before_recreate}},
     datafusion::{
         dialect::new_duckdb_dialect,
         sort_columns::{SortColumn, parse_sort_columns},
@@ -50,7 +50,7 @@ use datafusion::{
 };
 use datafusion_table_providers::{
     duckdb::{
-        DuckDBSettingsRegistry, DuckDBTableProviderFactory,
+        DuckDB, DuckDBSettingsRegistry, DuckDBTableProviderFactory,
         write::{DuckDBTableWriter, WriteCompletionHandler},
     },
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
@@ -154,7 +154,7 @@ impl DuckDBAccelerator {
         })?;
 
         let pool = match (duckdb_file, acceleration.mode) {
-            (Ok(duckdb_file), Mode::File | Mode::FileCreate) => {
+            (Ok(duckdb_file), Mode::File | Mode::FileCreate | Mode::FileUpdate) => {
                 let num_accelerating_datasets = self.get_num_accelerating_datasets(
                     Some(duckdb_file.as_str()),
                     &source.app(),
@@ -185,7 +185,7 @@ impl DuckDBAccelerator {
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?
             }
-            (Err(e), Mode::File | Mode::FileCreate) => {
+            (Err(e), Mode::File | Mode::FileCreate | Mode::FileUpdate) => {
                 return Err(Error::InvalidConfiguration {
                     detail: Arc::from(e.to_string()),
                 });
@@ -212,7 +212,7 @@ impl DuckDBAccelerator {
 
                 // If the path is Some, we're counting the number of file instances
                 if let Some(this_file_path) = path {
-                    if matches!(acceleration.mode, Mode::File | Mode::FileCreate)
+                    if matches!(acceleration.mode, Mode::File | Mode::FileCreate | Mode::FileUpdate)
                         && let Ok(file_path) = self.file_path(ds.as_ref())
                         && this_file_path == file_path
                     {
@@ -376,10 +376,18 @@ impl DataAccelerator for DuckDBAccelerator {
                 .into());
             }
 
-            // If mode is FileCreate, delete the existing file to start fresh
+            // If mode is FileCreate, snapshot the existing file (if enabled) then delete it to start fresh
             if acceleration.mode == Mode::FileCreate {
                 let file_path = std::path::Path::new(&path);
                 if file_path.exists() {
+                    snapshot_before_recreate(
+                        acceleration,
+                        &source.name().to_string(),
+                        runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(&path)),
+                        AccelerationEngine::DuckDB,
+                    )
+                    .await;
+
                     tracing::warn!(
                         "DuckDB acceleration mode is 'file_create', removing existing file: {}",
                         path
@@ -470,7 +478,7 @@ impl DataAccelerator for DuckDBAccelerator {
                     .filter_map(|other_source| {
                         if other_source.acceleration().is_some_and(|a| {
                             a.engine == Engine::DuckDB
-                                && matches!(a.mode, Mode::File | Mode::FileCreate)
+                                && matches!(a.mode, Mode::File | Mode::FileCreate | Mode::FileUpdate)
                         }) {
                             if other_source.name() == source.name() {
                                 None
@@ -563,6 +571,28 @@ impl DataAccelerator for DuckDBAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    async fn drop_table(
+        &self,
+        table_name: &str,
+        source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let pool = Arc::new(self.get_shared_pool(source).await?);
+        let mut conn = pool.connect_sync()?;
+        let duckdb_conn = DuckDB::duckdb_conn(&mut conn).boxed()?;
+        let drop_sql = format!("DROP TABLE IF EXISTS \"{table_name}\"");
+        duckdb_conn
+            .get_underlying_conn_mut()
+            .execute(&drop_sql, [])
+            .boxed()?;
+        // Also drop any internal DuckDB tables associated with this table
+        let internal_drop = format!("DROP TABLE IF EXISTS \"__data_{table_name}\"");
+        let _ = duckdb_conn
+            .get_underlying_conn_mut()
+            .execute(&internal_drop, []);
+        tracing::info!("Dropped DuckDB table '{table_name}' for schema recreation (file_update mode)");
+        Ok(())
     }
 }
 
@@ -1751,5 +1781,67 @@ mod tests {
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "should have 3 rows");
+    }
+
+    /// Tests that the DROP TABLE SQL used by `drop_table` correctly removes a table.
+    #[tokio::test]
+    async fn test_drop_table_sql_removes_table() {
+        use datafusion_table_providers::duckdb::DuckDB;
+        use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+
+        let pool = Arc::new(
+            DuckDbConnectionPool::new_memory().expect("to create DuckDB connection pool"),
+        );
+        let mut conn = pool.connect_sync().expect("to get connection from pool");
+        let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("to get DuckDB connection");
+
+        let table_name = "drop_test_table";
+        let underlying = duckdb_conn.get_underlying_conn_mut();
+
+        // Create a table
+        underlying
+            .execute(
+                &format!("CREATE TABLE \"{table_name}\" (id INTEGER, name VARCHAR)"),
+                [],
+            )
+            .expect("create table should succeed");
+
+        // Insert data
+        underlying
+            .execute(
+                &format!("INSERT INTO \"{table_name}\" VALUES (1, 'alice')"),
+                [],
+            )
+            .expect("insert should succeed");
+
+        // Verify table exists
+        let count: i32 = underlying
+            .query_row(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+                [table_name],
+                |row| row.get(0),
+            )
+            .expect("to query table count");
+        assert_eq!(count, 1, "table should exist before drop");
+
+        // Execute the same DROP TABLE SQL that drop_table() uses
+        underlying
+            .execute(&format!("DROP TABLE IF EXISTS \"{table_name}\""), [])
+            .expect("drop should succeed");
+
+        // Verify the table is gone
+        let count: i32 = underlying
+            .query_row(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+                [table_name],
+                |row| row.get(0),
+            )
+            .expect("to query table count");
+        assert_eq!(count, 0, "table should not exist after drop");
+
+        // Verify DROP IF EXISTS on non-existent table doesn't error
+        underlying
+            .execute(&format!("DROP TABLE IF EXISTS \"{table_name}\""), [])
+            .expect("drop of non-existent table should succeed");
     }
 }

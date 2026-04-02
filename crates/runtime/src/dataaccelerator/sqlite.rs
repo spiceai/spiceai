@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
+    dataaccelerator::{FilePathError, snapshots::{download_snapshot_if_needed, snapshot_before_recreate}},
     datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
     parameters::ParameterSpec,
@@ -32,7 +32,10 @@ use datafusion::{
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::{
-    sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
+    sql::db_connection_pool::{
+        sqlitepool::SqliteConnectionPool,
+        dbconnection::sqliteconn::SqliteConnection,
+    },
     sqlite::{SqliteTableProviderFactory, write::SqliteTableWriter},
 };
 use runtime_acceleration::snapshot::AccelerationEngine;
@@ -168,7 +171,7 @@ impl SqliteAccelerator {
         })?;
 
         let mode = match acceleration.mode {
-            Mode::File | Mode::FileCreate => {
+            Mode::File | Mode::FileCreate | Mode::FileUpdate => {
                 datafusion_table_providers::sql::db_connection_pool::Mode::File
             }
             Mode::Memory => datafusion_table_providers::sql::db_connection_pool::Mode::Memory,
@@ -259,10 +262,18 @@ impl DataAccelerator for SqliteAccelerator {
                 .into());
             }
 
-            // If mode is FileCreate, delete the existing file to start fresh
+            // If mode is FileCreate, snapshot the existing file (if enabled) then delete it to start fresh
             if acceleration.mode == Mode::FileCreate {
                 let file_path = std::path::Path::new(&path);
                 if file_path.exists() {
+                    snapshot_before_recreate(
+                        acceleration,
+                        &source.name().to_string(),
+                        runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(&path)),
+                        AccelerationEngine::Sqlite,
+                    )
+                    .await;
+
                     tracing::warn!(
                         "SQLite acceleration mode is 'file_create', removing existing file: {}",
                         path
@@ -324,7 +335,7 @@ impl DataAccelerator for SqliteAccelerator {
                 .filter_map(|other_dataset| {
                     if other_dataset.acceleration.as_ref().is_some_and(|a| {
                         a.engine == Engine::Sqlite
-                            && matches!(a.mode, Mode::File | Mode::FileCreate)
+                            && matches!(a.mode, Mode::File | Mode::FileCreate | Mode::FileUpdate)
                     }) {
                         if other_dataset.name() == source.name() {
                             None
@@ -376,6 +387,28 @@ impl DataAccelerator for SqliteAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    async fn drop_table(
+        &self,
+        table_name: &str,
+        source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let pool = self.get_shared_pool(source).await?;
+        let conn_sync = pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err("Failed to downcast to SqliteConnection".into());
+        };
+        let table = table_name.to_string();
+        conn.conn
+            .call(move |conn| {
+                conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), [])?;
+                Ok::<(), rusqlite::Error>(())
+            })
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+        tracing::info!("Dropped SQLite table '{table_name}' for schema recreation (file_update mode)");
+        Ok(())
     }
 }
 

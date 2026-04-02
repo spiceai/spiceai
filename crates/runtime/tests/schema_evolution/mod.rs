@@ -39,6 +39,7 @@ use crate::{
 };
 
 const DUCKDB_FILE_PATH: &str = "./schema_evolution.duckdb";
+const DUCKDB_FILE_UPDATE_PATH: &str = "./schema_evolution_file_update.duckdb";
 
 #[tokio::test]
 async fn test_schema_evolution() -> Result<(), anyhow::Error> {
@@ -167,6 +168,14 @@ async fn execute_pg_statement(db_conn: &PostgresConnection, sql: &str) {
 }
 
 async fn initialize_runtime(port: usize) -> Result<Runtime, anyhow::Error> {
+    initialize_runtime_with_mode(port, Mode::File, DUCKDB_FILE_PATH).await
+}
+
+async fn initialize_runtime_with_mode(
+    port: usize,
+    mode: Mode,
+    duckdb_file: &str,
+) -> Result<Runtime, anyhow::Error> {
     // Re-register connectors in case a previous runtime shutdown cleared them
     register_test_connectors().await;
 
@@ -187,9 +196,9 @@ async fn initialize_runtime(port: usize) -> Result<Runtime, anyhow::Error> {
     ds.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some("duckdb".to_string()),
-        mode: Mode::File,
+        mode,
         params: Some(Params::from_string_map(
-            vec![("duckdb_file".to_string(), DUCKDB_FILE_PATH.to_string())]
+            vec![("duckdb_file".to_string(), duckdb_file.to_string())]
                 .into_iter()
                 .collect(),
         )),
@@ -258,4 +267,105 @@ async fn wait_for_checkpoint(
     }
 
     Ok(())
+}
+
+/// Tests `Mode::FileUpdate` schema detection: additive changes keep the existing file,
+/// while breaking changes (column removed, type changed) trigger table recreation.
+#[tokio::test]
+async fn test_schema_evolution_file_update_mode() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    if std::fs::metadata(DUCKDB_FILE_UPDATE_PATH).is_ok() {
+        std::fs::remove_file(DUCKDB_FILE_UPDATE_PATH)
+            .expect("should remove local database");
+    }
+
+    test_request_context()
+        .scope(async {
+            let port = common::get_random_port()?;
+            let running_container = common::start_postgres_docker_container(port).await?;
+
+            let pool = common::get_postgres_connection_pool(port, None).await?;
+            let db_conn = pool
+                .connect_direct()
+                .await
+                .expect("connection can be established");
+
+            // Reset the table and do an initial load with file_update mode
+            reset_pg_table(&db_conn).await;
+
+            let rt = Arc::new(
+                initialize_runtime_with_mode(port, Mode::FileUpdate, DUCKDB_FILE_UPDATE_PATH)
+                    .await?,
+            );
+
+            let sql = "SELECT id, town, age FROM cham ORDER BY id ASC";
+            run_and_verify_query(&rt, sql, "test_schema_evolution_file_update_initial").await;
+
+            // Additive change: add a column — should NOT trigger recreation
+            rt.shutdown().await;
+            drop(rt);
+            execute_pg_statement(
+                &db_conn,
+                "ALTER TABLE public.chameleon ADD COLUMN country varchar NULL;",
+            )
+            .await;
+            let rt = Arc::new(
+                initialize_runtime_with_mode(port, Mode::FileUpdate, DUCKDB_FILE_UPDATE_PATH)
+                    .await?,
+            );
+            run_and_verify_query(
+                &rt,
+                sql,
+                "test_schema_evolution_file_update_add_column",
+            )
+            .await;
+
+            // Breaking change: drop a column — should trigger table recreation
+            rt.shutdown().await;
+            drop(rt);
+            reset_pg_table(&db_conn).await;
+            execute_pg_statement(&db_conn, "ALTER TABLE public.chameleon DROP COLUMN age;").await;
+            let rt = Arc::new(
+                initialize_runtime_with_mode(port, Mode::FileUpdate, DUCKDB_FILE_UPDATE_PATH)
+                    .await?,
+            );
+            run_and_verify_query(
+                &rt,
+                "SELECT id, town FROM cham ORDER BY id ASC",
+                "test_schema_evolution_file_update_drop_column",
+            )
+            .await;
+
+            // Breaking change: change column type — should trigger table recreation
+            rt.shutdown().await;
+            drop(rt);
+            reset_pg_table(&db_conn).await;
+            execute_pg_statement(
+                &db_conn,
+                "ALTER TABLE chameleon ALTER COLUMN age TYPE TEXT USING (age::TEXT);",
+            )
+            .await;
+            let rt = Arc::new(
+                initialize_runtime_with_mode(port, Mode::FileUpdate, DUCKDB_FILE_UPDATE_PATH)
+                    .await?,
+            );
+            run_and_verify_query(
+                &rt,
+                sql,
+                "test_schema_evolution_file_update_change_type",
+            )
+            .await;
+
+            running_container.remove().await?;
+
+            if std::fs::metadata(DUCKDB_FILE_UPDATE_PATH).is_ok() {
+                std::fs::remove_file(DUCKDB_FILE_UPDATE_PATH)
+                    .expect("should remove local database");
+            }
+
+            Ok(())
+        })
+        .await
 }

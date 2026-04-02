@@ -563,7 +563,7 @@ impl Dataset {
             return acceleration.enabled
                 && matches!(
                     acceleration.mode,
-                    acceleration::Mode::File | acceleration::Mode::FileCreate
+                    acceleration::Mode::File | acceleration::Mode::FileCreate | acceleration::Mode::FileUpdate
                 );
         }
 

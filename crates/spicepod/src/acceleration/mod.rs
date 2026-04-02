@@ -47,6 +47,10 @@ pub enum Mode {
     /// Always create a new file, truncating/overwriting any existing file on startup.
     /// Use this when you want a fresh acceleration on each startup.
     FileCreate,
+    /// Open an existing file if it exists, then check schema compatibility on refresh.
+    /// If the source schema is incompatible (non-additive change), snapshot (if enabled)
+    /// and recreate the acceleration file from scratch.
+    FileUpdate,
 }
 
 impl Display for Mode {
@@ -55,6 +59,7 @@ impl Display for Mode {
             Mode::Memory => write!(f, "memory"),
             Mode::File => write!(f, "file"),
             Mode::FileCreate => write!(f, "file_create"),
+            Mode::FileUpdate => write!(f, "file_update"),
         }
     }
 }
@@ -452,5 +457,44 @@ mod tests {
             acceleration.on_conflict.get("foo"),
             Some(&OnConflictBehavior::Drop)
         );
+    }
+
+    #[test]
+    fn test_deserialize_mode_memory() {
+        let yaml = "mode: memory";
+        let accel: Acceleration = yaml::from_str(yaml).expect("should parse");
+        assert_eq!(accel.mode, Mode::Memory);
+    }
+
+    #[test]
+    fn test_deserialize_mode_file() {
+        let yaml = "mode: file";
+        let accel: Acceleration = yaml::from_str(yaml).expect("should parse");
+        assert_eq!(accel.mode, Mode::File);
+    }
+
+    #[test]
+    fn test_deserialize_mode_file_create() {
+        let yaml = "mode: file_create";
+        let accel: Acceleration = yaml::from_str(yaml).expect("should parse");
+        assert_eq!(accel.mode, Mode::FileCreate);
+    }
+
+    #[test]
+    fn test_deserialize_mode_file_update() {
+        let yaml = "mode: file_update";
+        let accel: Acceleration = yaml::from_str(yaml).expect("should parse");
+        assert_eq!(accel.mode, Mode::FileUpdate);
+    }
+
+    #[test]
+    fn test_mode_display_round_trip() {
+        for mode in [Mode::Memory, Mode::File, Mode::FileCreate, Mode::FileUpdate] {
+            let s = mode.to_string();
+            let yaml = format!("mode: {s}");
+            let accel: Acceleration = yaml::from_str(&yaml)
+                .unwrap_or_else(|_| panic!("should parse mode '{s}'"));
+            assert_eq!(accel.mode, mode, "round-trip failed for mode '{s}'");
+        }
     }
 }
