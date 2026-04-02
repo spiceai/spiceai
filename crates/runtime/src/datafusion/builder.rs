@@ -584,7 +584,7 @@ pub(crate) fn runtime_env(
     // If no memory limit is specified, default to 90% of total memory (container-aware)
     let effective_memory_limit = memory_limit.unwrap_or_else(|| {
         let total_memory = crate::resource_monitor::get_total_memory();
-        let default_limit = total_memory * 100 / 90;
+        let default_limit = total_memory.saturating_mul(90) / 100;
 
         tracing::debug!(
             "No memory limit specified, defaulting to 90% of total memory: {}",
