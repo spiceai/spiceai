@@ -1322,7 +1322,7 @@ fn extract_dml_target_table(plan: &LogicalPlan) -> Option<TableReference> {
         LogicalPlan::Extension(ext) => {
             use super::cayenne_ddl::logical_nodes::{
                 DistributedCayenneDeleteNode, DistributedCayenneInsertNode,
-                DistributedCayenneUpdateNode,
+                DistributedCayenneMergeNode, DistributedCayenneUpdateNode,
             };
             use super::planner::logical_nodes::CayenneMergeNode;
             if let Some(n) = ext
@@ -1349,6 +1349,13 @@ fn extract_dml_target_table(plan: &LogicalPlan) -> Option<TableReference> {
             if let Some(n) = ext.node.as_any().downcast_ref::<CayenneMergeNode>() {
                 return Some(n.target_table.clone());
             }
+            if let Some(n) = ext
+                .node
+                .as_any()
+                .downcast_ref::<DistributedCayenneMergeNode>()
+            {
+                return Some(n.target_table.clone());
+            }
             None
         }
         _ => None,
@@ -1364,7 +1371,7 @@ fn is_dml_extension(plan: &LogicalPlan) -> bool {
     if let LogicalPlan::Extension(ext) = plan {
         use super::cayenne_ddl::logical_nodes::{
             DistributedCayenneDeleteNode, DistributedCayenneInsertNode,
-            DistributedCayenneUpdateNode,
+            DistributedCayenneMergeNode, DistributedCayenneUpdateNode,
         };
         use super::planner::logical_nodes::CayenneMergeNode;
         if ext
@@ -1386,6 +1393,11 @@ fn is_dml_extension(plan: &LogicalPlan) -> bool {
                 .node
                 .as_any()
                 .downcast_ref::<CayenneMergeNode>()
+                .is_some()
+            || ext
+                .node
+                .as_any()
+                .downcast_ref::<DistributedCayenneMergeNode>()
                 .is_some()
         {
             return true;
