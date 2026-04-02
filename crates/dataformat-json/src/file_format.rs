@@ -1136,7 +1136,11 @@ mod tests {
     fn test_fixture_bom_object_schema() {
         let data = load_fixture("bom_object.json");
         // Verify BOM is actually present
-        assert_eq!(&data[..3], &[0xEF, 0xBB, 0xBF], "fixture should start with UTF-8 BOM");
+        assert_eq!(
+            &data[..3],
+            &[0xEF, 0xBB, 0xBF],
+            "fixture should start with UTF-8 BOM"
+        );
         let mut take = || true;
         let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
             .expect("Object schema from bom_object.json");
@@ -1159,7 +1163,11 @@ mod tests {
     #[test]
     fn test_fixture_bom_jsonl_auto_schema() {
         let data = load_fixture("bom_jsonl.json");
-        assert_eq!(&data[..3], &[0xEF, 0xBB, 0xBF], "fixture should start with UTF-8 BOM");
+        assert_eq!(
+            &data[..3],
+            &[0xEF, 0xBB, 0xBF],
+            "fixture should start with UTF-8 BOM"
+        );
         let mut take = || true;
         let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
             .expect("Auto schema from bom_jsonl.json");
@@ -1170,7 +1178,11 @@ mod tests {
     #[test]
     fn test_fixture_bom_array_auto_schema() {
         let data = load_fixture("bom_array.json");
-        assert_eq!(&data[..3], &[0xEF, 0xBB, 0xBF], "fixture should start with UTF-8 BOM");
+        assert_eq!(
+            &data[..3],
+            &[0xEF, 0xBB, 0xBF],
+            "fixture should start with UTF-8 BOM"
+        );
         let mut take = || true;
         let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
             .expect("Auto schema from bom_array.json");
