@@ -2476,11 +2476,8 @@ mod tests {
 
         // Case 1: stored refresh_sql matches current → no forced refresh (should wait or be disabled)
         let stored_sql = refresh_sql.to_sql();
-        let checkpoint_matching = MockCheckpointer::new_arc_with_refresh_sql(
-            true,
-            Some(now),
-            Some(stored_sql.clone()),
-        );
+        let checkpoint_matching =
+            MockCheckpointer::new_arc_with_refresh_sql(true, Some(now), Some(stored_sql.clone()));
         let mut refresh_with_matching_sql = Refresh::new(RefreshMode::Full);
         refresh_with_matching_sql = refresh_with_matching_sql.refresh_sql(refresh_sql.clone());
         let result = refresh_with_matching_sql
@@ -2508,11 +2505,8 @@ mod tests {
         );
 
         // Case 3: stored refresh_sql is Some, current is None → forced refresh
-        let checkpoint_had_sql = MockCheckpointer::new_arc_with_refresh_sql(
-            true,
-            Some(now),
-            Some(stored_sql),
-        );
+        let checkpoint_had_sql =
+            MockCheckpointer::new_arc_with_refresh_sql(true, Some(now), Some(stored_sql));
         let refresh_no_sql = Refresh::new(RefreshMode::Full);
         let result = refresh_no_sql
             .startup_next_refresh(RefreshOnStartup::Auto, Some(checkpoint_had_sql))
@@ -2523,8 +2517,7 @@ mod tests {
         );
 
         // Case 4: stored refresh_sql is None, current is Some → forced refresh
-        let checkpoint_no_sql =
-            MockCheckpointer::new_arc_with_refresh_sql(true, Some(now), None);
+        let checkpoint_no_sql = MockCheckpointer::new_arc_with_refresh_sql(true, Some(now), None);
         let mut refresh_with_sql = Refresh::new(RefreshMode::Full);
         refresh_with_sql = refresh_with_sql.refresh_sql(refresh_sql);
         let result = refresh_with_sql

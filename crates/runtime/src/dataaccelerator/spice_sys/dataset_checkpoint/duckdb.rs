@@ -448,7 +448,10 @@ mod tests {
 
         // Update to a different refresh_sql
         checkpoint
-            .checkpoint(&schema_ref, Some("SELECT id FROM source_table WHERE id > 10"))
+            .checkpoint(
+                &schema_ref,
+                Some("SELECT id FROM source_table WHERE id > 10"),
+            )
             .await
             .expect("Failed to update refresh_sql");
 
