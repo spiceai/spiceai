@@ -40,10 +40,13 @@ jobs:
         uses: ./.github/actions/check-code-changes
 
   check:
-    name: Check (Develop)
+    name: Rust Lint
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
+
+    env:
+      SPICEIO_LOG_FILE: /tmp/spiceio-check.log
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -52,7 +55,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up spiceio
-        uses: spiceai/spiceio/.github/actions/setup@f964d0fc0c7c60f1463c35971636493b8186a7e2 # v0.2.0
+        uses: spiceai/spiceio/.github/actions/setup@a5e2c9d94accb108945b81797c99a29349e0b993 # v0.4.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -87,11 +90,22 @@ jobs:
       - name: Show sccache stats
         run: sccache --show-stats
 
+      - name: Upload spiceio logs
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: spiceio-check-logs
+          path: /tmp/spiceio-check.log
+          if-no-files-found: ignore
+
   build-and-test:
-    name: Build and Test (Develop)
+    name: Build and Test
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
+
+    env:
+      SPICEIO_LOG_FILE: /tmp/spiceio-build.log
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -100,7 +114,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up spiceio
-        uses: spiceai/spiceio/.github/actions/setup@f964d0fc0c7c60f1463c35971636493b8186a7e2 # v0.2.0
+        uses: spiceai/spiceio/.github/actions/setup@a5e2c9d94accb108945b81797c99a29349e0b993 # v0.4.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -148,3 +162,11 @@ jobs:
             echo "Update Cargo.lock"
             exit 1
           fi
+
+      - name: Upload spiceio logs
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: spiceio-build-logs
+          path: /tmp/spiceio-build.log
+          if-no-files-found: ignore
