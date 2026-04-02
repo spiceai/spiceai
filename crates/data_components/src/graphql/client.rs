@@ -2390,6 +2390,6 @@ mod tests {
         let query = "{\n  users {\n    name\n  }\n}";
         let result = super::format_query_with_context(query, 2, 3);
         assert!(result.contains("  users {"), "should show the error line");
-        assert!(result.contains("^"), "should show the caret marker");
+        assert!(result.contains('^'), "should show the caret marker");
     }
 }

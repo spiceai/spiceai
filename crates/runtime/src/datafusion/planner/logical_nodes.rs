@@ -17,7 +17,7 @@ limitations under the License.
 //! Logical plan nodes for Cayenne DML operations produced by the Spice planner.
 //!
 //! Currently empty — local DELETE is handled by Cayenne's `TableProvider`
-//! implementation through DataFusion's standard physical planning, and
+//! implementation through `DataFusion`'s standard physical planning, and
 //! distributed DELETE reuses `DistributedCayenneDeleteNode` from `cayenne_ddl`.
 //!
 //! Future DML operations (UPDATE, MERGE) will add nodes here.
