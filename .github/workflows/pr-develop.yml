@@ -71,6 +71,9 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
       - name: Run cargo check
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}

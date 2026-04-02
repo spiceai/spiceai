@@ -1504,6 +1504,9 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
 }
 
 fn format_query_with_context(query: &str, line: usize, column: usize) -> String {
+    if line == 0 || column == 0 {
+        return query.to_string();
+    }
     let query_lines: Vec<&str> = query.split('\n').collect();
     let error_line = query_lines.get(line - 1).unwrap_or(&"");
     let marker = " ".repeat(column - 1) + "^";
@@ -2361,5 +2364,32 @@ mod tests {
             request.headers().get("authorization").is_none(),
             "Expected no authorization header"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // format_query_with_context regression tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_query_with_context_zero_line_does_not_panic() {
+        let query = "{ users { name } }";
+        // line=0 or column=0 should not panic, just return the raw query
+        let result = super::format_query_with_context(query, 0, 1);
+        assert_eq!(result, query);
+    }
+
+    #[test]
+    fn format_query_with_context_zero_column_does_not_panic() {
+        let query = "{ users { name } }";
+        let result = super::format_query_with_context(query, 1, 0);
+        assert_eq!(result, query);
+    }
+
+    #[test]
+    fn format_query_with_context_valid_position() {
+        let query = "{\n  users {\n    name\n  }\n}";
+        let result = super::format_query_with_context(query, 2, 3);
+        assert!(result.contains("  users {"), "should show the error line");
+        assert!(result.contains("^"), "should show the caret marker");
     }
 }
