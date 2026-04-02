@@ -34,7 +34,7 @@ use datafusion::{
     execution::{
         DiskManager, SessionStateBuilder,
         disk_manager::DiskManagerMode,
-        memory_pool::{GreedyMemoryPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool},
+        memory_pool::{GreedyMemoryPool, MemoryPool, TrackConsumersPool},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
     optimizer::{
@@ -581,53 +581,27 @@ pub(crate) fn runtime_env(
         DiskManager::builder()
     };
 
-    // If no memory limit is specified, default to 70% of total memory (container-aware)
-    let effective_memory_limit = memory_limit.or_else(|| {
+    // If no memory limit is specified, default to 90% of total memory (container-aware)
+    let effective_memory_limit = memory_limit.unwrap_or_else(|| {
         let total_memory = crate::resource_monitor::get_total_memory();
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let default_limit = (total_memory as f64 * 0.70) as u64;
+        let default_limit = total_memory * 100 / 90;
 
         tracing::debug!(
-            "No memory limit specified, defaulting to 70% of total memory: {}",
-            {
-                #[expect(clippy::cast_possible_truncation)]
-                util::human_readable_bytes(default_limit as usize)
-            }
+            "No memory limit specified, defaulting to 90% of total memory: {}",
+            util::human_readable_bytes(default_limit as usize)
         );
-        Some(default_limit)
+
+        default_limit
     });
 
-    let memory_pool: Arc<dyn MemoryPool> = if let Some(limit) = effective_memory_limit {
-        let limit = if let Ok(limit) = limit.try_into() {
-            limit
-        } else {
-            tracing::warn!(
-                "Memory limit {limit} is too large for the memory pool.\n Defaulting to a maximum sized pool of {}.",
-                usize::MAX
-            );
-
-            usize::MAX
-        };
-
-        let Some(topn) = NonZeroUsize::new(5) else {
-            unreachable!("Memory pool TopN must be greater than 0");
-        };
-
-        Arc::new(TrackConsumersPool::new(GreedyMemoryPool::new(limit), topn))
-    } else {
-        let Some(topn) = NonZeroUsize::new(5) else {
-            unreachable!("Memory pool TopN must be greater than 0");
-        };
-
-        Arc::new(TrackConsumersPool::new(
-            UnboundedMemoryPool::default(),
-            topn,
-        ))
+    let Some(topn) = NonZeroUsize::new(5) else {
+        unreachable!("Memory pool TopN must be greater than 0");
     };
+
+    let memory_pool = Arc::new(TrackConsumersPool::new(
+        GreedyMemoryPool::new(effective_memory_limit as usize),
+        topn,
+    ));
 
     match RuntimeEnvBuilder::default()
         .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::new(io_runtime)))
