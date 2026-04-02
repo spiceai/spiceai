@@ -381,9 +381,12 @@ impl FileOpener for SpiceJsonOpener {
                     // SODA and json_pointer require buffering the full response
                     // because they must parse the entire JSON document.
                     // Auto needs buffering to peek the first byte then decode.
-                    // Object and JSONL/Array can stream directly.
+                    // Object needs buffering because the single JSON value may span multiple chunks.
                     if json_pointer.is_some()
-                        || matches!(format, Format::Auto | Format::Json | Format::Soda)
+                        || matches!(
+                            format,
+                            Format::Auto | Format::Json | Format::Soda | Format::Object
+                        )
                     {
                         let s = s.map_err(DataFusionError::from);
                         let decompressed = file_compression_type.convert_stream(s.boxed())?;

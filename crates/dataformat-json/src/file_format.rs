@@ -302,25 +302,11 @@ impl FileFormat for SpiceJsonFormat {
                             raw_buf
                         };
 
-                        let mut reader = BufReader::new(std::io::Cursor::new(buf));
-
-                        let is_array = match self.options.format {
-                            Format::Array => true,
-                            Format::Jsonl | Format::Object => false,
-                            Format::Soda => unreachable!("handled above"),
-                            Format::Auto | Format::Json => {
-                                peek_first_non_ws_byte(&mut reader).is_ok_and(|b| b == b'[')
-                            }
-                        };
-
-                        let schema = if is_array {
-                            let mut adapter = ArrayToNdjson::try_new(reader)?;
-                            let iter = ValueIter::new(&mut adapter, None);
-                            infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
-                        } else {
-                            let iter = ValueIter::new(&mut reader, None);
-                            infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
-                        };
+                        let schema = infer_json_schema_for_format(
+                            &buf,
+                            self.options.format,
+                            &mut take_while,
+                        )?;
 
                         if let Some(separator) = &self.options.flatten_json {
                             unnest_struct_schema(&schema, separator)
@@ -366,25 +352,11 @@ impl FileFormat for SpiceJsonFormat {
                             raw_buf
                         };
 
-                        let mut reader = BufReader::new(std::io::Cursor::new(buf));
-
-                        let is_array = match self.options.format {
-                            Format::Array => true,
-                            Format::Jsonl | Format::Object => false,
-                            Format::Soda => unreachable!("handled above"),
-                            Format::Auto | Format::Json => {
-                                peek_first_non_ws_byte(&mut reader).is_ok_and(|b| b == b'[')
-                            }
-                        };
-
-                        let schema = if is_array {
-                            let mut adapter = ArrayToNdjson::try_new(reader)?;
-                            let iter = ValueIter::new(&mut adapter, None);
-                            infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
-                        } else {
-                            let iter = ValueIter::new(&mut reader, None);
-                            infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
-                        };
+                        let schema = infer_json_schema_for_format(
+                            &buf,
+                            self.options.format,
+                            &mut take_while,
+                        )?;
 
                         if let Some(separator) = &self.options.flatten_json {
                             unnest_struct_schema(&schema, separator)
@@ -643,6 +615,76 @@ impl DataSource for NonRepartitionedFileScanConfig {
     }
 }
 
+/// Infer a JSON schema from all bytes in `buf`, dispatching by [`Format`].
+///
+/// For [`Format::Object`] the buffer is parsed as a single JSON value (handles
+/// multi-line / pretty-printed objects).
+///
+/// For [`Format::Auto`] and [`Format::Json`], when the content starts with `{`
+/// the function first tries to parse the entire buffer as a single JSON object.
+/// If that succeeds (no trailing content) the schema is inferred from that one
+/// value. If it fails (e.g. because there are multiple NDJSON lines) it falls
+/// back to Arrow's line-based `ValueIter`.
+fn infer_json_schema_for_format(
+    buf: &[u8],
+    format: Format,
+    take_while: &mut dyn FnMut() -> bool,
+) -> Result<Schema> {
+    if format == Format::Object {
+        let value: serde_json::Value =
+            serde_json::from_slice(buf).map_err(|e| DataFusionError::External(Box::new(e)))?;
+        return infer_json_schema_from_iterator(std::iter::once(Ok::<_, ArrowError>(value)))
+            .map_err(DataFusionError::from);
+    }
+
+    let mut reader = BufReader::new(std::io::Cursor::new(buf));
+
+    let is_array = match format {
+        Format::Array => true,
+        Format::Jsonl | Format::Object => false,
+        Format::Soda => {
+            return Err(DataFusionError::Internal(
+                "Format::Soda should be handled before calling infer_json_schema_for_format"
+                    .to_string(),
+            ));
+        }
+        Format::Auto | Format::Json => peek_first_non_ws_byte(&mut reader).is_ok_and(|b| b == b'['),
+    };
+
+    if is_array {
+        let mut adapter = ArrayToNdjson::try_new(reader)?;
+        let iter = ValueIter::new(&mut adapter, None);
+        Ok(infer_json_schema_from_iterator(
+            iter.take_while(|_| take_while()),
+        )?)
+    } else {
+        // For Auto/Json: try parsing as a single JSON object first.
+        // This handles multi-line/pretty-printed objects that the line-based
+        // ValueIter cannot parse. serde_json::from_slice rejects input with
+        // trailing non-whitespace content, so NDJSON files will fail here and
+        // fall through to ValueIter.
+        if matches!(format, Format::Auto | Format::Json) {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(buf) {
+                if value.is_object() {
+                    return Ok(infer_json_schema_from_iterator(std::iter::once(Ok::<
+                        _,
+                        ArrowError,
+                    >(
+                        value
+                    )))?);
+                }
+            }
+        }
+
+        // NDJSON: use line-based ValueIter
+        let mut reader = BufReader::new(std::io::Cursor::new(buf));
+        let iter = ValueIter::new(&mut reader, None);
+        Ok(infer_json_schema_from_iterator(
+            iter.take_while(|_| take_while()),
+        )?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,5 +764,85 @@ mod tests {
         let _ = "invalid"
             .parse::<Format>()
             .expect_err("invalid format should be rejected");
+    }
+
+    #[test]
+    fn test_infer_schema_object_single_line() {
+        let buf = br#"{"name": "Alice", "age": 30}"#;
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(buf, Format::Object, &mut take)
+            .expect("should infer schema from single-line object");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+    }
+
+    #[test]
+    fn test_infer_schema_object_pretty_printed() {
+        let buf = b"{\n  \"airports\": 23\n}";
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(buf, Format::Object, &mut take)
+            .expect("should infer schema from pretty-printed object");
+        assert_eq!(schema.fields().len(), 1);
+        assert!(schema.field_with_name("airports").is_ok());
+    }
+
+    #[test]
+    fn test_infer_schema_object_nested_pretty_printed() {
+        let buf = br#"{
+  "airports": [
+    {"code": "ATL", "name": "Hartsfield"},
+    {"code": "LAX", "name": "Los Angeles"}
+  ],
+  "count": 2
+}"#;
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(buf, Format::Object, &mut take)
+            .expect("should infer schema from nested pretty-printed object");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("airports").is_ok());
+        assert!(schema.field_with_name("count").is_ok());
+    }
+
+    #[test]
+    fn test_infer_schema_object_invalid_json() {
+        let buf = b"not json";
+        let mut take = || true;
+        infer_json_schema_for_format(buf, Format::Object, &mut take)
+            .expect_err("should fail on invalid JSON");
+    }
+
+    #[test]
+    fn test_infer_schema_auto_pretty_printed_object() {
+        // Auto format should detect a multi-line JSON object without json_format: object
+        let buf = b"{\n  \"airports\": 23\n}";
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(buf, Format::Auto, &mut take)
+            .expect("Auto should infer schema from pretty-printed object");
+        assert_eq!(schema.fields().len(), 1);
+        assert!(schema.field_with_name("airports").is_ok());
+    }
+
+    #[test]
+    fn test_infer_schema_json_pretty_printed_object() {
+        // Json format should also detect a multi-line JSON object
+        let buf = b"{\n  \"name\": \"Alice\",\n  \"age\": 30\n}";
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(buf, Format::Json, &mut take)
+            .expect("Json should infer schema from pretty-printed object");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+    }
+
+    #[test]
+    fn test_infer_schema_auto_ndjson_still_works() {
+        // NDJSON with multiple lines should still work via ValueIter fallback
+        let buf = b"{\"a\": 1}\n{\"a\": 2, \"b\": 3}\n";
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(buf, Format::Auto, &mut take)
+            .expect("Auto should still handle NDJSON");
+        assert!(schema.field_with_name("a").is_ok());
+        assert!(schema.field_with_name("b").is_ok());
     }
 }
