@@ -34,6 +34,7 @@ use datafusion::{
         ExecutionPlan, ExecutionPlanProperties, execute_stream, repartition::RepartitionExec,
         sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
     },
+    sql::TableReference,
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
@@ -504,164 +505,164 @@ impl Query {
 
         let inner_span = span.clone();
 
-        let query_result = async {
-            let mut session = self.get_session_state(&request_context);
+        let query_result =
+            async {
+                let mut session = self.get_session_state(&request_context);
 
-            let ctx = self;
-            let tracker = ctx.tracker;
+                let ctx = self;
+                let tracker = ctx.tracker;
 
-            // Sets the request context as an extension on DataFusion, to allow recovering it to track telemetry
-            session
-                .config_mut()
-                .set_extension(Arc::clone(&request_context));
+                // Sets the request context as an extension on DataFusion, to allow recovering it to track telemetry
+                session
+                    .config_mut()
+                    .set_extension(Arc::clone(&request_context));
 
-            // Get the `LogicalPlan` or cached results
-            let (plan, mut tracker, cache_manager) = match &ctx.sql {
-                QueryMethod::Text {
-                    sql,
-                    parameters,
-                    table_allowlist: Some(allowlist),
-                } => {
-                    let raw_cache_key = CacheKey::Query(sql, parameters.as_ref())
-                        .as_raw_key(Query::plan_hasher(&ctx.df));
-                    let plan = match Self::get_plan(
-                        &ctx.df,
-                        &session,
+                // Get the `LogicalPlan` or cached results
+                let (plan, mut tracker, cache_manager) = match &ctx.sql {
+                    QueryMethod::Text {
                         sql,
-                        &raw_cache_key,
-                        parameters.clone(),
-                    )
-                    .await
-                    {
-                        Ok(plan) => plan,
-                        Err(e) => match e {
-                            Error::UnableToExecuteQuery { source } => {
-                                let code = ErrorCode::from(&source);
-                                let snafu_err = Error::UnableToExecuteQuery { source };
-                                if let Some(t) = tracker {
-                                    t.finish_with_error(
-                                        &request_context,
-                                        snafu_err.to_string(),
-                                        code,
-                                    );
+                        parameters,
+                        table_allowlist: Some(allowlist),
+                    } => {
+                        let raw_cache_key = CacheKey::Query(sql, parameters.as_ref())
+                            .as_raw_key(Query::plan_hasher(&ctx.df));
+                        let plan = match Self::get_plan(
+                            &ctx.df,
+                            &session,
+                            sql,
+                            &raw_cache_key,
+                            parameters.clone(),
+                        )
+                        .await
+                        {
+                            Ok(plan) => plan,
+                            Err(e) => match e {
+                                Error::UnableToExecuteQuery { source } => {
+                                    let code = ErrorCode::from(&source);
+                                    let snafu_err = Error::UnableToExecuteQuery { source };
+                                    if let Some(t) = tracker {
+                                        t.finish_with_error(
+                                            &request_context,
+                                            snafu_err.to_string(),
+                                            code,
+                                        );
+                                    }
+                                    return Err(snafu_err);
                                 }
-                                return Err(snafu_err);
-                            }
-                            _ => return Err(e),
-                        },
-                    };
-                    let tables_referenced = plan.as_table_refs();
-                    if let Some(disallowed_table) = tables_referenced
-                        .iter()
-                        .find(|&t| !allowlist.table_is_allowed(t))
-                    {
-                        return Err(Error::TableAccessDisallowed {
-                            table: disallowed_table.to_string(),
-                        });
-                    }
-
-                    (
-                        Box::new(plan),
-                        tracker,
-                        RequestCacheManager::new(CacheStatus::CacheDisabled, raw_cache_key),
-                    )
-                }
-                QueryMethod::Text {
-                    sql,
-                    parameters,
-                    table_allowlist: None,
-                } => {
-                    match Self::get_plan_or_cached(
-                        &ctx.df,
-                        &session,
-                        Arc::clone(&request_context),
-                        sql,
-                        parameters.clone(),
-                        tracker,
-                    )
-                    .await?
-                    {
-                        PlanOrCached::Plan(plan, tracker, cache_manager) => {
-                            (plan, tracker, cache_manager)
+                                _ => return Err(e),
+                            },
+                        };
+                        let tables_referenced = plan.as_table_refs();
+                        if let Some(disallowed_table) = tables_referenced
+                            .iter()
+                            .find(|&t| !allowlist.table_is_allowed(t))
+                        {
+                            return Err(Error::TableAccessDisallowed {
+                                table: disallowed_table.to_string(),
+                            });
                         }
-                        PlanOrCached::Cached(query_result) => return Ok(query_result),
+
+                        (
+                            Box::new(plan),
+                            tracker,
+                            RequestCacheManager::new(CacheStatus::CacheDisabled, raw_cache_key),
+                        )
+                    }
+                    QueryMethod::Text {
+                        sql,
+                        parameters,
+                        table_allowlist: None,
+                    } => {
+                        match Self::get_plan_or_cached(
+                            &ctx.df,
+                            &session,
+                            Arc::clone(&request_context),
+                            sql,
+                            parameters.clone(),
+                            tracker,
+                        )
+                        .await?
+                        {
+                            PlanOrCached::Plan(plan, tracker, cache_manager) => {
+                                (plan, tracker, cache_manager)
+                            }
+                            PlanOrCached::Cached(query_result) => return Ok(query_result),
+                        }
+                    }
+                    QueryMethod::Plan(logical_plan) => {
+                        let cache_manager = RequestCacheManager::new(
+                            CacheStatus::CacheMiss,
+                            CacheKey::LogicalPlan(logical_plan)
+                                .as_raw_key(Query::plan_hasher(&ctx.df)),
+                        );
+                        (logical_plan.clone(), None, cache_manager)
+                    }
+                };
+
+                if let Err(e) = validate_sql_query_operations(&plan, &ctx.df) {
+                    let e = find_datafusion_root(e);
+                    handle_error!(
+                        tracker,
+                        &request_context,
+                        ErrorCode::QueryPlanningError,
+                        e,
+                        UnableToExecuteQuery
+                    )
+                }
+
+                // Proactively invalidate cached query state for tables affected by
+                // DML mutations (INSERT, DELETE, UPDATE).
+                // - results cache must be cleared so repeated SQL does not replay
+                //   pre-mutation answers
+                // - plans cache must be cleared so future queries re-resolve table
+                //   providers with up-to-date in-memory state.
+                if let Some(dml_table) = extract_dml_target_table(&plan)
+                    && let Err(e) = ctx.df.caching().invalidate_for_table(dml_table.clone())
+                {
+                    tracing::warn!(
+                        "Failed to invalidate caches for table {dml_table} before DML: {e}",
+                    );
+                }
+
+                let input_tables = get_logical_plan_input_tables(&plan);
+                if input_tables
+                    .iter()
+                    .any(|tr| matches!(tr.schema(), Some(SPICE_RUNTIME_SCHEMA)))
+                {
+                    inner_span.record("runtime_query", true);
+                }
+
+                // If any of the input tables are accelerated, mark the query as accelerated
+                let mut is_accelerated = false;
+                for tr in &input_tables {
+                    if ctx.df.is_accelerated(tr).await {
+                        is_accelerated = true;
+                        break;
                     }
                 }
-                QueryMethod::Plan(logical_plan) => {
-                    let cache_manager = RequestCacheManager::new(
-                        CacheStatus::CacheMiss,
-                        CacheKey::LogicalPlan(logical_plan).as_raw_key(Query::plan_hasher(&ctx.df)),
-                    );
-                    (logical_plan.clone(), None, cache_manager)
+                if is_accelerated {
+                    tracker = tracker.map(|mut t| {
+                        t.is_accelerated = Some(true);
+                        t
+                    });
                 }
-            };
 
-            if let Err(e) = validate_sql_query_operations(&plan, &ctx.df) {
-                let e = find_datafusion_root(e);
-                handle_error!(
-                    tracker,
-                    &request_context,
-                    ErrorCode::QueryPlanningError,
-                    e,
-                    UnableToExecuteQuery
-                )
-            }
+                let datasets = Arc::new(input_tables);
+                tracker = tracker.map(|t| t.datasets(Arc::clone(&datasets)));
 
-            // Proactively invalidate cached query state for tables affected by
-            // DML mutations (INSERT, DELETE, UPDATE).
-            // - results cache must be cleared so repeated SQL does not replay
-            //   pre-mutation answers
-            // - plans cache must be cleared so future queries re-resolve table
-            //   providers with up-to-date in-memory state.
-            if let LogicalPlan::Dml(dml) = &*plan
-                && let Err(e) = ctx
-                    .df
-                    .caching()
-                    .invalidate_for_table(dml.table_name.clone())
-            {
-                tracing::warn!(
-                    "Failed to invalidate caches for table {} before DML: {e}",
-                    dml.table_name
-                );
-            }
-
-            let input_tables = get_logical_plan_input_tables(&plan);
-            if input_tables
-                .iter()
-                .any(|tr| matches!(tr.schema(), Some(SPICE_RUNTIME_SCHEMA)))
-            {
-                inner_span.record("runtime_query", true);
-            }
-
-            // If any of the input tables are accelerated, mark the query as accelerated
-            let mut is_accelerated = false;
-            for tr in &input_tables {
-                if ctx.df.is_accelerated(tr).await {
-                    is_accelerated = true;
-                    break;
-                }
-            }
-            if is_accelerated {
+                // Start the timer for the query execution
                 tracker = tracker.map(|mut t| {
-                    t.is_accelerated = Some(true);
+                    t.query_execution_duration_timer = Instant::now();
                     t
                 });
-            }
 
-            let datasets = Arc::new(input_tables);
-            tracker = tracker.map(|t| t.datasets(Arc::clone(&datasets)));
-
-            // Start the timer for the query execution
-            tracker = tracker.map(|mut t| {
-                t.query_execution_duration_timer = Instant::now();
-                t
-            });
-
-            // Statement plans (PREPARE, EXECUTE, DEALLOCATE) need special handling
-            // They modify session state rather than producing query results, so must be
-            // executed through SessionContext::execute_logical_plan() instead of create_physical_plan()
-            let (res_stream, physical_plan): (SendableRecordBatchStream, Arc<dyn ExecutionPlan>) =
-                if matches!(&*plan, LogicalPlan::Statement(_)) {
+                // Statement plans (PREPARE, EXECUTE, DEALLOCATE) need special handling
+                // They modify session state rather than producing query results, so must be
+                // executed through SessionContext::execute_logical_plan() instead of create_physical_plan()
+                let (res_stream, physical_plan): (
+                    SendableRecordBatchStream,
+                    Arc<dyn ExecutionPlan>,
+                ) = if matches!(&*plan, LogicalPlan::Statement(_)) {
                     // For Statement plans, use SessionContext::execute_logical_plan()
                     // which handles PREPARE/EXECUTE/DEALLOCATE by modifying session state.
                     // Use the session-specific context if available to ensure prepared statements
@@ -775,80 +776,84 @@ impl Query {
                     (stream, physical_plan)
                 };
 
-            // Skip schema verification for Statement plans (PREPARE/EXECUTE/DEALLOCATE),
-            // DDL plans (CREATE TABLE/DROP TABLE), and DML Delete plans, as their logical
-            // plan schema may differ from the actual execution result (DDL plans may be
-            // rewritten by analyzer rules into extension nodes with different output schemas)
-            let res_stream = if !matches!(&*plan, LogicalPlan::Statement(_) | LogicalPlan::Ddl(_))
-                && !matches!(
-                    &*plan,
-                    LogicalPlan::Dml(dml)
-                        if matches!(
-                            &dml.op,
-                            datafusion::logical_expr::WriteOp::Delete
-                                | datafusion::logical_expr::WriteOp::Update
+                // Skip schema verification for Statement plans (PREPARE/EXECUTE/DEALLOCATE),
+                // DDL plans (CREATE TABLE/DROP TABLE), DML Delete/Update plans, and Spice
+                // DML extension nodes, as their logical plan schema may differ from the
+                // actual execution result (DDL/DML plans may be rewritten by analyzer rules
+                // into extension nodes with different output schemas).
+                let res_stream =
+                    if !matches!(&*plan, LogicalPlan::Statement(_) | LogicalPlan::Ddl(_))
+                        && !matches!(
+                            &*plan,
+                            LogicalPlan::Dml(dml)
+                                if matches!(
+                                    &dml.op,
+                                    datafusion::logical_expr::WriteOp::Delete
+                                        | datafusion::logical_expr::WriteOp::Update
+                                )
                         )
-                ) {
-                let plan_schema = Arc::clone(plan.schema().inner());
-                let res_schema = res_stream.schema();
+                        && !is_dml_extension(&plan)
+                    {
+                        let plan_schema = Arc::clone(plan.schema().inner());
+                        let res_schema = res_stream.schema();
 
-                if let Err(e) = verify_schema(plan_schema.fields(), res_schema.fields()) {
-                    handle_error!(
-                        tracker,
-                        &request_context,
-                        ErrorCode::InternalError,
-                        e,
-                        SchemaMismatch
+                        if let Err(e) = verify_schema(plan_schema.fields(), res_schema.fields()) {
+                            handle_error!(
+                                tracker,
+                                &request_context,
+                                ErrorCode::InternalError,
+                                e,
+                                SchemaMismatch
+                            )
+                        }
+                        // The AggregateStatistics physical optimizer may replace an
+                        // AggregateExec with a ProjectionExec containing a literal
+                        // value, which changes the output nullability (literals report
+                        // nullable = value.is_null()).  Reconcile the execution result
+                        // schema with the logical plan schema so downstream consumers
+                        // (e.g. FlightSQL GetFlightInfo vs DoGet) see consistent
+                        // nullability.
+                        reconcile_stream_nullability(res_stream, &plan_schema)
+                    } else {
+                        res_stream
+                    };
+
+                let final_stream = if cache_manager.should_cache_results() {
+                    Self::wrap_stream_with_cache(
+                        &ctx.df,
+                        res_stream,
+                        cache_manager.raw_cache_key,
+                        datasets,
                     )
-                }
-                // The AggregateStatistics physical optimizer may replace an
-                // AggregateExec with a ProjectionExec containing a literal
-                // value, which changes the output nullability (literals report
-                // nullable = value.is_null()).  Reconcile the execution result
-                // schema with the logical plan schema so downstream consumers
-                // (e.g. FlightSQL GetFlightInfo vs DoGet) see consistent
-                // nullability.
-                reconcile_stream_nullability(res_stream, &plan_schema)
-            } else {
-                res_stream
-            };
+                } else {
+                    res_stream
+                };
 
-            let final_stream = if cache_manager.should_cache_results() {
-                Self::wrap_stream_with_cache(
-                    &ctx.df,
-                    res_stream,
-                    cache_manager.raw_cache_key,
-                    datasets,
-                )
-            } else {
-                res_stream
-            };
-
-            let final_stream = attach_physical_plan_metrics_to_stream(
-                final_stream,
-                physical_plan,
-                Arc::clone(&request_context),
-                inner_span.clone(),
-            );
-
-            let final_stream = attach_query_active_guard_to_stream(
-                final_stream,
-                &request_context,
-                inner_span.clone(),
-            );
-
-            Ok(QueryResult::new(
-                attach_query_tracker_to_stream(
-                    inner_span,
-                    Arc::clone(&request_context),
-                    tracker,
+                let final_stream = attach_physical_plan_metrics_to_stream(
                     final_stream,
-                ),
-                cache_manager.cache_status,
-            ))
-        }
-        .instrument(span.clone())
-        .await;
+                    physical_plan,
+                    Arc::clone(&request_context),
+                    inner_span.clone(),
+                );
+
+                let final_stream = attach_query_active_guard_to_stream(
+                    final_stream,
+                    &request_context,
+                    inner_span.clone(),
+                );
+
+                Ok(QueryResult::new(
+                    attach_query_tracker_to_stream(
+                        inner_span,
+                        Arc::clone(&request_context),
+                        tracker,
+                        final_stream,
+                    ),
+                    cache_manager.cache_status,
+                ))
+            }
+            .instrument(span.clone())
+            .await;
 
         match query_result {
             Ok(result) => Ok(result),
@@ -1337,6 +1342,49 @@ fn reconcile_stream_nullability(
             })
         }),
     ))
+}
+
+/// Extract the target table reference from a DML logical plan.
+///
+/// Handles both standard DataFusion `LogicalPlan::Dml` nodes and
+/// distributed Cayenne DML extension nodes.
+fn extract_dml_target_table(plan: &LogicalPlan) -> Option<TableReference> {
+    match plan {
+        LogicalPlan::Dml(dml) => Some(dml.table_name.clone()),
+        #[cfg(not(windows))]
+        LogicalPlan::Extension(ext) => {
+            use super::cayenne_ddl::logical_nodes::DistributedCayenneDeleteNode;
+            if let Some(n) = ext
+                .node
+                .as_any()
+                .downcast_ref::<DistributedCayenneDeleteNode>()
+            {
+                return Some(n.table_name.clone());
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Returns `true` if the plan is a distributed DML extension node.
+///
+/// Used to skip schema verification for DML extension nodes, whose output
+/// schema may differ from the logical plan's schema.
+fn is_dml_extension(plan: &LogicalPlan) -> bool {
+    #[cfg(not(windows))]
+    if let LogicalPlan::Extension(ext) = plan {
+        use super::cayenne_ddl::logical_nodes::DistributedCayenneDeleteNode;
+        if ext
+            .node
+            .as_any()
+            .downcast_ref::<DistributedCayenneDeleteNode>()
+            .is_some()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
