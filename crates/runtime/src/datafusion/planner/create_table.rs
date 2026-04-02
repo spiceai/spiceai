@@ -91,12 +91,13 @@ pub(super) async fn plan_create_table(
         Err(e) => {
             // Clean up the store entry if planning fails.
             if let Some(ref key) = store_key
-                && let Err(cleanup_err) = cleanup_store_entry(ddl_store, key) {
-                    tracing::warn!(
-                        "Failed to clean up DDL extension store entry for {key} \
-                         after planning failure: {cleanup_err}"
-                    );
-                }
+                && let Err(cleanup_err) = cleanup_store_entry(ddl_store, key)
+            {
+                tracing::warn!(
+                    "Failed to clean up DDL extension store entry for {key} \
+                           after planning failure: {cleanup_err}"
+                );
+            }
             Err(e)
         }
     }
