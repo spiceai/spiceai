@@ -904,42 +904,9 @@ impl Query {
         let plan = match self.sql {
             QueryMethod::Plan(ref plan) => plan.clone(),
             QueryMethod::Text { ref sql, .. } => {
-                // Pre-process CREATE TABLE extensions (WITH options, PARTITION BY) before planning
-                let preprocessed =
-                    match super::ddl::preprocess::preprocess_create_table_with_options(
-                        sql,
-                        self.df.ddl_extension_store(),
-                    ) {
-                        Ok(preprocessed) => preprocessed,
-                        Err(e) => {
-                            let e = find_datafusion_root(e);
-                            self.handle_schema_error(&request_context, &e);
-                            return Err(e);
-                        }
-                    };
-
-                let (effective_sql, store_key) = match &preprocessed {
-                    super::ddl::preprocess::PreprocessResult::Modified {
-                        sql: modified,
-                        store_key,
-                    } => (modified.as_str(), Some(store_key.clone())),
-                    super::ddl::preprocess::PreprocessResult::Unchanged => (sql.as_ref(), None),
-                };
-
-                match session.create_logical_plan(effective_sql).await {
+                match self.df.create_logical_plan(&session, sql).await {
                     Ok(plan) => Box::new(plan),
                     Err(e) => {
-                        if let Some(store_key) = store_key
-                            && let Err(cleanup_err) =
-                                super::ddl::preprocess::cleanup_preprocessed_ddl_options(
-                                    self.df.ddl_extension_store(),
-                                    &store_key,
-                                )
-                        {
-                            let cleanup_err = find_datafusion_root(cleanup_err);
-                            self.handle_schema_error(&request_context, &cleanup_err);
-                            return Err(cleanup_err);
-                        }
                         let e = find_datafusion_root(e);
                         self.handle_schema_error(&request_context, &e);
                         return Err(e);

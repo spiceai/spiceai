@@ -2588,30 +2588,7 @@ impl DataFusion {
             None
         };
 
-        // Pre-process CREATE TABLE statements to extract DDL extensions
-        // (WITH options, PARTITION BY) before planning.
-        let preprocessed =
-            ddl::preprocess::preprocess_create_table_with_options(sql, &self.ddl_extension_store)?;
-        let (effective_sql, store_key) = match &preprocessed {
-            ddl::preprocess::PreprocessResult::Modified {
-                sql: modified,
-                store_key,
-            } => (modified.as_str(), Some(store_key)),
-            ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
-        };
-
-        let plan = match self.create_logical_plan(session, effective_sql).await {
-            Ok(plan) => plan,
-            Err(e) => {
-                if let Some(store_key) = store_key {
-                    ddl::preprocess::cleanup_preprocessed_ddl_options(
-                        &self.ddl_extension_store,
-                        store_key,
-                    )?;
-                }
-                return Err(e);
-            }
-        };
+        let plan = self.create_logical_plan(session, sql).await?;
 
         if let Some(cache) = plans_cache
             && let Some(cache_key) = cache_key_opt
@@ -2623,10 +2600,11 @@ impl DataFusion {
         Ok(plan)
     }
 
-    /// Route SQL through the planner, which intercepts Cayenne DML
-    /// at the statement level, or falls back to DataFusion's standard planner.
+    /// Route SQL through the planner, which intercepts DDL extensions and
+    /// Cayenne DML at the statement level, or falls back to DataFusion's
+    /// standard planner.
     #[cfg(not(windows))]
-    async fn create_logical_plan(
+    pub(crate) async fn create_logical_plan(
         &self,
         session: &SessionState,
         sql: &str,
@@ -2638,6 +2616,7 @@ impl DataFusion {
                 planner::CatalogMode::Standard
             },
             cluster_role: self.cluster_config.effective_role(),
+            ddl_extension_store: Arc::clone(&self.ddl_extension_store),
         };
 
         planner::create_logical_plan(sql, session, &ctx).await
@@ -2646,7 +2625,7 @@ impl DataFusion {
     /// On Windows the `planner` module is not available, so delegate
     /// directly to DataFusion's standard logical planner.
     #[cfg(windows)]
-    async fn create_logical_plan(
+    pub(crate) async fn create_logical_plan(
         &self,
         session: &SessionState,
         sql: &str,
