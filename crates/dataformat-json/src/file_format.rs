@@ -615,6 +615,9 @@ impl DataSource for NonRepartitionedFileScanConfig {
     }
 }
 
+/// UTF-8 BOM prefix (`\xEF\xBB\xBF`).
+const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
 /// Infer a JSON schema from all bytes in `buf`, dispatching by [`Format`].
 ///
 /// For [`Format::Object`] the buffer is parsed as a single JSON value (handles
@@ -630,9 +633,14 @@ fn infer_json_schema_for_format(
     format: Format,
     take_while: &mut dyn FnMut() -> bool,
 ) -> Result<Schema> {
+    // Strip a leading UTF-8 BOM so serde_json can parse the input.
+    let buf = buf.strip_prefix(&UTF8_BOM).unwrap_or(buf);
+
     if format == Format::Object {
         let value: serde_json::Value =
             serde_json::from_slice(buf).map_err(|e| DataFusionError::External(Box::new(e)))?;
+        // Decrement schema_infer_max_rec consistently for single-object inputs.
+        take_while();
         return infer_json_schema_from_iterator(std::iter::once(Ok::<_, ArrowError>(value)))
             .map_err(DataFusionError::from);
     }
@@ -666,6 +674,7 @@ fn infer_json_schema_for_format(
         if matches!(format, Format::Auto | Format::Json) {
             if let Ok(value) = serde_json::from_slice::<serde_json::Value>(buf) {
                 if value.is_object() {
+                    take_while();
                     return Ok(infer_json_schema_from_iterator(std::iter::once(Ok::<
                         _,
                         ArrowError,
@@ -1119,5 +1128,53 @@ mod tests {
         assert!(schema.field_with_name("airports").is_ok());
         assert!(schema.field_with_name("count").is_ok());
         assert!(schema.field_with_name("source").is_ok());
+    }
+
+    // ---- BOM-prefixed fixtures ----
+
+    #[test]
+    fn test_fixture_bom_object_schema() {
+        let data = load_fixture("bom_object.json");
+        // Verify BOM is actually present
+        assert_eq!(&data[..3], &[0xEF, 0xBB, 0xBF], "fixture should start with UTF-8 BOM");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
+            .expect("Object schema from bom_object.json");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_bom_object_auto_schema() {
+        let data = load_fixture("bom_object.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
+            .expect("Auto schema from bom_object.json");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_bom_jsonl_auto_schema() {
+        let data = load_fixture("bom_jsonl.json");
+        assert_eq!(&data[..3], &[0xEF, 0xBB, 0xBF], "fixture should start with UTF-8 BOM");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
+            .expect("Auto schema from bom_jsonl.json");
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_bom_array_auto_schema() {
+        let data = load_fixture("bom_array.json");
+        assert_eq!(&data[..3], &[0xEF, 0xBB, 0xBF], "fixture should start with UTF-8 BOM");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
+            .expect("Auto schema from bom_array.json");
+        assert!(schema.field_with_name("id").is_ok());
+        assert!(schema.field_with_name("val").is_ok());
     }
 }
