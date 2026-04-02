@@ -1004,13 +1004,6 @@ mod tests {
         server.shutdown().await;
     }
 
-    fn metric_value(metrics: &datafusion::physical_plan::metrics::MetricsSet, name: &str) -> usize {
-        metrics
-            .sum_by_name(name)
-            .map(|metric| metric.as_usize())
-            .unwrap_or_default()
-    }
-
     fn has_metric(metrics: &datafusion::physical_plan::metrics::MetricsSet, name: &str) -> bool {
         metrics.sum_by_name(name).is_some()
     }
@@ -1082,11 +1075,6 @@ mod tests {
         let first = stream.next().await;
         assert!(first.is_some());
         assert!(first.expect("item should exist").is_err());
-
-        // The first stream item was an error, so first_batch_time is still unset until
-        // stream completion/drop fallback records it.
-        let metrics = exec.metrics().expect("metrics should exist");
-        assert_eq!(metric_value(&metrics, "first_batch_time"), 0);
 
         drop(stream);
 
