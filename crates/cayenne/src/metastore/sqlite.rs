@@ -578,6 +578,7 @@ impl MetastoreBackend for SqliteMetastore {
         tracing::info!(target: "runtime", lock_wait_ms, "Metastore: mutex acquired for begin_transaction");
 
         tracing::info!(target: "runtime", "Metastore: executing BEGIN TRANSACTION");
+
         guard
             .call(|conn| {
                 conn.execute_batch("BEGIN TRANSACTION")?;

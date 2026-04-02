@@ -2618,7 +2618,11 @@ mod tests {
             true
         }
 
-        async fn checkpoint(&self, _schema: &SchemaRef) -> DatasetCheckpointResult<()> {
+        async fn checkpoint(
+            &self,
+            _schema: &SchemaRef,
+            _refresh_sql: Option<&str>,
+        ) -> DatasetCheckpointResult<()> {
             Ok(())
         }
 
@@ -2627,6 +2631,10 @@ mod tests {
         }
 
         async fn last_checkpoint_time(&self) -> DatasetCheckpointResult<Option<SystemTime>> {
+            Ok(None)
+        }
+
+        async fn get_refresh_sql(&self) -> DatasetCheckpointResult<Option<String>> {
             Ok(None)
         }
     }
