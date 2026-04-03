@@ -40,7 +40,7 @@ jobs:
 
       - name: Set up spiceio
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@8c7781c6707cd60f1a18acb197168bebc9338532 # v0.4.3
+        uses: spiceai/spiceio/.github/actions/setup@07f50ad2b40d272a857ca2483712d8b0ade6480b # v0.5.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
