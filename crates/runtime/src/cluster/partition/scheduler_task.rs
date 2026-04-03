@@ -269,6 +269,10 @@ impl PartitionManagementTask {
                 match result {
                     Ok(()) => {
                         self.status.update_component_status("partition_metadata", ComponentStatus::Ready);
+                        // Mark distributed datasets as Ready now that partition
+                        // metadata has been seeded. This unblocks /v1/ready so
+                        // executors can connect and be assigned partitions.
+                        self.mark_all_partition_datasets_ready().await;
                     }
                     Err(err) => {
                         tracing::warn!("Failed to initialize partition metadata: {err}");
@@ -375,6 +379,27 @@ impl PartitionManagementTask {
     /// been assigned to at least one executor.
     async fn update_dataset_statuses(&self) {
         update_dataset_statuses_from_partitions(&self.partition_manager, &self.status).await;
+    }
+
+    /// Mark all datasets tracked by the partition manager as
+    /// [`ComponentStatus::Ready`] unconditionally.
+    ///
+    /// Called once after partition metadata initialization to unblock
+    /// `/v1/ready` so executors can connect and receive assignments.
+    async fn mark_all_partition_datasets_ready(&self) {
+        let tables = match self.partition_manager.list_tables().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to list tables for post-init dataset ready");
+                return;
+            }
+        };
+
+        for table_name in &tables {
+            let table_ref = TableReference::parse_str(table_name);
+            self.status
+                .update_dataset(&table_ref, ComponentStatus::Ready);
+        }
     }
 
     /// Seed partition metadata for all accelerated tables that don't have metadata yet.
