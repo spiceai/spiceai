@@ -40,7 +40,7 @@ jobs:
         uses: ./.github/actions/check-code-changes
 
   check:
-    name: Check (Develop)
+    name: Rust Lint
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
@@ -51,8 +51,12 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set spiceio log path
+        run: echo "SPICEIO_LOG_FILE=/tmp/spiceio-check-$$.log" >> "$GITHUB_ENV"
+
       - name: Set up spiceio
-        uses: spiceai/spiceio/.github/actions/setup@f964d0fc0c7c60f1463c35971636493b8186a7e2 # v0.2.0
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@8c7781c6707cd60f1a18acb197168bebc9338532 # v0.4.3
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -62,6 +66,8 @@ jobs:
 
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
+        with:
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Install Protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
@@ -87,8 +93,20 @@ jobs:
       - name: Show sccache stats
         run: sccache --show-stats
 
+      - name: Kill spiceio
+        if: always() && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: spiceio-check-logs
+          path: ${{ env.SPICEIO_LOG_FILE }}
+          if-no-files-found: ignore
+
   build-and-test:
-    name: Build and Test (Develop)
+    name: Build and Test
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
@@ -99,8 +117,12 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set spiceio log path
+        run: echo "SPICEIO_LOG_FILE=/tmp/spiceio-build-$$.log" >> "$GITHUB_ENV"
+
       - name: Set up spiceio
-        uses: spiceai/spiceio/.github/actions/setup@f964d0fc0c7c60f1463c35971636493b8186a7e2 # v0.2.0
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@8c7781c6707cd60f1a18acb197168bebc9338532 # v0.4.3
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -110,6 +132,8 @@ jobs:
 
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
+        with:
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -148,3 +172,15 @@ jobs:
             echo "Update Cargo.lock"
             exit 1
           fi
+
+      - name: Kill spiceio
+        if: always() && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: spiceio-build-logs
+          path: ${{ env.SPICEIO_LOG_FILE }}
+          if-no-files-found: ignore
