@@ -230,7 +230,10 @@ impl PartitionTableProvider {
             DataFusionError::Execution(format!("Failed to encode partition key: {e}"))
         })?;
 
-        if let Some(partition) = self.partitions.read().await.get(&partition_key) {
+        // retain the write lock across the entire get-or-create instead of holding a .read() which releases the lock and could race
+        // with another get-or-create for the same partition key, resulting in duplicate partitions being created
+        let mut partitions_lock = self.partitions.write().await;
+        if let Some(partition) = partitions_lock.get(&partition_key) {
             return Ok(Arc::clone(&partition.table_provider));
         }
 
@@ -240,10 +243,7 @@ impl PartitionTableProvider {
             .await
             .map_err(|e| DataFusionError::Execution(e.to_string()))?;
         let provider = Arc::clone(&partition.table_provider);
-        self.partitions
-            .write()
-            .await
-            .insert(partition_key, partition);
+        partitions_lock.insert(partition_key, partition);
         Ok(provider)
     }
 }

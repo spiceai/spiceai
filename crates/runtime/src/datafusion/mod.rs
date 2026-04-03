@@ -2833,10 +2833,17 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
         .as_any()
         .downcast_ref::<PartitionTableProvider>()
     {
-        return partitioned
+        let partition_exprs = partitioned
             .partition_by()
-            .first()
-            .map(|partition| partition.expression.to_string());
+            .iter()
+            .map(|partition| partition.expression.to_string())
+            .collect_vec();
+
+        return match partition_exprs.as_slice() {
+            [] => None,
+            [single] => Some(single.clone()),
+            _ => Some(format!("({})", partition_exprs.join(", "))),
+        };
     }
 
     if let Some(poly) = table_provider.as_any().downcast_ref::<PolyTableProvider>() {

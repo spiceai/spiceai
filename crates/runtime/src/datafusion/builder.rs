@@ -34,7 +34,7 @@ use datafusion::{
     execution::{
         DiskManager, SessionStateBuilder,
         disk_manager::DiskManagerMode,
-        memory_pool::{GreedyMemoryPool, MemoryPool, TrackConsumersPool},
+        memory_pool::{GreedyMemoryPool, TrackConsumersPool},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
     optimizer::{
