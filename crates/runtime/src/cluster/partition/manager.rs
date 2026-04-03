@@ -405,3 +405,194 @@ fn now_ms() -> Result<u128> {
         .map(|d| d.as_millis())
         .context(SystemTimeSnafu)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn in_memory_manager() -> PartitionManager {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        PartitionManager::new(store)
+    }
+
+    fn table(name: &str) -> TableReference {
+        TableReference::parse_str(name)
+    }
+
+    fn partition_value(key: &str, val: &str) -> PartitionValue {
+        HashMap::from([(key.to_string(), val.to_string())])
+    }
+
+    /// Verifies that `add_and_assign_partitions` correctly adds new partitions
+    /// and assigns them to executors in a single operation. This is the core
+    /// mechanism used by the pre-refresh partition discovery fix (#10075).
+    #[tokio::test]
+    async fn test_add_and_assign_new_partitions() {
+        let pm = in_memory_manager();
+        let tbl = table("my_table");
+
+        // Initialize empty metadata
+        pm.initialize_metadata(&tbl, vec!["bucket(3, id)".to_string()])
+            .await
+            .expect("init");
+
+        // Add and assign 3 new partitions to 2 executors
+        let p0 = partition_value("bucket(3, id)", "0");
+        let p1 = partition_value("bucket(3, id)", "1");
+        let p2 = partition_value("bucket(3, id)", "2");
+
+        let assignments = vec![
+            (&p0, "executor-1"),
+            (&p1, "executor-2"),
+            (&p2, "executor-1"),
+        ];
+
+        pm.add_and_assign_partitions(&tbl, &assignments)
+            .await
+            .expect("add and assign");
+
+        // Verify all partitions are present and correctly assigned
+        let metadata = pm
+            .get_table_metadata(&tbl)
+            .await
+            .expect("get metadata")
+            .expect("should exist");
+
+        assert_eq!(metadata.partitions.len(), 3);
+
+        let find_partition = |val: &str| -> &PartitionMetadata {
+            metadata
+                .partitions
+                .iter()
+                .find(|p| p.partition_value.get("bucket(3, id)") == Some(&val.to_string()))
+                .expect("partition not found")
+        };
+
+        let p0_meta = find_partition("0");
+        assert!(p0_meta.is_assigned_to("executor-1"));
+        assert!(!p0_meta.is_assigned_to("executor-2"));
+
+        let p1_meta = find_partition("1");
+        assert!(p1_meta.is_assigned_to("executor-2"));
+        assert!(!p1_meta.is_assigned_to("executor-1"));
+
+        let p2_meta = find_partition("2");
+        assert!(p2_meta.is_assigned_to("executor-1"));
+        assert!(!p2_meta.is_assigned_to("executor-2"));
+    }
+
+    /// Verifies that `add_and_assign_partitions` is idempotent when called with
+    /// already-existing partitions that are already assigned.
+    #[tokio::test]
+    async fn test_add_and_assign_idempotent() {
+        let pm = in_memory_manager();
+        let tbl = table("my_table");
+
+        pm.initialize_metadata(&tbl, vec!["bucket(2, id)".to_string()])
+            .await
+            .expect("init");
+
+        let p0 = partition_value("bucket(2, id)", "0");
+
+        // First call: add and assign
+        let assignments = vec![(&p0, "executor-1")];
+        pm.add_and_assign_partitions(&tbl, &assignments)
+            .await
+            .expect("first call");
+
+        // Second call: same partition, same executor - should be a no-op
+        pm.add_and_assign_partitions(&tbl, &assignments)
+            .await
+            .expect("second call (idempotent)");
+
+        let metadata = pm
+            .get_table_metadata(&tbl)
+            .await
+            .expect("get metadata")
+            .expect("should exist");
+
+        assert_eq!(metadata.partitions.len(), 1);
+        assert!(metadata.partitions[0].is_assigned_to("executor-1"));
+        // Should only have one executor entry
+        assert_eq!(metadata.partitions[0].assigned_executors.len(), 1);
+    }
+
+    /// Verifies that new partitions can be added alongside existing partitions.
+    /// This simulates the scenario where a refresh discovers new partition values
+    /// that were not present during the initial partition management cycle.
+    #[tokio::test]
+    async fn test_add_new_partitions_alongside_existing() {
+        let pm = in_memory_manager();
+        let tbl = table("my_table");
+
+        pm.initialize_metadata(&tbl, vec!["region".to_string()])
+            .await
+            .expect("init");
+
+        // First: add the initial partition
+        let p_east = partition_value("region", "us-east");
+        pm.add_and_assign_partitions(&tbl, &[(&p_east, "executor-1")])
+            .await
+            .expect("initial assignment");
+
+        // Verify: 1 partition assigned
+        let metadata = pm
+            .get_table_metadata(&tbl)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(metadata.partitions.len(), 1);
+
+        // Now simulate what happens during a refresh: a NEW partition value is discovered
+        let p_west = partition_value("region", "us-west");
+        pm.add_and_assign_partitions(&tbl, &[(&p_west, "executor-2")])
+            .await
+            .expect("add new partition before refresh");
+
+        // Verify: 2 partitions, each assigned to a different executor
+        let metadata = pm
+            .get_table_metadata(&tbl)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(metadata.partitions.len(), 2);
+
+        let east = metadata
+            .partitions
+            .iter()
+            .find(|p| p.partition_value.get("region") == Some(&"us-east".to_string()))
+            .expect("us-east");
+        assert!(east.is_assigned_to("executor-1"));
+
+        let west = metadata
+            .partitions
+            .iter()
+            .find(|p| p.partition_value.get("region") == Some(&"us-west".to_string()))
+            .expect("us-west");
+        assert!(west.is_assigned_to("executor-2"));
+    }
+
+    /// Verifies that `add_and_assign_partitions` with an empty assignments list
+    /// is a no-op (does not error or modify metadata).
+    #[tokio::test]
+    async fn test_add_and_assign_empty_is_noop() {
+        let pm = in_memory_manager();
+        let tbl = table("my_table");
+
+        pm.initialize_metadata(&tbl, vec!["col".to_string()])
+            .await
+            .expect("init");
+
+        let empty: Vec<(&PartitionValue, &str)> = vec![];
+        pm.add_and_assign_partitions(&tbl, &empty)
+            .await
+            .expect("empty is ok");
+
+        let metadata = pm
+            .get_table_metadata(&tbl)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert!(metadata.partitions.is_empty());
+    }
+}

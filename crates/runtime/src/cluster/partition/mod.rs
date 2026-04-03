@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-mod discovery;
+pub(crate) mod discovery;
 pub mod executor_selection;
 mod manager;
-mod metadata;
+pub(crate) mod metadata;
 pub mod scheduler_task;
 mod startup;
 pub(crate) mod write_through;

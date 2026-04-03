@@ -310,6 +310,9 @@ impl RuntimeBuilder {
             }),
             None => None, // No cluster config means we're running in standalone mode
         };
+        // Create the shared app reference early so both DataFusion and Runtime can share it.
+        let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
+
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
@@ -325,10 +328,15 @@ impl RuntimeBuilder {
         .with_url_tables(url_tables_enabled);
 
         if let Some(DistributedNode::Scheduler {
-            executor_registry, ..
+            executor_registry,
+            partition_manager,
+            ..
         }) = distributed.as_ref()
         {
-            df_builder = df_builder.with_executor_registry(Arc::clone(executor_registry));
+            df_builder = df_builder
+                .with_executor_registry(Arc::clone(executor_registry))
+                .with_partition_manager(Arc::clone(partition_manager))
+                .with_app(Arc::clone(&shared_app));
         }
 
         if let Some(resolved_cluster_config) = self.resolved_cluster_config {
@@ -359,7 +367,7 @@ impl RuntimeBuilder {
         };
 
         let mut rt = Runtime {
-            app: Arc::new(RwLock::new(self.app)),
+            app: shared_app,
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
             completion_llms: Arc::new(RwLock::new(HashMap::new())),

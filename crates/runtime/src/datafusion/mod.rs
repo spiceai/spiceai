@@ -48,7 +48,9 @@ use crate::view::prepare_view;
 use crate::{status, view};
 
 use {
-    crate::cluster::{ExecutorControlStreamRegistry, ExecutorRegistry, ResolvedClusterConfig},
+    crate::cluster::{
+        ExecutorControlStreamRegistry, ExecutorRegistry, PartitionManager, ResolvedClusterConfig,
+    },
     ballista_executor::executor::Executor,
     ballista_scheduler::scheduler_server::SchedulerServer,
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
@@ -557,6 +559,10 @@ pub struct DataFusion {
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
     /// Executor registry for distributed write forwarding (scheduler mode only).
     pub(crate) executor_registry: Option<Arc<ExecutorRegistry>>,
+    /// Partition manager for discovering/assigning partitions before refresh (scheduler mode only).
+    pub(crate) partition_manager: Option<Arc<PartitionManager>>,
+    /// App reference for partition discovery during refresh (scheduler mode only).
+    pub(crate) app: Option<Arc<TokioRwLock<Option<Arc<app::App>>>>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -1913,12 +1919,11 @@ impl DataFusion {
         if matches!(
             self.cluster_config.effective_role(),
             Some(crate::config::ClusterRole::Scheduler)
-        ) {
-            if let Some(executor_registry) = &self.executor_registry {
-                return self
-                    .forward_refresh_to_executors(executor_registry, dataset_name, &overrides)
-                    .await;
-            }
+        ) && let Some(executor_registry) = &self.executor_registry
+        {
+            return self
+                .forward_refresh_to_executors(executor_registry, dataset_name, overrides.as_ref())
+                .await;
         }
 
         let table = self
@@ -1942,12 +1947,31 @@ impl DataFusion {
 
     /// Forwards a dataset refresh command to all connected executors via the control stream.
     /// Returns `Ok(None)` because the scheduler does not have a local notifier for executor refreshes.
+    ///
+    /// Before forwarding the refresh, runs on-demand partition discovery to ensure new
+    /// partitions are assigned to executors. This prevents data loss when `spice refresh`
+    /// is triggered before the periodic partition management task discovers new partitions.
     async fn forward_refresh_to_executors(
         &self,
         executor_registry: &ExecutorRegistry,
         dataset_name: &TableReference,
-        overrides: &Option<RefreshOverrides>,
+        overrides: Option<&RefreshOverrides>,
     ) -> Result<Option<Arc<Notify>>> {
+        // Run on-demand partition discovery before forwarding the refresh command.
+        // This ensures that any new partition values in the source data are discovered,
+        // assigned to executors, and executors are notified -- before they receive the
+        // refresh command. Without this, the periodic partition management task (which
+        // runs on a 30-second interval) might not have discovered new partitions yet,
+        // causing executors to drop data from unassigned partitions. (fixes #10075)
+        if let Some(partition_manager) = &self.partition_manager {
+            self.discover_and_assign_partitions_for_refresh(
+                partition_manager,
+                executor_registry,
+                dataset_name,
+            )
+            .await;
+        }
+
         let overrides_json = match overrides {
             Some(o) => {
                 Some(
@@ -2006,6 +2030,258 @@ impl DataFusion {
         }
 
         Ok(None)
+    }
+
+    /// Discovers new partition values from the source table and assigns them to executors
+    /// before a refresh command is forwarded. This ensures executors have assignments for
+    /// all current partition values, preventing data loss from new partitions.
+    ///
+    /// If discovery fails for any reason, a warning is logged but the refresh still proceeds
+    /// (graceful degradation).
+    async fn discover_and_assign_partitions_for_refresh(
+        &self,
+        partition_manager: &Arc<crate::cluster::PartitionManager>,
+        executor_registry: &ExecutorRegistry,
+        dataset_name: &TableReference,
+    ) {
+        use crate::cluster::partition::discovery::table_partition_values;
+        use crate::cluster::partition::partition_value_to_bytes;
+        use runtime_proto::scheduler_control_message::Message as SchedulerControlMessageEnum;
+        use runtime_proto::{BytesArray, SchedulerControlMessage, UpdatePartitions};
+
+        let table_name = dataset_name.to_string();
+
+        // Read the app to get the dataset's partition_by config.
+        let Some(app_guard) = &self.app else {
+            tracing::debug!(
+                table = %table_name,
+                "No app reference available, skipping pre-refresh partition discovery"
+            );
+            return;
+        };
+        let app_opt = app_guard.read().await;
+        let Some(app) = app_opt.as_ref() else {
+            tracing::debug!(
+                table = %table_name,
+                "App not initialized, skipping pre-refresh partition discovery"
+            );
+            return;
+        };
+
+        // Find the acceleration config for this dataset or view.
+        let acceleration = app
+            .datasets
+            .iter()
+            .find(|d| resolved_equality(d.name.clone().into(), dataset_name.clone()))
+            .and_then(|d| d.acceleration.as_ref())
+            .or_else(|| {
+                app.views
+                    .iter()
+                    .find(|v| resolved_equality(v.name.clone().into(), dataset_name.clone()))
+                    .and_then(|v| v.acceleration.as_ref())
+            });
+
+        let Some(acceleration) = acceleration else {
+            tracing::debug!(
+                table = %table_name,
+                "No acceleration config found, skipping pre-refresh partition discovery"
+            );
+            return;
+        };
+
+        if acceleration.partition_by.is_empty() {
+            return; // Not partitioned, nothing to discover.
+        }
+
+        let partition_by = acceleration.partition_by.clone();
+        // Drop the read guard before performing async operations that might be slow.
+        drop(app_opt);
+
+        // Refresh partition manager cache from object store.
+        if let Err(e) = partition_manager.refresh().await {
+            tracing::warn!(
+                table = %table_name,
+                error = %e,
+                "Failed to refresh partition manager cache before refresh, proceeding anyway"
+            );
+            return;
+        }
+
+        // Get the self Arc for table_partition_values (it needs &Arc<DataFusion>).
+        let Some(df_arc) = self
+            .datafusion_ref
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+        else {
+            tracing::warn!(
+                table = %table_name,
+                "DataFusion self-reference not available, skipping pre-refresh partition discovery"
+            );
+            return;
+        };
+
+        // Discover current partition values from the source.
+        let source_partitions = match table_partition_values(dataset_name, &partition_by, &df_arc)
+            .await
+        {
+            Ok(values) => values,
+            Err(e) => {
+                tracing::warn!(
+                    table = %table_name,
+                    error = %e,
+                    "Failed to discover partition values before refresh, proceeding anyway"
+                );
+                return;
+            }
+        };
+
+        if source_partitions.is_empty() {
+            return;
+        }
+
+        // Get the current metadata to find new partitions.
+        let current_metadata = match partition_manager.get_table_metadata(dataset_name).await {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                tracing::debug!(
+                    table = %table_name,
+                    "No partition metadata found, skipping pre-refresh partition discovery"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    table = %table_name,
+                    error = %e,
+                    "Failed to get partition metadata before refresh, proceeding anyway"
+                );
+                return;
+            }
+        };
+
+        // Find partitions that exist in source but not in metadata.
+        let existing_partitions: std::collections::HashSet<Vec<(String, String)>> =
+            current_metadata
+                .partitions
+                .iter()
+                .map(|p| {
+                    let mut v: Vec<_> = p.partition_value.clone().into_iter().collect();
+                    v.sort();
+                    v
+                })
+                .collect();
+
+        let new_partitions: Vec<crate::cluster::partition::PartitionValue> = source_partitions
+            .into_iter()
+            .filter(|p| {
+                let mut v: Vec<_> = p.clone().into_iter().collect();
+                v.sort();
+                !existing_partitions.contains(&v)
+            })
+            .collect();
+
+        if new_partitions.is_empty() {
+            tracing::debug!(
+                table = %table_name,
+                "No new partitions discovered before refresh"
+            );
+            return;
+        }
+
+        tracing::info!(
+            table = %table_name,
+            count = new_partitions.len(),
+            "Discovered new partitions before refresh, assigning to executors"
+        );
+
+        // Get connected executors for round-robin assignment of new partitions.
+        let executor_ids = executor_registry.connected_executors().await;
+        if executor_ids.is_empty() {
+            tracing::warn!(
+                table = %table_name,
+                "No executors connected, cannot assign new partitions"
+            );
+            return;
+        }
+
+        // Assign new partitions to executors using round-robin.
+        let assignments: Vec<(&crate::cluster::partition::PartitionValue, &str)> = new_partitions
+            .iter()
+            .enumerate()
+            .map(|(i, pv)| (pv, executor_ids[i % executor_ids.len()].as_str()))
+            .collect();
+
+        if let Err(e) = partition_manager
+            .add_and_assign_partitions(dataset_name, &assignments)
+            .await
+        {
+            tracing::warn!(
+                table = %table_name,
+                error = %e,
+                "Failed to add and assign new partitions before refresh, proceeding anyway"
+            );
+            return;
+        }
+
+        // Notify executors of the new partition assignments.
+        // Group by executor for efficient notification.
+        let mut by_executor: std::collections::HashMap<
+            &str,
+            Vec<&crate::cluster::partition::PartitionValue>,
+        > = std::collections::HashMap::new();
+        for (pv, executor_id) in &assignments {
+            by_executor.entry(executor_id).or_default().push(pv);
+        }
+
+        for (executor_id, partitions) in by_executor {
+            let mut partitions_bytes = Vec::new();
+            for p in partitions {
+                match partition_value_to_bytes(p.clone(), dataset_name, &df_arc).await {
+                    Ok(bytes) => partitions_bytes.push(bytes.to_vec()),
+                    Err(e) => {
+                        tracing::warn!(
+                            table = %table_name,
+                            error = %e,
+                            "Failed to convert partition value to bytes, skipping notification for this partition"
+                        );
+                    }
+                }
+            }
+
+            if partitions_bytes.is_empty() {
+                continue;
+            }
+
+            let new_partitions_map = std::collections::HashMap::from([(
+                table_name.clone(),
+                BytesArray {
+                    items: partitions_bytes,
+                },
+            )]);
+
+            let command = SchedulerControlMessage {
+                message: Some(SchedulerControlMessageEnum::UpdatePartitions(
+                    UpdatePartitions {
+                        new_partitions: new_partitions_map,
+                        removed_partitions: std::collections::HashMap::new(),
+                    },
+                )),
+            };
+
+            if let Err(e) = executor_registry.send_command(executor_id, command).await {
+                tracing::warn!(
+                    executor_id = %executor_id,
+                    table = %table_name,
+                    error = %e,
+                    "Failed to notify executor of new partitions before refresh"
+                );
+            }
+        }
+
+        tracing::info!(
+            table = %table_name,
+            "Completed pre-refresh partition discovery and assignment"
+        );
     }
 
     pub async fn update_refresh_sql(

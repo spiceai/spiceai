@@ -26,6 +26,7 @@ use super::{
 };
 use crate::cluster::ResolvedClusterConfig;
 use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::cluster::partition::PartitionManager;
 use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, status};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
@@ -132,6 +133,8 @@ pub struct DataFusionBuilder {
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
     executor_registry: Option<Arc<ExecutorRegistry>>,
+    partition_manager: Option<Arc<PartitionManager>>,
+    app: Option<Arc<TokioRwLock<Option<Arc<app::App>>>>>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -177,6 +180,8 @@ impl DataFusionBuilder {
             url_tables_enabled: false,
             additional_analyzer_rules: vec![],
             executor_registry: None,
+            partition_manager: None,
+            app: None,
         }
     }
 
@@ -274,6 +279,20 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_executor_registry(mut self, registry: Arc<ExecutorRegistry>) -> Self {
         self.executor_registry = Some(registry);
+        self
+    }
+
+    /// Sets the partition manager for on-demand partition discovery before refresh (scheduler mode only).
+    #[must_use]
+    pub fn with_partition_manager(mut self, manager: Arc<PartitionManager>) -> Self {
+        self.partition_manager = Some(manager);
+        self
+    }
+
+    /// Sets the app reference for partition discovery during refresh (scheduler mode only).
+    #[must_use]
+    pub fn with_app(mut self, app: Arc<TokioRwLock<Option<Arc<app::App>>>>) -> Self {
+        self.app = Some(app);
         self
     }
 
@@ -499,6 +518,8 @@ impl DataFusionBuilder {
             executor: RwLock::new(None),
             executor_stream_registry: RwLock::new(None),
             executor_registry: self.executor_registry,
+            partition_manager: self.partition_manager,
+            app: self.app,
         }
     }
 }
