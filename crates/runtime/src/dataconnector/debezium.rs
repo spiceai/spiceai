@@ -618,12 +618,12 @@ async fn refresh_schema_if_evolved(
         schema_fields: fresh_fields.into_iter().cloned().collect(),
     };
 
-    if dataset.is_file_accelerated() {
-        if let Err(e) = set_metadata_to_accelerator(dataset, &updated_metadata).await {
-            tracing::warn!(
-                "Failed to persist updated schema for {dataset_name}: {e}. Using fresh schema in-memory only."
-            );
-        }
+    if dataset.is_file_accelerated()
+        && let Err(e) = set_metadata_to_accelerator(dataset, &updated_metadata).await
+    {
+        tracing::warn!(
+            "Failed to persist updated schema for {dataset_name}: {e}. Using fresh schema in-memory only."
+        );
     }
 
     Ok((updated_metadata, Arc::new(fresh_schema)))
