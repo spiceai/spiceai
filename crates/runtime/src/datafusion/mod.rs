@@ -62,6 +62,7 @@ use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
+use data_components::poly::PolyTableProvider;
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::common::{Constraint, Constraints, ToDFSchema};
@@ -97,6 +98,7 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
+use runtime_table_partition::provider::PartitionTableProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use spicepod::acceleration::SnapshotsTrigger;
@@ -1985,6 +1987,19 @@ impl DataFusion {
             )?;
 
             return Ok(notifier);
+        } else if let Some(write_through) = table
+            .as_any()
+            .downcast_ref::<crate::accelerated_table::write_through::WriteThroughAcceleratedTableProvider>()
+        {
+            let accelerated_table = write_through.inner();
+            let notifier = accelerated_table.refresher().on_complete_notification();
+            accelerated_table.trigger_refresh(overrides).await.context(
+                UnableToTriggerRefreshSnafu {
+                    dataset_name: dataset_name.to_string(),
+                },
+            )?;
+
+            return Ok(notifier);
         }
         NotAcceleratedTableSnafu {
             table_name: dataset_name.to_string(),
@@ -2096,6 +2111,17 @@ impl DataFusion {
                     dataset_name: dataset_name.to_string(),
                 },
             )?;
+        } else if let Some(write_through) = table
+            .as_any()
+            .downcast_ref::<crate::accelerated_table::write_through::WriteThroughAcceleratedTableProvider>()
+        {
+            write_through
+                .inner()
+                .update_refresh_sql(parsed)
+                .await
+                .context(UnableToTriggerRefreshSnafu {
+                    dataset_name: dataset_name.to_string(),
+                })?;
         }
 
         Ok(())
@@ -2113,6 +2139,17 @@ impl DataFusion {
 
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
             accelerated_table
+                .update_partition_filters(filters)
+                .await
+                .context(UnableToTriggerRefreshSnafu {
+                    dataset_name: dataset_name.to_string(),
+                })?;
+        } else if let Some(write_through) = table
+            .as_any()
+            .downcast_ref::<crate::accelerated_table::write_through::WriteThroughAcceleratedTableProvider>()
+        {
+            write_through
+                .inner()
                 .update_partition_filters(filters)
                 .await
                 .context(UnableToTriggerRefreshSnafu {
@@ -2736,20 +2773,41 @@ async fn resolve_table_partition_expr(
 ) -> Result<Option<String>, DataFusionError> {
     let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
 
-    let Some(catalog) = catalog else {
-        return Ok(None);
+    let expr_string = if let Some(catalog) = catalog
+        && let Some(aware) = cayenne_ddl::as_partition_aware(catalog)
+    {
+        aware
+            .table_partition_expr(schema_name, table_reference.table())
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?
+    } else {
+        None
     };
 
-    let Some(aware) = cayenne_ddl::as_partition_aware(catalog) else {
-        return Ok(None);
+    let provider_expr_string = if let Some(catalog) = catalog
+        && let Some(schema) = catalog.schema(schema_name)
+    {
+        match schema.table(table_reference.table()).await {
+            Ok(Some(table_provider)) => partition_expr_from_table_provider(&table_provider),
+            Ok(None) => None,
+            Err(err) => {
+                tracing::debug!(table = %table_reference, error = %err, "Failed to resolve table provider while reading partition expression");
+                None
+            }
+        }
+    } else {
+        None
     };
 
-    let Some(expr_string) = aware
-        .table_partition_expr(schema_name, table_reference.table())
-        .await
-        .boxed()
-        .map_err(DataFusionError::External)?
-    else {
+    let Some(expr_string) = expr_string.or(provider_expr_string).or_else(|| {
+        executor_registry.and_then(|registry| {
+            registry
+                .federated_partition_manager()
+                .get_cached_table_metadata(table_reference)
+                .and_then(|metadata| metadata.partition_expressions.first().cloned())
+        })
+    }) else {
         return Ok(None);
     };
 
@@ -2768,6 +2826,43 @@ async fn resolve_table_partition_expr(
     }
 
     Ok(Some(expr_string))
+}
+
+fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -> Option<String> {
+    if let Some(partitioned) = table_provider
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+    {
+        return partitioned
+            .partition_by()
+            .first()
+            .map(|partition| partition.expression.to_string());
+    }
+
+    if let Some(poly) = table_provider.as_any().downcast_ref::<PolyTableProvider>() {
+        return partition_expr_from_table_provider(&poly.writer());
+    }
+
+    if let Some(accelerated) = table_provider.as_any().downcast_ref::<AcceleratedTable>() {
+        return partition_expr_from_table_provider(&accelerated.get_accelerator());
+    }
+
+    if let Some(write_through) = table_provider
+        .as_any()
+        .downcast_ref::<crate::accelerated_table::write_through::WriteThroughAcceleratedTableProvider>()
+    {
+        return partition_expr_from_table_provider(&write_through.inner().get_accelerator());
+    }
+
+    if let Some(adaptor) = table_provider
+        .as_any()
+        .downcast_ref::<FederatedTableProviderAdaptor>()
+        && let Some(inner_provider) = adaptor.table_provider.as_ref()
+    {
+        return partition_expr_from_table_provider(inner_provider);
+    }
+
+    None
 }
 
 #[must_use]

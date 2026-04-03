@@ -68,6 +68,7 @@ pub(crate) mod sink;
 mod snapshots;
 mod synchronized_table;
 mod timestamp_metrics_utils;
+pub mod write_through;
 
 pub use refresh_task_runner::RefreshTaskRunner;
 pub use snapshots::SnapshotCreationConfig;

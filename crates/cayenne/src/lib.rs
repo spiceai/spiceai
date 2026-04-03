@@ -65,5 +65,6 @@ pub use cayenne_catalog::CayenneCatalog;
 pub use metadata::{DataFile, DeleteFile, ObjectStoreConfig, PartitionMetadata, TableMetadata};
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};
 pub use provider::{
-    CayenneContext, CayenneTableProvider, CayenneTableProviderBuilder, TimeRetentionFilterBuilder,
+    CayenneContext, CayenneStagedAppend, CayenneTableProvider, CayenneTableProviderBuilder,
+    TimeRetentionFilterBuilder,
 };

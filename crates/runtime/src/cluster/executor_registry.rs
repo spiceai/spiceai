@@ -308,6 +308,14 @@ fn is_accelerated_table_provider(table_provider: &Arc<dyn TableProvider>) -> boo
         return true;
     }
 
+    if table_provider
+        .as_any()
+        .downcast_ref::<crate::accelerated_table::write_through::WriteThroughAcceleratedTableProvider>()
+        .is_some()
+    {
+        return true;
+    }
+
     if let Some(adaptor) = table_provider
         .as_any()
         .downcast_ref::<FederatedTableProviderAdaptor>()
@@ -316,7 +324,11 @@ fn is_accelerated_table_provider(table_provider: &Arc<dyn TableProvider>) -> boo
         return inner_provider
             .as_any()
             .downcast_ref::<AcceleratedTable>()
-            .is_some();
+            .is_some()
+            || inner_provider
+                .as_any()
+                .downcast_ref::<crate::accelerated_table::write_through::WriteThroughAcceleratedTableProvider>()
+                .is_some();
     }
 
     false

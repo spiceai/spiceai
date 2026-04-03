@@ -215,6 +215,11 @@ impl PartitionTableProvider {
     pub fn creator(&self) -> &Arc<dyn PartitionCreator> {
         &self.creator
     }
+
+    #[must_use]
+    pub fn partition_by(&self) -> &[PartitionedBy] {
+        &self.partition_by
+    }
 }
 
 #[async_trait]

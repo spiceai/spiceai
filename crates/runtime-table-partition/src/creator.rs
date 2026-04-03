@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fmt::Debug;
+use std::{any::Any, fmt::Debug};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -43,7 +43,7 @@ pub enum Error {
 }
 
 #[async_trait]
-pub trait PartitionCreator: Debug + Send + Sync {
+pub trait PartitionCreator: Any + Debug + Send + Sync {
     /// Create a new [`Partition`] using the given partition values.
     ///
     /// For single-column partitions, pass a single-element vector.
@@ -76,4 +76,6 @@ pub trait PartitionCreator: Debug + Send + Sync {
     fn constraints(&self) -> Option<&Constraints> {
         None
     }
+
+    fn as_any(&self) -> &dyn Any;
 }

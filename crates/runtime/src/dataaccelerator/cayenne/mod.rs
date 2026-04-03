@@ -1441,6 +1441,10 @@ impl CayennePartitionCreator {
 
 #[async_trait]
 impl PartitionCreator for CayennePartitionCreator {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn create_partition(
         &self,
         partition_values: Vec<ScalarValue>,

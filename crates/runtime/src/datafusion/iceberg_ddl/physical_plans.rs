@@ -17,11 +17,14 @@ limitations under the License.
 //! Physical execution plans for Iceberg DDL operations.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Weak};
 
+use app::App;
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
@@ -34,8 +37,16 @@ use spicepod::acceleration::Acceleration;
 
 use super::acceleration_options::DatasetOptions;
 use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated_table::write_through::WriteThroughAcceleratedTableProvider;
+use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::datafusion::DataFusion;
+use crate::datafusion::composed_catalog::ComposedCatalogProvider;
+use data_components::RefreshableCatalogProvider;
+use data_components::iceberg::provider::IcebergCatalogProvider;
 use datafusion::catalog::CatalogProviderList;
+
+use crate::component::dataset::acceleration::{Acceleration as RuntimeAcceleration, Mode};
+use crate::dataaccelerator::AccelerationSource;
 
 /// Coerce nanosecond timestamp fields to microsecond precision.
 ///
@@ -66,6 +77,72 @@ fn ddl_result_schema() -> SchemaRef {
     )]))
 }
 
+#[derive(Debug)]
+struct IcebergDdlAccelerationSource {
+    app: Arc<App>,
+    name: TableReference,
+    acceleration: RuntimeAcceleration,
+    time_column: Option<String>,
+}
+
+impl IcebergDdlAccelerationSource {
+    fn new(
+        app_name: String,
+        name: TableReference,
+        acceleration: RuntimeAcceleration,
+        time_column: Option<String>,
+    ) -> Self {
+        let mut app = App::default();
+        app.name = app_name;
+
+        Self {
+            app: Arc::new(app),
+            name,
+            acceleration,
+            time_column,
+        }
+    }
+}
+
+impl AccelerationSource for IcebergDdlAccelerationSource {
+    fn clone_arc(&self) -> Arc<dyn AccelerationSource> {
+        Arc::new(Self {
+            app: Arc::clone(&self.app),
+            name: self.name.clone(),
+            acceleration: self.acceleration.clone(),
+            time_column: self.time_column.clone(),
+        })
+    }
+
+    fn is_file_accelerated(&self) -> bool {
+        matches!(self.acceleration.mode, Mode::File | Mode::FileCreate)
+    }
+
+    fn app(&self) -> Arc<App> {
+        Arc::clone(&self.app)
+    }
+
+    fn runtime(&self) -> Arc<crate::Runtime> {
+        unreachable!("DDL-created Iceberg acceleration source does not provide a runtime")
+    }
+
+    fn acceleration(&self) -> Option<&RuntimeAcceleration> {
+        Some(&self.acceleration)
+    }
+
+    fn name(&self) -> &TableReference {
+        &self.name
+    }
+
+    fn time_column(&self) -> Option<&str> {
+        self.time_column.as_deref()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 /// Physical plan for creating an Iceberg table.
 pub struct IcebergCreateTableExec {
     catalog: Arc<dyn Catalog>,
@@ -80,7 +157,183 @@ pub struct IcebergCreateTableExec {
     acceleration: Option<Acceleration>,
     dataset_options: DatasetOptions,
     datafusion: Weak<DataFusion>,
+    partition_expr_sql: Option<String>,
     properties: PlanProperties,
+}
+
+/// Physical plan for creating an Iceberg schema.
+pub struct IcebergCreateSchemaExec {
+    catalog: Arc<dyn Catalog>,
+    namespace: NamespaceIdent,
+    if_not_exists: bool,
+    df_catalog_name: String,
+    df_schema_name: String,
+    catalog_list: Arc<dyn CatalogProviderList>,
+    datafusion: Weak<DataFusion>,
+    properties: PlanProperties,
+}
+
+impl fmt::Debug for IcebergCreateSchemaExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IcebergCreateSchemaExec")
+            .field("namespace", &self.namespace)
+            .field("df_catalog_name", &self.df_catalog_name)
+            .field("df_schema_name", &self.df_schema_name)
+            .field("if_not_exists", &self.if_not_exists)
+            .finish_non_exhaustive()
+    }
+}
+
+impl IcebergCreateSchemaExec {
+    #[must_use]
+    pub fn new(
+        catalog: Arc<dyn Catalog>,
+        namespace: NamespaceIdent,
+        if_not_exists: bool,
+        df_catalog_name: String,
+        df_schema_name: String,
+        catalog_list: Arc<dyn CatalogProviderList>,
+        datafusion: Weak<DataFusion>,
+    ) -> Self {
+        let schema = ddl_result_schema();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        Self {
+            catalog,
+            namespace,
+            if_not_exists,
+            df_catalog_name,
+            df_schema_name,
+            catalog_list,
+            datafusion,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for IcebergCreateSchemaExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "IcebergCreateSchemaExec: {}.{}",
+            self.df_catalog_name, self.df_schema_name
+        )
+    }
+}
+
+impl ExecutionPlan for IcebergCreateSchemaExec {
+    fn name(&self) -> &'static str {
+        "IcebergCreateSchemaExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
+        let catalog = Arc::clone(&self.catalog);
+        let namespace = self.namespace.clone();
+        let if_not_exists = self.if_not_exists;
+        let df_catalog_name = self.df_catalog_name.clone();
+        let df_schema_name = self.df_schema_name.clone();
+        let catalog_list = Arc::clone(&self.catalog_list);
+        let result_schema = ddl_result_schema();
+        let datafusion = Weak::<DataFusion>::clone(&self.datafusion);
+
+        let stream = futures::stream::once(async move {
+            let exists = catalog.namespace_exists(&namespace).await.map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to check namespace existence '{}': {e}",
+                    namespace.join(".")
+                ))
+            })?;
+
+            if exists {
+                refresh_iceberg_catalog_provider(&catalog_list, &df_catalog_name).await?;
+
+                if if_not_exists {
+                    let batch = RecordBatch::try_new(
+                        result_schema,
+                        vec![Arc::new(StringArray::from(vec![format!(
+                            "Schema '{}' already exists",
+                            namespace.join(".")
+                        )]))],
+                    )?;
+                    return Ok(batch);
+                }
+
+                return Err(DataFusionError::Execution(format!(
+                    "Schema '{}' already exists in catalog '{}'",
+                    namespace.join("."),
+                    df_catalog_name
+                )));
+            }
+
+            catalog
+                .create_namespace(&namespace, HashMap::new())
+                .await
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to create Iceberg schema '{}': {e}",
+                        namespace.join(".")
+                    ))
+                })?;
+
+            refresh_iceberg_catalog_provider(&catalog_list, &df_catalog_name).await?;
+
+            if let Some(df) = datafusion.upgrade()
+                && matches!(
+                    df.cluster_config.effective_role(),
+                    Some(crate::config::ClusterRole::Scheduler)
+                )
+                && let Some(ref registry) = df.executor_registry
+            {
+                let forward_sql = build_forwarded_create_schema_sql(
+                    &df_catalog_name,
+                    &df_schema_name,
+                    if_not_exists,
+                );
+                forward_ddl_to_executors(registry, &forward_sql).await?;
+            }
+
+            let batch = RecordBatch::try_new(
+                result_schema,
+                vec![Arc::new(StringArray::from(vec![format!(
+                    "Schema '{}' created",
+                    namespace.join(".")
+                )]))],
+            )?;
+            Ok(batch)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            ddl_result_schema(),
+            stream,
+        )))
+    }
 }
 
 impl fmt::Debug for IcebergCreateTableExec {
@@ -111,6 +364,7 @@ impl IcebergCreateTableExec {
         catalog_list: Arc<dyn CatalogProviderList>,
         acceleration: Option<Acceleration>,
         dataset_options: DatasetOptions,
+        partition_expr_sql: Option<String>,
         datafusion: Weak<DataFusion>,
     ) -> Self {
         let schema = ddl_result_schema();
@@ -132,6 +386,7 @@ impl IcebergCreateTableExec {
             catalog_list,
             acceleration,
             dataset_options,
+            partition_expr_sql,
             datafusion,
             properties,
         }
@@ -188,9 +443,38 @@ impl ExecutionPlan for IcebergCreateTableExec {
         let result_schema = ddl_result_schema();
         let acceleration = self.acceleration.clone();
         let dataset_options = self.dataset_options.clone();
+        let partition_expr_sql = self.partition_expr_sql.clone();
         let datafusion = Weak::<DataFusion>::clone(&self.datafusion);
 
         let stream = futures::stream::once(async move {
+            let namespace_exists = catalog.namespace_exists(&namespace).await.map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to check namespace existence '{}': {e}",
+                    namespace.join(".")
+                ))
+            })?;
+
+            if !namespace_exists {
+                return Err(DataFusionError::Execution(format!(
+                    "Schema '{}' does not exist in catalog '{}'. Create it first with CREATE SCHEMA.",
+                    namespace.join("."),
+                    df_catalog_name
+                )));
+            }
+
+            refresh_iceberg_catalog_provider(&catalog_list, &df_catalog_name).await?;
+
+            let Some(df_catalog) = catalog_list.catalog(&df_catalog_name) else {
+                return Err(DataFusionError::Execution(format!(
+                    "Catalog '{df_catalog_name}' not found"
+                )));
+            };
+            let Some(schema_provider) = df_catalog.schema(&df_schema_name) else {
+                return Err(DataFusionError::Execution(format!(
+                    "Schema '{df_schema_name}' not found in catalog '{df_catalog_name}'"
+                )));
+            };
+
             // Coerce nanosecond timestamps to microsecond for Iceberg v2 compatibility
             let arrow_schema = coerce_timestamps_to_microsecond(&arrow_schema);
 
@@ -212,11 +496,72 @@ impl ExecutionPlan for IcebergCreateTableExec {
 
             if exists {
                 if if_not_exists {
+                    let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(
+                        IcebergTableProvider::try_new(
+                            Arc::clone(&catalog),
+                            namespace.clone(),
+                            table_name.clone(),
+                        )
+                        .await
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to create table provider for existing Iceberg table: {e}"
+                            ))
+                        })?,
+                    );
+
+                    let Some(df_catalog) = catalog_list.catalog(&df_catalog_name) else {
+                        return Err(DataFusionError::Execution(format!(
+                            "Catalog '{df_catalog_name}' not found"
+                        )));
+                    };
+                    let Some(schema_provider) = df_catalog.schema(&df_schema_name) else {
+                        return Err(DataFusionError::Execution(format!(
+                            "Schema '{df_schema_name}' not found in catalog '{df_catalog_name}'"
+                        )));
+                    };
+
+                    let message;
+                    if let Some(accel) = acceleration.as_ref().filter(|accel| accel.enabled) {
+                        let wrapped_provider = build_registered_provider(
+                            &catalog,
+                            namespace.clone(),
+                            table_name.clone(),
+                            Arc::clone(&provider),
+                            &schema_provider,
+                            &catalog_list,
+                            &df_catalog_name,
+                            &df_schema_name,
+                            accel,
+                            &dataset_options,
+                            partition_expr_sql.as_ref(),
+                            &datafusion,
+                        )
+                        .await?;
+
+                        if schema_provider.table_exist(&table_name) {
+                            let _ = schema_provider.deregister_table(&table_name);
+                        }
+                        schema_provider.register_table(table_name.clone(), wrapped_provider)?;
+                        message = format!(
+                            "Table '{table_name}' already exists and acceleration was registered"
+                        );
+                    } else {
+                        let deletion_provider =
+                            data_components::iceberg::delete::IcebergDeletionProvider::new(
+                                Arc::clone(&catalog),
+                                namespace.clone(),
+                                table_name.clone(),
+                                provider,
+                            );
+                        schema_provider
+                            .register_table(table_name.clone(), Arc::new(deletion_provider))?;
+                        message = format!("Table '{table_name}' already exists");
+                    }
+
                     let batch = RecordBatch::try_new(
                         result_schema,
-                        vec![Arc::new(StringArray::from(vec![format!(
-                            "Table '{table_name}' already exists"
-                        )]))],
+                        vec![Arc::new(StringArray::from(vec![message]))],
                     )?;
                     return Ok(batch);
                 }
@@ -273,70 +618,118 @@ impl ExecutionPlan for IcebergCreateTableExec {
                     ))
                 })?,
             );
-            // Register in the DataFusion catalog's schema provider
-            let Some(df_catalog) = catalog_list.catalog(&df_catalog_name) else {
-                return Err(DataFusionError::Execution(format!(
-                    "Catalog '{df_catalog_name}' not found"
-                )));
-            };
-            let Some(schema_provider) = df_catalog.schema(&df_schema_name) else {
-                return Err(DataFusionError::Execution(format!(
-                    "Schema '{df_schema_name}' not found in catalog '{df_catalog_name}'"
-                )));
-            };
-            let register_raw_provider =
-                |raw_provider: Arc<dyn datafusion::datasource::TableProvider>| -> DFResult<()> {
-                    let deletion_provider =
-                        data_components::iceberg::delete::IcebergDeletionProvider::new(
-                            Arc::clone(&catalog),
-                            namespace.clone(),
-                            table_name.clone(),
-                            raw_provider,
-                        );
-                    let adapted: Arc<dyn datafusion::datasource::TableProvider> =
-                        Arc::new(deletion_provider);
-                    schema_provider.register_table(table_name.clone(), adapted)?;
-                    Ok(())
-                };
-
-            let message = if let Some(ref accel) = acceleration
-                && accel.enabled
-            {
-                // Wrap in AcceleratedTable
-                match create_accelerated_iceberg_table(
-                    &datafusion,
+            let message;
+            if let Some(accel) = acceleration.as_ref().filter(|accel| accel.enabled) {
+                let wrapped_provider = match build_registered_provider(
+                    &catalog,
+                    namespace.clone(),
+                    table_name.clone(),
                     Arc::clone(&provider),
-                    accel,
-                    &dataset_options,
+                    &schema_provider,
+                    &catalog_list,
                     &df_catalog_name,
                     &df_schema_name,
-                    &table_name,
+                    accel,
+                    &dataset_options,
+                    partition_expr_sql.as_ref(),
+                    &datafusion,
                 )
                 .await
                 {
-                    Ok(accel_table) => {
-                        schema_provider
-                            .register_table(table_name.clone(), Arc::new(accel_table))?;
-                        format!(
-                            "Table '{table_name}' created with acceleration (engine={})",
-                            accel.engine.as_deref().unwrap_or("arrow")
-                        )
-                    }
+                    Ok(provider) => provider,
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to create accelerated table '{table_name}', \
-                             falling back to direct Iceberg reads: {e}"
-                        );
-                        // Fall back to registering the raw provider
-                        register_raw_provider(Arc::clone(&provider))?;
-                        format!("Table '{table_name}' created (acceleration failed: {e})")
+                        let rollback_error = rollback_created_iceberg_table(
+                            &catalog,
+                            &namespace,
+                            &table_name,
+                            Some((&schema_provider, &table_name)),
+                            e,
+                        )
+                        .await;
+                        return Err(rollback_error);
+                    }
+                };
+
+                if let Some(df) = datafusion.upgrade() {
+                    initialize_partition_metadata(
+                        df.executor_registry.as_deref(),
+                        &df_catalog_name,
+                        &df_schema_name,
+                        &table_name,
+                        partition_expr_sql.as_ref(),
+                    )
+                    .await;
+
+                    if matches!(
+                        df.cluster_config.effective_role(),
+                        Some(crate::config::ClusterRole::Scheduler)
+                    ) {
+                        if let Some(ref registry) = df.executor_registry {
+                            let forward_sql = build_forwarded_create_sql(
+                                &df_catalog_name,
+                                &df_schema_name,
+                                &table_name,
+                                arrow_schema.as_ref(),
+                                accel,
+                                &dataset_options,
+                                partition_expr_sql.as_ref(),
+                            )?;
+                            if let Err(e) = forward_ddl_to_executors(registry, &forward_sql).await {
+                                let rollback_error = rollback_created_iceberg_table(
+                                    &catalog,
+                                    &namespace,
+                                    &table_name,
+                                    Some((&schema_provider, &table_name)),
+                                    e,
+                                )
+                                .await;
+                                return Err(rollback_error);
+                            }
+                        }
                     }
                 }
+
+                if schema_provider.table_exist(&table_name) {
+                    let _ = schema_provider.deregister_table(&table_name);
+                }
+                if let Err(e) = schema_provider.register_table(table_name.clone(), wrapped_provider)
+                {
+                    let rollback_error = rollback_created_iceberg_table(
+                        &catalog,
+                        &namespace,
+                        &table_name,
+                        Some((&schema_provider, &table_name)),
+                        e,
+                    )
+                    .await;
+                    return Err(rollback_error);
+                }
+
+                message = format!(
+                    "Table '{table_name}' created with acceleration (engine={})",
+                    accel.engine.as_deref().unwrap_or("cayenne")
+                );
             } else {
                 // No acceleration — register raw IcebergTableProvider
-                register_raw_provider(provider)?;
-                format!("Table '{table_name}' created")
-            };
+                if let Err(e) = register_raw_provider(
+                    &catalog,
+                    namespace.clone(),
+                    table_name.clone(),
+                    &schema_provider,
+                    provider,
+                ) {
+                    let rollback_error = rollback_created_iceberg_table(
+                        &catalog,
+                        &namespace,
+                        &table_name,
+                        Some((&schema_provider, &table_name)),
+                        e,
+                    )
+                    .await;
+                    return Err(rollback_error);
+                }
+                message = format!("Table '{table_name}' created");
+            }
 
             let batch = RecordBatch::try_new(
                 result_schema,
@@ -366,14 +759,12 @@ async fn create_accelerated_iceberg_table(
     catalog_name: &str,
     schema_name: &str,
     table_name: &str,
+    partition_expr_sql: Option<&str>,
 ) -> Result<AcceleratedTable, DataFusionError> {
     use crate::accelerated_table::refresh::Refresh;
     use crate::component::dataset::TimeFormat;
-    use crate::component::dataset::acceleration::{
-        Acceleration as RuntimeAcceleration, RefreshMode,
-    };
+    use crate::component::dataset::acceleration::RefreshMode;
     use crate::federated_table::FederatedTable;
-    use datafusion::common::TableReference;
 
     let df = datafusion.upgrade().ok_or_else(|| {
         DataFusionError::Execution(
@@ -382,13 +773,30 @@ async fn create_accelerated_iceberg_table(
     })?;
 
     // Convert spicepod Acceleration → runtime Acceleration (parses durations, engine, etc.)
-    let runtime_accel = RuntimeAcceleration::try_from(acceleration.clone()).map_err(|e| {
+    let mut runtime_accel = RuntimeAcceleration::try_from(acceleration.clone()).map_err(|e| {
         DataFusionError::Execution(format!(
             "Failed to parse acceleration settings for table '{table_name}': {e}"
         ))
     })?;
 
-    let dataset_name = TableReference::bare(table_name.to_string());
+    if runtime_accel.partition_by.is_empty()
+        && let Some(partition_expr_sql) = partition_expr_sql
+    {
+        runtime_accel
+            .partition_by
+            .push(spicepod::partitioning::PartitionedBy {
+                name: "expr0".to_string(),
+                expression: partition_expr_sql.to_string(),
+            });
+    }
+
+    validate_write_through_acceleration(acceleration)?;
+
+    let dataset_name = TableReference::full(
+        catalog_name.to_string(),
+        schema_name.to_string(),
+        table_name.to_string(),
+    );
     let source_string = format!("{catalog_name}.{schema_name}.{table_name}");
 
     let source_schema = source_provider.schema();
@@ -396,6 +804,13 @@ async fn create_accelerated_iceberg_table(
 
     // Determine refresh mode from the acceleration settings
     let refresh_mode = runtime_accel.refresh_mode.unwrap_or(RefreshMode::Full);
+
+    let ddl_source = IcebergDdlAccelerationSource::new(
+        catalog_name.to_string(),
+        dataset_name.clone(),
+        runtime_accel.clone(),
+        dataset_options.time_column.clone(),
+    );
 
     // Create the accelerator engine table (Arrow/DuckDB/SQLite in-memory or file)
     let accelerated_table_provider = df
@@ -406,7 +821,7 @@ async fn create_accelerated_iceberg_table(
             None, // no constraints for DDL tables
             &runtime_accel,
             Arc::new(tokio::sync::RwLock::new(crate::secrets::Secrets::default())),
-            None, // no AccelerationSource
+            Some(&ddl_source),
             Arc::clone(&df.ctx),
         )
         .await
@@ -416,9 +831,6 @@ async fn create_accelerated_iceberg_table(
 
     // Build refresh configuration
     let mut refresh = Refresh::new(refresh_mode);
-    if let Some(check_interval) = runtime_accel.refresh_check_interval {
-        refresh = refresh.check_interval(check_interval);
-    }
     if let Some(ref time_column) = dataset_options.time_column {
         refresh = refresh.time_column(time_column.clone());
     }
@@ -441,6 +853,308 @@ async fn create_accelerated_iceberg_table(
     .map_err(|e| DataFusionError::Execution(format!("Failed to build accelerated table: {e}")))?;
 
     Ok(accelerated_table)
+}
+
+fn validate_write_through_acceleration(acceleration: &Acceleration) -> Result<(), DataFusionError> {
+    let engine = acceleration.engine.as_deref().unwrap_or("cayenne");
+    if !engine.eq_ignore_ascii_case("cayenne") {
+        return Err(DataFusionError::Plan(format!(
+            "Accelerated Iceberg catalog tables currently support only the Cayenne accelerator, got '{engine}'"
+        )));
+    }
+    Ok(())
+}
+
+fn register_raw_provider(
+    catalog: &Arc<dyn Catalog>,
+    namespace: NamespaceIdent,
+    table_name: String,
+    schema_provider: &Arc<dyn datafusion::catalog::SchemaProvider>,
+    raw_provider: Arc<dyn datafusion::datasource::TableProvider>,
+) -> DFResult<()> {
+    if schema_provider.table_exist(&table_name) {
+        let _ = schema_provider.deregister_table(&table_name);
+    }
+
+    let deletion_provider = data_components::iceberg::delete::IcebergDeletionProvider::new(
+        Arc::clone(catalog),
+        namespace,
+        table_name.clone(),
+        raw_provider,
+    );
+    let adapted: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(deletion_provider);
+    schema_provider.register_table(table_name, adapted)?;
+    Ok(())
+}
+
+#[expect(clippy::too_many_arguments)]
+async fn build_registered_provider(
+    _catalog: &Arc<dyn Catalog>,
+    _namespace: NamespaceIdent,
+    table_name: String,
+    raw_provider: Arc<dyn datafusion::datasource::TableProvider>,
+    _schema_provider: &Arc<dyn datafusion::catalog::SchemaProvider>,
+    _catalog_list: &Arc<dyn CatalogProviderList>,
+    df_catalog_name: &str,
+    df_schema_name: &str,
+    acceleration: &Acceleration,
+    dataset_options: &DatasetOptions,
+    partition_expr_sql: Option<&String>,
+    datafusion: &Weak<DataFusion>,
+) -> Result<Arc<dyn datafusion::datasource::TableProvider>, DataFusionError> {
+    let accelerated = create_accelerated_iceberg_table(
+        datafusion,
+        raw_provider,
+        acceleration,
+        dataset_options,
+        df_catalog_name,
+        df_schema_name,
+        &table_name,
+        partition_expr_sql.map(String::as_str),
+    )
+    .await?;
+
+    let accelerated = Arc::new(accelerated);
+    let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(
+        WriteThroughAcceleratedTableProvider::try_new(Arc::clone(&accelerated))?,
+    );
+
+    Ok(provider)
+}
+
+async fn initialize_partition_metadata(
+    executor_registry: Option<&ExecutorRegistry>,
+    catalog_name: &str,
+    schema_name: &str,
+    table_name: &str,
+    partition_expr_sql: Option<&String>,
+) {
+    if let Some(expr_sql) = partition_expr_sql
+        && let Some(registry) = executor_registry
+    {
+        let table_ref = datafusion::sql::TableReference::full(
+            catalog_name.to_string(),
+            schema_name.to_string(),
+            table_name.to_string(),
+        );
+        if let Err(error) = registry
+            .federated_partition_manager()
+            .initialize_metadata(&table_ref, vec![expr_sql.clone()])
+            .await
+        {
+            tracing::warn!(table = %table_ref, error = %error, "Failed to initialize partition metadata for table");
+        }
+    }
+}
+
+async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &str) -> DFResult<()> {
+    let clients = executor_registry.flight_sql_clients.read().await;
+    if clients.is_empty() {
+        return Ok(());
+    }
+
+    let futures: Vec<_> = clients
+        .values()
+        .cloned()
+        .map(|mut client| {
+            let sql = sql.to_string();
+            async move {
+                let flight_info = client.execute(sql, None).await.map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to forward Iceberg DDL to executor: {e}"
+                    ))
+                })?;
+                for endpoint in flight_info.endpoint {
+                    if let Some(ticket) = endpoint.ticket {
+                        let mut stream = client.do_get(ticket).await.map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to read Iceberg DDL executor result: {e}"
+                            ))
+                        })?;
+                        while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                            batch.map_err(|e| {
+                                DataFusionError::Execution(format!(
+                                    "Executor Iceberg DDL stream failed: {e}"
+                                ))
+                            })?;
+                        }
+                    }
+                }
+                Ok::<(), DataFusionError>(())
+            }
+        })
+        .collect();
+
+    for result in futures::future::join_all(futures).await {
+        result?;
+    }
+
+    Ok(())
+}
+
+fn build_forwarded_create_schema_sql(
+    catalog_name: &str,
+    schema_name: &str,
+    if_not_exists: bool,
+) -> String {
+    let if_not_exists_sql = if if_not_exists { " IF NOT EXISTS" } else { "" };
+    format!("CREATE SCHEMA{if_not_exists_sql} \"{catalog_name}\".\"{schema_name}\"")
+}
+
+fn build_forwarded_create_sql(
+    catalog_name: &str,
+    schema_name: &str,
+    table_name: &str,
+    arrow_schema: &Schema,
+    acceleration: &Acceleration,
+    dataset_options: &DatasetOptions,
+    partition_expr_sql: Option<&String>,
+) -> Result<String, DataFusionError> {
+    let columns_sql: Vec<String> = arrow_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let null_str = if field.is_nullable() { "" } else { " NOT NULL" };
+            let sql_type = arrow_datatype_to_sql(field.data_type())?;
+            Ok(format!("\"{}\" {sql_type}{null_str}", field.name()))
+        })
+        .collect::<Result<_, DataFusionError>>()?;
+
+    let mut sql = format!(
+        "CREATE TABLE IF NOT EXISTS \"{catalog_name}\".\"{schema_name}\".\"{table_name}\" ({})",
+        columns_sql.join(", ")
+    );
+
+    let mut options = Vec::new();
+    options.push(format!(
+        "\"acceleration.engine\" = '{}'",
+        acceleration.engine.as_deref().unwrap_or("cayenne")
+    ));
+    options.push(format!("\"acceleration.mode\" = '{}'", acceleration.mode));
+    if let Some(refresh_mode) = &acceleration.refresh_mode {
+        options.push(format!(
+            "\"acceleration.refresh_mode\" = '{}'",
+            render_refresh_mode(refresh_mode)
+        ));
+    }
+    if let Some(time_column) = &dataset_options.time_column {
+        options.push(format!("\"dataset.time_column\" = '{time_column}'"));
+    }
+    if let Some(time_format) = &dataset_options.time_format {
+        options.push(format!("\"dataset.time_format\" = '{}'", time_format));
+    }
+
+    if !options.is_empty() {
+        sql.push_str(&format!(" WITH ({})", options.join(", ")));
+    }
+
+    if let Some(partition_expr_sql) = partition_expr_sql {
+        sql.push_str(&format!(" PARTITION BY {partition_expr_sql}"));
+    }
+
+    Ok(sql)
+}
+
+fn arrow_datatype_to_sql(dt: &DataType) -> Result<String, DataFusionError> {
+    match dt {
+        DataType::Boolean => Ok("BOOLEAN".to_string()),
+        DataType::Int8 => Ok("TINYINT".to_string()),
+        DataType::Int16 => Ok("SMALLINT".to_string()),
+        DataType::Int32 => Ok("INT".to_string()),
+        DataType::Int64 => Ok("BIGINT".to_string()),
+        DataType::UInt8 => Ok("TINYINT UNSIGNED".to_string()),
+        DataType::UInt16 => Ok("SMALLINT UNSIGNED".to_string()),
+        DataType::UInt32 => Ok("INT UNSIGNED".to_string()),
+        DataType::UInt64 => Ok("BIGINT UNSIGNED".to_string()),
+        DataType::Float16 | DataType::Float32 => Ok("FLOAT".to_string()),
+        DataType::Float64 => Ok("DOUBLE".to_string()),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok("VARCHAR".to_string()),
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => Ok("BYTEA".to_string()),
+        DataType::Date32 | DataType::Date64 => Ok("DATE".to_string()),
+        DataType::Time32(_) | DataType::Time64(_) => Ok("TIME".to_string()),
+        DataType::Timestamp(_, _) => Ok("TIMESTAMP".to_string()),
+        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => Ok(format!("DECIMAL({p},{s})")),
+        DataType::Dictionary(_, value_type) => arrow_datatype_to_sql(value_type.as_ref()),
+        other => Err(DataFusionError::Execution(format!(
+            "Unsupported Arrow type for forwarded Iceberg DDL: {other}"
+        ))),
+    }
+}
+
+fn render_refresh_mode(mode: &spicepod::acceleration::RefreshMode) -> &'static str {
+    match mode {
+        spicepod::acceleration::RefreshMode::Full => "full",
+        spicepod::acceleration::RefreshMode::Append => "append",
+        spicepod::acceleration::RefreshMode::Changes => "changes",
+        spicepod::acceleration::RefreshMode::Caching => "caching",
+    }
+}
+
+async fn refresh_iceberg_catalog_provider(
+    catalog_list: &Arc<dyn CatalogProviderList>,
+    df_catalog_name: &str,
+) -> DFResult<()> {
+    let Some(df_catalog) = catalog_list.catalog(df_catalog_name) else {
+        return Err(DataFusionError::Execution(format!(
+            "Catalog '{df_catalog_name}' not found"
+        )));
+    };
+
+    if let Some(iceberg_provider) = df_catalog.as_any().downcast_ref::<IcebergCatalogProvider>() {
+        iceberg_provider.refresh().await.map_err(|e| {
+            DataFusionError::Execution(format!(
+                "Failed to refresh Iceberg catalog '{df_catalog_name}': {e}"
+            ))
+        })?;
+        return Ok(());
+    }
+
+    if let Some(composed) = df_catalog
+        .as_any()
+        .downcast_ref::<ComposedCatalogProvider>()
+        && let Some(iceberg_provider) = composed
+            .external()
+            .as_any()
+            .downcast_ref::<IcebergCatalogProvider>()
+    {
+        iceberg_provider.refresh().await.map_err(|e| {
+            DataFusionError::Execution(format!(
+                "Failed to refresh Iceberg catalog '{df_catalog_name}': {e}"
+            ))
+        })?;
+        return Ok(());
+    }
+
+    Err(DataFusionError::Execution(format!(
+        "Catalog '{df_catalog_name}' is not an Iceberg catalog"
+    )))
+}
+
+async fn rollback_created_iceberg_table(
+    catalog: &Arc<dyn Catalog>,
+    namespace: &NamespaceIdent,
+    table_name: &str,
+    local_registration: Option<(&Arc<dyn datafusion::catalog::SchemaProvider>, &str)>,
+    original_error: DataFusionError,
+) -> DataFusionError {
+    if let Some((schema_provider, registered_table_name)) = local_registration
+        && schema_provider.table_exist(registered_table_name)
+    {
+        let _ = schema_provider.deregister_table(registered_table_name);
+    }
+
+    let table_ident = TableIdent::new(namespace.clone(), table_name.to_string());
+    match catalog.drop_table(&table_ident).await {
+        Ok(()) => original_error,
+        Err(rollback_error) => DataFusionError::Execution(format!(
+            "{original_error}; additionally failed to roll back Iceberg table '{}.{}': {rollback_error}",
+            namespace.join("."),
+            table_name
+        )),
+    }
 }
 
 /// Physical plan for dropping an Iceberg table.
