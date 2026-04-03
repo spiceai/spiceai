@@ -64,6 +64,11 @@ pub enum Error {
     #[snafu(display("Cannot find partition metadata for table {table}"))]
     FindMetadata { table: String },
 
+    #[snafu(display(
+        "Cannot route partitioned write for replicated table {table}: broadcast routing is required"
+    ))]
+    ReplicatedWriteUnsupported { table: String },
+
     #[snafu(display("Failed to resolve partition expressions: {source}"))]
     ResolvePartitions {
         source: datafusion::error::DataFusionError,
@@ -271,6 +276,11 @@ pub(crate) async fn forward_partitioned_batches(
 ) -> Result<()> {
     let partition_manager = executor_registry.federated_partition_manager();
     let table_partitions = match partition_manager.get_table_metadata(path).await {
+        Ok(Some(metadata)) if metadata.is_replicated() => {
+            return Err(Error::ReplicatedWriteUnsupported {
+                table: path.to_string(),
+            });
+        }
         Ok(Some(metadata)) => metadata,
         Ok(None) => {
             partition_manager

@@ -38,7 +38,9 @@ use datafusion::sql::unparser::expr_to_sql;
 use runtime_table_partition::expression::validate_partition_expression;
 
 use super::is_cayenne_catalog;
-use super::logical_nodes::{CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode};
+use super::logical_nodes::{
+    CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode, CayenneTableDistribution,
+};
 use crate::datafusion::ddl::acceleration_options::{SharedDdlExtensionStore, TableDistribution};
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
@@ -174,7 +176,7 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                 let primary_key = extract_primary_key_columns(&create.constraints, &arrow_schema);
 
                 // Consume DDL extensions from the store (consumed on use)
-                let (partition_expr, partition_expr_sql) = {
+                let distribution = {
                     let mut store = self.ddl_options.write().map_err(|e| {
                         DataFusionError::Execution(format!(
                             "Failed to acquire DDL extension store lock: {e}"
@@ -183,28 +185,33 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                     let ext = store.remove(&TableReference::parse_str(&extension_key));
 
                     if let Some(ext) = ext {
-                        if let Some(TableDistribution::PartitionBy(partition_by_expr)) =
-                            ext.distribution
-                        {
-                            let partition_expr_sql = partition_by_expr.to_string();
-                            let state = self.session_state.upgrade().ok_or_else(|| {
-                                DataFusionError::Execution(
-                                    "Session state is no longer available".to_string(),
-                                )
-                            })?;
-                            let state_guard = state.read();
-                            let df_schema = arrow_schema.as_ref().clone().to_dfschema()?;
-                            let partition_expr = parse_and_validate_partition_expression(
-                                &partition_expr_sql,
-                                &state_guard,
-                                &df_schema,
-                            )?;
-                            (Some(partition_expr), Some(partition_expr_sql))
-                        } else {
-                            (None, None)
+                        match ext.distribution {
+                            Some(TableDistribution::Replicated) => {
+                                CayenneTableDistribution::Replicated
+                            }
+                            Some(TableDistribution::PartitionBy(partition_by_expr)) => {
+                                let partition_expr_sql = partition_by_expr.to_string();
+                                let state = self.session_state.upgrade().ok_or_else(|| {
+                                    DataFusionError::Execution(
+                                        "Session state is no longer available".to_string(),
+                                    )
+                                })?;
+                                let state_guard = state.read();
+                                let df_schema = arrow_schema.as_ref().clone().to_dfschema()?;
+                                let partition_expr = parse_and_validate_partition_expression(
+                                    &partition_expr_sql,
+                                    &state_guard,
+                                    &df_schema,
+                                )?;
+                                CayenneTableDistribution::Partitioned {
+                                    partition_expr,
+                                    partition_expr_sql,
+                                }
+                            }
+                            None => CayenneTableDistribution::Replicated,
                         }
                     } else {
-                        (None, None)
+                        CayenneTableDistribution::Replicated
                     }
                 };
 
@@ -216,8 +223,7 @@ impl AnalyzerRule for CayenneDdlAnalyzerRule {
                 )
                 .if_not_exists(create.if_not_exists)
                 .or_replace(create.or_replace)
-                .partition_expr(partition_expr)
-                .partition_expr_sql(partition_expr_sql)
+                .distribution(distribution)
                 .primary_key(primary_key)
                 .build();
 

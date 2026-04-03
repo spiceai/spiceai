@@ -628,15 +628,17 @@ impl ClusterService for ClusterServiceImpl {
                 }
                 let remaining = max_partitions_per_executor.saturating_sub(total_assigned);
 
-                if partition_manager
-                    .get_cached_table_metadata(table_ref)
-                    .is_none()
-                {
-                    tracing::info!(
-                        "No cached partition metadata for table {table_ref}. Scheduler likely has not finished discovering partitions for the table. Will not assign in initial allocation, but will get assigned on future assignments"
-                    );
-                    continue;
-                }
+                let cached_metadata = match partition_manager.get_cached_table_metadata(table_ref) {
+                    Some(m) if m.is_replicated() => continue,
+                    Some(m) => m,
+                    None => {
+                        tracing::info!(
+                            "No cached partition metadata for table {table_ref}. Scheduler likely has not finished discovering partitions for the table. Will not assign in initial allocation, but will get assigned on future assignments"
+                        );
+                        continue;
+                    }
+                };
+
                 match partition_manager
                     .allocate_partitions(table_ref, executor_id, remaining)
                     .await

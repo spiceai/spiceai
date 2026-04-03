@@ -428,7 +428,7 @@ impl PartitionManagementTask {
 
             // Use HashMap for set comparison of partition values
             let current_partitions: HashSet<Vec<(String, String)>> = metadata
-                .partitions
+                .partitions()
                 .iter()
                 .map(|p| {
                     let mut v: Vec<_> = p.partition_value.clone().into_iter().collect();
@@ -588,19 +588,25 @@ impl PartitionManagementTask {
                     table: table.to_string(),
                 })?;
 
+            if metadata.is_replicated() {
+                return Ok(());
+            }
+
             // Add new partitions (mark as unassigned)
             let now = now_ms();
             let mut added_any = false;
+            let Some(partitions) = metadata.partitions_mut() else {
+                return Ok(());
+            };
             for partition_value in &partition_values {
                 // Check if already exists (using exact match on HashMap)
-                if metadata
-                    .partitions
+                if partitions
                     .iter()
                     .any(|p| p.partition_value == *partition_value)
                 {
                     continue;
                 }
-                metadata.add_partition(PartitionMetadata::new(partition_value.clone()));
+                partitions.push(PartitionMetadata::new(partition_value.clone()));
                 added_any = true;
             }
 
@@ -608,7 +614,7 @@ impl PartitionManagementTask {
                 return Ok(());
             }
 
-            metadata.updated_at = now;
+            metadata.set_updated_at(now);
             match self
                 .partition_manager
                 .write_metadata(&table.to_string(), metadata)
@@ -687,15 +693,22 @@ impl PartitionManagementTask {
                     table: table.to_string(),
                 })?;
 
+            if metadata.is_replicated() {
+                break;
+            }
+
+            let Some(partitions) = metadata.partitions_mut() else {
+                break;
+            };
+
             // Remove partitions and track executors
             let mut removed_any = false;
             for partition_value in &partition_values {
-                if let Some(pos) = metadata
-                    .partitions
+                if let Some(pos) = partitions
                     .iter()
                     .position(|p| p.partition_value == *partition_value)
                 {
-                    let partition = &metadata.partitions[pos];
+                    let partition = &partitions[pos];
                     // Track executors that had this partition
                     for executor_id in &partition.assigned_executors {
                         executors_to_notify
@@ -703,7 +716,7 @@ impl PartitionManagementTask {
                             .or_default()
                             .push(partition_value.clone());
                     }
-                    metadata.partitions.remove(pos);
+                    partitions.remove(pos);
                     removed_any = true;
                 }
             }
@@ -712,7 +725,7 @@ impl PartitionManagementTask {
                 break;
             }
 
-            metadata.updated_at = now_ms();
+            metadata.set_updated_at(now_ms());
 
             match self
                 .partition_manager
@@ -911,7 +924,7 @@ impl PartitionManagementTask {
             let table_ref = TableReference::parse_str(table_name);
 
             if let Some(metadata) = self.partition_manager.get_cached_table_metadata(&table_ref) {
-                for partition in &metadata.partitions {
+                for partition in metadata.partitions() {
                     for executor_id in &partition.assigned_executors {
                         let load = loads.entry(executor_id.clone()).or_default();
                         load.partition_count += 1;

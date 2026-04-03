@@ -103,44 +103,127 @@ pub async fn partition_value_to_bytes(
         .to_bytes()
 }
 
+fn default_schema_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DistributionMode {
+    Partitioned,
+    Replicated,
+}
+
+fn default_distribution_mode() -> DistributionMode {
+    DistributionMode::Partitioned
+}
+
 /// Metadata for a database table with an acceleration.
-///
-/// Contains how the table is partitioned and which executors are responsible for each partition (refreshing and handling queries).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TablePartitionMetadata {
-    /// Fully qualified table name
-    pub table_name: String,
-    /// All partitions for this table
-    pub partitions: Vec<PartitionMetadata>,
-    /// Schema version for migration compatibility
-    pub schema_version: u32,
-    /// Last updated timestamp (milliseconds since UNIX epoch)
-    pub updated_at: u128,
-    /// The SQL expression strings for partition-by expressions (e.g. `["bucket(3, c_nationkey)"]`).
-    /// Stored so that auto-generated labels like `"expr0"` can be resolved back to the
-    /// original SQL expression for query routing.
-    pub partition_expressions: Vec<String>,
+    table_name: String,
+    #[serde(default = "default_schema_version")]
+    schema_version: u32,
+    updated_at: u128,
+    #[serde(default = "default_distribution_mode")]
+    distribution_mode: DistributionMode,
+    #[serde(default)]
+    partitions: Vec<PartitionMetadata>,
+    #[serde(default)]
+    partition_expressions: Vec<String>,
 }
 
 impl TablePartitionMetadata {
     #[must_use]
-    pub fn new(table_name: String, updated_at: u128, partition_expressions: Vec<String>) -> Self {
+    pub fn new_partitioned(
+        table_name: String,
+        updated_at: u128,
+        partition_expressions: Vec<String>,
+    ) -> Self {
         Self {
             table_name,
-            partitions: Vec::new(),
-            schema_version: 1,
+            schema_version: default_schema_version(),
             updated_at,
+            distribution_mode: DistributionMode::Partitioned,
+            partitions: Vec::new(),
             partition_expressions,
         }
     }
 
-    pub fn add_partition(&mut self, partition: PartitionMetadata) {
-        self.partitions.push(partition);
+    #[must_use]
+    pub fn new_replicated(table_name: String, updated_at: u128) -> Self {
+        Self {
+            table_name,
+            schema_version: default_schema_version(),
+            updated_at,
+            distribution_mode: DistributionMode::Replicated,
+            partitions: Vec::new(),
+            partition_expressions: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_replicated(&self) -> bool {
+        matches!(self.distribution_mode, DistributionMode::Replicated)
+    }
+
+    #[must_use]
+    pub fn partitions(&self) -> &[PartitionMetadata] {
+        &self.partitions
+    }
+
+    pub fn partitions_mut(&mut self) -> Option<&mut Vec<PartitionMetadata>> {
+        if self.is_replicated() {
+            None
+        } else {
+            Some(&mut self.partitions)
+        }
+    }
+
+    #[must_use]
+    pub fn partition_expressions(&self) -> &[String] {
+        &self.partition_expressions
+    }
+
+    pub fn set_partition_expressions_if_empty(&mut self, partition_expressions: Vec<String>) {
+        if !self.is_replicated()
+            && self.partition_expressions.is_empty()
+            && !partition_expressions.is_empty()
+        {
+            self.partition_expressions = partition_expressions;
+        }
+    }
+
+    pub fn set_partitions(&mut self, partitions: Vec<PartitionMetadata>) -> bool {
+        if self.is_replicated() {
+            false
+        } else {
+            self.partitions = partitions;
+            true
+        }
+    }
+
+    #[must_use]
+    pub fn updated_at(&self) -> u128 {
+        self.updated_at
+    }
+
+    pub fn set_updated_at(&mut self, updated_at: u128) {
+        self.updated_at = updated_at;
+    }
+
+    pub fn add_partition(&mut self, partition: PartitionMetadata) -> bool {
+        if let Some(partitions) = self.partitions_mut() {
+            partitions.push(partition);
+            true
+        } else {
+            false
+        }
     }
 
     #[must_use]
     pub fn unassigned_partitions(&self) -> Vec<&PartitionMetadata> {
-        self.partitions
+        self.partitions()
             .iter()
             .filter(|p| !p.is_assigned())
             .collect()
@@ -158,14 +241,13 @@ impl TablePartitionMetadata {
             partition_value,
             assigned_executors,
             ..
-        } in &self.partitions
+        } in self.partitions()
         {
             // Build a single AND-combined predicate for this partition:
             //   key1 = val1 AND key2 = val2 AND ...
             let partition_predicate = partition_value
                 .iter()
                 .map(|(proj, lit)| {
-                    // Ensure lit is same type as proj
                     let col = ctx.parse_sql_expr(proj, &df_schema)?;
                     let col_type = col.get_type(&df_schema)?;
                     let mut lit = ctx.parse_sql_expr(lit, &df_schema)?;

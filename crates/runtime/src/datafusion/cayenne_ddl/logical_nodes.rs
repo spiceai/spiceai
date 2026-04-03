@@ -38,6 +38,15 @@ fn ddl_output_schema() -> DFSchemaRef {
     )
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub enum CayenneTableDistribution {
+    Partitioned {
+        partition_expr: Expr,
+        partition_expr_sql: String,
+    },
+    Replicated,
+}
+
 /// Logical plan node for `CREATE TABLE` on a Cayenne catalog.
 #[derive(Debug)]
 pub struct CayenneCreateTableNode {
@@ -53,10 +62,8 @@ pub struct CayenneCreateTableNode {
     pub df_catalog_name: String,
     /// The `DataFusion` schema name (for registering the table provider).
     pub df_schema_name: String,
-    /// Optional validated partition expression for the new table.
-    pub partition_expr: Option<Expr>,
-    /// Original SQL text for the partition expression, preserved for forwarding.
-    pub partition_expr_sql: Option<String>,
+    /// Distribution mode for the new table.
+    pub distribution: CayenneTableDistribution,
     /// Primary key column names extracted from SQL constraints.
     pub primary_key: Vec<String>,
     /// Output schema (single "result" column).
@@ -78,8 +85,7 @@ impl CayenneCreateTableNode {
             df_schema_name,
             if_not_exists: false,
             or_replace: false,
-            partition_expr: None,
-            partition_expr_sql: None,
+            distribution: CayenneTableDistribution::Replicated,
             primary_key: Vec::new(),
         }
     }
@@ -92,8 +98,7 @@ pub struct CayenneCreateTableNodeBuilder {
     or_replace: bool,
     df_catalog_name: String,
     df_schema_name: String,
-    partition_expr: Option<Expr>,
-    partition_expr_sql: Option<String>,
+    distribution: CayenneTableDistribution,
     primary_key: Vec<String>,
 }
 
@@ -111,14 +116,8 @@ impl CayenneCreateTableNodeBuilder {
     }
 
     #[must_use]
-    pub fn partition_expr(mut self, partition_expr: Option<Expr>) -> Self {
-        self.partition_expr = partition_expr;
-        self
-    }
-
-    #[must_use]
-    pub fn partition_expr_sql(mut self, partition_expr_sql: Option<String>) -> Self {
-        self.partition_expr_sql = partition_expr_sql;
+    pub fn distribution(mut self, distribution: CayenneTableDistribution) -> Self {
+        self.distribution = distribution;
         self
     }
 
@@ -137,8 +136,7 @@ impl CayenneCreateTableNodeBuilder {
             or_replace: self.or_replace,
             df_catalog_name: self.df_catalog_name,
             df_schema_name: self.df_schema_name,
-            partition_expr: self.partition_expr,
-            partition_expr_sql: self.partition_expr_sql,
+            distribution: self.distribution,
             primary_key: self.primary_key,
             output_schema: ddl_output_schema(),
         }
@@ -150,8 +148,7 @@ impl Hash for CayenneCreateTableNode {
         self.table_name.hash(state);
         self.df_catalog_name.hash(state);
         self.df_schema_name.hash(state);
-        self.partition_expr.hash(state);
-        self.partition_expr_sql.hash(state);
+        self.distribution.hash(state);
         self.primary_key.hash(state);
     }
 }
@@ -161,8 +158,7 @@ impl PartialEq for CayenneCreateTableNode {
         self.table_name == other.table_name
             && self.df_catalog_name == other.df_catalog_name
             && self.df_schema_name == other.df_schema_name
-            && self.partition_expr == other.partition_expr
-            && self.partition_expr_sql == other.partition_expr_sql
+            && self.distribution == other.distribution
             && self.primary_key == other.primary_key
     }
 }
@@ -189,7 +185,12 @@ impl UserDefinedLogicalNodeCore for CayenneCreateTableNode {
     }
 
     fn expressions(&self) -> Vec<Expr> {
-        self.partition_expr.iter().cloned().collect()
+        match &self.distribution {
+            CayenneTableDistribution::Partitioned { partition_expr, .. } => {
+                vec![partition_expr.clone()]
+            }
+            CayenneTableDistribution::Replicated => Vec::new(),
+        }
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -205,12 +206,20 @@ impl UserDefinedLogicalNodeCore for CayenneCreateTableNode {
         exprs: Vec<Expr>,
         _inputs: Vec<LogicalPlan>,
     ) -> datafusion::error::Result<Self> {
-        let partition_expr = match exprs.as_slice() {
-            [] => None,
-            [expr] => Some(expr.clone()),
+        let distribution = match (&self.distribution, exprs.as_slice()) {
+            (CayenneTableDistribution::Replicated, []) => CayenneTableDistribution::Replicated,
+            (
+                CayenneTableDistribution::Partitioned {
+                    partition_expr_sql, ..
+                },
+                [expr],
+            ) => CayenneTableDistribution::Partitioned {
+                partition_expr: expr.clone(),
+                partition_expr_sql: partition_expr_sql.clone(),
+            },
             _ => {
                 return Err(datafusion::error::DataFusionError::Internal(
-                    "CayenneCreateTableNode expects at most one partition expression".to_string(),
+                    "CayenneCreateTableNode expects exactly one partition expression for partitioned distribution and none for replicated distribution".to_string(),
                 ));
             }
         };
@@ -222,8 +231,7 @@ impl UserDefinedLogicalNodeCore for CayenneCreateTableNode {
             or_replace: self.or_replace,
             df_catalog_name: self.df_catalog_name.clone(),
             df_schema_name: self.df_schema_name.clone(),
-            partition_expr,
-            partition_expr_sql: self.partition_expr_sql.clone(),
+            distribution,
             primary_key: self.primary_key.clone(),
             output_schema: DFSchemaRef::clone(&self.output_schema),
         })

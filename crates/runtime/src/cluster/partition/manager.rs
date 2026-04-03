@@ -43,6 +43,11 @@ pub enum Error {
     #[snafu(display("No partition metadata found for table {table}"))]
     TableMetadataNotFound { table: String },
 
+    #[snafu(display(
+        "Table {table} is replicated and does not support partition assignment metadata updates"
+    ))]
+    TableNotPartitioned { table: String },
+
     #[snafu(display("Concurrent modification detected for table {table}"))]
     ConcurrentModification { table: String },
 }
@@ -119,6 +124,12 @@ impl PartitionManager {
         self.state.get_cached(&key)
     }
 
+    #[must_use]
+    pub fn is_replicated(&self, table: &TableReference) -> bool {
+        self.get_cached_table_metadata(table)
+            .is_some_and(|metadata| metadata.is_replicated())
+    }
+
     /// Initialize partition metadata for a table with the given partition expression SQL strings.
     ///
     /// If the file already exists, this is a no-op and returns `Ok(false)`.
@@ -133,8 +144,15 @@ impl PartitionManager {
         }
         let key = table.to_string();
         let now_ms = now_ms()?;
-        let metadata =
-            TablePartitionMetadata::new(table.to_string(), now_ms, partition_expressions);
+        let metadata = if partition_expressions.is_empty() {
+            TablePartitionMetadata::new_replicated(table.to_string(), now_ms)
+        } else {
+            TablePartitionMetadata::new_partitioned(
+                table.to_string(),
+                now_ms,
+                partition_expressions,
+            )
+        };
 
         match self
             .state
@@ -162,14 +180,26 @@ impl PartitionManager {
         let now_ms = now_ms()?;
 
         let mut metadata = self.get_table_metadata(table).await?.unwrap_or_else(|| {
-            TablePartitionMetadata::new(table.to_string(), now_ms, partition_expressions)
+            TablePartitionMetadata::new_partitioned(
+                table.to_string(),
+                now_ms,
+                partition_expressions.clone(),
+            )
         });
 
-        metadata.partitions = partition_values
+        if metadata.is_replicated() {
+            return Ok(());
+        }
+
+        let partitions = partition_values
             .into_iter()
             .map(PartitionMetadata::new)
             .collect();
-        metadata.updated_at = now_ms;
+        if !metadata.set_partitions(partitions) {
+            return Err(Error::TableNotPartitioned { table: key });
+        }
+        metadata.set_partition_expressions_if_empty(partition_expressions);
+        metadata.set_updated_at(now_ms);
 
         self.write_metadata(&key, metadata).await
     }
@@ -195,10 +225,17 @@ impl PartitionManager {
                 .await?
                 .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
 
+            if metadata.is_replicated() {
+                return Ok(AllocationResult {
+                    previously_assigned: vec![],
+                    newly_assigned: vec![],
+                });
+            }
+
             let mut result = AllocationResult {
                 newly_assigned: vec![],
                 previously_assigned: metadata
-                    .partitions
+                    .partitions()
                     .iter()
                     .filter_map(|p| {
                         if p.is_assigned_to(executor_id) {
@@ -211,7 +248,11 @@ impl PartitionManager {
             };
             let mut changes = false;
 
-            for partition in &mut metadata.partitions {
+            let Some(partitions) = metadata.partitions_mut() else {
+                return Err(Error::TableNotPartitioned { table: key.clone() });
+            };
+
+            for partition in partitions {
                 if result.count() >= limit {
                     break;
                 }
@@ -229,7 +270,7 @@ impl PartitionManager {
                 return Ok(result);
             }
 
-            metadata.updated_at = now_ms;
+            metadata.set_updated_at(now_ms);
 
             match self.write_metadata(&key, metadata).await {
                 Ok(()) => return Ok(result),
@@ -265,7 +306,11 @@ impl PartitionManager {
                 .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
 
             let mut updated = false;
-            for partition in &mut metadata.partitions {
+            let Some(partitions) = metadata.partitions_mut() else {
+                return Err(Error::TableNotPartitioned { table: key.clone() });
+            };
+
+            for partition in partitions {
                 if partition.partition_value == *partition_value {
                     partition.assign_to(executor_id.to_string(), now_ms);
                     updated = true;
@@ -280,7 +325,7 @@ impl PartitionManager {
                 });
             }
 
-            metadata.updated_at = now_ms;
+            metadata.set_updated_at(now_ms);
 
             match self.write_metadata(&key, metadata).await {
                 Ok(()) => return Ok(()),
@@ -337,10 +382,12 @@ impl PartitionManager {
                 .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
 
             let mut changes = false;
+            let Some(partitions) = metadata.partitions_mut() else {
+                return Err(Error::TableNotPartitioned { table: key.clone() });
+            };
 
             for &(partition_value, executor_id) in assignments {
-                let existing = metadata
-                    .partitions
+                let existing = partitions
                     .iter_mut()
                     .find(|p| p.partition_value == *partition_value);
 
@@ -352,7 +399,7 @@ impl PartitionManager {
                 } else {
                     let mut new_partition = PartitionMetadata::new(partition_value.clone());
                     new_partition.assign_to(executor_id.to_string(), now_ms);
-                    metadata.add_partition(new_partition);
+                    partitions.push(new_partition);
                     changes = true;
                 }
             }
@@ -361,7 +408,7 @@ impl PartitionManager {
                 return Ok(());
             }
 
-            metadata.updated_at = now_ms;
+            metadata.set_updated_at(now_ms);
 
             match self.write_metadata(&key, metadata).await {
                 Ok(()) => return Ok(()),

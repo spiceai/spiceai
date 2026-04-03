@@ -2762,7 +2762,7 @@ async fn resolve_table_partition_expr(
             .await
             .boxed()
             .map_err(DataFusionError::External)?
-        && let Some(original) = metadata.partition_expressions.get(idx)
+        && let Some(original) = metadata.partition_expressions().get(idx)
     {
         return Ok(Some(original.clone()));
     }

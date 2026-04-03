@@ -103,7 +103,9 @@ pub async fn create_logical_plan(
             // DDL: CREATE TABLE with extensions (WITH options, PARTITION BY, REPLICATED).
             // Intercepted regardless of catalog mode — extensions apply to
             // all catalog types (Cayenne, Iceberg, etc.).
-            SQLStatement::CreateTable(ct) if create_table::has_ddl_extensions(ct, is_replicated) => {
+            SQLStatement::CreateTable(ct)
+                if create_table::has_ddl_extensions(ct, is_replicated) =>
+            {
                 return create_table::plan_create_table(
                     statement,
                     session,

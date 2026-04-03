@@ -57,6 +57,7 @@ use runtime_table_partition::expression::PartitionedBy;
 use runtime_table_partition::provider::PartitionTableProvider;
 
 use super::get_cayenne_provider;
+use super::logical_nodes::CayenneTableDistribution;
 use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::dataaccelerator::cayenne::CayennePartitionCreator;
@@ -314,8 +315,7 @@ pub struct CayenneCreateTableExec {
     primary_key: Vec<String>,
     catalog_list: Arc<dyn CatalogProviderList>,
     executor_registry: Option<Arc<ExecutorRegistry>>,
-    partition_expr: Option<Expr>,
-    partition_expr_sql: Option<String>,
+    distribution: CayenneTableDistribution,
     properties: PlanProperties,
 }
 
@@ -340,8 +340,7 @@ pub struct CayenneCreateTableExecBuilder {
     primary_key: Vec<String>,
     catalog_list: Arc<dyn CatalogProviderList>,
     executor_registry: Option<Arc<ExecutorRegistry>>,
-    partition_expr: Option<Expr>,
-    partition_expr_sql: Option<String>,
+    distribution: CayenneTableDistribution,
 }
 
 impl CayenneCreateTableExecBuilder {
@@ -362,8 +361,7 @@ impl CayenneCreateTableExecBuilder {
             primary_key,
             catalog_list,
             executor_registry: None,
-            partition_expr: None,
-            partition_expr_sql: None,
+            distribution: CayenneTableDistribution::Replicated,
         }
     }
 
@@ -380,14 +378,8 @@ impl CayenneCreateTableExecBuilder {
     }
 
     #[must_use]
-    pub fn partition_expr(mut self, partition_expr: Option<Expr>) -> Self {
-        self.partition_expr = partition_expr;
-        self
-    }
-
-    #[must_use]
-    pub fn partition_expr_sql(mut self, partition_expr_sql: Option<String>) -> Self {
-        self.partition_expr_sql = partition_expr_sql;
+    pub fn distribution(mut self, distribution: CayenneTableDistribution) -> Self {
+        self.distribution = distribution;
         self
     }
 
@@ -409,8 +401,7 @@ impl CayenneCreateTableExecBuilder {
             primary_key: self.primary_key,
             catalog_list: self.catalog_list,
             executor_registry: self.executor_registry,
-            partition_expr: self.partition_expr,
-            partition_expr_sql: self.partition_expr_sql,
+            distribution: self.distribution,
             properties,
         }
     }
@@ -463,8 +454,18 @@ impl ExecutionPlan for CayenneCreateTableExec {
         let primary_key = self.primary_key.clone();
         let catalog_list = Arc::clone(&self.catalog_list);
         let executor_registry = self.executor_registry.clone();
-        let partition_expr = self.partition_expr.clone();
-        let partition_expr_sql = self.partition_expr_sql.clone();
+        let distribution = self.distribution.clone();
+        let (partition_expr, partition_expr_sql, replicated) = match &distribution {
+            CayenneTableDistribution::Partitioned {
+                partition_expr,
+                partition_expr_sql,
+            } => (
+                Some(partition_expr.clone()),
+                Some(partition_expr_sql.clone()),
+                false,
+            ),
+            CayenneTableDistribution::Replicated => (None, None, true),
+        };
         let partition_label = partition_expr.as_ref().map(partition_label_for_expr);
         let result_schema = ddl_result_schema();
         let runtime_env = context.runtime_env();
@@ -686,17 +687,23 @@ impl ExecutionPlan for CayenneCreateTableExec {
             schema_provider.register_table(table_name.clone(), wrapped_provider)?;
 
             // Initialize partition metadata so the scheduler can route queries by partition.
-            if let Some(ref pe) = partition_expr
-                && let Some(ref registry) = executor_registry
-            {
+            if let Some(ref registry) = executor_registry {
                 let table_ref = datafusion::sql::TableReference::full(
                     df_catalog_name.clone(),
                     df_schema_name.clone(),
                     table_name.clone(),
                 );
-                let expr_sql = partition_expr_sql.clone().unwrap_or_else(|| pe.to_string());
                 let pm = registry.federated_partition_manager();
-                if let Err(e) = pm.initialize_metadata(&table_ref, vec![expr_sql]).await {
+                let metadata_init = if replicated {
+                    pm.initialize_metadata(&table_ref, vec![]).await
+                } else if let Some(ref pe) = partition_expr {
+                    let expr_sql = partition_expr_sql.clone().unwrap_or_else(|| pe.to_string());
+                    pm.initialize_metadata(&table_ref, vec![expr_sql]).await
+                } else {
+                    Ok(false)
+                };
+
+                if let Err(e) = metadata_init {
                     tracing::warn!(
                         table = %table_ref,
                         error = %e,
@@ -731,7 +738,9 @@ impl ExecutionPlan for CayenneCreateTableExec {
                     "CREATE TABLE IF NOT EXISTS \"{df_catalog_name}\".\"{df_schema_name}\".\"{table_name}\" ({})",
                     table_elements.join(", ")
                 );
-                let ddl_sql = if let Some(ref partition_sql) = partition_expr_sql {
+                let ddl_sql = if replicated {
+                    format!("{ddl_sql} REPLICATED")
+                } else if let Some(ref partition_sql) = partition_expr_sql {
                     format!("{ddl_sql} PARTITION BY {partition_sql}")
                 } else {
                     ddl_sql

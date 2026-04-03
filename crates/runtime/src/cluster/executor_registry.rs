@@ -349,28 +349,31 @@ fn get_partitions_from_manager(
     table: &TableReference,
     schema: &SchemaRef,
 ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-    let Some(table_metadata) = partition_manager.get_cached_table_metadata(table) else {
-        // No partition metadata — route to a single live executor to avoid duplicate results.
-        let Some((executor_id, client)) = flight_sql_clients
-            .iter()
-            .filter(|(eid, _)| connections.contains_key(*eid))
-            .min_by(|(a, _), (b, _)| a.cmp(b))
-        else {
-            tracing::warn!(
-                "No partition assignments for table {table:?} and no connected executors with FlightSQL clients"
-            );
-            return Vec::new();
-        };
+    let table_metadata = match partition_manager.get_cached_table_metadata(table) {
+        Some(table) if !table.is_replicated() => table,
+        None | Some(_) => {
+            // Replicated tables are available on all executors. Route to one live executor.
+            let Some((executor_id, client)) = flight_sql_clients
+                .iter()
+                .filter(|(eid, _)| connections.contains_key(*eid))
+                .min_by(|(a, _), (b, _)| a.cmp(b))
+            else {
+                tracing::warn!(
+                    "Table {table:?} is replicated but there are no connected executors with FlightSQL clients"
+                );
+                return Vec::new();
+            };
 
-        return vec![(
-            flight_sql_table_provider(executor_id, client.clone(), table, Arc::clone(schema)),
-            Vec::new(),
-        )];
+            return vec![(
+                flight_sql_table_provider(executor_id, client.clone(), table, Arc::clone(schema)),
+                Vec::new(),
+            )];
+        }
     };
 
     // All required partitions (future: filter by query predicates)
     let required_partitions: Vec<HashMap<String, String>> = table_metadata
-        .partitions
+        .partitions()
         .iter()
         .map(|p| p.partition_value.clone())
         .collect();
@@ -382,7 +385,7 @@ fn get_partitions_from_manager(
 
     // Build executor -> partitions map, excluding dead executors
     let mut executor_partition_map: HashMap<String, Vec<PartitionValue>> = HashMap::new();
-    for partition_meta in &table_metadata.partitions {
+    for partition_meta in table_metadata.partitions() {
         for executor_id in &partition_meta.assigned_executors {
             if !connections.contains_key(executor_id) {
                 tracing::debug!(
@@ -495,7 +498,7 @@ impl TablePartitionProvider for FederatedPartitionProvider {
     fn should_partition(&self, tbl: &TableScan) -> bool {
         self.partition_manager
             .get_cached_table_metadata(&tbl.table_name)
-            .is_some()
+            .is_some_and(|metadata| !metadata.is_replicated())
     }
 
     fn get_partitions(
