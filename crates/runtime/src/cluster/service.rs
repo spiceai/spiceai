@@ -637,14 +637,11 @@ impl ClusterService for ClusterServiceImpl {
                     None => None,
                 };
 
-                let ddl_sql = create_table_if_not_exists(
-                    &table_ref,
-                    &table,
-                    partition_expr_str.as_deref(),
-                )
-                .map_err(|e| {
-                    Status::internal(format!("Failed to create DDL for table {table_ref}: {e}"))
-                })?;
+                let ddl_sql =
+                    create_table_if_not_exists(&table_ref, &table, partition_expr_str.as_deref())
+                        .map_err(|e| {
+                        Status::internal(format!("Failed to create DDL for table {table_ref}: {e}"))
+                    })?;
                 forward_sql_to_executor(client.clone(), &ddl_sql)
                     .await
                     .map_err(|e| {
