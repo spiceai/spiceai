@@ -574,8 +574,9 @@ async fn provision_spice_cloud_app(
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
 ) -> anyhow::Result<RunState> {
+    let api_url = args.spice_cloud_api_url.as_str();
     let cloud = commands::build_cloud_client(
-        Some(args.spice_cloud_api_url.as_str()),
+        Some(api_url),
         args.api_key.as_deref(),
     )?;
 
@@ -588,7 +589,7 @@ async fn provision_spice_cloud_app(
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     let app_name = commands::sanitize_app_name(&format!("spidapter-{short_id}"));
 
-    eprintln!("[stdio] Spice Cloud API: {}", cloud.base_url());
+    eprintln!("[stdio] Spice Cloud API: {api_url}");
     eprintln!("[stdio] Region cname: {cname}");
     eprintln!("[stdio] Flight endpoint: {flight_url}");
     eprintln!("[stdio] App name: {app_name}");
