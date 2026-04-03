@@ -95,7 +95,7 @@ pub(super) async fn plan_create_table(
             {
                 tracing::warn!(
                     "Failed to clean up DDL extension store entry for {key} \
-                         after planning failure: {cleanup_err}"
+                     after planning failure: {cleanup_err}"
                 );
             }
             Err(e)
