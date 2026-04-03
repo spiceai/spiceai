@@ -20,6 +20,7 @@ use aws_sdk_credential_bridge;
 use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
+use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{DFSchema, exec_err};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{
@@ -406,6 +407,31 @@ struct PhysicalSchemaMapping {
     logical_to_physical: HashMap<String, String>,
 }
 
+/// Rewrites column references in a DataFusion [`Expr`] from logical to physical names.
+///
+/// This is needed so that predicates pushed down to [`ParquetExec`] reference the physical
+/// column names actually present in the parquet files.
+fn rewrite_column_names(
+    expr: Expr,
+    logical_to_physical: &HashMap<String, String>,
+) -> Result<Expr, DataFusionError> {
+    Ok(expr
+        .transform(|e| {
+            if let Expr::Column(col) = &e {
+                if let Some(physical_name) = logical_to_physical.get(col.name()) {
+                    return Ok(datafusion::common::tree_node::Transformed::yes(
+                        Expr::Column(datafusion::common::Column::new(
+                            col.relation.clone(),
+                            physical_name,
+                        )),
+                    ));
+                }
+            }
+            Ok(datafusion::common::tree_node::Transformed::no(e))
+        })?
+        .data)
+}
+
 /// Builds a [`ProjectionExec`] that renames columns from physical names back to logical names.
 ///
 /// For columns with nested types (Struct, List, Map) where the physical and logical data types
@@ -710,7 +736,6 @@ impl TableProvider for DeltaTable {
         );
 
         let filter = conjunction(filters).unwrap_or_else(|| lit(true));
-        let physical_expr = state.create_physical_expr(filter, &df_schema)?;
 
         let non_partition_indices = self
             .arrow_schema
@@ -721,6 +746,12 @@ impl TableProvider for DeltaTable {
             .collect::<Vec<_>>();
 
         if let Some(mapping) = &self.physical_schema_mapping {
+            // Rewrite filter column references from logical to physical names
+            // so ParquetExec can match them against the physical parquet schema.
+            let physical_filter = rewrite_column_names(filter, &mapping.logical_to_physical)?;
+            let physical_df_schema = DFSchema::try_from(Arc::new(mapping.schema.clone()))?;
+            let physical_expr = state.create_physical_expr(physical_filter, &physical_df_schema)?;
+
             let physical_non_partition_schema =
                 Arc::new(mapping.schema.project(&non_partition_indices)?);
 
@@ -739,6 +770,7 @@ impl TableProvider for DeltaTable {
 
             build_column_mapping_projection(exec, &mapping.physical_to_logical, &self.arrow_schema)
         } else {
+            let physical_expr = state.create_physical_expr(filter, &df_schema)?;
             let schema = self.arrow_schema.project(&non_partition_indices)?;
 
             Ok(self
