@@ -1263,6 +1263,7 @@ impl DataFusion {
                 "Failed to invalidate caches for table {table_reference} after write: {e}"
             );
         }
+        self.caching().flush_pending_invalidations().await;
 
         self.runtime_status
             .update_dataset(table_reference, status::ComponentStatus::Ready);
@@ -1328,6 +1329,7 @@ impl DataFusion {
                 "Failed to invalidate caches for table {table_reference} after streaming write: {e}"
             );
         }
+        self.caching().flush_pending_invalidations().await;
 
         Ok(())
     }

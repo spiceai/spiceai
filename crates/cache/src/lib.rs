@@ -328,6 +328,21 @@ impl Caching {
         }
         Ok(())
     }
+
+    /// Drains Moka's deferred predicate-invalidation queue for all sub-caches.
+    /// `invalidate_for_table` uses `invalidate_entries_if` which schedules invalidations lazily;
+    /// calling this method ensures they are applied before the next cache read.
+    pub async fn flush_pending_invalidations(&self) {
+        if let Some(ref results_cache) = self.results {
+            results_cache.checkpoint().await;
+        }
+        if let Some(ref plans_cache) = self.plans {
+            plans_cache.checkpoint().await;
+        }
+        if let Some(ref search_cache) = self.search {
+            search_cache.checkpoint().await;
+        }
+    }
 }
 
 // TODO: sunset ``QueryResultsCacheProvider`` in favor of ``CacheProvider``?
@@ -481,6 +496,13 @@ impl QueryResultsCacheProvider {
     #[must_use]
     pub async fn item_count(&self) -> u64 {
         self.cache.item_count().await
+    }
+
+    /// Drains Moka's deferred predicate-invalidation queue.
+    /// `invalidate_for_table` uses `invalidate_entries_if` which schedules invalidations lazily;
+    /// calling this method ensures they are applied before the next cache read.
+    pub async fn checkpoint(&self) {
+        self.cache.checkpoint().await;
     }
 
     /// Returns the base TTL for cache entries (used for staleness checks).
