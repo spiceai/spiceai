@@ -25,10 +25,9 @@ limitations under the License.
 //!    the AST, stored in the [`DdlExtensionStore`], and stripped before
 //!    delegating to `DataFusion`.
 //!
-//! 2. **DML interception** — DELETE and UPDATE statements targeting Cayenne
-//!    catalog tables are converted into [`LogicalPlan::Extension`] nodes
-//!    directly for distributed mode. Support for additional DML types
-//!    (INSERT, MERGE) may be added in the future.
+//! 2. **DML interception** — DELETE, UPDATE, INSERT, and MERGE statements
+//!    targeting Cayenne catalog tables are converted into
+//!    [`LogicalPlan::Extension`] nodes directly for distributed mode.
 //!
 //! For everything else, the planner delegates to `DataFusion`'s standard
 //! `session.statement_to_plan()` path.
@@ -117,8 +116,8 @@ pub async fn create_logical_plan(
                 return plan_cayenne_dml(statement, session, ctx, WriteOp::Update).await;
             }
 
-            // DML: INSERT on Cayenne tables
-            SQLStatement::Insert(_) => {
+            // DML: INSERT on Cayenne tables (only when Cayenne is active)
+            SQLStatement::Insert(_) if ctx.catalog_mode == CatalogMode::Cayenne => {
                 return plan_cayenne_dml(
                     statement,
                     session,
