@@ -126,6 +126,8 @@ pub mod iceberg_ddl;
 pub mod job_executor_context_extension;
 pub mod managed_runtime;
 pub mod param_utils;
+#[cfg(not(windows))]
+pub mod planner;
 pub mod refresh_sql;
 pub mod request_context_extension;
 pub mod retention_sql;
@@ -926,6 +928,26 @@ impl DataFusion {
             .contains(table_reference)
     }
 
+    /// Returns `true` if any DDL-enabled catalog is Cayenne-backed.
+    #[cfg(not(windows))]
+    fn has_cayenne_catalog(&self) -> bool {
+        match self.ddl_enabled_catalogs.read() {
+            Ok(cats) => cats.iter().any(|name| {
+                self.ctx
+                    .catalog(name)
+                    .is_some_and(|c| cayenne_ddl::is_cayenne_catalog(c.as_ref()))
+            }),
+            Err(err) => {
+                tracing::error!(
+                    "Failed to acquire read lock for ddl_enabled_catalogs; \
+                     assuming Cayenne-backed catalogs are present to avoid \
+                     silently disabling distributed DELETE planning: {err}"
+                );
+                true
+            }
+        }
+    }
+
     /// Returns `true` if the given table reference resolves to a Cayenne-backed catalog.
     #[must_use]
     pub fn is_cayenne_catalog(&self, table_reference: &TableReference) -> bool {
@@ -1640,6 +1662,37 @@ impl DataFusion {
                 );
             }
 
+            // Auto-configure cache retention when stale_if_error is disabled.
+            // Expired cache entries (past max_age + SWR) are never served and waste storage.
+            if !acceleration_settings.caching_stale_if_error.is_enabled() {
+                if dataset.retention_period().is_some() {
+                    tracing::warn!(
+                        dataset = %dataset.name,
+                        "User-specified retention_period is overridden by automatic cache retention in caching mode",
+                    );
+                }
+
+                let max_age = acceleration_settings
+                    .caching_ttl
+                    .unwrap_or(Duration::from_secs(30));
+                let swr = acceleration_settings
+                    .caching_stale_while_revalidate_ttl
+                    .unwrap_or_default();
+                let retention_period = max_age + swr;
+                let check_interval = retention_period.max(Duration::from_secs(30));
+
+                let cache_retention = Retention::builder()
+                    .time_column(Some(
+                        crate::accelerated_table::caching::CACHE_REFRESHED_AT_COLUMN,
+                    ))
+                    .time_period(Some(retention_period))
+                    .check_interval(Some(check_interval))
+                    .enabled(true)
+                    .build();
+
+                accelerated_table_builder.retention(cache_retention);
+            }
+
             accelerated_table_builder.caching_ttl(acceleration_settings.caching_ttl);
             accelerated_table_builder.caching_stale_while_revalidate_ttl(
                 acceleration_settings.caching_stale_while_revalidate_ttl,
@@ -1908,6 +1961,18 @@ impl DataFusion {
         dataset_name: &TableReference,
         overrides: Option<RefreshOverrides>,
     ) -> Result<Option<Arc<Notify>>> {
+        // If we're a scheduler with an executor registry, forward refresh to executors
+        // instead of trying to refresh locally (the scheduler doesn't run refresh workers).
+        if matches!(
+            self.cluster_config.effective_role(),
+            Some(crate::config::ClusterRole::Scheduler)
+        ) && let Some(executor_registry) = &self.executor_registry
+        {
+            return self
+                .forward_refresh_to_executors(executor_registry, dataset_name, overrides.as_ref())
+                .await;
+        }
+
         let table = self
             .get_accelerated_table_provider(dataset_name.to_string().as_str())
             .await?;
@@ -1925,6 +1990,74 @@ impl DataFusion {
             table_name: dataset_name.to_string(),
         }
         .fail()?
+    }
+
+    /// Forwards a dataset refresh command to all connected executors via the control stream.
+    /// Returns `Ok(None)` because the scheduler does not have a local notifier for executor refreshes.
+    async fn forward_refresh_to_executors(
+        &self,
+        executor_registry: &ExecutorRegistry,
+        dataset_name: &TableReference,
+        overrides: Option<&RefreshOverrides>,
+    ) -> Result<Option<Arc<Notify>>> {
+        let overrides_json = match overrides {
+            Some(o) => {
+                Some(
+                    serde_json::to_string(o).map_err(|_| Error::UnableToTriggerRefresh {
+                        dataset_name: dataset_name.to_string(),
+                        source: crate::accelerated_table::Error::FailedToTriggerRefresh {
+                            source: tokio::sync::mpsc::error::SendError(None),
+                        },
+                    })?,
+                )
+            }
+            None => None,
+        };
+
+        let command = runtime_proto::SchedulerControlMessage {
+            message: Some(
+                runtime_proto::scheduler_control_message::Message::RefreshDataset(
+                    runtime_proto::RefreshDatasetCommand {
+                        dataset_name: dataset_name.to_string(),
+                        overrides_json,
+                    },
+                ),
+            ),
+        };
+
+        let executor_ids = executor_registry.connected_executors().await;
+        if executor_ids.is_empty() {
+            tracing::warn!(
+                "No executors connected to forward refresh for dataset '{dataset_name}'"
+            );
+            return Ok(None);
+        }
+
+        let mut failures = Vec::new();
+        for executor_id in &executor_ids {
+            if let Err(e) = executor_registry
+                .send_command(executor_id, command.clone())
+                .await
+            {
+                tracing::warn!("Failed to send refresh command to executor {executor_id}: {e}");
+                failures.push(executor_id.clone());
+            }
+        }
+
+        if failures.is_empty() {
+            tracing::info!(
+                "Forwarded refresh for dataset '{dataset_name}' to {} executor(s)",
+                executor_ids.len()
+            );
+        } else {
+            tracing::warn!(
+                "Refresh for '{dataset_name}' failed for {}/{} executor(s)",
+                failures.len(),
+                executor_ids.len()
+            );
+        }
+
+        Ok(None)
     }
 
     pub async fn update_refresh_sql(
@@ -2455,30 +2588,7 @@ impl DataFusion {
             None
         };
 
-        // Pre-process CREATE TABLE statements to extract DDL extensions
-        // (WITH options, PARTITION BY) before planning.
-        let preprocessed =
-            ddl::preprocess::preprocess_create_table_with_options(sql, &self.ddl_extension_store)?;
-        let (effective_sql, store_key) = match &preprocessed {
-            ddl::preprocess::PreprocessResult::Modified {
-                sql: modified,
-                store_key,
-            } => (modified.as_str(), Some(store_key)),
-            ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
-        };
-
-        let plan = match session.create_logical_plan(effective_sql).await {
-            Ok(plan) => plan,
-            Err(e) => {
-                if let Some(store_key) = store_key {
-                    ddl::preprocess::cleanup_preprocessed_ddl_options(
-                        &self.ddl_extension_store,
-                        store_key,
-                    )?;
-                }
-                return Err(e);
-            }
-        };
+        let plan = self.create_logical_plan(session, sql).await?;
 
         if let Some(cache) = plans_cache
             && let Some(cache_key) = cache_key_opt
@@ -2488,6 +2598,39 @@ impl DataFusion {
         }
 
         Ok(plan)
+    }
+
+    /// Route SQL through the planner, which intercepts DDL extensions and
+    /// Cayenne DML at the statement level, or falls back to `DataFusion`'s
+    /// standard planner.
+    #[cfg(not(windows))]
+    pub(crate) async fn create_logical_plan(
+        &self,
+        session: &SessionState,
+        sql: &str,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        let ctx = planner::PlannerContext {
+            catalog_mode: if self.has_cayenne_catalog() {
+                planner::CatalogMode::Cayenne
+            } else {
+                planner::CatalogMode::Standard
+            },
+            cluster_role: self.cluster_config.effective_role(),
+            ddl_extension_store: Arc::clone(&self.ddl_extension_store),
+        };
+
+        planner::create_logical_plan(sql, session, &ctx).await
+    }
+
+    /// On Windows the `planner` module is not available, so delegate
+    /// directly to DataFusion's standard logical planner.
+    #[cfg(windows)]
+    pub(crate) async fn create_logical_plan(
+        &self,
+        session: &SessionState,
+        sql: &str,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        session.create_logical_plan(sql).await
     }
 
     pub(crate) async fn clear_cached_plans(&self) {
