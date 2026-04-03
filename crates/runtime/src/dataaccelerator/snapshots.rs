@@ -139,12 +139,25 @@ pub(crate) async fn snapshot_before_recreate(
         return;
     };
 
+    // If the caller provided an empty schema (e.g. during file_create init when the table
+    // provider isn't available yet), try to read the real schema from existing snapshot
+    // metadata. This avoids storing an empty schema that would cause future snapshots or
+    // restores to fail with a schema mismatch.
+    let snapshot_schema = if schema.fields().is_empty() {
+        manager
+            .current_stored_schema()
+            .await
+            .unwrap_or(Arc::clone(&schema))
+    } else {
+        Arc::clone(&schema)
+    };
+
     // Create a mutex just for this one-off snapshot; no other operations are concurrent at init time.
     let mutex = Arc::new(tokio::sync::Mutex::new(()));
     let lock_guard = mutex.lock_owned().await;
 
     match manager
-        .create_snapshot(&schema, lock_guard, None, None, ForceCreate(true))
+        .create_snapshot(&snapshot_schema, lock_guard, None, None, ForceCreate(true))
         .await
     {
         Ok(Some(path)) => {

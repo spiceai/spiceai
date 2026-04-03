@@ -34,7 +34,7 @@ use datafusion::{
     execution::{
         DiskManager, SessionStateBuilder,
         disk_manager::DiskManagerMode,
-        memory_pool::{GreedyMemoryPool, MemoryPool, TrackConsumersPool},
+        memory_pool::{GreedyMemoryPool, TrackConsumersPool},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
     optimizer::{
@@ -599,6 +599,8 @@ pub(crate) fn runtime_env(
     };
 
     let memory_pool = Arc::new(TrackConsumersPool::new(
+        // The runtime targets 64-bit platforms; usize is always >= u64.
+        #[expect(clippy::cast_possible_truncation, reason = "runtime is 64-bit only")]
         GreedyMemoryPool::new(effective_memory_limit as usize),
         topn,
     ));

@@ -959,6 +959,17 @@ impl SnapshotManager {
         self
     }
 
+    /// Returns the schema currently stored in snapshot metadata for this dataset, if any.
+    ///
+    /// This is useful when callers need the real schema (e.g. for pre-recreation snapshots)
+    /// but don't have access to the table provider yet.
+    pub async fn current_stored_schema(&self) -> Option<SchemaRef> {
+        let handle = self.load_metadata().await.ok()??;
+        let dataset_entry = handle.metadata.datasets.get(&self.dataset_name)?;
+        let schema_meta = dataset_entry.current_schema()?;
+        schema_meta.to_schema_ref().ok()
+    }
+
     /// Creates a new snapshot by streaming the local acceleration file to object storage.
     ///
     /// For file-based accelerators (`DuckDB`, `SQLite`), this copies and uploads the database file.
