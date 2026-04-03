@@ -763,11 +763,17 @@ impl Builder {
 
         let (refresh_handle, refresh_trigger) =
             if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
-                // Accelerated tables aren't accelerated on scheduler. Immediately ready.
+                // Accelerated tables aren't accelerated on scheduler. Don't mark
+                // as Ready yet -- the partition management task will mark
+                // distributed datasets as Ready once executors have been assigned
+                // their partitions and notified.
+                // Register the dataset as Initializing so it is tracked by the
+                // runtime status system and blocks /v1/ready until the partition
+                // management task promotes it to Ready.
+                self.runtime_status
+                    .update_dataset(&self.dataset_name, status::ComponentStatus::Initializing);
                 // Set refresh_trigger to None because the receiver will be dropped
                 // (refresher.start() is not called), making the channel dead.
-                self.runtime_status
-                    .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
                 // Notify immediately so schedule creation doesn't block waiting for
                 // a refresh that will never happen locally on the scheduler.
                 on_complete_notification.notify_waiters();
