@@ -762,12 +762,12 @@ impl Builder {
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
 
         let refresh_handle = if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
-            // Accelerated tables aren't accelerated on the scheduler. Don't mark
-            // as Ready yet — the partition management task will promote the dataset
-            // to Ready once all of its partitions have been assigned to executors.
-            // Register as Initializing so /v1/ready waits for partition assignment.
-            self.runtime_status
-                .update_dataset(&self.dataset_name, status::ComponentStatus::Initializing);
+            // Accelerated tables aren't accelerated on the scheduler.
+            // Don't register this dataset as a readiness component — the
+            // `partition_metadata` component already gates /v1/ready until
+            // metadata has been seeded, and the partition management task
+            // will promote datasets to Ready once executors have been
+            // assigned their partitions.
             None
         } else {
             refresher.start(acceleration_refresh_mode).await?

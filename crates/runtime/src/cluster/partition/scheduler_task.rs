@@ -1311,11 +1311,11 @@ mod tests {
         .await;
 
         let status = RuntimeStatus::new();
-        let table_ref = TableReference::parse_str("test_table");
-        status.update_dataset(&table_ref, ComponentStatus::Initializing);
+        // On the scheduler, datasets are NOT pre-registered — the partition
+        // management task registers them once all partitions are assigned.
         assert_eq!(
             status.get_component_status("dataset:test_table"),
-            Some(ComponentStatus::Initializing)
+            None
         );
 
         update_dataset_statuses_from_partitions(&partition_manager, &status).await;
@@ -1328,7 +1328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unassigned_partitions_keeps_dataset_initializing() {
+    async fn test_unassigned_partitions_does_not_register_dataset() {
         let partition_manager = setup_partition_manager(vec![(
             "test_table",
             vec![
@@ -1339,20 +1339,18 @@ mod tests {
         .await;
 
         let status = RuntimeStatus::new();
-        let table_ref = TableReference::parse_str("test_table");
-        status.update_dataset(&table_ref, ComponentStatus::Initializing);
 
         update_dataset_statuses_from_partitions(&partition_manager, &status).await;
 
         assert_eq!(
             status.get_component_status("dataset:test_table"),
-            Some(ComponentStatus::Initializing),
-            "Dataset should remain Initializing when some partitions are unassigned"
+            None,
+            "Dataset should not be registered when some partitions are unassigned"
         );
     }
 
     #[tokio::test]
-    async fn test_all_unassigned_partitions_keeps_initializing() {
+    async fn test_all_unassigned_partitions_does_not_register_dataset() {
         let partition_manager = setup_partition_manager(vec![(
             "test_table",
             vec![
@@ -1364,15 +1362,13 @@ mod tests {
         .await;
 
         let status = RuntimeStatus::new();
-        let table_ref = TableReference::parse_str("test_table");
-        status.update_dataset(&table_ref, ComponentStatus::Initializing);
 
         update_dataset_statuses_from_partitions(&partition_manager, &status).await;
 
         assert_eq!(
             status.get_component_status("dataset:test_table"),
-            Some(ComponentStatus::Initializing),
-            "Dataset should remain Initializing when all partitions are unassigned"
+            None,
+            "Dataset should not be registered when all partitions are unassigned"
         );
     }
 
@@ -1381,8 +1377,6 @@ mod tests {
         let partition_manager = setup_partition_manager(vec![("test_table", vec![])]).await;
 
         let status = RuntimeStatus::new();
-        let table_ref = TableReference::parse_str("test_table");
-        status.update_dataset(&table_ref, ComponentStatus::Initializing);
 
         update_dataset_statuses_from_partitions(&partition_manager, &status).await;
 
@@ -1414,10 +1408,6 @@ mod tests {
         .await;
 
         let status = RuntimeStatus::new();
-        let table_a = TableReference::parse_str("table_a");
-        let table_b = TableReference::parse_str("table_b");
-        status.update_dataset(&table_a, ComponentStatus::Initializing);
-        status.update_dataset(&table_b, ComponentStatus::Initializing);
 
         update_dataset_statuses_from_partitions(&partition_manager, &status).await;
 
@@ -1428,8 +1418,8 @@ mod tests {
         );
         assert_eq!(
             status.get_component_status("dataset:table_b"),
-            Some(ComponentStatus::Initializing),
-            "table_b should remain Initializing (has unassigned partition)"
+            None,
+            "table_b should not be registered (has unassigned partition)"
         );
     }
 
@@ -1439,15 +1429,13 @@ mod tests {
         let partition_manager = PartitionManager::new(store);
 
         let status = RuntimeStatus::new();
-        let table_ref = TableReference::parse_str("some_table");
-        status.update_dataset(&table_ref, ComponentStatus::Initializing);
 
         update_dataset_statuses_from_partitions(&partition_manager, &status).await;
 
-        assert_eq!(
-            status.get_component_status("dataset:some_table"),
-            Some(ComponentStatus::Initializing),
-            "Dataset status should be unchanged when no tables exist in partition manager"
+        // No tables tracked, nothing should be registered
+        assert!(
+            !status.is_ready(),
+            "Status should not be ready when nothing is registered"
         );
     }
 }
