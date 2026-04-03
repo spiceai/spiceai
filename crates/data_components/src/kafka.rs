@@ -325,9 +325,7 @@ impl KafkaConsumer {
         self.consumer
             .seek(topic, partition, offset, std::time::Duration::from_secs(5))
             .context(UnableToRestartTopicSnafu {
-                message: format!(
-                    "Failed to seek partition {partition} to offset {offset:?}"
-                ),
+                message: format!("Failed to seek partition {partition} to offset {offset:?}"),
             })
     }
 

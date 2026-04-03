@@ -600,15 +600,21 @@ async fn check_schema_evolution(
     let msg = match peek_result {
         Ok(Ok(Some(msg))) => msg,
         Ok(Ok(None)) => {
-            tracing::debug!("No Kafka message available for schema evolution check on {dataset_name}");
+            tracing::debug!(
+                "No Kafka message available for schema evolution check on {dataset_name}"
+            );
             return;
         }
         Ok(Err(e)) => {
-            tracing::debug!("Could not peek Kafka message for schema evolution check on {dataset_name}: {e}");
+            tracing::debug!(
+                "Could not peek Kafka message for schema evolution check on {dataset_name}: {e}"
+            );
             return;
         }
         Err(_) => {
-            tracing::debug!("Timed out peeking Kafka message for schema evolution check on {dataset_name}");
+            tracing::debug!(
+                "Timed out peeking Kafka message for schema evolution check on {dataset_name}"
+            );
             return;
         }
     };
@@ -631,8 +637,7 @@ async fn check_schema_evolution(
         return;
     };
 
-    let new_fields_owned: Vec<change_event::Field> =
-        new_fields.into_iter().cloned().collect();
+    let new_fields_owned: Vec<change_event::Field> = new_fields.into_iter().cloned().collect();
 
     if new_fields_owned != metadata.schema_fields {
         tracing::info!(
@@ -642,9 +647,7 @@ async fn check_schema_evolution(
 
         if dataset.is_file_accelerated() {
             if let Err(e) = set_metadata_to_accelerator(dataset, metadata).await {
-                tracing::warn!(
-                    "Failed to persist updated schema metadata for {dataset_name}: {e}"
-                );
+                tracing::warn!("Failed to persist updated schema metadata for {dataset_name}: {e}");
             }
         }
     }

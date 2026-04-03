@@ -268,10 +268,7 @@ mod tests {
     #[test]
     fn field_with_parameters_equality() {
         let mut params = HashMap::new();
-        params.insert(
-            "connect.decimal.precision".to_string(),
-            "38".to_string(),
-        );
+        params.insert("connect.decimal.precision".to_string(), "38".to_string());
         params.insert("scale".to_string(), "9".to_string());
 
         let f1 = Field {
@@ -300,17 +297,11 @@ mod tests {
     #[test]
     fn field_with_different_parameters() {
         let mut params1 = HashMap::new();
-        params1.insert(
-            "connect.decimal.precision".to_string(),
-            "38".to_string(),
-        );
+        params1.insert("connect.decimal.precision".to_string(), "38".to_string());
         params1.insert("scale".to_string(), "9".to_string());
 
         let mut params2 = HashMap::new();
-        params2.insert(
-            "connect.decimal.precision".to_string(),
-            "38".to_string(),
-        );
+        params2.insert("connect.decimal.precision".to_string(), "38".to_string());
         params2.insert("scale".to_string(), "18".to_string());
 
         let f1 = Field {
