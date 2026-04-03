@@ -22,10 +22,10 @@ limitations under the License.
 //!
 //! These tests verify that the cluster infrastructure (mTLS, executor management, scheduler
 //! server) does not interfere with catalog operations, and that DDL/DML flows correctly
-//! through the scheduler's DataFusion context in cluster mode.
+//! through the scheduler's `DataFusion` context in cluster mode.
 //!
 //! Every non-count SELECT also has its `EXPLAIN` plan snapshot-tested to confirm
-//! that query planning succeeds through the scheduler's DataFusion context while
+//! that query planning succeeds through the scheduler's `DataFusion` context while
 //! executors are connected, and to catch regressions if the physical plan changes.
 
 use std::collections::HashMap;
@@ -466,7 +466,7 @@ async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
 /// - Two tables in the same schema can coexist
 /// - Cross-table JOINs produce correct results
 /// - DELETE on one table does not affect the other
-/// - Aggregations over JOINed data are correct
+/// - Aggregations over `JOIN`ed data are correct
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
 async fn test_distributed_cayenne_multi_table_join() -> Result<(), anyhow::Error> {
