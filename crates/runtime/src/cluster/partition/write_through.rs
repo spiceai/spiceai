@@ -471,8 +471,7 @@ async fn route_batch_and_assign_unseen(
     }
 
     // Assign an executor for each new partition value up front.
-    let executor_ids =
-        select_least_loaded_executors(partitions_by_executor, senders, entries.len())?;
+    let executor_ids = select_least_loaded_executors(partitions_by_executor, senders, &entries)?;
 
     // Persist all assignments in a single OCC write.
     let assignments: Vec<(&PartitionValue, &str)> = entries
@@ -712,41 +711,30 @@ fn build_partition_physical_exprs(
         .collect()
 }
 
-/// Selects the least-loaded executor for each of `count` new partition values,
-/// distributing them across executors by incrementally accounting for each assignment.
+/// Selects the executor for each new partition value in `entries`.
+///
+/// For bucket-partitioned entries (single key matching `bucket(N, col)` with
+/// scalar value `k`), the executor is chosen deterministically as the
+/// `(k % N)`'th executor in alphabetical order. This ensures that bucket
+/// assignments are stable and evenly spread across executors regardless of
+/// arrival order.
+///
+/// All other entries fall back to least-loaded assignment, incrementally
+/// accounting for each prior pick.
 fn select_least_loaded_executors(
     partitions_by_executor: &HashMap<String, Vec<Expr>>,
     senders: &HashMap<ExecutorId, Sender<RecordBatch>>,
-    count: usize,
+    entries: &[(
+        Vec<datafusion::common::ScalarValue>,
+        PartitionValue,
+        RecordBatch,
+    )],
 ) -> Result<Vec<ExecutorId>> {
-    if senders.is_empty() {
-        return Err(Error::NoExecutorsAvailable);
-    }
-
-    // Track load counts so each successive pick accounts for prior assignments.
-    let mut load: HashMap<&str, usize> = senders
-        .keys()
-        .map(|id| {
-            (
-                id.as_str(),
-                partitions_by_executor.get(id.as_str()).map_or(0, Vec::len),
-            )
-        })
-        .collect();
-
-    let mut result = Vec::with_capacity(count);
-    for _ in 0..count {
-        let executor_id = load
-            .iter()
-            .min_by_key(|&(_, &count)| count)
-            .map(|(&id, _)| id.to_string())
-            .ok_or(Error::NoExecutorsAvailable)?;
-        *load
-            .get_mut(executor_id.as_str())
-            .ok_or(Error::NoExecutorsAvailable)? += 1;
-        result.push(executor_id);
-    }
-    Ok(result)
+    super::write_assignment::select_least_loaded_executors(
+        partitions_by_executor,
+        senders,
+        entries,
+    )
 }
 
 /// Builds a physical filter expression per executor by OR-ing its partition expressions.
