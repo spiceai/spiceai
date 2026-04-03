@@ -350,13 +350,8 @@ impl DataConnector for Debezium {
                 );
 
                 // Check for schema evolution by peeking at the latest Kafka message
-                let (metadata, schema) = refresh_schema_if_evolved(
-                    metadata,
-                    dataset,
-                    topic,
-                    &self.kafka_config,
-                )
-                .await?;
+                let (metadata, schema) =
+                    refresh_schema_if_evolved(metadata, dataset, topic, &self.kafka_config).await?;
 
                 kafka_consumer.subscribe(topic).boxed().context(
                     super::UnableToGetReadProviderSnafu {
@@ -573,14 +568,13 @@ async fn refresh_schema_if_evolved(
 ) -> super::DataConnectorResult<(DebeziumKafkaMetadata, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
 
-    let cached_schema = debezium::arrow::convert_fields_to_arrow_schema(
-        metadata.schema_fields.iter().collect(),
-    )
-    .boxed()
-    .context(super::UnableToGetReadProviderSnafu {
-        dataconnector: "debezium",
-        connector_component: ConnectorComponent::from(dataset),
-    })?;
+    let cached_schema =
+        debezium::arrow::convert_fields_to_arrow_schema(metadata.schema_fields.iter().collect())
+            .boxed()
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "debezium",
+                connector_component: ConnectorComponent::from(dataset),
+            })?;
 
     // Try to peek at the latest Kafka message for the current schema
     let peek_result = KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
@@ -601,8 +595,7 @@ async fn refresh_schema_if_evolved(
         return Ok((metadata, Arc::new(cached_schema)));
     };
 
-    let fresh_schema = match debezium::arrow::convert_fields_to_arrow_schema(fresh_fields.clone())
-    {
+    let fresh_schema = match debezium::arrow::convert_fields_to_arrow_schema(fresh_fields.clone()) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
@@ -616,9 +609,7 @@ async fn refresh_schema_if_evolved(
         return Ok((metadata, Arc::new(cached_schema)));
     }
 
-    tracing::info!(
-        "Detected schema evolution for dataset {dataset_name}. Updating cached schema."
-    );
+    tracing::info!("Detected schema evolution for dataset {dataset_name}. Updating cached schema.");
 
     let updated_metadata = DebeziumKafkaMetadata {
         consumer_group_id: metadata.consumer_group_id,

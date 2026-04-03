@@ -700,8 +700,8 @@ mod tests {
 
     #[test]
     fn test_append_value_missing_nullable_field_fills_null() {
-        use arrow::array::Array;
         use crate::arrow::struct_builder::StructBuilder;
+        use arrow::array::Array;
 
         // Schema with one required and one nullable field
         let schema = Schema::new(vec![
@@ -714,7 +714,10 @@ mod tests {
         // Message is missing the nullable "name" field
         let value = json!({"id": 42});
         let result = append_value_to_struct_builder(value, &mut builder);
-        assert!(result.is_ok(), "Should succeed when nullable field is missing");
+        assert!(
+            result.is_ok(),
+            "Should succeed when nullable field is missing"
+        );
 
         let struct_array = builder.finish();
         let record_batch: RecordBatch = struct_array.into();
@@ -751,7 +754,10 @@ mod tests {
         // Message is missing the required "status" field
         let value = json!({"id": 42});
         let result = append_value_to_struct_builder(value, &mut builder);
-        assert!(result.is_err(), "Should fail when required field is missing");
+        assert!(
+            result.is_err(),
+            "Should fail when required field is missing"
+        );
     }
 
     #[test]
@@ -776,8 +782,8 @@ mod tests {
 
     #[test]
     fn test_append_value_multiple_missing_nullable_fields() {
-        use arrow::array::Array;
         use crate::arrow::struct_builder::StructBuilder;
+        use arrow::array::Array;
 
         // Schema with multiple nullable fields added via schema evolution
         let schema = Schema::new(vec![
