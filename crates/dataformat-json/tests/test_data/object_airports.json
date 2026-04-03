@@ -1,0 +1,11 @@
+{
+  "airports": [
+    {"code": "ATL", "name": "Hartsfield-Jackson Atlanta International", "city": "Atlanta", "state": "GA", "elevation_ft": 1026},
+    {"code": "LAX", "name": "Los Angeles International", "city": "Los Angeles", "state": "CA", "elevation_ft": 128},
+    {"code": "ORD", "name": "O'Hare International", "city": "Chicago", "state": "IL", "elevation_ft": 680},
+    {"code": "DFW", "name": "Dallas/Fort Worth International", "city": "Dallas-Fort Worth", "state": "TX", "elevation_ft": 607},
+    {"code": "DEN", "name": "Denver International", "city": "Denver", "state": "CO", "elevation_ft": 5431}
+  ],
+  "count": 5,
+  "source": "FAA"
+}
