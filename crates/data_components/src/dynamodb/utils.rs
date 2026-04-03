@@ -104,7 +104,10 @@ pub fn scalar_to_attribute_value(
                 };
                 // i256::Display does not forward fill/width, so convert first.
                 let frac_str = format!("{frac}");
-                format!("{sign}{whole}.{frac_str:0>width$}", width = scale_u32 as usize)
+                format!(
+                    "{sign}{whole}.{frac_str:0>width$}",
+                    width = scale_u32 as usize
+                )
             } else {
                 format!("{v}")
             };

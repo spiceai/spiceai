@@ -99,7 +99,8 @@ async fn run_with_harness<F>(harness: ClusterHarness, f: F) -> Result<(), anyhow
 where
     F: for<'a> FnOnce(
         &'a ClusterHarness,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + 'a>>,
+    )
+        -> Pin<Box<dyn std::future::Future<Output = Result<(), anyhow::Error>> + 'a>>,
 {
     let result = AssertUnwindSafe(f(&harness)).catch_unwind().await;
     harness.shutdown().await;
@@ -495,123 +496,125 @@ async fn test_distributed_cayenne_multi_table_join() -> Result<(), anyhow::Error
                 .start()
                 .await?;
 
-            run_with_harness(harness, |harness| Box::pin(async move {
-                harness.wait_for_executors(Duration::from_secs(15)).await?;
+            run_with_harness(harness, |harness| {
+                Box::pin(async move {
+                    harness.wait_for_executors(Duration::from_secs(15)).await?;
 
-                // Create schema and two related tables.
-                harness.query("CREATE SCHEMA jcat.store").await?;
+                    // Create schema and two related tables.
+                    harness.query("CREATE SCHEMA jcat.store").await?;
 
-                harness
-                    .query(
-                        "CREATE TABLE jcat.store.products (
+                    harness
+                        .query(
+                            "CREATE TABLE jcat.store.products (
                             product_id BIGINT NOT NULL,
                             name VARCHAR NOT NULL,
                             price DOUBLE NOT NULL
                         ) PARTITION BY product_id",
-                    )
-                    .await?;
+                        )
+                        .await?;
 
-                harness
-                    .query(
-                        "CREATE TABLE jcat.store.orders (
+                    harness
+                        .query(
+                            "CREATE TABLE jcat.store.orders (
                             order_id BIGINT NOT NULL,
                             product_id BIGINT NOT NULL,
                             quantity BIGINT NOT NULL
                         ) PARTITION BY order_id",
-                    )
-                    .await?;
+                        )
+                        .await?;
 
-                // Populate both tables.
-                harness
-                    .query(
-                        "INSERT INTO jcat.store.products VALUES
+                    // Populate both tables.
+                    harness
+                        .query(
+                            "INSERT INTO jcat.store.products VALUES
                             (1, 'Widget',  9.99),
                             (2, 'Gadget', 19.99),
                             (3, 'Gizmo',  14.50)",
-                    )
-                    .await?;
+                        )
+                        .await?;
 
-                harness
-                    .query(
-                        "INSERT INTO jcat.store.orders VALUES
+                    harness
+                        .query(
+                            "INSERT INTO jcat.store.orders VALUES
                             (100, 1, 5),
                             (101, 2, 2),
                             (102, 1, 3),
                             (103, 3, 1)",
-                    )
-                    .await?;
+                        )
+                        .await?;
 
-                // Validate independent counts.
-                let product_count = scalar_i64(
-                    &harness
-                        .query("SELECT COUNT(*) FROM jcat.store.products")
-                        .await?,
-                )?;
-                assert_eq!(product_count, 3);
+                    // Validate independent counts.
+                    let product_count = scalar_i64(
+                        &harness
+                            .query("SELECT COUNT(*) FROM jcat.store.products")
+                            .await?,
+                    )?;
+                    assert_eq!(product_count, 3);
 
-                let order_count = scalar_i64(
-                    &harness
-                        .query("SELECT COUNT(*) FROM jcat.store.orders")
-                        .await?,
-                )?;
-                assert_eq!(order_count, 4);
+                    let order_count = scalar_i64(
+                        &harness
+                            .query("SELECT COUNT(*) FROM jcat.store.orders")
+                            .await?,
+                    )?;
+                    assert_eq!(order_count, 4);
 
-                // Cross-table JOIN with aggregation.
-                let join_sql = "SELECT p.name, SUM(o.quantity) as total_qty \
+                    // Cross-table JOIN with aggregation.
+                    let join_sql = "SELECT p.name, SUM(o.quantity) as total_qty \
                                 FROM jcat.store.orders o \
                                 JOIN jcat.store.products p ON o.product_id = p.product_id \
                                 GROUP BY p.name \
                                 ORDER BY p.name";
-                let batches = harness.query(join_sql).await?;
-                assert_batches_eq!(
-                    &[
-                        "+--------+-----------+",
-                        "| name   | total_qty |",
-                        "+--------+-----------+",
-                        "| Gadget | 2         |",
-                        "| Gizmo  | 1         |",
-                        "| Widget | 8         |",
-                        "+--------+-----------+",
-                    ],
-                    &batches
-                );
-                let plan = explain_to_string(&harness.explain(join_sql).await?);
-                insta::assert_snapshot!("join_aggregation", plan);
+                    let batches = harness.query(join_sql).await?;
+                    assert_batches_eq!(
+                        &[
+                            "+--------+-----------+",
+                            "| name   | total_qty |",
+                            "+--------+-----------+",
+                            "| Gadget | 2         |",
+                            "| Gizmo  | 1         |",
+                            "| Widget | 8         |",
+                            "+--------+-----------+",
+                        ],
+                        &batches
+                    );
+                    let plan = explain_to_string(&harness.explain(join_sql).await?);
+                    insta::assert_snapshot!("join_aggregation", plan);
 
-                // Delete from orders and verify JOIN still correct.
-                harness
-                    .query("DELETE FROM jcat.store.orders WHERE order_id = 100")
-                    .await?;
+                    // Delete from orders and verify JOIN still correct.
+                    harness
+                        .query("DELETE FROM jcat.store.orders WHERE order_id = 100")
+                        .await?;
 
-                let batches = harness.query(join_sql).await?;
-                assert_batches_eq!(
-                    &[
-                        "+--------+-----------+",
-                        "| name   | total_qty |",
-                        "+--------+-----------+",
-                        "| Gadget | 2         |",
-                        "| Gizmo  | 1         |",
-                        "| Widget | 3         |",
-                        "+--------+-----------+",
-                    ],
-                    &batches
-                );
-                let plan = explain_to_string(&harness.explain(join_sql).await?);
-                insta::assert_snapshot!("join_aggregation_after_delete", plan);
+                    let batches = harness.query(join_sql).await?;
+                    assert_batches_eq!(
+                        &[
+                            "+--------+-----------+",
+                            "| name   | total_qty |",
+                            "+--------+-----------+",
+                            "| Gadget | 2         |",
+                            "| Gizmo  | 1         |",
+                            "| Widget | 3         |",
+                            "+--------+-----------+",
+                        ],
+                        &batches
+                    );
+                    let plan = explain_to_string(&harness.explain(join_sql).await?);
+                    insta::assert_snapshot!("join_aggregation_after_delete", plan);
 
-                // Products table should be unaffected by order deletion.
-                let product_count = scalar_i64(
-                    &harness
-                        .query("SELECT COUNT(*) FROM jcat.store.products")
-                        .await?,
-                )?;
-                assert_eq!(
-                    product_count, 3,
-                    "products should be unaffected by order deletion"
-                );
+                    // Products table should be unaffected by order deletion.
+                    let product_count = scalar_i64(
+                        &harness
+                            .query("SELECT COUNT(*) FROM jcat.store.products")
+                            .await?,
+                    )?;
+                    assert_eq!(
+                        product_count, 3,
+                        "products should be unaffected by order deletion"
+                    );
 
-                Ok(())
-            }))
+                    Ok(())
+                })
+            })
             .await
         })
         .await
@@ -788,138 +791,141 @@ async fn test_distributed_cayenne_primary_key_upsert() -> Result<(), anyhow::Err
                 .start()
                 .await?;
 
-            run_with_harness(harness, |harness| Box::pin(async move {
-                harness.wait_for_executors(Duration::from_secs(15)).await?;
+            run_with_harness(harness, |harness| {
+                Box::pin(async move {
+                    harness.wait_for_executors(Duration::from_secs(15)).await?;
 
-                harness.query("CREATE SCHEMA pkcat.myschema").await?;
+                    harness.query("CREATE SCHEMA pkcat.myschema").await?;
 
-                harness
-                    .query(
-                        "CREATE TABLE pkcat.myschema.users (
+                    harness
+                        .query(
+                            "CREATE TABLE pkcat.myschema.users (
                             id BIGINT NOT NULL,
                             name VARCHAR NOT NULL,
                             email VARCHAR,
                             PRIMARY KEY (id)
                         ) PARTITION BY id",
-                    )
-                    .await?;
+                        )
+                        .await?;
 
-                // Initial insert.
-                harness
-                    .query(
-                        "INSERT INTO pkcat.myschema.users VALUES
+                    // Initial insert.
+                    harness
+                        .query(
+                            "INSERT INTO pkcat.myschema.users VALUES
                             (1, 'Alice',   'alice@example.com'),
                             (2, 'Bob',     'bob@example.com'),
                             (3, 'Charlie', 'charlie@example.com')",
-                    )
-                    .await?;
+                        )
+                        .await?;
 
-                let count = scalar_i64(
-                    &harness
-                        .query("SELECT COUNT(*) FROM pkcat.myschema.users")
-                        .await?,
-                )?;
-                assert_eq!(count, 3, "expected 3 rows after initial insert");
+                    let count = scalar_i64(
+                        &harness
+                            .query("SELECT COUNT(*) FROM pkcat.myschema.users")
+                            .await?,
+                    )?;
+                    assert_eq!(count, 3, "expected 3 rows after initial insert");
 
-                // Insert with conflicting PKs — should upsert.
-                harness
-                    .query(
-                        "INSERT INTO pkcat.myschema.users VALUES
+                    // Insert with conflicting PKs — should upsert.
+                    harness
+                        .query(
+                            "INSERT INTO pkcat.myschema.users VALUES
                             (2, 'Bob Updated', 'bob_new@example.com'),
                             (4, 'Diana',       'diana@example.com')",
-                    )
-                    .await?;
+                        )
+                        .await?;
 
-                // Bob replaced, Diana added → 4 rows.
-                let count = scalar_i64(
-                    &harness
-                        .query("SELECT COUNT(*) FROM pkcat.myschema.users")
-                        .await?,
-                )?;
-                assert_eq!(count, 4, "expected 4 rows after upsert");
+                    // Bob replaced, Diana added → 4 rows.
+                    let count = scalar_i64(
+                        &harness
+                            .query("SELECT COUNT(*) FROM pkcat.myschema.users")
+                            .await?,
+                    )?;
+                    assert_eq!(count, 4, "expected 4 rows after upsert");
 
-                let select_pk = "SELECT id, name, email FROM pkcat.myschema.users ORDER BY id";
-                let batches = harness.query(select_pk).await?;
-                assert_batches_eq!(
-                    &[
-                        "+----+-------------+---------------------+",
-                        "| id | name        | email               |",
-                        "+----+-------------+---------------------+",
-                        "| 1  | Alice       | alice@example.com   |",
-                        "| 2  | Bob Updated | bob_new@example.com |",
-                        "| 3  | Charlie     | charlie@example.com |",
-                        "| 4  | Diana       | diana@example.com   |",
-                        "+----+-------------+---------------------+",
-                    ],
-                    &batches
-                );
-                let plan = explain_to_string(&harness.explain(select_pk).await?);
-                insta::assert_snapshot!("pk_select_after_upsert", plan);
+                    let select_pk = "SELECT id, name, email FROM pkcat.myschema.users ORDER BY id";
+                    let batches = harness.query(select_pk).await?;
+                    assert_batches_eq!(
+                        &[
+                            "+----+-------------+---------------------+",
+                            "| id | name        | email               |",
+                            "+----+-------------+---------------------+",
+                            "| 1  | Alice       | alice@example.com   |",
+                            "| 2  | Bob Updated | bob_new@example.com |",
+                            "| 3  | Charlie     | charlie@example.com |",
+                            "| 4  | Diana       | diana@example.com   |",
+                            "+----+-------------+---------------------+",
+                        ],
+                        &batches
+                    );
+                    let plan = explain_to_string(&harness.explain(select_pk).await?);
+                    insta::assert_snapshot!("pk_select_after_upsert", plan);
 
-                // Pure upsert — all conflicting PKs, no new rows.
-                harness
-                    .query(
-                        "INSERT INTO pkcat.myschema.users VALUES
+                    // Pure upsert — all conflicting PKs, no new rows.
+                    harness
+                        .query(
+                            "INSERT INTO pkcat.myschema.users VALUES
                             (1, 'Alice V2',   'alice_v2@example.com'),
                             (3, 'Charlie V2', 'charlie_v2@example.com')",
-                    )
-                    .await?;
+                        )
+                        .await?;
 
-                let count = scalar_i64(
-                    &harness
-                        .query("SELECT COUNT(*) FROM pkcat.myschema.users")
-                        .await?,
-                )?;
-                assert_eq!(count, 4, "row count should remain 4 after pure upsert");
+                    let count = scalar_i64(
+                        &harness
+                            .query("SELECT COUNT(*) FROM pkcat.myschema.users")
+                            .await?,
+                    )?;
+                    assert_eq!(count, 4, "row count should remain 4 after pure upsert");
 
-                let batches = harness.query(select_pk).await?;
-                assert_batches_eq!(
-                    &[
-                        "+----+-------------+------------------------+",
-                        "| id | name        | email                  |",
-                        "+----+-------------+------------------------+",
-                        "| 1  | Alice V2    | alice_v2@example.com   |",
-                        "| 2  | Bob Updated | bob_new@example.com    |",
-                        "| 3  | Charlie V2  | charlie_v2@example.com |",
-                        "| 4  | Diana       | diana@example.com      |",
-                        "+----+-------------+------------------------+",
-                    ],
-                    &batches
-                );
-                let plan = explain_to_string(&harness.explain(select_pk).await?);
-                insta::assert_snapshot!("pk_select_after_pure_upsert", plan);
+                    let batches = harness.query(select_pk).await?;
+                    assert_batches_eq!(
+                        &[
+                            "+----+-------------+------------------------+",
+                            "| id | name        | email                  |",
+                            "+----+-------------+------------------------+",
+                            "| 1  | Alice V2    | alice_v2@example.com   |",
+                            "| 2  | Bob Updated | bob_new@example.com    |",
+                            "| 3  | Charlie V2  | charlie_v2@example.com |",
+                            "| 4  | Diana       | diana@example.com      |",
+                            "+----+-------------+------------------------+",
+                        ],
+                        &batches
+                    );
+                    let plan = explain_to_string(&harness.explain(select_pk).await?);
+                    insta::assert_snapshot!("pk_select_after_pure_upsert", plan);
 
-                // DELETE still works on PK table.
-                harness
-                    .query("DELETE FROM pkcat.myschema.users WHERE id = 2")
-                    .await?;
+                    // DELETE still works on PK table.
+                    harness
+                        .query("DELETE FROM pkcat.myschema.users WHERE id = 2")
+                        .await?;
 
-                let count = scalar_i64(
-                    &harness
-                        .query("SELECT COUNT(*) FROM pkcat.myschema.users")
-                        .await?,
-                )?;
-                assert_eq!(count, 3, "expected 3 rows after delete");
+                    let count = scalar_i64(
+                        &harness
+                            .query("SELECT COUNT(*) FROM pkcat.myschema.users")
+                            .await?,
+                    )?;
+                    assert_eq!(count, 3, "expected 3 rows after delete");
 
-                let select_pk_after_del = "SELECT id, name FROM pkcat.myschema.users ORDER BY id";
-                let batches = harness.query(select_pk_after_del).await?;
-                assert_batches_eq!(
-                    &[
-                        "+----+------------+",
-                        "| id | name       |",
-                        "+----+------------+",
-                        "| 1  | Alice V2   |",
-                        "| 3  | Charlie V2 |",
-                        "| 4  | Diana      |",
-                        "+----+------------+",
-                    ],
-                    &batches
-                );
-                let plan = explain_to_string(&harness.explain(select_pk_after_del).await?);
-                insta::assert_snapshot!("pk_select_after_delete", plan);
+                    let select_pk_after_del =
+                        "SELECT id, name FROM pkcat.myschema.users ORDER BY id";
+                    let batches = harness.query(select_pk_after_del).await?;
+                    assert_batches_eq!(
+                        &[
+                            "+----+------------+",
+                            "| id | name       |",
+                            "+----+------------+",
+                            "| 1  | Alice V2   |",
+                            "| 3  | Charlie V2 |",
+                            "| 4  | Diana      |",
+                            "+----+------------+",
+                        ],
+                        &batches
+                    );
+                    let plan = explain_to_string(&harness.explain(select_pk_after_del).await?);
+                    insta::assert_snapshot!("pk_select_after_delete", plan);
 
-                Ok(())
-            }))
+                    Ok(())
+                })
+            })
             .await
         })
         .await
@@ -965,103 +971,106 @@ async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(),
                 .start()
                 .await?;
 
-            run_with_harness(harness, |harness| Box::pin(async move {
-                harness.wait_for_executors(Duration::from_secs(15)).await?;
+            run_with_harness(harness, |harness| {
+                Box::pin(async move {
+                    harness.wait_for_executors(Duration::from_secs(15)).await?;
 
-                harness.query("CREATE SCHEMA ncat.ns").await?;
+                    harness.query("CREATE SCHEMA ncat.ns").await?;
 
-                harness
-                    .query(
-                        "CREATE TABLE ncat.ns.metrics (
+                    harness
+                        .query(
+                            "CREATE TABLE ncat.ns.metrics (
                             id BIGINT NOT NULL,
                             label VARCHAR,
                             value BIGINT
                         ) PARTITION BY id",
-                    )
-                    .await?;
+                        )
+                        .await?;
 
-                harness
-                    .query(
-                        "INSERT INTO ncat.ns.metrics VALUES
+                    harness
+                        .query(
+                            "INSERT INTO ncat.ns.metrics VALUES
                             (1, 'alpha',  10),
                             (2, 'beta',   20),
                             (3, NULL,     30),
                             (4, 'delta',  NULL),
                             (5, NULL,     NULL)",
-                    )
-                    .await?;
+                        )
+                        .await?;
 
-                // COUNT(*) counts all rows; COUNT(label) and COUNT(value) exclude NULLs.
-                let count_star = scalar_i64(
-                    &harness
-                        .query("SELECT COUNT(*) FROM ncat.ns.metrics")
-                        .await?,
-                )?;
-                assert_eq!(count_star, 5, "COUNT(*) should be 5");
+                    // COUNT(*) counts all rows; COUNT(label) and COUNT(value) exclude NULLs.
+                    let count_star = scalar_i64(
+                        &harness
+                            .query("SELECT COUNT(*) FROM ncat.ns.metrics")
+                            .await?,
+                    )?;
+                    assert_eq!(count_star, 5, "COUNT(*) should be 5");
 
-                let count_label = scalar_i64(
-                    &harness
-                        .query("SELECT COUNT(label) FROM ncat.ns.metrics")
-                        .await?,
-                )?;
-                assert_eq!(
-                    count_label, 3,
-                    "COUNT(label) should be 3 (ids 3 and 5 have NULL label)"
-                );
+                    let count_label = scalar_i64(
+                        &harness
+                            .query("SELECT COUNT(label) FROM ncat.ns.metrics")
+                            .await?,
+                    )?;
+                    assert_eq!(
+                        count_label, 3,
+                        "COUNT(label) should be 3 (ids 3 and 5 have NULL label)"
+                    );
 
-                let count_value = scalar_i64(
-                    &harness
-                        .query("SELECT COUNT(value) FROM ncat.ns.metrics")
-                        .await?,
-                )?;
-                assert_eq!(
-                    count_value, 3,
-                    "COUNT(value) should be 3 (ids 4 and 5 have NULL value)"
-                );
+                    let count_value = scalar_i64(
+                        &harness
+                            .query("SELECT COUNT(value) FROM ncat.ns.metrics")
+                            .await?,
+                    )?;
+                    assert_eq!(
+                        count_value, 3,
+                        "COUNT(value) should be 3 (ids 4 and 5 have NULL value)"
+                    );
 
-                // SUM, MIN, MAX should skip NULLs.
-                let sum_sql = "SELECT SUM(value) FROM ncat.ns.metrics";
-                let sum_value = scalar_i64(&harness.query(sum_sql).await?)?;
-                assert_eq!(sum_value, 60, "SUM(value) should be 10+20+30 = 60");
-                let plan = explain_to_string(&harness.explain(sum_sql).await?);
-                insta::assert_snapshot!("null_agg_sum", plan);
+                    // SUM, MIN, MAX should skip NULLs.
+                    let sum_sql = "SELECT SUM(value) FROM ncat.ns.metrics";
+                    let sum_value = scalar_i64(&harness.query(sum_sql).await?)?;
+                    assert_eq!(sum_value, 60, "SUM(value) should be 10+20+30 = 60");
+                    let plan = explain_to_string(&harness.explain(sum_sql).await?);
+                    insta::assert_snapshot!("null_agg_sum", plan);
 
-                let min_sql = "SELECT MIN(value) FROM ncat.ns.metrics";
-                let min_value = scalar_i64(&harness.query(min_sql).await?)?;
-                assert_eq!(min_value, 10, "MIN(value) should be 10");
-                let plan = explain_to_string(&harness.explain(min_sql).await?);
-                insta::assert_snapshot!("null_agg_min", plan);
+                    let min_sql = "SELECT MIN(value) FROM ncat.ns.metrics";
+                    let min_value = scalar_i64(&harness.query(min_sql).await?)?;
+                    assert_eq!(min_value, 10, "MIN(value) should be 10");
+                    let plan = explain_to_string(&harness.explain(min_sql).await?);
+                    insta::assert_snapshot!("null_agg_min", plan);
 
-                let max_sql = "SELECT MAX(value) FROM ncat.ns.metrics";
-                let max_value = scalar_i64(&harness.query(max_sql).await?)?;
-                assert_eq!(max_value, 30, "MAX(value) should be 30");
-                let plan = explain_to_string(&harness.explain(max_sql).await?);
-                insta::assert_snapshot!("null_agg_max", plan);
+                    let max_sql = "SELECT MAX(value) FROM ncat.ns.metrics";
+                    let max_value = scalar_i64(&harness.query(max_sql).await?)?;
+                    assert_eq!(max_value, 30, "MAX(value) should be 30");
+                    let plan = explain_to_string(&harness.explain(max_sql).await?);
+                    insta::assert_snapshot!("null_agg_max", plan);
 
-                // WHERE IS NULL / IS NOT NULL.
-                let select_null = "SELECT id FROM ncat.ns.metrics WHERE label IS NULL ORDER BY id";
-                let batches = harness.query(select_null).await?;
-                assert_batches_eq!(
-                    &["+----+", "| id |", "+----+", "| 3  |", "| 5  |", "+----+",],
-                    &batches
-                );
-                let plan = explain_to_string(&harness.explain(select_null).await?);
-                insta::assert_snapshot!("null_filter_is_null", plan);
+                    // WHERE IS NULL / IS NOT NULL.
+                    let select_null =
+                        "SELECT id FROM ncat.ns.metrics WHERE label IS NULL ORDER BY id";
+                    let batches = harness.query(select_null).await?;
+                    assert_batches_eq!(
+                        &["+----+", "| id |", "+----+", "| 3  |", "| 5  |", "+----+",],
+                        &batches
+                    );
+                    let plan = explain_to_string(&harness.explain(select_null).await?);
+                    insta::assert_snapshot!("null_filter_is_null", plan);
 
-                let select_not_null =
-                    "SELECT id FROM ncat.ns.metrics WHERE value IS NOT NULL ORDER BY id";
-                let batches = harness.query(select_not_null).await?;
-                assert_batches_eq!(
-                    &[
-                        "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 3  |", "+----+",
-                    ],
-                    &batches
-                );
-                let plan = explain_to_string(&harness.explain(select_not_null).await?);
-                insta::assert_snapshot!("null_filter_is_not_null", plan);
+                    let select_not_null =
+                        "SELECT id FROM ncat.ns.metrics WHERE value IS NOT NULL ORDER BY id";
+                    let batches = harness.query(select_not_null).await?;
+                    assert_batches_eq!(
+                        &[
+                            "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 3  |", "+----+",
+                        ],
+                        &batches
+                    );
+                    let plan = explain_to_string(&harness.explain(select_not_null).await?);
+                    insta::assert_snapshot!("null_filter_is_not_null", plan);
 
-                Ok(())
-            }))
+                    Ok(())
+                })
+            })
             .await
         })
         .await
