@@ -671,9 +671,9 @@ fn infer_json_schema_for_format(
         // ValueIter cannot parse. serde_json::from_slice rejects input with
         // trailing non-whitespace content, so NDJSON files will fail here and
         // fall through to ValueIter.
-        if matches!(format, Format::Auto | Format::Json) {
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(buf) {
-                if value.is_object() {
+        if matches!(format, Format::Auto | Format::Json)
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(buf)
+                && value.is_object() {
                     take_while();
                     return Ok(infer_json_schema_from_iterator(std::iter::once(Ok::<
                         _,
@@ -682,8 +682,6 @@ fn infer_json_schema_for_format(
                         value
                     )))?);
                 }
-            }
-        }
 
         // NDJSON: use line-based ValueIter
         let mut reader = BufReader::new(std::io::Cursor::new(buf));
