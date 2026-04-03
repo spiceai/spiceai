@@ -229,13 +229,13 @@ impl DeltaTable {
 
         let arrow_schema = Self::get_logical_schema(&snapshot);
 
-        let physical_schema_mapping = if column_mapping_mode != ColumnMappingMode::None {
+        let physical_schema_mapping = if column_mapping_mode == ColumnMappingMode::None {
+            None
+        } else {
             Some(build_physical_schema_mapping(
                 &delta_schema,
                 column_mapping_mode,
             ))
-        } else {
-            None
         };
 
         Ok(Self {
@@ -381,7 +381,7 @@ fn build_physical_schema_mapping(
 
     for field in delta_schema.fields() {
         let physical_name = field.physical_name(column_mapping_mode).to_string();
-        let logical_name = field.name().to_string();
+        let logical_name = field.name().clone();
         physical_to_logical.insert(physical_name.clone(), logical_name.clone());
         logical_to_physical.insert(logical_name, physical_name.clone());
         fields.push(Field::new(
@@ -407,7 +407,7 @@ struct PhysicalSchemaMapping {
     logical_to_physical: HashMap<String, String>,
 }
 
-/// Rewrites column references in a DataFusion [`Expr`] from logical to physical names.
+/// Rewrites column references in a `DataFusion` [`Expr`] from logical to physical names.
 ///
 /// This is needed so that predicates pushed down to [`ParquetExec`] reference the physical
 /// column names actually present in the parquet files.
@@ -417,15 +417,15 @@ fn rewrite_column_names(
 ) -> Result<Expr, DataFusionError> {
     Ok(expr
         .transform(|e| {
-            if let Expr::Column(col) = &e {
-                if let Some(physical_name) = logical_to_physical.get(col.name()) {
-                    return Ok(datafusion::common::tree_node::Transformed::yes(
-                        Expr::Column(datafusion::common::Column::new(
-                            col.relation.clone(),
-                            physical_name,
-                        )),
-                    ));
-                }
+            if let Expr::Column(col) = &e
+                && let Some(physical_name) = logical_to_physical.get(col.name())
+            {
+                return Ok(datafusion::common::tree_node::Transformed::yes(
+                    Expr::Column(datafusion::common::Column::new(
+                        col.relation.clone(),
+                        physical_name,
+                    )),
+                ));
             }
             Ok(datafusion::common::tree_node::Transformed::no(e))
         })?
@@ -676,8 +676,7 @@ impl TableProvider for DeltaTable {
                     // Translate to logical name for schema lookup.
                     let logical_key = physical_to_logical
                         .and_then(|m| m.get(k))
-                        .map(String::as_str)
-                        .unwrap_or(k);
+                        .map_or(k.as_str(), String::as_str);
                     schema.field_with_name(logical_key).ok().cloned()
                 })
             })
@@ -695,8 +694,7 @@ impl TableProvider for DeltaTable {
                         // With column mapping, k is a physical name; translate before comparing.
                         let logical_key = physical_to_logical
                             .and_then(|m| m.get(k.as_str()))
-                            .map(String::as_str)
-                            .unwrap_or(k);
+                            .map_or(k.as_str(), String::as_str);
                         logical_key == field.name()
                     }) {
                         ScalarValue::try_from_string(value.clone(), field.data_type())
