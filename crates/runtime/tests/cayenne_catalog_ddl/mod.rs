@@ -1714,3 +1714,117 @@ async fn cayenne_catalog_merge_composite_key_no_cross_product() -> Result<(), St
         })
         .await
 }
+
+// =============================================================================
+// Test: MERGE INTO — duplicate source keys must error without losing target rows
+// =============================================================================
+
+#[tokio::test]
+async fn cayenne_catalog_merge_duplicate_source_keys_rejected() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            let catalog = make_cayenne_catalog(
+                "cat_dupkey",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let app = AppBuilder::new("cayenne_merge_dup_key")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
+                .with_runtime_config(Config::default().with_caching_disabled())
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err("Timeout waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check_with_timeout(&rt, Duration::from_secs(30)).await;
+
+            exec(&rt, "CREATE SCHEMA cat_dupkey.s").await?;
+
+            exec(
+                &rt,
+                "CREATE TABLE cat_dupkey.s.target (
+                    id BIGINT NOT NULL,
+                    val BIGINT NOT NULL
+                ) PARTITION BY id",
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "CREATE TABLE cat_dupkey.s.source (
+                    id BIGINT NOT NULL,
+                    val BIGINT NOT NULL
+                ) PARTITION BY id",
+            )
+            .await?;
+
+            // Insert one row into target.
+            exec(&rt, "INSERT INTO cat_dupkey.s.target VALUES (1, 100)").await?;
+
+            // Insert TWO rows with the same key into source — this is the
+            // duplicate key scenario that must not cause data loss.
+            exec(
+                &rt,
+                "INSERT INTO cat_dupkey.s.source VALUES (1, 200), (1, 300)",
+            )
+            .await?;
+
+            // MERGE should error because source has duplicate keys for the
+            // matched target row.
+            let merge_result = run_query(
+                &rt,
+                "MERGE INTO cat_dupkey.s.target AS t
+                 USING cat_dupkey.s.source AS s
+                 ON t.id = s.id
+                 WHEN MATCHED THEN UPDATE SET val = s.val",
+            )
+            .await;
+            assert!(
+                merge_result.is_err(),
+                "MERGE with duplicate source keys should fail, got: {merge_result:?}"
+            );
+            let err_msg = merge_result.unwrap_err();
+            assert!(
+                err_msg.contains("duplicate"),
+                "Error should mention duplicate keys, got: {err_msg}"
+            );
+
+            // Verify the target table is UNCHANGED — the row must not be lost.
+            let count = query_scalar_i64(&rt, "SELECT COUNT(*) FROM cat_dupkey.s.target").await?;
+            assert_eq!(count, 1, "Target must still have 1 row after failed MERGE");
+
+            let batches = run_query(&rt, "SELECT id, val FROM cat_dupkey.s.target").await?;
+            assert_batches_eq!(
+                [
+                    "+----+-----+",
+                    "| id | val |",
+                    "+----+-----+",
+                    "| 1  | 100 |",
+                    "+----+-----+",
+                ],
+                &batches
+            );
+
+            Ok(())
+        })
+        .await
+}
