@@ -131,6 +131,7 @@ jobs:
           name: ai-integration-test-archive
           path: ./integration.tar.zst
           retention-days: 1
+          retention-days: 1
 
       - name: Kill spiceio
         if: always() && steps.setup-spiceio.outputs.pid != ''
