@@ -1908,6 +1908,19 @@ impl DataFusion {
         dataset_name: &TableReference,
         overrides: Option<RefreshOverrides>,
     ) -> Result<Option<Arc<Notify>>> {
+        // If we're a scheduler with an executor registry, forward refresh to executors
+        // instead of trying to refresh locally (the scheduler doesn't run refresh workers).
+        if matches!(
+            self.cluster_config.effective_role(),
+            Some(crate::config::ClusterRole::Scheduler)
+        ) {
+            if let Some(executor_registry) = &self.executor_registry {
+                return self
+                    .forward_refresh_to_executors(executor_registry, dataset_name, &overrides)
+                    .await;
+            }
+        }
+
         let table = self
             .get_accelerated_table_provider(dataset_name.to_string().as_str())
             .await?;
@@ -1925,6 +1938,74 @@ impl DataFusion {
             table_name: dataset_name.to_string(),
         }
         .fail()?
+    }
+
+    /// Forwards a dataset refresh command to all connected executors via the control stream.
+    /// Returns `Ok(None)` because the scheduler does not have a local notifier for executor refreshes.
+    async fn forward_refresh_to_executors(
+        &self,
+        executor_registry: &ExecutorRegistry,
+        dataset_name: &TableReference,
+        overrides: &Option<RefreshOverrides>,
+    ) -> Result<Option<Arc<Notify>>> {
+        let overrides_json = match overrides {
+            Some(o) => {
+                Some(
+                    serde_json::to_string(o).map_err(|_| Error::UnableToTriggerRefresh {
+                        dataset_name: dataset_name.to_string(),
+                        source: crate::accelerated_table::Error::FailedToTriggerRefresh {
+                            source: tokio::sync::mpsc::error::SendError(None),
+                        },
+                    })?,
+                )
+            }
+            None => None,
+        };
+
+        let command = runtime_proto::SchedulerControlMessage {
+            message: Some(
+                runtime_proto::scheduler_control_message::Message::RefreshDataset(
+                    runtime_proto::RefreshDatasetCommand {
+                        dataset_name: dataset_name.to_string(),
+                        overrides_json,
+                    },
+                ),
+            ),
+        };
+
+        let executor_ids = executor_registry.connected_executors().await;
+        if executor_ids.is_empty() {
+            tracing::warn!(
+                "No executors connected to forward refresh for dataset '{dataset_name}'"
+            );
+            return Ok(None);
+        }
+
+        let mut failures = Vec::new();
+        for executor_id in &executor_ids {
+            if let Err(e) = executor_registry
+                .send_command(executor_id, command.clone())
+                .await
+            {
+                tracing::warn!("Failed to send refresh command to executor {executor_id}: {e}");
+                failures.push(executor_id.clone());
+            }
+        }
+
+        if failures.is_empty() {
+            tracing::info!(
+                "Forwarded refresh for dataset '{dataset_name}' to {} executor(s)",
+                executor_ids.len()
+            );
+        } else {
+            tracing::warn!(
+                "Refresh for '{dataset_name}' failed for {}/{} executor(s)",
+                failures.len(),
+                executor_ids.len()
+            );
+        }
+
+        Ok(None)
     }
 
     pub async fn update_refresh_sql(

@@ -761,14 +761,23 @@ impl Builder {
 
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
 
-        let refresh_handle = if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
-            // Accelerated tables aren't accelerated on scheduler. Immediately ready.
-            self.runtime_status
-                .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
-            None
-        } else {
-            refresher.start(acceleration_refresh_mode).await?
-        };
+        let (refresh_handle, refresh_trigger) =
+            if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
+                // Accelerated tables aren't accelerated on scheduler. Immediately ready.
+                // Set refresh_trigger to None because the receiver will be dropped
+                // (refresher.start() is not called), making the channel dead.
+                self.runtime_status
+                    .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
+                // Notify immediately so schedule creation doesn't block waiting for
+                // a refresh that will never happen locally on the scheduler.
+                on_complete_notification.notify_waiters();
+                (None, None)
+            } else {
+                (
+                    refresher.start(acceleration_refresh_mode).await?,
+                    refresh_trigger,
+                )
+            };
         let refresher = Arc::new(refresher);
 
         let mut handlers = vec![];
