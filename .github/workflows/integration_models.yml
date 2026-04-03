@@ -85,12 +85,9 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Set spiceio log path
-        run: echo "SPICEIO_LOG_FILE=/tmp/spiceio-models-build-$$.log" >> "$GITHUB_ENV"
-
       - name: Set up spiceio
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@8c7781c6707cd60f1a18acb197168bebc9338532 # v0.4.3
+        uses: spiceai/spiceio/.github/actions/setup@07f50ad2b40d272a857ca2483712d8b0ade6480b # v0.5.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -144,7 +141,7 @@ jobs:
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: spiceio-models-build-logs
-          path: ${{ env.SPICEIO_LOG_FILE }}
+          path: ${{ runner.temp }}/spiceio.log
           if-no-files-found: ignore
 
   test-models:
@@ -398,12 +395,9 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Set spiceio log path
-        run: echo "SPICEIO_LOG_FILE=/tmp/spiceio-models-build-extended-$$.log" >> "$GITHUB_ENV"
-
       - name: Set up spiceio
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@8c7781c6707cd60f1a18acb197168bebc9338532 # v0.4.3
+        uses: spiceai/spiceio/.github/actions/setup@07f50ad2b40d272a857ca2483712d8b0ade6480b # v0.5.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -454,5 +448,5 @@ jobs:
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: spiceio-models-build-extended-logs
-          path: ${{ env.SPICEIO_LOG_FILE }}
+          path: ${{ runner.temp }}/spiceio.log
           if-no-files-found: ignore

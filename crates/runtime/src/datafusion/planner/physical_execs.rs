@@ -264,7 +264,7 @@ fn extract_dml_count(batches: &[RecordBatch]) -> u64 {
                 .column_by_name("count")
                 .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
                 .into_iter()
-                .flat_map(UInt64Array::iter)
+                .flat_map(arrow::array::PrimitiveArray::iter)
                 .flatten()
         })
         .sum()
@@ -414,10 +414,7 @@ fn build_delete_filters(
     }
 
     // Combine all row predicates with OR.
-    match row_predicates
-        .into_iter()
-        .reduce(datafusion::prelude::Expr::or)
-    {
+    match row_predicates.into_iter().reduce(datafusion_expr::Expr::or) {
         Some(combined) => Ok(vec![combined]),
         None => Err(DataFusionError::Internal(
             "Failed to build delete filters: reduce produced no result".to_string(),
