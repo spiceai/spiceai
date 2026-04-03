@@ -1,0 +1,9 @@
+# Workarounds for building on aarch64-unknown-linux-gnu:
+# 1. Enable fp16/fhm target features to fix gemm-f16 compilation.
+#    See: https://github.com/sarah-quinones/gemm/issues/31
+# 2. Use lld linker — it automatically inserts range extension thunks for
+#    R_AARCH64_CALL26 relocations, avoiding the ±128 MiB overflow that GNU ld
+#    hits on large debug binaries.
+[target.aarch64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-Ctarget-feature=+fp16,+fhm", "-Clink-arg=-fuse-ld=lld"]
