@@ -253,6 +253,12 @@ impl ClusterHarnessBuilder {
         self
     }
 
+    /// Add a single executor with a specific `App` configuration.
+    pub fn executor_with_app(mut self, app: App) -> Self {
+        self.executor_apps.push(Some(app));
+        self
+    }
+
     /// Start all cluster nodes and return a [`ClusterHarness`] ready for queries.
     ///
     /// This:
