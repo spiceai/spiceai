@@ -1463,27 +1463,8 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
                 )));
             }
 
-            // Resolve the partition expression for this table.
-            let partition_expr = crate::datafusion::DataFusion::get_table_partition_expr_from_ctx(
-                &ctx,
-                registry,
-                &table_name,
-            )
-            .await
-            .map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "Failed to resolve partition expression for table '{table_name}': {e}"
-                ))
-            })?;
-
-            let Some(partition_expr) = partition_expr else {
-                return Err(DataFusionError::Execution(format!(
-                    "INSERT on '{table_name}' cannot be forwarded: table has no partition expression. Cayenne tables require PARTITION BY for distributed writes."
-                )));
-            };
-
             // Stream batches from the INSERT source plan directly through
-            // the partition write-through path, counting rows as they flow.
+            // the write-through path, counting rows as they flow.
             let input_schema = input.schema();
             let child_stream = input.execute(partition, task_ctx)?;
             let row_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1521,22 +1502,69 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
                 },
             ));
 
-            // Route batches through the partition write-through path.
-            crate::cluster::partition::write_through::forward_partitioned_batches(
-                registry,
-                Arc::clone(&ctx),
-                io_runtime,
-                &table_name,
-                &input_schema,
-                counting_stream,
-                &[partition_expr],
-            )
-            .await
-            .map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "Failed to forward INSERT batches for table '{table_name}': {e}"
-                ))
-            })?;
+            let table_metadata = registry
+                .federated_partition_manager()
+                .get_table_metadata(&table_name)
+                .await
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to resolve table distribution metadata for '{table_name}': {e}"
+                    ))
+                })?;
+
+            if table_metadata.is_some_and(|metadata| metadata.is_replicated()) {
+                crate::cluster::partition::write_through::forward_replicated_batches(
+                    registry,
+                    io_runtime,
+                    &table_name,
+                    &input_schema,
+                    counting_stream,
+                )
+                .await
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to broadcast INSERT batches for table '{table_name}': {e}"
+                    ))
+                })?;
+            } else {
+                // Resolve the partition expression for partitioned table routing.
+                let partition_expr =
+                    match crate::datafusion::DataFusion::get_table_partition_expr_from_ctx(
+                        &ctx,
+                        registry,
+                        &table_name,
+                    )
+                    .await
+                    {
+                        Ok(Some(p)) => p,
+                        Err(e) => {
+                            return Err(DataFusionError::Execution(format!(
+                                "Failed to resolve partition expression for table '{table_name}': {e}"
+                            )));
+                        }
+                        Ok(None) => {
+                            return Err(DataFusionError::Execution(format!(
+                                "INSERT on '{table_name}' cannot be forwarded: table has no partition expression. Cayenne tables require PARTITION BY for distributed writes."
+                            )))?;
+                        }
+                    };
+
+                crate::cluster::partition::write_through::forward_partitioned_batches(
+                    registry,
+                    Arc::clone(&ctx),
+                    io_runtime,
+                    &table_name,
+                    &input_schema,
+                    counting_stream,
+                    &[partition_expr],
+                )
+                .await
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to forward INSERT batches for table '{table_name}': {e}"
+                    ))
+                })?;
+            }
 
             let total_rows = row_count.load(std::sync::atomic::Ordering::Relaxed);
             RecordBatch::try_new(

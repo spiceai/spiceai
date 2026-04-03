@@ -407,6 +407,84 @@ pub(crate) async fn forward_partitioned_batches(
     Ok(())
 }
 
+/// Forward batches to all connected executors for replicated-table writes.
+///
+/// Each incoming batch is forwarded to every executor using the same `DoPut`
+/// forwarding tasks used by partitioned write-through.
+pub(crate) async fn forward_replicated_batches(
+    executor_registry: &ExecutorRegistry,
+    io_runtime: tokio::runtime::Handle,
+    path: &TableReference,
+    schema: &SchemaRef,
+    mut batches: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>,
+) -> Result<()> {
+    let tbl = path
+        .clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+
+    let all_executor_ids: Vec<ExecutorId> = {
+        let clients = executor_registry.flight_sql_clients.read().await;
+        clients.keys().cloned().collect()
+    };
+
+    let (senders, join_handles) = spawn_executor_forwarding_tasks(
+        executor_registry,
+        &all_executor_ids,
+        schema,
+        tbl,
+        &io_runtime,
+    )
+    .await?;
+
+    let mut routing_error: Option<Error> = None;
+    while let Some(batch_result) = StreamExt::next(&mut batches).await {
+        let batch = match batch_result {
+            Ok(b) => b,
+            Err(e) => {
+                routing_error = Some(e);
+                break;
+            }
+        };
+
+        let pending: Vec<(ExecutorId, RecordBatch)> = senders
+            .keys()
+            .map(|executor_id| (executor_id.clone(), batch.clone()))
+            .collect();
+
+        if let Err(e) = send_all_concurrent(&senders, pending, path).await {
+            routing_error = Some(e);
+            break;
+        }
+    }
+
+    drop(senders);
+    let mut executor_error: Option<Error> = None;
+    for handle in join_handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if executor_error.is_none() {
+                    executor_error = Some(e);
+                }
+            }
+            Err(e) => {
+                if executor_error.is_none() {
+                    executor_error = Some(Error::JoinTask { source: e });
+                }
+            }
+        }
+    }
+
+    if let Some(exec_err) = executor_error {
+        return Err(exec_err);
+    }
+    if let Some(route_err) = routing_error {
+        return Err(route_err);
+    }
+
+    Ok(())
+}
+
 /// Routes a [`RecordBatch`] of data to one or more executors' [`Sender<RecordBatch>`], based on the executor filter
 /// predicates, then assigns new partition predicate values to the least-loaded executor and forwards those rows accordingly.
 #[expect(clippy::too_many_arguments)]
