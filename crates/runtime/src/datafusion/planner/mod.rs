@@ -38,6 +38,7 @@ mod create_table;
 mod delete;
 mod insert;
 pub mod logical_nodes;
+mod merge;
 pub mod physical_execs;
 mod update;
 
@@ -133,7 +134,22 @@ pub async fn create_logical_plan(
                 .await;
             }
 
-            // Future: SQLStatement::Merge { .. }
+            // DML: INSERT on Cayenne tables
+            SQLStatement::Insert(_) => {
+                return plan_cayenne_dml(
+                    statement,
+                    session,
+                    ctx,
+                    WriteOp::Insert(InsertOp::Append),
+                )
+                .await;
+            }
+
+            // DML: MERGE on Cayenne tables
+            SQLStatement::Merge { .. } if ctx.catalog_mode == CatalogMode::Cayenne => {
+                return merge::plan_merge(statement, session, ctx, sql).await;
+            }
+
             _ => {}
         }
     }
@@ -190,9 +206,10 @@ async fn plan_distributed_dml(
         WriteOp::Delete => delete::plan_distributed_delete(dml),
         WriteOp::Insert(_) => insert::plan_distributed_insert(dml),
         WriteOp::Update => update::plan_distributed_update(dml),
-        _ => Err(DataFusionError::Internal(format!(
-            "Unsupported DML operation: {expected_op:?}"
-        ))),
+        WriteOp::Insert(_) => Ok(insert::plan_distributed_insert(dml)),
+        WriteOp::Ctas => Err(DataFusionError::Internal(
+            "CTAS should not reach DML planner".to_string(),
+        )),
     }
 }
 
