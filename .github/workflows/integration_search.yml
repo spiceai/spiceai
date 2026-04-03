@@ -71,4 +71,3 @@ jobs:
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          title: 'fix: Update Search integration test snapshots'
