@@ -153,7 +153,7 @@ pub struct Schema {
     pub name: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Field {
     #[serde(rename = "type")]
     pub field_type: String,
@@ -164,4 +164,163 @@ pub struct Field {
     pub version: Option<i64>,
     pub parameters: Option<HashMap<String, String>>,
     pub items: Option<Box<Field>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_field(field_type: &str, field_name: &str, optional: bool) -> Field {
+        Field {
+            field_type: field_type.to_string(),
+            fields: None,
+            optional,
+            name: None,
+            field: Some(field_name.to_string()),
+            version: None,
+            parameters: None,
+            items: None,
+        }
+    }
+
+    #[test]
+    fn field_equality_same_fields() {
+        let f1 = make_field("int32", "id", false);
+        let f2 = make_field("int32", "id", false);
+        assert_eq!(f1, f2);
+    }
+
+    #[test]
+    fn field_inequality_different_type() {
+        let f1 = make_field("int32", "id", false);
+        let f2 = make_field("int64", "id", false);
+        assert_ne!(f1, f2);
+    }
+
+    #[test]
+    fn field_inequality_different_name() {
+        let f1 = make_field("int32", "id", false);
+        let f2 = make_field("int32", "name", false);
+        assert_ne!(f1, f2);
+    }
+
+    #[test]
+    fn field_inequality_different_optionality() {
+        let f1 = make_field("int32", "id", false);
+        let f2 = make_field("int32", "id", true);
+        assert_ne!(f1, f2);
+    }
+
+    #[test]
+    fn schema_evolution_column_added() {
+        let old_fields = vec![
+            make_field("int32", "id", false),
+            make_field("string", "name", true),
+        ];
+        let new_fields = vec![
+            make_field("int32", "id", false),
+            make_field("string", "name", true),
+            make_field("string", "email", true),
+        ];
+        assert_ne!(old_fields, new_fields);
+    }
+
+    #[test]
+    fn schema_evolution_column_removed() {
+        let old_fields = vec![
+            make_field("int32", "id", false),
+            make_field("string", "name", true),
+            make_field("string", "obsolete", true),
+        ];
+        let new_fields = vec![
+            make_field("int32", "id", false),
+            make_field("string", "name", true),
+        ];
+        assert_ne!(old_fields, new_fields);
+    }
+
+    #[test]
+    fn schema_evolution_column_type_changed() {
+        let old_fields = vec![
+            make_field("int32", "id", false),
+            make_field("int32", "count", false),
+        ];
+        let new_fields = vec![
+            make_field("int32", "id", false),
+            make_field("int64", "count", false),
+        ];
+        assert_ne!(old_fields, new_fields);
+    }
+
+    #[test]
+    fn schema_unchanged() {
+        let fields1 = vec![
+            make_field("int32", "id", false),
+            make_field("string", "name", true),
+        ];
+        let fields2 = vec![
+            make_field("int32", "id", false),
+            make_field("string", "name", true),
+        ];
+        assert_eq!(fields1, fields2);
+    }
+
+    #[test]
+    fn field_with_parameters_equality() {
+        let mut params = HashMap::new();
+        params.insert(
+            "connect.decimal.precision".to_string(),
+            "38".to_string(),
+        );
+        params.insert("scale".to_string(), "9".to_string());
+
+        let f1 = Field {
+            field_type: "bytes".to_string(),
+            fields: None,
+            optional: true,
+            name: Some("org.apache.kafka.connect.data.Decimal".to_string()),
+            field: Some("amount".to_string()),
+            version: Some(1),
+            parameters: Some(params.clone()),
+            items: None,
+        };
+        let f2 = Field {
+            field_type: "bytes".to_string(),
+            fields: None,
+            optional: true,
+            name: Some("org.apache.kafka.connect.data.Decimal".to_string()),
+            field: Some("amount".to_string()),
+            version: Some(1),
+            parameters: Some(params),
+            items: None,
+        };
+        assert_eq!(f1, f2);
+    }
+
+    #[test]
+    fn field_with_different_parameters() {
+        let mut params1 = HashMap::new();
+        params1.insert(
+            "connect.decimal.precision".to_string(),
+            "38".to_string(),
+        );
+        params1.insert("scale".to_string(), "9".to_string());
+
+        let mut params2 = HashMap::new();
+        params2.insert(
+            "connect.decimal.precision".to_string(),
+            "38".to_string(),
+        );
+        params2.insert("scale".to_string(), "18".to_string());
+
+        let f1 = Field {
+            parameters: Some(params1),
+            ..make_field("bytes", "amount", true)
+        };
+        let f2 = Field {
+            parameters: Some(params2),
+            ..make_field("bytes", "amount", true)
+        };
+        assert_ne!(f1, f2);
+    }
 }

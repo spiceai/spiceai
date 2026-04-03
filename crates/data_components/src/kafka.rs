@@ -317,6 +317,20 @@ impl KafkaConsumer {
             .context(UnableToCommitMessageSnafu)
     }
 
+    /// Seek a specific partition to a given offset.
+    ///
+    /// This is used to rewind after peeking at a message (e.g., for schema
+    /// evolution detection) so the message is re-read by the changes stream.
+    pub fn seek(&self, topic: &str, partition: i32, offset: Offset) -> Result<()> {
+        self.consumer
+            .seek(topic, partition, offset, std::time::Duration::from_secs(5))
+            .context(UnableToRestartTopicSnafu {
+                message: format!(
+                    "Failed to seek partition {partition} to offset {offset:?}"
+                ),
+            })
+    }
+
     pub fn restart_topic(&self, topic: &str) -> Result<()> {
         let mut assignment = self
             .consumer

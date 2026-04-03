@@ -312,7 +312,7 @@ impl DataConnector for Debezium {
 
         let (kafka_consumer, metadata, schema) = match get_metadata_from_accelerator(dataset).await
         {
-            Some(metadata) => {
+            Some(mut metadata) => {
                 if let Some(config_consumer_group_id) = &self.kafka_config.consumer_group_id {
                     ensure!(
                         config_consumer_group_id == &metadata.consumer_group_id,
@@ -349,6 +349,26 @@ impl DataConnector for Debezium {
                     }
                 );
 
+                kafka_consumer.subscribe(topic).boxed().context(
+                    super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
+                    },
+                )?;
+
+                // Peek at the next available Kafka message to detect schema evolution.
+                // If the source table schema has changed since the metadata was cached,
+                // update the cached schema to avoid stale-schema errors (e.g. refresh SQL
+                // referencing columns that don't exist in the old schema).
+                check_schema_evolution(
+                    &kafka_consumer,
+                    topic,
+                    &dataset_name,
+                    dataset,
+                    &mut metadata,
+                )
+                .await;
+
                 let schema = debezium::arrow::convert_fields_to_arrow_schema(
                     metadata.schema_fields.iter().collect(),
                 )
@@ -357,13 +377,6 @@ impl DataConnector for Debezium {
                     dataconnector: "debezium",
                     connector_component: ConnectorComponent::from(dataset),
                 })?;
-
-                kafka_consumer.subscribe(topic).boxed().context(
-                    super::UnableToGetReadProviderSnafu {
-                        dataconnector: "debezium",
-                        connector_component: ConnectorComponent::from(dataset),
-                    },
-                )?;
 
                 (kafka_consumer, metadata, Arc::new(schema))
             }
@@ -560,4 +573,79 @@ async fn get_metadata_from_kafka(
         })?;
 
     Ok((kafka_consumer, metadata, Arc::new(schema)))
+}
+
+/// Peek at the next Kafka message to detect schema evolution.
+///
+/// When the source table schema has changed (columns added/removed/modified),
+/// Debezium produces messages with the updated schema. This function reads the
+/// next available message, compares its schema fields against the cached metadata,
+/// and updates the cache if the schema has evolved.
+///
+/// After peeking, the consumer is seeked back so the message is re-read by the
+/// changes stream and no CDC events are lost.
+async fn check_schema_evolution(
+    kafka_consumer: &KafkaConsumer,
+    topic: &str,
+    dataset_name: &str,
+    dataset: &Dataset,
+    metadata: &mut DebeziumKafkaMetadata,
+) {
+    let peek_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        kafka_consumer.next_json::<ChangeEventKey, ChangeEvent>(),
+    )
+    .await;
+
+    let msg = match peek_result {
+        Ok(Ok(Some(msg))) => msg,
+        Ok(Ok(None)) => {
+            tracing::debug!("No Kafka message available for schema evolution check on {dataset_name}");
+            return;
+        }
+        Ok(Err(e)) => {
+            tracing::debug!("Could not peek Kafka message for schema evolution check on {dataset_name}: {e}");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!("Timed out peeking Kafka message for schema evolution check on {dataset_name}");
+            return;
+        }
+    };
+
+    // Seek back so the peeked message is re-read by the changes stream.
+    let partition = msg.partition();
+    let offset = msg.offset();
+    if let Err(e) = kafka_consumer.seek(
+        topic,
+        partition,
+        data_components::kafka::rdkafka::Offset::Offset(offset),
+    ) {
+        tracing::warn!(
+            "Failed to seek back after schema evolution check on {dataset_name}: {e}. \
+             A single CDC event may be skipped."
+        );
+    }
+
+    let Some(new_fields) = msg.value().get_schema_fields() else {
+        return;
+    };
+
+    let new_fields_owned: Vec<change_event::Field> =
+        new_fields.into_iter().cloned().collect();
+
+    if new_fields_owned != metadata.schema_fields {
+        tracing::info!(
+            "Detected schema evolution for dataset {dataset_name}. Updating cached schema."
+        );
+        metadata.schema_fields = new_fields_owned;
+
+        if dataset.is_file_accelerated() {
+            if let Err(e) = set_metadata_to_accelerator(dataset, metadata).await {
+                tracing::warn!(
+                    "Failed to persist updated schema metadata for {dataset_name}: {e}"
+                );
+            }
+        }
+    }
 }
