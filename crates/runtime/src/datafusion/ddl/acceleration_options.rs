@@ -56,7 +56,7 @@ pub enum TableDistribution {
 ///
 /// Bundles `WITH (...)` options (`acceleration.*` and `dataset.*`), and
 /// distribution mode (`PARTITION BY` or `REPLICATED`) extracted during
-/// SQL pre-processing.
+/// statement planning.
 #[derive(Debug, Clone, Default)]
 pub struct CreateTableStatementExtension {
     /// Acceleration options, if any `acceleration.*` keys were present in `WITH (...)`.
@@ -119,7 +119,7 @@ pub fn new_shared_store() -> SharedDdlExtensionStore {
 /// ```
 ///
 /// The returned extension will have an empty `distribution` — distribution
-/// expressions are handled separately during pre-processing.
+/// expressions are handled separately by the planner.
 ///
 /// # Errors
 ///
