@@ -12,7 +12,6 @@ The Spice open source project provides multiple distribution variants to support
 | -------- | ----------------------- | -------------------------------------- | ------------------- |
 | Linux    | x86_64                  | AVX2, FMA, BMI1/2, LZCNT, POPCNT       | —                   |
 | Linux    | aarch64 (arm64)         | NEON, FP16 (FEAT_FP16), FHM (FEAT_FHM) | `clang`, `lld`      |
-| macOS    | x86_64                  | Native (build host)                    | —                   |
 | macOS    | aarch64 (Apple Silicon) | Native (build host)                    | —                   |
 | Windows  | x86_64 (MSVC)           | —                                      | MSVC toolchain      |
 
