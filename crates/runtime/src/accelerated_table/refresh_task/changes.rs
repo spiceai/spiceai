@@ -22,6 +22,7 @@ use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, U
 use arrow::datatypes::DataType;
 use cache::Caching;
 use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
+use data_components::delete::{DeletionTableProvider, get_deletion_provider};
 #[cfg(feature = "dynamodb")]
 use data_components::dynamodb::stream::StreamError as DynamoDBStreamError;
 #[cfg(any(feature = "debezium", feature = "kafka"))]
@@ -179,7 +180,11 @@ impl RefreshTask {
         for (op_type, row_indices) in sub_batches {
             match op_type {
                 ChangeOperationType::Delete => {
-                    self.process_delete_batch(&change_batch, &row_indices)
+                    let deletion_provider = get_deletion_provider(Arc::clone(&self.accelerator))
+                        .context(
+                            crate::accelerated_table::AcceleratedTableDoesntSupportDeleteSnafu,
+                        )?;
+                    self.process_delete_batch(&change_batch, &row_indices, &deletion_provider)
                         .await?;
                     had_change = true;
                 }
@@ -281,6 +286,7 @@ impl RefreshTask {
         &self,
         change_batch: &ChangeBatch,
         row_indices: &[usize],
+        deletion_provider: &Arc<dyn DeletionTableProvider>,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = &self.dataset_name;
 
@@ -300,12 +306,14 @@ impl RefreshTask {
             let session_state = ctx.state();
 
             let _lock_guard = self.accelerator_write_mutex.lock().await;
-            let delete_plan = self
-                .accelerator
-                .delete_from(&session_state, vec![combined])
-                .await
-                .map_err(find_datafusion_root)
-                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+            let delete_plan = DeletionTableProvider::delete_from(
+                deletion_provider.as_ref(),
+                &session_state,
+                &[combined],
+            )
+            .await
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
             collect(delete_plan, ctx.task_ctx())
                 .await
                 .map_err(find_datafusion_root)
@@ -531,6 +539,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use data_components::arrow::write::MemTable;
     use data_components::cdc::changes_schema;
+    use data_components::delete::DeletionTableProviderAdapter;
     use datafusion::datasource::TableProvider;
 
     use std::sync::Arc;
@@ -870,7 +879,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_change_delete_returns_data_written() {
-        let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
+        let adapter = Arc::new(DeletionTableProviderAdapter::new(make_mem_table()));
+        let task = make_refresh_task(adapter as Arc<dyn TableProvider>);
         let change_batch =
             create_test_change_batch(vec!["d"], &[vec!["id"]], vec![1], vec![Some("Alice")]);
         assert_eq!(

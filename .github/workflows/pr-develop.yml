@@ -51,9 +51,6 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Set spiceio log path
-        run: echo "SPICEIO_LOG_FILE=/tmp/spiceio-check-$$.log" >> "$GITHUB_ENV"
-
       - name: Set up spiceio
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@8c7781c6707cd60f1a18acb197168bebc9338532 # v0.4.3
@@ -102,7 +99,7 @@ jobs:
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: spiceio-check-logs
-          path: ${{ env.SPICEIO_LOG_FILE }}
+          path: ${{ runner.temp }}/spiceio.log
           if-no-files-found: ignore
 
   build-and-test:
@@ -116,9 +113,6 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
-
-      - name: Set spiceio log path
-        run: echo "SPICEIO_LOG_FILE=/tmp/spiceio-build-$$.log" >> "$GITHUB_ENV"
 
       - name: Set up spiceio
         id: setup-spiceio
@@ -182,5 +176,5 @@ jobs:
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: spiceio-build-logs
-          path: ${{ env.SPICEIO_LOG_FILE }}
+          path: ${{ runner.temp }}/spiceio.log
           if-no-files-found: ignore
