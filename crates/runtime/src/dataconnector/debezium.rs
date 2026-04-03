@@ -349,14 +349,14 @@ impl DataConnector for Debezium {
                     }
                 );
 
-                let schema = debezium::arrow::convert_fields_to_arrow_schema(
-                    metadata.schema_fields.iter().collect(),
+                // Check for schema evolution by peeking at the latest Kafka message
+                let (metadata, schema) = refresh_schema_if_evolved(
+                    metadata,
+                    dataset,
+                    topic,
+                    &self.kafka_config,
                 )
-                .boxed()
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "debezium",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?;
+                .await?;
 
                 kafka_consumer.subscribe(topic).boxed().context(
                     super::UnableToGetReadProviderSnafu {
@@ -365,7 +365,7 @@ impl DataConnector for Debezium {
                     },
                 )?;
 
-                (kafka_consumer, metadata, Arc::new(schema))
+                (kafka_consumer, metadata, schema)
             }
             None => get_metadata_from_kafka(dataset, topic, &self.kafka_config).await?,
         };
@@ -560,4 +560,80 @@ async fn get_metadata_from_kafka(
         })?;
 
     Ok((kafka_consumer, metadata, Arc::new(schema)))
+}
+
+/// Peek at the latest Kafka message to detect schema evolution. If the schema has
+/// changed from the cached metadata, update the stored metadata and return the fresh
+/// schema. Falls back to the cached schema if the peek fails or no messages are available.
+async fn refresh_schema_if_evolved(
+    metadata: DebeziumKafkaMetadata,
+    dataset: &Dataset,
+    topic: &str,
+    kafka_config: &KafkaConfig,
+) -> super::DataConnectorResult<(DebeziumKafkaMetadata, SchemaRef)> {
+    let dataset_name = dataset.name.to_string();
+
+    let cached_schema = debezium::arrow::convert_fields_to_arrow_schema(
+        metadata.schema_fields.iter().collect(),
+    )
+    .boxed()
+    .context(super::UnableToGetReadProviderSnafu {
+        dataconnector: "debezium",
+        connector_component: ConnectorComponent::from(dataset),
+    })?;
+
+    // Try to peek at the latest Kafka message for the current schema
+    let peek_result = KafkaConsumer::fetch_latest_message::<ChangeEventKey, ChangeEvent>(
+        topic,
+        kafka_config,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let Ok(Some((_key, value))) = peek_result else {
+        tracing::debug!(
+            "Could not peek at latest Kafka message for schema check on dataset {dataset_name}. Using cached schema."
+        );
+        return Ok((metadata, Arc::new(cached_schema)));
+    };
+
+    let Some(fresh_fields) = value.get_schema_fields() else {
+        return Ok((metadata, Arc::new(cached_schema)));
+    };
+
+    let fresh_schema = match debezium::arrow::convert_fields_to_arrow_schema(fresh_fields.clone())
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to convert fresh schema from Kafka for {dataset_name}: {e}. Using cached schema."
+            );
+            return Ok((metadata, Arc::new(cached_schema)));
+        }
+    };
+
+    if fresh_schema == cached_schema {
+        return Ok((metadata, Arc::new(cached_schema)));
+    }
+
+    tracing::info!(
+        "Detected schema evolution for dataset {dataset_name}. Updating cached schema."
+    );
+
+    let updated_metadata = DebeziumKafkaMetadata {
+        consumer_group_id: metadata.consumer_group_id,
+        topic: metadata.topic,
+        primary_keys: metadata.primary_keys,
+        schema_fields: fresh_fields.into_iter().cloned().collect(),
+    };
+
+    if dataset.is_file_accelerated() {
+        if let Err(e) = set_metadata_to_accelerator(dataset, &updated_metadata).await {
+            tracing::warn!(
+                "Failed to persist updated schema for {dataset_name}: {e}. Using fresh schema in-memory only."
+            );
+        }
+    }
+
+    Ok((updated_metadata, Arc::new(fresh_schema)))
 }
