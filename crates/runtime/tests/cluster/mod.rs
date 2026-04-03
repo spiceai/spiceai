@@ -21,3 +21,4 @@ pub mod harness;
 mod in_memory_shuffle;
 mod job_store;
 mod simple;
+mod write_through_idle_timeout;
