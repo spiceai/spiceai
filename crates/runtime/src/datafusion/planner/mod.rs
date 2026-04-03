@@ -128,14 +128,9 @@ pub async fn create_logical_plan(
                 .await;
             }
 
-            // DML: MERGE on Cayenne tables (local single-node only)
+            // DML: MERGE on Cayenne tables
             SQLStatement::Merge { .. } if ctx.catalog_mode == CatalogMode::Cayenne => {
-                if matches!(ctx.cluster_role, Some(ClusterRole::Scheduler)) {
-                    return Err(DataFusionError::Plan(
-                        "MERGE INTO is not supported in distributed mode".to_string(),
-                    ));
-                }
-                return merge::plan_merge(statement, session).await;
+                return merge::plan_merge(statement, session, ctx, sql).await;
             }
 
             _ => {}
