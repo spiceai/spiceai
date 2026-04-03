@@ -673,15 +673,16 @@ fn infer_json_schema_for_format(
         // fall through to ValueIter.
         if matches!(format, Format::Auto | Format::Json)
             && let Ok(value) = serde_json::from_slice::<serde_json::Value>(buf)
-                && value.is_object() {
-                    take_while();
-                    return Ok(infer_json_schema_from_iterator(std::iter::once(Ok::<
-                        _,
-                        ArrowError,
-                    >(
-                        value
-                    )))?);
-                }
+            && value.is_object()
+        {
+            take_while();
+            return Ok(infer_json_schema_from_iterator(std::iter::once(Ok::<
+                _,
+                ArrowError,
+            >(
+                value
+            )))?);
+        }
 
         // NDJSON: use line-based ValueIter
         let mut reader = BufReader::new(std::io::Cursor::new(buf));
