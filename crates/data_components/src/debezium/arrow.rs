@@ -725,18 +725,18 @@ mod tests {
 
         let id_col = record_batch
             .column_by_name("id")
-            .unwrap()
+            .expect("id column should exist")
             .as_any()
             .downcast_ref::<arrow::array::Int32Array>()
-            .unwrap();
+            .expect("id column should be Int32Array");
         assert_eq!(id_col.value(0), 42);
 
         let name_col = record_batch
             .column_by_name("name")
-            .unwrap()
+            .expect("name column should exist")
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("name column should be StringArray");
         assert!(name_col.is_null(0));
     }
 
@@ -797,11 +797,13 @@ mod tests {
 
         // Old message with only "id" (before schema evolution)
         let old_value = json!({"id": 1});
-        append_value_to_struct_builder(old_value, &mut builder).unwrap();
+        append_value_to_struct_builder(old_value, &mut builder)
+            .expect("old message should process successfully");
 
         // New message with all fields
         let new_value = json!({"id": 2, "name": "Alice", "age": 30, "active": true});
-        append_value_to_struct_builder(new_value, &mut builder).unwrap();
+        append_value_to_struct_builder(new_value, &mut builder)
+            .expect("new message should process successfully");
 
         let struct_array = builder.finish();
         let record_batch: RecordBatch = struct_array.into();
@@ -810,19 +812,19 @@ mod tests {
         // First row: id=1, rest null
         let id_col = record_batch
             .column_by_name("id")
-            .unwrap()
+            .expect("id column should exist")
             .as_any()
             .downcast_ref::<arrow::array::Int32Array>()
-            .unwrap();
+            .expect("id column should be Int32Array");
         assert_eq!(id_col.value(0), 1);
         assert_eq!(id_col.value(1), 2);
 
         let name_col = record_batch
             .column_by_name("name")
-            .unwrap()
+            .expect("name column should exist")
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
+            .expect("name column should be StringArray");
         assert!(name_col.is_null(0));
         assert_eq!(name_col.value(1), "Alice");
     }
