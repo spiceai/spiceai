@@ -2108,11 +2108,7 @@ impl DataFusion {
         }
 
         // Get the self Arc for table_partition_values (it needs &Arc<DataFusion>).
-        let Some(df_arc) = self
-            .datafusion_ref
-            .get()
-            .and_then(std::sync::Weak::upgrade)
-        else {
+        let Some(df_arc) = self.datafusion_ref.get().and_then(std::sync::Weak::upgrade) else {
             tracing::warn!(
                 table = %table_name,
                 "DataFusion self-reference not available, skipping pre-refresh partition discovery"
@@ -2121,19 +2117,18 @@ impl DataFusion {
         };
 
         // Discover current partition values from the source.
-        let source_partitions = match table_partition_values(dataset_name, &partition_by, &df_arc)
-            .await
-        {
-            Ok(values) => values,
-            Err(e) => {
-                tracing::warn!(
-                    table = %table_name,
-                    error = %e,
-                    "Failed to discover partition values before refresh, proceeding anyway"
-                );
-                return;
-            }
-        };
+        let source_partitions =
+            match table_partition_values(dataset_name, &partition_by, &df_arc).await {
+                Ok(values) => values,
+                Err(e) => {
+                    tracing::warn!(
+                        table = %table_name,
+                        error = %e,
+                        "Failed to discover partition values before refresh, proceeding anyway"
+                    );
+                    return;
+                }
+            };
 
         if source_partitions.is_empty() {
             return;
