@@ -61,6 +61,8 @@ enum RunState {
         api_key: String,
         /// Flight SQL endpoint URL derived from the cname.
         flight_url: String,
+        /// Normalized API base URL (stored separately from `cloud` to avoid tainted-struct logging).
+        api_url: String,
         /// Cloud client used during provisioning (reused for teardown).
         cloud: CloudClient,
     },
@@ -331,11 +333,13 @@ impl Handler for SpidapterHandler {
         };
 
         match state {
-            RunState::Scp { app_id, cloud, .. } => {
-                eprintln!(
-                    "[stdio] teardown: deleting app {app_id} at {}",
-                    cloud.base_url()
-                );
+            RunState::Scp {
+                app_id,
+                api_url,
+                cloud,
+                ..
+            } => {
+                eprintln!("[stdio] teardown: deleting app {app_id} at {api_url}");
                 commands::delete_app(&cloud, app_id)
                     .await
                     .map_err(|e| format!("Failed to delete app {app_id}: {e}"))?;
@@ -712,6 +716,7 @@ async fn provision_spice_cloud_app(
         app_id,
         api_key,
         flight_url,
+        api_url: api_url.to_owned(),
         cloud,
     })
 }
