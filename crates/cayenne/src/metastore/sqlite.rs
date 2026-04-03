@@ -20,8 +20,8 @@ limitations under the License.
 //! avoiding the overhead of opening a new connection for each operation.
 
 use super::{
-    duplicate_delete_file_index_error_message, ExecuteParams, MetastoreBackend, MetastoreGetValue,
-    MetastoreRow, MetastoreTransaction, MetastoreValue, QueryParams, QueryRowParams,
+    ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreTransaction,
+    MetastoreValue, QueryParams, QueryRowParams, duplicate_delete_file_index_error_message,
 };
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
@@ -575,7 +575,10 @@ impl MetastoreBackend for SqliteMetastore {
         let lock_start = std::time::Instant::now();
         let guard = conn.lock_owned().await;
         let lock_wait_ms = lock_start.elapsed().as_millis() as u64;
-        tracing::info!(lock_wait_ms, "Metastore: mutex acquired for begin_transaction");
+        tracing::info!(
+            lock_wait_ms,
+            "Metastore: mutex acquired for begin_transaction"
+        );
 
         tracing::info!("Metastore: executing BEGIN TRANSACTION");
         guard

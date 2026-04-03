@@ -265,7 +265,7 @@ fn map_clickhouse_type_to_arrow(type_str: &str) -> Result<DataType, clickhouse_r
         "Float32" => Ok(DataType::Float32),
         "Float64" => Ok(DataType::Float64),
         s if s.starts_with("FixedString") => Ok(DataType::Utf8),
-        "Date" => Ok(DataType::Date32),
+        "Date" | "Date32" => Ok(DataType::Date32),
         "DateTime" => Ok(DataType::Timestamp(TimeUnit::Second, None)),
         s if s.starts_with("Decimal") => {
             let parts: Vec<&str> = s
@@ -328,6 +328,8 @@ mod tests {
             ("String", DataType::Utf8),
             ("FixedString(10)", DataType::Utf8),
             ("Date", DataType::Date32),
+            ("Date32", DataType::Date32),
+            ("Nullable(Date32)", DataType::Date32),
             ("DateTime", DataType::Timestamp(TimeUnit::Second, None)),
             ("Decimal(18, 4)", DataType::Decimal128(18, 4)),
             ("Decimal(18)", DataType::Decimal128(18, 0)),
