@@ -600,11 +600,29 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
             wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
             wait_for_row_count(&harness, "categories", 10, Duration::from_secs(60)).await?;
 
+            // Wait for partition metadata to be fully initialized and assigned
+            // to executors. Poll until the EXPLAIN shows a partitioned plan
+            // (Union with bucket filters) rather than an EmptyRelation.
             let join_sql = "SELECT t.id, t.name, c.category, c.rating \
                             FROM test_data t JOIN categories c ON t.id = c.id \
                             ORDER BY t.id";
 
-            let plan = harness.explain(join_sql).await?;
+            let start = tokio::time::Instant::now();
+            let plan = loop {
+                let plan = harness.explain(join_sql).await?;
+                let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
+                    .expect("format explain")
+                    .to_string();
+                if plan_fmt.contains("UnionExec") || plan_fmt.contains("Union") {
+                    break plan;
+                }
+                if start.elapsed() > Duration::from_secs(30) {
+                    panic!(
+                        "Timed out waiting for partitioned EXPLAIN plan. Got:\n{plan_fmt}"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            };
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                 .expect("format explain")
                 .to_string();

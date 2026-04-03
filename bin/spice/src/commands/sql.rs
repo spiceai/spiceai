@@ -53,6 +53,18 @@ pub struct SqlArgs {
     #[arg(long)]
     tls_root_certificate_file: Option<String>,
 
+    /// The path to the client certificate file for mTLS authentication.
+    /// Required when connecting directly to a cluster node that enforces mutual TLS.
+    /// Must be used together with --client-tls-key-file.
+    #[arg(long, requires = "client_tls_key_file")]
+    client_tls_certificate_file: Option<String>,
+
+    /// The path to the client private key file for mTLS authentication.
+    /// Required when connecting directly to a cluster node that enforces mutual TLS.
+    /// Must be used together with --client-tls-certificate-file.
+    #[arg(long, requires = "client_tls_certificate_file")]
+    client_tls_key_file: Option<String>,
+
     /// Custom HTTP headers in format 'Key:Value' (can be specified multiple times)
     #[arg(long = "headers", value_name = "KEY:VALUE")]
     custom_headers: Vec<String>,
@@ -107,6 +119,8 @@ fn build_repl_config(ctx: &RuntimeContext, args: &SqlArgs) -> repl::ReplConfig {
         repl_flight_endpoint: flight_endpoint,
         http_endpoint,
         tls_root_certificate_file: args.tls_root_certificate_file.clone(),
+        client_tls_certificate_file: args.client_tls_certificate_file.clone(),
+        client_tls_key_file: args.client_tls_key_file.clone(),
         api_key: ctx.api_key().map(String::from),
         user_agent: Some(ctx.user_agent().to_string()),
         cache_control,
