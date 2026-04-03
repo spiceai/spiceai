@@ -130,6 +130,7 @@ jobs:
         with:
           name: ai-integration-test-archive
           path: ./integration.tar.zst
+          retention-days: 1
 
       - name: Kill spiceio
         if: always() && steps.setup-spiceio.outputs.pid != ''
@@ -141,18 +142,6 @@ jobs:
         with:
           name: spiceio-models-build-logs
           path: ${{ runner.temp }}/spiceio.log
-          if-no-files-found: ignore
-
-      - name: Kill spiceio
-        if: always() && steps.setup-spiceio.outputs.pid != ''
-        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
-
-      - name: Upload spiceio logs
-        if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
-        with:
-          name: spiceio-models-build-logs
-          path: ${{ env.SPICEIO_LOG_FILE }}
           if-no-files-found: ignore
 
   test-models:
