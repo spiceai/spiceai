@@ -277,8 +277,7 @@ async fn test_schema_evolution_file_update_mode() -> Result<(), anyhow::Error> {
     register_test_connectors().await;
 
     if std::fs::metadata(DUCKDB_FILE_UPDATE_PATH).is_ok() {
-        std::fs::remove_file(DUCKDB_FILE_UPDATE_PATH)
-            .expect("should remove local database");
+        std::fs::remove_file(DUCKDB_FILE_UPDATE_PATH).expect("should remove local database");
     }
 
     test_request_context()
@@ -315,12 +314,7 @@ async fn test_schema_evolution_file_update_mode() -> Result<(), anyhow::Error> {
                 initialize_runtime_with_mode(port, Mode::FileUpdate, DUCKDB_FILE_UPDATE_PATH)
                     .await?,
             );
-            run_and_verify_query(
-                &rt,
-                sql,
-                "test_schema_evolution_file_update_add_column",
-            )
-            .await;
+            run_and_verify_query(&rt, sql, "test_schema_evolution_file_update_add_column").await;
 
             // Breaking change: drop a column — should trigger table recreation
             rt.shutdown().await;
@@ -351,12 +345,7 @@ async fn test_schema_evolution_file_update_mode() -> Result<(), anyhow::Error> {
                 initialize_runtime_with_mode(port, Mode::FileUpdate, DUCKDB_FILE_UPDATE_PATH)
                     .await?,
             );
-            run_and_verify_query(
-                &rt,
-                sql,
-                "test_schema_evolution_file_update_change_type",
-            )
-            .await;
+            run_and_verify_query(&rt, sql, "test_schema_evolution_file_update_change_type").await;
 
             running_container.remove().await?;
 

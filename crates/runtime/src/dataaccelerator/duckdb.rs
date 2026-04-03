@@ -24,7 +24,10 @@ use crate::{
         },
         view::View,
     },
-    dataaccelerator::{FilePathError, snapshots::{download_snapshot_if_needed, snapshot_before_recreate}},
+    dataaccelerator::{
+        FilePathError,
+        snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
+    },
     datafusion::{
         dialect::new_duckdb_dialect,
         sort_columns::{SortColumn, parse_sort_columns},
@@ -212,8 +215,10 @@ impl DuckDBAccelerator {
 
                 // If the path is Some, we're counting the number of file instances
                 if let Some(this_file_path) = path {
-                    if matches!(acceleration.mode, Mode::File | Mode::FileCreate | Mode::FileUpdate)
-                        && let Ok(file_path) = self.file_path(ds.as_ref())
+                    if matches!(
+                        acceleration.mode,
+                        Mode::File | Mode::FileCreate | Mode::FileUpdate
+                    ) && let Ok(file_path) = self.file_path(ds.as_ref())
                         && this_file_path == file_path
                     {
                         instance_usage += 1;
@@ -383,7 +388,9 @@ impl DataAccelerator for DuckDBAccelerator {
                     snapshot_before_recreate(
                         acceleration,
                         &source.name().to_string(),
-                        runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(&path)),
+                        runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(
+                            &path,
+                        )),
                         AccelerationEngine::DuckDB,
                         Arc::new(arrow_schema::Schema::empty()),
                     )
@@ -479,7 +486,10 @@ impl DataAccelerator for DuckDBAccelerator {
                     .filter_map(|other_source| {
                         if other_source.acceleration().is_some_and(|a| {
                             a.engine == Engine::DuckDB
-                                && matches!(a.mode, Mode::File | Mode::FileCreate | Mode::FileUpdate)
+                                && matches!(
+                                    a.mode,
+                                    Mode::File | Mode::FileCreate | Mode::FileUpdate
+                                )
                         }) {
                             if other_source.name() == source.name() {
                                 None
@@ -582,24 +592,28 @@ impl DataAccelerator for DuckDBAccelerator {
         let pool = Arc::new(self.get_shared_pool(source).await?);
         let table_name = table_name.to_owned();
 
-        tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            let mut conn = pool.connect_sync()?;
-            let duckdb_conn = DuckDB::duckdb_conn(&mut conn).boxed()?;
-            let escaped = table_name.replace('"', "\"\"");
-            let drop_sql = format!("DROP TABLE IF EXISTS \"{escaped}\"");
-            duckdb_conn
-                .get_underlying_conn_mut()
-                .execute(&drop_sql, [])
-                .boxed()?;
-            // Also drop any internal DuckDB tables associated with this table
-            let internal_name = format!("__data_{table_name}").replace('"', "\"\"");
-            let internal_drop = format!("DROP TABLE IF EXISTS \"{internal_name}\"");
-            let _ = duckdb_conn
-                .get_underlying_conn_mut()
-                .execute(&internal_drop, []);
-            tracing::info!("Dropped DuckDB table '{table_name}' for schema recreation (file_update mode)");
-            Ok(())
-        })
+        tokio::task::spawn_blocking(
+            move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                let mut conn = pool.connect_sync()?;
+                let duckdb_conn = DuckDB::duckdb_conn(&mut conn).boxed()?;
+                let escaped = table_name.replace('"', "\"\"");
+                let drop_sql = format!("DROP TABLE IF EXISTS \"{escaped}\"");
+                duckdb_conn
+                    .get_underlying_conn_mut()
+                    .execute(&drop_sql, [])
+                    .boxed()?;
+                // Also drop any internal DuckDB tables associated with this table
+                let internal_name = format!("__data_{table_name}").replace('"', "\"\"");
+                let internal_drop = format!("DROP TABLE IF EXISTS \"{internal_name}\"");
+                let _ = duckdb_conn
+                    .get_underlying_conn_mut()
+                    .execute(&internal_drop, []);
+                tracing::info!(
+                    "Dropped DuckDB table '{table_name}' for schema recreation (file_update mode)"
+                );
+                Ok(())
+            },
+        )
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
     }
@@ -1798,9 +1812,8 @@ mod tests {
         use datafusion_table_providers::duckdb::DuckDB;
         use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
 
-        let pool = Arc::new(
-            DuckDbConnectionPool::new_memory().expect("to create DuckDB connection pool"),
-        );
+        let pool =
+            Arc::new(DuckDbConnectionPool::new_memory().expect("to create DuckDB connection pool"));
         let mut conn = pool.connect_sync().expect("to get connection from pool");
         let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("to get DuckDB connection");
 

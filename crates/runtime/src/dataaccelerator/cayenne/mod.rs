@@ -996,7 +996,8 @@ impl DataAccelerator for CayenneAccelerator {
         {
             let path_buf = PathBuf::from(&dir_path);
             if path_buf.exists() {
-                let metadata_dir_for_snapshot = PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
+                let metadata_dir_for_snapshot =
+                    PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
                 let snapshot_layout = runtime_acceleration::snapshot::AccelerationLayout::cayenne(
                     metadata_dir_for_snapshot,
                     path_buf.clone(),
@@ -1316,7 +1317,9 @@ impl DataAccelerator for CayenneAccelerator {
         let path_buf = PathBuf::from(&dir_path);
         if path_buf.exists() {
             tokio::fs::remove_dir_all(&path_buf).await.boxed()?;
-            tracing::info!("Removed Cayenne data directory '{dir_path}' for schema recreation (file_update mode)");
+            tracing::info!(
+                "Removed Cayenne data directory '{dir_path}' for schema recreation (file_update mode)"
+            );
         }
 
         // Also drop the table from metadata catalog

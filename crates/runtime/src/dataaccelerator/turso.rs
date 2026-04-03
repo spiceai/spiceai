@@ -56,7 +56,10 @@ use tokio::sync::Mutex;
 
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::{FilePathError, snapshots::{download_snapshot_if_needed, snapshot_before_recreate}},
+    dataaccelerator::{
+        FilePathError,
+        snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
+    },
     datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
     parameters::ParameterSpec,
@@ -461,7 +464,9 @@ impl DataAccelerator for TursoAccelerator {
                     snapshot_before_recreate(
                         acceleration,
                         &source.name().to_string(),
-                        runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(&path)),
+                        runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(
+                            &path,
+                        )),
                         AccelerationEngine::Turso,
                         Arc::new(arrow_schema::Schema::empty()),
                     )
@@ -696,10 +701,12 @@ impl DataAccelerator for TursoAccelerator {
         let conn = pool.connect().await?;
         let escaped = table_name.replace('"', "\"\"");
         let drop_sql = format!("DROP TABLE IF EXISTS \"{escaped}\"");
-        conn.execute(&drop_sql, ()).await.map_err(|e| {
-            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-        })?;
-        tracing::info!("Dropped Turso table '{table_name}' for schema recreation (file_update mode)");
+        conn.execute(&drop_sql, ())
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        tracing::info!(
+            "Dropped Turso table '{table_name}' for schema recreation (file_update mode)"
+        );
         Ok(())
     }
 }

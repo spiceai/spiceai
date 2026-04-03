@@ -434,7 +434,7 @@ fn validate_distributed_engine(
 
 /// Converts a runtime `Engine` to a snapshot `AccelerationEngine`.
 ///
-/// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow, PostgreSQL).
+/// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow, `PostgreSQL`).
 fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
     match engine {
         #[cfg(feature = "duckdb")]
@@ -1553,9 +1553,7 @@ impl DataFusion {
         //
         // Normalize Dictionary types in refresh_schema the same way create_accelerator_table
         // does, so that Dictionary→value type normalization doesn't trigger a false mismatch.
-        if acceleration_settings.mode == Mode::FileUpdate
-            && refresh_mode != RefreshMode::Disabled
-        {
+        if acceleration_settings.mode == Mode::FileUpdate && refresh_mode != RefreshMode::Disabled {
             let existing_schema = accelerated_table_provider.schema();
             let needs_dict_normalization = matches!(
                 acceleration_settings.engine.to_unpartitioned(),
@@ -1578,7 +1576,8 @@ impl DataFusion {
 
                 // Snapshot before recreating (best-effort)
                 if let Ok(layout) = get_acceleration_layout(dataset).await
-                    && let Some(accel_engine) = engine_to_acceleration_engine(acceleration_settings.engine)
+                    && let Some(accel_engine) =
+                        engine_to_acceleration_engine(acceleration_settings.engine)
                 {
                     dataaccelerator::snapshots::snapshot_before_recreate(
                         &acceleration_settings,
@@ -3771,12 +3770,8 @@ mod tests {
 
         #[test]
         fn nullability_changed_is_incompatible() {
-            let existing = Schema::new(vec![
-                Field::new("id", DataType::Int64, true),
-            ]);
-            let new = Schema::new(vec![
-                Field::new("id", DataType::Int64, false),
-            ]);
+            let existing = Schema::new(vec![Field::new("id", DataType::Int64, true)]);
+            let new = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
             assert!(!is_schema_additively_compatible(&existing, &new));
         }
     }

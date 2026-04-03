@@ -18,7 +18,10 @@ use std::sync::Arc;
 
 use crate::{
     component::dataset::acceleration::{Engine, Mode},
-    dataaccelerator::{FilePathError, snapshots::{download_snapshot_if_needed, snapshot_before_recreate}},
+    dataaccelerator::{
+        FilePathError,
+        snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
+    },
     datafusion::udf::deny_spice_specific_functions,
     make_spice_data_directory,
     parameters::ParameterSpec,
@@ -33,8 +36,7 @@ use datafusion::{
 };
 use datafusion_table_providers::{
     sql::db_connection_pool::{
-        sqlitepool::SqliteConnectionPool,
-        dbconnection::sqliteconn::SqliteConnection,
+        dbconnection::sqliteconn::SqliteConnection, sqlitepool::SqliteConnectionPool,
     },
     sqlite::{SqliteTableProviderFactory, write::SqliteTableWriter},
 };
@@ -269,7 +271,9 @@ impl DataAccelerator for SqliteAccelerator {
                     snapshot_before_recreate(
                         acceleration,
                         &source.name().to_string(),
-                        runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(&path)),
+                        runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(
+                            &path,
+                        )),
                         AccelerationEngine::Sqlite,
                         Arc::new(arrow_schema::Schema::empty()),
                     )
@@ -404,12 +408,14 @@ impl DataAccelerator for SqliteAccelerator {
         let escaped = table.replace('"', "\"\"");
         conn.conn
             .call(move |conn| {
-                conn.execute(&format!("DROP TABLE IF EXISTS \"{escaped}\""), [])?;;
+                conn.execute(&format!("DROP TABLE IF EXISTS \"{escaped}\""), [])?;
                 Ok::<(), rusqlite::Error>(())
             })
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-        tracing::info!("Dropped SQLite table '{table_name}' for schema recreation (file_update mode)");
+        tracing::info!(
+            "Dropped SQLite table '{table_name}' for schema recreation (file_update mode)"
+        );
         Ok(())
     }
 }

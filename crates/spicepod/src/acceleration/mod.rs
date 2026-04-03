@@ -492,8 +492,8 @@ mod tests {
         for mode in [Mode::Memory, Mode::File, Mode::FileCreate, Mode::FileUpdate] {
             let s = mode.to_string();
             let yaml = format!("mode: {s}");
-            let accel: Acceleration = yaml::from_str(&yaml)
-                .unwrap_or_else(|_| panic!("should parse mode '{s}'"));
+            let accel: Acceleration =
+                yaml::from_str(&yaml).unwrap_or_else(|_| panic!("should parse mode '{s}'"));
             assert_eq!(accel.mode, mode, "round-trip failed for mode '{s}'");
         }
     }
