@@ -48,26 +48,6 @@ use datafusion::catalog::CatalogProviderList;
 use crate::component::dataset::acceleration::{Acceleration as RuntimeAcceleration, Mode};
 use crate::dataaccelerator::AccelerationSource;
 
-/// Coerce nanosecond timestamp fields to microsecond precision.
-///
-/// Iceberg v2 does not support `timestamp_ns`. `DataFusion`'s SQL parser maps
-/// `TIMESTAMP` to `Timestamp(Nanosecond, ...)` by default, so we downgrade to
-/// microsecond before converting to Iceberg schema.
-fn coerce_timestamps_to_microsecond(schema: &Schema) -> Arc<Schema> {
-    let fields: Vec<Field> = schema
-        .fields()
-        .iter()
-        .map(|f| match f.data_type() {
-            DataType::Timestamp(TimeUnit::Nanosecond, tz) => f
-                .as_ref()
-                .clone()
-                .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, tz.clone())),
-            _ => f.as_ref().clone(),
-        })
-        .collect();
-    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
-}
-
 /// Creates a result schema for DDL operations (single "result" column).
 fn ddl_result_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
@@ -475,8 +455,8 @@ impl ExecutionPlan for IcebergCreateTableExec {
                 )));
             };
 
-            // Coerce nanosecond timestamps to microsecond for Iceberg v2 compatibility
-            let arrow_schema = coerce_timestamps_to_microsecond(&arrow_schema);
+            // Coerce Arrow types to Iceberg-compatible equivalents
+            let arrow_schema = Arc::new(super::coerce_arrow_schema_for_iceberg_v2(&arrow_schema));
 
             // Convert Arrow schema to Iceberg schema
             let iceberg_schema =
