@@ -2842,7 +2842,9 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
         return match partition_exprs.as_slice() {
             [] => None,
             [single] => Some(single.clone()),
-            _ => Some(format!("({})", partition_exprs.join(", "))),
+            _ => unreachable!(
+                "Multi-expression partition expressions are not supported yet: https://github.com/spiceai/spiceai/issues/9937"
+            ),
         };
     }
 
