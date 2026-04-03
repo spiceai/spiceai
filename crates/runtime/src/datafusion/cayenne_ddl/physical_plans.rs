@@ -38,7 +38,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{RecordBatch, StringArray};
+use arrow::array::{RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::CayenneTableProviderBuilder;
 use cayenne::metadata::CreateTableOptions;
@@ -1126,7 +1126,7 @@ impl DistributedCayenneDeleteExec {
         filter_sql: Option<String>,
         input: Arc<dyn ExecutionPlan>,
     ) -> Self {
-        let schema = ddl_result_schema();
+        let schema = dml_count_schema();
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
@@ -1189,7 +1189,7 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
         let table_name = self.table_name.clone();
         let executor_registry = self.executor_registry.clone();
         let filter_sql = self.filter_sql.clone();
-        let result_schema = ddl_result_schema();
+        let result_schema = dml_count_schema();
 
         let stream = futures::stream::once(async move {
             let Some(ref registry) = executor_registry else {
@@ -1203,17 +1203,12 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
             }
             forward_dml_to_executors(registry, &sql).await?;
 
-            RecordBatch::try_new(
-                result_schema,
-                vec![Arc::new(StringArray::from(vec![format!(
-                    "DELETE from '{table_name}' forwarded"
-                )]))],
-            )
-            .map_err(Into::into)
+            RecordBatch::try_new(result_schema, vec![Arc::new(UInt64Array::from(vec![0u64]))])
+                .map_err(Into::into)
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            ddl_result_schema(),
+            dml_count_schema(),
             stream,
         )))
     }
@@ -1253,7 +1248,7 @@ impl DistributedCayenneUpdateExec {
         assignments_sql: Vec<(String, String)>,
         input: Arc<dyn ExecutionPlan>,
     ) -> Self {
-        let schema = ddl_result_schema();
+        let schema = dml_count_schema();
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
             Partitioning::UnknownPartitioning(1),
@@ -1319,7 +1314,7 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
         let executor_registry = self.executor_registry.clone();
         let filter_sql = self.filter_sql.clone();
         let assignments_sql = self.assignments_sql.clone();
-        let result_schema = ddl_result_schema();
+        let result_schema = dml_count_schema();
 
         let stream = futures::stream::once(async move {
             let Some(ref registry) = executor_registry else {
@@ -1343,17 +1338,12 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
             }
             forward_dml_to_executors(registry, &sql).await?;
 
-            RecordBatch::try_new(
-                result_schema,
-                vec![Arc::new(StringArray::from(vec![format!(
-                    "UPDATE on '{table_name}' forwarded"
-                )]))],
-            )
-            .map_err(Into::into)
+            RecordBatch::try_new(result_schema, vec![Arc::new(UInt64Array::from(vec![0u64]))])
+                .map_err(Into::into)
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            ddl_result_schema(),
+            dml_count_schema(),
             stream,
         )))
     }
@@ -1562,6 +1552,203 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
             stream,
         )))
     }
+}
+
+/// Physical plan to forward `MERGE` DML operations to Cayenne tables
+/// across relevant executors in distributed mode.
+///
+/// Validates partition compatibility between source and target tables,
+/// then forwards the original MERGE SQL verbatim to all executors.
+pub struct DistributedCayenneMergeExec {
+    target_table: datafusion::sql::TableReference,
+    source_table: datafusion::sql::TableReference,
+    on_keys: Vec<(String, String)>,
+    /// Original MERGE SQL to forward to executors.
+    original_sql: String,
+    executor_registry: Option<Arc<ExecutorRegistry>>,
+    ctx: Arc<datafusion::prelude::SessionContext>,
+    properties: PlanProperties,
+}
+
+impl fmt::Debug for DistributedCayenneMergeExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DistributedCayenneMergeExec")
+            .field("target_table", &self.target_table.to_string())
+            .field("source_table", &self.source_table.to_string())
+            .field("on_keys", &self.on_keys)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DistributedCayenneMergeExec {
+    #[must_use]
+    pub fn new(
+        target_table: datafusion::sql::TableReference,
+        source_table: datafusion::sql::TableReference,
+        on_keys: Vec<(String, String)>,
+        original_sql: String,
+        executor_registry: Option<Arc<ExecutorRegistry>>,
+        ctx: Arc<datafusion::prelude::SessionContext>,
+    ) -> Self {
+        let schema = dml_count_schema();
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        Self {
+            target_table,
+            source_table,
+            on_keys,
+            original_sql,
+            executor_registry,
+            ctx,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for DistributedCayenneMergeExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "DistributedCayenneMergeExec: target={}, source={}",
+            self.target_table, self.source_table
+        )
+    }
+}
+
+impl ExecutionPlan for DistributedCayenneMergeExec {
+    fn name(&self) -> &'static str {
+        "DistributedCayenneMergeExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return Err(DataFusionError::Internal(
+                "DistributedCayenneMergeExec has no children".to_string(),
+            ));
+        }
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
+        let target_table = self.target_table.clone();
+        let source_table = self.source_table.clone();
+        let on_keys = self.on_keys.clone();
+        let original_sql = self.original_sql.clone();
+        let executor_registry = self.executor_registry.clone();
+        let ctx = Arc::clone(&self.ctx);
+        let result_schema = dml_count_schema();
+
+        let stream = futures::stream::once(async move {
+            let Some(ref registry) = executor_registry else {
+                return Err(DataFusionError::Execution(format!(
+                    "MERGE on '{target_table}' cannot be forwarded: no executor registry available"
+                )));
+            };
+
+            // Validate partition compatibility between source and target.
+            validate_partition_compatibility(
+                registry,
+                &ctx,
+                &target_table,
+                &source_table,
+                &on_keys,
+            )
+            .await?;
+
+            // Forward the original MERGE SQL to all executors.
+            forward_dml_to_executors(registry, &original_sql).await?;
+
+            RecordBatch::try_new(result_schema, vec![Arc::new(UInt64Array::from(vec![0u64]))])
+                .map_err(Into::into)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            dml_count_schema(),
+            stream,
+        )))
+    }
+}
+
+/// Validate that source and target tables have compatible partition layouts
+/// for distributed MERGE execution.
+///
+/// Requirements:
+/// 1. Both tables must have a partition expression
+/// 2. The partition expressions must be identical
+/// 3. The partition column must appear in the ON clause join keys
+async fn validate_partition_compatibility(
+    registry: &ExecutorRegistry,
+    ctx: &datafusion::prelude::SessionContext,
+    target_table: &datafusion::sql::TableReference,
+    source_table: &datafusion::sql::TableReference,
+    on_keys: &[(String, String)],
+) -> DFResult<()> {
+    let target_partition = crate::datafusion::DataFusion::get_table_partition_expr_from_ctx(
+        ctx,
+        registry,
+        target_table,
+    )
+    .await?;
+    let source_partition = crate::datafusion::DataFusion::get_table_partition_expr_from_ctx(
+        ctx,
+        registry,
+        source_table,
+    )
+    .await?;
+
+    let Some(target_part) = target_partition else {
+        return Err(DataFusionError::Plan(format!(
+            "Distributed MERGE requires target table '{target_table}' to have PARTITION BY configured"
+        )));
+    };
+    let Some(source_part) = source_partition else {
+        return Err(DataFusionError::Plan(format!(
+            "Distributed MERGE requires source table '{source_table}' to have PARTITION BY configured"
+        )));
+    };
+
+    if target_part != source_part {
+        return Err(DataFusionError::Plan(format!(
+            "Distributed MERGE requires identical partition expressions on source and target. \
+             Target partition: '{target_part}', Source partition: '{source_part}'"
+        )));
+    }
+
+    // Check that the partition column appears in the ON keys (target side).
+    let partition_in_on_keys = on_keys
+        .iter()
+        .any(|(target_col, _)| *target_col == target_part);
+    if !partition_in_on_keys {
+        return Err(DataFusionError::Plan(format!(
+            "Distributed MERGE requires the partition column '{target_part}' to appear in the \
+             ON clause join keys for correct executor-local execution"
+        )));
+    }
+
+    Ok(())
 }
 
 /// Schema for DML count results — single `count` column with `UInt64` type,

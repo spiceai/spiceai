@@ -182,22 +182,18 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
                 .expect("format explain agg")
                 .to_string();
             insta::assert_snapshot!(agg_plan_fmt, @r#"
-            +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | plan_type     | plan                                                                                                                                                                         |
-            +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | logical_plan  | Projection: count(Int64(1)) AS total_rows, avg(test_data.score) AS avg_score, min(test_data.age) AS min_age, max(test_data.age) AS max_age                                   |
-            |               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1)), avg(CAST(test_data.score AS Float64)), min(test_data.age), max(test_data.age)]]                                           |
-            |               |     TableScan: test_data projection=[age, score], partial_filters=[bucket(Int64(3), id) = Utf8("0") OR bucket(Int64(3), id) = Utf8("1") OR bucket(Int64(3), id) = Utf8("2")] |
-            | physical_plan | ProjectionExec: expr=[count(Int64(1))@0 as total_rows, avg(test_data.score)@1 as avg_score, min(test_data.age)@2 as min_age, max(test_data.age)@3 as max_age]                |
-            |               |   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1)), avg(test_data.score), min(test_data.age), max(test_data.age)]                                                    |
-            |               |     CoalescePartitionsExec                                                                                                                                                   |
-            |               |       AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1)), avg(test_data.score), min(test_data.age), max(test_data.age)]                                              |
-            |               |         RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                 |
-            |               |           CooperativeExec                                                                                                                                                    |
-            |               |             BytesProcessedExec                                                                                                                                               |
-            |               |               FlightSqlExec sql=SELECT age, score FROM test_data WHERE ((((bucket(3, "id") = '0') OR (bucket(3, "id") = '1')) OR (bucket(3, "id") = '2')))                   |
-            |               |                                                                                                                                                                              |
-            +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+            +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+            | plan_type     | plan                                                                                                                                                                                                                                                                                                                    |
+            +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+            | logical_plan  | Projection: count(Int64(1)) AS total_rows, avg(test_data.score) AS avg_score, min(test_data.age) AS min_age, max(test_data.age) AS max_age                                                                                                                                                                              |
+            |               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1)), avg(CAST(test_data.score AS Float64)), min(test_data.age), max(test_data.age)]]                                                                                                                                                                                      |
+            |               |     TableScan: test_data projection=[age, score], partial_filters=[bucket(Int64(3), id) = Utf8("0") OR bucket(Int64(3), id) = Utf8("1") OR bucket(Int64(3), id) = Utf8("2")]                                                                                                                                            |
+            | physical_plan | ProjectionExec: expr=[count(Int64(1))@0 as total_rows, avg(test_data.score)@1 as avg_score, min(test_data.age)@2 as min_age, max(test_data.age)@3 as max_age]                                                                                                                                                           |
+            |               |   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1)), avg(test_data.score), min(test_data.age), max(test_data.age)]                                                                                                                                                                                               |
+            |               |     CoalescePartitionsExec                                                                                                                                                                                                                                                                                              |
+            |               |       PartialAggregationFlightSqlExec sql=SELECT COUNT(1) AS "__agg_0", SUM(CAST("score" AS DOUBLE)) AS "__agg_1", COUNT(CAST("score" AS DOUBLE)) AS "__agg_2", MIN("age") AS "__agg_3", MAX("age") AS "__agg_4" FROM test_data WHERE (((bucket(3, "id") = '0') OR (bucket(3, "id") = '1')) OR (bucket(3, "id") = '2')) |
+            |               |                                                                                                                                                                                                                                                                                                                         |
+            +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
             "#);
 
             let agg = harness.query(aggregation_sql).await?;
@@ -604,37 +600,70 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
             wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
             wait_for_row_count(&harness, "categories", 10, Duration::from_secs(60)).await?;
 
+            // Wait for partition metadata to be fully initialized and assigned
+            // to executors. Poll until the EXPLAIN shows a partitioned plan
+            // (Union with bucket filters) rather than an EmptyRelation.
             let join_sql = "SELECT t.id, t.name, c.category, c.rating \
                             FROM test_data t JOIN categories c ON t.id = c.id \
                             ORDER BY t.id";
 
-            let plan = harness.explain(join_sql).await?;
+            let start = tokio::time::Instant::now();
+            let plan = loop {
+                let plan = harness.explain(join_sql).await?;
+                let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
+                    .expect("format explain")
+                    .to_string();
+                if plan_fmt.contains("UnionExec") || plan_fmt.contains("Union") {
+                    break plan;
+                }
+                if start.elapsed() > Duration::from_secs(30) {
+                    panic!(
+                        "Timed out waiting for partitioned EXPLAIN plan. Got:\n{plan_fmt}"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            };
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                 .expect("format explain")
                 .to_string();
             insta::assert_snapshot!(plan_fmt, @r#"
-            +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | plan_type     | plan                                                                                                                                                                                                                            |
-            +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | logical_plan  | Sort: t.id ASC NULLS LAST                                                                                                                                                                                                       |
-            |               |   Projection: t.id, t.name, c.category, c.rating                                                                                                                                                                                |
-            |               |     Inner Join: t.id = c.id                                                                                                                                                                                                     |
-            |               |       SubqueryAlias: t                                                                                                                                                                                                          |
-            |               |         TableScan: test_data projection=[id, name], partial_filters=[bucket(Int64(4), id) = Utf8("0") OR bucket(Int64(4), id) = Utf8("1") OR bucket(Int64(4), id) = Utf8("2") OR bucket(Int64(4), id) = Utf8("3")]              |
-            |               |       SubqueryAlias: c                                                                                                                                                                                                          |
-            |               |         TableScan: categories projection=[id, category, rating], partial_filters=[bucket(Int64(4), id) = Utf8("0") OR bucket(Int64(4), id) = Utf8("1") OR bucket(Int64(4), id) = Utf8("2") OR bucket(Int64(4), id) = Utf8("3")] |
-            | physical_plan | SortPreservingMergeExec: [id@0 ASC NULLS LAST]                                                                                                                                                                                  |
-            |               |   SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                                                                            |
-            |               |     HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[id@0, name@1, category@3, rating@4]                                                                      |
-            |               |       CooperativeExec                                                                                                                                                                                                           |
-            |               |         BytesProcessedExec                                                                                                                                                                                                      |
-            |               |           FlightSqlExec sql=SELECT id, name FROM test_data WHERE (((((bucket(4, "id") = '0') OR (bucket(4, "id") = '1')) OR (bucket(4, "id") = '2')) OR (bucket(4, "id") = '3')))                                               |
-            |               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                                                      |
-            |               |         CooperativeExec                                                                                                                                                                                                         |
-            |               |           BytesProcessedExec                                                                                                                                                                                                    |
-            |               |             FlightSqlExec sql=SELECT id, category, rating FROM categories WHERE (((((bucket(4, "id") = '0') OR (bucket(4, "id") = '1')) OR (bucket(4, "id") = '2')) OR (bucket(4, "id") = '3')))                                |
-            |               |                                                                                                                                                                                                                                 |
-            +---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+            +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------+
+            | plan_type     | plan                                                                                                                                                        |
+            +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------+
+            | logical_plan  | Sort: t.id ASC NULLS LAST                                                                                                                                   |
+            |               |   Projection: t.id, t.name, c.category, c.rating                                                                                                            |
+            |               |     Inner Join: t.id = c.id                                                                                                                                 |
+            |               |       SubqueryAlias: t                                                                                                                                      |
+            |               |         SubqueryAlias: test_data                                                                                                                            |
+            |               |           Union                                                                                                                                             |
+            |               |             TableScan: test_data projection=[id, name], partial_filters=[bucket(Int64(4), id) = Utf8("0") OR bucket(Int64(4), id) = Utf8("2")]              |
+            |               |             TableScan: test_data projection=[id, name], partial_filters=[bucket(Int64(4), id) = Utf8("1") OR bucket(Int64(4), id) = Utf8("3")]              |
+            |               |       SubqueryAlias: c                                                                                                                                      |
+            |               |         SubqueryAlias: categories                                                                                                                           |
+            |               |           Union                                                                                                                                             |
+            |               |             TableScan: categories projection=[id, category, rating], partial_filters=[bucket(Int64(4), id) = Utf8("1") OR bucket(Int64(4), id) = Utf8("3")] |
+            |               |             TableScan: categories projection=[id, category, rating], partial_filters=[bucket(Int64(4), id) = Utf8("0") OR bucket(Int64(4), id) = Utf8("2")] |
+            | physical_plan | SortPreservingMergeExec: [id@0 ASC NULLS LAST]                                                                                                              |
+            |               |   SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                        |
+            |               |     HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(id@0, id@0)], projection=[id@0, name@1, category@3, rating@4]  |
+            |               |       CoalescePartitionsExec                                                                                                                                |
+            |               |         UnionExec                                                                                                                                           |
+            |               |           CooperativeExec                                                                                                                                   |
+            |               |             BytesProcessedExec                                                                                                                              |
+            |               |               FlightSqlExec sql=SELECT id, name FROM test_data WHERE (((bucket(4, "id") = '0') OR (bucket(4, "id") = '2')))                                 |
+            |               |           CooperativeExec                                                                                                                                   |
+            |               |             BytesProcessedExec                                                                                                                              |
+            |               |               FlightSqlExec sql=SELECT id, name FROM test_data WHERE (((bucket(4, "id") = '1') OR (bucket(4, "id") = '3')))                                 |
+            |               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=2                                                                                  |
+            |               |         UnionExec                                                                                                                                           |
+            |               |           CooperativeExec                                                                                                                                   |
+            |               |             BytesProcessedExec                                                                                                                              |
+            |               |               FlightSqlExec sql=SELECT id, category, rating FROM categories WHERE (((bucket(4, "id") = '1') OR (bucket(4, "id") = '3')))                    |
+            |               |           CooperativeExec                                                                                                                                   |
+            |               |             BytesProcessedExec                                                                                                                              |
+            |               |               FlightSqlExec sql=SELECT id, category, rating FROM categories WHERE (((bucket(4, "id") = '0') OR (bucket(4, "id") = '2')))                    |
+            |               |                                                                                                                                                             |
+            +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------+
             "#);
 
             let rows = harness.query(join_sql).await?;
@@ -654,6 +683,96 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
             | 9  | Chris Martin | A        | 4.6    |
             | 10 | Anna Garcia  | C        | 2.7    |
             +----+--------------+----------+--------+
+            ");
+
+            harness.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// Test that `refresh_table()` on the scheduler forwards the refresh command to executors
+/// via the `RefreshDataset` control stream message, rather than failing with a
+/// "channel closed" error.
+///
+/// Verifies:
+/// - The scheduler detects it is in scheduler mode and forwards to executors
+/// - Executors receive the `RefreshDataset` command and trigger a local refresh
+/// - Data remains correct after the distributed refresh
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("runtime=debug,info"))
+        .with_ansi(true)
+        .try_init();
+
+    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
+        verify_env_secret_exists(env_var)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let csv_path = csv_tempdir.path().join("test_data.csv");
+    tokio::fs::write(&csv_path, TEST_DATA_CSV)
+        .await
+        .expect("write test data");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+            let app = AppBuilder::new("test_refresh_forwarding")
+                .with_dataset(make_memory_accelerated_dataset(
+                    format!("file:{}", csv_path.display()),
+                    "test_data",
+                    3,
+                    "id",
+                ))
+                .with_runtime(SpicepodRuntime {
+                    scheduler: Some(make_named_scheduler_config(
+                        "test_distributed_refresh_forwarding",
+                    )),
+                    ..SpicepodRuntime::default()
+                })
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(app)
+                .executors(1)
+                .start()
+                .await?;
+
+            harness.wait_for_executors(Duration::from_secs(15)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+
+            // Trigger refresh from the scheduler. Previously this would fail with
+            // "the refresh worker is no longer running. channel closed" because the
+            // scheduler doesn't run local refresh workers. Now it forwards to executors.
+            let table_ref = datafusion::sql::TableReference::parse_str("test_data");
+            harness
+                .scheduler
+                .datafusion()
+                .refresh_table(&table_ref, None)
+                .await
+                .expect("refresh_table on scheduler should forward to executors");
+
+            // Allow time for the executor to process the refresh command.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            // Verify data is still correct after refresh.
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(30)).await?;
+
+            let rows = harness
+                .query("SELECT COUNT(*) as cnt FROM test_data")
+                .await?;
+            let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
+            insta::assert_snapshot!(rows_fmt, @r"
+            +-----+
+            | cnt |
+            +-----+
+            | 10  |
+            +-----+
             ");
 
             harness.shutdown().await;

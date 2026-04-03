@@ -705,3 +705,128 @@ impl UserDefinedLogicalNodeCore for DistributedCayenneInsertNode {
         })
     }
 }
+
+/// Logical plan node to forward `MERGE` DML operations to Cayenne tables
+/// across relevant executors in distributed mode.
+///
+/// Stores the original MERGE SQL verbatim for forwarding, plus decomposed
+/// fields for partition compatibility validation and `explain` output.
+#[derive(Debug, Clone)]
+pub struct DistributedCayenneMergeNode {
+    /// Fully qualified target table reference.
+    pub target_table: TableReference,
+    /// Fully qualified source table reference.
+    pub source_table: TableReference,
+    /// Scan qualifier for the target side (alias or table name).
+    pub target_qualifier: String,
+    /// Scan qualifier for the source side (alias or table name).
+    pub source_qualifier: String,
+    /// Equi-join key pairs as `(target_col, source_col)` bare column names.
+    pub on_keys: Vec<(String, String)>,
+    /// SET assignments as `(target_col, value_sql)` pairs.
+    pub assignments: Vec<(String, String)>,
+    /// Original MERGE SQL text, forwarded verbatim to executors.
+    pub original_sql: String,
+    /// Output schema: single `count: UInt64` column.
+    pub output_schema: DFSchemaRef,
+}
+
+impl DistributedCayenneMergeNode {
+    /// Create a new `DistributedCayenneMergeNode`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the output schema cannot be constructed.
+    pub fn try_new(
+        target_table: TableReference,
+        source_table: TableReference,
+        target_qualifier: String,
+        source_qualifier: String,
+        on_keys: Vec<(String, String)>,
+        assignments: Vec<(String, String)>,
+        original_sql: String,
+    ) -> datafusion::error::Result<Self> {
+        let output_schema = Arc::new(datafusion::common::DFSchema::try_from(Schema::new(vec![
+            Field::new("count", DataType::UInt64, false),
+        ]))?);
+
+        Ok(Self {
+            target_table,
+            source_table,
+            target_qualifier,
+            source_qualifier,
+            on_keys,
+            assignments,
+            original_sql,
+            output_schema,
+        })
+    }
+}
+
+impl Hash for DistributedCayenneMergeNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.target_table.hash(state);
+        self.source_table.hash(state);
+        self.target_qualifier.hash(state);
+        self.source_qualifier.hash(state);
+        self.on_keys.hash(state);
+        self.assignments.hash(state);
+        self.original_sql.hash(state);
+    }
+}
+
+impl PartialEq for DistributedCayenneMergeNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.target_table == other.target_table
+            && self.source_table == other.source_table
+            && self.target_qualifier == other.target_qualifier
+            && self.source_qualifier == other.source_qualifier
+            && self.on_keys == other.on_keys
+            && self.assignments == other.assignments
+            && self.original_sql == other.original_sql
+    }
+}
+
+impl Eq for DistributedCayenneMergeNode {}
+
+impl PartialOrd for DistributedCayenneMergeNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.target_table
+            .to_string()
+            .partial_cmp(&other.target_table.to_string())
+    }
+}
+
+impl UserDefinedLogicalNodeCore for DistributedCayenneMergeNode {
+    fn name(&self) -> &'static str {
+        "DistributedCayenneMerge"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![]
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        &self.output_schema
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        vec![]
+    }
+
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "DistributedCayenneMerge: target={}, source={}, keys={:?}",
+            self.target_table, self.source_table, self.on_keys
+        )
+    }
+
+    fn with_exprs_and_inputs(
+        &self,
+        _exprs: Vec<Expr>,
+        _inputs: Vec<LogicalPlan>,
+    ) -> datafusion::error::Result<Self> {
+        Ok(self.clone())
+    }
+}

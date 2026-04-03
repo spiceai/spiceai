@@ -61,9 +61,14 @@ pub struct DeletionExec {
 }
 
 impl DeletionExec {
-    pub fn new(deletion_sink: Arc<dyn DeletionSink>, schema: &SchemaRef) -> Self {
+    pub fn new(deletion_sink: Arc<dyn DeletionSink>, _schema: &SchemaRef) -> Self {
+        let count_schema = Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::UInt64,
+            false,
+        )]));
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(schema)),
+            EquivalenceProperties::new(count_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -253,7 +258,7 @@ impl TableProvider for DeletionTableProviderAdapter {
         state: &dyn Session,
         filters: Vec<Expr>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        TableProvider::delete_from(self.source.as_ref(), state, filters).await
+        DeletionTableProvider::delete_from(self.source.as_ref(), state, &filters).await
     }
 
     async fn update(

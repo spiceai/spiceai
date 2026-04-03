@@ -32,10 +32,30 @@ use arrow::array::{Float64Array, Int64Array, RecordBatch};
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
 use runtime::Runtime;
-use runtime::config::Config;
+use runtime::cluster::ResolvedClusterConfig;
+use runtime::config::{ClusterConfig, ClusterRole, Config};
 use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
 use spicepod::param::Params;
+
+/// Creates a [`ResolvedClusterConfig`] with Executor role for tests.
+///
+/// Cayenne catalogs require distributed mode. Using the Executor role enables
+/// distributed-mode checks in the planner while avoiding scheduler-only
+/// distributed DML rewrites in these tests; Cayenne DDL rewriting via
+/// `CayenneDdlAnalyzerRule` is not gated on the cluster role.
+fn test_cluster_config() -> ResolvedClusterConfig {
+    ResolvedClusterConfig::try_new(ClusterConfig {
+        role: Some(ClusterRole::Executor),
+        allow_insecure_connections: true,
+        node_advertise_address: Some("127.0.0.1".to_string()),
+        ..Default::default()
+    })
+    .expect(
+        "failed to build Cayenne catalog DDL test ResolvedClusterConfig; expected Executor role, \
+         allow_insecure_connections = true, and node_advertise_address to be set",
+    )
+}
 
 /// Helper to run a SQL query against the runtime and collect results.
 async fn run_query(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, String> {
@@ -118,6 +138,7 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -143,8 +164,9 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
                     id BIGINT NOT NULL,
                     name VARCHAR NOT NULL,
                     email VARCHAR,
-                    age BIGINT
-                )",
+                    age BIGINT,
+                    PRIMARY KEY (id)
+                ) PARTITION BY id",
             )
             .await?;
 
@@ -268,121 +290,10 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             );
 
             // -----------------------------------------------------------------
-            // Step 6: UPDATE single row — modify a column value
+            // Step 6: INSERT after deletes — verify correctness
             // -----------------------------------------------------------------
-            exec(
-                &rt,
-                "UPDATE test_cat.myschema.users SET age = 31 WHERE id = 1",
-            )
-            .await?;
-
-            // Alice's age should now be 31 (was 30).
-            let batches = run_query(
-                &rt,
-                "SELECT id, name, age FROM test_cat.myschema.users WHERE id = 1",
-            )
-            .await?;
-            assert_batches_eq!(
-                &[
-                    "+----+-------+-----+",
-                    "| id | name  | age |",
-                    "+----+-------+-----+",
-                    "| 1  | Alice | 31  |",
-                    "+----+-------+-----+",
-                ],
-                &batches
-            );
-
-            // Row count should remain the same after UPDATE.
-            let count =
-                query_scalar_i64(&rt, "SELECT COUNT(*) FROM test_cat.myschema.users").await?;
-            assert_eq!(count, 4, "UPDATE should not change row count");
-
-            // -----------------------------------------------------------------
-            // Step 7: UPDATE multiple rows — bulk modification
-            // -----------------------------------------------------------------
-            exec(
-                &rt,
-                "UPDATE test_cat.myschema.users SET age = age + 10 WHERE age > 30",
-            )
-            .await?;
-
-            // Alice(31→41), Diana(28 unchanged), Frank(40→50), Grace(33→43)
-            let batches = run_query(
-                &rt,
-                "SELECT id, name, age FROM test_cat.myschema.users ORDER BY id",
-            )
-            .await?;
-            assert_batches_eq!(
-                &[
-                    "+----+-------+-----+",
-                    "| id | name  | age |",
-                    "+----+-------+-----+",
-                    "| 1  | Alice | 41  |",
-                    "| 4  | Diana | 28  |",
-                    "| 6  | Frank | 50  |",
-                    "| 7  | Grace | 43  |",
-                    "+----+-------+-----+",
-                ],
-                &batches
-            );
-
-            // -----------------------------------------------------------------
-            // Step 8: UPDATE with NULL — set a column to NULL
-            // -----------------------------------------------------------------
-            exec(
-                &rt,
-                "UPDATE test_cat.myschema.users SET email = NULL WHERE id = 4",
-            )
-            .await?;
-
-            let batches = run_query(
-                &rt,
-                "SELECT id, name, email FROM test_cat.myschema.users WHERE id = 4",
-            )
-            .await?;
-            assert_batches_eq!(
-                &[
-                    "+----+-------+-------+",
-                    "| id | name  | email |",
-                    "+----+-------+-------+",
-                    "| 4  | Diana |       |",
-                    "+----+-------+-------+",
-                ],
-                &batches
-            );
-
-            // -----------------------------------------------------------------
-            // Step 9: UPDATE multiple columns at once
-            // -----------------------------------------------------------------
-            exec(
-                &rt,
-                "UPDATE test_cat.myschema.users SET name = 'Grace Updated', age = 99 WHERE id = 7",
-            )
-            .await?;
-
-            let batches = run_query(
-                &rt,
-                "SELECT id, name, age FROM test_cat.myschema.users WHERE id = 7",
-            )
-            .await?;
-            assert_batches_eq!(
-                &[
-                    "+----+---------------+-----+",
-                    "| id | name          | age |",
-                    "+----+---------------+-----+",
-                    "| 7  | Grace Updated | 99  |",
-                    "+----+---------------+-----+",
-                ],
-                &batches
-            );
-
-            // Restore ages for subsequent steps: Alice=41, Diana=28, Frank=50, Grace=99
-            // Overall state: 4 rows
-
-            // -----------------------------------------------------------------
-            // Step 10: INSERT after UPDATE — verify correctness
-            // -----------------------------------------------------------------
+            // Note: UPDATE support is not yet available for partitioned Cayenne
+            // tables (reverted in #10061). Steps 6-9 test INSERT/DELETE only.
             exec(
                 &rt,
                 "INSERT INTO test_cat.myschema.users VALUES
@@ -395,8 +306,9 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             assert_eq!(count, 5, "Expected 5 rows after inserting Heidi");
 
             // -----------------------------------------------------------------
-            // Step 11: Aggregation queries — validate computations
+            // Step 7: Aggregation queries — validate computations
             // -----------------------------------------------------------------
+            // Remaining: Alice(30), Diana(28), Frank(40), Grace(33), Heidi(29)
             let avg_age = {
                 let batches = run_query(
                     &rt,
@@ -411,16 +323,15 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
                     .expect("avg_age column")
                     .value(0)
             };
-            // Remaining: Alice(41), Diana(28), Frank(50), Grace Updated(99), Heidi(29)
-            // Average = (41 + 28 + 50 + 99 + 29) / 5 = 247 / 5 = 49.4
+            // Average = (30 + 28 + 40 + 33 + 29) / 5 = 160 / 5 = 32.0
             assert!(
-                (avg_age - 49.4).abs() < f64::EPSILON,
-                "Expected AVG(age) = 49.4, got {avg_age}"
+                (avg_age - 32.0).abs() < f64::EPSILON,
+                "Expected AVG(age) = 32.0, got {avg_age}"
             );
 
             let max_age =
                 query_scalar_i64(&rt, "SELECT MAX(age) FROM test_cat.myschema.users").await?;
-            assert_eq!(max_age, 99, "Expected MAX(age) = 99 (Grace Updated)");
+            assert_eq!(max_age, 40, "Expected MAX(age) = 40 (Frank)");
 
             let min_age =
                 query_scalar_i64(&rt, "SELECT MIN(age) FROM test_cat.myschema.users").await?;
@@ -428,10 +339,10 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
 
             let sum_age =
                 query_scalar_i64(&rt, "SELECT SUM(age) FROM test_cat.myschema.users").await?;
-            assert_eq!(sum_age, 247, "Expected SUM(age) = 247");
+            assert_eq!(sum_age, 160, "Expected SUM(age) = 160");
 
             // -----------------------------------------------------------------
-            // Step 12: NULL handling validation
+            // Step 8: NULL handling validation
             // -----------------------------------------------------------------
             exec(
                 &rt,
@@ -446,10 +357,10 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
 
             let count_email =
                 query_scalar_i64(&rt, "SELECT COUNT(email) FROM test_cat.myschema.users").await?;
-            // Ivan has NULL email, Diana has NULL email (set in Step 8); all others have emails.
+            // Ivan has NULL email; all others have emails.
             assert_eq!(
-                count_email, 4,
-                "COUNT(email) should be 4 (Ivan and Diana have NULL email)"
+                count_email, 5,
+                "COUNT(email) should be 5 (only Ivan has NULL email)"
             );
 
             // Query rows where email IS NULL.
@@ -460,18 +371,17 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             .await?;
             assert_batches_eq!(
                 &[
-                    "+----+-------+",
-                    "| id | name  |",
-                    "+----+-------+",
-                    "| 4  | Diana |",
-                    "| 9  | Ivan  |",
-                    "+----+-------+",
+                    "+----+------+",
+                    "| id | name |",
+                    "+----+------+",
+                    "| 9  | Ivan |",
+                    "+----+------+",
                 ],
                 &batches
             );
 
             // -----------------------------------------------------------------
-            // Step 13: DELETE all remaining rows
+            // Step 9: DELETE all remaining rows
             // -----------------------------------------------------------------
             exec(&rt, "DELETE FROM test_cat.myschema.users WHERE true").await?;
 
@@ -480,7 +390,7 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             assert_eq!(count, 0, "Table should be empty after DELETE WHERE true");
 
             // -----------------------------------------------------------------
-            // Step 14: INSERT into empty table after full delete
+            // Step 10: INSERT into empty table after full delete
             // -----------------------------------------------------------------
             exec(
                 &rt,
@@ -537,6 +447,7 @@ async fn cayenne_catalog_ddl_create_if_not_exists() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -553,7 +464,7 @@ async fn cayenne_catalog_ddl_create_if_not_exists() -> Result<(), String> {
             exec(&rt, "CREATE SCHEMA cat_idempotent.s1").await?;
             exec(
                 &rt,
-                "CREATE TABLE cat_idempotent.s1.t1 (id BIGINT NOT NULL, val BIGINT)",
+                "CREATE TABLE cat_idempotent.s1.t1 (id BIGINT NOT NULL, val BIGINT) PARTITION BY id",
             )
             .await?;
 
@@ -563,7 +474,7 @@ async fn cayenne_catalog_ddl_create_if_not_exists() -> Result<(), String> {
             // CREATE TABLE IF NOT EXISTS should not fail or drop data.
             exec(
                 &rt,
-                "CREATE TABLE IF NOT EXISTS cat_idempotent.s1.t1 (id BIGINT NOT NULL, val BIGINT)",
+                "CREATE TABLE IF NOT EXISTS cat_idempotent.s1.t1 (id BIGINT NOT NULL, val BIGINT) PARTITION BY id",
             )
             .await?;
 
@@ -620,6 +531,7 @@ async fn cayenne_catalog_ddl_multiple_tables() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -642,7 +554,7 @@ async fn cayenne_catalog_ddl_multiple_tables() -> Result<(), String> {
                     product_id BIGINT NOT NULL,
                     name VARCHAR NOT NULL,
                     price DOUBLE NOT NULL
-                )",
+                ) PARTITION BY product_id",
             )
             .await?;
 
@@ -652,7 +564,7 @@ async fn cayenne_catalog_ddl_multiple_tables() -> Result<(), String> {
                     order_id BIGINT NOT NULL,
                     product_id BIGINT NOT NULL,
                     quantity BIGINT NOT NULL
-                )",
+                ) PARTITION BY order_id",
             )
             .await?;
 
@@ -772,6 +684,7 @@ async fn cayenne_catalog_ddl_drop_table() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -788,7 +701,7 @@ async fn cayenne_catalog_ddl_drop_table() -> Result<(), String> {
             exec(&rt, "CREATE SCHEMA cat_drop.ns").await?;
             exec(
                 &rt,
-                "CREATE TABLE cat_drop.ns.ephemeral (id BIGINT NOT NULL)",
+                "CREATE TABLE cat_drop.ns.ephemeral (id BIGINT NOT NULL) PARTITION BY id",
             )
             .await?;
 
@@ -813,7 +726,7 @@ async fn cayenne_catalog_ddl_drop_table() -> Result<(), String> {
             // Re-create the table — should work fine.
             exec(
                 &rt,
-                "CREATE TABLE cat_drop.ns.ephemeral (id BIGINT NOT NULL, val VARCHAR)",
+                "CREATE TABLE cat_drop.ns.ephemeral (id BIGINT NOT NULL, val VARCHAR) PARTITION BY id",
             )
             .await?;
 
@@ -865,6 +778,7 @@ async fn cayenne_catalog_ddl_primary_key_upsert() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -890,7 +804,7 @@ async fn cayenne_catalog_ddl_primary_key_upsert() -> Result<(), String> {
                     name VARCHAR NOT NULL,
                     email VARCHAR,
                     PRIMARY KEY (id)
-                )",
+                ) PARTITION BY id",
             )
             .await?;
 
@@ -1057,6 +971,7 @@ async fn cayenne_catalog_ddl_multiple_schemas() -> Result<(), String> {
             configure_test_datafusion();
             let rt = Runtime::builder()
                 .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
                 .with_runtime_config(Config::default().with_caching_disabled())
                 .build()
                 .await;
@@ -1077,12 +992,12 @@ async fn cayenne_catalog_ddl_multiple_schemas() -> Result<(), String> {
             // Create tables with the same name in different schemas.
             exec(
                 &rt,
-                "CREATE TABLE cat_schemas.finance.records (id BIGINT NOT NULL, amount DOUBLE)",
+                "CREATE TABLE cat_schemas.finance.records (id BIGINT NOT NULL, amount DOUBLE) PARTITION BY id",
             )
             .await?;
             exec(
                 &rt,
-                "CREATE TABLE cat_schemas.hr.records (id BIGINT NOT NULL, employee VARCHAR)",
+                "CREATE TABLE cat_schemas.hr.records (id BIGINT NOT NULL, employee VARCHAR) PARTITION BY id",
             )
             .await?;
 
@@ -1145,6 +1060,768 @@ async fn cayenne_catalog_ddl_multiple_schemas() -> Result<(), String> {
             assert_eq!(
                 hr_count, 2,
                 "hr.records should still have 2 rows (untouched)"
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+// =============================================================================
+// Test: MERGE INTO — matched update with aliases, expressions, no-match rows
+// =============================================================================
+
+#[tokio::test]
+async fn cayenne_catalog_merge_into() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            let catalog = make_cayenne_catalog(
+                "cat_merge",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let app = AppBuilder::new("cayenne_merge_into")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
+                .with_runtime_config(Config::default().with_caching_disabled())
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err("Timeout waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check_with_timeout(&rt, Duration::from_secs(30)).await;
+
+            exec(&rt, "CREATE SCHEMA cat_merge.s").await?;
+
+            exec(
+                &rt,
+                "CREATE TABLE cat_merge.s.inventory (
+                    id BIGINT NOT NULL,
+                    name VARCHAR NOT NULL,
+                    qty BIGINT NOT NULL
+                ) PARTITION BY id",
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "CREATE TABLE cat_merge.s.updates (
+                    id BIGINT NOT NULL,
+                    name VARCHAR NOT NULL,
+                    qty BIGINT NOT NULL
+                ) PARTITION BY id",
+            )
+            .await?;
+
+            // -----------------------------------------------------------------
+            // Seed data
+            // -----------------------------------------------------------------
+            exec(
+                &rt,
+                "INSERT INTO cat_merge.s.inventory VALUES
+                    (1, 'apple',  10),
+                    (2, 'banana', 20),
+                    (3, 'cherry', 30)",
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "INSERT INTO cat_merge.s.updates VALUES
+                    (1, 'apple',  50),
+                    (3, 'cherry', 100)",
+            )
+            .await?;
+
+            // -----------------------------------------------------------------
+            // Step 1: Basic MERGE — update qty from source
+            // -----------------------------------------------------------------
+            exec(
+                &rt,
+                "MERGE INTO cat_merge.s.inventory AS t
+                 USING cat_merge.s.updates AS s
+                 ON t.id = s.id
+                 WHEN MATCHED THEN UPDATE SET qty = s.qty",
+            )
+            .await?;
+
+            let batches = run_query(
+                &rt,
+                "SELECT id, name, qty FROM cat_merge.s.inventory ORDER BY id",
+            )
+            .await?;
+
+            assert_batches_eq!(
+                &[
+                    "+----+--------+-----+",
+                    "| id | name   | qty |",
+                    "+----+--------+-----+",
+                    "| 1  | apple  | 50  |",
+                    "| 2  | banana | 20  |",
+                    "| 3  | cherry | 100 |",
+                    "+----+--------+-----+",
+                ],
+                &batches
+            );
+
+            // -----------------------------------------------------------------
+            // Step 2: MERGE with expression — qty = s.qty + t.qty
+            // -----------------------------------------------------------------
+            exec(
+                &rt,
+                "MERGE INTO cat_merge.s.inventory AS t
+                 USING cat_merge.s.updates AS s
+                 ON t.id = s.id
+                 WHEN MATCHED THEN UPDATE SET qty = s.qty + t.qty",
+            )
+            .await?;
+
+            let batches = run_query(
+                &rt,
+                "SELECT id, name, qty FROM cat_merge.s.inventory ORDER BY id",
+            )
+            .await?;
+
+            // apple: 50 + 50 = 100, cherry: 100 + 100 = 200, banana unchanged
+            assert_batches_eq!(
+                &[
+                    "+----+--------+-----+",
+                    "| id | name   | qty |",
+                    "+----+--------+-----+",
+                    "| 1  | apple  | 100 |",
+                    "| 2  | banana | 20  |",
+                    "| 3  | cherry | 200 |",
+                    "+----+--------+-----+",
+                ],
+                &batches
+            );
+
+            // -----------------------------------------------------------------
+            // Step 3: MERGE updating multiple columns
+            // -----------------------------------------------------------------
+            exec(
+                &rt,
+                "MERGE INTO cat_merge.s.inventory AS t
+                 USING cat_merge.s.updates AS s
+                 ON t.id = s.id
+                 WHEN MATCHED THEN UPDATE SET qty = s.qty, name = s.name",
+            )
+            .await?;
+
+            let batches = run_query(
+                &rt,
+                "SELECT id, name, qty FROM cat_merge.s.inventory ORDER BY id",
+            )
+            .await?;
+
+            assert_batches_eq!(
+                &[
+                    "+----+--------+-----+",
+                    "| id | name   | qty |",
+                    "+----+--------+-----+",
+                    "| 1  | apple  | 50  |",
+                    "| 2  | banana | 20  |",
+                    "| 3  | cherry | 100 |",
+                    "+----+--------+-----+",
+                ],
+                &batches
+            );
+
+            // -----------------------------------------------------------------
+            // Step 4: MERGE without aliases (table-name qualifiers)
+            // -----------------------------------------------------------------
+            exec(
+                &rt,
+                "MERGE INTO cat_merge.s.inventory
+                 USING cat_merge.s.updates
+                 ON inventory.id = updates.id
+                 WHEN MATCHED THEN UPDATE SET qty = updates.qty + 1",
+            )
+            .await?;
+
+            let batches = run_query(
+                &rt,
+                "SELECT id, name, qty FROM cat_merge.s.inventory ORDER BY id",
+            )
+            .await?;
+
+            // apple: 50 + 1 = 51, cherry: 100 + 1 = 101
+            assert_batches_eq!(
+                &[
+                    "+----+--------+-----+",
+                    "| id | name   | qty |",
+                    "+----+--------+-----+",
+                    "| 1  | apple  | 51  |",
+                    "| 2  | banana | 20  |",
+                    "| 3  | cherry | 101 |",
+                    "+----+--------+-----+",
+                ],
+                &batches
+            );
+
+            // -----------------------------------------------------------------
+            // Step 5: MERGE with zero matches — no rows should change
+            // -----------------------------------------------------------------
+            // Replace source data with a non-matching ID.
+            exec(&rt, "DELETE FROM cat_merge.s.updates WHERE id IN (1, 3)").await?;
+            exec(
+                &rt,
+                "INSERT INTO cat_merge.s.updates VALUES (99, 'ghost', 999)",
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "MERGE INTO cat_merge.s.inventory AS t
+                 USING cat_merge.s.updates AS s
+                 ON t.id = s.id
+                 WHEN MATCHED THEN UPDATE SET qty = s.qty",
+            )
+            .await?;
+
+            let batches = run_query(
+                &rt,
+                "SELECT id, name, qty FROM cat_merge.s.inventory ORDER BY id",
+            )
+            .await?;
+
+            // Unchanged from step 4.
+            assert_batches_eq!(
+                &[
+                    "+----+--------+-----+",
+                    "| id | name   | qty |",
+                    "+----+--------+-----+",
+                    "| 1  | apple  | 51  |",
+                    "| 2  | banana | 20  |",
+                    "| 3  | cherry | 101 |",
+                    "+----+--------+-----+",
+                ],
+                &batches
+            );
+
+            let count = query_scalar_i64(&rt, "SELECT COUNT(*) FROM cat_merge.s.inventory").await?;
+            assert_eq!(count, 3, "Row count should remain 3 after zero-match MERGE");
+
+            Ok(())
+        })
+        .await
+}
+
+// =============================================================================
+// Test: MERGE INTO with partition key different from join key
+// =============================================================================
+
+#[tokio::test]
+async fn cayenne_catalog_merge_partition_key_differs_from_join_key() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            let catalog = make_cayenne_catalog(
+                "cat_mp",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let app = AppBuilder::new("cayenne_merge_partition")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
+                .with_runtime_config(Config::default().with_caching_disabled())
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err("Timeout waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check_with_timeout(&rt, Duration::from_secs(30)).await;
+
+            exec(&rt, "CREATE SCHEMA cat_mp.s").await?;
+
+            // Partitioned by `region` but MERGE joins on `sku`.
+            exec(
+                &rt,
+                "CREATE TABLE cat_mp.s.stock (
+                    sku VARCHAR NOT NULL,
+                    region VARCHAR NOT NULL,
+                    qty BIGINT NOT NULL
+                ) PARTITION BY region",
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "CREATE TABLE cat_mp.s.inbound (
+                    sku VARCHAR NOT NULL,
+                    region VARCHAR NOT NULL,
+                    qty BIGINT NOT NULL
+                ) PARTITION BY region",
+            )
+            .await?;
+
+            // Stock spans two partitions (US and EU).
+            exec(
+                &rt,
+                "INSERT INTO cat_mp.s.stock VALUES
+                    ('A', 'US', 10),
+                    ('B', 'US', 20),
+                    ('A', 'EU', 30),
+                    ('C', 'EU', 40)",
+            )
+            .await?;
+
+            // Inbound shipments only for SKU A across both regions.
+            exec(
+                &rt,
+                "INSERT INTO cat_mp.s.inbound VALUES
+                    ('A', 'US', 100),
+                    ('A', 'EU', 200)",
+            )
+            .await?;
+
+            // MERGE on sku + region (composite ON) — updates rows in both partitions.
+            exec(
+                &rt,
+                "MERGE INTO cat_mp.s.stock AS t
+                 USING cat_mp.s.inbound AS s
+                 ON t.sku = s.sku AND t.region = s.region
+                 WHEN MATCHED THEN UPDATE SET qty = s.qty",
+            )
+            .await?;
+
+            let batches = run_query(
+                &rt,
+                "SELECT sku, region, qty FROM cat_mp.s.stock ORDER BY region, sku",
+            )
+            .await?;
+
+            assert_batches_eq!(
+                &[
+                    "+-----+--------+-----+",
+                    "| sku | region | qty |",
+                    "+-----+--------+-----+",
+                    "| A   | EU     | 200 |",
+                    "| C   | EU     | 40  |",
+                    "| A   | US     | 100 |",
+                    "| B   | US     | 20  |",
+                    "+-----+--------+-----+",
+                ],
+                &batches
+            );
+
+            // Verify row count unchanged.
+            let count = query_scalar_i64(&rt, "SELECT COUNT(*) FROM cat_mp.s.stock").await?;
+            assert_eq!(count, 4);
+
+            Ok(())
+        })
+        .await
+}
+
+// =============================================================================
+// Test: MERGE INTO across multiple partitions with 3-way composite ON key
+// =============================================================================
+
+#[tokio::test]
+async fn cayenne_catalog_merge_composite_on_key() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            let catalog = make_cayenne_catalog(
+                "cat_mcp",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let app = AppBuilder::new("cayenne_merge_composite")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
+                .with_runtime_config(Config::default().with_caching_disabled())
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err("Timeout waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check_with_timeout(&rt, Duration::from_secs(30)).await;
+
+            exec(&rt, "CREATE SCHEMA cat_mcp.s").await?;
+
+            // Partitioned by month, MERGE joins on sensor_id + year + month.
+            exec(
+                &rt,
+                "CREATE TABLE cat_mcp.s.metrics (
+                    sensor_id BIGINT NOT NULL,
+                    year BIGINT NOT NULL,
+                    month BIGINT NOT NULL,
+                    reading DOUBLE NOT NULL
+                ) PARTITION BY month",
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "CREATE TABLE cat_mcp.s.corrections (
+                    sensor_id BIGINT NOT NULL,
+                    year BIGINT NOT NULL,
+                    month BIGINT NOT NULL,
+                    reading DOUBLE NOT NULL
+                ) PARTITION BY month",
+            )
+            .await?;
+
+            // Data spanning two partitions (month=1 and month=2).
+            exec(
+                &rt,
+                "INSERT INTO cat_mcp.s.metrics VALUES
+                    (1, 2025, 1, 10.0),
+                    (2, 2025, 1, 20.0),
+                    (1, 2025, 2, 30.0),
+                    (3, 2025, 2, 40.0)",
+            )
+            .await?;
+
+            // Corrections for sensor 1 in both months, sensor 2 in Jan only.
+            exec(
+                &rt,
+                "INSERT INTO cat_mcp.s.corrections VALUES
+                    (1, 2025, 1, 11.5),
+                    (2, 2025, 1, 22.5),
+                    (1, 2025, 2, 33.5)",
+            )
+            .await?;
+
+            // MERGE joining on sensor_id + year + month (3-way composite ON key).
+            exec(
+                &rt,
+                "MERGE INTO cat_mcp.s.metrics AS t
+                 USING cat_mcp.s.corrections AS s
+                 ON t.sensor_id = s.sensor_id
+                    AND t.year = s.year
+                    AND t.month = s.month
+                 WHEN MATCHED THEN UPDATE SET reading = s.reading",
+            )
+            .await?;
+
+            let batches = run_query(
+                &rt,
+                "SELECT sensor_id, year, month, reading
+                 FROM cat_mcp.s.metrics
+                 ORDER BY year, month, sensor_id",
+            )
+            .await?;
+
+            assert_batches_eq!(
+                &[
+                    "+-----------+------+-------+---------+",
+                    "| sensor_id | year | month | reading |",
+                    "+-----------+------+-------+---------+",
+                    "| 1         | 2025 | 1     | 11.5    |",
+                    "| 2         | 2025 | 1     | 22.5    |",
+                    "| 1         | 2025 | 2     | 33.5    |",
+                    "| 3         | 2025 | 2     | 40.0    |",
+                    "+-----------+------+-------+---------+",
+                ],
+                &batches
+            );
+
+            // sensor 3 in Feb should remain untouched (no matching correction).
+            let count = query_scalar_i64(&rt, "SELECT COUNT(*) FROM cat_mcp.s.metrics").await?;
+            assert_eq!(count, 4);
+
+            Ok(())
+        })
+        .await
+}
+
+/// Regression test: composite ON keys must use tuple-aware deletion predicates.
+///
+/// With two composite key columns (region, sku), if the matched rows are
+/// (US, A) and (EU, B), the old independent IN-list approach would build:
+///   `region IN ('US','EU') AND sku IN ('A','B')`
+/// which also matches (US, B) and (EU, A) — corrupting unmatched rows.
+///
+/// This test has exactly that pattern: target has (US,A), (US,B), (EU,A), (EU,B)
+/// but source only matches (US,A) and (EU,B). The unmatched rows (US,B) and (EU,A)
+/// must be preserved unchanged.
+#[tokio::test]
+async fn cayenne_catalog_merge_composite_key_no_cross_product() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            let catalog = make_cayenne_catalog(
+                "cat_xprod",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let app = AppBuilder::new("cayenne_merge_cross_product")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
+                .with_runtime_config(Config::default().with_caching_disabled())
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err("Timeout waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check_with_timeout(&rt, Duration::from_secs(30)).await;
+
+            exec(&rt, "CREATE SCHEMA cat_xprod.s").await?;
+
+            // Target table with composite key (region, sku). Partitioned by region.
+            exec(
+                &rt,
+                "CREATE TABLE cat_xprod.s.inventory (
+                    region VARCHAR NOT NULL,
+                    sku VARCHAR NOT NULL,
+                    qty BIGINT NOT NULL
+                ) PARTITION BY region",
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "CREATE TABLE cat_xprod.s.updates (
+                    region VARCHAR NOT NULL,
+                    sku VARCHAR NOT NULL,
+                    qty BIGINT NOT NULL
+                ) PARTITION BY region",
+            )
+            .await?;
+
+            // All 4 combinations of region x sku exist in target.
+            exec(
+                &rt,
+                "INSERT INTO cat_xprod.s.inventory VALUES
+                    ('US', 'A', 10),
+                    ('US', 'B', 20),
+                    ('EU', 'A', 30),
+                    ('EU', 'B', 40)",
+            )
+            .await?;
+
+            // Source only updates the diagonal: (US, A) and (EU, B).
+            // A cross-product bug would also delete/corrupt (US, B) and (EU, A).
+            exec(
+                &rt,
+                "INSERT INTO cat_xprod.s.updates VALUES
+                    ('US', 'A', 99),
+                    ('EU', 'B', 88)",
+            )
+            .await?;
+
+            // MERGE with composite ON key.
+            exec(
+                &rt,
+                "MERGE INTO cat_xprod.s.inventory AS t
+                 USING cat_xprod.s.updates AS s
+                 ON t.region = s.region AND t.sku = s.sku
+                 WHEN MATCHED THEN UPDATE SET qty = s.qty",
+            )
+            .await?;
+
+            let batches = run_query(
+                &rt,
+                "SELECT region, sku, qty
+                 FROM cat_xprod.s.inventory
+                 ORDER BY region, sku",
+            )
+            .await?;
+
+            // Only (US,A) and (EU,B) should be updated.
+            // (US,B) and (EU,A) must be UNCHANGED — not deleted, not modified.
+            assert_batches_eq!(
+                &[
+                    "+--------+-----+-----+",
+                    "| region | sku | qty |",
+                    "+--------+-----+-----+",
+                    "| EU     | A   | 30  |",
+                    "| EU     | B   | 88  |",
+                    "| US     | A   | 99  |",
+                    "| US     | B   | 20  |",
+                    "+--------+-----+-----+",
+                ],
+                &batches
+            );
+
+            // Row count must still be 4 — no rows lost.
+            let count = query_scalar_i64(&rt, "SELECT COUNT(*) FROM cat_xprod.s.inventory").await?;
+            assert_eq!(count, 4);
+
+            Ok(())
+        })
+        .await
+}
+
+// =============================================================================
+// Test: MERGE INTO — duplicate source keys must error without losing target rows
+// =============================================================================
+
+#[tokio::test]
+async fn cayenne_catalog_merge_duplicate_source_keys_rejected() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            let catalog = make_cayenne_catalog(
+                "cat_dupkey",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let app = AppBuilder::new("cayenne_merge_dup_key")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
+                .with_runtime_config(Config::default().with_caching_disabled())
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err("Timeout waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check_with_timeout(&rt, Duration::from_secs(30)).await;
+
+            exec(&rt, "CREATE SCHEMA cat_dupkey.s").await?;
+
+            exec(
+                &rt,
+                "CREATE TABLE cat_dupkey.s.target (
+                    id BIGINT NOT NULL,
+                    val BIGINT NOT NULL
+                ) PARTITION BY id",
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "CREATE TABLE cat_dupkey.s.source (
+                    id BIGINT NOT NULL,
+                    val BIGINT NOT NULL
+                ) PARTITION BY id",
+            )
+            .await?;
+
+            // Insert one row into target.
+            exec(&rt, "INSERT INTO cat_dupkey.s.target VALUES (1, 100)").await?;
+
+            // Insert TWO rows with the same key into source — this is the
+            // duplicate key scenario that must not cause data loss.
+            exec(
+                &rt,
+                "INSERT INTO cat_dupkey.s.source VALUES (1, 200), (1, 300)",
+            )
+            .await?;
+
+            // MERGE should error because source has duplicate keys for the
+            // matched target row.
+            let merge_result = run_query(
+                &rt,
+                "MERGE INTO cat_dupkey.s.target AS t
+                 USING cat_dupkey.s.source AS s
+                 ON t.id = s.id
+                 WHEN MATCHED THEN UPDATE SET val = s.val",
+            )
+            .await;
+            assert!(
+                merge_result.is_err(),
+                "MERGE with duplicate source keys should fail, got: {merge_result:?}"
+            );
+            let err_msg = merge_result.unwrap_err();
+            assert!(
+                err_msg.contains("duplicate"),
+                "Error should mention duplicate keys, got: {err_msg}"
+            );
+
+            // Verify the target table is UNCHANGED — the row must not be lost.
+            let count = query_scalar_i64(&rt, "SELECT COUNT(*) FROM cat_dupkey.s.target").await?;
+            assert_eq!(count, 1, "Target must still have 1 row after failed MERGE");
+
+            let batches = run_query(&rt, "SELECT id, val FROM cat_dupkey.s.target").await?;
+            assert_batches_eq!(
+                [
+                    "+----+-----+",
+                    "| id | val |",
+                    "+----+-----+",
+                    "| 1  | 100 |",
+                    "+----+-----+",
+                ],
+                &batches
             );
 
             Ok(())

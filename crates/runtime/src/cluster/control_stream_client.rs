@@ -61,6 +61,14 @@ pub type PartitionUpdateHandler = Arc<
         + Sync,
 >;
 
+/// Callback type for when an executor receives a dataset refresh command from the scheduler.
+///
+/// The handler takes two arguments:
+/// 1. `dataset_name`: The dataset name to refresh.
+/// 2. `overrides_json`: Optional JSON-serialized `RefreshOverrides`.
+pub type RefreshDatasetHandler =
+    Arc<dyn Fn(String, Option<String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// Handle for a single control stream connection to a scheduler.
 struct ControlStreamHandle {
     cancel: CancellationToken,
@@ -86,11 +94,13 @@ fn spawn_control_stream(
     poll_now_notify: Arc<Notify>,
     outbound_tx_state: Arc<RwLock<Option<mpsc::Sender<ExecutorControlMessage>>>>,
     partition_update_handler: Option<&PartitionUpdateHandler>,
+    refresh_dataset_handler: Option<&RefreshDatasetHandler>,
 ) -> ControlStreamHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
     let outbound_tx_state_for_task = Arc::clone(&outbound_tx_state);
     let partition_update_handler = partition_update_handler.cloned();
+    let refresh_dataset_handler = refresh_dataset_handler.cloned();
 
     let task = tokio::spawn(async move {
         let tls_enabled = client_tls_config.is_some();
@@ -271,6 +281,7 @@ fn spawn_control_stream(
                                         executor.as_deref(),
                                         &poll_now_notify,
                                         partition_update_handler.as_ref(),
+                                        refresh_dataset_handler.as_ref(),
                                     )
                                     .await;
                                 }
@@ -326,6 +337,7 @@ async fn handle_scheduler_message(
     executor: Option<&Executor>,
     poll_now_notify: &Notify,
     partition_update_handler: Option<&PartitionUpdateHandler>,
+    refresh_dataset_handler: Option<&RefreshDatasetHandler>,
 ) {
     match message {
         SchedulerMessage::RequestMetrics(request) => {
@@ -424,6 +436,18 @@ async fn handle_scheduler_message(
                 }
             }
         }
+        SchedulerMessage::RefreshDataset(cmd) => {
+            tracing::info!(
+                dataset = %cmd.dataset_name,
+                "Received RefreshDataset from scheduler {scheduler_address}"
+            );
+
+            if let Some(handler) = refresh_dataset_handler {
+                handler(cmd.dataset_name, cmd.overrides_json).await;
+            } else {
+                tracing::warn!("Received RefreshDataset command but no handler is registered");
+            }
+        }
     }
 }
 
@@ -454,6 +478,8 @@ pub struct ControlStreamManager {
     poll_now_notify: Arc<Notify>,
     /// Callback handler for partition updates.
     partition_update_handler: Option<PartitionUpdateHandler>,
+    /// Callback handler for dataset refresh commands.
+    refresh_dataset_handler: Option<RefreshDatasetHandler>,
 }
 
 impl ControlStreamManager {
@@ -466,6 +492,7 @@ impl ControlStreamManager {
         metrics_reader: Option<MetricsReader>,
         partition_update_handler: Option<PartitionUpdateHandler>,
         executor: Option<Arc<Executor>>,
+        refresh_dataset_handler: Option<RefreshDatasetHandler>,
     ) -> Self {
         Self {
             executor_id,
@@ -477,6 +504,7 @@ impl ControlStreamManager {
             known_schedulers: HashSet::new(),
             poll_now_notify: Arc::new(Notify::new()),
             partition_update_handler,
+            refresh_dataset_handler,
         }
     }
 
@@ -559,6 +587,7 @@ impl ControlStreamManager {
                 Arc::clone(&self.poll_now_notify),
                 Arc::clone(&outbound_tx_state),
                 self.partition_update_handler.as_ref(),
+                self.refresh_dataset_handler.as_ref(),
             );
             self.streams.insert(address, handle);
         }
@@ -641,6 +670,7 @@ mod tests {
             None, // no metrics reader
             None,
             None,
+            None,
         );
         assert!(manager.known_schedulers.is_empty());
         assert!(manager.streams.is_empty());
@@ -657,6 +687,7 @@ mod tests {
             Some(reader),
             None,
             None,
+            None,
         );
         assert!(manager.metrics_reader.is_some());
     }
@@ -666,6 +697,7 @@ mod tests {
         let mut manager = ControlStreamManager::new(
             "executor-1".to_string(),
             "executor-1".to_string(),
+            None,
             None,
             None,
             None,
@@ -681,6 +713,7 @@ mod tests {
         let mut manager = ControlStreamManager::new(
             "executor-1".to_string(),
             "executor-1".to_string(),
+            None,
             None,
             None,
             None,

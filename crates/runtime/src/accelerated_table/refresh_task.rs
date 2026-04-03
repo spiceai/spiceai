@@ -43,7 +43,7 @@ use crate::{
 };
 use arrow::compute::{SortOptions, filter_record_batch};
 use arrow::{
-    array::{RecordBatch, StructArray, TimestampNanosecondArray, make_comparator},
+    array::{Array, RecordBatch, StructArray, TimestampNanosecondArray, make_comparator},
     datatypes::DataType,
 };
 use arrow_schema::SchemaRef;
@@ -1070,6 +1070,21 @@ impl RefreshTask {
 
     fn get_filter_converter(&self, refresh: &Refresh) -> Option<TimestampFilterConvert> {
         let schema = self.federated.schema();
+        Self::build_filter_converter(&schema, refresh)
+    }
+
+    fn get_accelerator_filter_converter(
+        &self,
+        refresh: &Refresh,
+    ) -> Option<TimestampFilterConvert> {
+        let schema = self.accelerator.schema();
+        Self::build_filter_converter(&schema, refresh)
+    }
+
+    fn build_filter_converter(
+        schema: &SchemaRef,
+        refresh: &Refresh,
+    ) -> Option<TimestampFilterConvert> {
         let column = refresh.time_column.as_deref().unwrap_or_default();
         let field = schema.column_with_name(column).map(|(_, f)| f).cloned();
         let time_partition_column = refresh.time_partition_column.as_deref();
@@ -1181,7 +1196,7 @@ impl RefreshTask {
         let Some(value) = self.timestamp_nanos_for_append_query(refresh).await? else {
             return Ok(update);
         };
-        let Some(filter_converter) = self.get_filter_converter(refresh) else {
+        let Some(filter_converter) = self.get_accelerator_filter_converter(refresh) else {
             return Ok(update);
         };
 
@@ -1266,18 +1281,11 @@ impl RefreshTask {
             return Ok(None);
         };
 
-        let array = result.column(0)
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .context(super::FailedToFindLatestTimestampSnafu {
-                reason: "Failed to get the latest timestamp during incremental appending. Failed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
-            })?;
-
-        if array.is_empty() {
+        if result.num_rows() == 0 {
             return Ok(None);
         }
 
-        let mut value = array.value(0) as u128;
+        let col_array = result.column(0);
 
         let schema = &self.accelerator.schema();
         let Ok(accelerated_field) = schema.field_with_name(&column) else {
@@ -1287,15 +1295,123 @@ impl RefreshTask {
             });
         };
 
-        if let arrow::datatypes::DataType::Int8
-        | arrow::datatypes::DataType::Int16
-        | arrow::datatypes::DataType::Int32
-        | arrow::datatypes::DataType::Int64
-        | arrow::datatypes::DataType::UInt8
-        | arrow::datatypes::DataType::UInt16
-        | arrow::datatypes::DataType::UInt32
-        | arrow::datatypes::DataType::UInt64 = accelerated_field.data_type()
-        {
+        let is_integer_time_column = matches!(
+            accelerated_field.data_type(),
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+        );
+
+        // Extract the max timestamp value based on the column's data type.
+        // - String columns (ISO8601): parse the ISO string back to nanos
+        // - Integer columns (UnixSeconds/UnixMillis): read raw integer value
+        // - Timestamp columns: read as TimestampNanosecondArray (was CAST'd by max_timestamp_df)
+        // Handle all string array types (Utf8, LargeUtf8, Utf8View) for ISO8601 columns.
+        let iso_str_value = col_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            .or_else(|| {
+                col_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::LargeStringArray>()
+                    .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            })
+            .or_else(|| {
+                col_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringViewArray>()
+                    .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            });
+
+        let mut value: u128 = if let Some(iso_str) = iso_str_value {
+            util::timestamp_filter::parse_iso8601_to_nanos(&iso_str).context(
+                super::FailedToFindLatestTimestampSnafu {
+                    reason: format!(
+                        "Failed to parse ISO8601 timestamp '{iso_str}' from time column"
+                    ),
+                },
+            )?
+        } else if is_integer_time_column {
+            // Integer time columns are returned as-is (not cast to Timestamp)
+            // to avoid DuckDB cast errors. Extract the integer value directly.
+            if col_array.is_empty() {
+                return Ok(None);
+            }
+            match accelerated_field.data_type() {
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                    let arr = arrow::compute::cast(col_array, &DataType::Int64).map_err(|e| {
+                        super::Error::FailedToFindLatestTimestamp {
+                            reason: format!("Failed to cast integer time column to Int64: {e}"),
+                        }
+                    })?;
+                    let arr = arr
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .ok_or_else(|| super::Error::FailedToFindLatestTimestamp {
+                            reason: "Failed to downcast integer time column to Int64Array."
+                                .to_string(),
+                        })?;
+                    if arr.is_null(0) {
+                        return Ok(None);
+                    }
+                    let int_val = arr.value(0);
+                    u128::try_from(int_val).map_err(|_| {
+                        super::Error::FailedToFindLatestTimestamp {
+                            reason: format!(
+                                "Integer time column value {int_val} is negative and cannot be used as a timestamp."
+                            ),
+                        }
+                    })?
+                }
+                DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+                    let arr = arrow::compute::cast(col_array, &DataType::UInt64).map_err(|e| {
+                        super::Error::FailedToFindLatestTimestamp {
+                            reason: format!(
+                                "Failed to cast unsigned integer time column to UInt64: {e}"
+                            ),
+                        }
+                    })?;
+                    let arr = arr
+                        .as_any()
+                        .downcast_ref::<arrow::array::UInt64Array>()
+                        .ok_or_else(|| super::Error::FailedToFindLatestTimestamp {
+                            reason:
+                                "Failed to downcast unsigned integer time column to UInt64Array."
+                                    .to_string(),
+                        })?;
+                    if arr.is_null(0) {
+                        return Ok(None);
+                    }
+                    u128::from(arr.value(0))
+                }
+                other => {
+                    return Err(super::Error::FailedToFindLatestTimestamp {
+                        reason: format!("Unexpected data type {other} for integer time column."),
+                    });
+                }
+            }
+        } else {
+            let array = col_array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .context(super::FailedToFindLatestTimestampSnafu {
+                    reason: "Failed to get the latest timestamp during incremental appending. Failed to convert the value of the time column to a timestamp. Verify the column is a timestamp.",
+                })?;
+
+            if array.is_empty() {
+                return Ok(None);
+            }
+
+            array.value(0) as u128
+        };
+
+        if is_integer_time_column {
             match refresh.time_format {
                 Some(TimeFormat::UnixMillis) => {
                     value *= 1_000_000;
@@ -1592,11 +1708,31 @@ pub fn max_timestamp_df(
     ctx: SessionContext,
     column: &str,
 ) -> Result<DataFrame, DataFusionError> {
-    let expr = cast(
-        col(format!(r#""{column}""#)),
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-    )
-    .alias("a");
+    let schema = accelerator.schema();
+    let needs_cast = schema.column_with_name(column).is_some_and(|(_, f)| {
+        // Only CAST for native date/time/timestamp types that need precision normalization.
+        // Integers (UnixSeconds/UnixMillis) and strings (ISO8601) are directly sortable
+        // without CAST, which avoids engine-specific cast limitations (e.g. DuckDB can't
+        // cast BIGINT→TIMESTAMP, Vortex can't cast UTF8→TIMESTAMP).
+        matches!(
+            f.data_type(),
+            DataType::Date32
+                | DataType::Date64
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Timestamp(_, _)
+        )
+    });
+
+    let expr = if needs_cast {
+        cast(
+            col(format!(r#""{column}""#)),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        )
+        .alias("a")
+    } else {
+        col(format!(r#""{column}""#)).alias("a")
+    };
 
     accelerator_df(accelerator, &ctx)?
         .select(vec![expr])?
@@ -1782,8 +1918,11 @@ fn schema_evolution_mismatch_refresh_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int32Array;
+    use arrow::array::{Int32Array, Int64Array, UInt32Array, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
+    use data_components::arrow::write::MemTable;
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::SessionContext;
     use std::sync::Arc;
 
     #[test]
@@ -1866,5 +2005,416 @@ mod tests {
         };
 
         assert!(schema_evolution_mismatch_refresh_message("dataset", "nation", &error).is_none());
+    }
+
+    /// Tests that `max_timestamp_df` returns the maximum value for integer time columns
+    /// (e.g. `unix_seconds` / `unix_millis` time formats) without casting to a Timestamp type.
+    #[tokio::test]
+    async fn test_max_timestamp_df_integer_time_column() {
+        async fn run_test(data_type: DataType, array: Arc<dyn arrow::array::Array>) -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![Field::new("ts", data_type, false)]));
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), vec![array]).expect("batch created");
+            let mem_table =
+                Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("mem table created"))
+                    as Arc<dyn TableProvider>;
+
+            let ctx = SessionContext::new();
+            let df = max_timestamp_df(&mem_table, ctx.clone(), "ts").expect("df created");
+            let results = collect(
+                df.create_physical_plan()
+                    .await
+                    .expect("physical plan created"),
+                ctx.task_ctx(),
+            )
+            .await
+            .expect("query succeeded");
+            results.into_iter().next().expect("at least one batch")
+        }
+
+        // Signed Int64: column is returned as Int64.
+        let signed_vals = Int64Array::from(vec![100_i64, 200, 50]);
+        let batch = run_test(DataType::Int64, Arc::new(signed_vals)).await;
+        let max_val = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64Array")
+            .value(0);
+        assert_eq!(max_val, 200, "Int64: expected max value 200");
+
+        // Signed Int32: column is returned as Int32.
+        let signed_vals = Int32Array::from(vec![10_i32, 30, 20]);
+        let batch = run_test(DataType::Int32, Arc::new(signed_vals)).await;
+        let max_val = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .expect("Int32Array")
+            .value(0);
+        assert_eq!(max_val, 30, "Int32: expected max value 30");
+
+        // Unsigned UInt64: column is returned as UInt64.
+        let unsigned_vals = UInt64Array::from(vec![1_000_u64, 5_000, 3_000]);
+        let batch = run_test(DataType::UInt64, Arc::new(unsigned_vals)).await;
+        let max_val = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("UInt64Array")
+            .value(0);
+        assert_eq!(max_val, 5_000, "UInt64: expected max value 5000");
+
+        // Unsigned UInt32: column is returned as UInt32.
+        let unsigned_vals = UInt32Array::from(vec![7_u32, 42, 3]);
+        let batch = run_test(DataType::UInt32, Arc::new(unsigned_vals)).await;
+        let max_val = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .expect("UInt32Array")
+            .value(0);
+        assert_eq!(max_val, 42, "UInt32: expected max value 42");
+    }
+
+    /// Verifies that `max_timestamp_df` uses sort+limit on raw string (no CAST)
+    /// for utf8 columns, which avoids the Vortex/Cayenne cast kernel issue.
+    #[tokio::test]
+    async fn test_max_timestamp_df_utf8_no_cast() {
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time_col",
+            DataType::Utf8,
+            false,
+        )]));
+
+        let mem_table = MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+            .expect("mem table should be created");
+        let accelerator: Arc<dyn TableProvider> = Arc::new(mem_table);
+
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(&accelerator, ctx, "time_col").expect("should build df");
+
+        // Verify the plan uses sort+limit on raw string, not Cast or MAX
+        let plan_str = format!("{:?}", df.logical_plan());
+        assert!(
+            !plan_str.contains("Cast("),
+            "utf8 column should NOT use Cast, got: {plan_str}"
+        );
+        assert!(
+            plan_str.contains("Sort") && plan_str.contains("Limit"),
+            "utf8 column should use Sort+Limit, got: {plan_str}"
+        );
+    }
+
+    /// Verifies that `max_timestamp_df` still uses CAST+sort for non-string columns.
+    #[tokio::test]
+    async fn test_max_timestamp_df_timestamp_uses_cast() {
+        use arrow::array::TimestampNanosecondArray;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time_col",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                1_000_000_000,
+                3_000_000_000,
+                2_000_000_000,
+            ]))],
+        )
+        .expect("batch");
+
+        let mem_table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+            .expect("mem table should be created");
+        let accelerator: Arc<dyn TableProvider> = Arc::new(mem_table);
+
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(&accelerator, ctx, "time_col").expect("should build df");
+
+        // Verify the plan uses Cast, not MAX
+        let plan_str = format!("{:?}", df.logical_plan());
+        assert!(
+            plan_str.contains("Cast("),
+            "timestamp column should use Cast, got: {plan_str}"
+        );
+    }
+
+    /// Helper: run `max_timestamp_df` on an accelerator and extract the ISO string
+    /// from the result, using the same downcast chain as `timestamp_nanos_for_append_query`.
+    async fn collect_iso_string_from_max_df(
+        accelerator: &Arc<dyn TableProvider>,
+        col: &str,
+    ) -> Option<String> {
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(accelerator, ctx, col).expect("should build df");
+        let results = df.collect().await.expect("should collect");
+        let result = results.first()?;
+        if result.num_rows() == 0 {
+            return None;
+        }
+        let col_array = result.column(0);
+        col_array
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            .or_else(|| {
+                col_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::LargeStringArray>()
+                    .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            })
+            .or_else(|| {
+                col_array
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringViewArray>()
+                    .and_then(|a| (!a.is_null(0)).then(|| a.value(0).to_string()))
+            })
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_iso8601_utf8() {
+        use arrow::array::StringArray;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec![
+                "2024-01-01T00:00:00",
+                "2024-06-15T12:30:00",
+                "2024-03-10T08:00:00",
+            ]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let val = collect_iso_string_from_max_df(&mem, "t").await;
+        assert_eq!(val.as_deref(), Some("2024-06-15T12:30:00"));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_iso8601_large_utf8() {
+        use arrow::array::LargeStringArray;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::LargeUtf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(LargeStringArray::from(vec![
+                "2024-01-01T00:00:00",
+                "2024-06-15T12:30:00",
+                "2024-03-10T08:00:00",
+            ]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let val = collect_iso_string_from_max_df(&mem, "t").await;
+        assert_eq!(val.as_deref(), Some("2024-06-15T12:30:00"));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_iso8601_utf8_view() {
+        use arrow::array::StringViewArray;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Utf8View,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringViewArray::from(vec![
+                "2024-01-01T00:00:00",
+                "2024-06-15T12:30:00",
+                "2024-03-10T08:00:00",
+            ]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        let val = collect_iso_string_from_max_df(&mem, "t").await;
+        assert_eq!(val.as_deref(), Some("2024-06-15T12:30:00"));
+    }
+
+    /// Verifies that `max_timestamp_df` does NOT use CAST for integer columns (`UnixSeconds`).
+    #[tokio::test]
+    async fn test_max_timestamp_df_int64_no_cast() {
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time_col",
+            DataType::Int64,
+            false,
+        )]));
+
+        let mem_table = MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+            .expect("mem table should be created");
+        let accelerator: Arc<dyn TableProvider> = Arc::new(mem_table);
+
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(&accelerator, ctx, "time_col").expect("should build df");
+
+        let plan_str = format!("{:?}", df.logical_plan());
+        assert!(
+            !plan_str.contains("Cast("),
+            "integer column should NOT use Cast, got: {plan_str}"
+        );
+        assert!(
+            plan_str.contains("Sort") && plan_str.contains("Limit"),
+            "integer column should use Sort+Limit, got: {plan_str}"
+        );
+    }
+
+    /// Helper: run `max_timestamp_df` on a numeric accelerator and extract the max
+    /// value using the same `arrow::compute::cast` to `Int64` path as
+    /// `timestamp_nanos_for_append_query`.
+    async fn collect_numeric_from_max_df(
+        accelerator: &Arc<dyn TableProvider>,
+        col: &str,
+    ) -> Option<i64> {
+        let ctx = SessionContext::new();
+        let df = max_timestamp_df(accelerator, ctx, col).expect("should build df");
+        let results = df.collect().await.expect("should collect");
+        let result = results.first()?;
+        if result.num_rows() == 0 {
+            return None;
+        }
+        let col_array = result.column(0);
+        arrow::compute::cast(col_array.as_ref(), &DataType::Int64)
+            .ok()
+            .and_then(|arr| {
+                let int_array = arr.as_any().downcast_ref::<arrow::array::Int64Array>()?;
+                if int_array.is_null(0) {
+                    return None;
+                }
+                Some(int_array.value(0))
+            })
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_int64_extraction() {
+        use arrow::array::Int64Array;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![100, 300, 200]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_uint64_extraction() {
+        use arrow::array::UInt64Array;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::UInt64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt64Array::from(vec![100u64, 300, 200]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_int32_extraction() {
+        use arrow::array::Int32Array;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![100, 300, 200]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_uint32_extraction() {
+        use arrow::array::UInt32Array;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::UInt32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt32Array::from(vec![100u32, 300, 200]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_float64_extraction() {
+        use arrow::array::Float64Array;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("t", DataType::Float64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Float64Array::from(vec![100.0, 300.0, 200.0]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(collect_numeric_from_max_df(&mem, "t").await, Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_max_timestamp_df_timestamp_ns_extraction() {
+        use arrow::array::TimestampNanosecondArray;
+        use data_components::arrow::write::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                1_000_000_000,
+                3_000_000_000,
+                2_000_000_000,
+            ]))],
+        )
+        .expect("batch");
+        let mem = Arc::new(
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+        ) as Arc<dyn TableProvider>;
+        assert_eq!(
+            collect_numeric_from_max_df(&mem, "t").await,
+            Some(3_000_000_000)
+        );
     }
 }
