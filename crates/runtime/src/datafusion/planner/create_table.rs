@@ -95,7 +95,7 @@ pub(super) async fn plan_create_table(
             {
                 tracing::warn!(
                     "Failed to clean up DDL extension store entry for {key} \
-                           after planning failure: {cleanup_err}"
+                         after planning failure: {cleanup_err}"
                 );
             }
             Err(e)
@@ -534,7 +534,8 @@ mod tests {
             "CREATE TABLE foo (id INT, p TEXT, PRIMARY KEY (id, p)) PARTITION BY p",
         );
         let store = new_shared_store();
-        extract_and_store_extensions(ct, &store).unwrap();
+        extract_and_store_extensions(ct, &store)
+            .expect("partition key in primary key should succeed");
     }
 
     #[test]
@@ -567,7 +568,8 @@ mod tests {
     fn test_partition_by_no_primary_key_ok() {
         let ct = parse_create_table("CREATE TABLE foo (id INT, p TEXT) PARTITION BY p");
         let store = new_shared_store();
-        extract_and_store_extensions(ct, &store).unwrap();
+        extract_and_store_extensions(ct, &store)
+            .expect("partition by without primary key should succeed");
     }
 
     #[test]
@@ -576,7 +578,8 @@ mod tests {
             "CREATE TABLE foo (a INT, b TEXT, c VARCHAR, PRIMARY KEY (a, b)) PARTITION BY b",
         );
         let store = new_shared_store();
-        extract_and_store_extensions(ct, &store).unwrap();
+        extract_and_store_extensions(ct, &store)
+            .expect("composite primary key with partition should succeed");
     }
 
     #[test]
@@ -585,7 +588,8 @@ mod tests {
             "CREATE TABLE foo (id INT, region TEXT, PRIMARY KEY (id, region)) PARTITION BY bucket(4, region)",
         );
         let store = new_shared_store();
-        extract_and_store_extensions(ct, &store).unwrap();
+        extract_and_store_extensions(ct, &store)
+            .expect("bucket partition in primary key should succeed");
     }
 
     #[test]
