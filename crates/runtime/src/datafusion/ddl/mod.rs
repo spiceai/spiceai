@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Generic DDL support: shared types, preprocessing, and option parsing for
+//! Generic DDL support: shared types and option parsing for
 //! `CREATE TABLE` statements across catalog integrations (Iceberg, Cayenne, etc.).
 //!
 //! This module provides:
@@ -22,8 +22,8 @@ limitations under the License.
 //!   partitioning) extracted from `CREATE TABLE` statements.
 //! - [`DdlExtensionStore`]: Thread-safe store keyed by table name, consumed by
 //!   catalog-specific analyzer rules.
-//! - [`preprocess`]: SQL pre-processing to extract `WITH (...)` options and
-//!   `PARTITION BY` clauses before `DataFusion` planning.
+//!
+//! Statement-level interception and extension extraction is handled by the
+//! unified planner in [`super::planner`].
 
 pub mod acceleration_options;
-pub mod preprocess;

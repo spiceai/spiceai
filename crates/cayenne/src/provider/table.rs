@@ -37,7 +37,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use data_components::delete::DeletionExec;
+use data_components::delete::{DeletionExec, DeletionTableProvider};
 use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
@@ -4164,6 +4164,27 @@ impl TableProvider for CayenneTableProvider {
     }
 }
 
+// Implement DeletionTableProvider for Cayenne
+#[async_trait]
+impl DeletionTableProvider for CayenneTableProvider {
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        filters: &[Expr],
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        if self.file_based_deletes_preferred(filters) {
+            tracing::debug!(
+                "Table '{}': using file-based retention delete path",
+                self.table_metadata.table_name,
+            );
+            return self.delete_using_files(filters);
+        }
+
+        // Default path: deletion vectors via CayenneDeletionSink
+        self.delete_using_deletion_vectors(filters)
+    }
+}
+
 impl CayenneTableProvider {
     /// File-level delete path.
     ///
@@ -4190,8 +4211,8 @@ impl CayenneTableProvider {
             Some(self.build_protected_snapshot_listing_tables()?)
         };
 
-        Ok(Arc::new(DeletionExec::new(Arc::new(
-            FileBasedDeletionSink::new(
+        Ok(Arc::new(DeletionExec::new(
+            Arc::new(FileBasedDeletionSink::new(
                 Arc::clone(&self.listing_table),
                 protected_snapshot_tables,
                 filter.clone(),
@@ -4202,8 +4223,9 @@ impl CayenneTableProvider {
                 self.table_metadata.path.clone(),
                 Arc::clone(self.context.runtime_env()),
                 Arc::clone(&self.write_lock),
-            ),
-        ))))
+            )),
+            &self.table_metadata.schema,
+        )))
     }
 
     /// Main deletion-vector path via [`CayenneDeletionSink`].
@@ -4217,8 +4239,8 @@ impl CayenneTableProvider {
             .map(|(_, table)| table)
             .collect();
 
-        Ok(Arc::new(DeletionExec::new(Arc::new(
-            CayenneDeletionSink::new(
+        Ok(Arc::new(DeletionExec::new(
+            Arc::new(CayenneDeletionSink::new(
                 self.table_metadata.clone(),
                 Arc::clone(&self.catalog),
                 Arc::clone(&self.listing_table),
@@ -4230,8 +4252,9 @@ impl CayenneTableProvider {
                 snapshot_tables,
                 Arc::clone(self.context.runtime_env()),
                 Some(Arc::clone(&self.write_lock)),
-            ),
-        ))))
+            )),
+            &self.table_metadata.schema,
+        )))
     }
 
     /// Build listing tables for all protected snapshots.

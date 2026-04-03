@@ -20,10 +20,7 @@ use super::{
     TableStatusIsNotActiveSnafu,
 };
 use crate::cdc::ChangeBatch;
-use crate::delete::DeletionExec;
 use crate::dynamodb::arrow::dynamodb_items_to_arrow;
-use crate::dynamodb::dml::delete::DynamoDBDeletionSink;
-use crate::dynamodb::dml::insert::DynamoDBInsertSink;
 use crate::dynamodb::json_nest::{JsonNesting, json_nest_except_fields};
 use crate::dynamodb::request_builder::DynamoDBRequestPlanBuilder;
 use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
@@ -43,10 +40,7 @@ use aws_smithy_async::future::pagination_stream::TryFlatMap;
 use datafusion::common::{Constraint, Constraints, DFSchema};
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::DefaultTableSource;
-use datafusion::datasource::sink::DataSinkExec;
-use datafusion::logical_expr::{
-    LogicalPlanBuilder, TableProviderFilterPushDown, dml::InsertOp, ident,
-};
+use datafusion::logical_expr::{LogicalPlanBuilder, TableProviderFilterPushDown, ident};
 use datafusion::prelude::SessionContext;
 use datafusion::{
     catalog::{Session, TableProvider},
@@ -85,7 +79,6 @@ pub struct DynamoDBTableProvider {
     table_total_item_count: Option<i64>,
     pub ready_lag: Duration,
     json_nesting: Option<JsonNesting>,
-    write_parallelism: usize,
 }
 
 type DynamoDBItemStream =
@@ -111,7 +104,6 @@ impl DynamoDBTableProvider {
         ready_lag: Duration,
         metrics_collector: Arc<MetricsCollector>,
         json_nesting: Option<&JsonNesting>,
-        write_parallelism: usize,
     ) -> Result<Self, Error> {
         let db_client = Arc::new(DbClient::new(&sdk_config));
         let buffer_size = NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("1 is safe"));
@@ -190,121 +182,7 @@ impl DynamoDBTableProvider {
             table_total_item_count,
             ready_lag,
             json_nesting: json_nesting.cloned(),
-            write_parallelism,
         })
-    }
-
-    /// Creates a new `DynamoDB` table provider with an explicit schema.
-    ///
-    /// Use this when the table schema is known upfront (e.g., from DDL) and
-    /// scan-based inference is not needed or possible (empty table).
-    /// Partition and sort keys are fetched from the `DynamoDB` table metadata.
-    #[expect(clippy::too_many_arguments)]
-    pub async fn try_new_with_schema(
-        sdk_config: SdkConfig,
-        table_name: Arc<str>,
-        schema: SchemaRef,
-        config_partitions: Option<usize>,
-        scan_interval: Duration,
-        time_format: String,
-        ready_lag: Duration,
-        metrics_collector: Arc<MetricsCollector>,
-        write_parallelism: usize,
-    ) -> Result<Self, Error> {
-        let db_client = Arc::new(DbClient::new(&sdk_config));
-
-        let (partition_key, sort_key) =
-            Self::fetch_table_keys(Arc::clone(&db_client), &table_name).await?;
-
-        let buffer_size = NonZeroUsize::new(1).unwrap_or_else(|| unreachable!("1 is safe"));
-        let streams_client = Arc::new(
-            StreamsClient::builder(sdk_config, table_name.to_string())
-                .interval(Some(scan_interval))
-                .buffer(buffer_size)
-                .metrics_collector(metrics_collector)
-                .build(),
-        );
-
-        let table_schema = DynamoDBTableSchema::new(
-            table_name,
-            schema,
-            partition_key,
-            sort_key,
-            HashSet::new(),
-            &time_format,
-        );
-
-        let Ok(df_schema) = DFSchema::try_from(Arc::clone(table_schema.schema())) else {
-            unreachable!("DFSchema::try_from is infallible as of DataFusion 38")
-        };
-
-        let pk_indices: Vec<usize> = table_schema
-            .primary_keys()
-            .iter()
-            .filter_map(|pk| df_schema.index_of_column_by_name(None, pk))
-            .collect();
-
-        let constraints = if pk_indices.is_empty() {
-            None
-        } else {
-            Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
-                pk_indices,
-            )]))
-        };
-
-        Ok(Self {
-            db_client,
-            streams_client,
-            table_schema: table_schema.clone(),
-            constraints,
-            request_plan_builder: Arc::new(DynamoDBRequestPlanBuilder::new(table_schema)),
-            unnest_depth: None,
-            config_partitions,
-            table_total_item_count: None,
-            ready_lag,
-            json_nesting: None,
-            write_parallelism,
-        })
-    }
-
-    /// Fetch partition key and sort key from `DynamoDB` table metadata.
-    async fn fetch_table_keys(
-        db_client: Arc<DbClient>,
-        table_name: &str,
-    ) -> Result<(String, Option<String>)> {
-        let response = db_client
-            .describe_table()
-            .table_name(table_name)
-            .send()
-            .await
-            .map_err(map_sdk_error)
-            .context(DescribeTableSnafu)?;
-
-        let Some(table) = response.table() else {
-            return TableDoesNotExistSnafu { table_name }.fail();
-        };
-
-        let key_schema = table.key_schema();
-        let mut partition_key = None;
-        let mut sort_key = None;
-
-        for key in key_schema {
-            match key.key_type() {
-                KeyType::Hash => {
-                    partition_key = Some(key.attribute_name().to_string());
-                }
-                KeyType::Range => {
-                    sort_key = Some(key.attribute_name().to_string());
-                }
-                _ => {}
-            }
-        }
-
-        let Some(partition_key) = partition_key else {
-            return Err(Error::MissingPartitionKey);
-        };
-
-        Ok((partition_key, sort_key))
     }
 
     async fn fetch_table_metadata(
@@ -524,11 +402,6 @@ impl DynamoDBTableProvider {
     pub fn stream_metrics(&self) -> Metrics {
         self.streams_client.metrics()
     }
-
-    #[must_use]
-    pub fn time_format(&self) -> Arc<String> {
-        self.table_schema.time_format()
-    }
 }
 
 #[async_trait]
@@ -634,40 +507,6 @@ impl TableProvider for DynamoDBTableProvider {
         );
 
         result
-    }
-
-    async fn insert_into(
-        &self,
-        _state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        _overwrite: InsertOp,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let sink = Arc::new(DynamoDBInsertSink {
-            db_client: Arc::clone(&self.db_client),
-            table_name: self.table_schema.table_name().to_string(),
-            schema: Arc::clone(self.table_schema.schema()),
-            time_format: self.table_schema.time_format(),
-            parallelism: self.write_parallelism,
-        });
-        Ok(Arc::new(DataSinkExec::new(input, sink, None)))
-    }
-
-    async fn delete_from(
-        &self,
-        _state: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DeletionExec::new(Arc::new(
-            DynamoDBDeletionSink {
-                db_client: Arc::clone(&self.db_client),
-                table_name: self.table_schema.table_name().to_string(),
-                partition_key: self.table_schema.partition_key().to_string(),
-                sort_key: self.table_schema.sort_key().map(ToString::to_string),
-                time_format: self.table_schema.time_format(),
-                filters: filters,
-                parallelism: self.write_parallelism,
-            },
-        ))))
     }
 }
 

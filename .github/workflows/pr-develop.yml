@@ -40,7 +40,7 @@ jobs:
         uses: ./.github/actions/check-code-changes
 
   check:
-    name: Check (Develop)
+    name: Rust Lint
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
@@ -51,8 +51,20 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set up spiceio
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@07f50ad2b40d272a857ca2483712d8b0ade6480b # v0.5.0
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
+        with:
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Install Protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
@@ -61,6 +73,9 @@ jobs:
 
       - name: Set up cc
         uses: ./.github/actions/setup-cc
+
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
 
       - name: Run cargo check
         env:
@@ -75,8 +90,20 @@ jobs:
       - name: Show sccache stats
         run: sccache --show-stats
 
+      - name: Kill spiceio
+        if: always() && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: spiceio-check-logs
+          path: ${{ runner.temp }}/spiceio.log
+          if-no-files-found: ignore
+
   build-and-test:
-    name: Build and Test (Develop)
+    name: Build and Test
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
@@ -87,8 +114,20 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set up spiceio
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@07f50ad2b40d272a857ca2483712d8b0ade6480b # v0.5.0
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
+        with:
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -127,3 +166,15 @@ jobs:
             echo "Update Cargo.lock"
             exit 1
           fi
+
+      - name: Kill spiceio
+        if: always() && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: spiceio-build-logs
+          path: ${{ runner.temp }}/spiceio.log
+          if-no-files-found: ignore

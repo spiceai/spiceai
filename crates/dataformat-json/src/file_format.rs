@@ -302,25 +302,11 @@ impl FileFormat for SpiceJsonFormat {
                             raw_buf
                         };
 
-                        let mut reader = BufReader::new(std::io::Cursor::new(buf));
-
-                        let is_array = match self.options.format {
-                            Format::Array => true,
-                            Format::Jsonl | Format::Object => false,
-                            Format::Soda => unreachable!("handled above"),
-                            Format::Auto | Format::Json => {
-                                peek_first_non_ws_byte(&mut reader).is_ok_and(|b| b == b'[')
-                            }
-                        };
-
-                        let schema = if is_array {
-                            let mut adapter = ArrayToNdjson::try_new(reader)?;
-                            let iter = ValueIter::new(&mut adapter, None);
-                            infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
-                        } else {
-                            let iter = ValueIter::new(&mut reader, None);
-                            infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
-                        };
+                        let schema = infer_json_schema_for_format(
+                            &buf,
+                            self.options.format,
+                            &mut take_while,
+                        )?;
 
                         if let Some(separator) = &self.options.flatten_json {
                             unnest_struct_schema(&schema, separator)
@@ -366,25 +352,11 @@ impl FileFormat for SpiceJsonFormat {
                             raw_buf
                         };
 
-                        let mut reader = BufReader::new(std::io::Cursor::new(buf));
-
-                        let is_array = match self.options.format {
-                            Format::Array => true,
-                            Format::Jsonl | Format::Object => false,
-                            Format::Soda => unreachable!("handled above"),
-                            Format::Auto | Format::Json => {
-                                peek_first_non_ws_byte(&mut reader).is_ok_and(|b| b == b'[')
-                            }
-                        };
-
-                        let schema = if is_array {
-                            let mut adapter = ArrayToNdjson::try_new(reader)?;
-                            let iter = ValueIter::new(&mut adapter, None);
-                            infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
-                        } else {
-                            let iter = ValueIter::new(&mut reader, None);
-                            infer_json_schema_from_iterator(iter.take_while(|_| take_while()))?
-                        };
+                        let schema = infer_json_schema_for_format(
+                            &buf,
+                            self.options.format,
+                            &mut take_while,
+                        )?;
 
                         if let Some(separator) = &self.options.flatten_json {
                             unnest_struct_schema(&schema, separator)
@@ -643,6 +615,84 @@ impl DataSource for NonRepartitionedFileScanConfig {
     }
 }
 
+/// UTF-8 BOM prefix (`\xEF\xBB\xBF`).
+const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// Infer a JSON schema from all bytes in `buf`, dispatching by [`Format`].
+///
+/// For [`Format::Object`] the buffer is parsed as a single JSON value (handles
+/// multi-line / pretty-printed objects).
+///
+/// For [`Format::Auto`] and [`Format::Json`], when the content starts with `{`
+/// the function first tries to parse the entire buffer as a single JSON object.
+/// If that succeeds (no trailing content) the schema is inferred from that one
+/// value. If it fails (e.g. because there are multiple NDJSON lines) it falls
+/// back to Arrow's line-based `ValueIter`.
+fn infer_json_schema_for_format(
+    buf: &[u8],
+    format: Format,
+    take_while: &mut dyn FnMut() -> bool,
+) -> Result<Schema> {
+    // Strip a leading UTF-8 BOM so serde_json can parse the input.
+    let buf = buf.strip_prefix(&UTF8_BOM).unwrap_or(buf);
+
+    if format == Format::Object {
+        let value: serde_json::Value =
+            serde_json::from_slice(buf).map_err(|e| DataFusionError::External(Box::new(e)))?;
+        // Decrement schema_infer_max_rec consistently for single-object inputs.
+        take_while();
+        return infer_json_schema_from_iterator(std::iter::once(Ok::<_, ArrowError>(value)))
+            .map_err(DataFusionError::from);
+    }
+
+    let mut reader = BufReader::new(std::io::Cursor::new(buf));
+
+    let is_array = match format {
+        Format::Array => true,
+        Format::Jsonl | Format::Object => false,
+        Format::Soda => {
+            return Err(DataFusionError::Internal(
+                "Format::Soda should be handled before calling infer_json_schema_for_format"
+                    .to_string(),
+            ));
+        }
+        Format::Auto | Format::Json => peek_first_non_ws_byte(&mut reader).is_ok_and(|b| b == b'['),
+    };
+
+    if is_array {
+        let mut adapter = ArrayToNdjson::try_new(reader)?;
+        let iter = ValueIter::new(&mut adapter, None);
+        Ok(infer_json_schema_from_iterator(
+            iter.take_while(|_| take_while()),
+        )?)
+    } else {
+        // For Auto/Json: try parsing as a single JSON object first.
+        // This handles multi-line/pretty-printed objects that the line-based
+        // ValueIter cannot parse. serde_json::from_slice rejects input with
+        // trailing non-whitespace content, so NDJSON files will fail here and
+        // fall through to ValueIter.
+        if matches!(format, Format::Auto | Format::Json)
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(buf)
+            && value.is_object()
+        {
+            take_while();
+            return Ok(infer_json_schema_from_iterator(std::iter::once(Ok::<
+                _,
+                ArrowError,
+            >(
+                value
+            )))?);
+        }
+
+        // NDJSON: use line-based ValueIter
+        let mut reader = BufReader::new(std::io::Cursor::new(buf));
+        let iter = ValueIter::new(&mut reader, None);
+        Ok(infer_json_schema_from_iterator(
+            iter.take_while(|_| take_while()),
+        )?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,5 +772,420 @@ mod tests {
         let _ = "invalid"
             .parse::<Format>()
             .expect_err("invalid format should be rejected");
+    }
+
+    #[test]
+    fn test_infer_schema_object_single_line() {
+        let buf = br#"{"name": "Alice", "age": 30}"#;
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(buf, Format::Object, &mut take)
+            .expect("should infer schema from single-line object");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+    }
+
+    #[test]
+    fn test_infer_schema_object_pretty_printed() {
+        let buf = b"{\n  \"airports\": 23\n}";
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(buf, Format::Object, &mut take)
+            .expect("should infer schema from pretty-printed object");
+        assert_eq!(schema.fields().len(), 1);
+        assert!(schema.field_with_name("airports").is_ok());
+    }
+
+    #[test]
+    fn test_infer_schema_object_nested_pretty_printed() {
+        let buf = br#"{
+  "airports": [
+    {"code": "ATL", "name": "Hartsfield"},
+    {"code": "LAX", "name": "Los Angeles"}
+  ],
+  "count": 2
+}"#;
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(buf, Format::Object, &mut take)
+            .expect("should infer schema from nested pretty-printed object");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("airports").is_ok());
+        assert!(schema.field_with_name("count").is_ok());
+    }
+
+    #[test]
+    fn test_infer_schema_object_invalid_json() {
+        let buf = b"not json";
+        let mut take = || true;
+        infer_json_schema_for_format(buf, Format::Object, &mut take)
+            .expect_err("should fail on invalid JSON");
+    }
+
+    #[test]
+    fn test_infer_schema_auto_pretty_printed_object() {
+        // Auto format should detect a multi-line JSON object without json_format: object
+        let buf = b"{\n  \"airports\": 23\n}";
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(buf, Format::Auto, &mut take)
+            .expect("Auto should infer schema from pretty-printed object");
+        assert_eq!(schema.fields().len(), 1);
+        assert!(schema.field_with_name("airports").is_ok());
+    }
+
+    #[test]
+    fn test_infer_schema_json_pretty_printed_object() {
+        // Json format should also detect a multi-line JSON object
+        let buf = b"{\n  \"name\": \"Alice\",\n  \"age\": 30\n}";
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(buf, Format::Json, &mut take)
+            .expect("Json should infer schema from pretty-printed object");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+    }
+
+    #[test]
+    fn test_infer_schema_auto_ndjson_still_works() {
+        // NDJSON with multiple lines should still work via ValueIter fallback
+        let buf = b"{\"a\": 1}\n{\"a\": 2, \"b\": 3}\n";
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(buf, Format::Auto, &mut take)
+            .expect("Auto should still handle NDJSON");
+        assert!(schema.field_with_name("a").is_ok());
+        assert!(schema.field_with_name("b").is_ok());
+    }
+
+    #[test]
+    fn test_infer_schema_auto_object_with_nested_array() {
+        // A single JSON object containing an array field (common API response shape)
+        let buf = br#"{
+  "airports": [
+    {"code": "ATL", "name": "Hartsfield-Jackson Atlanta International"},
+    {"code": "PEK", "name": "Beijing Capital International"}
+  ]
+}"#;
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(buf, Format::Auto, &mut take)
+            .expect("Auto should infer schema from object with nested array");
+        assert_eq!(schema.fields().len(), 1);
+        assert!(schema.field_with_name("airports").is_ok());
+    }
+
+    #[test]
+    fn test_infer_schema_object_with_nested_array() {
+        let buf = br#"{
+  "airports": [
+    {"code": "ATL", "name": "Hartsfield-Jackson Atlanta International"},
+    {"code": "PEK", "name": "Beijing Capital International"}
+  ]
+}"#;
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(buf, Format::Object, &mut take)
+            .expect("Object should infer schema from object with nested array");
+        assert_eq!(schema.fields().len(), 1);
+        assert!(schema.field_with_name("airports").is_ok());
+    }
+
+    // ----------------------------------------------------------------
+    // File-based schema inference tests using committed JSON fixtures
+    // ----------------------------------------------------------------
+
+    const TEST_DATA_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/test_data/");
+
+    fn load_fixture(name: &str) -> Vec<u8> {
+        let path = format!("{TEST_DATA_DIR}{name}");
+        std::fs::read(&path).unwrap_or_else(|e| panic!("Failed to read fixture {path}: {e}"))
+    }
+
+    // ---- JSONL fixtures ----
+
+    #[test]
+    fn test_fixture_jsonl_standard_schema() {
+        let data = load_fixture("jsonl_standard.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Jsonl, &mut take)
+            .expect("Jsonl schema from jsonl_standard.json");
+        assert_eq!(schema.fields().len(), 3);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+        assert!(schema.field_with_name("active").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_jsonl_standard_auto_schema() {
+        let data = load_fixture("jsonl_standard.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
+            .expect("Auto schema from jsonl_standard.json");
+        assert_eq!(schema.fields().len(), 3);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+        assert!(schema.field_with_name("active").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_jsonl_crlf_schema() {
+        let data = load_fixture("jsonl_crlf.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Jsonl, &mut take)
+            .expect("Jsonl schema from jsonl_crlf.json");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("id").is_ok());
+        assert!(schema.field_with_name("status").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_jsonl_nested_schema() {
+        let data = load_fixture("jsonl_nested.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Jsonl, &mut take)
+            .expect("Jsonl schema from jsonl_nested.json");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("user").is_ok());
+        assert!(schema.field_with_name("scores").is_ok());
+    }
+
+    // ---- Array fixtures ----
+
+    #[test]
+    fn test_fixture_array_standard_schema() {
+        let data = load_fixture("array_standard.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
+            .expect("Array schema from array_standard.json");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_array_standard_auto_schema() {
+        let data = load_fixture("array_standard.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
+            .expect("Auto schema from array_standard.json");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_array_pretty_schema() {
+        let data = load_fixture("array_pretty.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
+            .expect("Array schema from array_pretty.json");
+        assert_eq!(schema.fields().len(), 3);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+        assert!(schema.field_with_name("city").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_array_single_schema() {
+        let data = load_fixture("array_single.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
+            .expect("Array schema from array_single.json");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("only").is_ok());
+        assert!(schema.field_with_name("value").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_array_nested_schema() {
+        let data = load_fixture("array_nested.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
+            .expect("Array schema from array_nested.json");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("tags").is_ok());
+        assert!(schema.field_with_name("meta").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_array_mixed_types_schema() {
+        let data = load_fixture("array_mixed_types.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
+            .expect("Array schema from array_mixed_types.json");
+        assert_eq!(schema.fields().len(), 7);
+        assert!(schema.field_with_name("str").is_ok());
+        assert!(schema.field_with_name("int").is_ok());
+        assert!(schema.field_with_name("float").is_ok());
+        assert!(schema.field_with_name("bool").is_ok());
+        assert!(schema.field_with_name("null_val").is_ok());
+        assert!(schema.field_with_name("nested").is_ok());
+        assert!(schema.field_with_name("arr").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_array_empty_schema() {
+        let data = load_fixture("array_empty.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
+            .expect("Array schema from array_empty.json");
+        assert_eq!(schema.fields().len(), 0);
+    }
+
+    // ---- Object fixtures ----
+
+    #[test]
+    fn test_fixture_object_single_schema() {
+        let data = load_fixture("object_single.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
+            .expect("Object schema from object_single.json");
+        assert_eq!(schema.fields().len(), 4);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+        assert!(schema.field_with_name("active").is_ok());
+        assert!(schema.field_with_name("scores").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_object_pretty_schema() {
+        let data = load_fixture("object_pretty.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
+            .expect("Object schema from object_pretty.json");
+        assert_eq!(schema.fields().len(), 4);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+        assert!(schema.field_with_name("address").is_ok());
+        assert!(schema.field_with_name("tags").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_object_pretty_auto_schema() {
+        // Key test: Auto should handle pretty-printed multi-line object
+        let data = load_fixture("object_pretty.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
+            .expect("Auto schema from object_pretty.json");
+        assert_eq!(schema.fields().len(), 4);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+        assert!(schema.field_with_name("address").is_ok());
+        assert!(schema.field_with_name("tags").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_object_nulls_schema() {
+        let data = load_fixture("object_nulls.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
+            .expect("Object schema from object_nulls.json");
+        assert_eq!(schema.fields().len(), 4);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("middle_name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+        assert!(schema.field_with_name("nickname").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_object_empty_schema() {
+        let data = load_fixture("object_empty.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
+            .expect("Object schema from object_empty.json");
+        assert_eq!(schema.fields().len(), 0);
+    }
+
+    // ---- Airports fixture (pretty-printed multi-line object with nested array) ----
+
+    #[test]
+    fn test_fixture_airports_object_schema() {
+        let data = load_fixture("object_airports.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
+            .expect("Object schema from object_airports.json");
+        assert_eq!(schema.fields().len(), 3);
+        assert!(schema.field_with_name("airports").is_ok());
+        assert!(schema.field_with_name("count").is_ok());
+        assert!(schema.field_with_name("source").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_airports_auto_schema() {
+        let data = load_fixture("object_airports.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
+            .expect("Auto schema from object_airports.json");
+        assert_eq!(schema.fields().len(), 3);
+        assert!(schema.field_with_name("airports").is_ok());
+        assert!(schema.field_with_name("count").is_ok());
+        assert!(schema.field_with_name("source").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_airports_json_schema() {
+        let data = load_fixture("object_airports.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Json, &mut take)
+            .expect("Json schema from object_airports.json");
+        assert_eq!(schema.fields().len(), 3);
+        assert!(schema.field_with_name("airports").is_ok());
+        assert!(schema.field_with_name("count").is_ok());
+        assert!(schema.field_with_name("source").is_ok());
+    }
+
+    // ---- BOM-prefixed fixtures ----
+
+    #[test]
+    fn test_fixture_bom_object_schema() {
+        let data = load_fixture("bom_object.json");
+        // Verify BOM is actually present
+        assert_eq!(
+            &data[..3],
+            &[0xEF, 0xBB, 0xBF],
+            "fixture should start with UTF-8 BOM"
+        );
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
+            .expect("Object schema from bom_object.json");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_bom_object_auto_schema() {
+        let data = load_fixture("bom_object.json");
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
+            .expect("Auto schema from bom_object.json");
+        assert_eq!(schema.fields().len(), 2);
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_bom_jsonl_auto_schema() {
+        let data = load_fixture("bom_jsonl.json");
+        assert_eq!(
+            &data[..3],
+            &[0xEF, 0xBB, 0xBF],
+            "fixture should start with UTF-8 BOM"
+        );
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
+            .expect("Auto schema from bom_jsonl.json");
+        assert!(schema.field_with_name("name").is_ok());
+        assert!(schema.field_with_name("age").is_ok());
+    }
+
+    #[test]
+    fn test_fixture_bom_array_auto_schema() {
+        let data = load_fixture("bom_array.json");
+        assert_eq!(
+            &data[..3],
+            &[0xEF, 0xBB, 0xBF],
+            "fixture should start with UTF-8 BOM"
+        );
+        let mut take = || true;
+        let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
+            .expect("Auto schema from bom_array.json");
+        assert!(schema.field_with_name("id").is_ok());
+        assert!(schema.field_with_name("val").is_ok());
     }
 }

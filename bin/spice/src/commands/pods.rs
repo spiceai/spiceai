@@ -17,7 +17,7 @@ limitations under the License.
 //! Pods command implementation - lists spicepods loaded by the runtime.
 
 use crate::context::RuntimeContext;
-use crate::error::{InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
+use crate::error::{self, InvalidResponseSnafu, Result, RuntimeUnavailableSnafu};
 use crate::output::{OutputFormat, TableRow, write_json, write_table};
 use clap::Args;
 use serde::{Deserialize, Serialize};
@@ -77,12 +77,7 @@ pub async fn execute(ctx: &RuntimeContext, args: &PodsArgs) -> Result<()> {
         .build()
     })?;
 
-    if !response.status().is_success() {
-        return Err(RuntimeUnavailableSnafu {
-            endpoint: ctx.http_endpoint().to_string(),
-        }
-        .build());
-    }
+    let response = error::check_response(response, ctx.http_endpoint()).await?;
 
     let spicepods: Vec<SpicepodStatus> = response.json().await.map_err(|e| {
         InvalidResponseSnafu {
