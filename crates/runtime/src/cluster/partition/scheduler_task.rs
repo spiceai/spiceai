@@ -1313,10 +1313,7 @@ mod tests {
         let status = RuntimeStatus::new();
         // On the scheduler, datasets are NOT pre-registered — the partition
         // management task registers them once all partitions are assigned.
-        assert_eq!(
-            status.get_component_status("dataset:test_table"),
-            None
-        );
+        assert_eq!(status.get_component_status("dataset:test_table"), None);
 
         update_dataset_statuses_from_partitions(&partition_manager, &status).await;
 
