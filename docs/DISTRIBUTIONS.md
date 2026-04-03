@@ -15,6 +15,8 @@ The Spice open source project provides multiple distribution variants to support
 | macOS    | aarch64 (Apple Silicon) | Native (build host)                    | —                   |
 | Windows  | x86_64 (MSVC)           | —                                      | MSVC toolchain      |
 
+> **Note:** Windows support is CLI (`spice`) only. The runtime daemon (`spiced`) is not supported on Windows natively — use WSL instead.
+
 ## Distribution Availability
 
 | Distribution / Variant | Open Source      | Spice Cloud | Enterprise |
