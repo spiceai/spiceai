@@ -3854,6 +3854,49 @@ mod tests {
             assert_eq!(lines.len(), 1);
             assert_eq!(lines[0], "{}");
         }
+
+        #[test]
+        fn test_file_object_airports() {
+            let data = load_fixture("object_airports.json");
+            // Multi-line object with nested array — auto-detect sees '{'
+            let mut reader = BufReader::new(Cursor::new(&data));
+            let byte = peek_first_non_ws_byte(&mut reader).expect("should peek");
+            assert_eq!(byte, b'{');
+            // Read entire content and parse
+            let mut content = String::new();
+            reader.read_to_string(&mut content).expect("should read");
+            let r: serde_json::Value = serde_json::from_str(&content).expect("parse");
+            assert_eq!(r["count"], 5);
+            assert_eq!(r["source"], "FAA");
+            let airports = r["airports"].as_array().expect("airports array");
+            assert_eq!(airports.len(), 5);
+            assert_eq!(airports[0]["code"], "ATL");
+            assert_eq!(airports[0]["city"], "Atlanta");
+            assert_eq!(airports[0]["elevation_ft"], 1026);
+        }
+
+        #[test]
+        fn test_file_object_airports_json_pointer() {
+            use crate::JsonPointerReader;
+            let data = load_fixture("object_airports.json");
+            // Extract the airports array via json_pointer
+            let extracted =
+                JsonPointerReader::from_vec(&data, "/airports").expect("extract /airports");
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut BufReader::new(extracted), &mut buf).expect("read");
+            // Should be an array of objects
+            let adapter =
+                ArrayToNdjson::try_new(BufReader::new(Cursor::new(buf))).expect("ArrayToNdjson");
+            let lines = read_all_lines(adapter).expect("read lines");
+            assert_eq!(lines.len(), 5);
+            let r0: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse row 0");
+            assert_eq!(r0["code"], "ATL");
+            assert_eq!(r0["name"], "Hartsfield-Jackson Atlanta International");
+            assert_eq!(r0["elevation_ft"], 1026);
+            let r4: serde_json::Value = serde_json::from_str(&lines[4]).expect("parse row 4");
+            assert_eq!(r4["code"], "DEN");
+            assert_eq!(r4["state"], "CO");
+        }
     }
 
     mod file_pointer_tests {
