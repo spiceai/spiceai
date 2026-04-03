@@ -22,8 +22,9 @@ limitations under the License.
 //! ## Strategies
 //!
 //! - **Bucket-deterministic**: For tables partitioned with `bucket(N, col)`,
-//!   the executor is chosen as `sorted_executors[k % N]` where `k` is the
-//!   bucket scalar value and executors are alphabetically ordered. This
+//!   the executor is chosen as `sorted_executors[k % len(sorted_executors)]`
+//!   where `k` is the bucket scalar value and executors are alphabetically
+//!   ordered. This distributes buckets evenly across available executors and
 //!   guarantees co-location of the same bucket index across different tables,
 //!   enabling local joins without data shuffling.
 //!
@@ -46,9 +47,9 @@ type ExecutorId = String;
 ///
 /// For bucket-partitioned entries (single key matching `bucket(N, col)` with
 /// scalar value `k`), the executor is chosen deterministically as the
-/// `(k % N)`'th executor in alphabetical order. This ensures that bucket
-/// assignments are stable and evenly spread across executors regardless of
-/// arrival order.
+/// `(k % len(executors))`'th executor in alphabetical order. This ensures that
+/// bucket assignments are stable and evenly spread across executors regardless
+/// of arrival order.
 ///
 /// All other entries fall back to least-loaded assignment, incrementally
 /// accounting for each prior pick.
@@ -113,24 +114,23 @@ pub(crate) fn select_least_loaded_executors(
 ///  - `partition_value` has exactly one key matching `bucket(N, …)`
 ///  - `scalar_values` has exactly one element convertible to an integer `k`
 ///
-/// The assigned executor is `sorted_executors[k % N]`.
+/// The assigned executor is `sorted_executors[k % len(sorted_executors)]`,
+/// distributing buckets evenly across however many executors are available.
 fn try_bucket_assignment(
     partition_value: &PartitionValue,
     scalar_values: &[ScalarValue],
     sorted_executors: &[&str],
 ) -> Option<String> {
-    if partition_value.len() != 1 || scalar_values.len() != 1 {
+    if partition_value.len() != 1 || scalar_values.len() != 1 || sorted_executors.is_empty() {
         return None;
     }
 
     let key = partition_value.keys().next()?;
-    let n = parse_bucket_n(key)?;
-    if n == 0 {
-        return None;
-    }
+    // Verify this is a bucket partition; we don't use N for indexing.
+    let _n = parse_bucket_n(key)?;
 
     let k = scalar_to_u16(&scalar_values[0])?;
-    let idx = usize::from(k % n) % sorted_executors.len();
+    let idx = usize::from(k) % sorted_executors.len();
     Some(sorted_executors[idx].to_string())
 }
 
@@ -201,7 +201,6 @@ mod tests {
 
     #[test]
     fn test_parse_bucket_n_zero() {
-        // parse_bucket_n returns Some(0), but try_bucket_assignment rejects it.
         assert_eq!(parse_bucket_n("bucket(0, col)"), Some(0));
     }
 
@@ -222,10 +221,25 @@ mod tests {
     fn test_try_bucket_assignment_deterministic() {
         let executors = vec!["exec_a", "exec_b", "exec_c"];
 
-        // bucket(3, col) with k=0 → exec_a, k=1 → exec_b, k=2 → exec_c
+        // bucket(3, col) with 3 executors: k % 3
+        // k=0 → exec_a, k=1 → exec_b, k=2 → exec_c, k=3 → exec_a
         for (k, expected) in [(0, "exec_a"), (1, "exec_b"), (2, "exec_c"), (3, "exec_a")] {
             let mut pv = HashMap::new();
             pv.insert("bucket(3, col)".to_string(), k.to_string());
+            let result =
+                try_bucket_assignment(&pv, &[ScalarValue::Int32(Some(k))], &executors);
+            assert_eq!(result.as_deref(), Some(expected), "k={k}");
+        }
+    }
+
+    #[test]
+    fn test_try_bucket_assignment_more_buckets_than_executors() {
+        // 6 buckets but only 2 executors: k % 2
+        let executors = vec!["exec_a", "exec_b"];
+
+        for (k, expected) in [(0, "exec_a"), (1, "exec_b"), (2, "exec_a"), (5, "exec_b")] {
+            let mut pv = HashMap::new();
+            pv.insert("bucket(6, col)".to_string(), k.to_string());
             let result =
                 try_bucket_assignment(&pv, &[ScalarValue::Int32(Some(k))], &executors);
             assert_eq!(result.as_deref(), Some(expected), "k={k}");

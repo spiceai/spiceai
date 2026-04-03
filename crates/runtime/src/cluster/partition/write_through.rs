@@ -715,9 +715,9 @@ fn build_partition_physical_exprs(
 ///
 /// For bucket-partitioned entries (single key matching `bucket(N, col)` with
 /// scalar value `k`), the executor is chosen deterministically as the
-/// `(k % N)`'th executor in alphabetical order. This ensures that bucket
-/// assignments are stable and evenly spread across executors regardless of
-/// arrival order.
+/// `(k % len(executors))`'th executor in alphabetical order. This ensures that
+/// bucket assignments are stable and evenly spread across executors regardless
+/// of arrival order.
 ///
 /// All other entries fall back to least-loaded assignment, incrementally
 /// accounting for each prior pick.
