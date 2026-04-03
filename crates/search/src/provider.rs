@@ -568,7 +568,7 @@ impl TableProvider for SearchQueryProvider {
                 let mut sort_exprs = vec![SortExpr::new(
                     Expr::Column(Column::new_unqualified(SEARCH_SCORE_COLUMN_NAME)),
                     false, // descending
-                    true,  // nulls_first
+                    false, // nulls_last (null scores should rank lowest, consistent with other search sort sites)
                 )];
                 sort_exprs.extend(self.primary_key.iter().map(|pk| {
                     SortExpr::new(

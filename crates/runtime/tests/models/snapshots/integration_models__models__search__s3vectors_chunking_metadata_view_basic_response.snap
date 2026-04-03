@@ -6,6 +6,30 @@ expression: normalize_search_response(resp)
   "duration_ms": "duration_ms_val",
   "results": [
     {
+      "_score": "0.79",
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          "\n2"
+        ]
+      },
+      "primary_key": {
+        "id": 612
+      }
+    },
+    {
+      "_score": "0.78",
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          " is 2."
+        ]
+      },
+      "primary_key": {
+        "id": 349
+      }
+    },
+    {
       "_score": "0.55",
       "dataset": "qs_view",
       "matches": {
@@ -27,30 +51,6 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 1277
-      }
-    },
-    {
-      "_score": "0.53",
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "\nd) $2-|-6| = 2 - 6 = -4"
-        ]
-      },
-      "primary_key": {
-        "id": 708
-      }
-    },
-    {
-      "_score": "0.53",
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\"
-        ]
-      },
-      "primary_key": {
-        "id": 189
       }
     }
   ]

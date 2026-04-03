@@ -29,8 +29,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use turso_shared::{
-    is_retryable_write_conflict_message, retry_backoff_delay, BEGIN_CONCURRENT_SQL,
-    BEGIN_TRANSACTION_SQL, COMMIT_SQL, DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS,
+    is_retryable_write_conflict_message, retry_backoff_delay, DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS,
 };
 
 struct ExistingDeleteFileRecord {
@@ -52,18 +51,6 @@ pub(crate) enum MetastoreImpl {
 }
 
 impl MetastoreImpl {
-    #[must_use]
-    pub(crate) fn is_turso(&self) -> bool {
-        #[cfg(feature = "turso")]
-        {
-            matches!(self, Self::Turso(_))
-        }
-        #[cfg(not(feature = "turso"))]
-        {
-            false
-        }
-    }
-
     /// Helper to query a single row from metastore, working with both `SQLite` and Turso
     pub(crate) async fn query_row_helper<F, T>(
         &self,
@@ -90,18 +77,6 @@ impl MetastoreImpl {
         }
     }
 
-    /// Helper to execute a batch of SQL statements.
-    ///
-    /// Callers that require atomicity must include explicit `BEGIN ... COMMIT`
-    /// statements in the SQL they pass to this helper.
-    pub(crate) async fn execute_batch_helper(&self, sql: &str) -> CatalogResult<()> {
-        match self {
-            MetastoreImpl::Sqlite(m) => m.execute_batch(sql).await,
-            #[cfg(feature = "turso")]
-            MetastoreImpl::Turso(m) => m.execute_batch(sql).await,
-        }
-    }
-
     /// Helper to query multiple rows from metastore, working with both `SQLite` and Turso
     pub(crate) async fn query_helper<F, T>(
         &self,
@@ -125,6 +100,21 @@ impl MetastoreImpl {
             MetastoreImpl::Sqlite(m) => m.shutdown().await,
             #[cfg(feature = "turso")]
             MetastoreImpl::Turso(m) => m.shutdown().await,
+        }
+    }
+
+    /// Begin a transaction on the underlying metastore.
+    ///
+    /// Each backend sends the appropriate BEGIN statement (e.g. `BEGIN TRANSACTION`
+    /// for `SQLite`, `BEGIN CONCURRENT` for Turso). The returned transaction object
+    /// holds exclusive access to the connection.
+    pub(crate) async fn begin_transaction(
+        &self,
+    ) -> CatalogResult<Box<dyn super::metastore::MetastoreTransaction>> {
+        match self {
+            MetastoreImpl::Sqlite(m) => m.begin_transaction().await,
+            #[cfg(feature = "turso")]
+            MetastoreImpl::Turso(m) => m.begin_transaction().await,
         }
     }
 }
@@ -218,6 +208,8 @@ impl CayenneCatalog {
                     return Ok(stored_metadata);
                 }
 
+                log_configuration_differences(table_name, &stored_metadata, options);
+
                 Err(CatalogError::ChangedConfiguration {
                     table_name: table_name.to_string(),
                 })
@@ -237,6 +229,25 @@ impl CayenneCatalog {
         pk_bytes_list: Vec<Vec<u8>>,
         sequence_number: i64,
     ) -> CatalogResult<()> {
+        let (sql, params) =
+            Self::build_insert_records_chunk_sql(table_id, pk_bytes_list, sequence_number);
+
+        self.metastore
+            .execute_helper(ExecuteParams { sql: &sql, params })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to add insert record entries in batch".to_string(),
+                source: Box::new(e),
+            })?;
+        Ok(())
+    }
+
+    /// Build the SQL and parameters for a single chunk of insert records.
+    fn build_insert_records_chunk_sql(
+        table_id: &str,
+        pk_bytes_list: Vec<Vec<u8>>,
+        sequence_number: i64,
+    ) -> (String, Vec<MetastoreValue>) {
         let mut values_parts = Vec::with_capacity(pk_bytes_list.len());
         let mut params = Vec::with_capacity(pk_bytes_list.len() * 4);
         let table_id = table_id.to_string();
@@ -262,14 +273,7 @@ impl CayenneCatalog {
             values_parts.join(", ")
         );
 
-        self.metastore
-            .execute_helper(ExecuteParams { sql: &sql, params })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to add insert record entries in batch".to_string(),
-                source: Box::new(e),
-            })?;
-        Ok(())
+        (sql, params)
     }
 }
 
@@ -328,11 +332,19 @@ impl MetadataCatalog for CayenneCatalog {
             .await
             .ok();
 
-        if existing_table_id.is_some() {
-            return self
+        if let Some(ref existing_id) = existing_table_id {
+            return match self
                 .validate_existing_table_configuration(table_name.as_str(), &options)
                 .await
-                .map(|stored_metadata| stored_metadata.table_id);
+            {
+                Ok(stored_metadata) => Ok(stored_metadata.table_id),
+                Err(CatalogError::ChangedConfiguration { .. }) => {
+                    // Fall back to stored config — the warning was already logged by
+                    // validate_existing_table_configuration.
+                    Ok(existing_id.clone())
+                }
+                Err(e) => Err(e),
+            };
         }
 
         // Serialize schema using Arrow IPC format (supports all Arrow types)
@@ -414,13 +426,22 @@ impl MetadataCatalog for CayenneCatalog {
         match insert_result {
             Ok(()) => {}
             Err(CatalogError::ConstraintViolation { .. }) => {
-                let existing_table = self
+                match self
                     .validate_existing_table_configuration(table_name.as_str(), &options)
-                    .await?;
-
-                ensure_snapshot_directory_exists(&existing_table).await?;
-
-                return Ok(existing_table.table_id);
+                    .await
+                {
+                    Ok(existing_table) => {
+                        ensure_snapshot_directory_exists(&existing_table).await?;
+                        return Ok(existing_table.table_id);
+                    }
+                    Err(CatalogError::ChangedConfiguration { .. }) => {
+                        // Fall back to stored config — the warning was already logged.
+                        let stored = self.get_table(&table_name).await?;
+                        ensure_snapshot_directory_exists(&stored).await?;
+                        return Ok(stored.table_id);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             Err(e) => return Err(e),
         }
@@ -828,40 +849,29 @@ impl MetadataCatalog for CayenneCatalog {
                 .await;
         }
 
-        // Multiple chunks required — wrap in a transaction for atomicity.
-        let begin = if self.metastore.is_turso() {
-            BEGIN_CONCURRENT_SQL
-        } else {
-            BEGIN_TRANSACTION_SQL
-        };
-        self.metastore
-            .execute_batch_helper(begin)
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
+        // Multiple chunks required — use a proper transaction for atomicity.
+        // The transaction holds exclusive access to the connection, preventing
+        // concurrent operations from interleaving BEGIN/COMMIT boundaries.
+        let tx = self.metastore.begin_transaction().await.map_err(|e| {
+            CatalogError::InvalidOperation {
                 message: "Failed to begin transaction for batch insert records".to_string(),
                 source: Box::new(e),
-            })?;
+            }
+        })?;
 
         for chunk in pk_bytes_list.chunks(MAX_ROWS_PER_CHUNK) {
-            if let Err(e) = self
-                .insert_records_chunk(table_id, chunk.to_vec(), sequence_number)
-                .await
-            {
-                // Best-effort rollback; if it fails, the connection will
-                // auto-rollback when the next statement runs.
-                let _ = self
-                    .metastore
-                    .execute_helper(ExecuteParams {
-                        sql: "ROLLBACK",
-                        params: vec![],
-                    })
-                    .await;
-                return Err(e);
+            let (sql, params) =
+                Self::build_insert_records_chunk_sql(table_id, chunk.to_vec(), sequence_number);
+            if let Err(e) = tx.execute(ExecuteParams { sql: &sql, params }).await {
+                // Transaction auto-rolls-back on drop.
+                return Err(CatalogError::InvalidOperation {
+                    message: "Failed to add insert record entries in batch".to_string(),
+                    source: Box::new(e),
+                });
             }
         }
 
-        self.metastore
-            .execute_batch_helper(COMMIT_SQL)
+        tx.commit()
             .await
             .map_err(|e| CatalogError::InvalidOperation {
                 message: "Failed to commit transaction for batch insert records".to_string(),
@@ -1021,9 +1031,7 @@ impl MetadataCatalog for CayenneCatalog {
             }
         }
 
-        // Execute all operations atomically using a transaction batch.
-        // Atomicity is provided by explicit BEGIN ... COMMIT statements in `batch_sql`,
-        // ensuring either all statements succeed or none takes effect.
+        // Execute all operations atomically using a proper transaction.
         //
         // Order matters for crash safety:
         // 1. Clear delete files first - they reference the old snapshot's data
@@ -1035,30 +1043,19 @@ impl MetadataCatalog for CayenneCatalog {
         // If interrupted between these, the old snapshot remains active with
         // no delete files, which is safe (just loses the pending deletions,
         // but data is not corrupted).
-        let begin_transaction = if self.metastore.is_turso() {
-            BEGIN_CONCURRENT_SQL
-        } else {
-            BEGIN_TRANSACTION_SQL
-        };
-
         let table_id_literal = sql_text_literal(table_id);
         let new_snapshot_id_literal = sql_text_literal(new_snapshot_id);
         let batch_sql = format!(
-            "{begin_transaction}; \
-             DELETE FROM cayenne_delete_file WHERE table_id = {table_id_literal}; \
+            "DELETE FROM cayenne_delete_file WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_insert_record WHERE table_id = {table_id_literal}; \
              DELETE FROM cayenne_snapshot_sequence WHERE table_id = {table_id_literal}; \
-             UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal}; \
-             {COMMIT_SQL};"
+             UPDATE cayenne_table SET current_snapshot_id = {new_snapshot_id_literal} WHERE table_id = {table_id_literal};"
         );
 
-        // BEGIN CONCURRENT may fail with SQLITE_BUSY/SQLITE_LOCKED conflicts at commit time.
-        // Retry a few times with backoff to improve throughput under concurrent writers.
-        let max_attempts = if self.metastore.is_turso() {
-            DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS
-        } else {
-            1
-        };
+        // The transaction may fail with SQLITE_BUSY/SQLITE_LOCKED conflicts at
+        // commit time (especially with Turso's BEGIN CONCURRENT). Retry a few
+        // times with backoff.
+        let max_attempts = DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS;
         if max_attempts == 0 {
             return Err(CatalogError::InvalidOperationNoSource {
                 message: "commit_compaction requires at least one attempt".to_string(),
@@ -1066,25 +1063,33 @@ impl MetadataCatalog for CayenneCatalog {
         }
 
         for attempt in 1..=max_attempts {
-            match self.metastore.execute_batch_helper(&batch_sql).await {
-                Ok(()) => return Ok(()),
-                Err(e)
-                    if self.metastore.is_turso()
-                        && attempt < max_attempts
-                        && is_retryable_turso_write_conflict(&e) =>
-                {
-                    rollback_failed_compaction_transaction(&self.metastore).await;
-                    let delay = retry_backoff_delay(attempt);
-                    tracing::debug!(
-                        attempt,
-                        max_attempts,
-                        ?delay,
-                        "Retrying Turso BEGIN CONCURRENT compaction transaction after conflict"
-                    );
-                    tokio::time::sleep(delay).await;
+            let tx = self.metastore.begin_transaction().await.map_err(|e| {
+                CatalogError::FailedToSetCurrentSnapshot {
+                    source: Box::new(e),
                 }
+            })?;
+
+            match tx.execute_batch(&batch_sql).await {
+                Ok(()) => match tx.commit().await {
+                    Ok(()) => return Ok(()),
+                    Err(e) if attempt < max_attempts && is_retryable_write_conflict(&e) => {
+                        let delay = retry_backoff_delay(attempt);
+                        tracing::debug!(
+                            attempt,
+                            max_attempts,
+                            ?delay,
+                            "Retrying compaction transaction after commit conflict"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(e) => {
+                        return Err(CatalogError::FailedToSetCurrentSnapshot {
+                            source: Box::new(e),
+                        });
+                    }
+                },
                 Err(e) => {
-                    rollback_failed_compaction_transaction(&self.metastore).await;
+                    // Transaction auto-rolls-back on drop.
                     return Err(CatalogError::FailedToSetCurrentSnapshot {
                         source: Box::new(e),
                     });
@@ -1339,7 +1344,7 @@ impl MetadataCatalog for CayenneCatalog {
     }
 }
 
-fn is_retryable_turso_write_conflict(error: &CatalogError) -> bool {
+fn is_retryable_write_conflict(error: &CatalogError) -> bool {
     match error {
         CatalogError::Database { message } => is_retryable_write_conflict_message(message),
         _ => false,
@@ -1423,27 +1428,6 @@ async fn ensure_snapshot_directory_exists(table: &TableMetadata) -> CatalogResul
         .map_err(|e| CatalogError::Io { source: e })
 }
 
-async fn rollback_failed_compaction_transaction(metastore: &MetastoreImpl) {
-    if let Err(error) = metastore
-        .execute_helper(ExecuteParams {
-            sql: "ROLLBACK",
-            params: vec![],
-        })
-        .await
-    {
-        let backend = if metastore.is_turso() {
-            "Turso"
-        } else {
-            "SQLite"
-        };
-        tracing::debug!(
-            backend,
-            ?error,
-            "Failed to rollback compaction transaction after batch error"
-        );
-    }
-}
-
 /// Checks if the existing stored configuration matches the new [`CreateTableOptions`].
 ///
 /// Returns `true` if the configuration matches (no recreation needed).
@@ -1488,7 +1472,77 @@ fn configuration_matches(stored: &TableMetadata, options: &CreateTableOptions) -
     true
 }
 
-/// Logs the specific configuration differences between stored and new options at debug level.
+/// Logs a warning describing exactly which configuration fields differ between the
+/// stored table metadata and the newly requested [`CreateTableOptions`].
+///
+/// Called when [`validate_existing_table_configuration`] detects a mismatch so the
+/// user can see *what* changed and how to resolve it.
+fn log_configuration_differences(
+    table_name: &str,
+    stored: &TableMetadata,
+    options: &CreateTableOptions,
+) {
+    let mut differences = Vec::new();
+
+    if stored.primary_key != options.primary_key {
+        differences.push(format!(
+            "primary_key: {:?} -> {:?}",
+            stored.primary_key, options.primary_key
+        ));
+    }
+
+    let stored_oc = stored.on_conflict.as_ref().map(ToString::to_string);
+    let new_oc = options.on_conflict.as_ref().map(ToString::to_string);
+    if stored_oc != new_oc {
+        differences.push(format!(
+            "on_conflict: {} -> {}",
+            stored_oc.as_deref().unwrap_or("none"),
+            new_oc.as_deref().unwrap_or("none"),
+        ));
+    }
+
+    if stored.partition_column != options.partition_column {
+        differences.push(format!(
+            "partition_column: {:?} -> {:?}",
+            stored.partition_column, options.partition_column
+        ));
+    }
+
+    if stored.schema.as_ref() != options.schema.as_ref() {
+        differences.push("schema: <changed>".to_string());
+    }
+
+    if stored.vortex_config.sort_columns != options.vortex_config.sort_columns {
+        differences.push(format!(
+            "sort_columns: {:?} -> {:?}",
+            stored.vortex_config.sort_columns, options.vortex_config.sort_columns
+        ));
+    }
+
+    if stored.vortex_config.compression_strategy != options.vortex_config.compression_strategy {
+        differences.push(format!(
+            "compression_strategy: {:?} -> {:?}",
+            stored.vortex_config.compression_strategy, options.vortex_config.compression_strategy
+        ));
+    }
+
+    if stored.path != options.base_path {
+        differences.push(format!(
+            "base_path: {:?} -> {:?}",
+            stored.path, options.base_path
+        ));
+    }
+
+    tracing::warn!(
+        table = table_name,
+        "Configuration for table '{table_name}' has changed but the existing acceleration was not recreated. \
+         Changed fields: [{}]. \
+         The acceleration will continue using the previously stored configuration. \
+         To apply the new configuration, delete the existing acceleration and restart.",
+        differences.join(", ")
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2450,7 +2504,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_table_returns_error_on_config_change() {
+    async fn test_create_table_falls_back_on_config_change() {
         let test_db = format!("sqlite://./.test_config_change_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
@@ -2483,7 +2537,8 @@ mod tests {
         assert!(metadata.primary_key.is_empty());
         assert_eq!(metadata.table_id, table_id_1);
 
-        // Now try to create with a primary key change — should get ChangedConfiguration error
+        // Now try to create with a primary key change — should fall back to stored config
+        // (a warning is logged, but create_table succeeds with the original table_id)
         let options_changed = CreateTableOptions {
             table_name: "test_table".to_string(),
             schema: Arc::clone(&schema),
@@ -2493,10 +2548,13 @@ mod tests {
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
-        let result = catalog.create_table(options_changed).await;
-        assert!(
-            matches!(&result, Err(CatalogError::ChangedConfiguration { .. })),
-            "Expected ChangedConfiguration error, got: {result:?}"
+        let table_id_2 = catalog
+            .create_table(options_changed)
+            .await
+            .expect("Config change should fall back gracefully");
+        assert_eq!(
+            table_id_1, table_id_2,
+            "Should return the original table_id when config changes"
         );
 
         // Original table should still be intact with original config
@@ -2533,7 +2591,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_table_returns_error_on_sort_columns_change() {
+    async fn test_create_table_falls_back_on_sort_columns_change() {
         let test_db = format!("sqlite://./.test_sort_change_{}.db", uuid::Uuid::now_v7());
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
@@ -2553,12 +2611,12 @@ mod tests {
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
-        catalog
+        let table_id_1 = catalog
             .create_table(options)
             .await
             .expect("Failed to create table");
 
-        // Add sort columns — should return ChangedConfiguration error
+        // Add sort columns — should fall back to stored config with a warning
         let vortex_config = crate::metadata::VortexConfig {
             sort_columns: vec!["ts".to_string()],
             ..Default::default()
@@ -2572,10 +2630,13 @@ mod tests {
             partition_column: None,
             vortex_config,
         };
-        let result = catalog.create_table(options_sorted).await;
-        assert!(
-            matches!(&result, Err(CatalogError::ChangedConfiguration { .. })),
-            "Expected ChangedConfiguration error, got: {result:?}"
+        let table_id_2 = catalog
+            .create_table(options_sorted)
+            .await
+            .expect("Sort column change should fall back gracefully");
+        assert_eq!(
+            table_id_1, table_id_2,
+            "Should return the original table_id when sort columns change"
         );
 
         // Cleanup
@@ -2810,31 +2871,408 @@ mod tests {
         }
     }
 
+    /// Helper to create a [`TableMetadata`] for unit tests.
+    fn make_test_metadata(
+        primary_key: Vec<String>,
+        on_conflict: Option<datafusion_table_providers::util::on_conflict::OnConflict>,
+        partition_column: Option<String>,
+        path: &str,
+        vortex_config: crate::metadata::VortexConfig,
+        schema: arrow_schema::SchemaRef,
+    ) -> TableMetadata {
+        TableMetadata {
+            table_id: "test-id".to_string(),
+            table_name: "test_table".to_string(),
+            path: path.to_string(),
+            path_is_relative: false,
+            schema,
+            primary_key,
+            on_conflict,
+            current_snapshot_id: "snap-1".to_string(),
+            partition_column,
+            vortex_config,
+            current_sequence_number: 0,
+        }
+    }
+
+    #[test]
+    fn test_configuration_matches_identical() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let stored = make_test_metadata(
+            vec!["id".to_string()],
+            None,
+            None,
+            "/tmp/test",
+            crate::metadata::VortexConfig::default(),
+            Arc::clone(&schema),
+        );
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: "/tmp/test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        assert!(
+            configuration_matches(&stored, &options),
+            "Identical configurations should match"
+        );
+    }
+
+    #[test]
+    fn test_configuration_matches_primary_key_differs() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let stored = make_test_metadata(
+            vec![],
+            None,
+            None,
+            "/tmp/test",
+            crate::metadata::VortexConfig::default(),
+            Arc::clone(&schema),
+        );
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: "/tmp/test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        assert!(
+            !configuration_matches(&stored, &options),
+            "Different primary_key should not match"
+        );
+    }
+
+    #[test]
+    fn test_configuration_matches_on_conflict_differs() {
+        use datafusion_table_providers::util::on_conflict::OnConflict;
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let stored = make_test_metadata(
+            vec!["id".to_string()],
+            None,
+            None,
+            "/tmp/test",
+            crate::metadata::VortexConfig::default(),
+            Arc::clone(&schema),
+        );
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::DoNothingAll),
+            base_path: "/tmp/test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        assert!(
+            !configuration_matches(&stored, &options),
+            "Different on_conflict should not match"
+        );
+    }
+
+    #[test]
+    fn test_configuration_matches_sort_columns_differ() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let stored = make_test_metadata(
+            vec![],
+            None,
+            None,
+            "/tmp/test",
+            crate::metadata::VortexConfig::default(),
+            Arc::clone(&schema),
+        );
+        let changed_vortex = crate::metadata::VortexConfig {
+            sort_columns: vec!["id".to_string()],
+            ..Default::default()
+        };
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/test".to_string(),
+            partition_column: None,
+            vortex_config: changed_vortex,
+        };
+        assert!(
+            !configuration_matches(&stored, &options),
+            "Different sort_columns should not match"
+        );
+    }
+
+    #[test]
+    fn test_configuration_matches_base_path_differs() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let stored = make_test_metadata(
+            vec![],
+            None,
+            None,
+            "/tmp/old_path",
+            crate::metadata::VortexConfig::default(),
+            Arc::clone(&schema),
+        );
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/new_path".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        assert!(
+            !configuration_matches(&stored, &options),
+            "Different base_path should not match"
+        );
+    }
+
+    #[test]
+    fn test_log_configuration_differences_primary_key_change() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let stored = make_test_metadata(
+            vec![],
+            None,
+            None,
+            "/tmp/test",
+            crate::metadata::VortexConfig::default(),
+            Arc::clone(&schema),
+        );
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: "/tmp/test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        // Should not panic; exercises the logging path for primary_key change.
+        log_configuration_differences("test_table", &stored, &options);
+    }
+
+    #[test]
+    fn test_log_configuration_differences_on_conflict_change() {
+        use datafusion_table_providers::util::on_conflict::OnConflict;
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let stored = make_test_metadata(
+            vec!["id".to_string()],
+            None,
+            None,
+            "/tmp/test",
+            crate::metadata::VortexConfig::default(),
+            Arc::clone(&schema),
+        );
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::DoNothingAll),
+            base_path: "/tmp/test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        // Should not panic; exercises the logging path for on_conflict change.
+        log_configuration_differences("test_table", &stored, &options);
+    }
+
+    #[test]
+    fn test_log_configuration_differences_multiple_fields() {
+        use datafusion_table_providers::util::on_conflict::OnConflict;
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let stored = make_test_metadata(
+            vec![],
+            None,
+            None,
+            "/tmp/old",
+            crate::metadata::VortexConfig::default(),
+            Arc::clone(&schema),
+        );
+        let changed_vortex = crate::metadata::VortexConfig {
+            sort_columns: vec!["id".to_string()],
+            ..Default::default()
+        };
+        let options = CreateTableOptions {
+            table_name: "test_table".to_string(),
+            schema,
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::DoNothingAll),
+            base_path: "/tmp/new".to_string(),
+            partition_column: Some("region".to_string()),
+            vortex_config: changed_vortex,
+        };
+        // Should not panic; exercises the logging path when many fields change at once.
+        log_configuration_differences("test_table", &stored, &options);
+    }
+
     #[tokio::test]
-    async fn test_rollback_failed_compaction_transaction_cleans_up_sqlite_batch_error() {
+    async fn test_create_table_on_conflict_change_falls_back() {
+        use datafusion_table_providers::util::on_conflict::OnConflict;
         let test_db = format!(
-            "sqlite://./.test_compaction_rollback_{}.db",
+            "sqlite://./.test_on_conflict_change_{}.db",
             uuid::Uuid::now_v7()
         );
         let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
         catalog.init().await.expect("Failed to initialize catalog");
 
-        let batch_result = catalog
-            .metastore
-            .execute_batch_helper(
-                "BEGIN TRANSACTION; INSERT INTO missing_table VALUES (1); COMMIT;",
-            )
-            .await;
-        assert!(batch_result.is_err(), "Expected batch execution to fail");
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, true),
+        ]));
 
-        rollback_failed_compaction_transaction(&catalog.metastore).await;
-
-        catalog
-            .metastore
-            .execute_batch_helper("BEGIN TRANSACTION; COMMIT;")
+        // Create table without on_conflict
+        let options = CreateTableOptions {
+            table_name: "oc_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_oc_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id_1 = catalog
+            .create_table(options)
             .await
-            .expect("Expected rollback helper to clear the failed SQLite transaction");
+            .expect("Failed to create table");
 
+        // Now try to add on_conflict — should fall back gracefully
+        let options_changed = CreateTableOptions {
+            table_name: "oc_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::DoNothingAll),
+            base_path: "/tmp/cayenne_oc_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let table_id_2 = catalog
+            .create_table(options_changed)
+            .await
+            .expect("on_conflict change should fall back gracefully");
+        assert_eq!(
+            table_id_1, table_id_2,
+            "Should return the original table_id when on_conflict changes"
+        );
+
+        // Stored metadata should still have original config (no on_conflict)
+        let metadata = catalog
+            .get_table("oc_table")
+            .await
+            .expect("Failed to get table");
+        assert!(
+            metadata.on_conflict.is_none(),
+            "Stored on_conflict should remain None"
+        );
+
+        // Cleanup
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_existing_table_configuration_returns_error_on_mismatch() {
+        let test_db = format!(
+            "sqlite://./.test_validate_mismatch_{}.db",
+            uuid::Uuid::now_v7()
+        );
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+
+        // Create table with no primary key
+        let options = CreateTableOptions {
+            table_name: "validate_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_validate_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        catalog
+            .create_table(options)
+            .await
+            .expect("Failed to create table");
+
+        // validate_existing_table_configuration should return ChangedConfiguration
+        let changed_options = CreateTableOptions {
+            table_name: "validate_table".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_validate_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let result = catalog
+            .validate_existing_table_configuration("validate_table", &changed_options)
+            .await;
+        assert!(
+            matches!(&result, Err(CatalogError::ChangedConfiguration { .. })),
+            "Expected ChangedConfiguration error from validate, got: {result:?}"
+        );
+
+        // validate_existing_table_configuration should return Ok when config matches
+        let same_options = CreateTableOptions {
+            table_name: "validate_table".to_string(),
+            schema,
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: "/tmp/cayenne_validate_test".to_string(),
+            partition_column: None,
+            vortex_config: crate::metadata::VortexConfig::default(),
+        };
+        let result = catalog
+            .validate_existing_table_configuration("validate_table", &same_options)
+            .await;
+        assert!(
+            result.is_ok(),
+            "Expected Ok when config matches, got: {result:?}"
+        );
+
+        // Cleanup
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));

@@ -15,20 +15,16 @@ limitations under the License.
 */
 
 #![allow(clippy::missing_errors_doc)]
-use std::{any::Any, borrow::Cow, error::Error, sync::Arc};
+use std::{any::Any, error::Error, sync::Arc};
 
 use ::arrow::{
     array::{ArrayRef, RecordBatch, UInt64Array},
-    datatypes::{DataType, Field, Schema, SchemaRef},
+    datatypes::{DataType, Field, Schema},
 };
 use async_trait::async_trait;
 use datafusion::{
-    catalog::{ScanArgs, ScanResult, Session},
-    common::{Constraints, Statistics},
-    datasource::{TableProvider, TableType},
-    error::{DataFusionError, Result as DataFusionResult},
+    error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{Expr, LogicalPlan, dml::InsertOp},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -36,19 +32,6 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
 };
-
-use crate::poly::PolyTableProvider;
-
-#[async_trait]
-pub trait DeletionTableProvider: TableProvider {
-    async fn delete_from(
-        &self,
-        _state: &dyn Session,
-        _filters: &[Expr],
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Err(DataFusionError::Plan("Not implemented".to_string()))
-    }
-}
 
 #[async_trait]
 pub trait DeletionSink: Send + Sync {
@@ -61,9 +44,14 @@ pub struct DeletionExec {
 }
 
 impl DeletionExec {
-    pub fn new(deletion_sink: Arc<dyn DeletionSink>, schema: &SchemaRef) -> Self {
+    pub fn new(deletion_sink: Arc<dyn DeletionSink>) -> Self {
+        let count_schema = Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::UInt64,
+            false,
+        )]));
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(schema)),
+            EquivalenceProperties::new(count_schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -147,121 +135,5 @@ impl ExecutionPlan for DeletionExec {
                 }
             })
         })))
-    }
-}
-
-#[derive(Debug)]
-pub struct DeletionTableProviderAdapter {
-    source: Arc<dyn DeletionTableProvider>,
-}
-
-impl DeletionTableProviderAdapter {
-    pub fn new(source: Arc<dyn DeletionTableProvider>) -> Self {
-        Self { source }
-    }
-
-    /// Returns a reference to the inner source table provider.
-    ///
-    /// This is useful for accessing the underlying table provider when the adapter
-    /// is wrapping another provider (e.g., `IndexedMemTable`) that needs direct access
-    /// for operations like index maintenance.
-    #[must_use]
-    pub fn source(&self) -> &Arc<dyn DeletionTableProvider> {
-        &self.source
-    }
-}
-
-#[expect(clippy::needless_pass_by_value)]
-pub fn get_deletion_provider(
-    from: Arc<dyn TableProvider>,
-) -> Option<Arc<dyn DeletionTableProvider>> {
-    if let Some(p) = from.as_any().downcast_ref::<PolyTableProvider>() {
-        return Some(Arc::new(p.clone()));
-    }
-    if let Some(p) = from.as_any().downcast_ref::<DeletionTableProviderAdapter>() {
-        return Some(Arc::clone(&p.source));
-    }
-
-    None
-}
-
-#[async_trait]
-#[deny(clippy::missing_trait_methods)]
-impl TableProvider for DeletionTableProviderAdapter {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn schema(&self) -> SchemaRef {
-        self.source.schema()
-    }
-    fn constraints(&self) -> Option<&Constraints> {
-        self.source.constraints()
-    }
-    fn table_type(&self) -> TableType {
-        self.source.table_type()
-    }
-    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
-        self.source.get_logical_plan()
-    }
-    fn get_table_definition(&self) -> Option<&str> {
-        self.source.get_table_definition()
-    }
-    fn get_column_default(&self, column: &str) -> Option<&Expr> {
-        self.source.get_column_default(column)
-    }
-
-    fn statistics(&self) -> Option<Statistics> {
-        self.source.statistics()
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> DataFusionResult<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
-        self.source.supports_filters_pushdown(filters)
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.source.scan(state, projection, filters, limit).await
-    }
-
-    async fn scan_with_args<'a>(
-        &self,
-        state: &dyn Session,
-        args: ScanArgs<'a>,
-    ) -> DataFusionResult<ScanResult> {
-        self.source.scan_with_args(state, args).await
-    }
-
-    async fn insert_into(
-        &self,
-        state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        overwrite: InsertOp,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.source.insert_into(state, input, overwrite).await
-    }
-
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        TableProvider::delete_from(self.source.as_ref(), state, filters).await
-    }
-
-    async fn update(
-        &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.source.update(state, assignments, filters).await
     }
 }

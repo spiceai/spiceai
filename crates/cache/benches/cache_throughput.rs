@@ -22,7 +22,7 @@ use cache::{
     AsTableRefs, CacheMetrics, CacheProvider, HashBuilder, LruCache, SimpleCache, Sizeable,
     get_hash_builder,
 };
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::sql::TableReference;
 use rand::distributions::Alphanumeric;
 use rand::rngs::StdRng;
@@ -30,6 +30,7 @@ use rand::{Rng, SeedableRng};
 use spicepod::component::caching::{CacheEngine, CachingPolicy, HashingAlgorithm};
 use std::collections::HashSet;
 use std::hash::Hasher;
+use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
 
