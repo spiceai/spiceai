@@ -662,13 +662,23 @@ impl TableProvider for DeltaTable {
         // We handle this by keeping track of all the partition columns we find in the `all_partition_columns` variable and if one
         // doesn't have a value, we add a NULL value for that field to the `partition_values` field of the `PartitionedFile` object.
         let mut partitioned_files: Vec<PartitionedFile> = vec![];
+        let physical_to_logical = self
+            .physical_schema_mapping
+            .as_ref()
+            .map(|m| &m.physical_to_logical);
         let all_partition_columns = scan_context
             .files
             .iter()
             .flat_map(|file| {
                 file.partition_values.iter().filter_map(|(k, _)| {
                     let schema = self.schema();
-                    schema.field_with_name(k).ok().cloned()
+                    // With column mapping, partition value keys use physical names.
+                    // Translate to logical name for schema lookup.
+                    let logical_key = physical_to_logical
+                        .and_then(|m| m.get(k))
+                        .map(String::as_str)
+                        .unwrap_or(k);
+                    schema.field_with_name(logical_key).ok().cloned()
                 })
             })
             // Use an IndexMap to preserve insertion order
@@ -681,11 +691,14 @@ impl TableProvider for DeltaTable {
             partitioned_file.partition_values = all_partition_columns
                 .iter()
                 .map(|(field, ())| {
-                    if let Some((_, value)) = file
-                        .partition_values
-                        .iter()
-                        .find(|(k, _)| *k == field.name())
-                    {
+                    if let Some((_, value)) = file.partition_values.iter().find(|(k, _)| {
+                        // With column mapping, k is a physical name; translate before comparing.
+                        let logical_key = physical_to_logical
+                            .and_then(|m| m.get(k.as_str()))
+                            .map(String::as_str)
+                            .unwrap_or(k);
+                        logical_key == field.name()
+                    }) {
                         ScalarValue::try_from_string(value.clone(), field.data_type())
                     } else {
                         // This will create a null value typed for the field

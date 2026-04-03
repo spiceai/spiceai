@@ -649,3 +649,146 @@ async fn query_delta_lake_column_mapping_mode_id() -> Result<(), String> {
         })
         .await
 }
+
+/// Tests that Delta Lake tables with column mapping and partitions correctly translate
+/// physical partition keys to logical column names. Also exercises deletion vectors.
+#[tokio::test]
+async fn query_delta_lake_column_mapping_with_partitions() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let path = setup_test_data(
+                "https://spiceai-public-datasets.s3.us-east-1.amazonaws.com/delta_column_mapping_partitioned.zip",
+                "delta_column_mapping_partitioned",
+            )
+            .await?;
+            let _hook = FileCleanup { path: path.clone() };
+
+            let app = AppBuilder::new("delta_lake_column_mapping_partitions")
+                .with_dataset(make_delta_lake_dataset(
+                    &format!("{path}/dv-with-columnmapping/delta"),
+                    "cm_partitioned",
+                    false,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            let test_cases: Vec<(&str, Vec<&str>)> = vec![
+                // Full scan with limit — verifies partition column values are correctly populated
+                (
+                    "SELECT part, col1, col2 FROM cm_partitioned ORDER BY part, col1 LIMIT 10",
+                    vec![
+                        "+------+------+------+",
+                        "| part | col1 | col2 |",
+                        "+------+------+------+",
+                        "| 0    | 30   | foo0 |",
+                        "| 0    | 40   | foo0 |",
+                        "| 1    | 1    | foo1 |",
+                        "| 1    | 11   | foo1 |",
+                        "| 1    | 21   | foo1 |",
+                        "| 1    | 31   | foo1 |",
+                        "| 1    | 41   | foo1 |",
+                        "| 2    | 32   | foo2 |",
+                        "| 2    | 42   | foo2 |",
+                        "| 3    | 3    | foo3 |",
+                        "+------+------+------+",
+                    ],
+                ),
+                // Filter on partition column (logical name)
+                (
+                    "SELECT part, col1 FROM cm_partitioned WHERE part = 3 ORDER BY col1",
+                    vec![
+                        "+------+------+",
+                        "| part | col1 |",
+                        "+------+------+",
+                        "| 3    | 3    |",
+                        "| 3    | 13   |",
+                        "| 3    | 23   |",
+                        "| 3    | 33   |",
+                        "| 3    | 43   |",
+                        "+------+------+",
+                    ],
+                ),
+                // Aggregation — row count confirms deletion vectors are applied
+                (
+                    "SELECT count(*) as cnt FROM cm_partitioned",
+                    vec![
+                        "+-----+",
+                        "| cnt |",
+                        "+-----+",
+                        "| 35  |",
+                        "+-----+",
+                    ],
+                ),
+            ];
+
+            for (query, expected_results) in &test_cases {
+                let query_result = rt
+                    .datafusion()
+                    .query_builder(query)
+                    .build()
+                    .run()
+                    .await
+                    .map_err(|e| format!("query `{query}` to plan: {e}"))?;
+
+                let data = query_result
+                    .data
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .map_err(|e| format!("query `{query}` to results: {e}"))?;
+
+                assert_batches_eq!(expected_results, &data);
+            }
+
+            // Verify partition pruning: EXPLAIN for `part = 3` should only scan
+            // the physical partition directory for partition 3 and not others.
+            let partition_query =
+                "SELECT part, col1 FROM cm_partitioned WHERE part = 3 ORDER BY col1";
+            let explain_plan = rt
+                .datafusion()
+                .query_builder(&format!("EXPLAIN {partition_query}"))
+                .build()
+                .run()
+                .await
+                .map_err(|e| format!("query EXPLAIN to plan: {e}"))?
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .map_err(|e| format!("query EXPLAIN to results: {e}"))?;
+
+            let pretty_explain_plan = pretty_format_batches(&explain_plan)
+                .expect("failed to format explain plan")
+                .to_string();
+
+            // Only the physical partition dir for part=3 should appear
+            for i in 0..10 {
+                let pattern = format!("col-60c949ca-b8bc-4330-b931-b73fb4c60037={i}");
+                if i == 3 {
+                    assert!(
+                        pretty_explain_plan.contains(&pattern),
+                        "EXPLAIN should show partition {i} directory"
+                    );
+                } else {
+                    assert!(
+                        !pretty_explain_plan.contains(&pattern),
+                        "EXPLAIN should not show partition {i} directory"
+                    );
+                }
+            }
+
+            Ok(())
+        })
+        .await
+}
