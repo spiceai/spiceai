@@ -1321,8 +1321,10 @@ fn extract_dml_target_table(plan: &LogicalPlan) -> Option<TableReference> {
         #[cfg(not(windows))]
         LogicalPlan::Extension(ext) => {
             use super::cayenne_ddl::logical_nodes::{
-                DistributedCayenneDeleteNode, DistributedCayenneUpdateNode,
+                DistributedCayenneDeleteNode, DistributedCayenneInsertNode,
+                DistributedCayenneUpdateNode,
             };
+            use super::planner::logical_nodes::CayenneMergeNode;
             if let Some(n) = ext
                 .node
                 .as_any()
@@ -1337,13 +1339,23 @@ fn extract_dml_target_table(plan: &LogicalPlan) -> Option<TableReference> {
             {
                 return Some(n.table_name.clone());
             }
+            if let Some(n) = ext
+                .node
+                .as_any()
+                .downcast_ref::<DistributedCayenneInsertNode>()
+            {
+                return Some(n.table_name.clone());
+            }
+            if let Some(n) = ext.node.as_any().downcast_ref::<CayenneMergeNode>() {
+                return Some(n.target_table.clone());
+            }
             None
         }
         _ => None,
     }
 }
 
-/// Returns `true` if the plan is a distributed DML extension node.
+/// Returns `true` if the plan is a DML extension node.
 ///
 /// Used to skip schema verification for DML extension nodes, whose output
 /// schema may differ from the logical plan's schema.
@@ -1351,21 +1363,30 @@ fn is_dml_extension(plan: &LogicalPlan) -> bool {
     #[cfg(not(windows))]
     if let LogicalPlan::Extension(ext) = plan {
         use super::cayenne_ddl::logical_nodes::{
-            DistributedCayenneDeleteNode, DistributedCayenneUpdateNode,
+            DistributedCayenneDeleteNode, DistributedCayenneInsertNode,
+            DistributedCayenneUpdateNode,
         };
+        use super::planner::logical_nodes::CayenneMergeNode;
         if ext
             .node
             .as_any()
             .downcast_ref::<DistributedCayenneDeleteNode>()
             .is_some()
-        {
-            return true;
-        }
-        if ext
-            .node
-            .as_any()
-            .downcast_ref::<DistributedCayenneUpdateNode>()
-            .is_some()
+            || ext
+                .node
+                .as_any()
+                .downcast_ref::<DistributedCayenneUpdateNode>()
+                .is_some()
+            || ext
+                .node
+                .as_any()
+                .downcast_ref::<DistributedCayenneInsertNode>()
+                .is_some()
+            || ext
+                .node
+                .as_any()
+                .downcast_ref::<CayenneMergeNode>()
+                .is_some()
         {
             return true;
         }
