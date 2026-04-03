@@ -202,11 +202,19 @@ async fn execute_merge(
         .collect::<Result<Vec<_>, _>>()
         .map_err(DataFusionError::from)?;
 
-    // Step 2: Build deletion filters from the matched key values.
+    // Step 2: Validate no duplicate target keys in join output.
+    // Per SQL MERGE semantics, each target row must match at most one source row.
+    // If source has duplicate keys, the INNER JOIN produces multiple output rows
+    // per target row. We must detect this *before* any mutations — otherwise the
+    // delete would commit (removing the target row) but the count verification
+    // would fail, leaving permanently missing rows.
+    validate_no_duplicate_target_keys(&normalized_batches, &target_key_columns)?;
+
+    // Step 3: Build deletion filters from the matched key values.
     // Uses tuple-aware OR-of-ANDs to avoid cross-product matches with composite keys.
     let delete_filters = build_delete_filters(&normalized_batches, &target_key_columns)?;
 
-    // Step 3: Delete matched rows from the target.
+    // Step 4: Delete matched rows from the target.
     let delete_plan = target_provider
         .delete_from(&session_state, delete_filters)
         .await?;
@@ -221,7 +229,7 @@ async fn execute_merge(
         )));
     }
 
-    // Step 4: Insert updated rows into the target.
+    // Step 5: Insert updated rows into the target.
     let input_exec = MemorySourceConfig::try_new_exec(&[normalized_batches], target_schema, None)?;
     let insert_plan = target_provider
         .insert_into(&session_state, input_exec, InsertOp::Append)
@@ -237,7 +245,7 @@ async fn execute_merge(
         )));
     }
 
-    // Step 5: Return the count of updated rows.
+    // Step 6: Return the count of updated rows.
     Ok(RecordBatch::try_from_iter_with_nullable(vec![(
         "count",
         Arc::new(UInt64Array::from(vec![total_rows as u64])) as ArrayRef,
@@ -260,6 +268,67 @@ fn extract_dml_count(batches: &[RecordBatch]) -> u64 {
                 .flatten()
         })
         .sum()
+}
+
+/// Validate that the join output contains no duplicate target key tuples.
+///
+/// Per SQL MERGE semantics, each target row must match at most one source row.
+/// If the source has duplicate keys, the INNER JOIN produces multiple output
+/// rows per target row. This check runs *before* any mutations to prevent
+/// the scenario where delete commits (removing target rows) but the subsequent
+/// count verification fails, leaving permanently missing rows.
+fn validate_no_duplicate_target_keys(
+    batches: &[RecordBatch],
+    key_columns: &[String],
+) -> Result<(), DataFusionError> {
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    for batch in batches {
+        // Resolve column indices for this batch.
+        let col_indices: Vec<usize> = key_columns
+            .iter()
+            .map(|key_col| {
+                batch.schema().index_of(key_col).map_err(|e| {
+                    DataFusionError::Internal(format!(
+                        "Key column '{key_col}' not found in join output: {e}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for row_idx in 0..batch.num_rows() {
+            // Build a composite key as a Vec<ScalarValue> for hashing.
+            let key: Vec<datafusion::common::ScalarValue> = col_indices
+                .iter()
+                .map(|&idx| {
+                    datafusion::common::ScalarValue::try_from_array(batch.column(idx), row_idx)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            if !seen.insert(key) {
+                let dup_display: Vec<String> = key_columns
+                    .iter()
+                    .zip(&col_indices)
+                    .map(|(name, &idx)| {
+                        let val = datafusion::common::ScalarValue::try_from_array(
+                            batch.column(idx),
+                            row_idx,
+                        )
+                        .map_or_else(|_| "?".to_string(), |v| v.to_string());
+                        format!("{name}={val}")
+                    })
+                    .collect();
+                return Err(DataFusionError::Execution(format!(
+                    "MERGE source has duplicate rows matching target key ({}). \
+                     Per SQL MERGE semantics, each target row must match at most one source row. \
+                     Deduplicate the source table before running MERGE.",
+                    dup_display.join(", ")
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build deletion filter expressions from matched key column values.
