@@ -99,7 +99,7 @@ pub(super) async fn plan_create_table(
             {
                 tracing::warn!(
                     "Failed to clean up DDL extension store entry for {key} \
-                         after planning failure: {cleanup_err}"
+                     after planning failure: {cleanup_err}"
                 );
             }
             Err(e)
@@ -509,7 +509,8 @@ mod tests {
             r#"CREATE TABLE foo (id INT, ts TIMESTAMP) WITH ("dataset.time_column" = 'ts', "dataset.time_format" = 'timestamp')"#,
         );
         let store = new_shared_store();
-        let (_, store_key) = extract_and_store_extensions(ct, &store, false).expect("should succeed");
+        let (_, store_key) =
+            extract_and_store_extensions(ct, &store, false).expect("should succeed");
 
         assert!(store_key.is_some());
         let ext = store
@@ -530,7 +531,8 @@ mod tests {
             r#"CREATE TABLE foo (id INT, ts TIMESTAMP) WITH ("acceleration.engine" = 'arrow', "acceleration.refresh_mode" = 'append', "dataset.time_column" = 'ts')"#,
         );
         let store = new_shared_store();
-        let (_, store_key) = extract_and_store_extensions(ct, &store, false).expect("should succeed");
+        let (_, store_key) =
+            extract_and_store_extensions(ct, &store, false).expect("should succeed");
         assert!(store_key.is_some());
 
         let ext = store
@@ -546,7 +548,8 @@ mod tests {
     fn test_extract_unrecognized_only_returns_none() {
         let ct = parse_create_table("CREATE TABLE foo (id INT) WITH (fillfactor = 70)");
         let store = new_shared_store();
-        let (_, store_key) = extract_and_store_extensions(ct, &store, false).expect("should succeed");
+        let (_, store_key) =
+            extract_and_store_extensions(ct, &store, false).expect("should succeed");
         assert!(store_key.is_none());
     }
 
