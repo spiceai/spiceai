@@ -1316,6 +1316,18 @@ impl CayenneTableProvider {
             )
             .await?;
 
+        // Defensively invalidate the list-files cache for the newly created protected snapshot
+        // directory. Although the new UUID-based URL should have no prior cache entry, any
+        // in-flight DataFusion plan that happened to list this directory during the write
+        // (e.g. via insert_into planning) could have cached a stale (empty or partial) listing.
+        // Clearing it here ensures scan_protected_snapshots() always sees the complete file set.
+        let new_snapshot_url = Self::snapshot_dir_url(
+            &self.table_metadata.path,
+            &self.table_metadata.table_id,
+            &new_snapshot_id,
+        );
+        Self::invalidate_list_files_cache(self.context.runtime_env(), &new_snapshot_url);
+
         // Get the maximum delete sequence from current deletions.
         // This snapshot is protected from deletions with seq <= max_delete_seq.
         let max_delete_seq = self.get_max_delete_sequence()?;
