@@ -294,6 +294,7 @@ impl PartitionManagementTask {
                     match self.run_management_cycle().await {
                         Ok(()) => {
                             self.status.update_component_status("partition_metadata", ComponentStatus::Ready);
+                            self.update_dataset_statuses().await;
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -364,6 +365,16 @@ impl PartitionManagementTask {
         }
 
         Ok(())
+    }
+
+    /// Check each table's partition metadata and update the corresponding dataset's
+    /// [`ComponentStatus`] on the runtime status tracker.
+    ///
+    /// Delegates to [`update_dataset_statuses_from_partitions`] which marks a
+    /// dataset as [`ComponentStatus::Ready`] when **all** of its partitions have
+    /// been assigned to at least one executor.
+    async fn update_dataset_statuses(&self) {
+        update_dataset_statuses_from_partitions(&self.partition_manager, &self.status).await;
     }
 
     /// Seed partition metadata for all accelerated tables that don't have metadata yet.
@@ -1197,4 +1208,246 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+/// Check each table in the partition manager and update the corresponding
+/// dataset's [`ComponentStatus`] on the given runtime status tracker.
+///
+/// A dataset is marked [`ComponentStatus::Ready`] when **all** of its
+/// partitions have been assigned to at least one executor. Datasets with
+/// unassigned partitions are left unchanged (typically
+/// [`ComponentStatus::Initializing`]).
+pub(crate) async fn update_dataset_statuses_from_partitions(
+    partition_manager: &PartitionManager,
+    status: &RuntimeStatus,
+) {
+    let tables = match partition_manager.list_tables().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to list tables for dataset status update");
+            return;
+        }
+    };
+
+    for table_name in &tables {
+        let table_ref = TableReference::parse_str(table_name);
+        let Some(metadata) = partition_manager.get_cached_table_metadata(&table_ref) else {
+            continue;
+        };
+
+        // A table with zero partitions has nothing to assign, so it's ready.
+        // Otherwise, every partition must be assigned to at least one executor.
+        let all_assigned = metadata
+            .partitions
+            .iter()
+            .all(PartitionMetadata::is_assigned);
+
+        if all_assigned {
+            status.update_dataset(&table_ref, ComponentStatus::Ready);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+
+    fn make_partition(key: &str, value: &str) -> PartitionValue {
+        HashMap::from([(key.to_string(), value.to_string())])
+    }
+
+    fn make_assigned_partition(key: &str, value: &str, executor: &str) -> PartitionMetadata {
+        let mut pm = PartitionMetadata::new(make_partition(key, value));
+        pm.assign_to(executor.to_string(), 1000);
+        pm
+    }
+
+    fn make_unassigned_partition(key: &str, value: &str) -> PartitionMetadata {
+        PartitionMetadata::new(make_partition(key, value))
+    }
+
+    /// Helper to set up a partition manager with pre-populated metadata.
+    async fn setup_partition_manager(
+        tables: Vec<(&str, Vec<PartitionMetadata>)>,
+    ) -> Arc<PartitionManager> {
+        let store = Arc::new(InMemory::new());
+        let manager = Arc::new(PartitionManager::new(store));
+
+        for (table_name, partitions) in tables {
+            let table_ref = TableReference::parse_str(table_name);
+            manager
+                .initialize_metadata(&table_ref, vec!["date".to_string()])
+                .await
+                .expect("should initialize metadata");
+
+            let metadata = super::super::metadata::TablePartitionMetadata {
+                table_name: table_name.to_string(),
+                partitions,
+                schema_version: 1,
+                updated_at: 1000,
+                partition_expressions: vec!["date".to_string()],
+            };
+            manager
+                .write_metadata(table_name, metadata)
+                .await
+                .expect("should write metadata");
+        }
+
+        manager.refresh().await.expect("should refresh");
+
+        manager
+    }
+
+    #[tokio::test]
+    async fn test_all_partitions_assigned_marks_dataset_ready() {
+        let partition_manager = setup_partition_manager(vec![(
+            "test_table",
+            vec![
+                make_assigned_partition("date", "2024-01-01", "executor1"),
+                make_assigned_partition("date", "2024-01-02", "executor2"),
+            ],
+        )])
+        .await;
+
+        let status = RuntimeStatus::new();
+        let table_ref = TableReference::parse_str("test_table");
+        status.update_dataset(&table_ref, ComponentStatus::Initializing);
+        assert_eq!(
+            status.get_component_status("dataset:test_table"),
+            Some(ComponentStatus::Initializing)
+        );
+
+        update_dataset_statuses_from_partitions(&partition_manager, &status).await;
+
+        assert_eq!(
+            status.get_component_status("dataset:test_table"),
+            Some(ComponentStatus::Ready),
+            "Dataset should be Ready when all partitions are assigned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unassigned_partitions_keeps_dataset_initializing() {
+        let partition_manager = setup_partition_manager(vec![(
+            "test_table",
+            vec![
+                make_assigned_partition("date", "2024-01-01", "executor1"),
+                make_unassigned_partition("date", "2024-01-02"),
+            ],
+        )])
+        .await;
+
+        let status = RuntimeStatus::new();
+        let table_ref = TableReference::parse_str("test_table");
+        status.update_dataset(&table_ref, ComponentStatus::Initializing);
+
+        update_dataset_statuses_from_partitions(&partition_manager, &status).await;
+
+        assert_eq!(
+            status.get_component_status("dataset:test_table"),
+            Some(ComponentStatus::Initializing),
+            "Dataset should remain Initializing when some partitions are unassigned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_all_unassigned_partitions_keeps_initializing() {
+        let partition_manager = setup_partition_manager(vec![(
+            "test_table",
+            vec![
+                make_unassigned_partition("date", "2024-01-01"),
+                make_unassigned_partition("date", "2024-01-02"),
+                make_unassigned_partition("date", "2024-01-03"),
+            ],
+        )])
+        .await;
+
+        let status = RuntimeStatus::new();
+        let table_ref = TableReference::parse_str("test_table");
+        status.update_dataset(&table_ref, ComponentStatus::Initializing);
+
+        update_dataset_statuses_from_partitions(&partition_manager, &status).await;
+
+        assert_eq!(
+            status.get_component_status("dataset:test_table"),
+            Some(ComponentStatus::Initializing),
+            "Dataset should remain Initializing when all partitions are unassigned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_partitions_marks_dataset_ready() {
+        let partition_manager = setup_partition_manager(vec![("test_table", vec![])]).await;
+
+        let status = RuntimeStatus::new();
+        let table_ref = TableReference::parse_str("test_table");
+        status.update_dataset(&table_ref, ComponentStatus::Initializing);
+
+        update_dataset_statuses_from_partitions(&partition_manager, &status).await;
+
+        assert_eq!(
+            status.get_component_status("dataset:test_table"),
+            Some(ComponentStatus::Ready),
+            "Dataset with no partitions should be marked Ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiple_tables_independent_status() {
+        let partition_manager = setup_partition_manager(vec![
+            (
+                "table_a",
+                vec![
+                    make_assigned_partition("date", "2024-01-01", "executor1"),
+                    make_assigned_partition("date", "2024-01-02", "executor1"),
+                ],
+            ),
+            (
+                "table_b",
+                vec![
+                    make_assigned_partition("date", "2024-01-01", "executor1"),
+                    make_unassigned_partition("date", "2024-01-02"),
+                ],
+            ),
+        ])
+        .await;
+
+        let status = RuntimeStatus::new();
+        let table_a = TableReference::parse_str("table_a");
+        let table_b = TableReference::parse_str("table_b");
+        status.update_dataset(&table_a, ComponentStatus::Initializing);
+        status.update_dataset(&table_b, ComponentStatus::Initializing);
+
+        update_dataset_statuses_from_partitions(&partition_manager, &status).await;
+
+        assert_eq!(
+            status.get_component_status("dataset:table_a"),
+            Some(ComponentStatus::Ready),
+            "table_a should be Ready (all partitions assigned)"
+        );
+        assert_eq!(
+            status.get_component_status("dataset:table_b"),
+            Some(ComponentStatus::Initializing),
+            "table_b should remain Initializing (has unassigned partition)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_tables_in_partition_manager() {
+        let store = Arc::new(InMemory::new());
+        let partition_manager = PartitionManager::new(store);
+
+        let status = RuntimeStatus::new();
+        let table_ref = TableReference::parse_str("some_table");
+        status.update_dataset(&table_ref, ComponentStatus::Initializing);
+
+        update_dataset_statuses_from_partitions(&partition_manager, &status).await;
+
+        assert_eq!(
+            status.get_component_status("dataset:some_table"),
+            Some(ComponentStatus::Initializing),
+            "Dataset status should be unchanged when no tables exist in partition manager"
+        );
+    }
 }
