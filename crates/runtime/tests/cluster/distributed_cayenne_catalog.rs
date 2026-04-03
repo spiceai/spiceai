@@ -231,7 +231,7 @@ async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
                     &batches
                 );
                 let plan = explain_to_string(&harness.explain(select_all).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("ddl_select_all_after_insert", plan);
 
                 // -----------------------------------------------------------------
                 // Step 3: UPDATE — single row
@@ -253,7 +253,7 @@ async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
                     &batches
                 );
                 let plan = explain_to_string(&harness.explain(select_single).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("ddl_select_single_after_update", plan);
 
                 // Row count unchanged after UPDATE.
                 let count = scalar_i64(
@@ -288,7 +288,7 @@ async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
                     &batches
                 );
                 let plan = explain_to_string(&harness.explain(select_bulk).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("ddl_select_all_after_bulk_update", plan);
 
                 // -----------------------------------------------------------------
                 // Step 5: UPDATE — set column to NULL
@@ -311,7 +311,7 @@ async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
                     &batches
                 );
                 let plan = explain_to_string(&harness.explain(select_null_upd).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("ddl_select_null_update", plan);
 
                 // -----------------------------------------------------------------
                 // Step 6: DELETE — single row
@@ -332,7 +332,7 @@ async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
                 let batches = harness.query(select_deleted).await?;
                 assert_eq!(total_rows(&batches), 0, "id=3 should no longer exist");
                 let plan = explain_to_string(&harness.explain(select_deleted).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("ddl_select_deleted_row", plan);
 
                 // -----------------------------------------------------------------
                 // Step 7: DELETE — range filter
@@ -364,7 +364,7 @@ async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
                     &batches
                 );
                 let plan = explain_to_string(&harness.explain(select_after_range).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("ddl_select_after_range_delete", plan);
 
                 // -----------------------------------------------------------------
                 // Step 8: DELETE — all remaining rows
@@ -403,7 +403,7 @@ async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
                     &batches
                 );
                 let plan = explain_to_string(&harness.explain(select_reinsert).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("ddl_select_after_reinsert", plan);
 
                 // -----------------------------------------------------------------
                 // Step 10: DROP TABLE and re-create
@@ -445,7 +445,7 @@ async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
                     &batches
                 );
                 let plan = explain_to_string(&harness.explain(select_recreated).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("ddl_select_after_recreate", plan);
 
                 Ok(())
             }))
@@ -576,7 +576,7 @@ async fn test_distributed_cayenne_multi_table_join() -> Result<(), anyhow::Error
                     &batches
                 );
                 let plan = explain_to_string(&harness.explain(join_sql).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("join_aggregation", plan);
 
                 // Delete from orders and verify JOIN still correct.
                 harness
@@ -597,7 +597,7 @@ async fn test_distributed_cayenne_multi_table_join() -> Result<(), anyhow::Error
                     &batches
                 );
                 let plan = explain_to_string(&harness.explain(join_sql).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("join_aggregation_after_delete", plan);
 
                 // Products table should be unaffected by order deletion.
                 let product_count = scalar_i64(
@@ -692,7 +692,7 @@ async fn test_distributed_cayenne_schema_isolation() -> Result<(), anyhow::Error
                     &batches
                 );
                 let plan = explain_to_string(&harness.explain(select_finance).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("schema_isolation_finance", plan);
 
                 let select_hr = "SELECT id, employee FROM scat.hr.records ORDER BY id";
                 let batches = harness.query(select_hr).await?;
@@ -708,7 +708,7 @@ async fn test_distributed_cayenne_schema_isolation() -> Result<(), anyhow::Error
                     &batches
                 );
                 let plan = explain_to_string(&harness.explain(select_hr).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("schema_isolation_hr", plan);
 
                 // Delete from one schema, verify the other is untouched.
                 harness
@@ -739,7 +739,7 @@ async fn test_distributed_cayenne_schema_isolation() -> Result<(), anyhow::Error
                     "hr.records should still be queryable after dropping finance.records"
                 );
                 let plan = explain_to_string(&harness.explain(select_hr).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("schema_isolation_hr_after_drop", plan);
 
                 Ok(())
             }))
@@ -854,7 +854,7 @@ async fn test_distributed_cayenne_primary_key_upsert() -> Result<(), anyhow::Err
                     &batches
                 );
                 let plan = explain_to_string(&harness.explain(select_pk).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("pk_select_after_upsert", plan);
 
                 // Pure upsert — all conflicting PKs, no new rows.
                 harness
@@ -887,7 +887,7 @@ async fn test_distributed_cayenne_primary_key_upsert() -> Result<(), anyhow::Err
                     &batches
                 );
                 let plan = explain_to_string(&harness.explain(select_pk).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("pk_select_after_pure_upsert", plan);
 
                 // DELETE still works on PK table.
                 harness
@@ -916,7 +916,7 @@ async fn test_distributed_cayenne_primary_key_upsert() -> Result<(), anyhow::Err
                     &batches
                 );
                 let plan = explain_to_string(&harness.explain(select_pk_after_del).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("pk_select_after_delete", plan);
 
                 Ok(())
             }))
@@ -1024,19 +1024,19 @@ async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(),
                 let sum_value = scalar_i64(&harness.query(sum_sql).await?)?;
                 assert_eq!(sum_value, 60, "SUM(value) should be 10+20+30 = 60");
                 let plan = explain_to_string(&harness.explain(sum_sql).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("null_agg_sum", plan);
 
                 let min_sql = "SELECT MIN(value) FROM ncat.ns.metrics";
                 let min_value = scalar_i64(&harness.query(min_sql).await?)?;
                 assert_eq!(min_value, 10, "MIN(value) should be 10");
                 let plan = explain_to_string(&harness.explain(min_sql).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("null_agg_min", plan);
 
                 let max_sql = "SELECT MAX(value) FROM ncat.ns.metrics";
                 let max_value = scalar_i64(&harness.query(max_sql).await?)?;
                 assert_eq!(max_value, 30, "MAX(value) should be 30");
                 let plan = explain_to_string(&harness.explain(max_sql).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("null_agg_max", plan);
 
                 // WHERE IS NULL / IS NOT NULL.
                 let select_null = "SELECT id FROM ncat.ns.metrics WHERE label IS NULL ORDER BY id";
@@ -1046,7 +1046,7 @@ async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(),
                     &batches
                 );
                 let plan = explain_to_string(&harness.explain(select_null).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("null_filter_is_null", plan);
 
                 let select_not_null =
                     "SELECT id FROM ncat.ns.metrics WHERE value IS NOT NULL ORDER BY id";
@@ -1058,7 +1058,7 @@ async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(),
                     &batches
                 );
                 let plan = explain_to_string(&harness.explain(select_not_null).await?);
-                insta::assert_snapshot!(plan, @"");
+                insta::assert_snapshot!("null_filter_is_not_null", plan);
 
                 Ok(())
             }))
