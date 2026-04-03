@@ -680,7 +680,7 @@ fn infer_json_schema_for_format(
                 _,
                 ArrowError,
             >(
-                value,
+                value
             )))?);
         }
 
