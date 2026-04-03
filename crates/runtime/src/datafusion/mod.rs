@@ -128,6 +128,8 @@ pub mod iceberg_ddl;
 pub mod job_executor_context_extension;
 pub mod managed_runtime;
 pub mod param_utils;
+#[cfg(not(windows))]
+pub mod planner;
 pub mod refresh_sql;
 pub mod request_context_extension;
 pub mod retention_sql;
@@ -932,6 +934,26 @@ impl DataFusion {
             .contains(table_reference)
     }
 
+    /// Returns `true` if any DDL-enabled catalog is Cayenne-backed.
+    #[cfg(not(windows))]
+    fn has_cayenne_catalog(&self) -> bool {
+        match self.ddl_enabled_catalogs.read() {
+            Ok(cats) => cats.iter().any(|name| {
+                self.ctx
+                    .catalog(name)
+                    .is_some_and(|c| cayenne_ddl::is_cayenne_catalog(c.as_ref()))
+            }),
+            Err(err) => {
+                tracing::error!(
+                    "Failed to acquire read lock for ddl_enabled_catalogs; \
+                     assuming Cayenne-backed catalogs are present to avoid \
+                     silently disabling distributed DELETE planning: {err}"
+                );
+                true
+            }
+        }
+    }
+
     /// Returns `true` if the given table reference resolves to a Cayenne-backed catalog.
     #[must_use]
     pub fn is_cayenne_catalog(&self, table_reference: &TableReference) -> bool {
@@ -1644,6 +1666,37 @@ impl DataFusion {
                         dataset_name: dataset.name.to_string(),
                     }
                 );
+            }
+
+            // Auto-configure cache retention when stale_if_error is disabled.
+            // Expired cache entries (past max_age + SWR) are never served and waste storage.
+            if !acceleration_settings.caching_stale_if_error.is_enabled() {
+                if dataset.retention_period().is_some() {
+                    tracing::warn!(
+                        dataset = %dataset.name,
+                        "User-specified retention_period is overridden by automatic cache retention in caching mode",
+                    );
+                }
+
+                let max_age = acceleration_settings
+                    .caching_ttl
+                    .unwrap_or(Duration::from_secs(30));
+                let swr = acceleration_settings
+                    .caching_stale_while_revalidate_ttl
+                    .unwrap_or_default();
+                let retention_period = max_age + swr;
+                let check_interval = retention_period.max(Duration::from_secs(30));
+
+                let cache_retention = Retention::builder()
+                    .time_column(Some(
+                        crate::accelerated_table::caching::CACHE_REFRESHED_AT_COLUMN,
+                    ))
+                    .time_period(Some(retention_period))
+                    .check_interval(Some(check_interval))
+                    .enabled(true)
+                    .build();
+
+                accelerated_table_builder.retention(cache_retention);
             }
 
             accelerated_table_builder.caching_ttl(acceleration_settings.caching_ttl);
@@ -2807,30 +2860,7 @@ impl DataFusion {
             None
         };
 
-        // Pre-process CREATE TABLE statements to extract DDL extensions
-        // (WITH options, PARTITION BY) before planning.
-        let preprocessed =
-            ddl::preprocess::preprocess_create_table_with_options(sql, &self.ddl_extension_store)?;
-        let (effective_sql, store_key) = match &preprocessed {
-            ddl::preprocess::PreprocessResult::Modified {
-                sql: modified,
-                store_key,
-            } => (modified.as_str(), Some(store_key)),
-            ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
-        };
-
-        let plan = match session.create_logical_plan(effective_sql).await {
-            Ok(plan) => plan,
-            Err(e) => {
-                if let Some(store_key) = store_key {
-                    ddl::preprocess::cleanup_preprocessed_ddl_options(
-                        &self.ddl_extension_store,
-                        store_key,
-                    )?;
-                }
-                return Err(e);
-            }
-        };
+        let plan = self.create_logical_plan(session, sql).await?;
 
         if let Some(cache) = plans_cache
             && let Some(cache_key) = cache_key_opt
@@ -2840,6 +2870,39 @@ impl DataFusion {
         }
 
         Ok(plan)
+    }
+
+    /// Route SQL through the planner, which intercepts DDL extensions and
+    /// Cayenne DML at the statement level, or falls back to `DataFusion`'s
+    /// standard planner.
+    #[cfg(not(windows))]
+    pub(crate) async fn create_logical_plan(
+        &self,
+        session: &SessionState,
+        sql: &str,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        let ctx = planner::PlannerContext {
+            catalog_mode: if self.has_cayenne_catalog() {
+                planner::CatalogMode::Cayenne
+            } else {
+                planner::CatalogMode::Standard
+            },
+            cluster_role: self.cluster_config.effective_role(),
+            ddl_extension_store: Arc::clone(&self.ddl_extension_store),
+        };
+
+        planner::create_logical_plan(sql, session, &ctx).await
+    }
+
+    /// On Windows the `planner` module is not available, so delegate
+    /// directly to DataFusion's standard logical planner.
+    #[cfg(windows)]
+    pub(crate) async fn create_logical_plan(
+        &self,
+        session: &SessionState,
+        sql: &str,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        session.create_logical_plan(sql).await
     }
 
     pub(crate) async fn clear_cached_plans(&self) {

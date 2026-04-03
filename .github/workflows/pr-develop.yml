@@ -5,6 +5,9 @@ on:
   pull_request:
     branches:
       - develop
+  merge_group:
+    branches:
+      - develop
   workflow_dispatch:
 
 concurrency:
@@ -18,7 +21,7 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_NET_RETRY: 10
   CARGO_HTTP_TIMEOUT: 60
-  CARGO_INCREMENTAL: 1
+  CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
@@ -37,7 +40,7 @@ jobs:
         uses: ./.github/actions/check-code-changes
 
   check:
-    name: Check (Develop)
+    name: Rust Lint
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
@@ -47,6 +50,21 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
+
+      - name: Set up spiceio
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@8c7781c6707cd60f1a18acb197168bebc9338532 # v0.4.3
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+
+      - name: Set up sccache
+        uses: ./.github/actions/setup-sccache
+        with:
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Install Protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
@@ -56,7 +74,12 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
       - name: Run cargo check
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
         run: cargo check --all-targets --features adbc,aws-secrets-manager,keyring-secret-store,models,release,mcp --workspace --exclude libnfs --locked
 
       - name: Validate datafusion-table-providers commit
@@ -64,8 +87,23 @@ jobs:
         env:
           BRANCH: spiceai-52
 
+      - name: Show sccache stats
+        run: sccache --show-stats
+
+      - name: Kill spiceio
+        if: always() && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: spiceio-check-logs
+          path: ${{ runner.temp }}/spiceio.log
+          if-no-files-found: ignore
+
   build-and-test:
-    name: Build and Test (Develop)
+    name: Build and Test
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
@@ -75,6 +113,21 @@ jobs:
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
+
+      - name: Set up spiceio
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@8c7781c6707cd60f1a18acb197168bebc9338532 # v0.4.3
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+
+      - name: Set up sccache
+        uses: ./.github/actions/setup-sccache
+        with:
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -93,11 +146,17 @@ jobs:
       - name: Build CLI and run nextest
         run: make build-cli nextest
         env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
           NEXTEST_FLAG: "--exclude libnfs --exclude connector-nfs -E 'not (package(aws-sdk-credential-bridge) | package(object_store_occ))'"
 
       - name: Build testoperator
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
         run: cargo build -p testoperator --all-features --locked
+
+      - name: Show sccache stats
+        run: sccache --show-stats
 
       - name: Check if Cargo.lock is updated
         run: |
@@ -107,3 +166,15 @@ jobs:
             echo "Update Cargo.lock"
             exit 1
           fi
+
+      - name: Kill spiceio
+        if: always() && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: spiceio-build-logs
+          path: ${{ runner.temp }}/spiceio.log
+          if-no-files-found: ignore
