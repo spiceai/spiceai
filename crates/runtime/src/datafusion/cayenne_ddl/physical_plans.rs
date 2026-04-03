@@ -1853,18 +1853,78 @@ async fn validate_partition_compatibility(
         )));
     }
 
-    // Check that the partition column appears in the ON keys (target side).
-    let partition_in_on_keys = on_keys
-        .iter()
-        .any(|(target_col, _)| *target_col == target_part);
-    if !partition_in_on_keys {
+    // Parse the partition expression to extract column references. For transform
+    // partitions like bucket(5, c_nationkey), the referenced column is c_nationkey.
+    // For simple column partitions like n_regionkey, the column is n_regionkey.
+    let partition_cols = extract_partition_column_references(&target_part)?;
+    let all_covered = !partition_cols.is_empty()
+        && partition_cols
+            .iter()
+            .all(|pc| on_keys.iter().any(|(target_col, _)| target_col == pc));
+    if !all_covered {
         return Err(DataFusionError::Plan(format!(
-            "Distributed MERGE requires the partition column '{target_part}' to appear in the \
-             ON clause join keys for correct executor-local execution"
+            "Distributed MERGE requires the partition column(s) referenced by '{target_part}' \
+             to appear in the ON clause join keys for correct executor-local execution"
         )));
     }
 
     Ok(())
+}
+
+/// Extract column name references from a partition expression string by parsing
+/// it as a SQL expression and walking the AST with sqlparser's `Visitor`.
+///
+/// Handles simple column references (`c_nationkey`) and transform expressions
+/// (`bucket(5, c_nationkey)`) — numeric/string literals are naturally excluded
+/// since they parse as `Value` nodes, not `Identifier` nodes.
+fn extract_partition_column_references(partition_expr: &str) -> DFResult<Vec<String>> {
+    use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Visit, Visitor};
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use datafusion::sql::sqlparser::parser::Parser;
+    use std::ops::ControlFlow;
+
+    struct ColumnCollector {
+        columns: Vec<String>,
+    }
+
+    impl Visitor for ColumnCollector {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<Self::Break> {
+            match expr {
+                SqlExpr::Identifier(ident) => {
+                    self.columns.push(ident.value.clone());
+                }
+                SqlExpr::CompoundIdentifier(idents) => {
+                    if let Some(last) = idents.last() {
+                        self.columns.push(last.value.clone());
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let dialect = GenericDialect {};
+    let mut parser = Parser::new(&dialect)
+        .try_with_sql(partition_expr)
+        .map_err(|e| {
+            DataFusionError::Plan(format!(
+                "Failed to parse partition expression '{partition_expr}': {e}"
+            ))
+        })?;
+    let sql_expr = parser.parse_expr().map_err(|e| {
+        DataFusionError::Plan(format!(
+            "Failed to parse partition expression '{partition_expr}': {e}"
+        ))
+    })?;
+
+    let mut collector = ColumnCollector {
+        columns: Vec::new(),
+    };
+    let _ = sql_expr.visit(&mut collector);
+    Ok(collector.columns)
 }
 
 /// Schema for DML count results — single `count` column with `UInt64` type,
@@ -1881,7 +1941,7 @@ fn dml_count_schema() -> SchemaRef {
 mod tests {
     use datafusion::logical_expr::col;
 
-    use super::partition_label_for_expr;
+    use super::{extract_partition_column_references, partition_label_for_expr};
 
     #[test]
     fn partition_label_for_expr_uses_column_name_when_safe() {
@@ -1899,5 +1959,37 @@ mod tests {
     fn partition_label_for_expr_sanitizes_unsafe_column_names() {
         let expr = col("tenant/../id");
         assert_eq!(partition_label_for_expr(&expr), "tenant____id");
+    }
+
+    #[test]
+    fn extract_partition_cols_simple_column() {
+        let cols = extract_partition_column_references("c_nationkey").expect("simple column");
+        assert_eq!(cols, vec!["c_nationkey"]);
+    }
+
+    #[test]
+    fn extract_partition_cols_bucket_function() {
+        let cols =
+            extract_partition_column_references("bucket(5, c_nationkey)").expect("bucket fn");
+        assert_eq!(cols, vec!["c_nationkey"]);
+    }
+
+    #[test]
+    fn extract_partition_cols_parenthesized() {
+        let cols =
+            extract_partition_column_references("(bucket(5, c_nationkey))").expect("parenthesized");
+        assert_eq!(cols, vec!["c_nationkey"]);
+    }
+
+    #[test]
+    fn extract_partition_cols_quoted_column() {
+        let cols = extract_partition_column_references(r#""order_date""#).expect("quoted column");
+        assert_eq!(cols, vec!["order_date"]);
+    }
+
+    #[test]
+    fn extract_partition_cols_binary_op() {
+        let cols = extract_partition_column_references("a + b").expect("binary op");
+        assert_eq!(cols, vec!["a", "b"]);
     }
 }
