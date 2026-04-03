@@ -49,7 +49,6 @@ pub(crate) mod deletion_strategy;
 pub(crate) mod retention;
 pub(crate) mod scan;
 pub(crate) mod sink;
-pub(crate) mod staged_append;
 pub(crate) mod staging_wal;
 pub(crate) mod streaming;
 pub(crate) mod table;
@@ -61,7 +60,7 @@ pub use context::CayenneContext;
 pub use deletion_strategy::{PkDeletionStrategy, PkDeletionStrategyWithCache};
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
-pub use staged_append::CayenneStagedAppend;
+pub use staging_wal::CayenneStagedAppend;
 pub use table::{CayenneTableProvider, CayenneTableProviderBuilder};
 pub use vortex_format::{attach_deletion_vectors_to_config, DeletionFilteringVortexFormat};
 

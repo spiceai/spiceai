@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::any::Any;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
@@ -24,11 +25,13 @@ use async_trait::async_trait;
 use cayenne::{CayenneStagedAppend, CayenneTableProvider};
 use data_components::poly::PolyTableProvider;
 use datafusion::catalog::{ScanArgs, ScanResult, Session};
-use datafusion::common::{Constraints, DataFusionError, Statistics};
+use datafusion::common::{Constraints, DFSchema, DataFusionError, Statistics};
 use datafusion::datasource::{TableProvider, TableType};
+use datafusion::execution::context::ExecutionProps;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
@@ -42,10 +45,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::accelerated_table::AcceleratedTable;
 use crate::dataaccelerator::cayenne::CayennePartitionCreator;
 use crate::dataaccelerator::upsert_dedup::UpsertDedupTableProvider;
-use crate::dataupdate::{
-    DataUpdate, StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
-};
+use crate::dataupdate::StreamingDataUpdateExecutionPlan;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
+use runtime_table_partition::insert::partition_batch_composite;
 use runtime_table_partition::provider::PartitionTableProvider;
 
 enum CayenneWriteTarget {
@@ -352,20 +354,77 @@ async fn write_all_with_partitioned_cayenne(
     federated: Arc<dyn TableProvider>,
     mut data: SendableRecordBatchStream,
 ) -> datafusion::common::Result<u64> {
+    let partitioned = accelerator
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .ok_or_else(|| {
+            DataFusionError::Execution(
+                "Write-through partitioned Cayenne path requires a PartitionTableProvider"
+                    .to_string(),
+            )
+        })?;
+
     let schema = data.schema();
+    let physical_exprs = create_partition_physical_exprs(partitioned, Arc::clone(&schema))?;
     let (source_tx, source_rx) = mpsc::channel(8);
     let source_task =
         spawn_federated_insert(Arc::clone(&federated), Arc::clone(&schema), source_rx);
 
     let mut upstream_error: Option<DataFusionError> = None;
-    let mut buffered_batches: Vec<RecordBatch> = Vec::new();
-    let mut row_count = 0_u64;
+    let mut partition_senders =
+        HashMap::<String, mpsc::Sender<datafusion::common::Result<RecordBatch>>>::new();
+    let mut partition_handles = Vec::new();
 
     while let Some(batch_result) = data.next().await {
         match batch_result {
             Ok(batch) => {
-                row_count += batch.num_rows() as u64;
-                buffered_batches.push(batch.clone());
+                let partitioned_batches = partition_batch_composite(&batch, &physical_exprs)?;
+                for (partition_key, (partition_values, partition_batch)) in partitioned_batches {
+                    let sender = if let Some(sender) = partition_senders.get(&partition_key) {
+                        sender.clone()
+                    } else {
+                        let partition_provider = partitioned
+                            .get_or_create_partition_provider(partition_values)
+                            .await?;
+                        let cayenne = partition_provider
+                            .as_any()
+                            .downcast_ref::<CayenneTableProvider>()
+                            .ok_or_else(|| {
+                                DataFusionError::Execution(
+                                    "Write-through partitioned Cayenne path requires Cayenne-backed partition providers"
+                                        .to_string(),
+                                )
+                            })?;
+
+                        let (partition_tx, partition_rx) = mpsc::channel(8);
+                        partition_senders.insert(partition_key, partition_tx.clone());
+                        partition_handles.push(spawn_staged_append(
+                            cayenne.clone_for_write_operations(),
+                            Arc::clone(&schema),
+                            partition_rx,
+                        ));
+                        partition_tx
+                    };
+
+                    if sender.send(Ok(partition_batch)).await.is_err() {
+                        upstream_error = Some(DataFusionError::Execution(
+                            "Write-through partitioned accelerator stream terminated before staging completed"
+                                .to_string(),
+                        ));
+                        break;
+                    }
+                }
+
+                if upstream_error.is_some() {
+                    let _ = source_tx
+                        .send(Err(DataFusionError::Execution(
+                            "Write-through partitioned accelerator stream terminated before staging completed"
+                                .to_string(),
+                        )))
+                        .await;
+                    break;
+                }
+
                 if source_tx.send(Ok(batch)).await.is_err() {
                     upstream_error = Some(DataFusionError::Execution(
                         "Write-through insert stream terminated before the federated write completed"
@@ -379,6 +438,11 @@ async fn write_all_with_partitioned_cayenne(
                 let _ = source_tx
                     .send(Err(DataFusionError::Execution(message.clone())))
                     .await;
+                for sender in partition_senders.values() {
+                    let _ = sender
+                        .send(Err(DataFusionError::Execution(message.clone())))
+                        .await;
+                }
                 upstream_error = Some(DataFusionError::Execution(message));
                 break;
             }
@@ -386,16 +450,40 @@ async fn write_all_with_partitioned_cayenne(
     }
 
     drop(source_tx);
+    drop(partition_senders);
 
+    let staged_result = join_partitioned_staged_tasks(partition_handles).await;
     let source_result = join_source_task(source_task).await;
-    if let Some(error) = upstream_error {
-        return Err(error);
-    }
-    source_result?;
 
-    append_to_accelerator(accelerator, schema, buffered_batches).await?;
-    inner.refresher().set_initial_load_completed(true);
-    Ok(row_count)
+    match (staged_result, source_result, upstream_error) {
+        (Ok(staged), Ok(()), None) => {
+            let row_count = staged.commit().await?;
+            inner.refresher().set_initial_load_completed(true);
+            Ok(row_count)
+        }
+        (Ok(staged), source_result, upstream_error) => {
+            if let Err(error) = staged.rollback().await {
+                tracing::error!("Failed to roll back staged partitioned Cayenne write: {error}");
+            }
+
+            if let Some(error) = upstream_error {
+                return Err(error);
+            }
+
+            match source_result {
+                Ok(()) => Err(DataFusionError::Execution(
+                    "Partitioned Cayenne staged write failed before commit".to_string(),
+                )),
+                Err(error) => Err(error),
+            }
+        }
+        (Err(staged_error), Ok(()), upstream_error) => Err(upstream_error.unwrap_or(staged_error)),
+        (Err(staged_error), Err(source_error), upstream_error) => {
+            Err(upstream_error.unwrap_or_else(|| DataFusionError::Execution(format!(
+                "Write-through insert failed for both partitioned accelerator and federated source: accelerator={staged_error}; source={source_error}"
+            ))))
+        }
+    }
 }
 
 fn spawn_federated_insert(
@@ -419,42 +507,83 @@ fn spawn_federated_insert(
     })
 }
 
-async fn append_to_accelerator(
-    accelerator: Arc<dyn TableProvider>,
-    schema: SchemaRef,
-    batches: Vec<RecordBatch>,
-) -> datafusion::common::Result<()> {
-    if batches.is_empty() {
-        return Ok(());
+struct PartitionedCayenneStagedAppend {
+    staged_appends: Vec<CayenneStagedAppend>,
+    row_count: u64,
+}
+
+impl std::fmt::Debug for PartitionedCayenneStagedAppend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartitionedCayenneStagedAppend")
+            .field("staged_appends", &self.staged_appends.len())
+            .field("row_count", &self.row_count)
+            .finish()
+    }
+}
+
+impl PartitionedCayenneStagedAppend {
+    async fn commit(self) -> datafusion::common::Result<u64> {
+        for staged_append in self.staged_appends {
+            staged_append
+                .commit()
+                .await
+                .map_err(DataFusionError::from)?;
+        }
+        Ok(self.row_count)
     }
 
-    let ctx = SessionContext::new();
-    let streaming_update = StreamingDataUpdate::try_from(DataUpdate {
-        schema,
-        data: batches,
-        update_type: UpdateType::Append,
-    })?;
-    let input: Arc<dyn ExecutionPlan> = Arc::new(SchemaCastScanExec::new(
-        Arc::new(StreamingDataUpdateExecutionPlan::new(streaming_update.data)),
-        accelerator.schema(),
-    ));
+    async fn rollback(self) -> datafusion::common::Result<()> {
+        for staged_append in self.staged_appends {
+            staged_append
+                .rollback()
+                .await
+                .map_err(DataFusionError::from)?;
+        }
+        Ok(())
+    }
+}
 
-    let insert_plan = accelerator
-        .insert_into(&ctx.state(), input, InsertOp::Append)
-        .await?;
-    let _ = datafusion::physical_plan::collect(insert_plan, ctx.task_ctx()).await?;
-    Ok(())
+fn create_partition_physical_exprs(
+    partitioned: &PartitionTableProvider,
+    schema: SchemaRef,
+) -> datafusion::common::Result<Vec<Arc<dyn PhysicalExpr>>> {
+    let input_dfschema = DFSchema::try_from(schema)?;
+    let execution_props = ExecutionProps::new();
+
+    partitioned
+        .partition_by()
+        .iter()
+        .map(|partitioned_by| {
+            datafusion::physical_expr::create_physical_expr(
+                &partitioned_by.expression,
+                &input_dfschema,
+                &execution_props,
+            )
+        })
+        .collect()
+}
+
+async fn join_partitioned_staged_tasks(
+    handles: Vec<JoinHandle<datafusion::common::Result<CayenneStagedAppend>>>,
+) -> datafusion::common::Result<PartitionedCayenneStagedAppend> {
+    let mut staged_appends = Vec::with_capacity(handles.len());
+    let mut row_count = 0_u64;
+
+    for handle in handles {
+        let staged_append = join_staged_task(handle).await?;
+        row_count += staged_append.row_count();
+        staged_appends.push(staged_append);
+    }
+
+    Ok(PartitionedCayenneStagedAppend {
+        staged_appends,
+        row_count,
+    })
 }
 
 fn extract_cayenne_write_target(
     table_provider: &Arc<dyn TableProvider>,
 ) -> Option<CayenneWriteTarget> {
-    let type_id = table_provider.as_any().type_id();
-    tracing::debug!(
-        ?type_id,
-        "extract_cayenne_write_target: inspecting provider"
-    );
-
     if let Some(cayenne) = table_provider
         .as_any()
         .downcast_ref::<CayenneTableProvider>()

@@ -539,6 +539,18 @@ impl ExecutionPlan for IcebergCreateTableExec {
                         )
                         .await?;
 
+                        synchronize_distributed_write_through_registration(
+                            &datafusion,
+                            accel,
+                            &df_catalog_name,
+                            &df_schema_name,
+                            &table_name,
+                            arrow_schema.as_ref(),
+                            &dataset_options,
+                            partition_expr_sql.as_ref(),
+                        )
+                        .await?;
+
                         if schema_provider.table_exist(&table_name) {
                             let _ = schema_provider.deregister_table(&table_name);
                         }
@@ -650,43 +662,27 @@ impl ExecutionPlan for IcebergCreateTableExec {
                     }
                 };
 
-                if let Some(df) = datafusion.upgrade() {
-                    initialize_partition_metadata(
-                        df.executor_registry.as_deref(),
-                        &df_catalog_name,
-                        &df_schema_name,
+                if let Err(e) = synchronize_distributed_write_through_registration(
+                    &datafusion,
+                    accel,
+                    &df_catalog_name,
+                    &df_schema_name,
+                    &table_name,
+                    arrow_schema.as_ref(),
+                    &dataset_options,
+                    partition_expr_sql.as_ref(),
+                )
+                .await
+                {
+                    let rollback_error = rollback_created_iceberg_table(
+                        &catalog,
+                        &namespace,
                         &table_name,
-                        partition_expr_sql.as_ref(),
+                        Some((&schema_provider, &table_name)),
+                        e,
                     )
                     .await;
-
-                    if matches!(
-                        df.cluster_config.effective_role(),
-                        Some(crate::config::ClusterRole::Scheduler)
-                    ) {
-                        if let Some(ref registry) = df.executor_registry {
-                            let forward_sql = build_forwarded_create_sql(
-                                &df_catalog_name,
-                                &df_schema_name,
-                                &table_name,
-                                arrow_schema.as_ref(),
-                                accel,
-                                &dataset_options,
-                                partition_expr_sql.as_ref(),
-                            )?;
-                            if let Err(e) = forward_ddl_to_executors(registry, &forward_sql).await {
-                                let rollback_error = rollback_created_iceberg_table(
-                                    &catalog,
-                                    &namespace,
-                                    &table_name,
-                                    Some((&schema_provider, &table_name)),
-                                    e,
-                                )
-                                .await;
-                                return Err(rollback_error);
-                            }
-                        }
-                    }
+                    return Err(rollback_error);
                 }
 
                 if schema_provider.table_exist(&table_name) {
@@ -791,6 +787,7 @@ async fn create_accelerated_iceberg_table(
     }
 
     validate_write_through_acceleration(acceleration)?;
+    validate_ddl_acceleration_runtime_requirements(acceleration)?;
 
     let dataset_name = TableReference::full(
         catalog_name.to_string(),
@@ -862,6 +859,29 @@ fn validate_write_through_acceleration(acceleration: &Acceleration) -> Result<()
             "Accelerated Iceberg catalog tables currently support only the Cayenne accelerator, got '{engine}'"
         )));
     }
+    Ok(())
+}
+
+fn validate_ddl_acceleration_runtime_requirements(
+    acceleration: &Acceleration,
+) -> Result<(), DataFusionError> {
+    let requires_runtime = acceleration.params.as_ref().is_some_and(|params| {
+        let param_data: HashMap<String, String> = params.as_string_map();
+
+        param_data.contains_key("cayenne_s3_zone_ids")
+            || param_data
+                .get("cayenne_file_path")
+                .is_some_and(|path| path.starts_with("s3://"))
+            || param_data.keys().any(|key| key.starts_with("cayenne_s3_"))
+    });
+
+    if requires_runtime {
+        return Err(DataFusionError::Plan(
+            "Accelerated Iceberg DDL tables do not yet support Cayenne S3 configuration because runtime-backed secret expansion is unavailable in this path"
+                .to_string(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -945,6 +965,50 @@ async fn initialize_partition_metadata(
             tracing::warn!(table = %table_ref, error = %error, "Failed to initialize partition metadata for table");
         }
     }
+}
+
+#[expect(clippy::too_many_arguments)]
+async fn synchronize_distributed_write_through_registration(
+    datafusion: &Weak<DataFusion>,
+    acceleration: &Acceleration,
+    catalog_name: &str,
+    schema_name: &str,
+    table_name: &str,
+    arrow_schema: &Schema,
+    dataset_options: &DatasetOptions,
+    partition_expr_sql: Option<&String>,
+) -> Result<(), DataFusionError> {
+    let Some(df) = datafusion.upgrade() else {
+        return Ok(());
+    };
+
+    initialize_partition_metadata(
+        df.executor_registry.as_deref(),
+        catalog_name,
+        schema_name,
+        table_name,
+        partition_expr_sql,
+    )
+    .await;
+
+    if matches!(
+        df.cluster_config.effective_role(),
+        Some(crate::config::ClusterRole::Scheduler)
+    ) && let Some(ref registry) = df.executor_registry
+    {
+        let forward_sql = build_forwarded_create_sql(
+            catalog_name,
+            schema_name,
+            table_name,
+            arrow_schema,
+            acceleration,
+            dataset_options,
+            partition_expr_sql,
+        )?;
+        forward_ddl_to_executors(registry, &forward_sql).await?;
+    }
+
+    Ok(())
 }
 
 async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &str) -> DFResult<()> {

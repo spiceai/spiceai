@@ -36,8 +36,105 @@ use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};
 use super::table::CayenneTableProvider;
 use super::Result;
 use crate::provider::Error;
+use datafusion::execution::SendableRecordBatchStream;
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectStorePath;
+use tokio::sync::OwnedMutexGuard;
+
+/// Coordinates staged writes and the staging WAL lifecycle for a Cayenne table.
+///
+/// This struct supports two usage patterns:
+/// - Granular orchestration via `write_wal`, `move_staged_files`,
+///   `remove_wal`, and `refresh_listing_table`
+/// - One-shot orchestration via `finalize_staged_write`
+///
+/// `begin_staged_append` returns this handle after writing data into `_staging/`
+/// so external consumers can synchronize writes and call `commit` only when ready.
+pub struct CayenneStagedAppend {
+    table: CayenneTableProvider,
+    write_guard: Option<OwnedMutexGuard<()>>,
+    row_count: u64,
+}
+
+impl std::fmt::Debug for CayenneStagedAppend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CayenneStagedAppend")
+            .field("table", &self.table.table_name())
+            .field("has_write_guard", &self.write_guard.is_some())
+            .field("row_count", &self.row_count)
+            .finish()
+    }
+}
+
+impl CayenneStagedAppend {
+    pub(crate) fn from_staged_append(
+        table: CayenneTableProvider,
+        write_guard: OwnedMutexGuard<()>,
+        row_count: u64,
+    ) -> Self {
+        Self {
+            table,
+            write_guard: Some(write_guard),
+            row_count,
+        }
+    }
+
+    pub(crate) fn from_existing_staging(table: CayenneTableProvider) -> Self {
+        Self {
+            table,
+            write_guard: None,
+            row_count: 0,
+        }
+    }
+
+    /// Returns the number of rows staged for commit.
+    #[must_use]
+    pub fn row_count(&self) -> u64 {
+        self.row_count
+    }
+
+    /// Writes the staging WAL for the current `_staging/` files.
+    pub async fn write_wal(&self) -> Result<()> {
+        self.table.write_staging_wal().await
+    }
+
+    /// Moves staged files into the current snapshot.
+    pub async fn move_staged_files(&self) -> Result<()> {
+        self.table.move_files_to_current_snapshot().await
+    }
+
+    /// Removes the staging WAL after a successful move.
+    pub async fn remove_wal(&self) -> Result<()> {
+        self.table.remove_staging_wal().await
+    }
+
+    /// Refreshes the listing table so newly committed files become visible.
+    pub fn refresh_listing_table(&self) -> Result<()> {
+        self.table.refresh_listing_table()
+    }
+
+    /// Executes the full WAL finalize sequence in order.
+    pub async fn finalize_staged_write(&self) -> Result<()> {
+        self.write_wal().await?;
+        self.move_staged_files().await?;
+        self.remove_wal().await?;
+        self.refresh_listing_table()?;
+        Ok(())
+    }
+
+    /// Commits the staged append, making the new rows visible to readers.
+    pub async fn commit(self) -> Result<u64> {
+        self.finalize_staged_write().await?;
+        let _ = self.write_guard;
+        Ok(self.row_count)
+    }
+
+    /// Discards the staged append and removes any staged files.
+    pub async fn rollback(self) -> Result<()> {
+        let _ = self.write_guard;
+        self.table.clear_staging_dir().await
+    }
+}
 
 /// Staging WAL (Write-Ahead Log) entry.
 ///
@@ -57,6 +154,61 @@ pub(crate) struct StagingWal {
 }
 
 impl CayenneTableProvider {
+    /// Create a staging WAL handle for data already written to `_staging/`.
+    pub(crate) fn staged_append_for_existing_staging(&self) -> CayenneStagedAppend {
+        CayenneStagedAppend::from_existing_staging(self.clone_for_write())
+    }
+
+    /// Stage an append into Cayenne without making the new rows visible.
+    ///
+    /// This path supports append-only semantics and returns a handle that allows
+    /// callers to commit or roll back once external coordination succeeds.
+    pub async fn begin_staged_append(
+        &self,
+        data: SendableRecordBatchStream,
+    ) -> Result<CayenneStagedAppend> {
+        let write_guard = self.write_lock_arc().lock_owned().await;
+
+        self.ensure_no_incomplete_write().await?;
+
+        if !self.pk_deletion_strategy().is_position_based() {
+            return Err(Error::Unsupported {
+                operation: "staged append for Cayenne tables with primary-key deletion handling",
+            });
+        }
+
+        if self.has_pending_deletions()? {
+            return Err(Error::Unsupported {
+                operation: "staged append for Cayenne tables with pending deletions",
+            });
+        }
+
+        let (prepared_stream, delete_specs, deleted_pk_i64, deleted_row_keys) =
+            self.prepare_stream_for_insert(data).await?;
+
+        if !delete_specs.is_empty() || !deleted_pk_i64.is_empty() || !deleted_row_keys.is_empty() {
+            return Err(Error::Unsupported {
+                operation: "staged append for Cayenne upsert or on-conflict writes",
+            });
+        }
+
+        self.clear_staging_dir().await?;
+
+        let (row_count, _writer_ops) = self
+            .write_to_snapshot(
+                prepared_stream,
+                self.target_file_size_bytes(),
+                STAGING_DIR_NAME,
+            )
+            .await?;
+
+        Ok(CayenneStagedAppend::from_staged_append(
+            self.clone_for_write(),
+            write_guard,
+            row_count,
+        ))
+    }
+
     /// Write the staging WAL file that records the pending move operation.
     ///
     /// The WAL is written after all data files have been staged but before any
