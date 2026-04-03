@@ -19039,7 +19039,7 @@ dependencies = [
 [[package]]
 name = "system-adapter-protocol"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/spicebench.git?rev=27754b5810745e3afc7bb703ecc13aa9835732ea#27754b5810745e3afc7bb703ecc13aa9835732ea"
+source = "git+https://github.com/spiceai/spicebench.git?rev=6327983bc1a90123e0c754b79781b931c969831e#6327983bc1a90123e0c754b79781b931c969831e"
 dependencies = [
  "arrow-schema",
  "async-trait",
@@ -19047,6 +19047,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "uuid 1.21.0",
 ]
 
