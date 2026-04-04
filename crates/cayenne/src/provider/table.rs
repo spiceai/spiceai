@@ -3420,11 +3420,11 @@ impl CayenneTableProvider {
         };
         let mut added = already_extended;
         for col_ref in filter.column_refs() {
-            if let Some((idx, _)) = self.table_metadata.schema.column_with_name(col_ref.name()) {
-                if !proj.contains(&idx) {
-                    proj.push(idx);
-                    added = true;
-                }
+            if let Some((idx, _)) = self.table_metadata.schema.column_with_name(col_ref.name())
+                && !proj.contains(&idx)
+            {
+                proj.push(idx);
+                added = true;
             }
         }
         (Some(proj), added)
@@ -3997,10 +3997,8 @@ impl TableProvider for CayenneTableProvider {
 
         // Strip extra columns (PK or retention time column) added to the projection
         // but not originally requested by the query.
-        if need_projection_strip {
-            if let Some(orig_proj) = projection {
-                return self.create_projection_strip(plan, orig_proj.len());
-            }
+        if need_projection_strip && let Some(orig_proj) = projection {
+            return self.create_projection_strip(plan, orig_proj.len());
         }
 
         Ok(Arc::new(CayenneAccelerationExec::new(plan)))

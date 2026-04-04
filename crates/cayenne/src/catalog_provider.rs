@@ -128,6 +128,11 @@ impl CayenneCatalogProvider {
     /// Create a new Cayenne catalog provider.
     ///
     /// Initializes the `SQLite` metadata catalog and local file storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata or data directories cannot be created,
+    /// or if the metadata catalog fails to initialize.
     pub async fn try_new(
         config: CayenneCatalogProviderConfig,
         runtime_env: Arc<RuntimeEnv>,
@@ -158,8 +163,7 @@ impl CayenneCatalogProvider {
         // Initialize local file storage
         let data_dir = config
             .data_dir
-            .as_ref()
-            .cloned()
+            .clone()
             .unwrap_or_else(|| format!("{spice_data_base_path}/cayenne_{catalog_name}/data"));
 
         tokio::fs::create_dir_all(&data_dir)
@@ -232,6 +236,10 @@ impl CayenneCatalogProvider {
     }
 
     /// Registers or replaces a schema provider for a namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the internal schema lock cannot be acquired.
     pub fn register_schema_provider(
         &self,
         name: &str,
@@ -397,6 +405,10 @@ impl CayenneSchemaProvider {
     ///
     /// `full_table_names` are namespace-prefixed names (`namespace/table_name`) as
     /// stored in the Cayenne metadata catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any table fails to load from the catalog.
     pub async fn try_new(
         catalog: Arc<dyn MetadataCatalog>,
         namespace: &str,
