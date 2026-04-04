@@ -3002,9 +3002,9 @@ checksum = "40e38929add23cdf8a366df9b0e088953150724bcbe5fc330b0d8eb3b328eec8"
 
 [[package]]
 name = "built"
-version = "0.7.7"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56ed6191a7e78c36abdb16ab65341eefd73d64d303fffccdbb00d51e4205967b"
+checksum = "c360505aed52b7ec96a3636c3f039d99103c37d1d9b4f7a8c743d3ea9ffcd03b"
 dependencies = [
  "chrono",
 ]
@@ -3828,7 +3828,7 @@ checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 [[package]]
 name = "clickhouse-rs"
 version = "1.1.0-alpha.1"
-source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.1#81a652c7c3dc4aff9097c30ece821393f089e3b5"
+source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.2#7e98394f44cfa33919ebc5a92c06d5bddba708bf"
 dependencies = [
  "byteorder",
  "cfg-if",
@@ -3858,7 +3858,7 @@ dependencies = [
 [[package]]
 name = "clickhouse-rs-cityhash-sys"
 version = "0.1.2"
-source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.1#81a652c7c3dc4aff9097c30ece821393f089e3b5"
+source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.2#7e98394f44cfa33919ebc5a92c06d5bddba708bf"
 dependencies = [
  "cc",
 ]
@@ -5681,7 +5681,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.4.2"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=7b37778211f37247823f0f17d929204cafe8c43c#7b37778211f37247823f0f17d929204cafe8c43c"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=9b7e0f48c00deefe1276a46890562523b4b97c41#9b7e0f48c00deefe1276a46890562523b4b97c41"
 dependencies = [
  "arrow-json",
  "async-stream",
@@ -6119,7 +6119,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=b2b9f54da35e9a4e0d9c0bd9f838066fc927bba6#b2b9f54da35e9a4e0d9c0bd9f838066fc927bba6"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=408e2c554db2433670ea2ffb43a4289fefe739ad#408e2c554db2433670ea2ffb43a4289fefe739ad"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -18299,6 +18299,7 @@ dependencies = [
  "object_store",
  "regex",
  "schemars 1.2.1",
+ "secrecy",
  "serde",
  "serde-value",
  "serde_json",
@@ -20547,9 +20548,9 @@ dependencies = [
 
 [[package]]
 name = "turso"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7adb377630e2cfc1aa10d44cff1a05edfca9dea1bcf500211a24917f37dbf492"
+checksum = "faba49ac70e21ea35cc963341485f3d17822f2cf433f42152a182117da21d29f"
 dependencies = [
  "thiserror 2.0.18",
  "tracing",
@@ -20564,9 +20565,9 @@ version = "2.0.0-unstable"
 
 [[package]]
 name = "turso_core"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34b2f28e920d1d893fdd5bf4a9bf666dc31f3f0c99832611a6e119b93501707f"
+checksum = "81fac73a12b91b569f4671d63d65912876c11e6312597c996dac40494f9f9b39"
 dependencies = [
  "aegis",
  "aes 0.8.4",
@@ -20576,7 +20577,7 @@ dependencies = [
  "bigdecimal",
  "bitflags 2.10.0",
  "branches",
- "built 0.7.7",
+ "built 0.7.5",
  "bumpalo",
  "bytemuck",
  "cfg_block",
@@ -20629,9 +20630,9 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07064bc2fefab2f90478d30fc8fae48d8526f590b70b303a1092081e8ee42a3f"
+checksum = "bdd7410a02a3a4cebd48a5bc0db74940d1157dc9c05ad42d48ee5156dd31edd1"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -20640,9 +20641,9 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ab0703506127013dc1fc7e115b2055aeb16ac8aed7b972a9156abd08406c74c"
+checksum = "9c846c30c3cb085884a8bbaba7760bdcc406ff2176cbde1e51d41b6057171fd4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -20651,9 +20652,9 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "770c38bab784693915ad996c28decbddecb563388ffb5038a4dfe16f4a446a86"
+checksum = "8402ba98c236e3e6d6ed6a43557a9a0b3a682f86a37fcafe02b659b9e6c06b82"
 dependencies = [
  "bitflags 2.10.0",
  "memchr",
@@ -20666,9 +20667,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16574ba104b802e2faa7654099d4aa00e769b9baaab347d6d98e9eef2a8d1f8c"
+checksum = "15b68fee8a6d8515fa6be08ad998d34eba0ac4a8e81dae4b9d0041e21ca01e22"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",
@@ -20682,9 +20683,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e92557fe426adaaa096bc33b7953a137020645cf43127ff81a77cea74d37cd4"
+checksum = "4b90fe1bcada9dda8b8e20900f744bdd52f641cccc179f1507e83f8f2ec0b1dc"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -20693,9 +20694,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_engine"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18182aacf9550e0e56cc567d2501d7b999a0eaee072f5623fb9ffd74c34a056a"
+checksum = "8a94f0d86e6823f63fc52040eb33131ce7fb9cebdb7329a5231443d846e0195a"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -20715,9 +20716,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_sdk_kit"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69cd8cceccd7b2428a3bf81a9f08cf27138a1a02c831a3599bd277c4dff2f06c"
+checksum = "b49fb6c54aaa988f333505a9023fe4985725995b1575eb1557105fa4ac13ea6d"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",

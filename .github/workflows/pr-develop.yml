@@ -45,9 +45,6 @@ jobs:
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
 
-    env:
-      SPICEIO_LOG_FILE: /tmp/spiceio-check.log
-
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
@@ -55,7 +52,8 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up spiceio
-        uses: spiceai/spiceio/.github/actions/setup@7009d5f668671ef39af3c4065ea8f8e4501f78af # v0.4.2
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@07f50ad2b40d272a857ca2483712d8b0ade6480b # v0.5.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -65,6 +63,8 @@ jobs:
 
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
+        with:
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Install Protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
@@ -90,12 +90,16 @@ jobs:
       - name: Show sccache stats
         run: sccache --show-stats
 
+      - name: Kill spiceio
+        if: always() && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
       - name: Upload spiceio logs
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: spiceio-check-logs
-          path: /tmp/spiceio-check.log
+          path: ${{ runner.temp }}/spiceio.log
           if-no-files-found: ignore
 
   build-and-test:
@@ -104,9 +108,6 @@ jobs:
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
 
-    env:
-      SPICEIO_LOG_FILE: /tmp/spiceio-build.log
-
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
@@ -114,7 +115,8 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up spiceio
-        uses: spiceai/spiceio/.github/actions/setup@7009d5f668671ef39af3c4065ea8f8e4501f78af # v0.4.2
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@07f50ad2b40d272a857ca2483712d8b0ade6480b # v0.5.0
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -124,6 +126,8 @@ jobs:
 
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
+        with:
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -163,10 +167,14 @@ jobs:
             exit 1
           fi
 
+      - name: Kill spiceio
+        if: always() && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
       - name: Upload spiceio logs
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: spiceio-build-logs
-          path: /tmp/spiceio-build.log
+          path: ${{ runner.temp }}/spiceio.log
           if-no-files-found: ignore

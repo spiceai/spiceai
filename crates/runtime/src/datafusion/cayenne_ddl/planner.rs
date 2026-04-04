@@ -28,11 +28,13 @@ use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 
 use super::logical_nodes::{
     CayenneCreateSchemaNode, CayenneCreateTableNode, CayenneDropTableNode,
-    DistributedCayenneDeleteNode, DistributedCayenneInsertNode, DistributedCayenneUpdateNode,
+    DistributedCayenneDeleteNode, DistributedCayenneInsertNode, DistributedCayenneMergeNode,
+    DistributedCayenneUpdateNode,
 };
 use super::physical_plans::{
     CayenneCreateSchemaExec, CayenneCreateTableExecBuilder, CayenneDropTableExec,
-    DistributedCayenneDeleteExec, DistributedCayenneInsertExec, DistributedCayenneUpdateExec,
+    DistributedCayenneDeleteExec, DistributedCayenneInsertExec, DistributedCayenneMergeExec,
+    DistributedCayenneUpdateExec,
 };
 use crate::cluster::executor_registry::ExecutorRegistry;
 
@@ -163,6 +165,20 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
                 ctx,
                 io_runtime,
                 Arc::clone(input),
+            ))));
+        }
+
+        if let Some(merge) = node.as_any().downcast_ref::<DistributedCayenneMergeNode>() {
+            let ctx = Arc::new(datafusion::prelude::SessionContext::new_with_state(
+                session_state.clone(),
+            ));
+            return Ok(Some(Arc::new(DistributedCayenneMergeExec::new(
+                merge.target_table.clone(),
+                merge.source_table.clone(),
+                merge.on_keys.clone(),
+                merge.original_sql.clone(),
+                self.executor_registry.clone(),
+                ctx,
             ))));
         }
 
