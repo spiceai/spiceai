@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use crate::Error::{self, FailedToStartClusterExecutor};
-use crate::auth::api_key_auth;
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
 use crate::cluster::partition::{
     executor_request_initial_partitions,
@@ -59,7 +58,6 @@ use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_expr::Expr;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
-use flight_client::Credentials;
 use futures::future::try_join_all;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
@@ -1329,9 +1327,6 @@ pub async fn initialize_cluster_executor(
         }
     });
 
-    let creds = credentials(app_def.runtime.auth.as_ref(), &rt)
-        .await
-        .unwrap_or(Credentials::anonymous());
     // Capture the cluster client TLS config (if mTLS is configured) for use in the can_connect
     // check. The local Flight server uses the cluster's private CA and requires clients to present
     // a certificate (mTLS), so passing the full ClientTlsConfig (with both CA and client identity)
@@ -1346,10 +1341,9 @@ pub async fn initialize_cluster_executor(
             FibonacciBackoffBuilder::new().max_retries(Some(10)).build(),
             || {
                 let addr = flight_addr.clone();
-                let creds = creds.clone();
                 let tls_config = cluster_client_tls.clone();
                 async move {
-                    flight_client::can_connect(addr.clone(), Some(creds), tls_config)
+                    flight_client::can_connect(addr.clone(), tls_config)
                         .await
                         .map_err(|e| {
                             tracing::warn!(
@@ -1400,27 +1394,6 @@ pub async fn initialize_cluster_executor(
 
         Ok(())
     })
-}
-
-async fn credentials(
-    auth: Option<&spicepod::component::runtime::Auth>,
-    rt: &Arc<Runtime>,
-) -> Option<Credentials> {
-    if let Some(spicepod::component::runtime::Auth {
-        api_key: Some(key_auth),
-    }) = auth
-    {
-        let secrets = rt.secrets();
-        let key = api_key_auth(&*secrets.read().await, key_auth)
-            .await
-            .api_keys
-            .first()?
-            .as_secret();
-
-        Some(Credentials::new("", key))
-    } else {
-        None
-    }
 }
 
 async fn create_scheduler_server(

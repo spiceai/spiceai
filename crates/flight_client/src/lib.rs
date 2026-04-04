@@ -703,7 +703,6 @@ pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
 /// # Arguments
 ///
 /// * `flight_addr` - The address to connect to.
-/// * `creds` - Optional credentials for authentication. Defaults to anonymous.
 /// * `tls_config` - Optional TLS configuration for the connection. When the server
 ///   uses mutual TLS (mTLS), this must include a client identity in addition to the
 ///   CA certificate, otherwise the TLS handshake will fail. If `None` and the address
@@ -714,10 +713,9 @@ pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
 /// Returns an error if the Flight client cannot establish a connection to the given address.
 pub async fn can_connect(
     flight_addr: impl Into<String>,
-    _creds: Option<Credentials>,
     tls_config: Option<tonic::transport::ClientTlsConfig>,
 ) -> Result<()> {
-    let url: Arc<str> = Arc::from(flight_addr.into().as_str());
+    let url = flight_addr.into();
     tls::new_tls_flight_channel_with_tls_config(&url, tls_config)
         .await
         .context(UnableToConnectToServerSnafu)?;
