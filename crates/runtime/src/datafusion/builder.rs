@@ -598,11 +598,15 @@ pub(crate) fn runtime_env(
         unreachable!("Memory pool TopN must be greater than 0");
     };
 
+    // Runtime is 64-bit minimum; usize is at least 64 bits on all supported targets.
+    #[expect(clippy::cast_possible_truncation)]
+    let effective_memory_bytes = effective_memory_limit as usize;
+
     let memory_pool = Arc::new(TrackConsumersPool::new(
         // The runtime supports only 64-bit platforms, so casting u64 to usize
         // will not truncate on supported targets.
         #[expect(clippy::cast_possible_truncation, reason = "runtime is 64-bit only")]
-        GreedyMemoryPool::new(effective_memory_limit as usize),
+        GreedyMemoryPool::new(effective_memory_bytes),
         topn,
     ));
 

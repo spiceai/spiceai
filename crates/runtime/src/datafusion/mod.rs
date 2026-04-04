@@ -1539,14 +1539,14 @@ impl DataFusion {
         // Normalize Dictionary types in refresh_schema the same way create_accelerator_table
         // does, so that Dictionary→value type normalization doesn't trigger a false mismatch.
         if acceleration_settings.mode == Mode::FileUpdate && refresh_mode != RefreshMode::Disabled {
-            let checkpoint_schema =
-                if let Ok(cp) = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
-                    && cp.exists().await
-                {
-                    cp.get_schema().await.ok().flatten()
-                } else {
-                    None
-                };
+            let checkpoint_schema = if let Ok(cp) =
+                DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
+                && cp.exists().await
+            {
+                cp.get_schema().await.ok().flatten()
+            } else {
+                None
+            };
             let existing_schema =
                 checkpoint_schema.unwrap_or_else(|| accelerated_table_provider.schema());
             let needs_dict_normalization = matches!(
@@ -1562,7 +1562,9 @@ impl DataFusion {
             } else {
                 Arc::clone(&refresh_schema)
             };
-            if let Some(diff) = arrow_tools::schema::schema_difference(&existing_schema, &normalized_refresh_schema) {
+            if let Some(diff) =
+                arrow_tools::schema::schema_difference(&existing_schema, &normalized_refresh_schema)
+            {
                 tracing::warn!(
                     "Dataset {} schema change detected in file_update mode. {diff}. Acceleration file is replaced.",
                     dataset.name
@@ -1599,8 +1601,7 @@ impl DataFusion {
                     .context(UnableToCreateDataAcceleratorSnafu)?;
 
                 // Clear the checkpoint so the refresh treats this as a fresh table
-                if let Ok(cp) =
-                    DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
+                if let Ok(cp) = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
                 {
                     let _ = cp.delete().await;
                 }

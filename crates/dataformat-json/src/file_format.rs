@@ -781,8 +781,12 @@ mod tests {
         let schema = infer_json_schema_for_format(buf, Format::Object, &mut take)
             .expect("should infer schema from single-line object");
         assert_eq!(schema.fields().len(), 2);
-        schema.field_with_name("name").expect("field should exist");
-        schema.field_with_name("age").expect("field should exist");
+        schema
+            .field_with_name("name")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("age")
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -794,7 +798,7 @@ mod tests {
         assert_eq!(schema.fields().len(), 1);
         schema
             .field_with_name("airports")
-            .expect("field should exist");
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -812,8 +816,10 @@ mod tests {
         assert_eq!(schema.fields().len(), 2);
         schema
             .field_with_name("airports")
-            .expect("field should exist");
-        schema.field_with_name("count").expect("field should exist");
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("count")
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -834,7 +840,7 @@ mod tests {
         assert_eq!(schema.fields().len(), 1);
         schema
             .field_with_name("airports")
-            .expect("field should exist");
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -845,8 +851,12 @@ mod tests {
         let schema = infer_json_schema_for_format(buf, Format::Json, &mut take)
             .expect("Json should infer schema from pretty-printed object");
         assert_eq!(schema.fields().len(), 2);
-        schema.field_with_name("name").expect("field should exist");
-        schema.field_with_name("age").expect("field should exist");
+        schema
+            .field_with_name("name")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("age")
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -856,8 +866,12 @@ mod tests {
         let mut take = || true;
         let schema = infer_json_schema_for_format(buf, Format::Auto, &mut take)
             .expect("Auto should still handle NDJSON");
-        schema.field_with_name("a").expect("field should exist");
-        schema.field_with_name("b").expect("field should exist");
+        schema
+            .field_with_name("a")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("b")
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -875,7 +889,7 @@ mod tests {
         assert_eq!(schema.fields().len(), 1);
         schema
             .field_with_name("airports")
-            .expect("field should exist");
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -892,7 +906,7 @@ mod tests {
         assert_eq!(schema.fields().len(), 1);
         schema
             .field_with_name("airports")
-            .expect("field should exist");
+            .expect("field should exist in schema");
     }
 
     // ----------------------------------------------------------------
@@ -915,11 +929,15 @@ mod tests {
         let schema = infer_json_schema_for_format(&data, Format::Jsonl, &mut take)
             .expect("Jsonl schema from jsonl_standard.json");
         assert_eq!(schema.fields().len(), 3);
-        schema.field_with_name("name").expect("field should exist");
-        schema.field_with_name("age").expect("field should exist");
+        schema
+            .field_with_name("name")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("age")
+            .expect("field should exist in schema");
         schema
             .field_with_name("active")
-            .expect("field should exist");
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -929,11 +947,15 @@ mod tests {
         let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
             .expect("Auto schema from jsonl_standard.json");
         assert_eq!(schema.fields().len(), 3);
-        schema.field_with_name("name").expect("field should exist");
-        schema.field_with_name("age").expect("field should exist");
+        schema
+            .field_with_name("name")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("age")
+            .expect("field should exist in schema");
         schema
             .field_with_name("active")
-            .expect("field should exist");
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -943,10 +965,12 @@ mod tests {
         let schema = infer_json_schema_for_format(&data, Format::Jsonl, &mut take)
             .expect("Jsonl schema from jsonl_crlf.json");
         assert_eq!(schema.fields().len(), 2);
-        schema.field_with_name("id").expect("field should exist");
+        schema
+            .field_with_name("id")
+            .expect("field should exist in schema");
         schema
             .field_with_name("status")
-            .expect("field should exist");
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -956,10 +980,12 @@ mod tests {
         let schema = infer_json_schema_for_format(&data, Format::Jsonl, &mut take)
             .expect("Jsonl schema from jsonl_nested.json");
         assert_eq!(schema.fields().len(), 2);
-        schema.field_with_name("user").expect("field should exist");
+        schema
+            .field_with_name("user")
+            .expect("field should exist in schema");
         schema
             .field_with_name("scores")
-            .expect("field should exist");
+            .expect("field should exist in schema");
     }
 
     // ---- Array fixtures ----
@@ -971,8 +997,12 @@ mod tests {
         let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
             .expect("Array schema from array_standard.json");
         assert_eq!(schema.fields().len(), 2);
-        schema.field_with_name("name").expect("field should exist");
-        schema.field_with_name("age").expect("field should exist");
+        schema
+            .field_with_name("name")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("age")
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -982,8 +1012,12 @@ mod tests {
         let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
             .expect("Auto schema from array_standard.json");
         assert_eq!(schema.fields().len(), 2);
-        schema.field_with_name("name").expect("field should exist");
-        schema.field_with_name("age").expect("field should exist");
+        schema
+            .field_with_name("name")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("age")
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -993,9 +1027,15 @@ mod tests {
         let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
             .expect("Array schema from array_pretty.json");
         assert_eq!(schema.fields().len(), 3);
-        schema.field_with_name("name").expect("field should exist");
-        schema.field_with_name("age").expect("field should exist");
-        schema.field_with_name("city").expect("field should exist");
+        schema
+            .field_with_name("name")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("age")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("city")
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -1005,8 +1045,12 @@ mod tests {
         let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
             .expect("Array schema from array_single.json");
         assert_eq!(schema.fields().len(), 2);
-        schema.field_with_name("only").expect("field should exist");
-        schema.field_with_name("value").expect("field should exist");
+        schema
+            .field_with_name("only")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("value")
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -1016,8 +1060,12 @@ mod tests {
         let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
             .expect("Array schema from array_nested.json");
         assert_eq!(schema.fields().len(), 2);
-        schema.field_with_name("tags").expect("field should exist");
-        schema.field_with_name("meta").expect("field should exist");
+        schema
+            .field_with_name("tags")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("meta")
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -1027,17 +1075,27 @@ mod tests {
         let schema = infer_json_schema_for_format(&data, Format::Array, &mut take)
             .expect("Array schema from array_mixed_types.json");
         assert_eq!(schema.fields().len(), 7);
-        schema.field_with_name("str").expect("field should exist");
-        schema.field_with_name("int").expect("field should exist");
-        schema.field_with_name("float").expect("field should exist");
-        schema.field_with_name("bool").expect("field should exist");
+        schema
+            .field_with_name("str")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("int")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("float")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("bool")
+            .expect("field should exist in schema");
         schema
             .field_with_name("null_val")
-            .expect("field should exist");
+            .expect("field should exist in schema");
         schema
             .field_with_name("nested")
-            .expect("field should exist");
-        schema.field_with_name("arr").expect("field should exist");
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("arr")
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -1058,14 +1116,18 @@ mod tests {
         let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
             .expect("Object schema from object_single.json");
         assert_eq!(schema.fields().len(), 4);
-        schema.field_with_name("name").expect("field should exist");
-        schema.field_with_name("age").expect("field should exist");
+        schema
+            .field_with_name("name")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("age")
+            .expect("field should exist in schema");
         schema
             .field_with_name("active")
-            .expect("field should exist");
+            .expect("field should exist in schema");
         schema
             .field_with_name("scores")
-            .expect("field should exist");
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -1075,12 +1137,18 @@ mod tests {
         let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
             .expect("Object schema from object_pretty.json");
         assert_eq!(schema.fields().len(), 4);
-        schema.field_with_name("name").expect("field should exist");
-        schema.field_with_name("age").expect("field should exist");
+        schema
+            .field_with_name("name")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("age")
+            .expect("field should exist in schema");
         schema
             .field_with_name("address")
-            .expect("field should exist");
-        schema.field_with_name("tags").expect("field should exist");
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("tags")
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -1091,12 +1159,18 @@ mod tests {
         let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
             .expect("Auto schema from object_pretty.json");
         assert_eq!(schema.fields().len(), 4);
-        schema.field_with_name("name").expect("field should exist");
-        schema.field_with_name("age").expect("field should exist");
+        schema
+            .field_with_name("name")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("age")
+            .expect("field should exist in schema");
         schema
             .field_with_name("address")
-            .expect("field should exist");
-        schema.field_with_name("tags").expect("field should exist");
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("tags")
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -1106,14 +1180,18 @@ mod tests {
         let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
             .expect("Object schema from object_nulls.json");
         assert_eq!(schema.fields().len(), 4);
-        schema.field_with_name("name").expect("field should exist");
+        schema
+            .field_with_name("name")
+            .expect("field should exist in schema");
         schema
             .field_with_name("middle_name")
-            .expect("field should exist");
-        schema.field_with_name("age").expect("field should exist");
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("age")
+            .expect("field should exist in schema");
         schema
             .field_with_name("nickname")
-            .expect("field should exist");
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -1136,11 +1214,13 @@ mod tests {
         assert_eq!(schema.fields().len(), 3);
         schema
             .field_with_name("airports")
-            .expect("field should exist");
-        schema.field_with_name("count").expect("field should exist");
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("count")
+            .expect("field should exist in schema");
         schema
             .field_with_name("source")
-            .expect("field should exist");
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -1152,11 +1232,13 @@ mod tests {
         assert_eq!(schema.fields().len(), 3);
         schema
             .field_with_name("airports")
-            .expect("field should exist");
-        schema.field_with_name("count").expect("field should exist");
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("count")
+            .expect("field should exist in schema");
         schema
             .field_with_name("source")
-            .expect("field should exist");
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -1168,11 +1250,13 @@ mod tests {
         assert_eq!(schema.fields().len(), 3);
         schema
             .field_with_name("airports")
-            .expect("field should exist");
-        schema.field_with_name("count").expect("field should exist");
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("count")
+            .expect("field should exist in schema");
         schema
             .field_with_name("source")
-            .expect("field should exist");
+            .expect("field should exist in schema");
     }
 
     // ---- BOM-prefixed fixtures ----
@@ -1190,8 +1274,12 @@ mod tests {
         let schema = infer_json_schema_for_format(&data, Format::Object, &mut take)
             .expect("Object schema from bom_object.json");
         assert_eq!(schema.fields().len(), 2);
-        schema.field_with_name("name").expect("field should exist");
-        schema.field_with_name("age").expect("field should exist");
+        schema
+            .field_with_name("name")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("age")
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -1201,8 +1289,12 @@ mod tests {
         let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
             .expect("Auto schema from bom_object.json");
         assert_eq!(schema.fields().len(), 2);
-        schema.field_with_name("name").expect("field should exist");
-        schema.field_with_name("age").expect("field should exist");
+        schema
+            .field_with_name("name")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("age")
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -1216,8 +1308,12 @@ mod tests {
         let mut take = || true;
         let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
             .expect("Auto schema from bom_jsonl.json");
-        schema.field_with_name("name").expect("field should exist");
-        schema.field_with_name("age").expect("field should exist");
+        schema
+            .field_with_name("name")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("age")
+            .expect("field should exist in schema");
     }
 
     #[test]
@@ -1231,7 +1327,11 @@ mod tests {
         let mut take = || true;
         let schema = infer_json_schema_for_format(&data, Format::Auto, &mut take)
             .expect("Auto schema from bom_array.json");
-        schema.field_with_name("id").expect("field should exist");
-        schema.field_with_name("val").expect("field should exist");
+        schema
+            .field_with_name("id")
+            .expect("field should exist in schema");
+        schema
+            .field_with_name("val")
+            .expect("field should exist in schema");
     }
 }
