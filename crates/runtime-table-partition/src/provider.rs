@@ -391,6 +391,26 @@ impl TableProvider for PartitionTableProvider {
             .execute_insert(input, insert_op, &ctx)
             .await
     }
+
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let partitions = self.partitions.read().await;
+        let partition_list: Vec<_> = partitions.values().cloned().collect();
+        drop(partitions);
+
+        let update_sink = Arc::new(PartitionedUpdateSink::new(
+            partition_list,
+            assignments,
+            filters,
+            state.task_ctx(),
+        ));
+
+        Ok(Arc::new(DeletionExec::new(update_sink, &self.schema)))
+    }
 }
 
 /// Implement `DeletionTableProvider` to support retention checks and delete operations
@@ -415,26 +435,6 @@ impl DeletionTableProvider for PartitionTableProvider {
         ));
 
         Ok(Arc::new(DeletionExec::new(deletion_sink, &self.schema)))
-    }
-
-    async fn update(
-        &self,
-        state: &dyn Session,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let partitions = self.partitions.read().await;
-        let partition_list: Vec<_> = partitions.values().cloned().collect();
-        drop(partitions);
-
-        let update_sink = Arc::new(PartitionedUpdateSink::new(
-            partition_list,
-            assignments,
-            filters,
-            state.task_ctx(),
-        ));
-
-        Ok(Arc::new(DeletionExec::new(update_sink)))
     }
 }
 

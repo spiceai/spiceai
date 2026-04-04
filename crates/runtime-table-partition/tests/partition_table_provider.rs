@@ -1539,7 +1539,10 @@ impl TableProvider for DeletablePartitionMemTable {
             count_per_call: 10,
         });
 
-        Ok(Arc::new(DeletionExec::new(deletion_sink)))
+        Ok(Arc::new(DeletionExec::new(
+            deletion_sink,
+            &self.mem_table.schema(),
+        )))
     }
 
     async fn update(
@@ -1554,7 +1557,10 @@ impl TableProvider for DeletablePartitionMemTable {
             count_per_call: 5,
         });
 
-        Ok(Arc::new(DeletionExec::new(update_sink)))
+        Ok(Arc::new(DeletionExec::new(
+            update_sink,
+            &self.mem_table.schema(),
+        )))
     }
 }
 
@@ -1582,8 +1588,8 @@ impl DeletionTableProvider for DeletablePartitionMemTable {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         // Simulate deleting 10 rows per partition
         let deletion_sink = Arc::new(MockDeletionSink {
-            deleted_count: Arc::clone(&self.deleted_count),
-            count_to_delete: 10,
+            count: Arc::clone(&self.deleted_count),
+            count_per_call: 10,
         });
 
         Ok(Arc::new(DeletionExec::new(
