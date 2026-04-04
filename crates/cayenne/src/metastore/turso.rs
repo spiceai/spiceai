@@ -614,9 +614,10 @@ impl Drop for TursoTransaction {
                      attempting auto-rollback"
                 );
                 if let Some(conn) = guard.as_ref()
-                    && let Err(err) = conn.execute("ROLLBACK", ()).await {
-                        tracing::error!("Failed to auto-rollback TursoTransaction on drop: {err}");
-                    }
+                    && let Err(err) = conn.execute("ROLLBACK", ()).await
+                {
+                    tracing::error!("Failed to auto-rollback TursoTransaction on drop: {err}");
+                }
                 // `guard` is dropped here, releasing the connection lock.
             });
         }

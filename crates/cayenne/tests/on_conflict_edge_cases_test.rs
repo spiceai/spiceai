@@ -42,7 +42,6 @@ use cayenne::metadata::CreateTableOptions;
 use cayenne::{CayenneTableProvider, MetadataCatalog};
 
 use data_components::delete::DeletionTableProvider;
-use datafusion::datasource::TableProvider;
 use datafusion::prelude::{Expr, SessionContext, col, lit};
 
 use datafusion_table_providers::util::{

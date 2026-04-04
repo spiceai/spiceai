@@ -128,6 +128,11 @@ impl CayenneCatalogProvider {
     /// Create a new Cayenne catalog provider.
     ///
     /// Initializes the `SQLite` metadata catalog and local file storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata or data directories cannot be created,
+    /// or if the `SQLite` catalog fails to initialize.
     pub async fn try_new(
         config: CayenneCatalogProviderConfig,
         runtime_env: Arc<RuntimeEnv>,
@@ -231,6 +236,10 @@ impl CayenneCatalogProvider {
     }
 
     /// Registers or replaces a schema provider for a namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the internal schema lock cannot be acquired.
     pub fn register_schema_provider(
         &self,
         name: &str,
@@ -396,6 +405,10 @@ impl CayenneSchemaProvider {
     ///
     /// `full_table_names` are namespace-prefixed names (`namespace/table_name`) as
     /// stored in the Cayenne metadata catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any table fails to load from the metadata catalog.
     pub async fn try_new(
         catalog: Arc<dyn MetadataCatalog>,
         namespace: &str,
