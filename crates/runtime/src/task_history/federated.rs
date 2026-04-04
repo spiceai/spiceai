@@ -411,17 +411,20 @@ fn build_peer_sql(table_ref: &str, filters: &[Expr], limit: Option<usize>) -> St
     }
 
     let unparser = datafusion::sql::unparser::Unparser::default();
-    let where_clause = filters
-        .iter()
-        .filter_map(|expr| {
-            unparser
-                .expr_to_sql(expr)
-                .ok()
-                .map(|sql_expr| sql_expr.to_string())
-        })
-        .collect::<Vec<_>>()
-        .join(" AND ");
+    let mut sql_parts = Vec::with_capacity(filters.len());
+    for expr in filters {
+        match unparser.expr_to_sql(expr) {
+            Ok(sql_expr) => sql_parts.push(sql_expr.to_string()),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to convert filter expression to SQL, omitting all filters for safety: {e}"
+                );
+                return base;
+            }
+        }
+    }
 
+    let where_clause = sql_parts.join(" AND ");
     if where_clause.is_empty() {
         return base;
     }
