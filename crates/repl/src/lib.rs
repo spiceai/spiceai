@@ -776,8 +776,7 @@ async fn get_and_display_nql_records(
         &Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .unwrap_or_default(),
+            .build()?,
         endpoint,
         query,
         LlmRuntime::Openai,
