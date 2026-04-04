@@ -84,6 +84,7 @@ impl RuntimeContext {
         let pods_dir = app_dir.join(SPICEPODS_DIR);
 
         let http_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_default();

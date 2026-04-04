@@ -445,7 +445,11 @@ async fn msal_device_code_flow(
     let scope_string = scopes.join(" ");
 
     // Step 1: Request device code
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
     let device_response = client
         .post(&device_code_url)
         .form(&[("client_id", client_id), ("scope", &scope_string)])
