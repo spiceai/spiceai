@@ -535,29 +535,37 @@ impl TableProvider for SearchQueryProvider {
             proj2
         });
 
-        let mut search_lp = LogicalPlanBuilder::new_from_arc(Arc::clone(&self.search_index_query))
-            .alias("search_index")?
-            .limit(0, self.pre_limit)?;
+        // Build search index base plan WITHOUT pre_limit so that filters can be added
+        // below the limit. DataFusion cannot push filters past a Limit node, so adding
+        // filters after the limit prevents them from reaching the underlying search index
+        // (e.g. S3VectorsQueryExec), causing both worse performance and incorrect results
+        // (top-K-then-filter vs top-K-of-filtered).
+        let search_base = LogicalPlanBuilder::new_from_arc(Arc::clone(&self.search_index_query))
+            .alias("search_index")?;
 
         let just_use_index = self.search_index_table_is_sufficient(
             &Arc::clone(self.search_index_query.schema()),
             inner_proj.as_ref(),
             filters,
         )?;
-        search_lp = match (just_use_index, filters.iter().cloned().reduce(Expr::and)) {
-            (true, None) => search_lp.limit(0, limit)?,
-            (true, Some(filter)) => search_lp.filter(filter)?.limit(0, limit)?,
+        let search_lp = match (just_use_index, filters.iter().cloned().reduce(Expr::and)) {
+            (true, None) => search_base.limit(0, self.pre_limit)?.limit(0, limit)?,
+            (true, Some(filter)) => search_base
+                .filter(filter)?
+                .limit(0, self.pre_limit)?
+                .limit(0, limit)?,
             (false, _) => {
-                // Pushdown indexes to search index
+                // Add supported filters BEFORE the pre_limit so they can be pushed down
+                // into the search index scan by DataFusion's PushDownFilter optimizer.
                 let search_index = if let Some(filter) =
-                    exprs_supported(filters, search_lp.schema())
+                    exprs_supported(filters, search_base.schema())
                         .iter()
                         .cloned()
                         .reduce(Expr::and)
                 {
-                    search_lp.filter(filter)?
+                    search_base.filter(filter)?.limit(0, self.pre_limit)?
                 } else {
-                    search_lp
+                    search_base.limit(0, self.pre_limit)?
                 };
 
                 self.join_with_base(inner_proj.as_ref(), search_index, filters)?
@@ -645,4 +653,234 @@ fn exprs_supported(exprs: &[Expr], schema: &DFSchemaRef) -> Vec<Expr> {
         })
         .cloned()
         .collect::<Vec<_>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use arrow::record_batch::RecordBatch;
+    use datafusion::{datasource::empty::EmptyTable, prelude::SessionContext};
+
+    /// A table provider that records the filters passed to its `scan()` method.
+    /// This lets us verify that filters are pushed down through the logical plan
+    /// into the underlying table provider's scan.
+    #[derive(Debug)]
+    struct FilterRecordingProvider {
+        schema: SchemaRef,
+        recorded_filters: Arc<Mutex<Vec<Vec<Expr>>>>,
+    }
+
+    impl FilterRecordingProvider {
+        fn new(schema: SchemaRef) -> (Arc<Self>, Arc<Mutex<Vec<Vec<Expr>>>>) {
+            let filters = Arc::new(Mutex::new(Vec::new()));
+            (
+                Arc::new(Self {
+                    schema,
+                    recorded_filters: Arc::clone(&filters),
+                }),
+                filters,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for FilterRecordingProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        fn supports_filters_pushdown(
+            &self,
+            filters: &[&Expr],
+        ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
+            Ok(vec![TableProviderFilterPushDown::Exact; filters.len()])
+        }
+        async fn scan(
+            &self,
+            _state: &dyn Session,
+            _projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            _limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+            self.recorded_filters
+                .lock()
+                .expect("lock")
+                .push(filters.to_vec());
+            // Return a valid empty plan
+            Ok(Arc::new(
+                datafusion::physical_plan::empty::EmptyExec::new(Arc::clone(&self.schema)),
+            ))
+        }
+    }
+
+    fn build_search_query_provider(
+        search_index_provider: Arc<dyn TableProvider>,
+        base_table_provider: Arc<dyn TableProvider>,
+        pre_limit: Option<usize>,
+    ) -> SearchQueryProvider {
+        let search_index_query = LogicalPlanBuilder::scan(
+            "search_index_inner",
+            Arc::new(DefaultTableSource::new(search_index_provider)),
+            None,
+        )
+        .expect("scan builder")
+        .build()
+        .expect("build");
+
+        SearchQueryProvider::new(
+            Arc::new(search_index_query),
+            base_table_provider,
+            "pk".to_string(),
+            vec!["pk".to_string()],
+            pre_limit,
+        )
+    }
+
+    /// Regression test for https://github.com/spiceai/spiceai/issues/10149
+    ///
+    /// Verifies that filters passed to `SearchQueryProvider::scan()` are pushed
+    /// down to the underlying search index table provider when a `pre_limit` is set.
+    ///
+    /// Previously, the pre_limit was added to the logical plan BEFORE filters,
+    /// preventing DataFusion's `PushDownFilter` from pushing filters past the
+    /// `Limit` node into the inner `TableScan`. This caused filters to never
+    /// reach the search index (e.g. `S3VectorsQueryExec`), producing both worse
+    /// performance and incorrect results (top-K-then-filter vs top-K-of-filtered).
+    #[tokio::test]
+    async fn filters_pushed_down_with_pre_limit_index_only() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Utf8, false),
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new("status", DataType::Utf8, true),
+        ]));
+
+        let (search_provider, recorded_filters) = FilterRecordingProvider::new(Arc::clone(&schema));
+
+        // Base table only has pk; search index has all columns → just_use_index = true
+        let base_schema = Arc::new(Schema::new(vec![Field::new("pk", DataType::Utf8, false)]));
+        let base_table: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(base_schema));
+
+        let sqp = build_search_query_provider(
+            search_provider,
+            base_table,
+            Some(50), // pre_limit that previously blocked filter pushdown
+        );
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let filter = col("status").eq(lit("active"));
+        let result = sqp.scan(&state, None, &[filter.clone()], Some(10)).await;
+        assert!(result.is_ok(), "scan failed: {:?}", result.err());
+
+        let filters = recorded_filters.lock().expect("lock");
+        assert!(
+            !filters.is_empty(),
+            "inner provider scan() was never called"
+        );
+        assert!(
+            !filters[0].is_empty(),
+            "filters were NOT pushed down to the search index table provider; \
+             they are stuck above the pre_limit Limit node (issue #10149)"
+        );
+    }
+
+    /// Same as above but for the join path (just_use_index = false), which is
+    /// the path described in issue #10149 where filters couldn't pass through
+    /// the Left Join into the inner search index.
+    #[tokio::test]
+    async fn filters_pushed_down_with_pre_limit_join_path() {
+        let search_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Utf8, false),
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new("status", DataType::Utf8, true),
+        ]));
+
+        let (search_provider, recorded_filters) =
+            FilterRecordingProvider::new(Arc::clone(&search_schema));
+
+        // Base table has extra column "data" not in search index → just_use_index = false
+        let base_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Utf8, false),
+            Field::new("data", DataType::Utf8, true),
+            Field::new("status", DataType::Utf8, true),
+        ]));
+        let base_batch = RecordBatch::new_empty(Arc::clone(&base_schema));
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::datasource::MemTable::try_new(base_schema, vec![vec![base_batch]])
+                .expect("MemTable"),
+        );
+
+        let sqp = build_search_query_provider(
+            search_provider,
+            base_table,
+            Some(50), // pre_limit
+        );
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        // Filter on "status" which IS in the search index schema,
+        // so exprs_supported() will include it for pushdown
+        let filter = col("status").eq(lit("active"));
+        let result = sqp.scan(&state, None, &[filter.clone()], Some(10)).await;
+        assert!(result.is_ok(), "scan failed: {:?}", result.err());
+
+        let filters = recorded_filters.lock().expect("lock");
+        assert!(
+            !filters.is_empty(),
+            "inner provider scan() was never called"
+        );
+        assert!(
+            !filters[0].is_empty(),
+            "filters were NOT pushed down to the search index table provider in \
+             the join path; they are stuck above the pre_limit (issue #10149)"
+        );
+    }
+
+    /// Verify that scan works correctly with no pre_limit (filters should
+    /// still be pushed down regardless).
+    #[tokio::test]
+    async fn filters_pushed_down_without_pre_limit() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Utf8, false),
+            Field::new(SEARCH_SCORE_COLUMN_NAME, DataType::Float64, false),
+            Field::new("status", DataType::Utf8, true),
+        ]));
+
+        let (search_provider, recorded_filters) = FilterRecordingProvider::new(Arc::clone(&schema));
+
+        let base_schema = Arc::new(Schema::new(vec![Field::new("pk", DataType::Utf8, false)]));
+        let base_table: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(base_schema));
+
+        let sqp = build_search_query_provider(
+            search_provider,
+            base_table,
+            None, // no pre_limit
+        );
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let filter = col("status").eq(lit("active"));
+        let result = sqp.scan(&state, None, &[filter.clone()], Some(10)).await;
+        assert!(result.is_ok(), "scan failed: {:?}", result.err());
+
+        let filters = recorded_filters.lock().expect("lock");
+        assert!(
+            !filters.is_empty(),
+            "inner provider scan() was never called"
+        );
+        assert!(
+            !filters[0].is_empty(),
+            "filters should be pushed down even without a pre_limit"
+        );
+    }
 }
