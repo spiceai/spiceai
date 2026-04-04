@@ -145,7 +145,10 @@ impl DataSink for CayenneDataSink {
     ) -> DFResult<u64> {
         // Acquire write lock to serialize all writes (append and overwrite) and
         // prevent concurrent races on catalog state, snapshot IDs, and listing table.
-        tracing::info!(table = self.table.table_name(), "Cayenne write lock: acquiring");
+        tracing::info!(
+            table = self.table.table_name(),
+            "Cayenne write lock: acquiring"
+        );
         let lock_wait_start = std::time::Instant::now();
         let _write_guard = self.table.write_lock().lock().await;
         let lock_wait_ms = lock_wait_start.elapsed().as_millis() as u64;
@@ -274,7 +277,8 @@ impl CayenneDataSink {
 
             tracing::info!(table = %table_name, "write_all_append: insert_to_new_snapshot starting");
             let write_start = std::time::Instant::now();
-            let rows = self.table
+            let rows = self
+                .table
                 .insert_to_new_snapshot_with_sequence(prepared_stream, new_sequence)
                 .await?;
             let write_ms = write_start.elapsed().as_millis() as u64;
