@@ -171,15 +171,21 @@ async fn get_metrics_status(
 ) -> Result<ComponentStatus, Box<dyn std::error::Error>> {
     use std::sync::LazyLock;
 
-    static METRICS_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-        reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap_or_default()
-    });
+    static METRICS_CLIENT: LazyLock<Result<reqwest::Client, reqwest::Error>> =
+        LazyLock::new(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(5))
+                .build()
+        });
 
-    let resp = METRICS_CLIENT
+    let client = METRICS_CLIENT.as_ref().map_err(|e| {
+        Box::new(std::io::Error::other(format!(
+            "Failed to build metrics HTTP client: {e}"
+        ))) as Box<dyn std::error::Error>
+    })?;
+
+    let resp = client
         .get(format!("http://{metrics_addr}/health"))
         .send()
         .await?;

@@ -85,6 +85,11 @@ pub enum Error {
     #[snafu(display("Unable to connect to Spice Cloud: {source}"))]
     UnableToConnectToSpiceCloud { source: reqwest::Error },
 
+    #[snafu(display(
+        "Spice Cloud HTTP client not initialized. Ensure the extension is initialized before use."
+    ))]
+    ClientNotInitialized {},
+
     #[snafu(display("Unable to build accelerated table: {source}"))]
     UnableToBuildAcceleratedTable {
         source: AcceleratedTableBuilderError,
@@ -94,23 +99,16 @@ pub enum Error {
 pub struct SpiceExtension {
     manifest: ExtensionManifest,
     api_key: String,
-    client: reqwest::Client,
+    client: Option<reqwest::Client>,
 }
 
 impl SpiceExtension {
     #[must_use]
     pub fn new(manifest: ExtensionManifest) -> Self {
-        let client = reqwest::Client::builder()
-            .use_rustls_tls()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(900))
-            .build()
-            .unwrap_or_default();
-
         SpiceExtension {
             manifest,
             api_key: String::new(),
-            client,
+            client: None,
         }
     }
 
@@ -154,8 +152,8 @@ impl SpiceExtension {
         path: &str,
         body: Req,
     ) -> Result<Resp, Error> {
-        let response = self
-            .client
+        let client = self.client.as_ref().ok_or(Error::ClientNotInitialized {})?;
+        let response = client
             .post(format!("{}{path}", self.spice_http_url()))
             .json(&body)
             .header("Content-Type", "application/json")
@@ -258,6 +256,16 @@ impl Extension for SpiceExtension {
         if !self.manifest.enabled {
             return Ok(());
         }
+
+        self.client = Some(
+            reqwest::Client::builder()
+                .use_rustls_tls()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(900))
+                .build()
+                .boxed()
+                .map_err(|source| ExtensionError::UnableToInitializeExtension { source })?,
+        );
 
         let api_key = self
             .get_spice_api_key(runtime)
