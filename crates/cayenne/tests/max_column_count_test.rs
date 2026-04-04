@@ -30,8 +30,8 @@ mod common;
 
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use cayenne::metadata::CreateTableOptions;
 use cayenne::CayenneTableProvider;
+use cayenne::metadata::CreateTableOptions;
 use common::insert_batch;
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::*;

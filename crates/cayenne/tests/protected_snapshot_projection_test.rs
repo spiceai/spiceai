@@ -31,7 +31,7 @@ mod common;
 
 use arrow::array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use cayenne::{metadata::CreateTableOptions, CayenneTableProvider, MetadataCatalog};
+use cayenne::{CayenneTableProvider, MetadataCatalog, metadata::CreateTableOptions};
 use common::TestFixture;
 use data_components::delete::DeletionTableProvider;
 use datafusion::datasource::TableProvider;

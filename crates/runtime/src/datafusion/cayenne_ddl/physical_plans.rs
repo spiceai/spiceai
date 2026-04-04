@@ -40,6 +40,7 @@ use std::sync::Arc;
 
 use arrow::array::{RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use cayenne::CayenneSchemaProvider;
 use cayenne::CayenneTableProviderBuilder;
 use cayenne::metadata::CreateTableOptions;
 use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
@@ -59,7 +60,6 @@ use runtime_table_partition::expression::PartitionedBy;
 use runtime_table_partition::provider::PartitionTableProvider;
 
 use super::get_cayenne_provider;
-use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::dataaccelerator::cayenne::CayennePartitionCreator;
 use crate::dataaccelerator::cayenne::transform_schema_for_vortex;

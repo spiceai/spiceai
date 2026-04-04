@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use turso_shared::{
-    is_retryable_write_conflict_message, retry_backoff_delay, DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS,
+    DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, is_retryable_write_conflict_message, retry_backoff_delay,
 };
 
 struct ExistingDeleteFileRecord {
@@ -1193,7 +1193,7 @@ impl MetadataCatalog for CayenneCatalog {
             Err(e) => {
                 return Err(CatalogError::FailedToAddPartition {
                     source: Box::new(e),
-                })
+                });
             }
         }
 

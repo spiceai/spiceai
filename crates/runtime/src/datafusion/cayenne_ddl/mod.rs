@@ -33,9 +33,10 @@ use datafusion::common::utils::quote_identifier;
 use datafusion::error::DataFusionError;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 
+use cayenne::CayenneCatalogProvider;
+
 use super::composed_catalog::ComposedCatalogProvider;
 use crate::catalogconnector::PartitionAwareCatalog;
-use crate::catalogconnector::cayenne::provider::CayenneCatalogProvider;
 use crate::datafusion::cayenne_ddl::physical_plans::arrow_datatype_to_sql;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 

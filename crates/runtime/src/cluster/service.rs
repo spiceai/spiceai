@@ -779,7 +779,7 @@ async fn notify_scheduler_executor_shutdown(
 /// loaded into the in-memory schema cache.
 #[cfg(not(windows))]
 async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
-    use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
+    use cayenne::CayenneSchemaProvider;
 
     let mut tables = Vec::new();
 
