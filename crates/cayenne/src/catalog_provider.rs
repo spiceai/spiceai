@@ -142,9 +142,11 @@ impl CayenneCatalogProvider {
             .unwrap_or_else(|| format!("{spice_data_base_path}/cayenne_{catalog_name}/metadata"));
 
         // Ensure metadata directory exists
-        std::fs::create_dir_all(&metadata_dir).map_err(|e| Error::InvalidConfiguration {
-            message: format!("Failed to create metadata directory '{metadata_dir}': {e}"),
-        })?;
+        tokio::fs::create_dir_all(&metadata_dir)
+            .await
+            .map_err(|e| Error::InvalidConfiguration {
+                message: format!("Failed to create metadata directory '{metadata_dir}': {e}"),
+            })?;
 
         // Initialize SQLite catalog
         let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
@@ -160,9 +162,11 @@ impl CayenneCatalogProvider {
             .cloned()
             .unwrap_or_else(|| format!("{spice_data_base_path}/cayenne_{catalog_name}/data"));
 
-        std::fs::create_dir_all(&data_dir).map_err(|e| Error::InvalidConfiguration {
-            message: format!("Failed to create data directory '{data_dir}': {e}"),
-        })?;
+        tokio::fs::create_dir_all(&data_dir)
+            .await
+            .map_err(|e| Error::InvalidConfiguration {
+                message: format!("Failed to create data directory '{data_dir}': {e}"),
+            })?;
 
         // Ensure trailing slash for consistent path joining
         let data_base_path = if data_dir.ends_with('/') {
