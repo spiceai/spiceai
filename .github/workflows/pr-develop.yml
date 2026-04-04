@@ -192,7 +192,7 @@ jobs:
   integration-tests:
     name: Runtime Integration Tests
     needs: check_changes
-    if: needs.check_changes.outputs.integration_tests_changed == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    if: needs.check_changes.outputs.integration_tests_changed == 'true'
     runs-on: spiceai-dev-runners
     timeout-minutes: 90
 
