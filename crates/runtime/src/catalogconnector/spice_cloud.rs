@@ -128,7 +128,7 @@ impl SpiceCloudPlatformCatalog {
         }
 
         let client = reqwest::Client::builder()
-            .user_agent(concat!("spiceai/", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("spiceai/{} ({}; {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH))
             .use_rustls_tls()
             .build()
             .context(UnableToBuildCatalogClientSnafu)?;
