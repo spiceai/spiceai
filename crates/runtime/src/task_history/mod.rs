@@ -378,9 +378,9 @@ impl TaskSpan {
                         match &span.hostname {
                             Some(hostname) => str_builder.append_value(hostname),
                             None => {
-                                // This should not happen in cluster mode - hostname should always be set
-                                // But handle gracefully by using empty string
-                                str_builder.append_value("");
+                                return Err(Error::MissingColumnsInRow {
+                                    columns: "hostname".to_string(),
+                                });
                             }
                         }
                     }
