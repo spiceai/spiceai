@@ -1,0 +1,11 @@
+# Workarounds for building on aarch64-unknown-linux-gnu:
+# 1. Enable neon/fp16/fhm target features to fix gemm-f16 compilation.
+#    See: https://github.com/sarah-quinones/gemm/issues/31
+# 2. Use lld linker — it automatically inserts range extension thunks for
+#    R_AARCH64_CALL26 relocations, avoiding the ±128 MiB overflow that GNU ld
+#    hits on large debug binaries.
+# Note: bin/spiced/.cargo/config.toml has its own aarch64 section that takes
+# precedence for spiced builds. Keep both in sync.
+[target.aarch64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-Ctarget-feature=+neon,+fp16,+fhm", "-Clink-arg=-fuse-ld=lld"]
