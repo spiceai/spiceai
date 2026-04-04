@@ -1829,7 +1829,8 @@ mod tests {
         .unwrap();
         let ddl = format!("CREATE TABLE tz_test (ts {tz_sql}) AS VALUES (1)");
         ctx.sql(&ddl).await.unwrap().collect().await.unwrap();
-        let schema = ctx.table("tz_test").await.unwrap().schema();
+        let tz_table = ctx.table("tz_test").await.unwrap();
+        let schema = tz_table.schema();
         let ts_field = schema.field_with_name(None, "ts").unwrap();
         assert!(
             matches!(ts_field.data_type(), DataType::Timestamp(_, Some(_))),
@@ -1842,7 +1843,8 @@ mod tests {
             arrow_datatype_to_sql(&DataType::Timestamp(TimeUnit::Nanosecond, None)).unwrap();
         let ddl = format!("CREATE TABLE naive_test (ts {naive_sql}) AS VALUES (1)");
         ctx.sql(&ddl).await.unwrap().collect().await.unwrap();
-        let schema = ctx.table("naive_test").await.unwrap().schema();
+        let naive_table = ctx.table("naive_test").await.unwrap();
+        let schema = naive_table.schema();
         let ts_field = schema.field_with_name(None, "ts").unwrap();
         assert!(
             matches!(ts_field.data_type(), DataType::Timestamp(_, None)),
