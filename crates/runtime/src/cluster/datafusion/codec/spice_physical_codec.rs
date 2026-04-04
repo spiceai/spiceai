@@ -200,15 +200,9 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
 
 /// Serialize the essential fields of a [`RequestContext`] into a proto message.
 fn request_context_to_proto(ctx: &RequestContext) -> RequestContextProto {
-    let (trace_id, span_id) = ctx
-        .trace_parent()
-        .as_ref()
-        .map_or((None, None), |tp| {
-            (
-                Some(tp.trace_id.to_string()),
-                Some(tp.span_id.to_string()),
-            )
-        });
+    let (trace_id, span_id) = ctx.trace_parent().as_ref().map_or((None, None), |tp| {
+        (Some(tp.trace_id.to_string()), Some(tp.span_id.to_string()))
+    });
 
     RequestContextProto {
         protocol: ctx.protocol() as u32,

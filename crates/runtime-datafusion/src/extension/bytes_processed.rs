@@ -103,10 +103,9 @@ impl PhysicalOptimizerRule for BytesProcessedPhysicalOptimizer {
                 return Ok(Transformed::new(plan, false, TreeNodeRecursion::Continue));
             }
 
-            let exec_plan =
-                BytesProcessedExec::new(plan, Arc::clone(&self.emit_bytes_callback))
-                    .with_request_context(Arc::clone(&request_context))
-                    .fallback_to_new_context();
+            let exec_plan = BytesProcessedExec::new(plan, Arc::clone(&self.emit_bytes_callback))
+                .with_request_context(Arc::clone(&request_context))
+                .fallback_to_new_context();
 
             Ok(Transformed::new(
                 Arc::new(exec_plan),
