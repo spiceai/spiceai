@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::Error::{self, FailedToStartClusterExecutor};
+use crate::auth::api_key_auth;
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
 use crate::cluster::partition::{
     executor_request_initial_partitions,
@@ -58,6 +59,7 @@ use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_expr::Expr;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
+use flight_client::Credentials;
 use futures::future::try_join_all;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
@@ -70,11 +72,11 @@ use std::env;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, RwLock, oneshot};
+use tokio::sync::{Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use url::Url;
@@ -158,7 +160,6 @@ fn spawn_scheduler_poll_loop(
     client_tls_config: Option<ClientTlsConfig>,
     executor: Arc<Executor>,
     codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode>,
-    readiness_sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
     poll_now_notify: Option<Arc<Notify>>,
     available_task_slots: Arc<tokio::sync::Semaphore>,
 ) -> SchedulerPollHandle {
@@ -255,43 +256,23 @@ fn spawn_scheduler_poll_loop(
                 .max_encoding_message_size(usize::MAX)
                 .max_decoding_message_size(usize::MAX);
 
-            let (tx_ready, rx_ready) = oneshot::channel();
-            let readiness_sender = Arc::clone(&readiness_sender);
-            let readiness_task = tokio::spawn(async move {
-                if let Ok(executor_id) = rx_ready.await {
-                    let sender = if let Ok(mut sender) = readiness_sender.lock() {
-                        sender.take()
-                    } else {
-                        tracing::warn!(
-                            "Readiness sender lock poisoned while handling executor readiness"
-                        );
-                        None
-                    };
-                    if let Some(sender) = sender {
-                        let _ = sender.send(executor_id);
-                    }
-                }
-            });
-
             let poll_future = execution_loop::poll_loop(
                 scheduler,
                 Arc::clone(&executor),
                 codec.clone(),
-                Some(tx_ready),
+                None,
                 poll_now_notify.clone(),
                 Some(Arc::clone(&available_task_slots)),
             );
 
             tokio::select! {
                 () = token.cancelled() => {
-                    readiness_task.abort();
                     tracing::debug!(
                         "Stopping scheduler poll loop for {scheduler_address} (cancelled)"
                     );
                     break;
                 }
                 result = poll_future => {
-                    readiness_task.abort();
                     if let Err(err) = result {
                         tracing::warn!(
                             "Scheduler poll loop ended for {scheduler_address}: {err}"
@@ -348,7 +329,6 @@ fn update_scheduler_pollers(
     client_tls_config: Option<&ClientTlsConfig>,
     executor: &Arc<Executor>,
     codec: &BallistaCodec<LogicalPlanNode, PhysicalPlanNode>,
-    readiness_sender: &Arc<Mutex<Option<oneshot::Sender<String>>>>,
     poll_now_notify: Option<&Arc<Notify>>,
     available_task_slots: &Arc<tokio::sync::Semaphore>,
 ) {
@@ -377,7 +357,6 @@ fn update_scheduler_pollers(
             client_tls_config.cloned(),
             Arc::clone(executor),
             codec.clone(),
-            Arc::clone(readiness_sender),
             poll_now_notify.cloned(),
             Arc::clone(available_task_slots),
         );
@@ -1199,9 +1178,6 @@ pub async fn initialize_cluster_executor(
         .boxed()
         .context(FailedToStartClusterExecutorSnafu)?;
 
-    let (tx_ready, rx_ready) = oneshot::channel::<String>();
-    let readiness_sender = Arc::new(Mutex::new(Some(tx_ready)));
-
     // Create the shared semaphore for task slot management across all scheduler poll loops.
     // This semaphore will be passed to each poll loop so the busy state can be tracked
     // and shared across nodes in the scheduler shared state location metadata.
@@ -1303,7 +1279,6 @@ pub async fn initialize_cluster_executor(
             client_tls_config_for_manager.as_ref(),
             &executor_for_manager,
             &codec_for_manager,
-            &readiness_sender,
             Some(&poll_now_notify),
             &available_task_slots_for_manager,
         );
@@ -1345,7 +1320,6 @@ pub async fn initialize_cluster_executor(
                             client_tls_config_for_manager.as_ref(),
                             &executor_for_manager,
                             &codec_for_manager,
-                            &readiness_sender,
                             Some(&poll_now_notify),
                             &available_task_slots_for_manager,
                         );
@@ -1355,19 +1329,50 @@ pub async fn initialize_cluster_executor(
         }
     });
 
+    let creds = credentials(app_def.runtime.auth.as_ref(), &rt)
+        .await
+        .unwrap_or(Credentials::anonymous());
     Ok(async move {
-        let _ = rx_ready
-            .await
-            .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?;
+        let flight_addr = rt.datafusion().cluster_config.node_advertise_url();
+        // Wait for our own flight service to be operational.
+        // Bound retries to avoid blocking forever if the Flight service never starts.
+        // 10 retries with fibonacci backoff totals ~2.5 minutes of waiting.
+        util::retry(
+            FibonacciBackoffBuilder::new().max_retries(Some(10)).build(),
+            || {
+                let addr = flight_addr.clone();
+                let creds = creds.clone();
+                async move {
+                    flight_client::can_connect(addr.clone(), Some(creds))
+                        .await
+                        .map_err(|e| {
+                            tracing::warn!("Failed to connect to local Flight service at {addr:?}");
+                            util::RetryError::Transient {
+                                err: e,
+                                retry_after: None,
+                            }
+                        })
+                }
+            },
+        )
+        .await
+        .map_err(|err| FailedToStartClusterExecutor {
+            source: format!("Failed to connect to local Flight service: {err}").into(),
+        })?;
+
+        tracing::warn!("flight ready");
+        // Bind the already-fetched app and initialize secrets for object store configuration
+        executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;
+        tracing::warn!("executor_bind_app ready");
+
+        executor_bind_object_stores(Arc::clone(&rt)).await?;
+        tracing::warn!("executor_bind_object_stores ready");
 
         // Get initial allocation of Accelerated table partitions.
         // This also provides scheduler with executor_id to connect over FlightSQL to fetch partitions during SQL queries.
-        //
-        // This must be done after executor's flight service is ready to accept connections. Otherwise the scheduler will attempt to make connection and fail. Waiting until after `rx_ready` (which is done after the executor has established a network connection to the Scheduler's control plane), should give enough time for executor to bind locally for flight.
         let initial_partitions = executor_request_initial_partitions(
             cluster_client.clone(),
-            rt.datafusion().cluster_config.node_advertise_url(),
+            flight_addr,
             rt.datafusion().ctx.as_ref(),
         )
         .await
@@ -1375,17 +1380,8 @@ pub async fn initialize_cluster_executor(
             source: format!("Failed to allocate initial partitions from scheduler: {status}")
                 .into(),
         })?;
-        tracing::debug!(
-            "For executor={:?}, initial accelerated table partitions={:?}",
-            rt.datafusion().cluster_config.node_advertise_url(),
-            initial_partitions.clone()
-        );
+        tracing::warn!("executor_request_initial_partitions ready");
         rt.set_partition_assignments(initial_partitions).await;
-
-        // Bind the already-fetched app and initialize secrets for object store configuration
-        executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;
-
-        executor_bind_object_stores(Arc::clone(&rt)).await?;
 
         rt.status.update_cluster("executor", ComponentStatus::Ready);
 
@@ -1396,6 +1392,28 @@ pub async fn initialize_cluster_executor(
 
         Ok(())
     })
+}
+
+async fn credentials(
+    auth: Option<&spicepod::component::runtime::Auth>,
+    rt: &Arc<Runtime>,
+) -> Option<Credentials> {
+    let _credentials: Option<Credentials> = if let Some(spicepod::component::runtime::Auth {
+        api_key: Some(key_auth),
+    }) = auth
+    {
+        let secrets = rt.secrets();
+        let key = api_key_auth(&*secrets.read().await, key_auth)
+            .await
+            .api_keys
+            .first()?
+            .as_secret();
+
+        Some(Credentials::new("", key))
+    } else {
+        None
+    };
+    None
 }
 
 async fn create_scheduler_server(
