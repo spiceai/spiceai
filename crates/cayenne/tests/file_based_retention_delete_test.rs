@@ -1178,16 +1178,17 @@ fn count_vortex_files(table_dir: &std::path::Path) -> usize {
     let mut count = 0;
     for entry in entries.filter_map(std::result::Result::ok) {
         let path = entry.path();
-        if path.is_dir() && path.file_name().is_none_or(|n| n != STAGING_DIR_NAME) {
-            if let Ok(snapshot_entries) = std::fs::read_dir(&path) {
-                for file_entry in snapshot_entries.filter_map(std::result::Result::ok) {
-                    if file_entry
-                        .path()
-                        .extension()
-                        .is_some_and(|ext| ext == "vortex")
-                    {
-                        count += 1;
-                    }
+        if path.is_dir()
+            && path.file_name().is_none_or(|n| n != STAGING_DIR_NAME)
+            && let Ok(snapshot_entries) = std::fs::read_dir(&path)
+        {
+            for file_entry in snapshot_entries.filter_map(std::result::Result::ok) {
+                if file_entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "vortex")
+                {
+                    count += 1;
                 }
             }
         }
