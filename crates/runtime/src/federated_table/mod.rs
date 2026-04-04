@@ -142,7 +142,15 @@ impl FederatedTable {
         table_provider: Arc<dyn TableProvider>,
         data_connector: Arc<dyn DataConnector>,
         shutdown_token: CancellationToken,
+        allow_schema_mismatch: bool,
     ) -> Self {
+        // When `allow_schema_mismatch` is `true`, schema differences are ignored and the
+        // table provider is returned immediately. The caller is responsible for handling
+        // schema evolution (e.g. `file_update` mode detects changes and recreates the acceleration).
+        if allow_schema_mismatch {
+            return Self::new_unchecked(table_provider);
+        }
+
         let Some(checkpoint) = Self::get_checkpoint(Arc::clone(&dataset)).await else {
             // Either this is not an accelerated table or the checkpoint does not exist.
             return Self::new_unchecked(table_provider);
