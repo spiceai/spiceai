@@ -605,6 +605,7 @@ impl ApiKey {
         }
     }
 
+    #[must_use] 
     pub fn as_secret(&self) -> SecretString {
         match self {
             ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => key.clone().into(),
