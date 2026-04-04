@@ -14,12 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use app::AppBuilder;
+#[cfg(feature = "postgres")]
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection;
+use runtime::Runtime;
+#[cfg(feature = "postgres")]
 use runtime::{
-    Runtime,
     component::dataset::Dataset as RuntimeDataset,
     dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
 };
@@ -29,18 +32,22 @@ use spicepod::{
     param::Params,
 };
 
+#[cfg(feature = "postgres")]
+use crate::postgres::common;
 use crate::{
     configure_test_datafusion, init_tracing,
-    postgres::common,
     utils::{
         register_test_connectors, run_query, runtime_ready_check, test_request_context,
         to_pretty_display,
     },
 };
 
+#[cfg(feature = "postgres")]
 const DUCKDB_FILE_PATH: &str = "./schema_evolution.duckdb";
+#[cfg(feature = "postgres")]
 const DUCKDB_FILE_UPDATE_PATH: &str = "./schema_evolution_file_update.duckdb";
 
+#[cfg(feature = "postgres")]
 #[tokio::test]
 async fn test_schema_evolution() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -135,6 +142,7 @@ async fn test_schema_evolution() -> Result<(), anyhow::Error> {
         .await
 }
 
+#[cfg(feature = "postgres")]
 #[expect(clippy::expect_used)]
 async fn run_and_verify_query(rt: &Arc<Runtime>, sql: &str, snapshot_name: &str) {
     let record_batch = run_query(rt, sql).await.expect("query should succeed");
@@ -144,6 +152,7 @@ async fn run_and_verify_query(rt: &Arc<Runtime>, sql: &str, snapshot_name: &str)
     );
 }
 
+#[cfg(feature = "postgres")]
 async fn reset_pg_table(db_conn: &PostgresConnection) {
     execute_pg_statement(db_conn, "DROP TABLE IF EXISTS public.chameleon;").await;
     execute_pg_statement(
@@ -158,6 +167,7 @@ async fn reset_pg_table(db_conn: &PostgresConnection) {
     .await;
 }
 
+#[cfg(feature = "postgres")]
 #[expect(clippy::expect_used)]
 async fn execute_pg_statement(db_conn: &PostgresConnection, sql: &str) {
     db_conn
@@ -167,10 +177,12 @@ async fn execute_pg_statement(db_conn: &PostgresConnection, sql: &str) {
         .expect("statement can be executed");
 }
 
+#[cfg(feature = "postgres")]
 async fn initialize_runtime(port: usize) -> Result<Runtime, anyhow::Error> {
     initialize_runtime_with_mode(port, Mode::File, DUCKDB_FILE_PATH).await
 }
 
+#[cfg(feature = "postgres")]
 async fn initialize_runtime_with_mode(
     port: usize,
     mode: Mode,
@@ -248,6 +260,7 @@ async fn initialize_runtime_with_mode(
     Ok(Arc::try_unwrap(rt).unwrap_or_else(|arc| (*arc).clone()))
 }
 
+#[cfg(feature = "postgres")]
 async fn wait_for_checkpoint(
     dataset: &RuntimeDataset,
     timeout_secs: u64,
@@ -271,6 +284,7 @@ async fn wait_for_checkpoint(
 
 /// Tests `Mode::FileUpdate` schema detection: additive changes keep the existing file,
 /// while breaking changes (column removed, type changed) trigger table recreation.
+#[cfg(feature = "postgres")]
 #[tokio::test]
 async fn test_schema_evolution_file_update_mode() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -357,4 +371,146 @@ async fn test_schema_evolution_file_update_mode() -> Result<(), anyhow::Error> {
             Ok(())
         })
         .await
+}
+
+// --- CSV-based file_update tests (no Postgres dependency) ---
+
+const CSV_INITIAL: &str = "id,name,age,city\n1,Alice,30,New York\n2,Bob,25,San Francisco\n";
+const CSV_ADD_COLUMN: &str =
+    "id,name,age,city,lname\n1,Alice,30,New York,Smith\n2,Bob,25,San Francisco,Jones\n";
+const CSV_DROP_COLUMN: &str = "id,name,city\n1,Alice,New York\n2,Bob,San Francisco\n";
+
+#[expect(clippy::expect_used)]
+async fn csv_run_and_verify_query(rt: &Arc<Runtime>, sql: &str, snapshot_name: &str) {
+    let record_batch = run_query(rt, sql).await.expect("query should succeed");
+    insta::assert_snapshot!(
+        snapshot_name,
+        to_pretty_display(&record_batch).expect("pretty display")
+    );
+}
+
+async fn init_csv_runtime(
+    csv_path: &str,
+    engine: &str,
+    accel_params: HashMap<String, String>,
+) -> Result<Runtime, anyhow::Error> {
+    register_test_connectors().await;
+
+    let mut ds = Dataset::new(&format!("file:{csv_path}"), "sample");
+    ds.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some(engine.to_string()),
+        mode: Mode::FileUpdate,
+        params: Some(Params::from_string_map(accel_params)),
+        ..Acceleration::default()
+    });
+
+    let app = AppBuilder::new("test_file_update_csv")
+        .with_dataset(ds)
+        .build();
+
+    configure_test_datafusion();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+    let cloned_rt = Arc::clone(&rt);
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+            return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+        }
+        () = cloned_rt.load_components() => {}
+    }
+
+    runtime_ready_check(&rt).await;
+
+    Ok(Arc::try_unwrap(rt).unwrap_or_else(|arc| (*arc).clone()))
+}
+
+async fn run_file_update_csv_phases(
+    engine: &str,
+    accel_params: HashMap<String, String>,
+    csv_path: &str,
+) -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let test_prefix = format!("test_file_update_csv_{engine}");
+    let sql = "SELECT * FROM sample ORDER BY id";
+
+    test_request_context()
+        .scope(async {
+            // Phase 1: Initial load (4 columns)
+            std::fs::write(csv_path, CSV_INITIAL).expect("write csv");
+            let rt = Arc::new(init_csv_runtime(csv_path, engine, accel_params.clone()).await?);
+            csv_run_and_verify_query(&rt, sql, &format!("{test_prefix}__initial"));
+            rt.shutdown().await;
+            drop(rt);
+
+            // Phase 2: Add column (5 columns) — should trigger recreation
+            std::fs::write(csv_path, CSV_ADD_COLUMN).expect("write csv");
+            let rt = Arc::new(init_csv_runtime(csv_path, engine, accel_params.clone()).await?);
+            csv_run_and_verify_query(&rt, sql, &format!("{test_prefix}__add_column"));
+            rt.shutdown().await;
+            drop(rt);
+
+            // Phase 3: Drop column (3 columns) — should trigger recreation
+            std::fs::write(csv_path, CSV_DROP_COLUMN).expect("write csv");
+            let rt = Arc::new(init_csv_runtime(csv_path, engine, accel_params.clone()).await?);
+            csv_run_and_verify_query(&rt, sql, &format!("{test_prefix}__drop_column"));
+            rt.shutdown().await;
+            drop(rt);
+
+            // Phase 4: No-change restart — should preserve existing data
+            let rt = Arc::new(init_csv_runtime(csv_path, engine, accel_params.clone()).await?);
+            csv_run_and_verify_query(&rt, sql, &format!("{test_prefix}__no_change_restart"));
+            rt.shutdown().await;
+            drop(rt);
+
+            Ok(())
+        })
+        .await
+}
+
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn test_file_update_csv_duckdb() -> Result<(), anyhow::Error> {
+    let temp_dir = tempfile::tempdir()?;
+    let accel_file = temp_dir.path().join("sample.duckdb");
+    let csv_file = temp_dir.path().join("sample.csv");
+    let params = HashMap::from([(
+        "duckdb_file".to_string(),
+        accel_file.to_string_lossy().to_string(),
+    )]);
+    run_file_update_csv_phases("duckdb", params, &csv_file.to_string_lossy()).await
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_file_update_csv_sqlite() -> Result<(), anyhow::Error> {
+    let temp_dir = tempfile::tempdir()?;
+    let accel_file = temp_dir.path().join("sample.db");
+    let csv_file = temp_dir.path().join("sample.csv");
+    let params = HashMap::from([(
+        "sqlite_file".to_string(),
+        accel_file.to_string_lossy().to_string(),
+    )]);
+    run_file_update_csv_phases("sqlite", params, &csv_file.to_string_lossy()).await
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_file_update_csv_cayenne() -> Result<(), anyhow::Error> {
+    let temp_dir = tempfile::tempdir()?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+    let csv_file = temp_dir.path().join("sample.csv");
+    let params = HashMap::from([
+        (
+            "cayenne_file_path".to_string(),
+            data_dir.to_string_lossy().to_string(),
+        ),
+        (
+            "cayenne_metadata_dir".to_string(),
+            metadata_dir.to_string_lossy().to_string(),
+        ),
+    ]);
+    run_file_update_csv_phases("cayenne", params, &csv_file.to_string_lossy()).await
 }

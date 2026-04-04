@@ -347,4 +347,27 @@ impl DatasetCheckpoint {
             _ => Err(Error::NoAccelerationConnection),
         }
     }
+
+    /// Deletes the checkpoint for this dataset so the next refresh treats it as a fresh table.
+    pub async fn delete(&self) -> Result<()> {
+        match &self.acceleration_connection {
+            #[cfg(feature = "duckdb")]
+            AccelerationConnection::DuckDB(pool) => self.delete_duckdb(pool),
+            #[cfg(feature = "postgres-accel")]
+            AccelerationConnection::Postgres(pool) => self.delete_postgres(pool).await,
+            #[cfg(feature = "sqlite")]
+            AccelerationConnection::SQLite(conn) => self.delete_sqlite(conn).await,
+            #[cfg(feature = "turso")]
+            AccelerationConnection::Turso(pool) => self.delete_turso(pool).await,
+            #[cfg(all(not(windows), feature = "sqlite"))]
+            AccelerationConnection::Cayenne(conn) => self.delete_sqlite(conn).await,
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "duckdb",
+                feature = "postgres-accel",
+                feature = "turso"
+            )))]
+            _ => Err(Error::NoAccelerationConnection),
+        }
+    }
 }

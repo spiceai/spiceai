@@ -449,33 +449,6 @@ fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
     }
 }
 
-/// Checks whether the `new_schema` (from the source/refresh) is additively compatible with
-/// `existing_schema` (from the current accelerated file).
-///
-/// Additive compatibility means every field in `existing_schema` is present in `new_schema`
-/// with the same field definition (name, data type, nullability, and metadata).
-/// Additional fields in `new_schema` are allowed (they are new columns).
-///
-/// Returns `true` if the schemas are compatible and the acceleration can be used as-is.
-/// Returns `false` if there is a breaking change (column removed, renamed, or any field
-/// attribute changed) that requires the acceleration to be recreated.
-fn is_schema_additively_compatible(existing_schema: &Schema, new_schema: &Schema) -> bool {
-    for field in existing_schema.fields() {
-        match new_schema.field_with_name(field.name()) {
-            Ok(new_field) => {
-                if field.as_ref() != new_field {
-                    return false;
-                }
-            }
-            Err(_) => {
-                // existing column not found in new schema → breaking change
-                return false;
-            }
-        }
-    }
-    true
-}
-
 /// Remap constraint column indices from the source schema to the refresh schema.
 ///
 /// When `refresh_sql` selects a subset or reordered set of columns, the primary key
@@ -1506,6 +1479,14 @@ impl DataFusion {
             );
         }
 
+        self.handle_schema_difference(
+            dataset,
+            &acceleration_settings,
+            &refresh_schema,
+            refresh_mode,
+        )
+        .await?;
+
         // Get source constraints (primary keys) for upsert behavior.
         //
         // For caching mode with DuckDB/Cayenne: constraints enable upsert behavior
@@ -1533,7 +1514,7 @@ impl DataFusion {
             &dataset.name.to_string(),
         )?;
 
-        let mut accelerated_table_provider = self
+        let accelerated_table_provider = self
             .accelerator_engine_registry
             .create_accelerator_table(
                 dataset.name.clone(),
@@ -1547,14 +1528,27 @@ impl DataFusion {
             .await
             .context(UnableToCreateDataAcceleratorSnafu)?;
 
-        // For file_update mode: compare the existing acceleration's schema against the
-        // source/refresh schema. If the change is not additive (columns removed, renamed,
-        // or types changed), snapshot the current file and recreate the acceleration.
+        // For file_update mode: compare the checkpoint schema (from the previous run) against
+        // the source/refresh schema. If there is any schema difference, snapshot the current
+        // file and recreate the acceleration.
+        //
+        // We read the schema from the checkpoint rather than from accelerated_table_provider
+        // because the provider reports the schema it was *created with* (refresh_schema),
+        // not the actual schema stored in the acceleration file.
         //
         // Normalize Dictionary types in refresh_schema the same way create_accelerator_table
         // does, so that Dictionary→value type normalization doesn't trigger a false mismatch.
         if acceleration_settings.mode == Mode::FileUpdate && refresh_mode != RefreshMode::Disabled {
-            let existing_schema = accelerated_table_provider.schema();
+            let checkpoint_schema =
+                if let Ok(cp) = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
+                    && cp.exists().await
+                {
+                    cp.get_schema().await.ok().flatten()
+                } else {
+                    None
+                };
+            let existing_schema =
+                checkpoint_schema.unwrap_or_else(|| accelerated_table_provider.schema());
             let needs_dict_normalization = matches!(
                 acceleration_settings.engine.to_unpartitioned(),
                 Engine::DuckDB | Engine::Sqlite | Engine::Turso
@@ -1568,9 +1562,9 @@ impl DataFusion {
             } else {
                 Arc::clone(&refresh_schema)
             };
-            if !is_schema_additively_compatible(&existing_schema, &normalized_refresh_schema) {
+            if let Some(diff) = arrow_tools::schema::schema_difference(&existing_schema, &normalized_refresh_schema) {
                 tracing::warn!(
-                    "Dataset {} has a non-additive schema change in file_update mode; snapshotting and recreating acceleration",
+                    "Dataset {} schema change detected in file_update mode. {diff}. Acceleration file is replaced.",
                     dataset.name
                 );
 
@@ -1603,6 +1597,13 @@ impl DataFusion {
                     .await
                     .map_err(|e| dataaccelerator::Error::AccelerationCreationFailed { source: e })
                     .context(UnableToCreateDataAcceleratorSnafu)?;
+
+                // Clear the checkpoint so the refresh treats this as a fresh table
+                if let Ok(cp) =
+                    DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
+                {
+                    let _ = cp.delete().await;
+                }
 
                 // Recreate the table with the correct (new) schema
                 accelerated_table_provider = self
@@ -1943,6 +1944,88 @@ impl DataFusion {
             .context(UnableToBuildAcceleratedTableSnafu {
                 dataset_name: dataset.name.to_string(),
             })
+    }
+
+    // For file_update mode: compare the checkpoint schema (from the previous run) against
+    // the source/refresh schema. If there is any schema difference, snapshot the current
+    // file and recreate the acceleration.
+    //
+    // We read the schema from the checkpoint rather than from accelerated_table_provider
+    // because the provider reports the schema it was *created with* (refresh_schema),
+    // not the actual schema stored in the acceleration file.
+    //
+    // Normalize Dictionary types in refresh_schema the same way create_accelerator_table
+    // does, so that Dictionary→value type normalization doesn't trigger a false mismatch.
+    async fn handle_schema_difference(
+        &self,
+        dataset: &Dataset,
+        acceleration_settings: &Acceleration,
+        refresh_schema: &Arc<Schema>,
+        refresh_mode: RefreshMode,
+    ) -> Result<(), Error> {
+        if acceleration_settings.mode == Mode::FileUpdate
+            && refresh_mode != RefreshMode::Disabled
+            && let Ok(cp) = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
+            && let Some(existing_schema) = cp.get_schema().await.ok().flatten()
+        {
+            let needs_dict_normalization = matches!(
+                acceleration_settings.engine.to_unpartitioned(),
+                Engine::DuckDB | Engine::Sqlite | Engine::Turso
+            );
+            let normalized_refresh_schema = if needs_dict_normalization
+                && arrow_tools::schema::has_dictionary_types(&refresh_schema)
+            {
+                Arc::new(arrow_tools::schema::normalize_dictionary_types(
+                    &refresh_schema,
+                ))
+            } else {
+                Arc::clone(&refresh_schema)
+            };
+
+            if let Some(diff) =
+                arrow_tools::schema::schema_difference(&existing_schema, &normalized_refresh_schema)
+            {
+                tracing::warn!(
+                    "Dataset {} schema change detected in file_update mode. {diff}. Acceleration file is replaced.",
+                    dataset.name
+                );
+
+                // Snapshot before recreating (best-effort)
+                if let Ok(layout) = get_acceleration_layout(dataset).await
+                    && let Some(accel_engine) =
+                        engine_to_acceleration_engine(acceleration_settings.engine)
+                {
+                    dataaccelerator::snapshots::snapshot_before_recreate(
+                        &acceleration_settings,
+                        &dataset.name.to_string(),
+                        layout,
+                        accel_engine,
+                        Arc::clone(&existing_schema),
+                    )
+                    .await;
+                }
+
+                // Drop the existing table from the acceleration engine so it can be recreated
+                // with the updated schema
+                let accelerator = self
+                    .accelerator_engine_registry
+                    .get_accelerator_engine(acceleration_settings.engine)
+                    .await
+                    .ok_or_else(|| Error::ExpectedAccelerationSettings {
+                        name: dataset.name.to_string(),
+                    })?;
+                accelerator
+                    .drop_table(&dataset.name.to_string(), dataset)
+                    .await
+                    .map_err(|e| dataaccelerator::Error::AccelerationCreationFailed { source: e })
+                    .context(UnableToCreateDataAcceleratorSnafu)?;
+
+                // Clear the checkpoint so the refresh treats this as a fresh table
+                let _ = cp.delete().await;
+            }
+        }
+
+        Ok(())
     }
 
     /// Attempt to synchronize refreshes with the parent table for localpod accelerated tables.
@@ -3686,93 +3769,6 @@ mod tests {
                 .expect("arrow should be allowed when not in distributed mode");
             validate_distributed_engine(&config, Engine::Cayenne, "ds")
                 .expect("cayenne should be allowed when not in distributed mode");
-        }
-    }
-
-    mod schema_additively_compatible_tests {
-        use arrow::datatypes::{DataType, Field, Schema};
-
-        use crate::datafusion::is_schema_additively_compatible;
-
-        fn schema(fields: &[(&str, DataType)]) -> Schema {
-            Schema::new(
-                fields
-                    .iter()
-                    .map(|(name, dt)| Field::new(*name, dt.clone(), true))
-                    .collect::<Vec<_>>(),
-            )
-        }
-
-        #[test]
-        fn identical_schemas_are_compatible() {
-            let s = schema(&[("id", DataType::Int64), ("name", DataType::Utf8)]);
-            assert!(is_schema_additively_compatible(&s, &s));
-        }
-
-        #[test]
-        fn new_column_added_is_compatible() {
-            let existing = schema(&[("id", DataType::Int64)]);
-            let new = schema(&[("id", DataType::Int64), ("name", DataType::Utf8)]);
-            assert!(is_schema_additively_compatible(&existing, &new));
-        }
-
-        #[test]
-        fn column_removed_is_incompatible() {
-            let existing = schema(&[("id", DataType::Int64), ("name", DataType::Utf8)]);
-            let new = schema(&[("id", DataType::Int64)]);
-            assert!(!is_schema_additively_compatible(&existing, &new));
-        }
-
-        #[test]
-        fn column_type_changed_is_incompatible() {
-            let existing = schema(&[("id", DataType::Int64), ("name", DataType::Utf8)]);
-            let new = schema(&[("id", DataType::Int64), ("name", DataType::Int32)]);
-            assert!(!is_schema_additively_compatible(&existing, &new));
-        }
-
-        #[test]
-        fn column_renamed_is_incompatible() {
-            let existing = schema(&[("id", DataType::Int64), ("town", DataType::Utf8)]);
-            let new = schema(&[("id", DataType::Int64), ("city", DataType::Utf8)]);
-            assert!(!is_schema_additively_compatible(&existing, &new));
-        }
-
-        #[test]
-        fn empty_existing_schema_is_always_compatible() {
-            let existing = schema(&[]);
-            let new = schema(&[("id", DataType::Int64)]);
-            assert!(is_schema_additively_compatible(&existing, &new));
-        }
-
-        #[test]
-        fn both_empty_schemas_are_compatible() {
-            let s = schema(&[]);
-            assert!(is_schema_additively_compatible(&s, &s));
-        }
-
-        #[test]
-        fn column_order_change_is_compatible() {
-            let existing = schema(&[("a", DataType::Int64), ("b", DataType::Utf8)]);
-            let new = schema(&[("b", DataType::Utf8), ("a", DataType::Int64)]);
-            assert!(is_schema_additively_compatible(&existing, &new));
-        }
-
-        #[test]
-        fn multiple_new_columns_added_is_compatible() {
-            let existing = schema(&[("id", DataType::Int64)]);
-            let new = schema(&[
-                ("id", DataType::Int64),
-                ("name", DataType::Utf8),
-                ("age", DataType::Int32),
-            ]);
-            assert!(is_schema_additively_compatible(&existing, &new));
-        }
-
-        #[test]
-        fn nullability_changed_is_incompatible() {
-            let existing = Schema::new(vec![Field::new("id", DataType::Int64, true)]);
-            let new = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
-            assert!(!is_schema_additively_compatible(&existing, &new));
         }
     }
 

@@ -188,4 +188,15 @@ impl DatasetCheckpoint {
             Ok(None)
         }
     }
+
+    pub(super) async fn delete_turso(&self, pool: &Arc<TursoConnectionPool>) -> Result<()> {
+        let conn = pool.connect().await.map_err(Error::external)?;
+
+        let delete = format!("DELETE FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?");
+        conn.execute(&delete, turso::params![self.dataset_name.clone()])
+            .await
+            .map_err(Error::external)?;
+
+        Ok(())
+    }
 }
