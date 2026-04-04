@@ -25,7 +25,7 @@ use crate::accelerated_table::{
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
-use crate::component::dataset::acceleration::{Acceleration, Engine, RefreshMode};
+use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::spice_sys::OpenOption;
@@ -80,12 +80,6 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
 use itertools::Itertools;
 use query::QueryBuilder;
-#[cfg(any(
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "postgres",
-    not(windows)
-))]
 use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_acceleration::snapshot::AccelerationLayout;
 #[cfg(any(
@@ -126,6 +120,8 @@ pub mod iceberg_ddl;
 pub mod job_executor_context_extension;
 pub mod managed_runtime;
 pub mod param_utils;
+#[cfg(not(windows))]
+pub mod planner;
 pub mod refresh_sql;
 pub mod request_context_extension;
 pub mod retention_sql;
@@ -434,6 +430,23 @@ fn validate_distributed_engine(
         .fail();
     }
     Ok(())
+}
+
+/// Converts a runtime `Engine` to a snapshot `AccelerationEngine`.
+///
+/// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow, `PostgreSQL`).
+fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
+    match engine {
+        #[cfg(feature = "duckdb")]
+        Engine::DuckDB | Engine::TableModePartitionedDuckDB => Some(AccelerationEngine::DuckDB),
+        #[cfg(feature = "sqlite")]
+        Engine::Sqlite => Some(AccelerationEngine::Sqlite),
+        #[cfg(feature = "turso")]
+        Engine::Turso => Some(AccelerationEngine::Turso),
+        #[cfg(not(windows))]
+        Engine::Cayenne => Some(AccelerationEngine::Cayenne),
+        _ => None,
+    }
 }
 
 /// Remap constraint column indices from the source schema to the refresh schema.
@@ -924,6 +937,26 @@ impl DataFusion {
             .read()
             .await
             .contains(table_reference)
+    }
+
+    /// Returns `true` if any DDL-enabled catalog is Cayenne-backed.
+    #[cfg(not(windows))]
+    fn has_cayenne_catalog(&self) -> bool {
+        match self.ddl_enabled_catalogs.read() {
+            Ok(cats) => cats.iter().any(|name| {
+                self.ctx
+                    .catalog(name)
+                    .is_some_and(|c| cayenne_ddl::is_cayenne_catalog(c.as_ref()))
+            }),
+            Err(err) => {
+                tracing::error!(
+                    "Failed to acquire read lock for ddl_enabled_catalogs; \
+                     assuming Cayenne-backed catalogs are present to avoid \
+                     silently disabling distributed DELETE planning: {err}"
+                );
+                true
+            }
+        }
     }
 
     /// Returns `true` if the given table reference resolves to a Cayenne-backed catalog.
@@ -1446,6 +1479,14 @@ impl DataFusion {
             );
         }
 
+        self.handle_schema_difference(
+            dataset,
+            &acceleration_settings,
+            &refresh_schema,
+            refresh_mode,
+        )
+        .await?;
+
         // Get source constraints (primary keys) for upsert behavior.
         //
         // For caching mode with DuckDB/Cayenne: constraints enable upsert behavior
@@ -1480,7 +1521,7 @@ impl DataFusion {
                 Arc::clone(&refresh_schema),
                 constraints.as_ref(),
                 &acceleration_settings,
-                secrets,
+                Arc::clone(&secrets),
                 Some(dataset),
                 Arc::clone(&self.ctx),
             )
@@ -1811,6 +1852,88 @@ impl DataFusion {
             })
     }
 
+    // For file_update mode: compare the checkpoint schema (from the previous run) against
+    // the source/refresh schema. If there is any schema difference, snapshot the current
+    // file and recreate the acceleration.
+    //
+    // We read the schema from the checkpoint rather than from accelerated_table_provider
+    // because the provider reports the schema it was *created with* (refresh_schema),
+    // not the actual schema stored in the acceleration file.
+    //
+    // Normalize Dictionary types in refresh_schema the same way create_accelerator_table
+    // does, so that Dictionary→value type normalization doesn't trigger a false mismatch.
+    async fn handle_schema_difference(
+        &self,
+        dataset: &Dataset,
+        acceleration_settings: &Acceleration,
+        refresh_schema: &Arc<Schema>,
+        refresh_mode: RefreshMode,
+    ) -> Result<(), Error> {
+        if acceleration_settings.mode == Mode::FileUpdate
+            && refresh_mode != RefreshMode::Disabled
+            && let Ok(cp) = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
+            && let Some(existing_schema) = cp.get_schema().await.ok().flatten()
+        {
+            let needs_dict_normalization = matches!(
+                acceleration_settings.engine.to_unpartitioned(),
+                Engine::DuckDB | Engine::Sqlite | Engine::Turso
+            );
+            let normalized_refresh_schema = if needs_dict_normalization
+                && arrow_tools::schema::has_dictionary_types(refresh_schema)
+            {
+                Arc::new(arrow_tools::schema::normalize_dictionary_types(
+                    refresh_schema,
+                ))
+            } else {
+                Arc::clone(refresh_schema)
+            };
+
+            if let Some(diff) =
+                arrow_tools::schema::schema_difference(&existing_schema, &normalized_refresh_schema)
+            {
+                tracing::warn!(
+                    "Dataset {} schema change detected in file_update mode. {diff}. Acceleration file is replaced.",
+                    dataset.name
+                );
+
+                // Snapshot before recreating (best-effort)
+                if let Ok(layout) = get_acceleration_layout(dataset).await
+                    && let Some(accel_engine) =
+                        engine_to_acceleration_engine(acceleration_settings.engine)
+                {
+                    dataaccelerator::snapshots::snapshot_before_recreate(
+                        acceleration_settings,
+                        &dataset.name.to_string(),
+                        layout,
+                        accel_engine,
+                        Arc::clone(&existing_schema),
+                    )
+                    .await;
+                }
+
+                // Drop the existing table from the acceleration engine so it can be recreated
+                // with the updated schema
+                let accelerator = self
+                    .accelerator_engine_registry
+                    .get_accelerator_engine(acceleration_settings.engine)
+                    .await
+                    .ok_or_else(|| Error::ExpectedAccelerationSettings {
+                        name: dataset.name.to_string(),
+                    })?;
+                accelerator
+                    .drop_table(&dataset.name.to_string(), dataset)
+                    .await
+                    .map_err(|e| dataaccelerator::Error::AccelerationCreationFailed { source: e })
+                    .context(UnableToCreateDataAcceleratorSnafu)?;
+
+                // Clear the checkpoint so the refresh treats this as a fresh table
+                let _ = cp.delete().await;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Attempt to synchronize refreshes with the parent table for localpod accelerated tables.
     ///
     /// This will not work if:
@@ -1939,6 +2062,18 @@ impl DataFusion {
         dataset_name: &TableReference,
         overrides: Option<RefreshOverrides>,
     ) -> Result<Option<Arc<Notify>>> {
+        // If we're a scheduler with an executor registry, forward refresh to executors
+        // instead of trying to refresh locally (the scheduler doesn't run refresh workers).
+        if matches!(
+            self.cluster_config.effective_role(),
+            Some(crate::config::ClusterRole::Scheduler)
+        ) && let Some(executor_registry) = &self.executor_registry
+        {
+            return self
+                .forward_refresh_to_executors(executor_registry, dataset_name, overrides.as_ref())
+                .await;
+        }
+
         let table = self
             .get_accelerated_table_provider(dataset_name.to_string().as_str())
             .await?;
@@ -1956,6 +2091,74 @@ impl DataFusion {
             table_name: dataset_name.to_string(),
         }
         .fail()?
+    }
+
+    /// Forwards a dataset refresh command to all connected executors via the control stream.
+    /// Returns `Ok(None)` because the scheduler does not have a local notifier for executor refreshes.
+    async fn forward_refresh_to_executors(
+        &self,
+        executor_registry: &ExecutorRegistry,
+        dataset_name: &TableReference,
+        overrides: Option<&RefreshOverrides>,
+    ) -> Result<Option<Arc<Notify>>> {
+        let overrides_json = match overrides {
+            Some(o) => {
+                Some(
+                    serde_json::to_string(o).map_err(|_| Error::UnableToTriggerRefresh {
+                        dataset_name: dataset_name.to_string(),
+                        source: crate::accelerated_table::Error::FailedToTriggerRefresh {
+                            source: tokio::sync::mpsc::error::SendError(None),
+                        },
+                    })?,
+                )
+            }
+            None => None,
+        };
+
+        let command = runtime_proto::SchedulerControlMessage {
+            message: Some(
+                runtime_proto::scheduler_control_message::Message::RefreshDataset(
+                    runtime_proto::RefreshDatasetCommand {
+                        dataset_name: dataset_name.to_string(),
+                        overrides_json,
+                    },
+                ),
+            ),
+        };
+
+        let executor_ids = executor_registry.connected_executors().await;
+        if executor_ids.is_empty() {
+            tracing::warn!(
+                "No executors connected to forward refresh for dataset '{dataset_name}'"
+            );
+            return Ok(None);
+        }
+
+        let mut failures = Vec::new();
+        for executor_id in &executor_ids {
+            if let Err(e) = executor_registry
+                .send_command(executor_id, command.clone())
+                .await
+            {
+                tracing::warn!("Failed to send refresh command to executor {executor_id}: {e}");
+                failures.push(executor_id.clone());
+            }
+        }
+
+        if failures.is_empty() {
+            tracing::info!(
+                "Forwarded refresh for dataset '{dataset_name}' to {} executor(s)",
+                executor_ids.len()
+            );
+        } else {
+            tracing::warn!(
+                "Refresh for '{dataset_name}' failed for {}/{} executor(s)",
+                failures.len(),
+                executor_ids.len()
+            );
+        }
+
+        Ok(None)
     }
 
     pub async fn update_refresh_sql(
@@ -2486,30 +2689,7 @@ impl DataFusion {
             None
         };
 
-        // Pre-process CREATE TABLE statements to extract DDL extensions
-        // (WITH options, PARTITION BY) before planning.
-        let preprocessed =
-            ddl::preprocess::preprocess_create_table_with_options(sql, &self.ddl_extension_store)?;
-        let (effective_sql, store_key) = match &preprocessed {
-            ddl::preprocess::PreprocessResult::Modified {
-                sql: modified,
-                store_key,
-            } => (modified.as_str(), Some(store_key)),
-            ddl::preprocess::PreprocessResult::Unchanged => (sql, None),
-        };
-
-        let plan = match session.create_logical_plan(effective_sql).await {
-            Ok(plan) => plan,
-            Err(e) => {
-                if let Some(store_key) = store_key {
-                    ddl::preprocess::cleanup_preprocessed_ddl_options(
-                        &self.ddl_extension_store,
-                        store_key,
-                    )?;
-                }
-                return Err(e);
-            }
-        };
+        let plan = self.create_logical_plan(session, sql).await?;
 
         if let Some(cache) = plans_cache
             && let Some(cache_key) = cache_key_opt
@@ -2519,6 +2699,39 @@ impl DataFusion {
         }
 
         Ok(plan)
+    }
+
+    /// Route SQL through the planner, which intercepts DDL extensions and
+    /// Cayenne DML at the statement level, or falls back to `DataFusion`'s
+    /// standard planner.
+    #[cfg(not(windows))]
+    pub(crate) async fn create_logical_plan(
+        &self,
+        session: &SessionState,
+        sql: &str,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        let ctx = planner::PlannerContext {
+            catalog_mode: if self.has_cayenne_catalog() {
+                planner::CatalogMode::Cayenne
+            } else {
+                planner::CatalogMode::Standard
+            },
+            cluster_role: self.cluster_config.effective_role(),
+            ddl_extension_store: Arc::clone(&self.ddl_extension_store),
+        };
+
+        planner::create_logical_plan(sql, session, &ctx).await
+    }
+
+    /// On Windows the `planner` module is not available, so delegate
+    /// directly to DataFusion's standard logical planner.
+    #[cfg(windows)]
+    pub(crate) async fn create_logical_plan(
+        &self,
+        session: &SessionState,
+        sql: &str,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        session.create_logical_plan(sql).await
     }
 
     pub(crate) async fn clear_cached_plans(&self) {

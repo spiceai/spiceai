@@ -29,7 +29,7 @@ use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{
-    ApiKey, ApiKeyAuth, Auth, Flight, Runtime, Scheduler, TelemetryConfig,
+    ApiKey, ApiKeyAuth, Auth, Flight, Query, Runtime, Scheduler, TelemetryConfig,
 };
 use spicepod::param::{ParamValue, Params};
 use spicepod::spec::SpicepodDefinition;
@@ -61,6 +61,8 @@ enum RunState {
         api_key: String,
         /// Flight SQL endpoint URL derived from the cname.
         flight_url: String,
+        /// Normalized API base URL (stored separately from `cloud` to avoid tainted-struct logging).
+        api_url: String,
         /// Cloud client used during provisioning (reused for teardown).
         cloud: CloudClient,
     },
@@ -331,11 +333,13 @@ impl Handler for SpidapterHandler {
         };
 
         match state {
-            RunState::Scp { app_id, cloud, .. } => {
-                eprintln!(
-                    "[stdio] teardown: deleting app {app_id} at {}",
-                    cloud.base_url()
-                );
+            RunState::Scp {
+                app_id,
+                api_url,
+                cloud,
+                ..
+            } => {
+                eprintln!("[stdio] teardown: deleting app {app_id} at {api_url}");
                 commands::delete_app(&cloud, app_id)
                     .await
                     .map_err(|e| format!("Failed to delete app {app_id}: {e}"))?;
@@ -574,10 +578,8 @@ async fn provision_spice_cloud_app(
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
 ) -> anyhow::Result<RunState> {
-    let cloud = commands::build_cloud_client(
-        Some(args.spice_cloud_api_url.as_str()),
-        args.api_key.as_deref(),
-    )?;
+    let api_url = args.spice_cloud_api_url.trim_end_matches('/');
+    let cloud = commands::build_cloud_client(Some(api_url), args.api_key.as_deref())?;
 
     let cname = commands::resolve_default_cname(&cloud).await?;
     let flight_url = args
@@ -588,7 +590,7 @@ async fn provision_spice_cloud_app(
     let short_id = run_id_str.split('-').next().unwrap_or_default();
     let app_name = commands::sanitize_app_name(&format!("spidapter-{short_id}"));
 
-    eprintln!("[stdio] Spice Cloud API: {}", cloud.base_url());
+    eprintln!("[stdio] Spice Cloud API: {api_url}");
     eprintln!("[stdio] Region cname: {cname}");
     eprintln!("[stdio] Flight endpoint: {flight_url}");
     eprintln!("[stdio] App name: {app_name}");
@@ -714,6 +716,7 @@ async fn provision_spice_cloud_app(
         app_id,
         api_key,
         flight_url,
+        api_url: api_url.to_owned(),
         cloud,
     })
 }
@@ -1508,6 +1511,13 @@ fn generate_adbc_spicepod(
             do_put_rate_limit_enabled: false,
             ..Flight::default()
         }),
+        query: Some(Query {
+            memory_limit: args
+                .query_memory_limit
+                .clone()
+                .or(Some("150Gi".to_string())),
+            ..Query::default()
+        }),
         ..Runtime::default()
     };
 
@@ -1631,6 +1641,7 @@ mod tests {
             cayenne_metadata_dir: None,
             ephemeral_storage_limit_gb: None,
             organization_tag: None,
+            query_memory_limit: None,
         }
     }
 

@@ -114,6 +114,7 @@ message SchedulerControlMessage {
         PollNowCommand poll_now = 2;
         UpdatePartitions update_partitions = 3;
         CancelTasksCommand cancel_tasks = 4;
+        RefreshDatasetCommand refresh_dataset = 5;
     }
 }
 
@@ -160,6 +161,14 @@ message TaskCancelInfo {
     string job_id = 2;
     uint32 stage_id = 3;
     uint32 partition_id = 4;
+}
+
+// Command sent from scheduler to executor to refresh a specific dataset.
+message RefreshDatasetCommand {
+    // The dataset name (as a TableReference string, e.g. "taxi_trips").
+    string dataset_name = 1;
+    // Optional JSON-serialized RefreshOverrides.
+    optional string overrides_json = 2;
 }
 
 // Heartbeat message sent by executor to scheduler.

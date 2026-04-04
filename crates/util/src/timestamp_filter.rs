@@ -197,14 +197,28 @@ impl TimestampFilterConvert {
 ///
 /// Returns a string like `2024-01-25T20:43:41.000000000`.
 #[must_use]
-#[expect(clippy::cast_possible_wrap)]
 pub fn nanos_to_iso8601_string(nanos: u128) -> String {
-    let secs = (nanos / 1_000_000_000) as i64;
-    let subsec_nanos = (nanos % 1_000_000_000) as u32;
-    chrono::DateTime::from_timestamp(secs, subsec_nanos)
-        .unwrap_or_default()
-        .format("%Y-%m-%dT%H:%M:%S%.9f")
-        .to_string()
+    let format_max_timestamp = || {
+        tracing::warn!(
+            "Timestamp value {nanos}ns exceeds chrono range; saturating ISO 8601 filter literal to the maximum representable UTC timestamp"
+        );
+        chrono::DateTime::<chrono::Utc>::MAX_UTC
+            .format("%Y-%m-%dT%H:%M:%S%.9f")
+            .to_string()
+    };
+
+    let Ok(secs) = i64::try_from(nanos / 1_000_000_000) else {
+        return format_max_timestamp();
+    };
+    let Ok(subsec_nanos) = u32::try_from(nanos % 1_000_000_000) else {
+        unreachable!("nanosecond remainder always fits in u32")
+    };
+
+    let Some(datetime) = chrono::DateTime::from_timestamp(secs, subsec_nanos) else {
+        return format_max_timestamp();
+    };
+
+    datetime.format("%Y-%m-%dT%H:%M:%S%.9f").to_string()
 }
 
 /// Parse an ISO 8601 string back to nanoseconds since Unix epoch.
@@ -360,6 +374,16 @@ mod tests {
         assert_eq!(
             nanos_to_iso8601_string(1_706_215_421_123_456_789),
             "2024-01-25T20:43:41.123456789"
+        );
+    }
+
+    #[test]
+    fn test_nanos_to_iso8601_string_out_of_range_does_not_truncate() {
+        assert_eq!(
+            nanos_to_iso8601_string(u128::MAX),
+            chrono::DateTime::<chrono::Utc>::MAX_UTC
+                .format("%Y-%m-%dT%H:%M:%S%.9f")
+                .to_string()
         );
     }
 

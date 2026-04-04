@@ -38,13 +38,14 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::{
-    metadata::CreateTableOptions, CayenneTableProvider, CayenneTableProviderBuilder,
-    MetadataCatalog,
+    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
+    metadata::CreateTableOptions,
 };
 use common::TestFixture;
+use data_components::delete::DeletionTableProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
-use datafusion::prelude::{col, lit, Expr};
+use datafusion::prelude::{Expr, col, lit};
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
 };
@@ -108,7 +109,7 @@ async fn setup_int64_upsert_table(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-            "id".to_string()
+            "id".to_string(),
         ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
@@ -163,7 +164,7 @@ async fn insert_batch(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> 
 
 async fn delete_records(table: &Arc<CayenneTableProvider>, filter: Expr) -> TestResult<u64> {
     let ctx = SessionContext::new();
-    let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(results
         .first()

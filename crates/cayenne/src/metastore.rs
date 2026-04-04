@@ -365,21 +365,13 @@ impl<T: MetastoreGetValue> MetastoreGetValue for Option<T> {
     }
 }
 
-// Transaction support is backend-specific and cannot be expressed as a trait object
-// due to generic methods. Each backend should provide its own concrete transaction type.
-//
-// For example:
-// - SqliteMetastore provides SqliteTransaction
-// - TursoMetastore provides TursoTransaction
-//
-// These concrete types should follow the RAII pattern:
-// - Automatically rollback on drop unless explicitly committed
-// - Provide execute(), query_row(), query() methods matching the MetastoreBackend API
-// - Provide commit() and rollback() methods
+/// A metastore transaction that provides exclusive access to the underlying
+/// connection for the duration of its lifetime.
+///
 /// The transaction must be explicitly committed via `commit()`, otherwise it will
 /// automatically rollback when dropped.
 #[async_trait]
-pub trait MetastoreTransaction: Send + Sync {
+pub trait MetastoreTransaction: Send {
     /// Execute a SQL statement that modifies data within the transaction.
     ///
     /// # Errors
@@ -387,25 +379,12 @@ pub trait MetastoreTransaction: Send + Sync {
     /// Returns an error if the statement cannot be executed.
     async fn execute(&self, params: ExecuteParams<'_>) -> CatalogResult<()>;
 
-    /// Query a single row from the database within the transaction.
+    /// Execute a batch of SQL statements within the transaction.
     ///
     /// # Errors
     ///
-    /// Returns an error if the query fails or returns no rows.
-    async fn query_row<F, T>(&self, params: QueryRowParams<'_>, f: F) -> CatalogResult<T>
-    where
-        F: FnOnce(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
-        T: Send + 'static;
-
-    /// Query multiple rows from the database within the transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the query fails.
-    async fn query<F, T>(&self, params: QueryParams<'_>, f: F) -> CatalogResult<Vec<T>>
-    where
-        F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
-        T: Send + 'static;
+    /// Returns an error if any statement in the batch fails.
+    async fn execute_batch(&self, sql: &str) -> CatalogResult<()>;
 
     /// Commit the transaction.
     ///
@@ -414,7 +393,7 @@ pub trait MetastoreTransaction: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the transaction cannot be committed.
-    async fn commit(self) -> CatalogResult<()>;
+    async fn commit(self: Box<Self>) -> CatalogResult<()>;
 
     /// Explicitly rollback the transaction.
     ///
@@ -423,7 +402,7 @@ pub trait MetastoreTransaction: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the transaction cannot be rolled back.
-    async fn rollback(self) -> CatalogResult<()>;
+    async fn rollback(self: Box<Self>) -> CatalogResult<()>;
 }
 
 /// Trait for metastore backend implementations.
@@ -472,6 +451,21 @@ pub trait MetastoreBackend: Send + Sync {
     where
         F: Fn(&dyn MetastoreRow) -> CatalogResult<T> + Send + 'static,
         T: Send + 'static;
+
+    /// Begin a new transaction, acquiring exclusive access to the connection.
+    ///
+    /// The returned transaction holds a lock on the underlying connection,
+    /// preventing other operations from interleaving. This ensures that
+    /// multi-statement transactions (BEGIN...COMMIT) are atomic even when
+    /// multiple tasks share the same metastore.
+    ///
+    /// The backend-specific BEGIN statement is sent automatically
+    /// (e.g. `BEGIN TRANSACTION` for `SQLite`, `BEGIN CONCURRENT` for Turso).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be started.
+    async fn begin_transaction(&self) -> CatalogResult<Box<dyn MetastoreTransaction>>;
 
     /// Shutdown the metastore, performing any necessary cleanup.
     ///
