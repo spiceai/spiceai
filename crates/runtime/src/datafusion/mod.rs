@@ -1879,13 +1879,13 @@ impl DataFusion {
                 Engine::DuckDB | Engine::Sqlite | Engine::Turso
             );
             let normalized_refresh_schema = if needs_dict_normalization
-                && arrow_tools::schema::has_dictionary_types(&refresh_schema)
+                && arrow_tools::schema::has_dictionary_types(refresh_schema)
             {
                 Arc::new(arrow_tools::schema::normalize_dictionary_types(
-                    &refresh_schema,
+                    refresh_schema,
                 ))
             } else {
-                Arc::clone(&refresh_schema)
+                Arc::clone(refresh_schema)
             };
 
             if let Some(diff) =
@@ -1902,7 +1902,7 @@ impl DataFusion {
                         engine_to_acceleration_engine(acceleration_settings.engine)
                 {
                     dataaccelerator::snapshots::snapshot_before_recreate(
-                        &acceleration_settings,
+                        acceleration_settings,
                         &dataset.name.to_string(),
                         layout,
                         accel_engine,

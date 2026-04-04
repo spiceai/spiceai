@@ -66,7 +66,6 @@ use runtime_object_store::registry::default_runtime_env;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
 use runtime_proto::{GetAppDefinitionRequest, GetSchedulersRequest, TaskCancelInfo};
 use runtime_secrets::Secrets;
-use secrecy::SecretString;
 use snafu::ResultExt;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -1399,12 +1398,12 @@ async fn credentials(
     auth: Option<&spicepod::component::runtime::Auth>,
     rt: &Arc<Runtime>,
 ) -> Option<Credentials> {
-    let foo: Option<Credentials> = if let Some(spicepod::component::runtime::Auth {
+    let _credentials: Option<Credentials> = if let Some(spicepod::component::runtime::Auth {
         api_key: Some(key_auth),
     }) = auth
     {
         let secrets = rt.secrets();
-        let key = api_key_auth(&*secrets.read().await, &key_auth)
+        let key = api_key_auth(&*secrets.read().await, key_auth)
             .await
             .api_keys
             .first()?
