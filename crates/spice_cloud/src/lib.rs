@@ -103,7 +103,7 @@ impl SpiceExtension {
         let client = reqwest::Client::builder()
             .use_rustls_tls()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(1800))
+            .timeout(Duration::from_secs(900))
             .build()
             .unwrap_or_default();
 
