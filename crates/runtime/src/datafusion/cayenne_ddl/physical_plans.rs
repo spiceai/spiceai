@@ -1813,13 +1813,16 @@ mod tests {
     }
 
     /// Round-trip test: generate DDL via `arrow_datatype_to_sql`, parse it through
-    /// DataFusion's SQL engine, and verify the resulting schema preserves timezone
-    /// presence.
+    /// DataFusion's SQL engine (with PostgreSQL dialect, matching the runtime),
+    /// and verify the resulting schema preserves timezone presence.
     #[tokio::test]
     async fn timestamp_ddl_roundtrip_preserves_timezone() {
-        use datafusion::prelude::SessionContext;
+        use datafusion::prelude::{SessionConfig, SessionContext};
 
-        let ctx = SessionContext::new();
+        let mut config = SessionConfig::new();
+        config.options_mut().sql_parser.dialect =
+            datafusion::common::config::Dialect::PostgreSQL;
+        let ctx = SessionContext::new_with_config(config);
 
         // Timezone-aware: should roundtrip to Timestamp(Nanosecond, Some("UTC"))
         let tz_sql = arrow_datatype_to_sql(&DataType::Timestamp(
