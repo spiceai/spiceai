@@ -339,7 +339,12 @@ fn table_reference_creator_spark(uc_table: &UCTable) -> Option<TableReference> {
 
 fn table_reference_creator_delta_lake(uc_table: &UCTable) -> Option<TableReference> {
     let storage_location = uc_table.storage_location.as_deref()?;
-    Some(TableReference::bare(format!("{storage_location}/")))
+    // Don't append a trailing slash here — `DeltaTable::from` calls
+    // `ensure_folder_location` which already adds one when needed.
+    // Unconditionally appending caused double-slash paths (e.g.
+    // "file:///path/to/table//") when the catalog API returned
+    // locations that already ended with '/'.
+    Some(TableReference::bare(storage_location.to_string()))
 }
 
 use token_provider::TokenProvider;
@@ -455,7 +460,7 @@ mod tests {
         );
         match reference {
             TableReference::Bare { table } => {
-                assert_eq!(table.as_ref(), "s3://bucket/path/");
+                assert_eq!(table.as_ref(), "s3://bucket/path");
             }
             _ => unreachable!("already asserted to be Bare table reference"),
         }
@@ -471,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_reference_creator_delta_lake_appends_trailing_slash() {
+    fn test_table_reference_creator_delta_lake_preserves_location() {
         let table = make_uc_table(Some("abfss://container@account.dfs.core.windows.net/path"));
         let reference = table_reference_creator_delta_lake(&table).expect("should return Some");
         assert!(
@@ -480,12 +485,32 @@ mod tests {
         );
         match reference {
             TableReference::Bare { table } => {
-                assert!(
-                    table.as_ref().ends_with('/'),
-                    "delta lake reference should end with trailing slash"
+                assert_eq!(
+                    table.as_ref(),
+                    "abfss://container@account.dfs.core.windows.net/path",
+                    "delta lake reference should preserve location without modification"
                 );
             }
             _ => unreachable!("already asserted to be Bare table reference"),
+        }
+    }
+
+    /// Regression test for https://github.com/spiceai/spiceai/issues/7904
+    /// Storage locations ending with '/' must not get a second '/' appended.
+    #[test]
+    fn test_table_reference_creator_delta_lake_no_double_slash() {
+        let table = make_uc_table(Some("s3://bucket/path/"));
+        let reference = table_reference_creator_delta_lake(&table).expect("should return Some");
+        match reference {
+            TableReference::Bare { table } => {
+                assert!(
+                    !table.as_ref().ends_with("//"),
+                    "must not produce double trailing slash, got: {}",
+                    table.as_ref()
+                );
+                assert_eq!(table.as_ref(), "s3://bucket/path/");
+            }
+            _ => panic!("Expected Bare table reference"),
         }
     }
 
@@ -532,7 +557,7 @@ mod tests {
             TableReference::Bare { table } => {
                 assert_eq!(
                     table.as_ref(),
-                    "s3://my-bucket/warehouse/catalog/schema/table/"
+                    "s3://my-bucket/warehouse/catalog/schema/table"
                 );
             }
             _ => unreachable!("already asserted to be Bare table reference"),

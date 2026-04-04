@@ -194,7 +194,12 @@ impl CatalogConnector for UnityCatalog {
 
 fn table_reference_creator(uc_table: &UCTable) -> Option<TableReference> {
     let storage_location = uc_table.storage_location.as_deref()?;
-    Some(TableReference::bare(format!("{storage_location}/")))
+    // Don't append a trailing slash here — `DeltaTable::from` calls
+    // `ensure_folder_location` which already adds one when needed.
+    // Unconditionally appending caused double-slash paths (e.g.
+    // "file:///path/to/table//") when the Unity Catalog API returned
+    // locations that already ended with '/'.
+    Some(TableReference::bare(storage_location.to_string()))
 }
 
 #[cfg(test)]
@@ -224,7 +229,7 @@ mod tests {
         );
         match reference {
             TableReference::Bare { table } => {
-                assert_eq!(table.as_ref(), "s3://my-bucket/warehouse/table/");
+                assert_eq!(table.as_ref(), "s3://my-bucket/warehouse/table");
             }
             _ => unreachable!("already asserted to be Bare table reference"),
         }
@@ -240,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_reference_creator_appends_trailing_slash() {
+    fn test_table_reference_creator_preserves_location_as_is() {
         let table = make_uc_table(Some("gs://bucket/path"));
         let reference = table_reference_creator(&table).expect("should return Some");
         assert!(
@@ -249,9 +254,10 @@ mod tests {
         );
         match reference {
             TableReference::Bare { table } => {
-                assert!(
-                    table.as_ref().ends_with('/'),
-                    "reference should end with trailing slash"
+                assert_eq!(
+                    table.as_ref(),
+                    "gs://bucket/path",
+                    "reference should preserve storage location without modification"
                 );
             }
             _ => unreachable!("already asserted to be Bare table reference"),
@@ -272,10 +278,67 @@ mod tests {
             TableReference::Bare { table } => {
                 assert_eq!(
                     table.as_ref(),
-                    "abfss://container@account.dfs.core.windows.net/warehouse/table/"
+                    "abfss://container@account.dfs.core.windows.net/warehouse/table"
                 );
             }
             _ => unreachable!("already asserted to be Bare table reference"),
+        }
+    }
+
+    /// Regression test for https://github.com/spiceai/spiceai/issues/7904
+    /// Unity Catalog API returns storage_location with a trailing slash.
+    /// Previously, `table_reference_creator` unconditionally appended another
+    /// slash, creating a double-slash path like "file:///path/to/table//"
+    /// which caused Delta Lake to fail with "Path does not exist".
+    #[test]
+    fn test_table_reference_creator_no_double_slash_when_location_ends_with_slash() {
+        let table = make_uc_table(Some(
+            "file:///home/unitycatalog/etc/data/managed/unity/default/tables/marksheet/",
+        ));
+        let reference = table_reference_creator(&table).expect("should return Some");
+        match reference {
+            TableReference::Bare { table } => {
+                assert!(
+                    !table.as_ref().ends_with("//"),
+                    "reference must not end with double slash, got: {}",
+                    table.as_ref()
+                );
+                assert_eq!(
+                    table.as_ref(),
+                    "file:///home/unitycatalog/etc/data/managed/unity/default/tables/marksheet/"
+                );
+            }
+            _ => panic!("Expected Bare table reference"),
+        }
+    }
+
+    /// Edge case: storage_location that is just a scheme with no path content.
+    #[test]
+    fn test_table_reference_creator_bare_scheme() {
+        let table = make_uc_table(Some("s3://bucket"));
+        let reference = table_reference_creator(&table).expect("should return Some");
+        match reference {
+            TableReference::Bare { table } => {
+                assert_eq!(table.as_ref(), "s3://bucket");
+            }
+            _ => panic!("Expected Bare table reference"),
+        }
+    }
+
+    /// Edge case: storage_location with file:// scheme for local paths.
+    #[test]
+    fn test_table_reference_creator_file_scheme() {
+        let table = make_uc_table(Some("file:///tmp/marksheet_uniform/"));
+        let reference = table_reference_creator(&table).expect("should return Some");
+        match reference {
+            TableReference::Bare { table } => {
+                assert_eq!(table.as_ref(), "file:///tmp/marksheet_uniform/");
+                assert!(
+                    !table.as_ref().ends_with("//"),
+                    "must not produce double trailing slash"
+                );
+            }
+            _ => panic!("Expected Bare table reference"),
         }
     }
 }
