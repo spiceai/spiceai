@@ -189,6 +189,55 @@ pub async fn new_tls_flight_channel(
     }
 }
 
+/// Creates a new TLS-enabled Flight channel using an in-memory CA certificate.
+///
+/// If `ca_certificate` is provided, it is used for server verification.
+/// Otherwise, system certificates will be loaded.
+///
+/// Use this instead of [`new_tls_flight_channel`] when the CA certificate is already
+/// loaded in memory (e.g. from `ClusterTlsConfig::ca_certificate_pem`).
+///
+/// # Errors
+///
+/// Will return `Err` if:
+///    - It couldn't connect to the endpoint.
+///    - It couldn't load the system TLS certificate (when `ca_certificate` is `None`).
+pub async fn new_tls_flight_channel_with_cert(
+    endpoint_str: &str,
+    ca_certificate: Option<tonic::transport::Certificate>,
+) -> Result<Channel> {
+    if let Some(tls_info) = extract_tls_endpoint_info(endpoint_str) {
+        // Use the normalized URL (https://) for tonic compatibility
+        let mut endpoint =
+            Endpoint::from_str(&tls_info.normalized_url).context(UnableToConnectToEndpointSnafu)?;
+
+        let cert = if let Some(cert) = ca_certificate {
+            cert
+        } else {
+            system_tls_certificate()?
+        };
+
+        let tls_config = ClientTlsConfig::new()
+            .ca_certificate(cert)
+            .domain_name(tls_info.domain_name);
+        endpoint = endpoint
+            .tls_config(tls_config)
+            .context(UnableToConnectToEndpointSnafu)?;
+
+        endpoint
+            .connect()
+            .await
+            .context(UnableToConnectToEndpointSnafu)
+    } else {
+        // Non-TLS endpoint, connect without TLS config
+        Endpoint::from_str(endpoint_str)
+            .context(UnableToConnectToEndpointSnafu)?
+            .connect()
+            .await
+            .context(UnableToConnectToEndpointSnafu)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

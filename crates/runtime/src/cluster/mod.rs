@@ -401,6 +401,8 @@ pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 pub struct ClusterTlsConfig {
     /// CA certificate used to validate other cluster nodes
     pub ca_certificate: Certificate,
+    /// Raw PEM bytes of the CA certificate, kept for passing to TLS clients that need in-memory certs
+    pub ca_certificate_pem: Vec<u8>,
     /// Client TLS config with CA and client identity for mTLS
     pub client_tls_config: ClientTlsConfig,
     /// Server identity (cert + key) for serving TLS
@@ -486,6 +488,7 @@ impl ClusterTlsConfig {
 
         Ok(Self {
             ca_certificate,
+            ca_certificate_pem: ca_cert_pem,
             client_tls_config,
             server_identity,
         })
@@ -1332,6 +1335,13 @@ pub async fn initialize_cluster_executor(
     let creds = credentials(app_def.runtime.auth.as_ref(), &rt)
         .await
         .unwrap_or(Credentials::anonymous());
+    // Capture the cluster CA PEM bytes (if TLS is configured) for use in the can_connect check.
+    // The local Flight server uses the cluster's private CA, so system TLS certs won't work.
+    let cluster_ca_pem = rt
+        .df
+        .cluster_config
+        .tls_config()
+        .map(|t| t.ca_certificate_pem.clone());
     Ok(async move {
         let flight_addr = rt.datafusion().cluster_config.node_advertise_url();
         // Wait for our own flight service to be operational.
@@ -1342,14 +1352,26 @@ pub async fn initialize_cluster_executor(
             || {
                 let addr = flight_addr.clone();
                 let creds = creds.clone();
+                let ca_certificate = cluster_ca_pem
+                    .as_deref()
+                    .map(tonic::transport::Certificate::from_pem);
                 async move {
-                    flight_client::can_connect(addr.clone(), Some(creds))
+                    flight_client::can_connect(addr.clone(), Some(creds), ca_certificate)
                         .await
                         .map_err(|e| {
-                            tracing::warn!("Failed to connect to local Flight service at {addr:?}");
-                            util::RetryError::Transient {
-                                err: e,
-                                retry_after: None,
+                            tracing::warn!("Failed to connect to local Flight service at {addr:?}: {e}");
+                            // Auth failures will never succeed with retries; treat as permanent.
+                            if matches!(
+                                e,
+                                flight_client::Error::Unauthorized {}
+                                    | flight_client::Error::PermissionDenied {}
+                            ) {
+                                util::RetryError::Permanent(e)
+                            } else {
+                                util::RetryError::Transient {
+                                    err: e,
+                                    retry_after: None,
+                                }
                             }
                         })
                 }
@@ -1360,13 +1382,13 @@ pub async fn initialize_cluster_executor(
             source: format!("Failed to connect to local Flight service: {err}").into(),
         })?;
 
-        tracing::warn!("flight ready");
+        tracing::debug!("Local Flight service is ready");
         // Bind the already-fetched app and initialize secrets for object store configuration
         executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;
-        tracing::warn!("executor_bind_app ready");
+        tracing::debug!("executor_bind_app complete");
 
         executor_bind_object_stores(Arc::clone(&rt)).await?;
-        tracing::warn!("executor_bind_object_stores ready");
+        tracing::debug!("executor_bind_object_stores complete");
 
         // Get initial allocation of Accelerated table partitions.
         // This also provides scheduler with executor_id to connect over FlightSQL to fetch partitions during SQL queries.
@@ -1380,7 +1402,7 @@ pub async fn initialize_cluster_executor(
             source: format!("Failed to allocate initial partitions from scheduler: {status}")
                 .into(),
         })?;
-        tracing::warn!("executor_request_initial_partitions ready");
+        tracing::debug!("executor_request_initial_partitions complete");
         rt.set_partition_assignments(initial_partitions).await;
 
         rt.status.update_cluster("executor", ComponentStatus::Ready);

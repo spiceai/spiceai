@@ -698,19 +698,27 @@ pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
     }
 }
 
-/// Checks if an anonymous Flight client can connect to an address.
+/// Checks if a Flight client can connect to an address.
+///
+/// # Arguments
+///
+/// * `flight_addr` - The address to connect to.
+/// * `creds` - Optional credentials for authentication. Defaults to anonymous.
+/// * `ca_certificate` - Optional CA certificate (PEM format) for TLS verification.
+///   Required when the server uses a private/self-signed CA (e.g. cluster mTLS).
+///   If not provided, system certificates are used.
 ///
 /// # Errors
 ///
 /// Returns an error if the Flight client cannot establish a connection to the given address.
-pub async fn can_connect(flight_addr: impl Into<String>, creds: Option<Credentials>) -> Result<()> {
-    let url = flight_addr.into();
-    FlightClient::try_new(
-        url.into(),
-        creds.unwrap_or(Credentials::anonymous()),
-        None,
-        None,
-    )
-    .await?;
+pub async fn can_connect(
+    flight_addr: impl Into<String>,
+    _creds: Option<Credentials>,
+    ca_certificate: Option<tonic::transport::Certificate>,
+) -> Result<()> {
+    let url: Arc<str> = Arc::from(flight_addr.into().as_str());
+    tls::new_tls_flight_channel_with_cert(&url, ca_certificate)
+        .await
+        .context(UnableToConnectToServerSnafu)?;
     Ok(())
 }
