@@ -71,9 +71,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display(
-        "The upstream server returned an error (HTTP {status}). {detail}"
-    ))]
+    #[snafu(display("The upstream server returned an error (HTTP {status}). {detail}"))]
     JsonDecodeError {
         status: reqwest::StatusCode,
         detail: String,
