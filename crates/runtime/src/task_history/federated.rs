@@ -396,26 +396,40 @@ fn sort_batches_by_start_time(
 }
 
 /// Builds the SQL query to send to peer schedulers and executors.
+///
+/// Uses `DataFusion`'s SQL unparser to convert filter expressions into valid SQL,
+/// ensuring literals and identifiers are encoded correctly for remote execution.
 fn build_peer_sql(table_ref: &str, filters: &[Expr], limit: Option<usize>) -> String {
-    if filters.is_empty() {
-        if let Some(limit) = limit {
-            format!("SELECT * FROM {table_ref} LIMIT {limit}")
-        } else {
-            format!("SELECT * FROM {table_ref}")
-        }
+    let base = if let Some(limit) = limit {
+        format!("SELECT * FROM {table_ref} LIMIT {limit}")
     } else {
-        // Convert filter expressions to SQL WHERE clause
-        let where_clause = filters
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(" AND ");
+        format!("SELECT * FROM {table_ref}")
+    };
 
-        if let Some(limit) = limit {
-            format!("SELECT * FROM {table_ref} WHERE {where_clause} LIMIT {limit}")
-        } else {
-            format!("SELECT * FROM {table_ref} WHERE {where_clause}")
-        }
+    if filters.is_empty() {
+        return base;
+    }
+
+    let unparser = datafusion::sql::unparser::Unparser::default();
+    let where_clause = filters
+        .iter()
+        .filter_map(|expr| {
+            unparser
+                .expr_to_sql(expr)
+                .ok()
+                .map(|sql_expr| sql_expr.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
+    if where_clause.is_empty() {
+        return base;
+    }
+
+    if let Some(limit) = limit {
+        format!("SELECT * FROM {table_ref} WHERE {where_clause} LIMIT {limit}")
+    } else {
+        format!("SELECT * FROM {table_ref} WHERE {where_clause}")
     }
 }
 
@@ -481,18 +495,18 @@ mod tests {
 
         let table_ref = "\"runtime\".\"task_history\"";
 
-        // Single filter
+        // Single filter — string literal should be properly quoted via SQL unparser
         let filter = col("status").eq(lit("completed"));
         assert_eq!(
             build_peer_sql(table_ref, &[filter], None),
-            "SELECT * FROM \"runtime\".\"task_history\" WHERE status = Utf8(\"completed\")"
+            "SELECT * FROM \"runtime\".\"task_history\" WHERE (\"status\" = 'completed')"
         );
 
         // Filter with limit
         let filter = col("task_id").eq(lit("task-123"));
         assert_eq!(
             build_peer_sql(table_ref, &[filter], Some(50)),
-            "SELECT * FROM \"runtime\".\"task_history\" WHERE task_id = Utf8(\"task-123\") LIMIT 50"
+            "SELECT * FROM \"runtime\".\"task_history\" WHERE (task_id = 'task-123') LIMIT 50"
         );
 
         // Multiple filters (combined with AND)
@@ -500,7 +514,7 @@ mod tests {
         let filter2 = col("execution_time").gt(lit(100));
         assert_eq!(
             build_peer_sql(table_ref, &[filter1, filter2], None),
-            "SELECT * FROM \"runtime\".\"task_history\" WHERE status = Utf8(\"running\") AND execution_time > Int32(100)"
+            "SELECT * FROM \"runtime\".\"task_history\" WHERE (\"status\" = 'running') AND (execution_time > 100)"
         );
     }
 
@@ -572,5 +586,69 @@ mod tests {
 
         assert_eq!(projected_col_0.value(0), "value_7");
         assert_eq!(projected_col_1.value(0), "value_10");
+    }
+
+    #[test]
+    fn test_sort_batches_by_start_time_sorts_across_batches() {
+        use arrow::array::TimestampNanosecondArray;
+        use arrow::datatypes::TimeUnit;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(
+                "start_time",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+
+        // Batch 1: timestamps 300, 100 (unsorted)
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["c", "a"])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![300, 100]).with_timezone("UTC"))
+                    as ArrayRef,
+            ],
+        )
+        .expect("batch1");
+
+        // Batch 2: timestamp 200 (interleaved between batch1 values)
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["b"])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![200]).with_timezone("UTC"))
+                    as ArrayRef,
+            ],
+        )
+        .expect("batch2");
+
+        let sorted =
+            sort_batches_by_start_time(&[batch1, batch2], &schema).expect("sort should succeed");
+
+        assert_eq!(sorted.len(), 1, "should produce a single sorted batch");
+        let batch = &sorted[0];
+        assert_eq!(batch.num_rows(), 3);
+
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("id column");
+        assert_eq!(ids.value(0), "a"); // start_time=100
+        assert_eq!(ids.value(1), "b"); // start_time=200
+        assert_eq!(ids.value(2), "c"); // start_time=300
+    }
+
+    #[test]
+    fn test_sort_batches_empty_input() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "start_time",
+            DataType::Utf8,
+            false,
+        )]));
+        let result = sort_batches_by_start_time(&[], &schema).expect("empty input should succeed");
+        assert!(result.is_empty());
     }
 }
