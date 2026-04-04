@@ -30,7 +30,7 @@ use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 
 use cayenne::{
-    metadata::CreateTableOptions, CayenneCatalog, CayenneTableProvider, MetadataCatalog,
+    CayenneCatalog, CayenneTableProvider, MetadataCatalog, metadata::CreateTableOptions,
 };
 
 use data_components::delete::DeletionTableProvider;
@@ -47,8 +47,8 @@ use tempfile::TempDir;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-async fn setup_test_table(
-) -> TestResult<(Arc<CayenneTableProvider>, SessionContext, TempDir, TempDir)> {
+async fn setup_test_table()
+-> TestResult<(Arc<CayenneTableProvider>, SessionContext, TempDir, TempDir)> {
     let data_dir = TempDir::new()?;
     let metadata_dir = TempDir::new()?;
 

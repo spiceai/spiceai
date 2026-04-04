@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
-use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::TableProvider;
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::prelude::SessionContext;
 use datafusion_common::Result as DFResult;
 use datafusion_expr::dml::InsertOp;
