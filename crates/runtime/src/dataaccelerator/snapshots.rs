@@ -141,13 +141,14 @@ pub(crate) async fn snapshot_before_recreate(
 
     // If the caller provided an empty schema (e.g. during file_create init when the table
     // provider isn't available yet), try to read the real schema from existing snapshot
-    // metadata. This avoids storing an empty schema that would cause future snapshots or
-    // restores to fail with a schema mismatch.
+    // metadata. If no stored schema exists either, skip the snapshot to avoid storing an
+    // empty schema that would make this snapshot unrestorable.
     let snapshot_schema = if schema.fields().is_empty() {
-        manager
-            .current_stored_schema()
-            .await
-            .unwrap_or(Arc::clone(&schema))
+        let Some(stored) = manager.current_stored_schema().await else {
+            tracing::debug!(dataset = %dataset_name, "No stored schema available for pre-recreation snapshot; skipping");
+            return;
+        };
+        stored
     } else {
         Arc::clone(&schema)
     };

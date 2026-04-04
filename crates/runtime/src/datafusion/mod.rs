@@ -1599,7 +1599,7 @@ impl DataFusion {
                         name: dataset.name.to_string(),
                     })?;
                 accelerator
-                    .drop_table(&dataset.name.to_string(), dataset)
+                    .drop_table(dataset.name.table(), dataset)
                     .await
                     .map_err(|e| dataaccelerator::Error::AccelerationCreationFailed { source: e })
                     .context(UnableToCreateDataAcceleratorSnafu)?;

@@ -616,11 +616,10 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                 if plan_fmt.contains("UnionExec") || plan_fmt.contains("Union") {
                     break plan;
                 }
-                if start.elapsed() > Duration::from_secs(30) {
-                    panic!(
-                        "Timed out waiting for partitioned EXPLAIN plan. Got:\n{plan_fmt}"
-                    );
-                }
+                assert!(
+                    start.elapsed() <= Duration::from_secs(30),
+                    "Timed out waiting for partitioned EXPLAIN plan. Got:\n{plan_fmt}"
+                );
                 tokio::time::sleep(Duration::from_millis(500)).await;
             };
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
