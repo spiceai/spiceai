@@ -21,9 +21,10 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 #[async_trait]
 pub trait DatasetCheckpointer: Send + Sync {
     async fn exists(&self) -> bool;
-    async fn checkpoint(&self, schema: &SchemaRef) -> Result<()>;
+    async fn checkpoint(&self, schema: &SchemaRef, refresh_sql: Option<&str>) -> Result<()>;
     async fn get_schema(&self) -> Result<Option<SchemaRef>>;
     async fn last_checkpoint_time(&self) -> Result<Option<SystemTime>>;
+    async fn get_refresh_sql(&self) -> Result<Option<String>>;
 }
 
 type CheckpointerFuture =

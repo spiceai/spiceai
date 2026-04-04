@@ -51,6 +51,7 @@ impl CloudClient {
     pub fn new(base_url: &str) -> Result<Self> {
         let client = Client::builder()
             .timeout(DEFAULT_TIMEOUT)
+            .https_only(true)
             .build()
             .context(HttpRequestSnafu)?;
 
@@ -81,6 +82,7 @@ impl CloudClient {
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self> {
         self.client = Client::builder()
             .timeout(timeout)
+            .https_only(true)
             .build()
             .context(HttpRequestSnafu)?;
         Ok(self)

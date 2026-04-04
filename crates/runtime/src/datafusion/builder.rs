@@ -34,7 +34,7 @@ use datafusion::{
     execution::{
         DiskManager, SessionStateBuilder,
         disk_manager::DiskManagerMode,
-        memory_pool::{FairSpillPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool},
+        memory_pool::{GreedyMemoryPool, TrackConsumersPool},
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
     optimizer::{
@@ -65,7 +65,10 @@ use datafusion_optimizer_rules::{
     logical_plan::{
         CacheInvalidationExtensionPlanner, cache_invalidation::CacheInvalidationOptimizerRule,
     },
-    physical_plan::EmptyHashJoinExecPhysicalOptimization,
+    physical_plan::{
+        EmptyHashJoinExecPhysicalOptimization,
+        flightsql::aggregate_pushdown::FlightSQLPartialAggregatePushdown,
+    },
 };
 use runtime_datafusion::{
     extension::{ExtensionPlanQueryPlanner, bytes_processed::BytesProcessedPhysicalOptimizer},
@@ -340,6 +343,13 @@ impl DataFusionBuilder {
                 Arc::new(Box::new(track_bytes_processed)),
             )));
 
+        if matches!(
+            self.cluster_config.as_ref().and_then(|cfg| cfg.role()),
+            Some(ClusterRole::Scheduler)
+        ) {
+            state = state.with_physical_optimizer_rule(FlightSQLPartialAggregatePushdown::new());
+        }
+
         let mut state = state.build();
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
@@ -571,53 +581,31 @@ pub(crate) fn runtime_env(
         DiskManager::builder()
     };
 
-    // If no memory limit is specified, default to 70% of total memory (container-aware)
-    let effective_memory_limit = memory_limit.or_else(|| {
+    // If no memory limit is specified, default to 90% of total memory (container-aware)
+    let effective_memory_limit = memory_limit.unwrap_or_else(|| {
         let total_memory = crate::resource_monitor::get_total_memory();
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let default_limit = (total_memory as f64 * 0.70) as u64;
+        let default_limit = total_memory.saturating_mul(90) / 100;
 
         tracing::debug!(
-            "No memory limit specified, defaulting to 70% of total memory: {}",
-            {
-                #[expect(clippy::cast_possible_truncation)]
-                util::human_readable_bytes(default_limit as usize)
-            }
+            "No memory limit specified, defaulting to 90% of total memory: {}",
+            util::human_readable_bytes(default_limit as usize)
         );
-        Some(default_limit)
+
+        default_limit
     });
 
-    let memory_pool: Arc<dyn MemoryPool> = if let Some(limit) = effective_memory_limit {
-        let limit = if let Ok(limit) = limit.try_into() {
-            limit
-        } else {
-            tracing::warn!(
-                "Memory limit {limit} is too large for the memory pool.\n Defaulting to a maximum sized pool of {}.",
-                usize::MAX
-            );
-
-            usize::MAX
-        };
-
-        let Some(topn) = NonZeroUsize::new(5) else {
-            unreachable!("Memory pool TopN must be greater than 0");
-        };
-
-        Arc::new(TrackConsumersPool::new(FairSpillPool::new(limit), topn))
-    } else {
-        let Some(topn) = NonZeroUsize::new(5) else {
-            unreachable!("Memory pool TopN must be greater than 0");
-        };
-
-        Arc::new(TrackConsumersPool::new(
-            UnboundedMemoryPool::default(),
-            topn,
-        ))
+    let Some(topn) = NonZeroUsize::new(5) else {
+        unreachable!("Memory pool TopN must be greater than 0");
     };
+
+    // Runtime is 64-bit minimum; usize is at least 64 bits on all supported targets.
+    #[expect(clippy::cast_possible_truncation)]
+    let effective_memory_bytes = effective_memory_limit as usize;
+
+    let memory_pool = Arc::new(TrackConsumersPool::new(
+        GreedyMemoryPool::new(effective_memory_bytes),
+        topn,
+    ));
 
     match RuntimeEnvBuilder::default()
         .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::new(io_runtime)))
