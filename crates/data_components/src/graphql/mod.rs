@@ -415,7 +415,7 @@ mod tests {
     fn test_gateway_errors_detected() {
         // 502 Bad Gateway and 504 Gateway Timeout should be detected as gateway errors
         let gateway_codes = [
-            StatusCode::BAD_GATEWAY,    // 502
+            StatusCode::BAD_GATEWAY,     // 502
             StatusCode::GATEWAY_TIMEOUT, // 504
         ];
 

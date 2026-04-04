@@ -870,8 +870,16 @@ impl GraphQLClient {
         error_checker: Option<ErrorChecker>,
         query_cost: Option<u32>,
     ) -> Result<GraphQLQueryResult> {
-        self.execute_inner(query, schema, limit, cursor, error_checker, query_cost, false)
-            .await
+        self.execute_inner(
+            query,
+            schema,
+            limit,
+            cursor,
+            error_checker,
+            query_cost,
+            false,
+        )
+        .await
     }
 
     #[expect(clippy::too_many_lines)]
