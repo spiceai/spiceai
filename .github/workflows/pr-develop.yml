@@ -79,13 +79,13 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
-      - name: Run cargo fmt
-        run: cargo fmt --all -- --check
+      - name: Set up make
+        uses: ./.github/actions/setup-make
 
-      - name: Run cargo check
+      - name: Run Rust lint
+        run: make lint-rust
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-        run: cargo check --all-targets --features adbc,aws-secrets-manager,keyring-secret-store,models,release,mcp --workspace --exclude libnfs --locked
 
       - name: Validate datafusion-table-providers commit
         run: bash .github/scripts/validate_table_providers_commit.sh
@@ -217,6 +217,9 @@ jobs:
 
       - name: Set up cc
         uses: ./.github/actions/setup-cc
+
+      - name: Install Oracle ODPI-C
+        uses: ./.github/actions/setup-oracle-odpi
 
       - name: Build integration test archive
         env:

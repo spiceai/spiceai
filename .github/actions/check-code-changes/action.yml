@@ -61,7 +61,6 @@ runs:
         filters: |
           integration_tests:
             - 'crates/runtime/tests/**'
-            - 'crates/runtime-table-partition/tests/**'
 
     - name: Detect changed test modules
       id: changed_modules
@@ -89,27 +88,17 @@ runs:
 
         for file in $CHANGED_FILES; do
           [ -z "$file" ] && continue
-          # Only derive module names from runtime/tests (not runtime-table-partition)
-          case "$file" in
-            crates/runtime/tests/*)
-              rel="${file#crates/runtime/tests/}"
-              mod="${rel%%/*}"
-              mod="${mod%.rs}"
-              # Shared infrastructure changes require running all tests
-              case "$mod" in
-                integration|utils|test_data|docker)
-                  RUN_ALL=true
-                  break
-                  ;;
-              esac
-              MODULES="$MODULES $mod"
-              ;;
-            *)
-              # Changes outside runtime/tests (e.g. runtime-table-partition) trigger all tests
+          rel="${file#crates/runtime/tests/}"
+          mod="${rel%%/*}"
+          mod="${mod%.rs}"
+          # Shared infrastructure changes require running all tests
+          case "$mod" in
+            integration|utils|test_data|docker)
               RUN_ALL=true
               break
               ;;
           esac
+          MODULES="$MODULES $mod"
         done
 
         if [ "$RUN_ALL" = "true" ]; then
