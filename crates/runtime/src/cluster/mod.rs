@@ -1352,7 +1352,9 @@ pub async fn initialize_cluster_executor(
                     flight_client::can_connect(addr.clone(), Some(creds), tls_config)
                         .await
                         .map_err(|e| {
-                            tracing::warn!("Failed to connect to local Flight service at {addr:?}: {e}");
+                            tracing::warn!(
+                                "Failed to connect to local Flight service at {addr:?}: {e}"
+                            );
                             util::RetryError::Transient {
                                 err: e,
                                 retry_after: None,
