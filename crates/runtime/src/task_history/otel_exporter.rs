@@ -57,9 +57,9 @@ pub struct TaskHistoryExporter {
     min_sql_duration_ms: Option<f64>,
     captured_plan: TaskHistoryCapturedPlan,
     min_plan_duration_ms: Option<f64>,
-    /// The hostname (advertise address) for this node.
+    /// The node ID (advertise address) for this node.
     /// Only populated in cluster mode.
-    hostname: Option<Arc<str>>,
+    node_id: Option<Arc<str>>,
 }
 
 impl Debug for TaskHistoryExporter {
@@ -75,7 +75,7 @@ impl TaskHistoryExporter {
         min_sql_duration_ms: Option<f64>,
         captured_plan: TaskHistoryCapturedPlan,
         min_plan_duration_ms: Option<f64>,
-        hostname: Option<Arc<str>>,
+        node_id: Option<Arc<str>>,
     ) -> Self {
         Self {
             df,
@@ -83,7 +83,7 @@ impl TaskHistoryExporter {
             min_sql_duration_ms,
             captured_plan,
             min_plan_duration_ms,
-            hostname,
+            node_id,
         }
     }
 
@@ -298,7 +298,7 @@ impl TaskHistoryExporter {
             execution_duration_ms,
             error_message,
             labels,
-            hostname: self.hostname.clone(),
+            node_id: self.node_id.clone(),
         }
     }
 }

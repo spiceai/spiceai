@@ -80,7 +80,7 @@ impl Runtime {
 
         tracing::info!("{}", config_details);
 
-        // Determine if we're in cluster mode (hostname column needed)
+        // Determine if we're in cluster mode (node_id column needed)
         let effective_role = self.df.cluster_config.effective_role();
         let is_cluster_mode = effective_role.is_some();
 
@@ -105,8 +105,8 @@ impl Runtime {
             }) => {
                 let schema = local_table.schema();
 
-                // Compute hostname: {advertise_host}:{bind_port}
-                let hostname =
+                // Compute node_id: {advertise_host}:{bind_port}
+                let node_id =
                     if let Some(advertise_host) = self.df.cluster_config.node_advertise_address() {
                         let bind_port = self.df.cluster_config.node_bind_address().port();
                         format!("{advertise_host}:{bind_port}")
@@ -115,9 +115,7 @@ impl Runtime {
                         self.df.cluster_config.node_bind_address().to_string()
                     };
 
-                tracing::debug!(
-                    "Registering federated task_history table with hostname={hostname}"
-                );
+                tracing::debug!("Registering federated task_history table with node_id={node_id}");
 
                 // Register the local table under a separate name for RPC handlers to use
                 // This avoids infinite recursion when peers query each other
@@ -139,7 +137,7 @@ impl Runtime {
                     Arc::clone(peers),
                     Arc::clone(&executor_registry.flight_sql_clients),
                     self.df.cluster_config.client_tls_config().cloned(),
-                    hostname,
+                    node_id,
                 );
                 Arc::new(federated)
             }

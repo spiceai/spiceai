@@ -63,7 +63,7 @@ use crate::task_history::DEFAULT_TASK_HISTORY_TABLE;
 /// If any peer or executor fails, the entire query fails with an error containing
 /// the identifiers of the failed nodes.
 pub struct FederatedTaskHistoryTable {
-    /// Schema for the `task_history` table (with `hostname` column)
+    /// Schema for the `task_history` table (with `node_id` column)
     schema: SchemaRef,
     /// Local `task_history` table provider (direct reference to avoid recursion)
     local_table: Arc<dyn TableProvider>,
@@ -74,14 +74,14 @@ pub struct FederatedTaskHistoryTable {
     /// TLS configuration for connecting to peer schedulers
     client_tls_config: Option<ClientTlsConfig>,
     /// This scheduler's advertise address (to exclude from peer queries)
-    local_hostname: String,
+    local_node_id: String,
 }
 
 impl std::fmt::Debug for FederatedTaskHistoryTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FederatedTaskHistoryTable")
             .field("schema", &self.schema)
-            .field("local_hostname", &self.local_hostname)
+            .field("local_node_id", &self.local_node_id)
             .finish_non_exhaustive()
     }
 }
@@ -95,7 +95,7 @@ impl FederatedTaskHistoryTable {
         scheduler_peers: Arc<RwLock<SchedulerPeers>>,
         executor_flight_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
         client_tls_config: Option<ClientTlsConfig>,
-        local_hostname: String,
+        local_node_id: String,
     ) -> Self {
         Self {
             schema,
@@ -103,7 +103,7 @@ impl FederatedTaskHistoryTable {
             scheduler_peers,
             executor_flight_clients,
             client_tls_config,
-            local_hostname,
+            local_node_id,
         }
     }
 
@@ -232,7 +232,7 @@ impl TableProvider for FederatedTaskHistoryTable {
         let peers = self.scheduler_peers.read().await;
         let peer_addresses: Vec<String> = peers
             .keys()
-            .filter(|addr| *addr != &self.local_hostname)
+            .filter(|addr| *addr != &self.local_node_id)
             .cloned()
             .collect();
         drop(peers);
