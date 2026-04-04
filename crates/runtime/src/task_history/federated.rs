@@ -57,7 +57,7 @@ use crate::task_history::DEFAULT_TASK_HISTORY_TABLE;
 /// When `scan()` is called, this provider:
 /// 1. Queries the local `task_history` table directly (via stored reference)
 /// 2. Fans out to all peer schedulers via the `GetTaskHistory` RPC
-/// 3. Fans out to all connected executors via FlightSQL
+/// 3. Fans out to all connected executors via `FlightSQL`
 /// 4. Combines all results into a single result set sorted by `start_time`
 ///
 /// If any peer or executor fails, the entire query fails with an error containing
@@ -69,7 +69,7 @@ pub struct FederatedTaskHistoryTable {
     local_table: Arc<dyn TableProvider>,
     /// Peer schedulers for fan-out queries
     scheduler_peers: Arc<RwLock<SchedulerPeers>>,
-    /// FlightSQL clients for connected executors
+    /// `FlightSQL` clients for connected executors
     executor_flight_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
     /// TLS configuration for connecting to peer schedulers
     client_tls_config: Option<ClientTlsConfig>,
@@ -166,7 +166,7 @@ impl FederatedTaskHistoryTable {
         Ok(batches)
     }
 
-    /// Executes a query against a single executor via FlightSQL.
+    /// Executes a query against a single executor via `FlightSQL`.
     async fn query_executor(
         executor_id: String,
         client: FlightSqlClient,
@@ -177,12 +177,7 @@ impl FederatedTaskHistoryTable {
             data_components::flightsql::query_to_stream(client, sql, cookie_store)
                 .try_collect()
                 .await
-                .map_err(|e| {
-                    (
-                        executor_id,
-                        format!("FlightSQL query failed: {e}"),
-                    )
-                })?;
+                .map_err(|e| (executor_id, format!("FlightSQL query failed: {e}")))?;
         Ok(batches)
     }
 
@@ -326,7 +321,7 @@ impl TableProvider for FederatedTaskHistoryTable {
         }
 
         // Sort combined results by start_time
-        let all_batches = sort_batches_by_start_time(all_batches, &self.schema)?;
+        let all_batches = sort_batches_by_start_time(&all_batches, &self.schema)?;
 
         // Build the execution plan from the collected batches. Keep the source
         // schema unprojected and let MemorySourceConfig apply projection once.
@@ -361,7 +356,7 @@ impl TableProvider for FederatedTaskHistoryTable {
 /// Concatenates all batches, sorts by `start_time`, and returns a single sorted batch.
 /// Returns an empty vec if the input is empty or unsorted batches if `start_time` is missing.
 fn sort_batches_by_start_time(
-    batches: Vec<RecordBatch>,
+    batches: &[RecordBatch],
     schema: &SchemaRef,
 ) -> DataFusionResult<Vec<RecordBatch>> {
     let non_empty: Vec<&RecordBatch> = batches.iter().filter(|b| b.num_rows() > 0).collect();
