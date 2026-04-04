@@ -312,9 +312,9 @@ mod tests {
         }
     }
 
-    /// Edge case: storage_location that is just a scheme with no path content.
+    /// Edge case: storage_location pointing to a bucket root with no key/path.
     #[test]
-    fn test_table_reference_creator_bare_scheme() {
+    fn test_table_reference_creator_bucket_root() {
         let table = make_uc_table(Some("s3://bucket"));
         let reference = table_reference_creator(&table).expect("should return Some");
         match reference {
