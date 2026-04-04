@@ -786,7 +786,9 @@ mod tests {
             "inner provider scan() was never called"
         );
         assert!(
-            !filters[0].is_empty(),
+            filters
+                .iter()
+                .any(|scan_filters| scan_filters.contains(&filter)),
             "filters were NOT pushed down to the search index table provider; \
              they are stuck above the pre_limit Limit node (issue #10149)"
         );
@@ -839,7 +841,9 @@ mod tests {
             "inner provider scan() was never called"
         );
         assert!(
-            !filters[0].is_empty(),
+            filters.iter().any(|scan_filters| scan_filters
+                .iter()
+                .any(|pushed_filter| pushed_filter == &filter)),
             "filters were NOT pushed down to the search index table provider in \
              the join path; they are stuck above the pre_limit (issue #10149)"
         );
@@ -879,7 +883,7 @@ mod tests {
             "inner provider scan() was never called"
         );
         assert!(
-            !filters[0].is_empty(),
+            filters.iter().any(|scan_filters| !scan_filters.is_empty()),
             "filters should be pushed down even without a pre_limit"
         );
     }
