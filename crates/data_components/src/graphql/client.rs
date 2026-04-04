@@ -668,10 +668,6 @@ pub struct GraphQLClient {
     rate_limiter: Option<Arc<dyn RateLimiter>>,
     rate_controller: Option<Arc<RateController>>,
     semaphore: Option<Arc<Semaphore>>,
-    /// Set after a gateway error (502/504) to force `Connection: close` on the
-    /// next request, ensuring a fresh TCP connection instead of reusing a pooled
-    /// connection that may route to the same bad upstream.
-    close_connection_on_next_request: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -857,7 +853,6 @@ impl GraphQLClient {
             rate_limiter,
             rate_controller,
             semaphore,
-            close_connection_on_next_request: AtomicBool::new(false),
         })
     }
 
@@ -866,7 +861,6 @@ impl GraphQLClient {
         self.schema.as_ref().map(Arc::clone)
     }
 
-    #[expect(clippy::too_many_lines)]
     pub(crate) async fn execute(
         &self,
         query: &GraphQLQuery,
@@ -875,6 +869,22 @@ impl GraphQLClient {
         cursor: Option<String>,
         error_checker: Option<ErrorChecker>,
         query_cost: Option<u32>,
+    ) -> Result<GraphQLQueryResult> {
+        self.execute_inner(query, schema, limit, cursor, error_checker, query_cost, false)
+            .await
+    }
+
+    #[expect(clippy::too_many_lines)]
+    #[expect(clippy::too_many_arguments)]
+    async fn execute_inner(
+        &self,
+        query: &GraphQLQuery,
+        schema: Option<SchemaRef>,
+        limit: Option<usize>,
+        cursor: Option<String>,
+        error_checker: Option<ErrorChecker>,
+        query_cost: Option<u32>,
+        close_connection: bool,
     ) -> Result<GraphQLQueryResult> {
         // Validate cursor if present
         if let Some(ref cursor_val) = cursor {
@@ -930,7 +940,7 @@ impl GraphQLClient {
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 
         let mut request = self.client.post(self.endpoint.clone()).body(body);
-        if self.close_connection_on_next_request.swap(false, Ordering::Relaxed) {
+        if close_connection {
             request = request.header(reqwest::header::CONNECTION, "close");
         }
         request = request_with_auth(request, self.auth.as_ref());
@@ -1274,21 +1284,31 @@ impl GraphQLClient {
             .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
             .build();
 
+        let close_connection = Arc::new(AtomicBool::new(false));
+
         retry(backoff, || {
             let schema = schema.clone();
             let cursor = cursor.clone();
             let error_checker = error_checker.clone();
+            let should_close = close_connection.swap(false, Ordering::Relaxed);
+            let close_conn = Arc::clone(&close_connection);
 
             async move {
                 client
-                    .execute(query, schema, limit, cursor, error_checker, query_cost)
+                    .execute_inner(
+                        query,
+                        schema,
+                        limit,
+                        cursor,
+                        error_checker,
+                        query_cost,
+                        should_close,
+                    )
                     .await
                     .map_err(|e| {
                         if is_retriable_error(&e) {
                             if is_gateway_error(&e) {
-                                client
-                                    .close_connection_on_next_request
-                                    .store(true, Ordering::Relaxed);
+                                close_conn.store(true, Ordering::Relaxed);
                             }
                             tracing::warn!("Page fetch failed, will retry: {e}");
                             RetryError::transient(e)
