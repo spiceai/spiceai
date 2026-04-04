@@ -306,7 +306,7 @@ jobs:
   test-hf:
     name: Test Hugging Face Models
     needs: build
-    if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' }}
+    if: ${{ github.event.inputs.run_all_tests == 'true' || github.event_name == 'schedule' || github.event_name == 'push' }}
     runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
