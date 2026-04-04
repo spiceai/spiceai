@@ -129,6 +129,8 @@ impl SpiceCloudPlatformCatalog {
 
         let client = reqwest::Client::builder()
             .use_rustls_tls()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .context(UnableToBuildCatalogClientSnafu)?;
 

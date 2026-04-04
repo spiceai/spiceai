@@ -271,18 +271,28 @@ async fn zipkin_task_history_otel_exporter(
     Ok(Some(
         ZipkinExporter::builder()
             .with_collector_endpoint(collector_endpoint)
-            .with_http_client(Client::new())
+            .with_http_client(
+                Client::builder()
+                    .connect_timeout(Duration::from_secs(10))
+                    .timeout(Duration::from_secs(30))
+                    .build()?,
+            )
             .build()?,
     ))
 }
 
 async fn is_zipkin_endpoint_reachable(endpoint: &str) -> bool {
-    let client = Client::new();
-    let timeout = Duration::from_secs(5);
+    let Ok(client) = Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(5))
+        .build()
+    else {
+        return false;
+    };
 
     let url = format!("{endpoint}?serviceName=test");
 
-    match client.get(&url).timeout(timeout).send().await {
+    match client.get(&url).send().await {
         Ok(response) => response.status().is_success(),
         Err(_) => false,
     }

@@ -381,6 +381,7 @@ async fn post_setup_sink_action(
         }
 
         let sql_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .build()?;
 
@@ -677,6 +678,7 @@ async fn provision_spice_cloud_app(
     commands::create_deployment(&cloud, app_id, args.channel.as_deref()).await?;
 
     let poll_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(600))
         .build()?;
     commands::wait_for_deployment_ready(
@@ -1197,6 +1199,7 @@ async fn wait_for_local_http_ready(
 ) -> anyhow::Result<()> {
     let ready_url = format!("{http_url}/health");
     let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(2))
         .build()?;
 
@@ -1226,6 +1229,7 @@ async fn wait_for_local_sql_ready(
     api_key: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(2))
         .build()?;
 
@@ -1306,6 +1310,7 @@ async fn wait_for_local_executor_count(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(2))
         .build()?;
     let metrics_url = format!("{scheduler_http_url}/metrics");
