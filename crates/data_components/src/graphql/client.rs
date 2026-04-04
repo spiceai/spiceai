@@ -1003,9 +1003,20 @@ impl GraphQLClient {
                     e,
                     preview
                 );
+
+                // For server errors returning HTML (e.g., upstream gateway/proxy errors),
+                // provide a clear message instead of exposing the JSON parse error.
+                let detail = if status.is_server_error() {
+                    "The server returned a non-JSON response (likely an upstream proxy error). This is a temporary issue and will be retried automatically. If the problem persists, contact support or check the API status page.".to_string()
+                } else {
+                    format!(
+                        "The response could not be parsed as JSON. Technical details: {e}"
+                    )
+                };
+
                 Error::JsonDecodeError {
                     status,
-                    error: e.to_string(),
+                    detail,
                     response_preview: preview,
                 }
             })?;

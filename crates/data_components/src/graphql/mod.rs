@@ -30,7 +30,7 @@ pub mod provider;
 pub mod rate_limit;
 
 /// Maximum number of retry attempts for a single page fetch during pagination.
-pub const PAGE_RETRY_MAX_ATTEMPTS: u32 = 3;
+pub const PAGE_RETRY_MAX_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -72,11 +72,11 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "The API returned an invalid response (HTTP {status}). This may indicate a temporary server issue. The data refresh will be retried automatically. If the problem persists, contact support. Technical details: {error}"
+        "The upstream server returned an error (HTTP {status}). {detail}"
     ))]
     JsonDecodeError {
         status: reqwest::StatusCode,
-        error: String,
+        detail: String,
         response_preview: String,
     },
 
@@ -228,7 +228,7 @@ mod tests {
         for status in server_error_codes {
             let error = Error::JsonDecodeError {
                 status,
-                error: "expected value at line 1 column 1".to_string(),
+                detail: "expected value at line 1 column 1".to_string(),
                 response_preview: "<html>Server Error</html>".to_string(),
             };
             assert!(
@@ -291,7 +291,7 @@ mod tests {
         for status in client_error_codes {
             let error = Error::JsonDecodeError {
                 status,
-                error: "expected value at line 1 column 1".to_string(),
+                detail: "expected value at line 1 column 1".to_string(),
                 response_preview: "invalid response".to_string(),
             };
             assert!(
@@ -349,6 +349,8 @@ mod tests {
         //   Call 1: num_retries=1, index 1 -> 1000ms
         //   Call 2: num_retries=2, index 2 -> 2000ms
         //   Call 3: num_retries=3, index 3 -> 3000ms
+        //   Call 4: num_retries=4, index 4 -> 5000ms
+        //   Call 5: num_retries=5, index 5 -> 8000ms
         let mut backoff = FibonacciBackoffBuilder::new()
             .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
             .randomization_factor(0.0) // No randomization for predictable testing
@@ -366,7 +368,15 @@ mod tests {
         let delay_3 = backoff.next_backoff().expect("should have delay");
         assert_eq!(delay_3, Duration::from_secs(3));
 
-        // After max_retries (3), should return None
+        // Call 4: num_retries=4, index 4 -> 5000ms (5s)
+        let delay_4 = backoff.next_backoff().expect("should have delay");
+        assert_eq!(delay_4, Duration::from_secs(5));
+
+        // Call 5: num_retries=5, index 5 -> 8000ms (8s)
+        let delay_5 = backoff.next_backoff().expect("should have delay");
+        assert_eq!(delay_5, Duration::from_secs(8));
+
+        // After max_retries (5), should return None
         assert!(
             backoff.next_backoff().is_none(),
             "Should return None after max retries"
@@ -379,18 +389,20 @@ mod tests {
 
         // Verify that PAGE_RETRY_MAX_ATTEMPTS is used correctly with FibonacciBackoff.
         // PAGE_RETRY_MAX_ATTEMPTS represents the maximum number of retry attempts,
-        // excluding the initial attempt. With PAGE_RETRY_MAX_ATTEMPTS = 3:
+        // excluding the initial attempt. With PAGE_RETRY_MAX_ATTEMPTS = 5:
         // - Attempt 1: initial try
         // - Attempt 2: first retry (after first failure) - backoff call 1
         // - Attempt 3: second retry (after second failure) - backoff call 2
         // - Attempt 4: third retry (after third failure) - backoff call 3
-        // - After attempt 4 fails, backoff returns None, give up
+        // - Attempt 5: fourth retry (after fourth failure) - backoff call 4
+        // - Attempt 6: fifth retry (after fifth failure) - backoff call 5
+        // - After attempt 6 fails, backoff returns None, give up
 
         let mut backoff = FibonacciBackoffBuilder::new()
             .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
             .build();
 
-        // Should allow 3 retries (backoff returns Some 3 times)
+        // Should allow 5 retries (backoff returns Some 5 times)
         assert!(
             backoff.next_backoff().is_some(),
             "First retry should be allowed"
@@ -403,11 +415,19 @@ mod tests {
             backoff.next_backoff().is_some(),
             "Third retry should be allowed"
         );
+        assert!(
+            backoff.next_backoff().is_some(),
+            "Fourth retry should be allowed"
+        );
+        assert!(
+            backoff.next_backoff().is_some(),
+            "Fifth retry should be allowed"
+        );
 
-        // Fourth call should return None (max retries exhausted)
+        // Sixth call should return None (max retries exhausted)
         assert!(
             backoff.next_backoff().is_none(),
-            "Fourth retry should NOT be allowed (max retries exhausted)"
+            "Sixth retry should NOT be allowed (max retries exhausted)"
         );
     }
 
@@ -431,7 +451,7 @@ mod tests {
 
             let json_decode_err = Error::JsonDecodeError {
                 status,
-                error: "unexpected EOF".to_string(),
+                detail: "unexpected EOF".to_string(),
                 response_preview: "<html>Bad Gateway</html>".to_string(),
             };
             assert!(
