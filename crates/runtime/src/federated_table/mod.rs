@@ -144,9 +144,9 @@ impl FederatedTable {
         shutdown_token: CancellationToken,
         allow_schema_mismatch: bool,
     ) -> Self {
-        /// When `allow_schema_mismatch` is `true`, schema differences are ignored and the
-        /// table provider is returned immediately. The caller is responsible for handling
-        /// schema evolution (e.g. `file_update` mode detects changes and recreates the acceleration).
+        // When `allow_schema_mismatch` is `true`, schema differences are ignored and the
+        // table provider is returned immediately. The caller is responsible for handling
+        // schema evolution (e.g. `file_update` mode detects changes and recreates the acceleration).
         if allow_schema_mismatch {
             return Self::new_unchecked(table_provider);
         }
@@ -282,11 +282,9 @@ impl FederatedTable {
         let dataset_name = dataset.name.clone();
         let dataset_name_str = dataset_name.to_string();
         let accelerated_schema = Arc::clone(&schema);
-        println!("###### - 1");
 
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
-            println!("###### - 2");
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
 
             let tracer = OnceTracer::new();
