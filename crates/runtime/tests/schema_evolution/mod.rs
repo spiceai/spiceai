@@ -396,7 +396,7 @@ async fn init_csv_runtime(
 ) -> Result<Runtime, anyhow::Error> {
     register_test_connectors().await;
 
-    let mut ds = Dataset::new(&format!("file:{csv_path}"), "sample");
+    let mut ds = Dataset::new(format!("file:{csv_path}"), "sample");
     ds.acceleration = Some(Acceleration {
         enabled: true,
         engine: Some(engine.to_string()),
@@ -440,27 +440,27 @@ async fn run_file_update_csv_phases(
             // Phase 1: Initial load (4 columns)
             std::fs::write(csv_path, CSV_INITIAL).expect("write csv");
             let rt = Arc::new(init_csv_runtime(csv_path, engine, accel_params.clone()).await?);
-            csv_run_and_verify_query(&rt, sql, &format!("{test_prefix}__initial"));
+            csv_run_and_verify_query(&rt, sql, &format!("{test_prefix}__initial")).await;
             rt.shutdown().await;
             drop(rt);
 
             // Phase 2: Add column (5 columns) — should trigger recreation
             std::fs::write(csv_path, CSV_ADD_COLUMN).expect("write csv");
             let rt = Arc::new(init_csv_runtime(csv_path, engine, accel_params.clone()).await?);
-            csv_run_and_verify_query(&rt, sql, &format!("{test_prefix}__add_column"));
+            csv_run_and_verify_query(&rt, sql, &format!("{test_prefix}__add_column")).await;
             rt.shutdown().await;
             drop(rt);
 
             // Phase 3: Drop column (3 columns) — should trigger recreation
             std::fs::write(csv_path, CSV_DROP_COLUMN).expect("write csv");
             let rt = Arc::new(init_csv_runtime(csv_path, engine, accel_params.clone()).await?);
-            csv_run_and_verify_query(&rt, sql, &format!("{test_prefix}__drop_column"));
+            csv_run_and_verify_query(&rt, sql, &format!("{test_prefix}__drop_column")).await;
             rt.shutdown().await;
             drop(rt);
 
             // Phase 4: No-change restart — should preserve existing data
             let rt = Arc::new(init_csv_runtime(csv_path, engine, accel_params.clone()).await?);
-            csv_run_and_verify_query(&rt, sql, &format!("{test_prefix}__no_change_restart"));
+            csv_run_and_verify_query(&rt, sql, &format!("{test_prefix}__no_change_restart")).await;
             rt.shutdown().await;
             drop(rt);
 
