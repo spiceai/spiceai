@@ -158,8 +158,7 @@ impl CayenneCatalogProvider {
         // Initialize local file storage
         let data_dir = config
             .data_dir
-            .as_ref()
-            .cloned()
+            .clone()
             .unwrap_or_else(|| format!("{spice_data_base_path}/cayenne_{catalog_name}/data"));
 
         tokio::fs::create_dir_all(&data_dir)

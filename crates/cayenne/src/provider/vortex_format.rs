@@ -153,8 +153,8 @@ fn attach_access_plan_to_file(
     let file_path = file.object_meta.location.to_string();
 
     // Check if this file has deletions
-    if let Some(bitmap) = deletion_map.get(&file_path) {
-        if !bitmap.is_empty() {
+    if let Some(bitmap) = deletion_map.get(&file_path)
+        && !bitmap.is_empty() {
             // ExcludeRoaring is preferred over ExcludeByIndex: less memory (~2 bits vs 8 bytes/row)
             // and enables native bitmap operations in Vortex (intersection, is_disjoint) which is faster
             let exclude: RoaringTreemap = bitmap.iter().map(u64::from).collect();
@@ -173,7 +173,6 @@ fn attach_access_plan_to_file(
 
             return (file, true);
         }
-    }
 
     (file, false)
 }
