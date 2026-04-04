@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 
+use secrecy::SecretString;
 use subtle::ConstantTimeEq;
 
 use super::{
@@ -601,6 +602,12 @@ impl ApiKey {
             ApiKey::ReadOnly {
                 key: input.to_string(),
             }
+        }
+    }
+
+    pub fn as_secret(&self) -> SecretString {
+        match self {
+            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => key.clone().into(),
         }
     }
 
