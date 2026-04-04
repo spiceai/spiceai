@@ -33,8 +33,8 @@ use spicepod::component::model::{Model, ModelSource};
 /// Builds a [`RateController`] for a model based on user-configured params or provider defaults.
 ///
 /// User params take precedence:
-/// - `ai_max_concurrency`: max concurrent AI UDF requests for this model
-/// - `ai_requests_per_minute`: max RPM for this model
+/// - `max_concurrency`: max concurrent AI UDF requests for this model
+/// - `requests_per_minute_limit`: max RPM for this model
 ///
 /// If neither is set, provider-specific defaults are used based on the model source,
 /// model ID, and any provider-specific tier params (e.g. `usage_tier` for OpenAI).
@@ -43,8 +43,8 @@ pub fn build_model_rate_controller(
     model: &Model,
     params: &HashMap<String, SecretString>,
 ) -> Arc<RateController> {
-    let max_concurrency = parse_param_u32(params, "ai_max_concurrency");
-    let rpm = parse_param_u32(params, "ai_requests_per_minute");
+    let max_concurrency = parse_param_u32(params, "max_concurrency");
+    let rpm = parse_param_u32(params, "requests_per_minute_limit");
 
     if max_concurrency.is_some() || rpm.is_some() {
         return build_from_params(max_concurrency, rpm);
@@ -59,7 +59,7 @@ pub fn build_model_rate_controller(
 /// Build a rate controller from explicit user parameters.
 fn build_from_params(
     max_concurrency: Option<u32>,
-    requests_per_minute: Option<u32>,
+    requests_per_minute_limit: Option<u32>,
 ) -> Arc<RateController> {
     let mut builder = RateController::builder();
 
@@ -67,7 +67,7 @@ fn build_from_params(
         builder = builder.with_max_concurrent_requests(concurrency as usize);
     }
 
-    if let Some(rpm) = requests_per_minute
+    if let Some(rpm) = requests_per_minute_limit
         && let Some(nz_rpm) = NonZeroU32::new(rpm)
     {
         builder = builder.add_quota(Quota::per_minute(nz_rpm));
@@ -92,7 +92,7 @@ fn provider_default_rate_controller(
         Some(ModelSource::Databricks) => build_defaults(10, 500),
         Some(ModelSource::SpiceAI) => build_defaults(10, 500),
         // Local models: conservative concurrency (typically 1 GPU), no RPM limit.
-        // Users with multi-GPU setups should override via ai_max_concurrency.
+        // Users with multi-GPU setups should override via max_concurrency.
         Some(ModelSource::HuggingFace | ModelSource::File) => {
             RateController::builder()
                 .with_max_concurrent_requests(1)
@@ -162,9 +162,8 @@ fn anthropic_default(
     _model_id: &str,
     params: &HashMap<String, SecretString>,
 ) -> Arc<RateController> {
-    // Anthropic doesn't have a formal "usage_tier" param yet in our config,
-    // but we can check for one if specified.
-    let tier = parse_param_u32(params, "anthropic_tier");
+    let tier = parse_param_u32(params, "anthropic_usage_tier")
+        .or_else(|| parse_param_u32(params, "usage_tier"));
 
     let (max_concurrent, rpm) = match tier {
         Some(1) => (10, 50),
@@ -204,7 +203,8 @@ fn google_default(model_id: &str) -> Arc<RateController> {
 // ---------------------------------------------------------------------------
 
 fn xai_default(_model_id: &str, params: &HashMap<String, SecretString>) -> Arc<RateController> {
-    let tier = parse_param_u32(params, "xai_tier");
+    let tier = parse_param_u32(params, "xai_usage_tier")
+        .or_else(|| parse_param_u32(params, "usage_tier"));
 
     let (max_concurrent, rpm) = match tier {
         Some(0) => (2, 5),
@@ -283,8 +283,8 @@ mod tests {
         let model = Model::new("openai:gpt-4o", "gpt-4o");
         let params = make_params(&[
             ("usage_tier", "free"),
-            ("ai_max_concurrency", "50"),
-            ("ai_requests_per_minute", "2000"),
+            ("max_concurrency", "50"),
+            ("requests_per_minute_limit", "2000"),
         ]);
         let _rc = build_model_rate_controller(&model, &params);
         // Explicit params take precedence over Free tier defaults
@@ -293,21 +293,21 @@ mod tests {
     #[test]
     fn test_explicit_concurrency_only() {
         let model = Model::new("openai:gpt-4o", "gpt-4o");
-        let params = make_params(&[("ai_max_concurrency", "10")]);
+        let params = make_params(&[("max_concurrency", "10")]);
         let _rc = build_model_rate_controller(&model, &params);
     }
 
     #[test]
     fn test_explicit_rpm_only() {
         let model = Model::new("openai:gpt-4o", "gpt-4o");
-        let params = make_params(&[("ai_requests_per_minute", "500")]);
+        let params = make_params(&[("requests_per_minute_limit", "500")]);
         let _rc = build_model_rate_controller(&model, &params);
     }
 
     #[test]
     fn test_invalid_param_ignored() {
         let model = Model::new("openai:gpt-4o", "gpt-4o");
-        let params = make_params(&[("ai_max_concurrency", "not_a_number")]);
+        let params = make_params(&[("max_concurrency", "not_a_number")]);
         let _rc = build_model_rate_controller(&model, &params);
         // Invalid value is ignored, falls back to provider defaults
     }
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn test_anthropic_tier4() {
         let model = Model::new("anthropic:claude-opus-4-6", "claude-opus");
-        let params = make_params(&[("anthropic_tier", "4")]);
+        let params = make_params(&[("anthropic_usage_tier", "4")]);
         let _rc = build_model_rate_controller(&model, &params);
         // Tier 4: 200 concurrent, 4000 RPM
     }
@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn test_xai_tier4() {
         let model = Model::new("xai:grok-4.20", "grok");
-        let params = make_params(&[("xai_tier", "4")]);
+        let params = make_params(&[("xai_usage_tier", "4")]);
         let _rc = build_model_rate_controller(&model, &params);
         // Tier 4: 100 concurrent, 1000 RPM
     }
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn test_local_model_overridable() {
         let model = Model::new("file:data/model", "local-model");
-        let params = make_params(&[("ai_max_concurrency", "4")]);
+        let params = make_params(&[("max_concurrency", "4")]);
         let _rc = build_model_rate_controller(&model, &params);
         // User can override for multi-GPU setups
     }

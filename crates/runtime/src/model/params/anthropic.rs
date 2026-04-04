@@ -35,6 +35,6 @@ pub(crate) const ANTHROPIC_PARAMETERS: [ParameterSpec; ANTHROPIC_PARAM_LEN] = [
     ParameterSpec::runtime("endpoint").description("The Anthropic API base endpoint."),
     ParameterSpec::component("api_key").description("The Anthropic API key."),
     ParameterSpec::component("auth_token").description("The Anthropic Auth Token."),
-    ParameterSpec::runtime("anthropic_tier")
-        .description("Anthropic usage tier (1-4). Used for AI UDF rate limit defaults."),
+    ParameterSpec::component("usage_tier")
+        .description("Anthropic usage tier (1-4). Used for rate limit defaults."),
 ];

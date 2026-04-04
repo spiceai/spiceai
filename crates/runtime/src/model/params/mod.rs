@@ -61,11 +61,11 @@ pub const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
     ParameterSpec::runtime("system_prompt")
         .description("An additional system prompt used for all chat completions to this model."),
     ParameterSpec::runtime("parameterized_prompt"),
-    // Rate limiting parameters for AI UDF concurrency control
-    ParameterSpec::runtime("ai_max_concurrency")
-        .description("Maximum number of concurrent AI UDF requests for this model. Overrides provider defaults."),
-    ParameterSpec::runtime("ai_requests_per_minute")
-        .description("Maximum requests per minute for this model in AI UDF queries. Overrides provider defaults."),
+    // Rate limiting parameters for concurrent inference
+    ParameterSpec::runtime("max_concurrency")
+        .description("Maximum number of concurrent requests for this model. Overrides provider defaults."),
+    ParameterSpec::runtime("requests_per_minute_limit")
+        .description("Maximum requests per minute for this model. Overrides provider defaults."),
     // OpenAI compatible default override parameters for all models
     ParameterSpec::runtime("frequency_penalty"),
     ParameterSpec::runtime("logit_bias"),
@@ -118,11 +118,11 @@ pub const COMMON_MODEL_PARAMETERS_WITH_DEPRECATED: [ParameterSpec; PARAM_WITH_DE
     ParameterSpec::runtime("system_prompt")
         .description("An additional system prompt used for all chat completions to this model."),
     ParameterSpec::runtime("parameterized_prompt"),
-    // Rate limiting parameters for AI UDF concurrency control
-    ParameterSpec::runtime("ai_max_concurrency")
-        .description("Maximum number of concurrent AI UDF requests for this model. Overrides provider defaults."),
-    ParameterSpec::runtime("ai_requests_per_minute")
-        .description("Maximum requests per minute for this model in AI UDF queries. Overrides provider defaults."),
+    // Rate limiting parameters for concurrent inference
+    ParameterSpec::runtime("max_concurrency")
+        .description("Maximum number of concurrent requests for this model. Overrides provider defaults."),
+    ParameterSpec::runtime("requests_per_minute_limit")
+        .description("Maximum requests per minute for this model. Overrides provider defaults."),
     // OpenAI compatible default override parameters for all models
     ParameterSpec::component("frequency_penalty"),
     ParameterSpec::component("logit_bias"),

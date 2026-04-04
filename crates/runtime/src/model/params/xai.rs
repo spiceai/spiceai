@@ -30,6 +30,6 @@ const XAI_PARAM_LEN: usize = 2;
 
 pub(crate) const XAI_PARAMETERS: [ParameterSpec; XAI_PARAM_LEN] = [
     ParameterSpec::component("api_key").description("The xAI API key."),
-    ParameterSpec::runtime("xai_tier")
-        .description("xAI usage tier (0-4). Used for AI UDF rate limit defaults."),
+    ParameterSpec::component("usage_tier")
+        .description("xAI usage tier (0-4). Used for rate limit defaults."),
 ];
