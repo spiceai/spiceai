@@ -80,9 +80,9 @@ pub(crate) struct TaskSpan {
     pub(crate) error_message: Option<Arc<str>>,
     pub(crate) labels: HashMap<Arc<str>, Arc<str>>,
 
-    /// The scheduler ID (advertise address) that executed this task.
+    /// The hostname (advertise address) of the node that executed this task.
     /// Only populated in cluster mode.
-    pub(crate) scheduler_id: Option<Arc<str>>,
+    pub(crate) hostname: Option<Arc<str>>,
     // For top-level HTTP tasks, have a label:
     // - "http_status" (200, 400)
 }
@@ -175,9 +175,9 @@ impl TaskSpan {
             ),
         ];
 
-        // Add scheduler_id column only in cluster mode
+        // Add hostname column only in cluster mode
         if is_cluster_mode {
-            fields.push(Field::new("scheduler_id", DataType::Utf8, false));
+            fields.push(Field::new("hostname", DataType::Utf8, false));
         }
 
         Schema::new(fields)
@@ -194,7 +194,7 @@ impl TaskSpan {
             .collect();
 
         // Get the schema from the registered table to ensure we use the correct schema
-        // (with or without scheduler_id depending on cluster mode)
+        // (with or without hostname depending on cluster mode)
         let table_ref = TableReference::partial(SPICE_RUNTIME_SCHEMA, DEFAULT_TASK_HISTORY_TABLE);
         let table_provider = df.get_table(&table_ref).await.context(TableNotFoundSnafu)?;
         let schema = table_provider.schema();
@@ -373,12 +373,12 @@ impl TaskSpan {
                             .boxed()
                             .context(UnableToCreateRowSnafu)?;
                     }
-                    "scheduler_id" => {
+                    "hostname" => {
                         let str_builder = downcast_builder::<StringBuilder>(field_builder)?;
-                        match &span.scheduler_id {
-                            Some(scheduler_id) => str_builder.append_value(scheduler_id),
+                        match &span.hostname {
+                            Some(hostname) => str_builder.append_value(hostname),
                             None => {
-                                // This should not happen in cluster mode - scheduler_id should always be set
+                                // This should not happen in cluster mode - hostname should always be set
                                 // But handle gracefully by using empty string
                                 str_builder.append_value("");
                             }
