@@ -941,7 +941,11 @@ impl GraphQLClient {
 
         let mut request = self.client.post(self.endpoint.clone()).body(body);
         if close_connection {
-            request = request.header(reqwest::header::CONNECTION, "close");
+            // Force HTTP/1.1 because Connection: close is a hop-by-hop header
+            // that is invalid in HTTP/2 and may be stripped or cause errors.
+            request = request
+                .version(reqwest::Version::HTTP_11)
+                .header(reqwest::header::CONNECTION, "close");
         }
         request = request_with_auth(request, self.auth.as_ref());
 

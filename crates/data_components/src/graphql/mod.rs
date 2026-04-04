@@ -410,4 +410,86 @@ mod tests {
             "Fourth retry should NOT be allowed (max retries exhausted)"
         );
     }
+
+    #[test]
+    fn test_gateway_errors_detected() {
+        // 502 Bad Gateway and 504 Gateway Timeout should be detected as gateway errors
+        let gateway_codes = [
+            StatusCode::BAD_GATEWAY,    // 502
+            StatusCode::GATEWAY_TIMEOUT, // 504
+        ];
+
+        for status in gateway_codes {
+            let invalid_status_err = Error::InvalidReqwestStatus {
+                status,
+                message: format!("Gateway error: {status}"),
+            };
+            assert!(
+                is_gateway_error(&invalid_status_err),
+                "InvalidReqwestStatus with {status} should be a gateway error"
+            );
+
+            let json_decode_err = Error::JsonDecodeError {
+                status,
+                error: "unexpected EOF".to_string(),
+                response_preview: "<html>Bad Gateway</html>".to_string(),
+            };
+            assert!(
+                is_gateway_error(&json_decode_err),
+                "JsonDecodeError with {status} should be a gateway error"
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_gateway_server_errors_not_detected() {
+        // Other 5xx errors should NOT be detected as gateway errors
+        let non_gateway_codes = [
+            StatusCode::INTERNAL_SERVER_ERROR,      // 500
+            StatusCode::NOT_IMPLEMENTED,            // 501
+            StatusCode::SERVICE_UNAVAILABLE,        // 503
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED, // 505
+        ];
+
+        for status in non_gateway_codes {
+            let error = Error::InvalidReqwestStatus {
+                status,
+                message: format!("Server error: {status}"),
+            };
+            assert!(
+                !is_gateway_error(&error),
+                "InvalidReqwestStatus with {status} should NOT be a gateway error"
+            );
+        }
+    }
+
+    #[test]
+    fn test_client_and_non_status_errors_not_gateway() {
+        // 4xx errors and non-status errors should NOT be gateway errors
+        let client_error = Error::InvalidReqwestStatus {
+            status: StatusCode::NOT_FOUND,
+            message: "Not Found".to_string(),
+        };
+        assert!(
+            !is_gateway_error(&client_error),
+            "404 should not be a gateway error"
+        );
+
+        let non_status_errors = vec![
+            Error::InvalidCredentialsOrPermissions {
+                message: "bad creds".to_string(),
+            },
+            Error::InternalError {
+                message: "internal".to_string(),
+            },
+            Error::NoJsonPointerFound {},
+        ];
+
+        for error in &non_status_errors {
+            assert!(
+                !is_gateway_error(error),
+                "Non-status error should not be a gateway error: {error:?}"
+            );
+        }
+    }
 }
