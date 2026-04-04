@@ -152,6 +152,22 @@ pub(crate) async fn allocate_initial_partitions(
 
     // Find accelerated datasets with partitioning
     for table_ref in super::partition::accelerated_tables(app).keys() {
+        match partition_manager.get_cached_table_metadata(table_ref) {
+            Some(t) if t.is_replicated() => {
+                tracing::info!(
+                    "{table_ref} is replicated. No partitions need to be assigned. All data is broadcast to each executor."
+                );
+                continue;
+            }
+            Some(_) => {}
+            None => {
+                tracing::info!(
+                    "No cached partition metadata for table {table_ref}. Scheduler likely has not finished discovering partitions for the table. Will not assign in initial allocation, but will get assigned on future assignments"
+                );
+                continue;
+            }
+        };
+
         if total_assigned >= max_partitions_per_executor {
             tracing::debug!(
                 "Executor {executor_id} reached max_partitions_per_executor ({max_partitions_per_executor}) during initial allocation, skipping remaining tables"
@@ -160,15 +176,6 @@ pub(crate) async fn allocate_initial_partitions(
         }
         let remaining = max_partitions_per_executor.saturating_sub(total_assigned);
 
-        if partition_manager
-            .get_cached_table_metadata(table_ref)
-            .is_none()
-        {
-            tracing::info!(
-                "No cached partition metadata for table {table_ref}. Scheduler likely has not finished discovering partitions for the table. Will not assign in initial allocation, but will get assigned on future assignments"
-            );
-            continue;
-        }
         let result = partition_manager
             .allocate_partitions(table_ref, executor_id, remaining)
             .await
