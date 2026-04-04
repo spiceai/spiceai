@@ -455,21 +455,25 @@ impl KafkaConsumer {
         timeout: Duration,
     ) -> Result<Option<(Option<K>, V)>> {
         let temp_group_id = format!("spice-schema-peek-{}", uuid::Uuid::new_v4());
-        let temp_consumer = Self::create(temp_group_id, kafka_config)?;
+        let mut peek_config = kafka_config.clone();
+        peek_config.metrics_store = None; // Avoid skewing real consumer metrics
+        let temp_consumer = Self::create(temp_group_id, &peek_config)?;
 
         // Fetch topic metadata to discover partitions
         let metadata = temp_consumer
             .consumer
             .fetch_metadata(Some(topic), timeout)
             .context(UnableToRestartTopicSnafu {
-                message: "Failed to fetch topic metadata",
+                message: "Failed to fetch topic metadata".to_string(),
             })?;
 
         let topic_metadata = metadata
             .topics()
             .iter()
             .find(|t| t.name() == topic)
-            .context(MetadataTopicNotFoundSnafu { topic })?;
+            .context(MetadataTopicNotFoundSnafu {
+                topic: topic.to_string(),
+            })?;
 
         // Find the partition with the highest watermark (most recent data)
         let mut best_partition: Option<(i32, i64)> = None;
@@ -500,14 +504,14 @@ impl KafkaConsumer {
         let mut tpl = rdkafka::TopicPartitionList::new();
         tpl.add_partition_offset(topic, partition_id, Offset::Offset(high_watermark - 1))
             .context(UnableToRestartTopicSnafu {
-                message: "Failed to configure partition offset",
+                message: "Failed to configure partition offset".to_string(),
             })?;
 
         temp_consumer
             .consumer
             .assign(&tpl)
             .context(UnableToRestartTopicSnafu {
-                message: "Failed to assign partition",
+                message: "Failed to assign partition".to_string(),
             })?;
 
         // Read the message with a timeout

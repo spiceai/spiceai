@@ -584,11 +584,20 @@ async fn refresh_schema_if_evolved(
     )
     .await;
 
-    let Ok(Some((_key, value))) = peek_result else {
-        tracing::debug!(
-            "Could not peek at latest Kafka message for schema check on dataset {dataset_name}. Using cached schema."
-        );
-        return Ok((metadata, Arc::new(cached_schema)));
+    let value = match peek_result {
+        Ok(Some((_key, value))) => value,
+        Ok(None) => {
+            tracing::debug!(
+                "Could not peek at latest Kafka message for schema check on dataset {dataset_name}. Using cached schema."
+            );
+            return Ok((metadata, Arc::new(cached_schema)));
+        }
+        Err(e) => {
+            tracing::debug!(
+                "Failed to peek at latest Kafka message for schema check on dataset {dataset_name}: {e}. Using cached schema."
+            );
+            return Ok((metadata, Arc::new(cached_schema)));
+        }
     };
 
     let Some(fresh_fields) = value.get_schema_fields() else {
