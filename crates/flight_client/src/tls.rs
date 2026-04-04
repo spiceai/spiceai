@@ -195,7 +195,9 @@ pub async fn new_tls_flight_channel(
 /// Otherwise, system certificates will be loaded.
 ///
 /// Use this instead of [`new_tls_flight_channel`] when the CA certificate is already
-/// loaded in memory (e.g. from `ClusterTlsConfig::ca_certificate_pem`).
+/// loaded in memory. For mutual TLS (mTLS), use
+/// [`new_tls_flight_channel_with_tls_config`] instead, which accepts a full
+/// [`ClientTlsConfig`] including a client identity.
 ///
 /// # Errors
 ///
@@ -222,6 +224,56 @@ pub async fn new_tls_flight_channel_with_cert(
             .domain_name(tls_info.domain_name);
         endpoint = endpoint
             .tls_config(tls_config)
+            .context(UnableToConnectToEndpointSnafu)?;
+
+        endpoint
+            .connect()
+            .await
+            .context(UnableToConnectToEndpointSnafu)
+    } else {
+        // Non-TLS endpoint, connect without TLS config
+        Endpoint::from_str(endpoint_str)
+            .context(UnableToConnectToEndpointSnafu)?
+            .connect()
+            .await
+            .context(UnableToConnectToEndpointSnafu)
+    }
+}
+
+/// Creates a new TLS-enabled Flight channel using a pre-built [`ClientTlsConfig`].
+///
+/// Unlike [`new_tls_flight_channel_with_cert`] which only accepts a CA certificate,
+/// this function accepts a full `ClientTlsConfig` that may include a client identity
+/// for mutual TLS (mTLS). Use this when the server requires clients to present a
+/// certificate (e.g. the cluster executor Flight server configured with `client_ca_root`).
+///
+/// If `tls_config` is `None` and the endpoint uses a TLS scheme, system certificates
+/// are used (server-only TLS, no client identity).
+///
+/// # Errors
+///
+/// Will return `Err` if:
+///    - It couldn't connect to the endpoint.
+///    - It couldn't load the system TLS certificate (when `tls_config` is `None`).
+pub async fn new_tls_flight_channel_with_tls_config(
+    endpoint_str: &str,
+    tls_config: Option<ClientTlsConfig>,
+) -> Result<Channel> {
+    if let Some(tls_info) = extract_tls_endpoint_info(endpoint_str) {
+        // Use the normalized URL (https://) for tonic compatibility
+        let mut endpoint =
+            Endpoint::from_str(&tls_info.normalized_url).context(UnableToConnectToEndpointSnafu)?;
+
+        let config = if let Some(cfg) = tls_config {
+            cfg.domain_name(tls_info.domain_name)
+        } else {
+            ClientTlsConfig::new()
+                .ca_certificate(system_tls_certificate()?)
+                .domain_name(tls_info.domain_name)
+        };
+
+        endpoint = endpoint
+            .tls_config(config)
             .context(UnableToConnectToEndpointSnafu)?;
 
         endpoint

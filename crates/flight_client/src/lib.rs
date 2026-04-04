@@ -704,9 +704,10 @@ pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
 ///
 /// * `flight_addr` - The address to connect to.
 /// * `creds` - Optional credentials for authentication. Defaults to anonymous.
-/// * `ca_certificate` - Optional CA certificate (PEM format) for TLS verification.
-///   Required when the server uses a private/self-signed CA (e.g. cluster mTLS).
-///   If not provided, system certificates are used.
+/// * `tls_config` - Optional TLS configuration for the connection. When the server
+///   uses mutual TLS (mTLS), this must include a client identity in addition to the
+///   CA certificate, otherwise the TLS handshake will fail. If `None` and the address
+///   uses a TLS scheme, system certificates are used (server-only TLS).
 ///
 /// # Errors
 ///
@@ -714,10 +715,10 @@ pub fn is_connection_reset_error(error: &tonic::Status) -> bool {
 pub async fn can_connect(
     flight_addr: impl Into<String>,
     _creds: Option<Credentials>,
-    ca_certificate: Option<tonic::transport::Certificate>,
+    tls_config: Option<tonic::transport::ClientTlsConfig>,
 ) -> Result<()> {
     let url: Arc<str> = Arc::from(flight_addr.into().as_str());
-    tls::new_tls_flight_channel_with_cert(&url, ca_certificate)
+    tls::new_tls_flight_channel_with_tls_config(&url, tls_config)
         .await
         .context(UnableToConnectToServerSnafu)?;
     Ok(())

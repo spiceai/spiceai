@@ -399,10 +399,8 @@ pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 /// enabling mutual TLS authentication between cluster nodes.
 #[derive(Debug, Clone)]
 pub struct ClusterTlsConfig {
-    /// CA certificate used to validate other cluster nodes
+    /// CA certificate used to validate other cluster nodes and cloned into TLS clients as needed
     pub ca_certificate: Certificate,
-    /// Raw PEM bytes of the CA certificate, kept for passing to TLS clients that need in-memory certs
-    pub ca_certificate_pem: Vec<u8>,
     /// Client TLS config with CA and client identity for mTLS
     pub client_tls_config: ClientTlsConfig,
     /// Server identity (cert + key) for serving TLS
@@ -488,7 +486,6 @@ impl ClusterTlsConfig {
 
         Ok(Self {
             ca_certificate,
-            ca_certificate_pem: ca_cert_pem,
             client_tls_config,
             server_identity,
         })
@@ -1335,13 +1332,11 @@ pub async fn initialize_cluster_executor(
     let creds = credentials(app_def.runtime.auth.as_ref(), &rt)
         .await
         .unwrap_or(Credentials::anonymous());
-    // Capture the cluster CA PEM bytes (if TLS is configured) for use in the can_connect check.
-    // The local Flight server uses the cluster's private CA, so system TLS certs won't work.
-    let cluster_ca_pem = rt
-        .df
-        .cluster_config
-        .tls_config()
-        .map(|t| t.ca_certificate_pem.clone());
+    // Capture the cluster client TLS config (if mTLS is configured) for use in the can_connect
+    // check. The local Flight server uses the cluster's private CA and requires clients to present
+    // a certificate (mTLS), so passing the full ClientTlsConfig (with both CA and client identity)
+    // is required for the TLS handshake to succeed.
+    let cluster_client_tls = rt.df.cluster_config.client_tls_config().cloned();
     Ok(async move {
         let flight_addr = rt.datafusion().cluster_config.node_advertise_url();
         // Wait for our own flight service to be operational.
@@ -1352,28 +1347,15 @@ pub async fn initialize_cluster_executor(
             || {
                 let addr = flight_addr.clone();
                 let creds = creds.clone();
-                let ca_certificate = cluster_ca_pem
-                    .as_deref()
-                    .map(tonic::transport::Certificate::from_pem);
+                let tls_config = cluster_client_tls.clone();
                 async move {
-                    flight_client::can_connect(addr.clone(), Some(creds), ca_certificate)
+                    flight_client::can_connect(addr.clone(), Some(creds), tls_config)
                         .await
                         .map_err(|e| {
-                            tracing::warn!(
-                                "Failed to connect to local Flight service at {addr:?}: {e}"
-                            );
-                            // Auth failures will never succeed with retries; treat as permanent.
-                            if matches!(
-                                e,
-                                flight_client::Error::Unauthorized {}
-                                    | flight_client::Error::PermissionDenied {}
-                            ) {
-                                util::RetryError::Permanent(e)
-                            } else {
-                                util::RetryError::Transient {
-                                    err: e,
-                                    retry_after: None,
-                                }
+                            tracing::warn!("Failed to connect to local Flight service at {addr:?}: {e}");
+                            util::RetryError::Transient {
+                                err: e,
+                                retry_after: None,
                             }
                         })
                 }
