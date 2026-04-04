@@ -252,7 +252,6 @@ jobs:
       - name: Pull the Postgres/MySQL images
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
-          echo ${{ env.CONTAINER_REGISTRY }}
           docker pull ${{ env.CONTAINER_REGISTRY }}postgres:latest
           docker pull ${{ env.CONTAINER_REGISTRY }}mysql:latest
 
@@ -272,7 +271,7 @@ jobs:
           repositories: |
             spiceai
 
-      - name: Run integration test
+      - name: Run integration tests
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           AWS_EC2_METADATA_DISABLED: true
@@ -315,11 +314,12 @@ jobs:
           AWS_S3_VECTORS_KEY: ${{ secrets.AWS_S3_VECTORS_KEY }}
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
         run: |
-          if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_test/integration.tar.zst
-          else
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_test/integration.tar.zst --skip spiceai_integration_test
+          set -euo pipefail
+          ARGS=(--workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst --partition '${{ matrix.partition }}')
+          if [ -z "${SPICE_SECRET_SPICEAI_KEY:-}" ]; then
+            ARGS+=(--skip spiceai_integration_test)
           fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run "${ARGS[@]}"
 
       - name: Run retention OOM regression test
         if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'

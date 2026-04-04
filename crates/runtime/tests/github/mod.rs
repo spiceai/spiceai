@@ -306,6 +306,7 @@ async fn test_github_issues() -> Result<(), String> {
 
 #[tokio::test]
 async fn test_github_commits() -> Result<(), String> {
+    // Validates GitHub commits connector returns correct data for ref-filtered and unfiltered queries.
     let _tracing = init_tracing(Some("integration=debug,info"));
     if !repo_github_secret_available("test_github_commits").await {
         return Ok(());

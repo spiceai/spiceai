@@ -31,7 +31,8 @@ jobs:
     runs-on: spiceai-macos
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
-      integration_tests_changed: ${{ steps.check_integration.outputs.integration_tests }}
+      integration_tests_changed: ${{ steps.check.outputs.integration_tests_changed }}
+      integration_test_filter: ${{ steps.check.outputs.integration_test_filter }}
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -40,16 +41,6 @@ jobs:
       - name: Check for code changes
         id: check
         uses: ./.github/actions/check-code-changes
-
-      - name: Check for integration test changes
-        id: check_integration
-        uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3
-        with:
-          filters: |
-            integration_tests:
-              - 'crates/runtime/tests/**'
-              - 'crates/runtime-table-partition/tests/**'
-
 
   check:
     name: Rust Lint
@@ -191,21 +182,21 @@ jobs:
           path: ${{ runner.temp }}/spiceio.log
           if-no-files-found: ignore
 
-  # Build integration tests archive - only run if integration tests have changed
-  integration-build:
-    name: Build Integration Tests
+  # Build and run integration tests - only run if integration tests have changed
+  integration-tests:
+    name: Runtime Integration Tests
     needs: check_changes
+    if: needs.check_changes.outputs.integration_tests_changed == 'true'
     runs-on: spiceai-dev-runners
+    timeout-minutes: 90
+
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
 
       - name: Set up Rust
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
         uses: ./.github/actions/setup-rust
 
       - name: Set up spiceio
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@07f50ad2b40d272a857ca2483712d8b0ade6480b # v0.5.0
         with:
@@ -216,27 +207,22 @@ jobs:
           region: us-west-1
 
       - name: Set up sccache
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
         uses: ./.github/actions/setup-sccache
         with:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Set up Nextest
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
         uses: ./.github/actions/setup-nextest
 
       - name: Install Protoc
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up cc
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
         uses: ./.github/actions/setup-cc
 
       - name: Build integration test archive
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
@@ -245,49 +231,10 @@ jobs:
           FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,dynamodb,oracle,kafka,iceberg-write,snapshots,mongodb"
           cargo nextest archive -p runtime --test integration --features ${FEATURES} --archive-file integration.tar.zst --locked
 
-      - name: Upload test archive
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
-        with:
-          name: integration-test-archive-develop
-          path: ./integration.tar.zst
-          retention-days: 1
-
       - name: Show sccache stats
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
         run: sccache --show-stats
 
-      - name: Kill spiceio
-        if: always() && steps.setup-spiceio.outputs.pid != ''
-        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
-
-  # Run integration tests matrix - only run if integration tests have changed
-  integration-tests:
-    name: Integration Tests [${{ matrix.partition }}]
-    needs: [check_changes, integration-build]
-    runs-on: spiceai-dev-runners
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        partition: ['count:1/3', 'count:2/3', 'count:3/3']
-
-    steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
-
-      - name: Set up Nextest
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
-        uses: ./.github/actions/setup-nextest
-
-      - name: Download test archive
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
-        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4
-        with:
-          name: integration-test-archive-develop
-
       - name: Login to ACR
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
         uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
         with:
           registry: spiceaitestimages.azurecr.io
@@ -295,18 +242,15 @@ jobs:
           password: ${{ secrets.AZCR_PASSWORD }}
 
       - name: Pull the Postgres/MySQL images
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
         run: |
           docker pull ${{ env.CONTAINER_REGISTRY }}postgres:latest
           docker pull ${{ env.CONTAINER_REGISTRY }}mysql:latest
 
       - name: Set up Spice.ai API Key
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
         run: |
           echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_KEY }}"' > .env
 
       - name: Set up Github Token
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
         uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v2
         id: github-app-token
         with:
@@ -317,7 +261,6 @@ jobs:
             spiceai
 
       - name: Run integration tests
-        if: needs.check_changes.outputs.integration_tests_changed == 'true'
         env:
           AWS_EC2_METADATA_DISABLED: true
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
@@ -363,8 +306,16 @@ jobs:
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
         run: |
           set -euo pipefail
-          if [ -n "${SPICE_SECRET_SPICEAI_KEY:-}" ]; then
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file integration.tar.zst
-          else
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file integration.tar.zst --skip spiceai_integration_test
+          ARGS=(--workspace-remap "${PWD}" --archive-file integration.tar.zst)
+          FILTER='${{ needs.check_changes.outputs.integration_test_filter }}'
+          if [ -n "$FILTER" ]; then
+            ARGS+=(-E "$FILTER")
           fi
+          if [ -z "${SPICE_SECRET_SPICEAI_KEY:-}" ]; then
+            ARGS+=(--skip spiceai_integration_test)
+          fi
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run "${ARGS[@]}"
+
+      - name: Kill spiceio
+        if: always() && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true

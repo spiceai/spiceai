@@ -19,6 +19,12 @@ outputs:
   relevant_changes:
     description: 'Whether there are relevant code changes'
     value: ${{ steps.check_changes.outputs.relevant_changes }}
+  integration_tests_changed:
+    description: 'Whether integration test files changed'
+    value: ${{ steps.check_integration.outputs.integration_tests }}
+  integration_test_filter:
+    description: 'Nextest filter expression for changed test modules (empty = run all)'
+    value: ${{ steps.changed_modules.outputs.filter }}
 
 runs:
   using: 'composite'
@@ -46,3 +52,70 @@ runs:
       shell: bash
       run: |
         echo "relevant_changes=${{ steps.changed-code-files.outputs.code_changes }}" >> $GITHUB_OUTPUT
+
+    - name: Check for integration test changes
+      id: check_integration
+      uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3
+      with:
+        filters: |
+          integration_tests:
+            - 'crates/runtime/tests/**'
+            - 'crates/runtime-table-partition/tests/**'
+
+    - name: Detect changed test modules
+      id: changed_modules
+      if: steps.check_integration.outputs.integration_tests == 'true'
+      shell: bash
+      run: |
+        # Only filter for pull_request events where we can reliably diff
+        if [ "${{ github.event_name }}" != "pull_request" ]; then
+          echo "filter=" >> $GITHUB_OUTPUT
+          echo "Non-PR event, will run all integration tests"
+          exit 0
+        fi
+
+        CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD -- 'crates/runtime/tests/')
+
+        if [ -z "$CHANGED_FILES" ]; then
+          echo "filter=" >> $GITHUB_OUTPUT
+          echo "No test files changed"
+          exit 0
+        fi
+
+        RUN_ALL=false
+        MODULES=""
+
+        while IFS= read -r file; do
+          [ -z "$file" ] && continue
+          rel="${file#crates/runtime/tests/}"
+          mod="${rel%%/*}"
+          mod="${mod%.rs}"
+          # Shared infrastructure changes require running all tests
+          case "$mod" in
+            integration|utils|test_data|docker)
+              RUN_ALL=true
+              break
+              ;;
+          esac
+          MODULES="$MODULES $mod"
+        done <<< "$CHANGED_FILES"
+
+        if [ "$RUN_ALL" = "true" ]; then
+          echo "filter=" >> $GITHUB_OUTPUT
+          echo "Shared test infrastructure changed, will run all integration tests"
+          exit 0
+        fi
+
+        UNIQUE=$(echo "$MODULES" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+        FILTER=""
+        for mod in $UNIQUE; do
+          [ -z "$mod" ] && continue
+          if [ -n "$FILTER" ]; then
+            FILTER="$FILTER | test(~${mod}::)"
+          else
+            FILTER="test(~${mod}::)"
+          fi
+        done
+
+        echo "filter=$FILTER" >> $GITHUB_OUTPUT
+        echo "Will run tests matching: $FILTER"

@@ -89,8 +89,8 @@ jobs:
             // Check if this is a manual workflow dispatch
             const isManualDispatch = context.eventName === 'workflow_dispatch';
 
-            // Include Windows and Linux ARM only for tagged releases, release branches, or manual dispatch (exclude trunk pushes)
-            const includeWindowsAndLinuxArm = isTaggedRelease || isReleaseBranch || isManualDispatch;
+            // Include Windows only for tagged releases, release branches, or manual dispatch (exclude trunk pushes)
+            const includeWindows = isTaggedRelease || isReleaseBranch || isManualDispatch;
 
             // Tagged releases use GitHub hosted runners, others use spiceai runners
             const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos";
@@ -116,20 +116,19 @@ jobs:
                 tags: ["default", "metal"],
                 use_minio: false,
                 is_tagged_release: isTaggedRelease,
-              }
-            ];
-
-            // Add Linux ARM and Windows only for tagged releases, release branches, or manual dispatch
-            if (includeWindowsAndLinuxArm) {
-              matrix.push({
+              }, {
                 name: "Linux aarch64",
-                runner: isTaggedRelease ? "hosted-linux-arm-runner" : "hosted-linux-arm-runner",
+                runner: "ubuntu-22.04-arm",
                 target_os: "linux",
                 target_arch: "aarch64",
                 tags: ["default"],
                 use_minio: false,
                 is_tagged_release: isTaggedRelease,
-              });
+              }
+            ];
+
+            // Add Windows only for tagged releases, release branches, or manual dispatch
+            if (includeWindows) {
               matrix.push({
                 name: "Windows x64",
                 runner: "windows-latest",
