@@ -49,8 +49,8 @@ pub fn get_params_spec(source: &ModelSource) -> Option<&'static [ParameterSpec]>
     }
 }
 
-pub const PARAM_LEN: usize = 44;
-pub const PARAM_WITH_DEPRE_LEN: usize = 45;
+pub const PARAM_LEN: usize = 46;
+pub const PARAM_WITH_DEPRE_LEN: usize = 47;
 
 // Model parameters that are used for openai model provider. Those parameters are supported by other (non-openai) models as well.
 // OpenAI model is prefixed with `openai_`, use separate PARAMETERS constant to avoid confusion with other model providers.
@@ -61,6 +61,11 @@ pub const COMMON_MODEL_PARAMETERS: [ParameterSpec; PARAM_LEN] = [
     ParameterSpec::runtime("system_prompt")
         .description("An additional system prompt used for all chat completions to this model."),
     ParameterSpec::runtime("parameterized_prompt"),
+    // Rate limiting parameters for AI UDF concurrency control
+    ParameterSpec::runtime("ai_max_concurrency")
+        .description("Maximum number of concurrent AI UDF requests for this model. Overrides provider defaults."),
+    ParameterSpec::runtime("ai_requests_per_minute")
+        .description("Maximum requests per minute for this model in AI UDF queries. Overrides provider defaults."),
     // OpenAI compatible default override parameters for all models
     ParameterSpec::runtime("frequency_penalty"),
     ParameterSpec::runtime("logit_bias"),
@@ -113,6 +118,11 @@ pub const COMMON_MODEL_PARAMETERS_WITH_DEPRECATED: [ParameterSpec; PARAM_WITH_DE
     ParameterSpec::runtime("system_prompt")
         .description("An additional system prompt used for all chat completions to this model."),
     ParameterSpec::runtime("parameterized_prompt"),
+    // Rate limiting parameters for AI UDF concurrency control
+    ParameterSpec::runtime("ai_max_concurrency")
+        .description("Maximum number of concurrent AI UDF requests for this model. Overrides provider defaults."),
+    ParameterSpec::runtime("ai_requests_per_minute")
+        .description("Maximum requests per minute for this model in AI UDF queries. Overrides provider defaults."),
     // OpenAI compatible default override parameters for all models
     ParameterSpec::component("frequency_penalty"),
     ParameterSpec::component("logit_bias"),

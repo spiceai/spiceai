@@ -32,7 +32,7 @@ use std::pin::Pin;
 use tokio::time::Instant;
 use tracing_futures::Instrument;
 
-use crate::model::metrics::{handle_metrics, request_labels_responses};
+use crate::model::metrics::{handle_metrics, handle_token_metrics, request_labels_responses};
 
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -153,6 +153,7 @@ impl Responses for ResponsesWrapper {
 
                 if let Some(usage) = resp.usage.clone() {
                     tracing::info!(target: "task_history", parent: &span, completion_tokens = %usage.output_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.input_tokens, id=resp.id, "labels");
+                    handle_token_metrics(usage.input_tokens, usage.output_tokens, &labels);
                 }
 
                 match serde_json::to_string(&captured_output) {
@@ -246,6 +247,7 @@ where
                                 prompt_tokens = %usage.input_tokens,
                                 "Usage info"
                             );
+                            handle_token_metrics(usage.input_tokens, usage.output_tokens, &self.labels);
                         }
 
                         response.model.clone_from(&self.model_public_name);

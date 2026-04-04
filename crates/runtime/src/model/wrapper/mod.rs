@@ -37,7 +37,7 @@ use tera::Tera;
 use tokio::time::Instant;
 use tracing_futures::Instrument;
 
-use crate::model::metrics::handle_metrics;
+use crate::model::metrics::{handle_metrics, handle_token_metrics};
 
 use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
@@ -341,6 +341,7 @@ impl Chat for ChatWrapper {
             Ok(mut resp) => {
                 if let Some(usage) = resp.usage.clone() {
                     tracing::info!(target: "task_history", parent: &span, completion_tokens = %usage.completion_tokens, total_tokens = %usage.total_tokens, prompt_tokens = %usage.prompt_tokens, id=resp.id, "labels");
+                    handle_token_metrics(usage.prompt_tokens, usage.completion_tokens, &labels);
                 }
                 let captured_output: Vec<_> = resp.choices.iter().map(|c| &c.message).collect();
                 match serde_json::to_string(&captured_output) {
@@ -434,6 +435,7 @@ where
 
                     // Usage should be on last message, so we can add latency metrics here.
                     handle_metrics(self.started.elapsed(), false, &self.labels);
+                    handle_token_metrics(usage.prompt_tokens, usage.completion_tokens, &self.labels);
                 }
                 Poll::Ready(Some(Ok(item)))
             }
