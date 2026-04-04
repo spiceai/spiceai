@@ -21,7 +21,7 @@ use tokio::sync::Semaphore;
 
 use super::{
     ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, ReqwestInternalSnafu, Result,
-    is_retriable_error,
+    is_gateway_error, is_retriable_error,
 };
 use arrow::{
     array::RecordBatch,
@@ -37,6 +37,7 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use snafu::ResultExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
@@ -667,6 +668,10 @@ pub struct GraphQLClient {
     rate_limiter: Option<Arc<dyn RateLimiter>>,
     rate_controller: Option<Arc<RateController>>,
     semaphore: Option<Arc<Semaphore>>,
+    /// Set after a gateway error (502/504) to force `Connection: close` on the
+    /// next request, ensuring a fresh TCP connection instead of reusing a pooled
+    /// connection that may route to the same bad upstream.
+    close_connection_on_next_request: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -852,6 +857,7 @@ impl GraphQLClient {
             rate_limiter,
             rate_controller,
             semaphore,
+            close_connection_on_next_request: AtomicBool::new(false),
         })
     }
 
@@ -924,6 +930,9 @@ impl GraphQLClient {
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 
         let mut request = self.client.post(self.endpoint.clone()).body(body);
+        if self.close_connection_on_next_request.swap(false, Ordering::Relaxed) {
+            request = request.header(reqwest::header::CONNECTION, "close");
+        }
         request = request_with_auth(request, self.auth.as_ref());
 
         // Replace separated semaphore with RateController semaphore: https://github.com/spiceai/spiceai/issues/8636
@@ -1276,6 +1285,11 @@ impl GraphQLClient {
                     .await
                     .map_err(|e| {
                         if is_retriable_error(&e) {
+                            if is_gateway_error(&e) {
+                                client
+                                    .close_connection_on_next_request
+                                    .store(true, Ordering::Relaxed);
+                            }
                             tracing::warn!("Page fetch failed, will retry: {e}");
                             RetryError::transient(e)
                         } else {

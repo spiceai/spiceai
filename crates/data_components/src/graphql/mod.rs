@@ -145,6 +145,20 @@ pub fn is_retriable_error(error: &Error) -> bool {
     }
 }
 
+/// Returns `true` if the error is a gateway error (502 Bad Gateway or 504 Gateway Timeout)
+/// that may benefit from closing the current connection and establishing a fresh one.
+#[must_use]
+pub fn is_gateway_error(error: &Error) -> bool {
+    let status = match error {
+        Error::InvalidReqwestStatus { status, .. } | Error::JsonDecodeError { status, .. } => {
+            Some(*status)
+        }
+        Error::ReqwestInternal { source } => source.status(),
+        _ => None,
+    };
+    status.is_some_and(|s| s == StatusCode::BAD_GATEWAY || s == StatusCode::GATEWAY_TIMEOUT)
+}
+
 #[derive(Debug, Clone)]
 pub struct FilterPushdownResult {
     pub filter_pushdown: TableProviderFilterPushDown,
