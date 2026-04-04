@@ -1802,10 +1802,7 @@ mod tests {
 
     #[test]
     fn dictionary_unwraps_to_value_type() {
-        let dt = DataType::Dictionary(
-            Box::new(DataType::Int32),
-            Box::new(DataType::Utf8),
-        );
+        let dt = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
         assert_eq!(arrow_datatype_to_sql(&dt).unwrap(), "VARCHAR");
     }
 
