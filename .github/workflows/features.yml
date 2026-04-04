@@ -39,7 +39,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up spiceio
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && secrets.UNAS_SMB_PASS != ''
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
         with:
@@ -66,7 +66,7 @@ jobs:
           fi
 
       - name: Set up sccache
-        if: runner.os == 'macOS' && env.SCCACHE_SETUP == 'true'
+        if: runner.os == 'macOS' && env.SCCACHE_SETUP == 'true' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
@@ -105,7 +105,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Show sccache stats
-        if: runner.os == 'macOS' && env.SCCACHE_SETUP == 'true'
+        if: runner.os == 'macOS' && env.SCCACHE_SETUP == 'true' && steps.setup-spiceio.outputs.endpoint != ''
         run: sccache --show-stats
 
       - name: Kill spiceio
