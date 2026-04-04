@@ -1398,7 +1398,7 @@ async fn credentials(
     auth: Option<&spicepod::component::runtime::Auth>,
     rt: &Arc<Runtime>,
 ) -> Option<Credentials> {
-    let _credentials: Option<Credentials> = if let Some(spicepod::component::runtime::Auth {
+    if let Some(spicepod::component::runtime::Auth {
         api_key: Some(key_auth),
     }) = auth
     {
@@ -1412,8 +1412,7 @@ async fn credentials(
         Some(Credentials::new("", key))
     } else {
         None
-    };
-    None
+    }
 }
 
 async fn create_scheduler_server(
