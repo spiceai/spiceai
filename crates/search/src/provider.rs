@@ -714,9 +714,9 @@ mod tests {
                 .expect("lock")
                 .push(filters.to_vec());
             // Return a valid empty plan
-            Ok(Arc::new(
-                datafusion::physical_plan::empty::EmptyExec::new(Arc::clone(&self.schema)),
-            ))
+            Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+                Arc::clone(&self.schema),
+            )))
         }
     }
 
