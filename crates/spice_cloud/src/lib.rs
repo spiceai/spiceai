@@ -94,14 +94,23 @@ pub enum Error {
 pub struct SpiceExtension {
     manifest: ExtensionManifest,
     api_key: String,
+    client: reqwest::Client,
 }
 
 impl SpiceExtension {
     #[must_use]
     pub fn new(manifest: ExtensionManifest) -> Self {
+        let client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(1800))
+            .build()
+            .unwrap_or_default();
+
         SpiceExtension {
             manifest,
             api_key: String::new(),
+            client,
         }
     }
 
@@ -145,13 +154,8 @@ impl SpiceExtension {
         path: &str,
         body: Req,
     ) -> Result<Resp, Error> {
-        let client = reqwest::Client::builder()
-            .use_rustls_tls()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(1800))
-            .build()
-            .context(UnableToConnectToSpiceCloudSnafu)?;
-        let response = client
+        let response = self
+            .client
             .post(format!("{}{path}", self.spice_http_url()))
             .json(&body)
             .header("Content-Type", "application/json")
@@ -240,7 +244,7 @@ impl SpiceExtension {
 
 impl Default for SpiceExtension {
     fn default() -> Self {
-        SpiceExtension::new(ExtensionManifest::default())
+        Self::new(ExtensionManifest::default())
     }
 }
 
@@ -286,10 +290,7 @@ impl SpiceExtensionFactory {
 
 impl ExtensionFactory for SpiceExtensionFactory {
     fn create(&self) -> Box<dyn Extension> {
-        Box::new(SpiceExtension {
-            manifest: self.manifest.clone(),
-            api_key: String::new(),
-        })
+        Box::new(SpiceExtension::new(self.manifest.clone()))
     }
 }
 

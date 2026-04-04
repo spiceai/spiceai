@@ -114,6 +114,8 @@ impl KubernetesClient {
         self.client = Some(
             reqwest::Client::builder()
                 .add_root_certificate(certificate)
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .context(UnableToCreateK8SClientSnafu)?,
         );
