@@ -25,12 +25,20 @@ pub mod logical_nodes;
 pub mod physical_plans;
 pub mod planner;
 
-use datafusion::catalog::CatalogProvider;
+use std::sync::Arc;
+
+use datafusion::catalog::{CatalogProvider, TableProvider};
+use datafusion::common::Constraint;
+use datafusion::common::utils::quote_identifier;
+use datafusion::error::DataFusionError;
+use datafusion::sql::{ResolvedTableReference, TableReference};
 
 use cayenne::CayenneCatalogProvider;
 
 use super::composed_catalog::ComposedCatalogProvider;
 use crate::catalogconnector::PartitionAwareCatalog;
+use crate::datafusion::cayenne_ddl::physical_plans::arrow_datatype_to_sql;
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 /// Check whether the given catalog provider is a Cayenne-backed catalog.
 pub fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {
@@ -64,4 +72,81 @@ pub fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCa
 pub fn as_partition_aware(provider: &dyn CatalogProvider) -> Option<&dyn PartitionAwareCatalog> {
     let cayenne_catalog = get_cayenne_provider(provider)?;
     Some(cayenne_catalog as &dyn PartitionAwareCatalog)
+}
+
+/// Constructs a `CREATE TABLE IF NOT EXISTS` DDL SQL query for the provided [`TableReference`].
+///
+/// If `partition_expr` is provided, a `PARTITION BY <expr>` clause is appended after the
+/// column definitions. This ensures executors receiving the DDL will create the table with
+/// the same partition layout as the scheduler.
+///
+/// Identifier quoting escapes embedded double-quotes to prevent SQL injection.
+pub fn create_table_if_not_exists(
+    tbl: &TableReference,
+    provider: &Arc<dyn TableProvider>,
+    partition_expr: Option<&str>,
+) -> Result<String, DataFusionError> {
+    let ResolvedTableReference {
+        catalog,
+        schema,
+        table,
+    } = tbl
+        .clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+    let table_schema = provider.schema();
+
+    let columns_sql: Vec<String> = table_schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let null_str = if f.is_nullable() { "" } else { " NOT NULL" };
+            let sql_type = arrow_datatype_to_sql(f.data_type())?;
+            Ok::<String, DataFusionError>(format!(
+                "{} {sql_type}{null_str}",
+                quote_identifier(f.name())
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut table_elements = columns_sql;
+
+    let primary_key: Vec<String> = provider
+        .constraints()
+        .and_then(|c| {
+            c.iter().find_map(|cc| {
+                if let Constraint::PrimaryKey(v) = cc {
+                    let num_fields = table_schema.fields().len();
+                    Some(
+                        v.iter()
+                            .filter(|i| **i < num_fields)
+                            .map(|i| table_schema.field(*i).name().clone())
+                            .collect(),
+                    )
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_default();
+
+    if !primary_key.is_empty() {
+        let pk_cols = primary_key
+            .iter()
+            .map(|c| quote_identifier(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        table_elements.push(format!("PRIMARY KEY ({pk_cols})"));
+    }
+
+    let partition_clause = match partition_expr {
+        Some(expr) if !expr.is_empty() => format!(" PARTITION BY {expr}"),
+        _ => String::new(),
+    };
+
+    Ok(format!(
+        "CREATE TABLE IF NOT EXISTS {}.{}.{} ({}){partition_clause}",
+        quote_identifier(&catalog),
+        quote_identifier(&schema),
+        quote_identifier(&table),
+        table_elements.join(", ")
+    ))
 }

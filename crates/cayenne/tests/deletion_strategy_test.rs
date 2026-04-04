@@ -42,6 +42,8 @@ use cayenne::{
     metadata::CreateTableOptions,
 };
 
+use data_components::delete::DeletionTableProvider;
+
 use datafusion::datasource::TableProvider;
 
 use datafusion::execution::context::SessionContext;
@@ -66,7 +68,7 @@ async fn insert_batch(table: &Arc<CayenneTableProvider>, batch: RecordBatch) -> 
 
 async fn delete_records(table: &Arc<CayenneTableProvider>, filter: Expr) -> TestResult<u64> {
     let ctx = SessionContext::new();
-    let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(results
         .first()
