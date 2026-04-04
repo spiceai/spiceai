@@ -259,7 +259,7 @@ jobs:
   # Build and test on Linux ARM64
   build-test-arm64:
     name: Build and Test (ARM64)
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-22.04-arm
     needs: [check_changes]
 
     steps:
