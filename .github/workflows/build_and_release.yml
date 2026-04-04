@@ -118,7 +118,7 @@ jobs:
                 is_tagged_release: isTaggedRelease,
               }, {
                 name: "Linux aarch64",
-                runner: "ubuntu-22.04-arm",
+                runner: "ubuntu-24.04-arm",
                 target_os: "linux",
                 target_arch: "aarch64",
                 tags: ["default"],

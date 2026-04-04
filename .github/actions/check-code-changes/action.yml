@@ -57,9 +57,11 @@ runs:
       id: check_integration
       uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3
       with:
+        list-files: shell
         filters: |
           integration_tests:
             - 'crates/runtime/tests/**'
+            - 'crates/runtime-table-partition/tests/**'
 
     - name: Detect changed test modules
       id: changed_modules
@@ -73,7 +75,8 @@ runs:
           exit 0
         fi
 
-        CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD -- 'crates/runtime/tests/')
+        # Use the file list from dorny/paths-filter (covers the full PR diff)
+        CHANGED_FILES="${{ steps.check_integration.outputs.integration_tests_files }}"
 
         if [ -z "$CHANGED_FILES" ]; then
           echo "filter=" >> $GITHUB_OUTPUT
@@ -84,20 +87,30 @@ runs:
         RUN_ALL=false
         MODULES=""
 
-        while IFS= read -r file; do
+        for file in $CHANGED_FILES; do
           [ -z "$file" ] && continue
-          rel="${file#crates/runtime/tests/}"
-          mod="${rel%%/*}"
-          mod="${mod%.rs}"
-          # Shared infrastructure changes require running all tests
-          case "$mod" in
-            integration|utils|test_data|docker)
+          # Only derive module names from runtime/tests (not runtime-table-partition)
+          case "$file" in
+            crates/runtime/tests/*)
+              rel="${file#crates/runtime/tests/}"
+              mod="${rel%%/*}"
+              mod="${mod%.rs}"
+              # Shared infrastructure changes require running all tests
+              case "$mod" in
+                integration|utils|test_data|docker)
+                  RUN_ALL=true
+                  break
+                  ;;
+              esac
+              MODULES="$MODULES $mod"
+              ;;
+            *)
+              # Changes outside runtime/tests (e.g. runtime-table-partition) trigger all tests
               RUN_ALL=true
               break
               ;;
           esac
-          MODULES="$MODULES $mod"
-        done <<< "$CHANGED_FILES"
+        done
 
         if [ "$RUN_ALL" = "true" ]; then
           echo "filter=" >> $GITHUB_OUTPUT
