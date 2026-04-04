@@ -472,9 +472,10 @@ impl DataFusionBuilder {
             ),
         ));
 
-        // Expand SearchQueryProvider table scans into their full logical plan equivalents so
-        // DataFusion's optimizer can act on the search plan structure.
-        ctx.add_analyzer_rule(Arc::new(search::analyzer_rule::SearchQueryAnalyzerRule));
+        // Expand SearchQueryProvider table scans into their full logical plan equivalents.
+        // This runs as an optimizer rule (after PushDownFilter) so that scan.filters is
+        // populated, allowing filters to be pushed down into search index queries.
+        ctx.add_optimizer_rule(Arc::new(search::optimizer_rule::SearchQueryOptimizerRule));
 
         DataFusion {
             runtime_status: self.status,
