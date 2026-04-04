@@ -60,7 +60,6 @@ runs:
         filters: |
           integration_tests:
             - 'crates/runtime/tests/**'
-            - 'crates/runtime-table-partition/tests/**'
 
     - name: Detect changed test modules
       id: changed_modules
