@@ -645,10 +645,10 @@ async fn check_schema_evolution(
         );
         metadata.schema_fields = new_fields_owned;
 
-        if dataset.is_file_accelerated() {
-            if let Err(e) = set_metadata_to_accelerator(dataset, metadata).await {
-                tracing::warn!("Failed to persist updated schema metadata for {dataset_name}: {e}");
-            }
+        if dataset.is_file_accelerated()
+            && let Err(e) = set_metadata_to_accelerator(dataset, metadata).await
+        {
+            tracing::warn!("Failed to persist updated schema metadata for {dataset_name}: {e}");
         }
     }
 }
