@@ -91,13 +91,19 @@ runs:
           rel="${file#crates/runtime/tests/}"
           mod="${rel%%/*}"
           mod="${mod%.rs}"
-          # Shared infrastructure changes require running all tests
+          # Shared infrastructure or top-level test files require running all tests
           case "$mod" in
             integration|utils|test_data|docker)
               RUN_ALL=true
               break
               ;;
           esac
+          # Top-level .rs files (e.g. integration_models.rs, retention_oom.rs) don't map
+          # to module directories in --test integration, so run all tests
+          if [[ "$rel" != */* ]]; then
+            RUN_ALL=true
+            break
+          fi
           MODULES="$MODULES $mod"
         done
 

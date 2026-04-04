@@ -261,15 +261,14 @@ jobs:
     name: Build and Test (ARM64)
     runs-on: ubuntu-22.04-arm
     needs: [check_changes]
+    if: needs.check_changes.outputs.relevant_changes == 'true'
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
-        if: needs.check_changes.outputs.relevant_changes == 'true'
         with:
           fetch-depth: 1
 
       - name: Cache Cargo registry
-        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: |
@@ -281,29 +280,23 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-cargo-
 
       - name: Set up Rust
-        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-rust
 
       - name: Set up Nextest
-        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-nextest
 
       - name: Install Protoc
-        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up make
-        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-make
 
       - name: Set up cc
-        if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
       - name: Build CLI and run nextest
-        if: needs.check_changes.outputs.relevant_changes == 'true'
         run: make build-cli nextest
         env:
           RUST_PROFILE: ${{ env.RUST_PROFILE }}
