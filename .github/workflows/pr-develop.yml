@@ -196,20 +196,10 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Set up spiceio
-        id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@07f50ad2b40d272a857ca2483712d8b0ade6480b # v0.5.0
-        with:
-          smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
-          token: ${{ github.token }}
-          bucket: sccache
-          region: us-west-1
-
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
         with:
-          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -315,7 +305,3 @@ jobs:
             ARGS+=(--skip spiceai_integration_test)
           fi
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run "${ARGS[@]}"
-
-      - name: Kill spiceio
-        if: always() && steps.setup-spiceio.outputs.pid != ''
-        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
