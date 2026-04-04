@@ -57,7 +57,7 @@ impl GitHubClient {
 
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
-            .user_agent("spice")
+            .user_agent(concat!("spice/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_default();
 

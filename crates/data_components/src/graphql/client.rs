@@ -953,7 +953,7 @@ impl GraphQLClient {
         // timeouts to match the original client — GitHub requires a User-Agent header.
         let http_client = if close_connection {
             reqwest::Client::builder()
-                .user_agent("spice")
+                .user_agent(concat!("spiceai/", env!("CARGO_PKG_VERSION")))
                 .pool_max_idle_per_host(0)
                 .build()
                 .context(ReqwestInternalSnafu)?

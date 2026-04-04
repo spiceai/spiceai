@@ -290,6 +290,7 @@ impl Github {
             };
 
             let client = reqwest::Client::builder()
+                .user_agent(concat!("spiceai/", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -369,7 +370,7 @@ impl Github {
         let rate_controller = get_github_auth_context_rate_controller(auth_context).await;
 
         let client = reqwest::Client::builder()
-            .user_agent("spice")
+            .user_agent(concat!("spiceai/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
             .gzip(true)

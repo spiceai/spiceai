@@ -207,6 +207,7 @@ async fn get_m2m_access_token(
     let token_endpoint_url = format!("https://{databricks_endpoint}/oidc/v1/token");
 
     let client = reqwest::Client::builder()
+        .user_agent(concat!("spiceai/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .build()?;

@@ -249,6 +249,7 @@ pub struct GithubRestClient {
 impl GithubRestClient {
     pub fn new(token: Option<&str>) -> reqwest::Result<Self> {
         let client = reqwest::Client::builder()
+            .user_agent(concat!("spiceai/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
             .build()?;
