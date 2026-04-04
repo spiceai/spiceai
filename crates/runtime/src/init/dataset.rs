@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use crate::cluster::partition::get_partition_filter_exprs;
+use crate::component::dataset::acceleration::Mode;
 use crate::dataaccelerator::BootstrapStatus;
 use crate::dataaccelerator::spice_sys::OpenOption;
 use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
@@ -399,6 +400,13 @@ impl Runtime {
             return Err(err);
         }
 
+        // In file_update mode, schema mismatches are handled by create_accelerated_table
+        // which detects changes and recreates the acceleration with the new schema.
+        let allow_schema_mismatch = ds
+            .acceleration
+            .as_ref()
+            .is_some_and(|a| a.mode == Mode::FileUpdate);
+
         // Test dataset connectivity by attempting to get a read provider.
         let federated_table = match data_connector.read_provider(&ds).await {
             Ok(provider) => {
@@ -407,6 +415,7 @@ impl Runtime {
                     provider,
                     Arc::clone(&data_connector),
                     self.status.shutdown_token(),
+                    allow_schema_mismatch,
                 )
                 .await
             }
@@ -667,11 +676,16 @@ impl Runtime {
             }
             .build()
         })?;
+        let allow_schema_mismatch = ds
+            .acceleration
+            .as_ref()
+            .is_some_and(|a| a.mode == Mode::FileUpdate);
         let federated_table = FederatedTable::new(
             Arc::clone(&ds),
             read_table,
             Arc::clone(&connector),
             self.status.shutdown_token(),
+            allow_schema_mismatch,
         )
         .await;
 
