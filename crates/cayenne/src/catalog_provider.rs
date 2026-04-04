@@ -132,7 +132,7 @@ impl CayenneCatalogProvider {
     /// # Errors
     ///
     /// Returns an error if the metadata or data directories cannot be created,
-    /// or if the `SQLite` catalog fails to initialize.
+    /// or if the metadata catalog fails to initialize.
     pub async fn try_new(
         config: CayenneCatalogProviderConfig,
         runtime_env: Arc<RuntimeEnv>,
@@ -408,7 +408,7 @@ impl CayenneSchemaProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error if any table fails to load from the metadata catalog.
+    /// Returns an error if any table fails to load from the catalog.
     pub async fn try_new(
         catalog: Arc<dyn MetadataCatalog>,
         namespace: &str,
