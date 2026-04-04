@@ -198,12 +198,30 @@ message MetricsResponse {
     bytes otlp_metrics = 2;
 }
 
+// Serialized RequestContext for distributed query execution.
+// Carries the essential request metadata so that trace IDs and protocol
+// information survive scheduler-to-executor distribution.
+message RequestContextProto {
+    // Protocol enum value (see runtime_request_context::Protocol).
+    uint32 protocol = 1;
+    // W3C traceparent trace-id as a 32-char lowercase hex string.
+    optional string trace_id = 2;
+    // W3C traceparent span-id as a 16-char lowercase hex string.
+    optional string span_id = 3;
+    // Raw Authorization header value from the original request.
+    optional string authorization_header = 4;
+}
+
 // Physical plan
 message SchemaCastScanExecNode {
     bytes schema = 1;
 }
 
-message BytesProcessedExecNode {}
+message BytesProcessedExecNode {
+    // The request context captured at plan optimization time on the scheduler.
+    // Allows executors to reconstruct the RequestContext (trace IDs, protocol, etc.).
+    optional RequestContextProto request_context = 1;
+}
 
 message CayenneAccelerationExecNode {}
 

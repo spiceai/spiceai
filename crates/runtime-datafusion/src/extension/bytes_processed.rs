@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -88,6 +88,12 @@ impl PhysicalOptimizerRule for BytesProcessedPhysicalOptimizer {
         plan: std::sync::Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        // Capture the current request context so it survives distribution to remote executors.
+        // SAFETY: The optimizer runs synchronously within the async task scope of the originating
+        // request, so the tokio task-local `REQUEST_CONTEXT` is set. Outside a request scope
+        // (e.g. refresh tasks) this returns the INTERNAL context, which is the correct fallback.
+        let request_context = unsafe { RequestContext::current_sync() };
+
         plan.transform_down(|plan| {
             if plan.as_any().downcast_ref::<BytesProcessedExec>().is_some() {
                 return Ok(Transformed::new(plan, false, TreeNodeRecursion::Jump));
@@ -97,10 +103,10 @@ impl PhysicalOptimizerRule for BytesProcessedPhysicalOptimizer {
                 return Ok(Transformed::new(plan, false, TreeNodeRecursion::Continue));
             }
 
-            let mut exec_plan =
-                BytesProcessedExec::new(plan, Arc::clone(&self.emit_bytes_callback));
-
-            exec_plan = exec_plan.fallback_to_new_context();
+            let exec_plan =
+                BytesProcessedExec::new(plan, Arc::clone(&self.emit_bytes_callback))
+                    .with_request_context(Arc::clone(&request_context))
+                    .fallback_to_new_context();
 
             Ok(Transformed::new(
                 Arc::new(exec_plan),
@@ -161,6 +167,10 @@ pub struct BytesProcessedExec {
     input_exec: Arc<dyn ExecutionPlan>,
     emit_bytes_callback: Arc<BytesEmittedCallback>,
     fallback_to_new_context: bool,
+    /// Pre-captured request context for distributed execution.
+    /// When present, this context is used instead of reading from the `TaskContext` session config.
+    /// This allows trace IDs and protocol information to survive scheduler-to-executor distribution.
+    request_context: Option<Arc<RequestContext>>,
 }
 
 impl BytesProcessedExec {
@@ -172,6 +182,7 @@ impl BytesProcessedExec {
             input_exec,
             emit_bytes_callback,
             fallback_to_new_context: false,
+            request_context: None,
         }
     }
 
@@ -179,6 +190,19 @@ impl BytesProcessedExec {
     pub fn fallback_to_new_context(mut self) -> Self {
         self.fallback_to_new_context = true;
         self
+    }
+
+    /// Attach a pre-captured `RequestContext` so it is preserved across distributed execution.
+    #[must_use]
+    pub fn with_request_context(mut self, request_context: Arc<RequestContext>) -> Self {
+        self.request_context = Some(request_context);
+        self
+    }
+
+    /// Returns the stored request context, if any.
+    #[must_use]
+    pub fn request_context(&self) -> Option<&Arc<RequestContext>> {
+        self.request_context.as_ref()
     }
 }
 
@@ -275,6 +299,7 @@ impl ExecutionPlan for BytesProcessedExec {
             input_exec: input,
             emit_bytes_callback: Arc::clone(&self.emit_bytes_callback),
             fallback_to_new_context: self.fallback_to_new_context,
+            request_context: self.request_context.clone(),
         }))
     }
 
@@ -299,7 +324,9 @@ impl ExecutionPlan for BytesProcessedExec {
         let stream = self.input_exec.execute(partition, Arc::clone(&context))?;
         let schema = stream.schema();
 
-        let request_context = if let Some(request_context) =
+        let request_context = if let Some(request_context) = &self.request_context {
+            Arc::clone(request_context)
+        } else if let Some(request_context) =
             context.session_config().get_extension::<RequestContext>()
         {
             request_context

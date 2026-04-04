@@ -27,12 +27,15 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion_expr::ScalarUDF;
 use datafusion_proto::generated::datafusion_common;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+use opentelemetry::trace::{SpanId, TraceId};
 use prost::Message;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
 use runtime_proto::{
-    BytesProcessedExecNode, CayenneAccelerationExecNode, SchemaCastScanExecNode, UdtfExecNode,
+    BytesProcessedExecNode, CayenneAccelerationExecNode, RequestContextProto,
+    SchemaCastScanExecNode, UdtfExecNode,
 };
+use runtime_request_context::{Protocol, RequestContext, RequestContextBuilder, TraceParent};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -87,14 +90,17 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             ));
 
             Ok(exec)
-        } else if BytesProcessedExecNode::decode(buf).is_ok() {
-            Ok(Arc::new(
-                BytesProcessedExec::new(
-                    Arc::clone(&inputs[0]),
-                    Arc::new(Box::new(track_bytes_processed)),
-                )
-                .fallback_to_new_context(),
-            ))
+        } else if let Ok(node) = BytesProcessedExecNode::decode(buf) {
+            let request_context = request_context_from_proto(node.request_context);
+            let mut exec = BytesProcessedExec::new(
+                Arc::clone(&inputs[0]),
+                Arc::new(Box::new(track_bytes_processed)),
+            )
+            .fallback_to_new_context();
+            if let Some(ctx) = request_context {
+                exec = exec.with_request_context(Arc::new(ctx));
+            }
+            Ok(Arc::new(exec))
         } else if CayenneAccelerationExecNode::decode(buf).is_ok() {
             #[cfg(not(windows))]
             {
@@ -144,8 +150,11 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             let node = SchemaCastScanExecNode { schema: schema_buf };
             node.encode(buf)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        } else if node.as_any().downcast_ref::<BytesProcessedExec>().is_some() {
-            let node = BytesProcessedExecNode {};
+        } else if let Some(bytes_exec) = node.as_any().downcast_ref::<BytesProcessedExec>() {
+            let request_context = bytes_exec
+                .request_context()
+                .map(|ctx| request_context_to_proto(ctx));
+            let node = BytesProcessedExecNode { request_context };
             node.encode(buf)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
         } else if let Some(udtf_exec) = node.as_any().downcast_ref::<UdtfExec>() {
@@ -187,4 +196,47 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
     fn try_decode_udf(&self, name: &str, _buf: &[u8]) -> Result<Arc<ScalarUDF>> {
         self.runtime()?.df.ctx.udf(name)
     }
+}
+
+/// Serialize the essential fields of a [`RequestContext`] into a proto message.
+fn request_context_to_proto(ctx: &RequestContext) -> RequestContextProto {
+    let (trace_id, span_id) = ctx
+        .trace_parent()
+        .as_ref()
+        .map_or((None, None), |tp| {
+            (
+                Some(tp.trace_id.to_string()),
+                Some(tp.span_id.to_string()),
+            )
+        });
+
+    RequestContextProto {
+        protocol: ctx.protocol() as u32,
+        trace_id,
+        span_id,
+        authorization_header: ctx.authorization_header().map(str::to_string),
+    }
+}
+
+/// Reconstruct a [`RequestContext`] from its proto representation, if present.
+fn request_context_from_proto(proto: Option<RequestContextProto>) -> Option<RequestContext> {
+    let proto = proto?;
+
+    let protocol = Protocol::from(proto.protocol as u8);
+
+    let trace_parent = match (proto.trace_id, proto.span_id) {
+        (Some(tid), Some(sid)) => {
+            let trace_id = TraceId::from_hex(&tid).ok()?;
+            let span_id = SpanId::from_hex(&sid).ok()?;
+            Some(TraceParent { trace_id, span_id })
+        }
+        _ => None,
+    };
+
+    let ctx = RequestContextBuilder::new(protocol)
+        .with_trace_parent(trace_parent)
+        .with_authorization_header(proto.authorization_header)
+        .build();
+
+    Some(ctx)
 }
