@@ -124,8 +124,12 @@ pub fn is_retriable_error(error: &Error) -> bool {
         }
         Error::JsonDecodeError { status, .. } => {
             // JSON decode errors with server error status codes are often due to
-            // truncated responses from timeouts or server issues
-            status.is_server_error()
+            // truncated responses from timeouts or server issues.
+            // A non-JSON 403 is also retriable: it indicates a transient upstream
+            // proxy/abuse-detection block (e.g. GitHub's "Request forbidden by
+            // administrative rules"), not a genuine credentials/permissions error
+            // (which would return valid JSON).
+            status.is_server_error() || *status == StatusCode::FORBIDDEN
         }
         Error::ReqwestInternal { source } => {
             // Check for transient network/connection errors:
