@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use arrow::array::RecordBatch;
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::Expr;
+use regex::Regex;
 use tokio::sync::mpsc::Sender;
 
 use super::metadata::PartitionValue;
@@ -137,12 +138,15 @@ fn try_bucket_assignment(
 /// Parses the `N` from a partition key of the form `bucket(N, …)`.
 /// Returns `None` if the key does not match this pattern.
 fn parse_bucket_n(key: &str) -> Option<u16> {
-    let trimmed = key.trim();
-    let rest = trimmed.strip_prefix("bucket(")?;
-    let rest = rest.strip_suffix(')')?;
-    // Split on the first comma: "N, col_expr"
-    let (n_str, _) = rest.split_once(',')?;
-    n_str.trim().parse::<u16>().ok()
+    // Match optional surrounding parentheses, whitespace, then bucket(N, ...)
+    // Captures the number N in the first group
+    Regex::new(r"^\s*\(?\s*bucket\s*\(\s*(\d+)\s*,.*\)\s*\)?\s*$")
+        .ok()?
+        .captures(key)?
+        .get(1)?
+        .as_str()
+        .parse::<u16>()
+        .ok()
 }
 
 /// Converts a [`ScalarValue`] to `u16`, supporting common integer and unsigned types.
@@ -188,6 +192,8 @@ mod tests {
         assert_eq!(parse_bucket_n("bucket(3, c_nationkey)"), Some(3));
         assert_eq!(parse_bucket_n("bucket(16, col)"), Some(16));
         assert_eq!(parse_bucket_n("bucket( 5 , col )"), Some(5));
+        assert_eq!(parse_bucket_n("(bucket(10, p_partkey))"), Some(10));
+        assert_eq!(parse_bucket_n("( bucket(10 , p_partkey ))"), Some(10));
     }
 
     #[test]
@@ -226,8 +232,7 @@ mod tests {
         for (k, expected) in [(0, "exec_a"), (1, "exec_b"), (2, "exec_c"), (3, "exec_a")] {
             let mut pv = HashMap::new();
             pv.insert("bucket(3, col)".to_string(), k.to_string());
-            let result =
-                try_bucket_assignment(&pv, &[ScalarValue::Int32(Some(k))], &executors);
+            let result = try_bucket_assignment(&pv, &[ScalarValue::Int32(Some(k))], &executors);
             assert_eq!(result.as_deref(), Some(expected), "k={k}");
         }
     }
@@ -240,8 +245,7 @@ mod tests {
         for (k, expected) in [(0, "exec_a"), (1, "exec_b"), (2, "exec_a"), (5, "exec_b")] {
             let mut pv = HashMap::new();
             pv.insert("bucket(6, col)".to_string(), k.to_string());
-            let result =
-                try_bucket_assignment(&pv, &[ScalarValue::Int32(Some(k))], &executors);
+            let result = try_bucket_assignment(&pv, &[ScalarValue::Int32(Some(k))], &executors);
             assert_eq!(result.as_deref(), Some(expected), "k={k}");
         }
     }
@@ -252,7 +256,11 @@ mod tests {
         let mut pv = HashMap::new();
         pv.insert("region".to_string(), "us-east".to_string());
         assert_eq!(
-            try_bucket_assignment(&pv, &[ScalarValue::Utf8(Some("us-east".to_string()))], &executors),
+            try_bucket_assignment(
+                &pv,
+                &[ScalarValue::Utf8(Some("us-east".to_string()))],
+                &executors
+            ),
             None
         );
     }
@@ -291,7 +299,11 @@ mod tests {
             m
         };
 
-        let entries = vec![make_entry("bucket(3, col)", "0", ScalarValue::Int32(Some(0)))];
+        let entries = vec![make_entry(
+            "bucket(3, col)",
+            "0",
+            ScalarValue::Int32(Some(0)),
+        )];
 
         let result =
             select_least_loaded_executors(&partitions_by_executor, &senders, &entries).unwrap();
@@ -329,7 +341,11 @@ mod tests {
     fn test_select_no_executors() {
         let partitions_by_executor: HashMap<String, Vec<Expr>> = HashMap::new();
         let senders: HashMap<String, Sender<RecordBatch>> = HashMap::new();
-        let entries = vec![make_entry("bucket(3, col)", "0", ScalarValue::Int32(Some(0)))];
+        let entries = vec![make_entry(
+            "bucket(3, col)",
+            "0",
+            ScalarValue::Int32(Some(0)),
+        )];
 
         let result = select_least_loaded_executors(&partitions_by_executor, &senders, &entries);
         assert!(result.is_err());
