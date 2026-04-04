@@ -20,8 +20,8 @@ use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::{error::Result, physical_plan::projection::ProjectionExec};
 use datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
@@ -30,8 +30,8 @@ use runtime_datafusion::extension::bytes_processed::BytesProcessedExec;
 use runtime_datafusion::join_accumulator::ExactLeftAccumulator;
 use std::sync::Arc;
 
-use crate::provider::scan::IsCayenneAccelerationExec;
 use crate::provider::CayenneAccelerationExec;
+use crate::provider::scan::IsCayenneAccelerationExec;
 
 /// Optimizer rule that rewrites `HashJoinExec` nodes to use `ExactLeftAccumulator`
 /// when the probe side is a `CayenneAccelerationExec`.

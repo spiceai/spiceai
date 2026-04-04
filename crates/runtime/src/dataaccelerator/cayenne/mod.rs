@@ -26,6 +26,7 @@ use regex::Regex;
 use arrow::datatypes::DataType;
 use arrow_schema::Schema;
 use async_trait::async_trait;
+use data_components::delete::DeletionTableProviderAdapter;
 use data_components::poly::PolyTableProvider;
 use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
@@ -990,12 +991,27 @@ impl DataAccelerator for CayenneAccelerator {
             return Ok(BootstrapStatus::none());
         }
 
-        // If mode is FileCreate, delete the existing directory and metadata to start fresh
+        // If mode is FileCreate, snapshot existing data (if enabled) then delete the directory and metadata to start fresh
         if let Some(acceleration) = source.acceleration()
             && acceleration.mode == Mode::FileCreate
         {
             let path_buf = PathBuf::from(&dir_path);
             if path_buf.exists() {
+                let metadata_dir_for_snapshot =
+                    PathBuf::from(Self::resolve_metadata_dir(Some(acceleration)));
+                let snapshot_layout = runtime_acceleration::snapshot::AccelerationLayout::cayenne(
+                    metadata_dir_for_snapshot,
+                    path_buf.clone(),
+                );
+                super::snapshots::snapshot_before_recreate(
+                    acceleration,
+                    &source.name().to_string(),
+                    snapshot_layout,
+                    AccelerationEngine::Cayenne,
+                    Arc::new(arrow_schema::Schema::empty()),
+                )
+                .await;
+
                 tracing::warn!(
                     "Cayenne acceleration mode is 'file_create', removing existing directory: {}",
                     dir_path
@@ -1167,7 +1183,7 @@ impl DataAccelerator for CayenneAccelerator {
         if partition_by.is_empty() {
             // Non-partitioned table - wrap in PolyTableProvider for proper deletion/retention support
             // Wrap with upsert deduplication if needed based on on_conflict settings
-            let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+            let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
                 cayenne_table,
                 &cmd.options,
                 cmd.constraints.clone(),
@@ -1181,6 +1197,7 @@ impl DataAccelerator for CayenneAccelerator {
 
             let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
                 Arc::clone(&write_provider),
+                delete_provider,
                 write_provider,
                 schema_metadata,
             ));
@@ -1263,7 +1280,7 @@ impl DataAccelerator for CayenneAccelerator {
             );
 
             // Wrap with upsert deduplication if needed based on on_conflict settings
-            let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+            let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
                 partition_provider,
                 &cmd.options,
                 cmd.constraints.clone(),
@@ -1277,6 +1294,7 @@ impl DataAccelerator for CayenneAccelerator {
 
             let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
                 Arc::clone(&write_provider),
+                delete_provider,
                 write_provider,
                 schema_metadata,
             ));
@@ -1291,6 +1309,40 @@ impl DataAccelerator for CayenneAccelerator {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    async fn drop_table(
+        &self,
+        table_name: &str,
+        source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let dir_path = self.cayenne_data_dir(source).boxed()?;
+        let path_buf = PathBuf::from(&dir_path);
+        if path_buf.exists() {
+            tokio::fs::remove_dir_all(&path_buf).await.boxed()?;
+            tracing::info!(
+                "Removed Cayenne data directory '{dir_path}' for schema recreation (file_update mode)"
+            );
+        }
+
+        // Also drop the table from metadata catalog
+        if let Some(acceleration) = source.acceleration() {
+            let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
+            let metastore_type = acceleration
+                .params
+                .get("cayenne_metastore")
+                .map_or("sqlite", String::as_str);
+            if let Ok(catalog) = self
+                .get_or_create_catalog(&metadata_dir, metastore_type)
+                .await
+            {
+                let _ = catalog.drop_table(table_name).await;
+            }
+        }
+
+        // Recreate the data directory so the next create_external_table works
+        tokio::fs::create_dir_all(&path_buf).await.boxed()?;
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1548,9 +1600,13 @@ impl PartitionCreator for CayennePartitionCreator {
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
 
+        // Wrap in DeletionTableProviderAdapter so get_deletion_provider can find it
+        let adapted_table: Arc<dyn TableProvider> =
+            Arc::new(DeletionTableProviderAdapter::new(Arc::new(cayenne_table)));
+
         Ok(Partition {
             partition_values,
-            table_provider: Arc::new(cayenne_table),
+            table_provider: adapted_table,
         })
     }
 
@@ -1617,9 +1673,13 @@ impl PartitionCreator for CayennePartitionCreator {
                 .boxed()
                 .context(creator::InferringPartitionsSnafu)?;
 
+            // Wrap in DeletionTableProviderAdapter so get_deletion_provider can find it
+            let adapted_table: Arc<dyn TableProvider> =
+                Arc::new(DeletionTableProviderAdapter::new(Arc::new(cayenne_table)));
+
             result.push(Partition {
                 partition_values,
-                table_provider: Arc::new(cayenne_table),
+                table_provider: adapted_table,
             });
         }
 

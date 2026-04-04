@@ -45,10 +45,10 @@ limitations under the License.
 //! 5. Register delete files in catalog
 //! 6. Update in-memory caches for immediate query consistency
 
+use super::super::Error;
 use super::super::constants::{DELETION_CACHE_LOCK_POISONED, LISTING_TABLE_LOCK_POISONED};
 use super::super::deletion_strategy::PkDeletionStrategyWithCache;
 use super::super::utils::convert_to_u64_box;
-use super::super::Error;
 use super::vector_io::{DeletionIdentifier, DeletionVectorWriteSpec, DeletionVectorWriter};
 use crate::catalog::MetadataCatalog;
 use crate::metadata::TableMetadata;
@@ -64,11 +64,11 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::physical_plan::{collect, execute_stream};
 use datafusion_catalog::TableProvider;
-use datafusion_common::tree_node::TreeNode;
 use datafusion_common::DFSchema;
-use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_common::tree_node::TreeNode;
 use datafusion_expr::Expr;
-use datafusion_physical_expr::{create_physical_expr, PhysicalExpr};
+use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use futures::StreamExt;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex as TokioMutex;

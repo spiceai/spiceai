@@ -161,6 +161,8 @@ pub(crate) async fn get(Path((namespace, table)): Path<(NamespacePath, String)>)
     };
 
     let arrow_schema = table.schema();
+    let arrow_schema =
+        crate::datafusion::iceberg_ddl::coerce_arrow_schema_for_iceberg_v2(&arrow_schema);
     let arrow_schema = assign_field_ids(&arrow_schema);
     let iceberg_schema = match arrow_schema_to_schema(&arrow_schema) {
         Ok(schema) => schema,
@@ -639,5 +641,117 @@ mod tests {
             None,
             "Original schema should be returned for deeply nested lists"
         );
+    }
+
+    /// Helper: coerce + assign field IDs + convert to Iceberg schema (the full HTTP path).
+    fn coerce_and_convert(schema: &ArrowSchema) -> iceberg::spec::Schema {
+        let coerced = crate::datafusion::iceberg_ddl::coerce_arrow_schema_for_iceberg_v2(schema);
+        let with_ids = assign_field_ids(&coerced);
+        arrow_schema_to_schema(&with_ids).expect("Should convert to iceberg schema")
+    }
+
+    #[test]
+    fn test_coerce_timestamps_all_units_and_timezones() {
+        let schema = ArrowSchema::new(vec![
+            Field::new(
+                "ts_s",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
+                true,
+            ),
+            Field::new(
+                "ts_ms",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new(
+                "ts_ns",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                true,
+            ),
+            Field::new(
+                "ts_us",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new(
+                "ts_s_utc",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("UTC".into())),
+                true,
+            ),
+            Field::new(
+                "ts_ms_utc",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new(
+                "ts_ns_utc",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new(
+                "ts_us_utc",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+        ]);
+        coerce_and_convert(&schema);
+    }
+
+    #[test]
+    fn test_coerce_date_and_time_types() {
+        let schema = ArrowSchema::new(vec![
+            Field::new("d32", DataType::Date32, false),
+            Field::new("d64", DataType::Date64, true),
+            Field::new(
+                "t32_s",
+                DataType::Time32(arrow::datatypes::TimeUnit::Second),
+                true,
+            ),
+            Field::new(
+                "t32_ms",
+                DataType::Time32(arrow::datatypes::TimeUnit::Millisecond),
+                true,
+            ),
+            Field::new(
+                "t64_us",
+                DataType::Time64(arrow::datatypes::TimeUnit::Microsecond),
+                false,
+            ),
+            Field::new(
+                "t64_ns",
+                DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond),
+                true,
+            ),
+        ]);
+        coerce_and_convert(&schema);
+    }
+
+    #[test]
+    fn test_coerce_mixed_schema() {
+        // A realistic schema mixing types that need coercion with types that don't.
+        let schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
+                true,
+            ),
+            Field::new(
+                "updated_at",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new("event_date", DataType::Date64, true),
+            Field::new(
+                "event_time",
+                DataType::Time32(arrow::datatypes::TimeUnit::Millisecond),
+                true,
+            ),
+            Field::new("amount", DataType::Decimal128(10, 2), true),
+            Field::new("active", DataType::Boolean, false),
+            Field::new("data", DataType::Binary, true),
+        ]);
+        coerce_and_convert(&schema);
     }
 }

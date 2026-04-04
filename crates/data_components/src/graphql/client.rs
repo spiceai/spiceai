@@ -21,7 +21,7 @@ use tokio::sync::Semaphore;
 
 use super::{
     ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, ReqwestInternalSnafu, Result,
-    is_retriable_error,
+    is_gateway_error, is_retriable_error,
 };
 use arrow::{
     array::RecordBatch,
@@ -37,6 +37,7 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use snafu::ResultExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
@@ -860,7 +861,6 @@ impl GraphQLClient {
         self.schema.as_ref().map(Arc::clone)
     }
 
-    #[expect(clippy::too_many_lines)]
     pub(crate) async fn execute(
         &self,
         query: &GraphQLQuery,
@@ -869,6 +869,30 @@ impl GraphQLClient {
         cursor: Option<String>,
         error_checker: Option<ErrorChecker>,
         query_cost: Option<u32>,
+    ) -> Result<GraphQLQueryResult> {
+        self.execute_inner(
+            query,
+            schema,
+            limit,
+            cursor,
+            error_checker,
+            query_cost,
+            false,
+        )
+        .await
+    }
+
+    #[expect(clippy::too_many_lines)]
+    #[expect(clippy::too_many_arguments)]
+    async fn execute_inner(
+        &self,
+        query: &GraphQLQuery,
+        schema: Option<SchemaRef>,
+        limit: Option<usize>,
+        cursor: Option<String>,
+        error_checker: Option<ErrorChecker>,
+        query_cost: Option<u32>,
+        close_connection: bool,
     ) -> Result<GraphQLQueryResult> {
         // Validate cursor if present
         if let Some(ref cursor_val) = cursor {
@@ -924,6 +948,13 @@ impl GraphQLClient {
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 
         let mut request = self.client.post(self.endpoint.clone()).body(body);
+        if close_connection {
+            // Force HTTP/1.1 because Connection: close is a hop-by-hop header
+            // that is invalid in HTTP/2 and may be stripped or cause errors.
+            request = request
+                .version(reqwest::Version::HTTP_11)
+                .header(reqwest::header::CONNECTION, "close");
+        }
         request = request_with_auth(request, self.auth.as_ref());
 
         // Replace separated semaphore with RateController semaphore: https://github.com/spiceai/spiceai/issues/8636
@@ -1265,17 +1296,32 @@ impl GraphQLClient {
             .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
             .build();
 
+        let close_connection = Arc::new(AtomicBool::new(false));
+
         retry(backoff, || {
             let schema = schema.clone();
             let cursor = cursor.clone();
             let error_checker = error_checker.clone();
+            let should_close = close_connection.swap(false, Ordering::Relaxed);
+            let close_conn = Arc::clone(&close_connection);
 
             async move {
                 client
-                    .execute(query, schema, limit, cursor, error_checker, query_cost)
+                    .execute_inner(
+                        query,
+                        schema,
+                        limit,
+                        cursor,
+                        error_checker,
+                        query_cost,
+                        should_close,
+                    )
                     .await
                     .map_err(|e| {
                         if is_retriable_error(&e) {
+                            if is_gateway_error(&e) {
+                                close_conn.store(true, Ordering::Relaxed);
+                            }
                             tracing::warn!("Page fetch failed, will retry: {e}");
                             RetryError::transient(e)
                         } else {
@@ -2390,6 +2436,6 @@ mod tests {
         let query = "{\n  users {\n    name\n  }\n}";
         let result = super::format_query_with_context(query, 2, 3);
         assert!(result.contains("  users {"), "should show the error line");
-        assert!(result.contains("^"), "should show the caret marker");
+        assert!(result.contains('^'), "should show the caret marker");
     }
 }

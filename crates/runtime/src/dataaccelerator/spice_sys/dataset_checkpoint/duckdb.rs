@@ -188,6 +188,20 @@ impl DatasetCheckpoint {
             Ok(None)
         }
     }
+
+    pub(super) fn delete_duckdb(&self, pool: &Arc<DuckDbConnectionPool>) -> Result<()> {
+        let mut db_conn = Arc::clone(pool).connect_sync().map_err(Error::external)?;
+        let duckdb_conn = datafusion_table_providers::duckdb::DuckDB::duckdb_conn(&mut db_conn)
+            .map_err(Error::external)?
+            .get_underlying_conn_mut();
+
+        let delete = format!("DELETE FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?");
+        duckdb_conn
+            .execute(&delete, [&self.dataset_name])
+            .map_err(Error::external)?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -448,7 +462,10 @@ mod tests {
 
         // Update to a different refresh_sql
         checkpoint
-            .checkpoint(&schema_ref, Some("SELECT id FROM source_table WHERE id > 10"))
+            .checkpoint(
+                &schema_ref,
+                Some("SELECT id FROM source_table WHERE id > 10"),
+            )
             .await
             .expect("Failed to update refresh_sql");
 
