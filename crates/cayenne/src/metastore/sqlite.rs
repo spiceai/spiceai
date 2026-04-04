@@ -663,15 +663,22 @@ impl Drop for SqliteTransaction {
             // Best-effort rollback — fire and forget since we're in drop.
             // tokio_rusqlite::Connection::call sends a closure to the bg
             // thread; it will execute even after this Drop returns.
-            // We spawn a task to await the future properly.
-            tokio::spawn(async move {
-                let _ = conn
-                    .call(|conn| {
-                        let _ = conn.execute_batch("ROLLBACK");
-                        Ok::<_, rusqlite::Error>(())
-                    })
-                    .await;
-            });
+            // Guard against panicking if no Tokio runtime is active (e.g. during shutdown).
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = conn
+                        .call(|conn| {
+                            let _ = conn.execute_batch("ROLLBACK");
+                            Ok::<_, rusqlite::Error>(())
+                        })
+                        .await;
+                });
+            } else {
+                tracing::warn!(
+                    "SqliteTransaction dropped without commit/rollback and no Tokio runtime is active; \
+                     skipping best-effort rollback"
+                );
+            }
         }
     }
 }

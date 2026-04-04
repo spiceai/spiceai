@@ -608,18 +608,28 @@ impl Drop for TursoTransaction {
             // Spawn a best-effort async rollback while holding the owned guard.
             // The guard (and its mutex lock) is moved into the spawned task and
             // released after the ROLLBACK completes or fails.
-            tokio::spawn(async move {
-                tracing::debug!(
-                    "TursoTransaction dropped without explicit commit or rollback; \
-                     attempting auto-rollback"
-                );
-                if let Some(conn) = guard.as_ref() {
-                    if let Err(err) = conn.execute("ROLLBACK", ()).await {
-                        tracing::error!("Failed to auto-rollback TursoTransaction on drop: {err}");
+            // Guard against panicking if no Tokio runtime is active (e.g. during shutdown).
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    tracing::debug!(
+                        "TursoTransaction dropped without explicit commit or rollback; \
+                         attempting auto-rollback"
+                    );
+                    if let Some(conn) = guard.as_ref() {
+                        if let Err(err) = conn.execute("ROLLBACK", ()).await {
+                            tracing::error!(
+                                "Failed to auto-rollback TursoTransaction on drop: {err}"
+                            );
+                        }
                     }
-                }
-                // `guard` is dropped here, releasing the connection lock.
-            });
+                    // `guard` is dropped here, releasing the connection lock.
+                });
+            } else {
+                tracing::warn!(
+                    "TursoTransaction dropped without commit/rollback and no Tokio runtime is active; \
+                     skipping best-effort rollback"
+                );
+            }
         }
     }
 }
