@@ -19,7 +19,13 @@ pub mod cluster;
 use crate::tls::TlsConfig;
 use bytes::Bytes;
 use cluster::ClusterMetricsCollector;
-use http::{HeaderValue, Request, Response};
+use governor::{
+    RateLimiter,
+    clock::DefaultClock,
+    middleware::NoOpMiddleware,
+    state::{InMemoryState, NotKeyed},
+};
+use http::{HeaderValue, Request, Response, StatusCode};
 use http_body_util::Full;
 use hyper::{
     body::{self, Incoming},
@@ -39,6 +45,8 @@ use std::net::ToSocketAddrs;
 use std::{fmt::Debug, sync::Arc};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
+
+type DirectRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>;
 
 const PERCENTILES: [f64; 4] = [50.0, 90.0, 95.0, 99.0];
 
@@ -62,6 +70,7 @@ pub(crate) async fn start<A>(
     prometheus_registry: Option<prometheus::Registry>,
     tls_config: Option<Arc<TlsConfig>>,
     cluster_collector: Option<Arc<ClusterMetricsCollector>>,
+    rate_limiter: Option<Arc<DirectRateLimiter>>,
 ) -> Result<()>
 where
     A: ToSocketAddrs + Debug + Clone + Copy,
@@ -99,6 +108,7 @@ where
                     acceptor.clone(),
                     prometheus_registry.clone(),
                     cluster_collector.clone(),
+                    rate_limiter.clone(),
                 );
             }
             None => {
@@ -106,6 +116,7 @@ where
                     stream,
                     prometheus_registry.clone(),
                     cluster_collector.clone(),
+                    rate_limiter.clone(),
                 );
             }
         }
@@ -117,12 +128,14 @@ fn process_tls_tcp_stream(
     acceptor: TlsAcceptor,
     prometheus_registry: prometheus::Registry,
     cluster_collector: Option<Arc<ClusterMetricsCollector>>,
+    rate_limiter: Option<Arc<DirectRateLimiter>>,
 ) {
     tokio::spawn(async move {
         let stream = acceptor.accept(stream).await;
         match stream {
             Ok(stream) => {
-                serve_connection(stream, prometheus_registry, cluster_collector).await;
+                serve_connection(stream, prometheus_registry, cluster_collector, rate_limiter)
+                    .await;
             }
             Err(e) => {
                 tracing::debug!("Error accepting TLS connection: {e}");
@@ -135,11 +148,13 @@ fn process_tcp_stream(
     stream: TcpStream,
     prometheus_registry: prometheus::Registry,
     cluster_collector: Option<Arc<ClusterMetricsCollector>>,
+    rate_limiter: Option<Arc<DirectRateLimiter>>,
 ) {
     tokio::spawn(serve_connection(
         stream,
         prometheus_registry,
         cluster_collector,
+        rate_limiter,
     ));
 }
 
@@ -147,15 +162,23 @@ async fn serve_connection<S>(
     stream: S,
     prometheus_registry: prometheus::Registry,
     cluster_collector: Option<Arc<ClusterMetricsCollector>>,
+    rate_limiter: Option<Arc<DirectRateLimiter>>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let service = hyper::service::service_fn(move |req: Request<body::Incoming>| {
         let prometheus_registry = prometheus_registry.clone();
         let cluster_collector = cluster_collector.clone();
+        let rate_limiter = rate_limiter.clone();
         async move {
             Ok::<_, hyper::Error>(
-                handle_http_request(&prometheus_registry, cluster_collector.as_deref(), &req).await,
+                handle_http_request(
+                    &prometheus_registry,
+                    cluster_collector.as_deref(),
+                    rate_limiter.as_deref(),
+                    &req,
+                )
+                .await,
             )
         }
     });
@@ -187,11 +210,26 @@ fn parse_query_string(query: &str) -> HashMap<String, String> {
 async fn handle_http_request(
     prometheus_registry: &prometheus::Registry,
     cluster_collector: Option<&ClusterMetricsCollector>,
+    rate_limiter: Option<&DirectRateLimiter>,
     req: &Request<Incoming>,
 ) -> Response<Full<Bytes>> {
     let mut response = Response::new(if req.uri().path() == "/health" {
         "OK".into()
     } else {
+        // Check rate limit for metrics requests (not /health).
+        if let Some(Err(wait_time)) = rate_limiter.map(DirectRateLimiter::check) {
+            let retry_after = wait_time
+                .wait_time_from(wait_time.earliest_possible())
+                .as_secs();
+            let mut resp = Response::new(Full::from(format!(
+                "Too many requests. Retry after {retry_after} seconds.\n"
+            )));
+            *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+            resp.headers_mut()
+                .append(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+            return resp;
+        }
+
         // Check for ?scope=cluster query parameter
         let query_params = req
             .uri()

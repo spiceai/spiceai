@@ -60,6 +60,7 @@ use futures::{
     Stream, TryFutureExt,
     future::{join_all, try_join_all},
 };
+use governor::RateLimiter;
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
 use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
@@ -932,6 +933,7 @@ impl Runtime {
             }) => {
                 let fut = cluster::initialize_cluster_scheduler_future(
                     &self,
+                    endpoint_auth.clone(),
                     Arc::clone(executor_registry),
                     Arc::clone(peers),
                 )
@@ -1094,6 +1096,8 @@ impl Runtime {
         let metrics_endpoint = self.metrics_endpoint;
         let prometheus_registry = self.prometheus_registry.clone();
         let cloned_tls_config = tls_config.clone();
+        let metrics_rate_limiter =
+            Arc::new(RateLimiter::direct(self.rate_limits.cluster_metrics_limit));
 
         let metrics_future = self
             .start_runtime_task(METRICS_SERVER, None, async move {
@@ -1102,6 +1106,7 @@ impl Runtime {
                     prometheus_registry,
                     cloned_tls_config,
                     cluster_collector,
+                    Some(metrics_rate_limiter),
                 )
                 .await
                 .context(UnableToStartMetricsServerSnafu)

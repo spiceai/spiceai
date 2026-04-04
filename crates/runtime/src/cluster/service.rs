@@ -59,6 +59,13 @@ use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
 use std::collections::HashMap;
 use std::task::{Context, Poll};
+
+use governor::{
+    RateLimiter,
+    clock::DefaultClock,
+    middleware::NoOpMiddleware,
+    state::{InMemoryState, NotKeyed},
+};
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -169,6 +176,8 @@ impl ExecutorControlStreamRegistry {
     }
 }
 
+type DirectRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock, NoOpMiddleware>;
+
 /// Internal cluster service for scheduler-executor communication.
 pub struct ClusterServiceImpl {
     app: Arc<TokioRwLock<Option<Arc<App>>>>,
@@ -181,11 +190,17 @@ pub struct ClusterServiceImpl {
     metrics_reader: Option<MetricsReader>,
     /// Registry of connected executor streams for [`PollNow`] broadcasts.
     executor_streams: ExecutorControlStreamRegistry,
+    /// Separate rate limiter for metrics/observability RPCs.
+    /// This is intentionally independent of data-path rate limits
+    /// so that clients can still retrieve observability data even
+    /// when data requests are rate-limited.
+    metrics_rate_limiter: Arc<DirectRateLimiter>,
 }
 
 impl ClusterServiceImpl {
     /// Creates a new cluster service implementation.
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         app: Arc<TokioRwLock<Option<Arc<App>>>>,
         secrets: Arc<TokioRwLock<Secrets>>,
@@ -194,6 +209,7 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
+        metrics_rate_limiter: DirectRateLimiter,
     ) -> Self {
         Self {
             app,
@@ -204,6 +220,7 @@ impl ClusterServiceImpl {
             executor_registry,
             metrics_reader,
             executor_streams: ExecutorControlStreamRegistry::new(),
+            metrics_rate_limiter: Arc::new(metrics_rate_limiter),
         }
     }
 
@@ -222,6 +239,7 @@ impl ClusterServiceImpl {
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
         executor_streams: ExecutorControlStreamRegistry,
+        metrics_rate_limiter: DirectRateLimiter,
     ) -> Self {
         Self {
             app,
@@ -231,8 +249,8 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
-
             executor_streams,
+            metrics_rate_limiter: Arc::new(metrics_rate_limiter),
         }
     }
 
@@ -256,6 +274,23 @@ impl ClusterServiceImpl {
     #[must_use]
     pub fn executor_registry(&self) -> Arc<ExecutorRegistry> {
         Arc::clone(&self.executor_registry)
+    }
+
+    /// Checks the metrics-specific rate limiter and returns a gRPC `RESOURCE_EXHAUSTED`
+    /// status if the limit is exceeded.
+    fn check_metrics_rate_limit(&self) -> Result<(), Status> {
+        if let Err(wait_time) = self.metrics_rate_limiter.check() {
+            let retry_after_secs = wait_time
+                .wait_time_from(wait_time.earliest_possible())
+                .as_secs();
+            tracing::trace!(
+                "Cluster metrics request rate-limited, retry after {retry_after_secs}s"
+            );
+            return Err(Status::resource_exhausted(format!(
+                "Too many metrics requests. Retry after {retry_after_secs} seconds."
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -396,6 +431,8 @@ impl ClusterService for ClusterServiceImpl {
         &self,
         request: Request<GetTaskHistoryRequest>,
     ) -> Result<Response<GetTaskHistoryResponse>, Status> {
+        self.check_metrics_rate_limit()?;
+
         let request = request.into_inner();
 
         tracing::debug!(
@@ -436,6 +473,8 @@ impl ClusterService for ClusterServiceImpl {
         &self,
         _request: Request<GetMetricsRequest>,
     ) -> Result<Response<GetMetricsResponse>, Status> {
+        self.check_metrics_rate_limit()?;
+
         // Collect local OTLP metrics and return as protobuf bytes
         let otlp_metrics = self
             .metrics_reader
