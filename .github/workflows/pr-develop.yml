@@ -52,6 +52,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up spiceio
+        if: runner.os == 'macOS'
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
         with:
@@ -62,6 +63,7 @@ jobs:
           region: us-west-1
 
       - name: Set up sccache
+        if: runner.os == 'macOS'
         uses: ./.github/actions/setup-sccache
         with:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
@@ -88,10 +90,11 @@ jobs:
           BRANCH: spiceai-52
 
       - name: Show sccache stats
+        if: runner.os == 'macOS'
         run: sccache --show-stats
 
       - name: Kill spiceio
-        if: always() && steps.setup-spiceio.outputs.pid != ''
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
       - name: Upload spiceio logs
@@ -115,6 +118,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up spiceio
+        if: runner.os == 'macOS'
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
         with:
@@ -125,6 +129,7 @@ jobs:
           region: us-west-1
 
       - name: Set up sccache
+        if: runner.os == 'macOS'
         uses: ./.github/actions/setup-sccache
         with:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
@@ -156,6 +161,7 @@ jobs:
         run: cargo build -p testoperator --all-features --locked
 
       - name: Show sccache stats
+        if: runner.os == 'macOS'
         run: sccache --show-stats
 
       - name: Check if Cargo.lock is updated
@@ -168,7 +174,7 @@ jobs:
           fi
 
       - name: Kill spiceio
-        if: always() && steps.setup-spiceio.outputs.pid != ''
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
       - name: Upload spiceio logs
