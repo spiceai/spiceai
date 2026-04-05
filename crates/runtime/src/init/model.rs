@@ -216,6 +216,9 @@ impl Runtime {
                 let mut llm_map = self.completion_llms.write().await;
                 llm_map.remove(&m.name);
                 drop(llm_map);
+                let mut responses_map = self.responses_llms.write().await;
+                responses_map.remove(&m.name);
+                drop(responses_map);
                 let mut rc_map = self.model_rate_controllers.write().await;
                 rc_map.remove(&m.name);
             }
