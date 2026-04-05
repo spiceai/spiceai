@@ -1766,15 +1766,24 @@ mod tests {
     fn timestamp_with_tz_maps_to_timestamptz() {
         // Microsecond with UTC timezone — common in Cayenne retention columns.
         let dt = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
-        assert_eq!(arrow_datatype_to_sql(&dt).unwrap(), "TIMESTAMP WITH TIME ZONE");
+        assert_eq!(
+            arrow_datatype_to_sql(&dt).unwrap(),
+            "TIMESTAMP WITH TIME ZONE"
+        );
 
         // Nanosecond with UTC timezone.
         let dt = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
-        assert_eq!(arrow_datatype_to_sql(&dt).unwrap(), "TIMESTAMP WITH TIME ZONE");
+        assert_eq!(
+            arrow_datatype_to_sql(&dt).unwrap(),
+            "TIMESTAMP WITH TIME ZONE"
+        );
 
         // Second with non-UTC timezone.
         let dt = DataType::Timestamp(TimeUnit::Second, Some("+05:30".into()));
-        assert_eq!(arrow_datatype_to_sql(&dt).unwrap(), "TIMESTAMP WITH TIME ZONE");
+        assert_eq!(
+            arrow_datatype_to_sql(&dt).unwrap(),
+            "TIMESTAMP WITH TIME ZONE"
+        );
     }
 
     #[test]
