@@ -947,14 +947,21 @@ impl GraphQLClient {
 
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 
-        let mut request = self.client.post(self.endpoint.clone()).body(body);
-        if close_connection {
-            // Force HTTP/1.1 because Connection: close is a hop-by-hop header
-            // that is invalid in HTTP/2 and may be stripped or cause errors.
-            request = request
-                .version(reqwest::Version::HTTP_11)
-                .header(reqwest::header::CONNECTION, "close");
-        }
+        // When close_connection is true (after a gateway error like 502), build a
+        // fresh reqwest::Client so the retry goes out on a new TCP connection instead
+        // of reusing the (possibly broken) pooled connection. Preserve user-agent and
+        // timeouts to match the original client — GitHub requires a User-Agent header.
+        let http_client = if close_connection {
+            reqwest::Client::builder()
+                .user_agent(util::spiceai_user_agent())
+                .pool_max_idle_per_host(0)
+                .build()
+                .context(ReqwestInternalSnafu)?
+        } else {
+            self.client.clone()
+        };
+
+        let mut request = http_client.post(self.endpoint.clone()).body(body);
         request = request_with_auth(request, self.auth.as_ref());
 
         // Replace separated semaphore with RateController semaphore: https://github.com/spiceai/spiceai/issues/8636
@@ -1003,9 +1010,20 @@ impl GraphQLClient {
                     e,
                     preview
                 );
+
+                // For server errors returning HTML (e.g., upstream gateway/proxy errors),
+                // provide a clear message instead of exposing the JSON parse error.
+                let detail = if status.is_server_error() {
+                    "The server returned a non-JSON response (likely an upstream proxy error). This is a temporary issue and will be retried automatically. If the problem persists, contact support or check the API status page.".to_string()
+                } else {
+                    format!(
+                        "The response could not be parsed as JSON. Technical details: {e}"
+                    )
+                };
+
                 Error::JsonDecodeError {
                     status,
-                    error: e.to_string(),
+                    detail,
                     response_preview: preview,
                 }
             })?;

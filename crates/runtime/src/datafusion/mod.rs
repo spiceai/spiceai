@@ -569,7 +569,7 @@ pub struct DataFusion {
     /// Only used in scheduler mode.
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
     /// Executor registry for distributed write forwarding (scheduler mode only).
-    pub(crate) executor_registry: Option<Arc<ExecutorRegistry>>,
+    pub executor_registry: Option<Arc<ExecutorRegistry>>,
 }
 
 impl std::fmt::Debug for DataFusion {
