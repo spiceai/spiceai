@@ -278,8 +278,8 @@ impl ExecutionPlan for PartitionerExec {
                             ))?;
                         }
                         Err(join_err) => {
-                            tracing::info!(
-                                "Partition write task failed (task panicked or was cancelled): {join_err}; rows_received_so_far={row_count}"
+                            tracing::error!(
+                                "Partition write task failed (task panicked or was cancelled): {join_err}"
                             );
                             return Err(DataFusionError::Execution(format!(
                                 "Partition write task failed (task panicked or was cancelled): {join_err}"

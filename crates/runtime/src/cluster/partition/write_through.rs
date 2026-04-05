@@ -976,32 +976,84 @@ async fn forward_batches_to_executor(
         }
     };
 
-    if let Err(e) = response.into_inner().try_collect::<Vec<_>>().await {
-        encoder_handle.abort();
-        tracing::error!(
-            executor = %executor_id,
-            table = %table_label,
-            elapsed_ms = elapsed_ms(),
-            batches = batches_forwarded.load(Ordering::Relaxed),
-            keepalives = keepalives_sent.load(Ordering::Relaxed),
-            error = %e,
-            "Executor `DoPut` acknowledgement failed",
-        );
-        return Err(Error::DoPutAck { source: e });
-    }
-
-    tracing::info!(
-        executor = %executor_id,
-        table = %table_label,
-        elapsed_ms = elapsed_ms(),
-        batches = batches_forwarded.load(Ordering::Relaxed),
-        keepalives = keepalives_sent.load(Ordering::Relaxed),
-        "Executor forwarding task completed successfully",
+    // Drive the encoder task and the DoPut response stream concurrently.
+    //
+    // The executor sends PutResult acks as it receives and commits each batch,
+    // and closes the response stream only after it has processed everything.
+    // The encoder task encodes RecordBatches from `rx` into FlightData and sends
+    // them into `flight_rx`; it signals completion (or an error) via
+    // `encode_result_tx` once `rx` is fully drained.
+    //
+    // We must wait for BOTH to finish before declaring success:
+    //  - The encoder must fully drain `rx` and close `flight_rx` so the executor
+    //    receives every batch — if we dropped `flight_rx` early, the encoder's
+    //    remaining sends would fail and those batches would be silently lost.
+    //  - The response stream must be fully consumed so we know the executor has
+    //    committed every batch it received.
+    //
+    // `join!` runs both futures concurrently on the same task. Dropping either
+    // future here would abort the other, so we let join! drive them to completion.
+    let (encode_result, ack_result) = tokio::join!(
+        async {
+            match encode_result_rx.await {
+                Ok(result) => result.map_err(|message| Error::Encode { message }),
+                Err(_) => {
+                    // The sender was dropped without sending a result, which
+                    // means the encoder task was aborted or panicked.
+                    Err(Error::Encode {
+                        message: "encoder task ended unexpectedly without sending a result"
+                            .to_string(),
+                    })
+                }
+            }
+        },
+        async {
+            response
+                .into_inner()
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|e| Error::DoPutAck { source: e })
+        },
     );
 
-    match encode_result_rx.await {
-        Ok(Ok(())) | Err(_) => Ok(()),
-        Ok(Err(message)) => Err(Error::Encode { message }),
+    match (encode_result, ack_result) {
+        (Ok(()), Ok(_)) => {
+            tracing::info!(
+                executor = %executor_id,
+                table = %table_label,
+                elapsed_ms = elapsed_ms(),
+                batches = batches_forwarded.load(Ordering::Relaxed),
+                keepalives = keepalives_sent.load(Ordering::Relaxed),
+                "Executor forwarding task completed successfully",
+            );
+            Ok(())
+        }
+        (Err(e), _) => {
+            encoder_handle.abort();
+            tracing::error!(
+                executor = %executor_id,
+                table = %table_label,
+                elapsed_ms = elapsed_ms(),
+                batches = batches_forwarded.load(Ordering::Relaxed),
+                keepalives = keepalives_sent.load(Ordering::Relaxed),
+                error = %e,
+                "Executor forwarding encoder failed",
+            );
+            Err(e)
+        }
+        (_, Err(e)) => {
+            encoder_handle.abort();
+            tracing::error!(
+                executor = %executor_id,
+                table = %table_label,
+                elapsed_ms = elapsed_ms(),
+                batches = batches_forwarded.load(Ordering::Relaxed),
+                keepalives = keepalives_sent.load(Ordering::Relaxed),
+                error = %e,
+                "Executor `DoPut` acknowledgement failed",
+            );
+            Err(e)
+        }
     }
 }
 
