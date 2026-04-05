@@ -583,7 +583,7 @@ async fn handle_table_definition_options(
                          Set `access: read_write_create` on the catalog to enable DDL.",
                     )));
                 }
-                let drop_sql = format!("DROP TABLE {path}");
+                let drop_sql = format!("DROP TABLE {}", path.to_quoted_string());
                 tracing::info!("DoPut: dropping existing table `{path}` for if_exists=Replace");
                 datafusion
                     .ctx
@@ -650,7 +650,7 @@ async fn auto_create_table(
     let create_sql = if let Some(like_table) = opts.ingest_options.get("create_like_table") {
         build_create_like_table_sql(datafusion, path, like_table).await?
     } else {
-        arrow_schema_to_create_table_sql(path, incoming_schema)
+        arrow_schema_to_create_table_sql(path, incoming_schema)?
     };
 
     tracing::info!("DoPut: auto-creating table `{path}` via DDL: {create_sql}");
@@ -686,7 +686,7 @@ async fn build_create_like_table_sql(
             ))
         })?;
 
-    let mut sql = arrow_schema_to_create_table_sql(target_path, &source_schema);
+    let mut sql = arrow_schema_to_create_table_sql(target_path, &source_schema)?;
 
     // Copy partition expression from source table if it has one.
     // Propagate errors — silently omitting a partition expression would cause
@@ -708,53 +708,63 @@ async fn build_create_like_table_sql(
 }
 
 /// Convert an Arrow schema to a `CREATE TABLE IF NOT EXISTS` SQL statement.
-fn arrow_schema_to_create_table_sql(path: &TableReference, schema: &Schema) -> String {
-    let columns: Vec<String> = schema
+fn arrow_schema_to_create_table_sql(
+    path: &TableReference,
+    schema: &Schema,
+) -> Result<String, Status> {
+    let columns: Result<Vec<String>, Status> = schema
         .fields()
         .iter()
         .map(|field| {
             let col_name = quote_identifier(field.name());
-            let col_type = arrow_type_to_sql(field.data_type());
+            let col_type = arrow_type_to_sql(field.data_type())?;
             let nullable = if field.is_nullable() { "" } else { " NOT NULL" };
-            format!("{col_name} {col_type}{nullable}")
+            Ok(format!("{col_name} {col_type}{nullable}"))
         })
         .collect();
     let quoted_path = path.to_quoted_string();
-    format!(
+    Ok(format!(
         "CREATE TABLE IF NOT EXISTS {quoted_path} ({})",
-        columns.join(", ")
-    )
+        columns?.join(", ")
+    ))
 }
 
 /// Map Arrow data types to SQL type names for CREATE TABLE DDL.
-fn arrow_type_to_sql(data_type: &DataType) -> String {
+///
+/// Unsigned integer types are mapped to the next-larger signed SQL type to
+/// preserve the full value range (e.g. `UInt32` -> `BIGINT`). Unsupported
+/// Arrow types return an error rather than silently falling back to `TEXT`.
+fn arrow_type_to_sql(data_type: &DataType) -> Result<String, Status> {
     match data_type {
-        DataType::Boolean => "BOOLEAN".to_string(),
-        DataType::Int8 | DataType::UInt8 => "TINYINT".to_string(),
-        DataType::Int16 | DataType::UInt16 => "SMALLINT".to_string(),
-        DataType::Int32 | DataType::UInt32 => "INTEGER".to_string(),
-        DataType::Int64 | DataType::UInt64 => "BIGINT".to_string(),
-        DataType::Float16 => "REAL".to_string(),
-        DataType::Float32 => "REAL".to_string(),
-        DataType::Float64 => "DOUBLE".to_string(),
-        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => {
-            format!("DECIMAL({p},{s})")
-        }
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "TEXT".to_string(),
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "BYTEA".to_string(),
-        DataType::Date32 | DataType::Date64 => "DATE".to_string(),
-        DataType::Timestamp(_, Some(_)) => "TIMESTAMPTZ".to_string(),
-        DataType::Timestamp(_, None) => "TIMESTAMP".to_string(),
-        DataType::Time32(_) | DataType::Time64(_) => "TIME".to_string(),
-        DataType::Duration(_) => "BIGINT".to_string(),
-        DataType::Interval(_) => "INTERVAL".to_string(),
-        DataType::FixedSizeBinary(_) => "BYTEA".to_string(), // no fixed-size binary in SQL; use BYTEA
+        DataType::Boolean => Ok("BOOLEAN".to_string()),
+        DataType::Int8 => Ok("TINYINT".to_string()),
+        DataType::UInt8 => Ok("SMALLINT".to_string()),
+        DataType::Int16 => Ok("SMALLINT".to_string()),
+        DataType::UInt16 => Ok("INTEGER".to_string()),
+        DataType::Int32 => Ok("INTEGER".to_string()),
+        DataType::UInt32 => Ok("BIGINT".to_string()),
+        DataType::Int64 => Ok("BIGINT".to_string()),
+        DataType::UInt64 => Ok("DECIMAL(20,0)".to_string()),
+        DataType::Float16 => Ok("REAL".to_string()),
+        DataType::Float32 => Ok("REAL".to_string()),
+        DataType::Float64 => Ok("DOUBLE".to_string()),
+        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => Ok(format!("DECIMAL({p},{s})")),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok("TEXT".to_string()),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => Ok("BYTEA".to_string()),
+        DataType::Date32 | DataType::Date64 => Ok("DATE".to_string()),
+        DataType::Timestamp(_, Some(_)) => Ok("TIMESTAMPTZ".to_string()),
+        DataType::Timestamp(_, None) => Ok("TIMESTAMP".to_string()),
+        DataType::Time32(_) | DataType::Time64(_) => Ok("TIME".to_string()),
+        DataType::Duration(_) => Ok("BIGINT".to_string()),
+        DataType::Interval(_) => Ok("INTERVAL".to_string()),
+        DataType::FixedSizeBinary(_) => Ok("BYTEA".to_string()),
         DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
-            let inner = arrow_type_to_sql(field.data_type());
-            format!("{inner}[]")
+            let inner = arrow_type_to_sql(field.data_type())?;
+            Ok(format!("{inner}[]"))
         }
-        // Fallback: use TEXT for unsupported types
-        _ => "TEXT".to_string(),
+        _ => Err(Status::invalid_argument(format!(
+            "Unsupported Arrow data type for auto-created table: {data_type}"
+        ))),
     }
 }
 
@@ -890,7 +900,7 @@ mod tests {
             Field::new("score", DataType::Float64, true),
         ]);
         let path = TableReference::full("catalog", "schema", "my_table");
-        let sql = arrow_schema_to_create_table_sql(&path, &schema);
+        let sql = arrow_schema_to_create_table_sql(&path, &schema).expect("should succeed");
         assert_eq!(
             sql,
             r#"CREATE TABLE IF NOT EXISTS catalog.schema.my_table ("id" BIGINT NOT NULL, "name" TEXT, "score" DOUBLE)"#
@@ -923,7 +933,7 @@ mod tests {
             ),
         ]);
         let path = TableReference::bare("test");
-        let sql = arrow_schema_to_create_table_sql(&path, &schema);
+        let sql = arrow_schema_to_create_table_sql(&path, &schema).expect("should succeed");
         assert!(sql.contains("\"col_bool\" BOOLEAN"));
         assert!(sql.contains("\"col_i8\" TINYINT"));
         assert!(sql.contains("\"col_i16\" SMALLINT"));
@@ -946,7 +956,7 @@ mod tests {
             Field::new("optional", DataType::Int32, true),
         ]);
         let path = TableReference::bare("t");
-        let sql = arrow_schema_to_create_table_sql(&path, &schema);
+        let sql = arrow_schema_to_create_table_sql(&path, &schema).expect("should succeed");
         assert!(sql.contains("\"required\" INTEGER NOT NULL"));
         assert!(sql.contains("\"optional\" INTEGER"));
         // "optional" should NOT contain "NOT NULL"
@@ -961,7 +971,7 @@ mod tests {
             true,
         )]);
         let path = TableReference::bare("t");
-        let sql = arrow_schema_to_create_table_sql(&path, &schema);
+        let sql = arrow_schema_to_create_table_sql(&path, &schema).expect("should succeed");
         assert!(sql.contains("\"tags\" TEXT[]"));
     }
 
@@ -969,19 +979,43 @@ mod tests {
 
     #[test]
     fn test_arrow_type_to_sql_utf8_variants() {
-        assert_eq!(arrow_type_to_sql(&DataType::Utf8), "TEXT");
-        assert_eq!(arrow_type_to_sql(&DataType::LargeUtf8), "TEXT");
-        assert_eq!(arrow_type_to_sql(&DataType::Utf8View), "TEXT");
+        assert_eq!(arrow_type_to_sql(&DataType::Utf8).unwrap(), "TEXT");
+        assert_eq!(arrow_type_to_sql(&DataType::LargeUtf8).unwrap(), "TEXT");
+        assert_eq!(arrow_type_to_sql(&DataType::Utf8View).unwrap(), "TEXT");
+    }
+
+    #[test]
+    fn test_arrow_type_to_sql_unsigned_integers() {
+        // UInt types should map to the next-larger signed type to preserve full value range
+        assert_eq!(arrow_type_to_sql(&DataType::UInt8).unwrap(), "SMALLINT");
+        assert_eq!(arrow_type_to_sql(&DataType::UInt16).unwrap(), "INTEGER");
+        assert_eq!(arrow_type_to_sql(&DataType::UInt32).unwrap(), "BIGINT");
+        assert_eq!(
+            arrow_type_to_sql(&DataType::UInt64).unwrap(),
+            "DECIMAL(20,0)"
+        );
+    }
+
+    #[test]
+    fn test_arrow_type_to_sql_unsupported_returns_error() {
+        // Unsupported types should return an error, not silently fall back to TEXT
+        let result = arrow_type_to_sql(&DataType::Null);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().message().to_string();
+        assert!(
+            err_msg.contains("Unsupported Arrow data type"),
+            "got: {err_msg}"
+        );
     }
 
     #[test]
     fn test_arrow_type_to_sql_decimal() {
         assert_eq!(
-            arrow_type_to_sql(&DataType::Decimal128(10, 2)),
+            arrow_type_to_sql(&DataType::Decimal128(10, 2)).unwrap(),
             "DECIMAL(10,2)"
         );
         assert_eq!(
-            arrow_type_to_sql(&DataType::Decimal256(38, 0)),
+            arrow_type_to_sql(&DataType::Decimal256(38, 0)).unwrap(),
             "DECIMAL(38,0)"
         );
     }
@@ -989,14 +1023,15 @@ mod tests {
     #[test]
     fn test_arrow_type_to_sql_timestamp_tz() {
         assert_eq!(
-            arrow_type_to_sql(&DataType::Timestamp(TimeUnit::Microsecond, None)),
+            arrow_type_to_sql(&DataType::Timestamp(TimeUnit::Microsecond, None)).unwrap(),
             "TIMESTAMP"
         );
         assert_eq!(
             arrow_type_to_sql(&DataType::Timestamp(
                 TimeUnit::Microsecond,
                 Some("UTC".into())
-            )),
+            ))
+            .unwrap(),
             "TIMESTAMPTZ"
         );
     }

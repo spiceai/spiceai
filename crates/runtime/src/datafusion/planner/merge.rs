@@ -24,9 +24,12 @@ limitations under the License.
 //! WHEN MATCHED THEN UPDATE SET col1 = expr1, ...
 //! ```
 //!
-//! Both source and target must be Cayenne catalog tables. Single-node
-//! execution only (distributed mode returns an error). Target must not
+//! Both source and target must be Cayenne catalog tables. Target must not
 //! have `primary_key` or `on_conflict` configured.
+//!
+//! In single-node mode, a local `CayenneMergeNode` is produced.
+//! In distributed (scheduler) mode, a `DistributedCayenneMergeNode` is
+//! produced which forwards the original SQL to connected executors.
 
 use std::sync::Arc;
 
@@ -45,11 +48,13 @@ use super::{PlannerContext, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, is_caye
 use crate::config::ClusterRole;
 use crate::datafusion::cayenne_ddl::logical_nodes::DistributedCayenneMergeNode;
 
-/// Plan a `MERGE INTO` statement for local Cayenne execution.
+/// Plan a `MERGE INTO` statement for Cayenne execution.
 ///
 /// Parses the AST, validates phase 1 constraints, normalizes the ON clause
-/// into bare `(target_col, source_col)` key pairs, and produces a
-/// `CayenneMergeNode` extension node.
+/// into bare `(target_col, source_col)` key pairs, and produces either a
+/// local `CayenneMergeNode` or (when running on the scheduler in distributed
+/// mode) a `DistributedCayenneMergeNode` that forwards the original SQL to
+/// connected executors.
 pub(super) async fn plan_merge(
     statement: Statement,
     session: &SessionState,
