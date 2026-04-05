@@ -21,7 +21,6 @@ use app::AppBuilder;
 #[cfg(feature = "postgres")]
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::postgresconn::PostgresConnection;
 use runtime::Runtime;
-#[cfg(feature = "postgres")]
 use runtime::{
     component::dataset::Dataset as RuntimeDataset,
     dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
@@ -260,7 +259,6 @@ async fn initialize_runtime_with_mode(
     Ok(Arc::try_unwrap(rt).unwrap_or_else(|arc| (*arc).clone()))
 }
 
-#[cfg(feature = "postgres")]
 async fn wait_for_checkpoint(
     dataset: &RuntimeDataset,
     timeout_secs: u64,
@@ -406,7 +404,7 @@ async fn init_csv_runtime(
     });
 
     let app = AppBuilder::new("test_file_update_csv")
-        .with_dataset(ds)
+        .with_dataset(ds.clone())
         .build();
 
     configure_test_datafusion();
@@ -421,6 +419,28 @@ async fn init_csv_runtime(
     }
 
     runtime_ready_check(&rt).await;
+
+    // Wait for the file_update checkpoint to be written so the next phase's schema
+    // detection has the previous schema available.  The checkpoint is stored via the
+    // accelerator's own metadata mechanism (e.g. SQLite for Cayenne) — if the
+    // current engine doesn't support it, skip (best-effort).
+    let app_ref = rt.app();
+    let app_lock = app_ref.read().await;
+    if let Some(app) = app_lock.as_ref()
+        && let Ok(runtime_dataset) =
+            runtime::component::dataset::builder::DatasetBuilder::try_from(ds)
+                .map_err(anyhow::Error::from)
+                .and_then(|b| {
+                    b.with_app(Arc::clone(app))
+                        .with_runtime(Arc::clone(&rt))
+                        .build()
+                        .map_err(anyhow::Error::from)
+                })
+    {
+        // Ignore errors (e.g. UnsupportedEngine for Cayenne without sqlite feature)
+        let _ = wait_for_checkpoint(&runtime_dataset, 30).await;
+    }
+    drop(app_lock);
 
     Ok(Arc::try_unwrap(rt).unwrap_or_else(|arc| (*arc).clone()))
 }
