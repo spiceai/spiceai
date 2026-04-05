@@ -598,14 +598,19 @@ impl ClusterService for ClusterServiceImpl {
                 );
             })
             .map_err(|e| Status::internal(format!("Failed to create Flight SQL client: {e}")))?;
-        {
-            let mut flight_client_registry =
-                self.executor_registry.flight_sql_clients.write().await;
-            flight_client_registry.insert(executor_id.to_string(), client.clone());
-        }
 
         // Forward `CREATE TABLE IF NOT EXISTS` DDL to executor, including PARTITION BY
         // when the table has a partition expression in the Cayenne metadata catalog.
+        //
+        // IMPORTANT: The executor client is intentionally NOT yet registered in
+        // `flight_sql_clients` at this point. Registering it before the DDL is applied
+        // would open a race: a concurrent write-through could see the executor in the
+        // registry, open a DoPut channel to it, and fail immediately because the target
+        // table does not yet exist on the executor. That DoPut failure would close the
+        // sender channel, causing the routing loop to break out early and silently drop
+        // all remaining batches in the stream. By deferring registration until after DDL
+        // and partition allocation are complete the executor is only visible to writers
+        // once it is fully ready to receive data.
         #[cfg(not(windows))]
         for table_ref in discover_cayenne_tables(&self.datafusion).await {
             if let Some(table) = self.datafusion.get_table(&table_ref).await {
@@ -674,6 +679,15 @@ impl ClusterService for ClusterServiceImpl {
                     tracing::warn!("Failed to allocate partitions to executor {executor_id}: {e}");
                 }
             }
+        }
+
+        // Register the executor client only after DDL has been applied and partitions
+        // have been allocated. This ensures the executor is fully ready to receive
+        // write-through traffic before it becomes visible to the routing loop.
+        {
+            let mut flight_client_registry =
+                self.executor_registry.flight_sql_clients.write().await;
+            flight_client_registry.insert(executor_id.to_string(), client);
         }
 
         Ok(Response::new(AllocateInitialPartitionsResponse {
