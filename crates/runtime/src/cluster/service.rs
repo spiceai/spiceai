@@ -62,7 +62,7 @@ use std::task::{Context, Poll};
 
 use governor::{
     RateLimiter,
-    clock::DefaultClock,
+    clock::{Clock, DefaultClock},
     middleware::NoOpMiddleware,
     state::{InMemoryState, NotKeyed},
 };
@@ -281,14 +281,19 @@ impl ClusterServiceImpl {
     fn check_metrics_rate_limit(&self) -> Result<(), Status> {
         if let Err(wait_time) = self.metrics_rate_limiter.check() {
             let retry_after_secs = wait_time
-                .wait_time_from(wait_time.earliest_possible())
+                .wait_time_from(DefaultClock::default().now())
                 .as_secs();
             tracing::trace!(
                 "Cluster metrics request rate-limited, retry after {retry_after_secs}s"
             );
-            return Err(Status::resource_exhausted(format!(
+            let mut status = Status::resource_exhausted(format!(
                 "Too many metrics requests. Retry after {retry_after_secs} seconds."
-            )));
+            ));
+            if let Ok(val) = tonic::metadata::MetadataValue::try_from(&retry_after_secs.to_string())
+            {
+                status.metadata_mut().insert("retry-after", val);
+            }
+            return Err(status);
         }
         Ok(())
     }

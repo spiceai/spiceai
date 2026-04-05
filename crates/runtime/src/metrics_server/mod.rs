@@ -21,7 +21,7 @@ use bytes::Bytes;
 use cluster::ClusterMetricsCollector;
 use governor::{
     RateLimiter,
-    clock::DefaultClock,
+    clock::{Clock, DefaultClock},
     middleware::NoOpMiddleware,
     state::{InMemoryState, NotKeyed},
 };
@@ -219,14 +219,17 @@ async fn handle_http_request(
         // Check rate limit for metrics requests (not /health).
         if let Some(Err(wait_time)) = rate_limiter.map(DirectRateLimiter::check) {
             let retry_after = wait_time
-                .wait_time_from(wait_time.earliest_possible())
+                .wait_time_from(DefaultClock::default().now())
                 .as_secs();
             let mut resp = Response::new(Full::from(format!(
                 "Too many requests. Retry after {retry_after} seconds.\n"
             )));
             *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-            resp.headers_mut()
-                .append(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+            let headers = resp.headers_mut();
+            headers.append(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+            if let Ok(val) = HeaderValue::from_str(&retry_after.to_string()) {
+                headers.append("retry-after", val);
+            }
             return resp;
         }
 
