@@ -493,10 +493,11 @@ impl ExecutionPlan for CayenneCreateTableExec {
             let metadata_table_name = format!("{df_schema_name}/{table_name}");
 
             // Check if table already exists via the metadata catalog
-            let exists = metadata_catalog
+            let existing_table_metadata = metadata_catalog
                 .get_table(&metadata_table_name)
                 .await
-                .is_ok();
+                .ok();
+            let exists = existing_table_metadata.is_some();
 
             if exists {
                 if if_not_exists {
@@ -520,21 +521,146 @@ impl ExecutionPlan for CayenneCreateTableExec {
                         };
 
                     // Open and register the existing table provider if not already present.
+                    // IMPORTANT: for partitioned tables, we must register a PartitionTableProvider
+                    // (not a plain CayenneTableProvider) so that DoPut writes are routed correctly
+                    // through PartitionerExec. Registering a plain provider would cause all writes
+                    // to bypass partition routing and write to a single non-partitioned sub-table.
                     if !schema_provider.table_exist(&table_name) {
-                        let builder = CayenneTableProviderBuilder::new(
-                            Arc::clone(&metadata_catalog),
-                            Arc::clone(&runtime_env),
-                        );
-                        if let Ok(provider) = builder.open(&metadata_table_name).await {
-                            let provider = Arc::new(provider);
-                            let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
-                            let wrapped_provider: Arc<dyn datafusion::catalog::TableProvider> =
-                                Arc::new(DeletionTableProviderAdapter::new(deletion_provider));
-                            if let Err(e) =
-                                schema_provider.register_table(table_name.clone(), wrapped_provider)
-                            {
-                                tracing::error!(table_name, error = %e, "Failed to register existing Cayenne table in schema provider");
-                            }
+                        let wrapped_provider: Arc<dyn datafusion::catalog::TableProvider> =
+                            if let Some(ref partition_expr) = partition_expr {
+                                // Partitioned table: reconstruct PartitionTableProvider so writes
+                                // are routed through PartitionerExec.
+                                let table_id = existing_table_metadata
+                                    .as_ref()
+                                    .map(|m| m.table_id.clone())
+                                    .unwrap_or_default();
+
+                                let table_data_path = format!(
+                                    "{}{metadata_table_name}/",
+                                    data_base_path.trim_end_matches('/').to_string() + "/"
+                                );
+
+                                let vortex_schema =
+                                    match transform_schema_for_vortex(
+                                        &arrow_schema,
+                                        UnsupportedTypeAction::Error,
+                                    ) {
+                                        Ok(s) => Arc::new(s),
+                                        Err(e) => {
+                                            tracing::error!(
+                                                table_name,
+                                                error = %e,
+                                                "Failed to transform schema for Vortex while registering existing partitioned table"
+                                            );
+                                            return Ok(RecordBatch::try_new(
+                                                result_schema,
+                                                vec![Arc::new(StringArray::from(vec![format!(
+                                                    "Table '{table_name}' already exists"
+                                                )]))],
+                                            )?);
+                                        }
+                                    };
+
+                                let partition_name = partition_label
+                                    .clone()
+                                    .unwrap_or_else(|| partition_label_for_expr(partition_expr));
+
+                                let on_conflict = if primary_key.is_empty() {
+                                    None
+                                } else {
+                                    Some(OnConflict::Upsert(ColumnReference::new(
+                                        primary_key.clone(),
+                                    )))
+                                };
+
+                                let partition_by = vec![PartitionedBy {
+                                    name: partition_name,
+                                    expression: partition_expr.clone(),
+                                }];
+
+                                let creator = Arc::new(CayennePartitionCreator::new(
+                                    metadata_table_name.clone(),
+                                    PathBuf::from(&table_data_path),
+                                    partition_by.clone(),
+                                    Arc::clone(&vortex_schema),
+                                    Arc::clone(&metadata_catalog),
+                                    table_id,
+                                    UnsupportedTypeAction::Error,
+                                    Vec::new(), // retention_filters
+                                    None,       // time_retention_filter_builder
+                                    vortex_config.clone(),
+                                    None, // object_store_config (local filesystem)
+                                    primary_key.clone(),
+                                    on_conflict,
+                                    Arc::clone(&runtime_env),
+                                ));
+
+                                match PartitionTableProvider::new(
+                                    creator,
+                                    partition_by,
+                                    Arc::clone(&vortex_schema),
+                                )
+                                .await
+                                {
+                                    Ok(partition_provider) => {
+                                        let partition_provider = Arc::new(partition_provider);
+                                        let deletion_provider: Arc<dyn DeletionTableProvider> =
+                                            partition_provider;
+                                        Arc::new(DeletionTableProviderAdapter::new(
+                                            deletion_provider,
+                                        ))
+                                            as Arc<dyn datafusion::catalog::TableProvider>
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            table_name,
+                                            error = %e,
+                                            "Failed to reconstruct PartitionTableProvider for existing partitioned table on restart"
+                                        );
+                                        return Ok(RecordBatch::try_new(
+                                            result_schema,
+                                            vec![Arc::new(StringArray::from(vec![format!(
+                                                "Table '{table_name}' already exists"
+                                            )]))],
+                                        )?);
+                                    }
+                                }
+                            } else {
+                                // Non-partitioned table: open the plain CayenneTableProvider.
+                                let builder = CayenneTableProviderBuilder::new(
+                                    Arc::clone(&metadata_catalog),
+                                    Arc::clone(&runtime_env),
+                                );
+                                match builder.open(&metadata_table_name).await {
+                                    Ok(provider) => {
+                                        let provider = Arc::new(provider);
+                                        let deletion_provider: Arc<dyn DeletionTableProvider> =
+                                            provider;
+                                        Arc::new(DeletionTableProviderAdapter::new(
+                                            deletion_provider,
+                                        ))
+                                            as Arc<dyn datafusion::catalog::TableProvider>
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            table_name,
+                                            error = %e,
+                                            "Failed to open existing Cayenne table on restart"
+                                        );
+                                        return Ok(RecordBatch::try_new(
+                                            result_schema,
+                                            vec![Arc::new(StringArray::from(vec![format!(
+                                                "Table '{table_name}' already exists"
+                                            )]))],
+                                        )?);
+                                    }
+                                }
+                            };
+
+                        if let Err(e) =
+                            schema_provider.register_table(table_name.clone(), wrapped_provider)
+                        {
+                            tracing::error!(table_name, error = %e, "Failed to register existing Cayenne table in schema provider");
                         }
                     }
 
