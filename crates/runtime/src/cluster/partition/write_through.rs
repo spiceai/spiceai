@@ -338,14 +338,25 @@ pub(crate) async fn forward_partitioned_batches(
 
     // Route each batch through partition filters to the appropriate executor.
     let mut routing_error: Option<Error> = None;
+    let mut routed_batches: u64 = 0;
+    let mut routed_rows: u64 = 0;
     while let Some(batch_result) = StreamExt::next(&mut batches).await {
         let batch = match batch_result {
             Ok(b) => b,
             Err(e) => {
+                tracing::error!(
+                    table = %path,
+                    routed_batches,
+                    routed_rows,
+                    error = %e,
+                    "Routing loop: error reading batch from input stream; stopping routing"
+                );
                 routing_error = Some(e);
                 break;
             }
         };
+        routed_batches += 1;
+        routed_rows += batch.num_rows() as u64;
         if let Err(e) = route_batch_and_assign_unseen(
             &batch,
             &mut executor_filters,
@@ -358,10 +369,25 @@ pub(crate) async fn forward_partitioned_batches(
         )
         .await
         {
+            tracing::error!(
+                table = %path,
+                routed_batches,
+                routed_rows,
+                error = %e,
+                "Routing loop: error routing batch to executor; stopping routing"
+            );
             routing_error = Some(e);
             break;
         }
     }
+
+    tracing::info!(
+        table = %path,
+        executors = all_executor_ids.len(),
+        routed_batches,
+        routed_rows,
+        "Scheduler routing loop complete"
+    );
 
     // Signal completion by dropping senders, then await all forwarding tasks.
     // Collect executor-side errors even when routing failed — the forwarding

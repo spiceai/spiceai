@@ -386,7 +386,12 @@ fn create_response_stream(
         let path = path.clone();
         let mut write_future = Box::pin(df.write_streaming_data(&path, streaming_update));
 
+        let mut received_batches: u64 = 0;
+        let mut received_rows: u64 = 0;
+
         if let Some(first_batch) = first_batch {
+            received_batches += 1;
+            received_rows += first_batch.num_rows() as u64;
             yield handle_record_batch(first_batch, &batch_tx, &path.to_string()).await;
         }
 
@@ -401,6 +406,8 @@ fn create_response_stream(
                 () = &mut deadline => {
                     tracing::error!(
                         dataset = %path,
+                        received_batches,
+                        received_rows,
                         "Timeout: no record batch received within {} seconds",
                         idle_timeout.as_secs()
                     );
@@ -420,6 +427,8 @@ fn create_response_stream(
                             // remaining messages and report success.
                             tracing::warn!(
                                 dataset = %path,
+                                received_batches,
+                                received_rows,
                                 "Write operation completed before Flight stream ended; draining remaining messages without writing"
                             );
                             while let Some(msg) = streaming_flight.next().await {
@@ -431,7 +440,12 @@ fn create_response_stream(
                             break;
                         }
                         Err(e) => {
-                            tracing::error!("Write operation failed. Details included in the response.");
+                            tracing::error!(
+                                dataset = %path,
+                                received_batches,
+                                received_rows,
+                                "Write operation failed. Details included in the response."
+                            );
                             yield Err(Status::internal(format!("Write operation failed: {e}")));
                             break;
                         }
@@ -456,14 +470,28 @@ fn create_response_stream(
                             ) {
                                 Ok(batches) => batches,
                                 Err(e) => {
-                                    tracing::error!("Failed to convert flight data to batches: {e}");
+                                    tracing::error!(
+                                        dataset = %path,
+                                        received_batches,
+                                        received_rows,
+                                        "Failed to convert flight data to batches: {e}"
+                                    );
                                     yield Err(Status::internal(format!("Failed to convert flight data to batches: {e}")));
                                     break;
                                 }
                             };
 
+                            received_batches += 1;
+                            received_rows += new_batch.num_rows() as u64;
+
                             // Only report errors; a success message is sent as the final step upon successful write completion
                             if let Err(err) = handle_record_batch(new_batch, &batch_tx, &path.to_string()).await {
+                                tracing::error!(
+                                    dataset = %path,
+                                    received_batches,
+                                    received_rows,
+                                    "Failed to forward batch to write channel"
+                                );
                                 yield Err(err);
                                 break;
                             }
@@ -471,12 +499,19 @@ fn create_response_stream(
                         None => {
                             // End of the stream; signal that stream is completed and data write should be finalized
                             drop(batch_tx);
-                            tracing::trace!("No more messages in the stream, finalizing write operation for path: {path}");
+                            tracing::info!(
+                                dataset = %path,
+                                received_batches,
+                                received_rows,
+                                "DoPut stream ended; finalizing write"
+                            );
 
                             // Wait for the write operation to complete
                             if let Err(e) = write_future.await {
                                 tracing::error!(
                                     dataset = %path,
+                                    received_batches,
+                                    received_rows,
                                     "Write operation failed after receiving all batches. Details included in the response."
                                 );
                                 yield Err(Status::internal(format!("Write operation failed: {e}")));
@@ -485,7 +520,12 @@ fn create_response_stream(
                             break;
                         }
                         Some(Err(e)) => {
-                            tracing::error!("Error reading message: {e}");
+                            tracing::error!(
+                                dataset = %path,
+                                received_batches,
+                                received_rows,
+                                "Error reading message from Flight stream: {e}"
+                            );
                             yield Err(Status::internal(format!("Error reading message: {e}")));
                             break;
                         }
