@@ -628,11 +628,23 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
 
             // Verify plan structure without relying on partition ordering (which depends
             // on non-deterministic executor-to-partition assignment).
-            assert!(plan_fmt.contains("Inner Join: t.id = c.id"), "plan should contain inner join");
-            assert!(plan_fmt.contains("SubqueryAlias: test_data"), "plan should contain test_data");
-            assert!(plan_fmt.contains("SubqueryAlias: categories"), "plan should contain categories");
+            assert!(
+                plan_fmt.contains("Inner Join: t.id = c.id"),
+                "plan should contain inner join"
+            );
+            assert!(
+                plan_fmt.contains("SubqueryAlias: test_data"),
+                "plan should contain test_data"
+            );
+            assert!(
+                plan_fmt.contains("SubqueryAlias: categories"),
+                "plan should contain categories"
+            );
             // Both tables should have Union (2 executor branches)
-            assert!(plan_fmt.contains("UnionExec"), "physical plan should contain UnionExec");
+            assert!(
+                plan_fmt.contains("UnionExec"),
+                "physical plan should contain UnionExec"
+            );
             // All 4 bucket values should appear for each table
             for bucket in &["'0'", "'1'", "'2'", "'3'"] {
                 assert!(
@@ -644,14 +656,26 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                     "plan should contain categories partition filter"
                 );
                 assert!(
-                    plan_fmt.matches(&format!("bucket(4, \"id\") = {bucket}")).count() >= 2,
+                    plan_fmt
+                        .matches(&format!("bucket(4, \"id\") = {bucket}"))
+                        .count()
+                        >= 2,
                     "bucket {bucket} should appear in both test_data and categories filters"
                 );
             }
             // Verify distributed execution operators
-            assert!(plan_fmt.contains("FlightSqlExec"), "plan should use FlightSqlExec");
-            assert!(plan_fmt.contains("HashJoinExec"), "plan should contain HashJoinExec");
-            assert!(plan_fmt.contains("SortPreservingMergeExec"), "plan should contain SortPreservingMerge");
+            assert!(
+                plan_fmt.contains("FlightSqlExec"),
+                "plan should use FlightSqlExec"
+            );
+            assert!(
+                plan_fmt.contains("HashJoinExec"),
+                "plan should contain HashJoinExec"
+            );
+            assert!(
+                plan_fmt.contains("SortPreservingMergeExec"),
+                "plan should contain SortPreservingMerge"
+            );
 
             let rows = harness.query(join_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
