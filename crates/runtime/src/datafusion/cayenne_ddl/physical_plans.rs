@@ -119,7 +119,7 @@ pub(super) fn arrow_datatype_to_sql(dt: &DataType) -> DFResult<String> {
         | DataType::FixedSizeBinary(_) => Ok("BYTEA".to_string()),
         DataType::Date32 | DataType::Date64 => Ok("DATE".to_string()),
         DataType::Time32(_) | DataType::Time64(_) => Ok("TIME".to_string()),
-        DataType::Timestamp(_, Some(_)) => Ok("TIMESTAMPTZ".to_string()),
+        DataType::Timestamp(_, Some(_)) => Ok("TIMESTAMP WITH TIME ZONE".to_string()),
         DataType::Timestamp(_, None) => Ok("TIMESTAMP".to_string()),
         DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => Ok(format!("DECIMAL({p},{s})")),
         DataType::Dictionary(_, value_type) => arrow_datatype_to_sql(value_type.as_ref()),
@@ -1766,15 +1766,15 @@ mod tests {
     fn timestamp_with_tz_maps_to_timestamptz() {
         // Microsecond with UTC timezone — common in Cayenne retention columns.
         let dt = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
-        assert_eq!(arrow_datatype_to_sql(&dt).unwrap(), "TIMESTAMPTZ");
+        assert_eq!(arrow_datatype_to_sql(&dt).unwrap(), "TIMESTAMP WITH TIME ZONE");
 
         // Nanosecond with UTC timezone.
         let dt = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
-        assert_eq!(arrow_datatype_to_sql(&dt).unwrap(), "TIMESTAMPTZ");
+        assert_eq!(arrow_datatype_to_sql(&dt).unwrap(), "TIMESTAMP WITH TIME ZONE");
 
         // Second with non-UTC timezone.
         let dt = DataType::Timestamp(TimeUnit::Second, Some("+05:30".into()));
-        assert_eq!(arrow_datatype_to_sql(&dt).unwrap(), "TIMESTAMPTZ");
+        assert_eq!(arrow_datatype_to_sql(&dt).unwrap(), "TIMESTAMP WITH TIME ZONE");
     }
 
     #[test]
@@ -1820,8 +1820,7 @@ mod tests {
         use datafusion::prelude::{SessionConfig, SessionContext};
 
         let mut config = SessionConfig::new();
-        config.options_mut().sql_parser.dialect =
-            datafusion::common::config::Dialect::PostgreSQL;
+        config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::PostgreSQL;
         let ctx = SessionContext::new_with_config(config);
 
         // Timezone-aware: should roundtrip to Timestamp(Nanosecond, Some("UTC"))
