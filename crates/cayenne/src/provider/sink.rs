@@ -177,6 +177,11 @@ impl CayenneDataSink {
     ///
     /// Returns an error if the data cannot be inserted.
     async fn write_all_append(&self, data: SendableRecordBatchStream) -> super::Result<u64> {
+        tracing::info!(
+            "write_all_append: starting for table '{}'",
+            self.table.table_name(),
+        );
+
         // Ensure no incomplete write from a previous crash before proceeding.
         // A leftover staging WAL indicates an interrupted file-move operation,
         // meaning the table may contain partial data. Block all writes until resolved.
@@ -324,6 +329,12 @@ impl CayenneDataSink {
         self.table.refresh_listing_table()?;
 
         // Write lock is released when `_write_guard` drops (in write_all).
+
+        tracing::info!(
+            "write_all_append: completed for table '{}', returning {} rows",
+            self.table.table_name(),
+            total_rows,
+        );
 
         Ok(total_rows)
     }

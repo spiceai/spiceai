@@ -1498,6 +1498,14 @@ impl CayenneTableProvider {
         let total_rows = total_rows_written.load(Ordering::Relaxed);
         let writer_ops = usize::from(total_rows > 0); // 1 writer op if we wrote any rows, otherwise 0
 
+        tracing::info!(
+            "write_to_snapshot completed for table '{}' snapshot '{}': {} rows in {} writer op(s)",
+            self.table_metadata.table_name,
+            snapshot_id,
+            total_rows,
+            writer_ops,
+        );
+
         // Log final summary for S3 Express uploads
         if is_s3_storage {
             let elapsed = start_time.elapsed();
