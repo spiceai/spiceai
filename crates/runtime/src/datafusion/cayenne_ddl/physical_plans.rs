@@ -1820,5 +1820,4 @@ mod tests {
         let dt = DataType::Duration(TimeUnit::Second);
         assert!(arrow_datatype_to_sql(&dt).is_err());
     }
-
 }
