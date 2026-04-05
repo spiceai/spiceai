@@ -250,9 +250,7 @@ impl fmt::Display for TestCases {
             TestCases::VectorSearchSqlRandom => "vector_search_sql_random",
             TestCases::VectorSearchSqlVectors => "vector_search_sql_vectors",
             TestCases::VectorSearchSqlIndexOnly => "vector_search_sql_index_only",
-            TestCases::VectorSearchSqlFilteredIndexOnly => {
-                "vector_search_sql_filtered_index_only"
-            }
+            TestCases::VectorSearchSqlFilteredIndexOnly => "vector_search_sql_filtered_index_only",
         };
         write!(f, "{s}")
     }
