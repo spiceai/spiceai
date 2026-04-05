@@ -26,14 +26,14 @@ use datafusion_physical_expr::{Distribution, OrderingRequirements, PhysicalExpr}
 use futures::TryStreamExt;
 
 use datafusion_physical_plan::{
-    execution_plan::{check_default_invariants, CardinalityEffect, InvariantLevel},
+    DisplayAs, ExecutionPlan, PlanProperties, SortOrderPushdownResult,
+    execution_plan::{CardinalityEffect, InvariantLevel, check_default_invariants},
     expressions::PhysicalSortExpr,
     filter_pushdown::{
         ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
     },
     metrics::MetricsSet,
     projection::ProjectionExec,
-    DisplayAs, ExecutionPlan, PlanProperties, SortOrderPushdownResult,
 };
 
 /// Wrapper for Cayenne acceleration execution plans.

@@ -87,7 +87,7 @@ jobs:
 
       - name: Set up spiceio
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@8c7781c6707cd60f1a18acb197168bebc9338532 # v0.4.3
+        uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}
@@ -130,6 +130,7 @@ jobs:
         with:
           name: ai-integration-test-archive
           path: ./integration.tar.zst
+          retention-days: 1
 
       - name: Kill spiceio
         if: always() && steps.setup-spiceio.outputs.pid != ''
@@ -141,18 +142,6 @@ jobs:
         with:
           name: spiceio-models-build-logs
           path: ${{ runner.temp }}/spiceio.log
-          if-no-files-found: ignore
-
-      - name: Kill spiceio
-        if: always() && steps.setup-spiceio.outputs.pid != ''
-        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
-
-      - name: Upload spiceio logs
-        if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
-        with:
-          name: spiceio-models-build-logs
-          path: ${{ env.SPICEIO_LOG_FILE }}
           if-no-files-found: ignore
 
   test-models:
@@ -408,7 +397,7 @@ jobs:
 
       - name: Set up spiceio
         id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@8c7781c6707cd60f1a18acb197168bebc9338532 # v0.4.3
+        uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
         with:
           smb-url: smb://runner@192.168.3.148/ai_platform_dev
           smb-pass: ${{ secrets.UNAS_SMB_PASS }}

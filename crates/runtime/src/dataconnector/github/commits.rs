@@ -202,7 +202,7 @@ fn commits_filter_pushdown(expr: &Expr) -> FilterPushdownResult {
         return match (op, value) {
             (Operator::Eq, ScalarValue::Utf8(Some(value))) if !value.is_empty() => {
                 FilterPushdownResult {
-                    filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Inexact,
+                    filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Exact,
                     expr: expr.clone(),
                     context: Some(format!("ref:{value}")),
                 }
@@ -594,7 +594,7 @@ mod tests {
 
         assert_eq!(
             result.filter_pushdown,
-            datafusion::logical_expr::TableProviderFilterPushDown::Inexact
+            datafusion::logical_expr::TableProviderFilterPushDown::Exact
         );
         assert_eq!(result.context.as_deref(), Some("ref:trunk"));
     }
@@ -621,12 +621,12 @@ mod tests {
     fn test_requested_ref_from_filters_rejects_multiple_ref_values() {
         let filters = vec![
             FilterPushdownResult {
-                filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Inexact,
+                filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Exact,
                 expr: datafusion::prelude::col("ref").eq(datafusion::prelude::lit("trunk")),
                 context: Some("ref:trunk".to_string()),
             },
             FilterPushdownResult {
-                filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Inexact,
+                filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Exact,
                 expr: datafusion::prelude::col("ref").eq(datafusion::prelude::lit("main")),
                 context: Some("ref:main".to_string()),
             },

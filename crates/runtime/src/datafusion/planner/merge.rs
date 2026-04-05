@@ -192,7 +192,7 @@ async fn validate_target_metadata(
     target_ref: &TableReference,
     target_name: &str,
 ) -> DFResult<()> {
-    use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
+    use cayenne::CayenneSchemaProvider;
 
     let catalog_name = target_ref.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
     let schema_name = target_ref.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);

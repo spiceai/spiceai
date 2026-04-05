@@ -61,7 +61,7 @@ async fn test_large_upsert_exceeds_sqlite_param_limit(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-            "id".to_string()
+            "id".to_string(),
         ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
