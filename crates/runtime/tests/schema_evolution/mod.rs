@@ -426,8 +426,8 @@ async fn init_csv_runtime(
     // current engine doesn't support it, skip (best-effort).
     let app_ref = rt.app();
     let app_lock = app_ref.read().await;
-    if let Some(app) = app_lock.as_ref() {
-        if let Ok(runtime_dataset) =
+    if let Some(app) = app_lock.as_ref()
+        && let Ok(runtime_dataset) =
             runtime::component::dataset::builder::DatasetBuilder::try_from(ds)
                 .map_err(anyhow::Error::from)
                 .and_then(|b| {
@@ -436,10 +436,9 @@ async fn init_csv_runtime(
                         .build()
                         .map_err(anyhow::Error::from)
                 })
-        {
-            // Ignore errors (e.g. UnsupportedEngine for Cayenne without sqlite feature)
-            let _ = wait_for_checkpoint(&runtime_dataset, 30).await;
-        }
+    {
+        // Ignore errors (e.g. UnsupportedEngine for Cayenne without sqlite feature)
+        let _ = wait_for_checkpoint(&runtime_dataset, 30).await;
     }
     drop(app_lock);
 

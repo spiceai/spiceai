@@ -648,11 +648,11 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
             // All 4 bucket values should appear for each table
             for bucket in &["'0'", "'1'", "'2'", "'3'"] {
                 assert!(
-                    plan_fmt.contains(&format!("FROM test_data WHERE")),
+                    plan_fmt.contains("FROM test_data WHERE"),
                     "plan should contain test_data partition filter"
                 );
                 assert!(
-                    plan_fmt.contains(&format!("FROM categories WHERE")),
+                    plan_fmt.contains("FROM categories WHERE"),
                     "plan should contain categories partition filter"
                 );
                 assert!(
