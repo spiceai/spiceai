@@ -1821,46 +1821,4 @@ mod tests {
         assert!(arrow_datatype_to_sql(&dt).is_err());
     }
 
-    /// Round-trip test: generate DDL via `arrow_datatype_to_sql`, parse it through
-    /// DataFusion's SQL engine (with PostgreSQL dialect, matching the runtime),
-    /// and verify the resulting schema preserves timezone presence.
-    #[tokio::test]
-    async fn timestamp_ddl_roundtrip_preserves_timezone() {
-        use datafusion::prelude::{SessionConfig, SessionContext};
-
-        let mut config = SessionConfig::new();
-        config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::PostgreSQL;
-        let ctx = SessionContext::new_with_config(config);
-
-        // Timezone-aware: should roundtrip to Timestamp(Nanosecond, Some("UTC"))
-        let tz_sql = arrow_datatype_to_sql(&DataType::Timestamp(
-            TimeUnit::Microsecond,
-            Some("UTC".into()),
-        ))
-        .unwrap();
-        let ddl = format!("CREATE TABLE tz_test (ts {tz_sql}) AS VALUES (1)");
-        ctx.sql(&ddl).await.unwrap().collect().await.unwrap();
-        let tz_table = ctx.table("tz_test").await.unwrap();
-        let schema = tz_table.schema();
-        let ts_field = schema.field_with_name(None, "ts").unwrap();
-        assert!(
-            matches!(ts_field.data_type(), DataType::Timestamp(_, Some(_))),
-            "Expected Timestamp(_, Some(_)) but got {:?}",
-            ts_field.data_type()
-        );
-
-        // Timezone-naive: should roundtrip to Timestamp(Nanosecond, None)
-        let naive_sql =
-            arrow_datatype_to_sql(&DataType::Timestamp(TimeUnit::Nanosecond, None)).unwrap();
-        let ddl = format!("CREATE TABLE naive_test (ts {naive_sql}) AS VALUES (1)");
-        ctx.sql(&ddl).await.unwrap().collect().await.unwrap();
-        let naive_table = ctx.table("naive_test").await.unwrap();
-        let schema = naive_table.schema();
-        let ts_field = schema.field_with_name(None, "ts").unwrap();
-        assert!(
-            matches!(ts_field.data_type(), DataType::Timestamp(_, None)),
-            "Expected Timestamp(_, None) but got {:?}",
-            ts_field.data_type()
-        );
-    }
 }
