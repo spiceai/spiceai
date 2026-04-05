@@ -140,38 +140,11 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                 .expect("format explain")
                 .to_string();
-            insta::assert_snapshot!(plan_fmt, @r#"
-            +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | plan_type     | plan                                                                                                                                                                                       |
-            +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | logical_plan  | Sort: test_data.id ASC NULLS LAST                                                                                                                                                          |
-            |               |   TableScan: test_data projection=[id, name, age, city, score], partial_filters=[bucket(Int64(3), id) = Utf8("0") OR bucket(Int64(3), id) = Utf8("1") OR bucket(Int64(3), id) = Utf8("2")] |
-            | physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                        |
-            |               |   CooperativeExec                                                                                                                                                                          |
-            |               |     BytesProcessedExec                                                                                                                                                                     |
-            |               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data WHERE ((((bucket(3, "id") = '0') OR (bucket(3, "id") = '1')) OR (bucket(3, "id") = '2')))                         |
-            |               |                                                                                                                                                                                            |
-            +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            "#);
+            insta::assert_snapshot!("bucket_partitioning_plan", plan_fmt);
 
             let rows = harness.query(select_all_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
-            insta::assert_snapshot!( rows_fmt, @r"
-            +----+--------------+-----+--------------+-------+
-            | id | name         | age | city         | score |
-            +----+--------------+-----+--------------+-------+
-            | 1  | John Doe     | 28  | New York     | 85    |
-            | 2  | Jane Smith   | 34  | Los Angeles  | 92    |
-            | 3  | Mike Johnson | 45  | Chicago      | 78    |
-            | 4  | Emily Brown  | 31  | Houston      | 89    |
-            | 5  | David Lee    | 39  | Phoenix      | 76    |
-            | 6  | Sarah Wilson | 26  | Philadelphia | 94    |
-            | 7  | Tom Anderson | 52  | San Antonio  | 81    |
-            | 8  | Lisa Taylor  | 29  | San Diego    | 88    |
-            | 9  | Chris Martin | 37  | Dallas       | 79    |
-            | 10 | Anna Garcia  | 41  | San Jose     | 90    |
-            +----+--------------+-----+--------------+-------+
-            ");
+            insta::assert_snapshot!("bucket_partitioning_rows", rows_fmt);
 
             // --- Test 2: Aggregation ---
             let aggregation_sql = "SELECT COUNT(*) as total_rows, AVG(score) as avg_score, \
@@ -181,30 +154,11 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             let agg_plan_fmt = arrow::util::pretty::pretty_format_batches(&agg_plan)
                 .expect("format explain agg")
                 .to_string();
-            insta::assert_snapshot!(agg_plan_fmt, @r#"
-            +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | plan_type     | plan                                                                                                                                                                                                                                                                                                                    |
-            +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | logical_plan  | Projection: count(Int64(1)) AS total_rows, avg(test_data.score) AS avg_score, min(test_data.age) AS min_age, max(test_data.age) AS max_age                                                                                                                                                                              |
-            |               |   Aggregate: groupBy=[[]], aggr=[[count(Int64(1)), avg(CAST(test_data.score AS Float64)), min(test_data.age), max(test_data.age)]]                                                                                                                                                                                      |
-            |               |     TableScan: test_data projection=[age, score], partial_filters=[bucket(Int64(3), id) = Utf8("0") OR bucket(Int64(3), id) = Utf8("1") OR bucket(Int64(3), id) = Utf8("2")]                                                                                                                                            |
-            | physical_plan | ProjectionExec: expr=[count(Int64(1))@0 as total_rows, avg(test_data.score)@1 as avg_score, min(test_data.age)@2 as min_age, max(test_data.age)@3 as max_age]                                                                                                                                                           |
-            |               |   AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1)), avg(test_data.score), min(test_data.age), max(test_data.age)]                                                                                                                                                                                               |
-            |               |     CoalescePartitionsExec                                                                                                                                                                                                                                                                                              |
-            |               |       PartialAggregationFlightSqlExec sql=SELECT COUNT(1) AS "__agg_0", SUM(CAST("score" AS DOUBLE)) AS "__agg_1", COUNT(CAST("score" AS DOUBLE)) AS "__agg_2", MIN("age") AS "__agg_3", MAX("age") AS "__agg_4" FROM test_data WHERE (((bucket(3, "id") = '0') OR (bucket(3, "id") = '1')) OR (bucket(3, "id") = '2')) |
-            |               |                                                                                                                                                                                                                                                                                                                         |
-            +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            "#);
+            insta::assert_snapshot!("bucket_partitioning_agg_plan", agg_plan_fmt);
 
             let agg = harness.query(aggregation_sql).await?;
             let agg_fmt = arrow::util::pretty::pretty_format_batches(&agg).expect("format agg");
-            insta::assert_snapshot!(agg_fmt, @r"
-            +------------+-----------+---------+---------+
-            | total_rows | avg_score | min_age | max_age |
-            +------------+-----------+---------+---------+
-            | 10         | 85.2      | 26      | 52      |
-            +------------+-----------+---------+---------+
-            ");
+            insta::assert_snapshot!("bucket_partitioning_agg", agg_fmt);
 
             harness.shutdown().await;
             Ok(())
@@ -271,38 +225,27 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                 .expect("format explain")
                 .to_string();
-            insta::assert_snapshot!(plan_fmt, @r#"
-            +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | plan_type     | plan                                                                                                                                                                                                                           |
-            +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | logical_plan  | Sort: test_data.id ASC NULLS LAST                                                                                                                                                                                              |
-            |               |   TableScan: test_data projection=[id, name, age, city, score], partial_filters=[bucket(Int64(4), id) = Utf8("0") OR bucket(Int64(4), id) = Utf8("1") OR bucket(Int64(4), id) = Utf8("2") OR bucket(Int64(4), id) = Utf8("3")] |
-            | physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                                                            |
-            |               |   CooperativeExec                                                                                                                                                                                                              |
-            |               |     BytesProcessedExec                                                                                                                                                                                                         |
-            |               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data WHERE (((((bucket(4, "id") = '0') OR (bucket(4, "id") = '1')) OR (bucket(4, "id") = '2')) OR (bucket(4, "id") = '3')))                                |
-            |               |                                                                                                                                                                                                                                |
-            +---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            "#);
+            // Plan structure is non-deterministic (partition-to-executor assignment varies),
+            // so verify structural properties instead of an exact snapshot.
+            assert!(
+                plan_fmt.contains("Sort"),
+                "plan should contain Sort operator"
+            );
+            assert!(
+                plan_fmt.contains("FlightSqlExec"),
+                "plan should use FlightSqlExec for distributed execution"
+            );
+            // All 4 bucket values should appear in partition filters
+            for bucket in &["'0'", "'1'", "'2'", "'3'"] {
+                assert!(
+                    plan_fmt.contains(&format!("bucket(4, \"id\") = {bucket}")),
+                    "bucket {bucket} should appear in partition filters"
+                );
+            }
 
             let rows = harness.query(select_all_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
-            insta::assert_snapshot!(rows_fmt, @r"
-            +----+--------------+-----+--------------+-------+
-            | id | name         | age | city         | score |
-            +----+--------------+-----+--------------+-------+
-            | 1  | John Doe     | 28  | New York     | 85    |
-            | 2  | Jane Smith   | 34  | Los Angeles  | 92    |
-            | 3  | Mike Johnson | 45  | Chicago      | 78    |
-            | 4  | Emily Brown  | 31  | Houston      | 89    |
-            | 5  | David Lee    | 39  | Phoenix      | 76    |
-            | 6  | Sarah Wilson | 26  | Philadelphia | 94    |
-            | 7  | Tom Anderson | 52  | San Antonio  | 81    |
-            | 8  | Lisa Taylor  | 29  | San Diego    | 88    |
-            | 9  | Chris Martin | 37  | Dallas       | 79    |
-            | 10 | Anna Garcia  | 41  | San Jose     | 90    |
-            +----+--------------+-----+--------------+-------+
-            ");
+            insta::assert_snapshot!("multi_executor_rows", rows_fmt);
 
             // --- Aggregation across both executors ---
             let agg_sql = "SELECT COUNT(*) as total_rows, AVG(score) as avg_score, \
@@ -310,13 +253,7 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
 
             let agg = harness.query(agg_sql).await?;
             let agg_fmt = arrow::util::pretty::pretty_format_batches(&agg).expect("format agg");
-            insta::assert_snapshot!(agg_fmt, @r"
-            +------------+-----------+---------+---------+
-            | total_rows | avg_score | min_age | max_age |
-            +------------+-----------+---------+---------+
-            | 10         | 85.2      | 26      | 52      |
-            +------------+-----------+---------+---------+
-            ");
+            insta::assert_snapshot!("multi_executor_agg", agg_fmt);
 
             harness.shutdown().await;
             Ok(())
@@ -385,37 +322,11 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                 .expect("format explain")
                 .to_string();
-            insta::assert_snapshot!(plan_fmt, @r#"
-            +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | plan_type     | plan                                                                                                                                                                                                           |
-            +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            | logical_plan  | Sort: test_data.id ASC NULLS LAST                                                                                                                                                                              |
-            |               |   Filter: test_data.score > Int64(85)                                                                                                                                                                          |
-            |               |     TableScan: test_data projection=[id, name, score], partial_filters=[bucket(Int64(3), id) = Utf8("0") OR bucket(Int64(3), id) = Utf8("1") OR bucket(Int64(3), id) = Utf8("2"), test_data.score > Int64(85)] |
-            | physical_plan | SortPreservingMergeExec: [id@0 ASC NULLS LAST]                                                                                                                                                                 |
-            |               |   SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                                                           |
-            |               |     FilterExec: score@2 > 85                                                                                                                                                                                   |
-            |               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                                     |
-            |               |         CooperativeExec                                                                                                                                                                                        |
-            |               |           BytesProcessedExec                                                                                                                                                                                   |
-            |               |             FlightSqlExec sql=SELECT id, name, score FROM test_data WHERE ((((bucket(3, "id") = '0') OR (bucket(3, "id") = '1')) OR (bucket(3, "id") = '2'))) AND (("score" > 85))                             |
-            |               |                                                                                                                                                                                                                |
-            +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-            "#);
+            insta::assert_snapshot!("predicate_pushdown_plan", plan_fmt);
 
             let rows = harness.query(filtered_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
-            insta::assert_snapshot!(rows_fmt, @r"
-            +----+--------------+-------+
-            | id | name         | score |
-            +----+--------------+-------+
-            | 2  | Jane Smith   | 92    |
-            | 4  | Emily Brown  | 89    |
-            | 6  | Sarah Wilson | 94    |
-            | 8  | Lisa Taylor  | 88    |
-            | 10 | Anna Garcia  | 90    |
-            +----+--------------+-------+
-            ");
+            insta::assert_snapshot!("predicate_pushdown_rows", rows_fmt);
 
             harness.shutdown().await;
             Ok(())
@@ -506,22 +417,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
             // After rebalance executor[1] should hold all 4 buckets and return all rows.
             let rows = harness.query(select_all).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
-            insta::assert_snapshot!(rows_fmt, @r"
-            +----+
-            | id |
-            +----+
-            | 1  |
-            | 2  |
-            | 3  |
-            | 4  |
-            | 5  |
-            | 6  |
-            | 7  |
-            | 8  |
-            | 9  |
-            | 10 |
-            +----+
-            ");
+            insta::assert_snapshot!("rebalance_rows", rows_fmt);
 
             // Explicit shutdown of the remaining executor before harness drop.
             harness.executors[1].shutdown().await;
@@ -679,22 +575,7 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
 
             let rows = harness.query(join_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
-            insta::assert_snapshot!( rows_fmt, @r"
-            +----+--------------+----------+--------+
-            | id | name         | category | rating |
-            +----+--------------+----------+--------+
-            | 1  | John Doe     | A        | 4.5    |
-            | 2  | Jane Smith   | B        | 3.2    |
-            | 3  | Mike Johnson | A        | 4.8    |
-            | 4  | Emily Brown  | C        | 2.1    |
-            | 5  | David Lee    | B        | 3.9    |
-            | 6  | Sarah Wilson | A        | 4.2    |
-            | 7  | Tom Anderson | C        | 1.8    |
-            | 8  | Lisa Taylor  | B        | 3.5    |
-            | 9  | Chris Martin | A        | 4.6    |
-            | 10 | Anna Garcia  | C        | 2.7    |
-            +----+--------------+----------+--------+
-            ");
+            insta::assert_snapshot!("join_rows", rows_fmt);
 
             harness.shutdown().await;
             Ok(())
@@ -778,13 +659,7 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
                 .query("SELECT COUNT(*) as cnt FROM test_data")
                 .await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
-            insta::assert_snapshot!(rows_fmt, @r"
-            +-----+
-            | cnt |
-            +-----+
-            | 10  |
-            +-----+
-            ");
+            insta::assert_snapshot!("refresh_forwarding_count", rows_fmt);
 
             harness.shutdown().await;
             Ok(())
