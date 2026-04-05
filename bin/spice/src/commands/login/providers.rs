@@ -446,6 +446,7 @@ async fn msal_device_code_flow(
 
     // Step 1: Request device code
     let client = reqwest::Client::builder()
+        .user_agent(format!("spice/{} ({}; {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH))
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()

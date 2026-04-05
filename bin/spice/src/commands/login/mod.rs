@@ -184,6 +184,7 @@ async fn login_spiceai(
 
     // Poll for auth status
     let client = reqwest::Client::builder()
+        .user_agent(format!("spice/{} ({}; {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH))
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -355,6 +356,7 @@ async fn get_spice_auth_context(
     }
 
     let client = reqwest::Client::builder()
+        .user_agent(format!("spice/{} ({}; {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH))
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()
