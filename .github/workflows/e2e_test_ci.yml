@@ -1931,8 +1931,20 @@ jobs:
         if: always()
         run: |
           if [ -f /tmp/simulate_pid ]; then
-            kill "$(cat /tmp/simulate_pid)" 2>/dev/null || true
-            wait "$(cat /tmp/simulate_pid)" 2>/dev/null || true
+            pid="$(cat /tmp/simulate_pid)"
+            kill "$pid" 2>/dev/null || true
+
+            # wait for the process to exit (not a child, so use kill -0 polling)
+            timeout_secs=30
+            elapsed=0
+            while kill -0 "$pid" 2>/dev/null; do
+              if [ "$elapsed" -ge "$timeout_secs" ]; then
+                kill -9 "$pid" 2>/dev/null || true
+                break
+              fi
+              sleep 1
+              elapsed=$((elapsed + 1))
+            done
           fi
           pkill -f simulate_append_data || true
 
