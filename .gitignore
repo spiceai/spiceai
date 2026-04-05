@@ -75,6 +75,11 @@ data/
 *.db.wal
 *.db-shm
 *.db-log
+*.duckdb
+*.duckdb.wal
 
 # Cluster logs
 cluster_logs/
+
+# Claude worktrees
+.claude/worktrees/

@@ -41,8 +41,8 @@ use cayenne::metadata::CreateTableOptions;
 
 use cayenne::{CayenneTableProvider, MetadataCatalog};
 
-use datafusion::datasource::TableProvider;
-use datafusion::prelude::{col, lit, Expr, SessionContext};
+use data_components::delete::DeletionTableProvider;
+use datafusion::prelude::{Expr, SessionContext, col, lit};
 
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
@@ -58,13 +58,13 @@ async fn insert_batch(
         .map_err(Into::into)
 }
 
-/// Helper to delete records from a table using the `delete_from` API
+/// Helper to delete records from a table using the `DeletionTableProvider` API
 async fn delete_records(
     table: &Arc<CayenneTableProvider>,
     filter: Expr,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
-    let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(results
         .first()
@@ -178,7 +178,7 @@ async fn test_single_upsert_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-            "id".to_string()
+            "id".to_string(),
         ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
@@ -246,7 +246,7 @@ async fn test_do_nothing_drops_conflicts_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: Some(OnConflict::DoNothing(ColumnReference::new(vec![
-            "id".to_string()
+            "id".to_string(),
         ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
@@ -396,7 +396,7 @@ async fn test_upsert_large_batch_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-            "id".to_string()
+            "id".to_string(),
         ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
@@ -562,7 +562,7 @@ async fn test_string_pk_upsert_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["code".to_string()],
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-            "code".to_string()
+            "code".to_string(),
         ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
@@ -713,7 +713,7 @@ async fn test_mixed_conflict_batch_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-            "id".to_string()
+            "id".to_string(),
         ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
@@ -803,7 +803,7 @@ async fn test_empty_batch_impl(
         schema: Arc::clone(&schema),
         primary_key: vec!["id".to_string()],
         on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-            "id".to_string()
+            "id".to_string(),
         ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,

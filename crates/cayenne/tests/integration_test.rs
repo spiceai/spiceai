@@ -562,8 +562,8 @@ async fn test_cayenne_statistics_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use arrow::datatypes::{DataType, Field, Schema};
-    use cayenne::metadata::CreateTableOptions;
     use cayenne::CayenneTableProvider;
+    use cayenne::metadata::CreateTableOptions;
     use datafusion::common::TableReference;
     use datafusion::execution::context::SessionContext;
     use datafusion_catalog::TableProvider;
@@ -649,9 +649,9 @@ async fn test_cayenne_core_data_types_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use arrow::array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
-        Float32Array, Float64Array, Int16Array, Int32Array, Int8Array, LargeBinaryArray,
-        LargeStringArray, RecordBatch, TimestampMicrosecondArray, UInt16Array, UInt32Array,
-        UInt64Array, UInt8Array,
+        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, LargeBinaryArray,
+        LargeStringArray, RecordBatch, TimestampMicrosecondArray, UInt8Array, UInt16Array,
+        UInt32Array, UInt64Array,
     };
     use arrow::datatypes::TimeUnit;
     use std::f32::consts::{E as F32_E, PI as F32_PI};

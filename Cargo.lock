@@ -496,7 +496,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 [[package]]
 name = "arrow"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -516,7 +516,7 @@ dependencies = [
 [[package]]
 name = "arrow-arith"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -529,7 +529,7 @@ dependencies = [
 [[package]]
 name = "arrow-array"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "ahash 0.8.12",
  "arrow-buffer",
@@ -547,7 +547,7 @@ dependencies = [
 [[package]]
 name = "arrow-buffer"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "bytes",
  "half",
@@ -558,7 +558,7 @@ dependencies = [
 [[package]]
 name = "arrow-cast"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -579,7 +579,7 @@ dependencies = [
 [[package]]
 name = "arrow-csv"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -593,7 +593,7 @@ dependencies = [
 [[package]]
 name = "arrow-data"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "arrow-buffer",
  "arrow-schema",
@@ -605,7 +605,7 @@ dependencies = [
 [[package]]
 name = "arrow-flight"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -632,7 +632,7 @@ dependencies = [
 [[package]]
 name = "arrow-ipc"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -647,7 +647,7 @@ dependencies = [
 [[package]]
 name = "arrow-json"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -683,7 +683,7 @@ dependencies = [
 [[package]]
 name = "arrow-ord"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -695,7 +695,7 @@ dependencies = [
 [[package]]
 name = "arrow-row"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -707,7 +707,7 @@ dependencies = [
 [[package]]
 name = "arrow-schema"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "bitflags 2.10.0",
  "serde",
@@ -718,7 +718,7 @@ dependencies = [
 [[package]]
 name = "arrow-select"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "ahash 0.8.12",
  "arrow-array",
@@ -731,7 +731,7 @@ dependencies = [
 [[package]]
 name = "arrow-string"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -869,6 +869,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "assert-json-diff"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47e4f2b81832e72834d7518d8487a0396a28cc408186a2e8854c0f98011faf12"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2992,9 +3002,9 @@ checksum = "40e38929add23cdf8a366df9b0e088953150724bcbe5fc330b0d8eb3b328eec8"
 
 [[package]]
 name = "built"
-version = "0.7.7"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56ed6191a7e78c36abdb16ab65341eefd73d64d303fffccdbb00d51e4205967b"
+checksum = "c360505aed52b7ec96a3636c3f039d99103c37d1d9b4f7a8c743d3ea9ffcd03b"
 dependencies = [
  "chrono",
 ]
@@ -3500,6 +3510,7 @@ dependencies = [
  "roaring",
  "rstest 0.26.1",
  "runtime-datafusion",
+ "runtime-table-partition",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3818,7 +3829,7 @@ checksum = "3a822ea5bc7590f9d40f1ba12c0dc3c2760f3482c6984db1573ad11031420831"
 [[package]]
 name = "clickhouse-rs"
 version = "1.1.0-alpha.1"
-source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.1#81a652c7c3dc4aff9097c30ece821393f089e3b5"
+source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.2#7e98394f44cfa33919ebc5a92c06d5bddba708bf"
 dependencies = [
  "byteorder",
  "cfg-if",
@@ -3848,7 +3859,7 @@ dependencies = [
 [[package]]
 name = "clickhouse-rs-cityhash-sys"
 version = "0.1.2"
-source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.1#81a652c7c3dc4aff9097c30ece821393f089e3b5"
+source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.2#7e98394f44cfa33919ebc5a92c06d5bddba708bf"
 dependencies = [
  "cc",
 ]
@@ -3956,6 +3967,7 @@ version = "0.4.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb7b51a7d9c967fc26773061ba86150f19c50c0d65c887cb1fbe295fd16619b7"
 dependencies = [
+ "brotli",
  "bzip2",
  "compression-core",
  "flate2",
@@ -5323,7 +5335,7 @@ dependencies = [
  "url",
  "util",
  "uuid 1.21.0",
- "zip 8.3.0",
+ "zip 7.4.0",
 ]
 
 [[package]]
@@ -5671,7 +5683,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.4.2"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=09379a9#09379a9818b9e3fc10c0a52c7f6cb3fa99c1eaf8"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=9b7e0f48c00deefe1276a46890562523b4b97c41#9b7e0f48c00deefe1276a46890562523b4b97c41"
 dependencies = [
  "arrow-json",
  "async-stream",
@@ -5852,22 +5864,27 @@ name = "datafusion-optimizer-rules"
 version = "2.0.0-unstable"
 dependencies = [
  "arrow",
+ "arrow-flight",
  "async-stream",
  "async-trait",
  "cache",
  "chrono",
+ "data_components",
  "datafusion",
  "datafusion-datasource",
  "datafusion-expr",
  "datafusion-federation",
  "datafusion-table-providers",
  "duckdb",
+ "flight_client",
  "futures",
+ "insta",
  "itertools 0.14.0",
  "object_store",
  "r2d2",
  "snafu",
  "tokio",
+ "tonic",
  "tracing",
  "url",
 ]
@@ -6104,7 +6121,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=fe0b78ff01a329448e3d533192967ba05a88cdd1#fe0b78ff01a329448e3d533192967ba05a88cdd1"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=408e2c554db2433670ea2ffb43a4289fefe739ad#408e2c554db2433670ea2ffb43a4289fefe739ad"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -6197,6 +6214,24 @@ checksum = "f0d7a944e61df464668c5f51f56cc667396a8821434273112948ea0b66e405d7"
 dependencies = [
  "hybrid-array",
 ]
+
+[[package]]
+name = "deadpool"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0be2b1d1d6ec8d846f05e137292d0b89133caf95ef33695424c09568bdd39b1b"
+dependencies = [
+ "deadpool-runtime",
+ "lazy_static",
+ "num_cpus",
+ "tokio",
+]
+
+[[package]]
+name = "deadpool-runtime"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "092966b41edc516079bdf31ec78a2e0588d1d0c08f78b91d8307215928642b2b"
 
 [[package]]
 name = "debug_unsafe"
@@ -6620,7 +6655,7 @@ dependencies = [
 [[package]]
 name = "docx-rs"
 version = "0.4.17"
-source = "git+https://github.com/spiceai/docx-rs?rev=2a85dce57d0128e2cd7c369545516c347cb8c529#2a85dce57d0128e2cd7c369545516c347cb8c529"
+source = "git+https://github.com/spiceai/docx-rs?rev=508456cf36bbc1ae5f381d24b03f0a993703e3ee#508456cf36bbc1ae5f381d24b03f0a993703e3ee"
 dependencies = [
  "base64 0.13.1",
  "image 0.24.9",
@@ -6628,7 +6663,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "xml-rs",
- "zip 8.3.0",
+ "zip 7.4.0",
 ]
 
 [[package]]
@@ -10957,15 +10992,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lzma-rust2"
-version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47bb1e988e6fb779cf720ad431242d3f03167c1b3f2b1aae7f1a94b2495b36ae"
-dependencies = [
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "mac"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13398,7 +13424,7 @@ dependencies = [
 [[package]]
 name = "parquet"
 version = "57.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=db1e8ae934c2f89081886404df4ec3e45504479a#db1e8ae934c2f89081886404df4ec3e45504479a"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=96190c47f7a1ab90af53800a2c6c2ba4e0726f74#96190c47f7a1ab90af53800a2c6c2ba4e0726f74"
 dependencies = [
  "ahash 0.8.12",
  "arrow-array",
@@ -15940,6 +15966,7 @@ dependencies = [
  "ballista-scheduler",
  "base64 0.22.1",
  "bcder",
+ "blake3",
  "bollard",
  "byte-unit",
  "bytes",
@@ -18144,6 +18171,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "urlencoding",
+ "wiremock",
  "yaml",
  "zip 7.4.0",
 ]
@@ -18273,6 +18301,7 @@ dependencies = [
  "object_store",
  "regex",
  "schemars 1.2.1",
+ "secrecy",
  "serde",
  "serde-value",
  "serde_json",
@@ -20521,9 +20550,9 @@ dependencies = [
 
 [[package]]
 name = "turso"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7adb377630e2cfc1aa10d44cff1a05edfca9dea1bcf500211a24917f37dbf492"
+checksum = "faba49ac70e21ea35cc963341485f3d17822f2cf433f42152a182117da21d29f"
 dependencies = [
  "thiserror 2.0.18",
  "tracing",
@@ -20538,9 +20567,9 @@ version = "2.0.0-unstable"
 
 [[package]]
 name = "turso_core"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34b2f28e920d1d893fdd5bf4a9bf666dc31f3f0c99832611a6e119b93501707f"
+checksum = "81fac73a12b91b569f4671d63d65912876c11e6312597c996dac40494f9f9b39"
 dependencies = [
  "aegis",
  "aes 0.8.4",
@@ -20550,7 +20579,7 @@ dependencies = [
  "bigdecimal",
  "bitflags 2.10.0",
  "branches",
- "built 0.7.7",
+ "built 0.7.5",
  "bumpalo",
  "bytemuck",
  "cfg_block",
@@ -20603,9 +20632,9 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07064bc2fefab2f90478d30fc8fae48d8526f590b70b303a1092081e8ee42a3f"
+checksum = "bdd7410a02a3a4cebd48a5bc0db74940d1157dc9c05ad42d48ee5156dd31edd1"
 dependencies = [
  "chrono",
  "getrandom 0.3.4",
@@ -20614,9 +20643,9 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ab0703506127013dc1fc7e115b2055aeb16ac8aed7b972a9156abd08406c74c"
+checksum = "9c846c30c3cb085884a8bbaba7760bdcc406ff2176cbde1e51d41b6057171fd4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -20625,9 +20654,9 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "770c38bab784693915ad996c28decbddecb563388ffb5038a4dfe16f4a446a86"
+checksum = "8402ba98c236e3e6d6ed6a43557a9a0b3a682f86a37fcafe02b659b9e6c06b82"
 dependencies = [
  "bitflags 2.10.0",
  "memchr",
@@ -20640,9 +20669,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16574ba104b802e2faa7654099d4aa00e769b9baaab347d6d98e9eef2a8d1f8c"
+checksum = "15b68fee8a6d8515fa6be08ad998d34eba0ac4a8e81dae4b9d0041e21ca01e22"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",
@@ -20656,9 +20685,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e92557fe426adaaa096bc33b7953a137020645cf43127ff81a77cea74d37cd4"
+checksum = "4b90fe1bcada9dda8b8e20900f744bdd52f641cccc179f1507e83f8f2ec0b1dc"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -20667,9 +20696,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_engine"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18182aacf9550e0e56cc567d2501d7b999a0eaee072f5623fb9ffd74c34a056a"
+checksum = "8a94f0d86e6823f63fc52040eb33131ce7fb9cebdb7329a5231443d846e0195a"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -20689,9 +20718,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_sdk_kit"
-version = "0.5.1"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69cd8cceccd7b2428a3bf81a9f08cf27138a1a02c831a3599bd277c4dff2f06c"
+checksum = "b49fb6c54aaa988f333505a9023fe4985725995b1575eb1557105fa4ac13ea6d"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",
@@ -22991,6 +23020,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "wiremock"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08db1edfb05d9b3c1542e521aea074442088292f00b5f28e435c714a98f85031"
+dependencies = [
+ "assert-json-diff",
+ "base64 0.22.1",
+ "deadpool",
+ "futures",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper 1.8.1",
+ "hyper-util",
+ "log",
+ "once_cell",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "wit-bindgen"
 version = "0.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23483,34 +23535,7 @@ dependencies = [
  "getrandom 0.4.1",
  "hmac 0.12.1",
  "indexmap 2.13.0",
- "lzma-rust2 0.15.7",
- "memchr",
- "pbkdf2 0.12.2",
- "ppmd-rust",
- "sha1 0.10.6",
- "time",
- "typed-path",
- "zeroize",
- "zopfli",
- "zstd",
-]
-
-[[package]]
-name = "zip"
-version = "8.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a243cfad17427fc077f529da5a95abe4e94fd2bfdb601611870a6557cc67657"
-dependencies = [
- "aes 0.8.4",
- "bzip2",
- "constant_time_eq",
- "crc32fast",
- "deflate64",
- "flate2",
- "getrandom 0.4.1",
- "hmac 0.12.1",
- "indexmap 2.13.0",
- "lzma-rust2 0.16.2",
+ "lzma-rust2",
  "memchr",
  "pbkdf2 0.12.2",
  "ppmd-rust",

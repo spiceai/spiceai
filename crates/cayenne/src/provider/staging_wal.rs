@@ -32,9 +32,9 @@ limitations under the License.
 //! on the next table open or write attempt, alerting the operator to a potentially inconsistent
 //! state.
 
+use super::Result;
 use super::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};
 use super::table::CayenneTableProvider;
-use super::Result;
 use crate::provider::Error;
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectStorePath;
