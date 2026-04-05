@@ -15,7 +15,7 @@ expression: "normalize_chat_completion_response(response, true)"
               "arguments": "{\"query\":\"{\\\"table\\\":\\\"spice.public.taxi_trips\\\"}\"}",
               "name": "describe"
             },
-            "id": "call-0e6743ce-d539-48d2-8af2-1ac205bf528a",
+            "id": "call-b0ffe69e-d9e3-42f5-aaf5-af03a17b7cb1",
             "type": "function"
           }
         ]
