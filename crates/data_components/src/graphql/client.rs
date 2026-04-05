@@ -949,9 +949,11 @@ impl GraphQLClient {
 
         // When close_connection is true (after a gateway error like 502), build a
         // fresh reqwest::Client so the retry goes out on a new TCP connection instead
-        // of reusing the (possibly broken) pooled connection.
+        // of reusing the (possibly broken) pooled connection. Preserve user-agent and
+        // timeouts to match the original client — GitHub requires a User-Agent header.
         let http_client = if close_connection {
             reqwest::Client::builder()
+                .user_agent(format!("spiceai/{} ({}; {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH))
                 .pool_max_idle_per_host(0)
                 .build()
                 .context(ReqwestInternalSnafu)?

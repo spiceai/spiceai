@@ -119,6 +119,7 @@ pub fn format_models_hint(models: &[String], provider_name: &str) -> String {
 #[must_use]
 pub fn create_http_client() -> Option<reqwest::Client> {
     reqwest::Client::builder()
+        .user_agent(format!("spiceai/{} ({}; {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH))
         .timeout(API_TIMEOUT)
         .use_rustls_tls()
         .build()

@@ -111,6 +111,7 @@ impl ModelSource for SpiceAI {
         }
 
         let client = reqwest::Client::builder()
+            .user_agent(format!("spiceai/{} ({}; {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH))
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(1800))
             .build()
