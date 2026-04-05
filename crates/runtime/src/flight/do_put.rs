@@ -386,7 +386,12 @@ fn create_response_stream(
         let path = path.clone();
         let mut write_future = Box::pin(df.write_streaming_data(&path, streaming_update));
 
+        let mut batches_received: u64 = 0;
+        let mut rows_received: u64 = 0;
+
         if let Some(first_batch) = first_batch {
+            batches_received += 1;
+            rows_received += first_batch.num_rows() as u64;
             yield handle_record_batch(first_batch, &batch_tx, &path.to_string()).await;
         }
 
@@ -418,12 +423,44 @@ fn create_response_stream(
                             // ended. This can happen when the data sink does not
                             // consume the input stream or finishes early. Drain
                             // remaining messages and report success.
-                            tracing::warn!("Write operation completed before stream ended for dataset: {path}");
+                            tracing::warn!(
+                                dataset = %path,
+                                batches_received,
+                                rows_received,
+                                "Write operation completed before Flight stream ended; draining remaining messages without writing"
+                            );
+                            let mut drained_batches: u64 = 0;
+                            let mut drained_rows: u64 = 0;
                             while let Some(msg) = streaming_flight.next().await {
-                                if let Err(e) = msg {
-                                    tracing::error!("Error reading remaining message after early write completion: {e}");
+                                match msg {
+                                    Ok(data) => {
+                                        // Attempt to decode to get the row count for logging
+                                        if let Ok(batch) = arrow_flight::utils::flight_data_to_arrow_batch(
+                                            &data,
+                                            Arc::clone(&schema),
+                                            &std::collections::HashMap::new(),
+                                        ) {
+                                            drained_batches += 1;
+                                            drained_rows += batch.num_rows() as u64;
+                                        } else {
+                                            drained_batches += 1;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(dataset = %path, "Error reading remaining message after early write completion: {e}");
+                                    }
                                 }
                             }
+                            tracing::info!(
+                                dataset = %path,
+                                batches_received,
+                                rows_received,
+                                drained_batches,
+                                drained_rows,
+                                "Early write completion drain finished; {} rows in {} batches were NOT written",
+                                drained_rows,
+                                drained_batches,
+                            );
                             yield Ok(PutResult::default());
                             break;
                         }
@@ -459,6 +496,9 @@ fn create_response_stream(
                                 }
                             };
 
+                            batches_received += 1;
+                            rows_received += new_batch.num_rows() as u64;
+
                             // Only report errors; a success message is sent as the final step upon successful write completion
                             if let Err(err) = handle_record_batch(new_batch, &batch_tx, &path.to_string()).await {
                                 yield Err(err);
@@ -472,10 +512,21 @@ fn create_response_stream(
 
                             // Wait for the write operation to complete
                             if let Err(e) = write_future.await {
-                                tracing::error!("Write operation failed. Details included in the response.");
+                                tracing::error!(
+                                    dataset = %path,
+                                    batches_received,
+                                    rows_received,
+                                    "Write operation failed after receiving all batches. Details included in the response."
+                                );
                                 yield Err(Status::internal(format!("Write operation failed: {e}")));
+                            } else {
+                                tracing::info!(
+                                    dataset = %path,
+                                    batches_received,
+                                    rows_received,
+                                    "Write operation completed successfully"
+                                );
                             }
-                            tracing::debug!("Write operation completed successfully for dataset: {path}");
                             yield Ok(PutResult::default())
                             break;
                         }
