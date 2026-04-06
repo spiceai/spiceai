@@ -375,7 +375,7 @@ impl Https {
             .unwrap_or(90);
 
         Client::builder()
-            .user_agent("spice")
+            .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(connect_timeout_secs))
             .timeout(Duration::from_secs(timeout_secs))
             .pool_max_idle_per_host(pool_max_idle_per_host)

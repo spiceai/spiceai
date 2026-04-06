@@ -32,8 +32,8 @@ use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 
 use cayenne::{
-    metadata::CreateTableOptions, CayenneCatalog, CayenneTableProvider,
-    CayenneTableProviderBuilder, MetadataCatalog,
+    CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
+    metadata::CreateTableOptions,
 };
 
 use datafusion::datasource::TableProvider;

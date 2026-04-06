@@ -34,8 +34,8 @@ use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray, UInt64Arr
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use cayenne::metadata::CreateTableOptions;
 use cayenne::{
-    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, TimeRetentionFilterBuilder,
-    STAGING_DIR_NAME,
+    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, STAGING_DIR_NAME,
+    TimeRetentionFilterBuilder,
 };
 use common::TestFixture;
 use datafusion::datasource::TableProvider;
@@ -1004,7 +1004,7 @@ async fn create_pk_retention_table(
 
     let on_conflict = if with_upsert {
         Some(OnConflict::Upsert(ColumnReference::new(vec![
-            "id".to_string()
+            "id".to_string(),
         ])))
     } else {
         None
@@ -1177,16 +1177,17 @@ fn count_vortex_files(table_dir: &std::path::Path) -> usize {
     let mut count = 0;
     for entry in entries.filter_map(std::result::Result::ok) {
         let path = entry.path();
-        if path.is_dir() && path.file_name().is_none_or(|n| n != STAGING_DIR_NAME) {
-            if let Ok(snapshot_entries) = std::fs::read_dir(&path) {
-                for file_entry in snapshot_entries.filter_map(std::result::Result::ok) {
-                    if file_entry
-                        .path()
-                        .extension()
-                        .is_some_and(|ext| ext == "vortex")
-                    {
-                        count += 1;
-                    }
+        if path.is_dir()
+            && path.file_name().is_none_or(|n| n != STAGING_DIR_NAME)
+            && let Ok(snapshot_entries) = std::fs::read_dir(&path)
+        {
+            for file_entry in snapshot_entries.filter_map(std::result::Result::ok) {
+                if file_entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "vortex")
+                {
+                    count += 1;
                 }
             }
         }

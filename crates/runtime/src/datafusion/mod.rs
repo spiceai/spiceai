@@ -25,7 +25,7 @@ use crate::accelerated_table::{
 use crate::accelerated_table::{AcceleratedTable, Retention, refresh::Refresh};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
-use crate::component::dataset::acceleration::{Acceleration, Engine, RefreshMode};
+use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
 use crate::component::dataset::{Dataset, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::spice_sys::OpenOption;
@@ -62,6 +62,7 @@ use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
+use data_components::poly::PolyTableProvider;
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::common::{Constraint, Constraints, ToDFSchema};
@@ -80,12 +81,6 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
 use itertools::Itertools;
 use query::QueryBuilder;
-#[cfg(any(
-    feature = "duckdb",
-    feature = "sqlite",
-    feature = "postgres",
-    not(windows)
-))]
 use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_acceleration::snapshot::AccelerationLayout;
 #[cfg(any(
@@ -97,6 +92,7 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
+use runtime_table_partition::provider::PartitionTableProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use spicepod::acceleration::SnapshotsTrigger;
@@ -438,6 +434,23 @@ fn validate_distributed_engine(
     Ok(())
 }
 
+/// Converts a runtime `Engine` to a snapshot `AccelerationEngine`.
+///
+/// Returns `None` for engines that don't support file-based snapshots (e.g. Arrow, `PostgreSQL`).
+fn engine_to_acceleration_engine(engine: Engine) -> Option<AccelerationEngine> {
+    match engine {
+        #[cfg(feature = "duckdb")]
+        Engine::DuckDB | Engine::TableModePartitionedDuckDB => Some(AccelerationEngine::DuckDB),
+        #[cfg(feature = "sqlite")]
+        Engine::Sqlite => Some(AccelerationEngine::Sqlite),
+        #[cfg(feature = "turso")]
+        Engine::Turso => Some(AccelerationEngine::Turso),
+        #[cfg(not(windows))]
+        Engine::Cayenne => Some(AccelerationEngine::Cayenne),
+        _ => None,
+    }
+}
+
 /// Remap constraint column indices from the source schema to the refresh schema.
 ///
 /// When `refresh_sql` selects a subset or reordered set of columns, the primary key
@@ -558,7 +571,7 @@ pub struct DataFusion {
     /// Only used in scheduler mode.
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
     /// Executor registry for distributed write forwarding (scheduler mode only).
-    pub(crate) executor_registry: Option<Arc<ExecutorRegistry>>,
+    pub executor_registry: Option<Arc<ExecutorRegistry>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -1468,6 +1481,14 @@ impl DataFusion {
             );
         }
 
+        self.handle_schema_difference(
+            dataset,
+            &acceleration_settings,
+            &refresh_schema,
+            refresh_mode,
+        )
+        .await?;
+
         // Get source constraints (primary keys) for upsert behavior.
         //
         // For caching mode with DuckDB/Cayenne: constraints enable upsert behavior
@@ -1502,7 +1523,7 @@ impl DataFusion {
                 Arc::clone(&refresh_schema),
                 constraints.as_ref(),
                 &acceleration_settings,
-                secrets,
+                Arc::clone(&secrets),
                 Some(dataset),
                 Arc::clone(&self.ctx),
             )
@@ -1831,6 +1852,88 @@ impl DataFusion {
             .context(UnableToBuildAcceleratedTableSnafu {
                 dataset_name: dataset.name.to_string(),
             })
+    }
+
+    // For file_update mode: compare the checkpoint schema (from the previous run) against
+    // the source/refresh schema. If there is any schema difference, snapshot the current
+    // file and recreate the acceleration.
+    //
+    // We read the schema from the checkpoint rather than from accelerated_table_provider
+    // because the provider reports the schema it was *created with* (refresh_schema),
+    // not the actual schema stored in the acceleration file.
+    //
+    // Normalize Dictionary types in refresh_schema the same way create_accelerator_table
+    // does, so that Dictionary→value type normalization doesn't trigger a false mismatch.
+    async fn handle_schema_difference(
+        &self,
+        dataset: &Dataset,
+        acceleration_settings: &Acceleration,
+        refresh_schema: &Arc<Schema>,
+        refresh_mode: RefreshMode,
+    ) -> Result<(), Error> {
+        if acceleration_settings.mode == Mode::FileUpdate
+            && refresh_mode != RefreshMode::Disabled
+            && let Ok(cp) = DatasetCheckpoint::try_new(dataset, OpenOption::OpenExisting).await
+            && let Some(existing_schema) = cp.get_schema().await.ok().flatten()
+        {
+            let needs_dict_normalization = matches!(
+                acceleration_settings.engine.to_unpartitioned(),
+                Engine::DuckDB | Engine::Sqlite | Engine::Turso
+            );
+            let normalized_refresh_schema = if needs_dict_normalization
+                && arrow_tools::schema::has_dictionary_types(refresh_schema)
+            {
+                Arc::new(arrow_tools::schema::normalize_dictionary_types(
+                    refresh_schema,
+                ))
+            } else {
+                Arc::clone(refresh_schema)
+            };
+
+            if let Some(diff) =
+                arrow_tools::schema::schema_difference(&existing_schema, &normalized_refresh_schema)
+            {
+                tracing::warn!(
+                    "Dataset {} schema change detected in file_update mode. {diff}. Acceleration file is replaced.",
+                    dataset.name
+                );
+
+                // Snapshot before recreating (best-effort)
+                if let Ok(layout) = get_acceleration_layout(dataset).await
+                    && let Some(accel_engine) =
+                        engine_to_acceleration_engine(acceleration_settings.engine)
+                {
+                    dataaccelerator::snapshots::snapshot_before_recreate(
+                        acceleration_settings,
+                        &dataset.name.to_string(),
+                        layout,
+                        accel_engine,
+                        Arc::clone(&existing_schema),
+                    )
+                    .await;
+                }
+
+                // Drop the existing table from the acceleration engine so it can be recreated
+                // with the updated schema
+                let accelerator = self
+                    .accelerator_engine_registry
+                    .get_accelerator_engine(acceleration_settings.engine)
+                    .await
+                    .ok_or_else(|| Error::ExpectedAccelerationSettings {
+                        name: dataset.name.to_string(),
+                    })?;
+                accelerator
+                    .drop_table(&dataset.name.to_string(), dataset)
+                    .await
+                    .map_err(|e| dataaccelerator::Error::AccelerationCreationFailed { source: e })
+                    .context(UnableToCreateDataAcceleratorSnafu)?;
+
+                // Clear the checkpoint so the refresh treats this as a fresh table
+                let _ = cp.delete().await;
+            }
+        }
+
+        Ok(())
     }
 
     /// Attempt to synchronize refreshes with the parent table for localpod accelerated tables.
@@ -2736,20 +2839,41 @@ async fn resolve_table_partition_expr(
 ) -> Result<Option<String>, DataFusionError> {
     let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
 
-    let Some(catalog) = catalog else {
-        return Ok(None);
+    let expr_string = if let Some(catalog) = catalog
+        && let Some(aware) = cayenne_ddl::as_partition_aware(catalog)
+    {
+        aware
+            .table_partition_expr(schema_name, table_reference.table())
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?
+    } else {
+        None
     };
 
-    let Some(aware) = cayenne_ddl::as_partition_aware(catalog) else {
-        return Ok(None);
+    let provider_expr_string = if let Some(catalog) = catalog
+        && let Some(schema) = catalog.schema(schema_name)
+    {
+        match schema.table(table_reference.table()).await {
+            Ok(Some(table_provider)) => partition_expr_from_table_provider(&table_provider),
+            Ok(None) => None,
+            Err(err) => {
+                tracing::debug!(table = %table_reference, error = %err, "Failed to resolve table provider while reading partition expression");
+                None
+            }
+        }
+    } else {
+        None
     };
 
-    let Some(expr_string) = aware
-        .table_partition_expr(schema_name, table_reference.table())
-        .await
-        .boxed()
-        .map_err(DataFusionError::External)?
-    else {
+    let Some(expr_string) = expr_string.or(provider_expr_string).or_else(|| {
+        executor_registry.and_then(|registry| {
+            registry
+                .federated_partition_manager()
+                .get_cached_table_metadata(table_reference)
+                .and_then(|metadata| metadata.partition_expressions.first().cloned())
+        })
+    }) else {
         return Ok(None);
     };
 
@@ -2768,6 +2892,45 @@ async fn resolve_table_partition_expr(
     }
 
     Ok(Some(expr_string))
+}
+
+fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -> Option<String> {
+    if let Some(partitioned) = table_provider
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+    {
+        let partition_exprs = partitioned
+            .partition_by()
+            .iter()
+            .map(|partition| partition.expression.to_string())
+            .collect_vec();
+
+        return match partition_exprs.as_slice() {
+            [] => None,
+            [single] => Some(single.clone()),
+            _ => unreachable!(
+                "Multi-expression partition expressions are not supported yet: https://github.com/spiceai/spiceai/issues/9937"
+            ),
+        };
+    }
+
+    if let Some(poly) = table_provider.as_any().downcast_ref::<PolyTableProvider>() {
+        return partition_expr_from_table_provider(&poly.writer());
+    }
+
+    if let Some(accelerated) = table_provider.as_any().downcast_ref::<AcceleratedTable>() {
+        return partition_expr_from_table_provider(&accelerated.get_accelerator());
+    }
+
+    if let Some(adaptor) = table_provider
+        .as_any()
+        .downcast_ref::<FederatedTableProviderAdaptor>()
+        && let Some(inner_provider) = adaptor.table_provider.as_ref()
+    {
+        return partition_expr_from_table_provider(inner_provider);
+    }
+
+    None
 }
 
 #[must_use]

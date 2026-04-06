@@ -56,7 +56,7 @@ pub mod sqlite;
 #[cfg(feature = "turso")]
 pub mod turso;
 
-mod snapshots;
+pub(crate) mod snapshots;
 pub mod spice_sys;
 pub mod upsert_dedup;
 
@@ -434,6 +434,21 @@ pub trait DataAccelerator: Send + Sync {
         Ok(BootstrapStatus::none())
     }
 
+    /// Drops an existing table from the acceleration engine.
+    ///
+    /// Used by `file_update` mode to remove a table whose schema is incompatible with
+    /// the current source, so it can be recreated with the correct schema.
+    ///
+    /// The default implementation is a no-op; engines that support file-based acceleration
+    /// should override this.
+    async fn drop_table(
+        &self,
+        _table_name: &str,
+        _source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
     /// Check if the accelerator is initialized for a component
     fn is_initialized(&self, _source: &dyn AccelerationSource) -> bool {
         true
@@ -546,7 +561,7 @@ impl AcceleratorExternalTableBuilder {
     }
 
     fn validate_arrow(&self) -> Result<(), Error> {
-        if Mode::File == self.mode {
+        if matches!(self.mode, Mode::File | Mode::FileUpdate) {
             InvalidConfigurationSnafu {
                 msg: "File mode not supported for Arrow engine".to_string(),
             }

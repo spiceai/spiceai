@@ -50,17 +50,17 @@ use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::{Constraints, DFSchema};
 use datafusion_execution::cache::TableScopedPath;
 use datafusion_execution::config::SessionConfig;
-use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{Expr, LogicalPlan, Operator, TableProviderFilterPushDown, TableType};
+use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::SendableRecordBatchStream;
 use datafusion_physical_plan::collect;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::union::UnionExec;
-use datafusion_physical_plan::ExecutionPlan;
 use datafusion_table_providers::util::constraints::UpsertOptions;
 use datafusion_table_providers::util::on_conflict::OnConflict;
 use futures::{StreamExt, TryStreamExt};
@@ -359,6 +359,22 @@ impl CayenneTableProvider {
     #[must_use]
     pub(crate) fn write_lock(&self) -> &tokio::sync::Mutex<()> {
         &self.write_lock
+    }
+
+    #[must_use]
+    pub(crate) fn write_lock_arc(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.write_lock)
+    }
+
+    #[must_use]
+    pub(crate) fn target_file_size_bytes(&self) -> usize {
+        self.context.target_file_size_bytes()
+    }
+
+    /// Returns a cheap clone that shares the underlying table state for write operations.
+    #[must_use]
+    pub fn clone_for_write_operations(&self) -> Self {
+        self.clone_for_write()
     }
 
     /// Returns whether retention filters are configured for this table.
@@ -1526,7 +1542,7 @@ impl CayenneTableProvider {
     /// - Retention filters are table-wide predicates (e.g., "delete rows older than 30 days")
     /// - They must scan all table data, not just the newly written chunks
     /// - The write lock ensures atomicity: all writes + retention happen as one operation
-    fn clone_for_write(&self) -> Self {
+    pub(crate) fn clone_for_write(&self) -> Self {
         Self {
             table_metadata: self.table_metadata.clone(),
             catalog: Arc::clone(&self.catalog),
@@ -3406,11 +3422,11 @@ impl CayenneTableProvider {
         };
         let mut added = already_extended;
         for col_ref in filter.column_refs() {
-            if let Some((idx, _)) = self.table_metadata.schema.column_with_name(col_ref.name()) {
-                if !proj.contains(&idx) {
-                    proj.push(idx);
-                    added = true;
-                }
+            if let Some((idx, _)) = self.table_metadata.schema.column_with_name(col_ref.name())
+                && !proj.contains(&idx)
+            {
+                proj.push(idx);
+                added = true;
             }
         }
         (Some(proj), added)
@@ -3533,7 +3549,7 @@ impl CayenneTableProvider {
                 // Filter to only include deletions with seq > min_delete_seq_to_apply
                 let filtered_deletions: HashMap<i64, i64> = all_deleted_pks
                     .iter()
-                    .filter(|(_pk, &seq)| seq > min_delete_seq_to_apply)
+                    .filter(|(_, seq)| **seq > min_delete_seq_to_apply)
                     .map(|(&pk, &seq)| (pk, seq))
                     .collect();
 
@@ -3575,7 +3591,7 @@ impl CayenneTableProvider {
                     // Filter to only include deletions with seq > min_delete_seq_to_apply
                     let filtered_deletions: HashMap<Box<[u8]>, i64> = all_deleted_keys
                         .iter()
-                        .filter(|(_key, &seq)| seq > min_delete_seq_to_apply)
+                        .filter(|(_, seq)| **seq > min_delete_seq_to_apply)
                         .map(|(key, &seq)| (key.clone(), seq))
                         .collect();
 
@@ -3978,10 +3994,8 @@ impl TableProvider for CayenneTableProvider {
 
         // Strip extra columns (PK or retention time column) added to the projection
         // but not originally requested by the query.
-        if need_projection_strip {
-            if let Some(orig_proj) = projection {
-                return self.create_projection_strip(plan, orig_proj.len());
-            }
+        if need_projection_strip && let Some(orig_proj) = projection {
+            return self.create_projection_strip(plan, orig_proj.len());
         }
 
         Ok(Arc::new(CayenneAccelerationExec::new(plan)))
@@ -4418,8 +4432,8 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::metadata::VortexConfig;
     use crate::CayenneCatalog;
+    use crate::metadata::VortexConfig;
 
     use super::*;
 
@@ -4429,8 +4443,8 @@ mod tests {
     use datafusion::common::{Constraints, ToDFSchema};
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::execution::context::SessionContext;
-    use datafusion::logical_expr::dml::InsertOp;
     use datafusion::logical_expr::CreateExternalTable;
+    use datafusion::logical_expr::dml::InsertOp;
     use datafusion::physical_plan::collect;
     use datafusion_common::DataFusionError;
     use datafusion_federation::schema_cast::record_convert::try_cast_to;
@@ -4469,7 +4483,7 @@ mod tests {
                 _ => {
                     return Err(DataFusionError::Execution(format!(
                         "Unsupported cayenne_metastore type: {metastore_type}"
-                    )))
+                    )));
                 }
             };
 

@@ -17,7 +17,7 @@ limitations under the License.
 use arrow_schema::TimeUnit;
 use async_trait::async_trait;
 use chrono::{NaiveDateTime, TimeZone as _, Utc};
-use data_components::delete::{DeletionExec, DeletionSink};
+use data_components::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use datafusion::arrow::array::{
     Array, ArrayRef, Int32Array, Int64Array, StringArray, TimestampNanosecondArray, UInt64Array,
 };
@@ -1472,6 +1472,7 @@ struct DeletablePartitionMemTable {
     #[expect(dead_code)]
     partition_value: ScalarValue,
     deleted_count: Arc<RwLock<u64>>,
+    updated_count: Arc<RwLock<u64>>,
 }
 
 impl DeletablePartitionMemTable {
@@ -1480,6 +1481,7 @@ impl DeletablePartitionMemTable {
             mem_table,
             partition_value,
             deleted_count: Arc::new(RwLock::new(0)),
+            updated_count: Arc::new(RwLock::new(0)),
         }
     }
 }
@@ -1524,35 +1526,60 @@ impl TableProvider for DeletablePartitionMemTable {
         self.mem_table.insert_into(state, input, insert_op).await
     }
 
-    async fn delete_from(
+    async fn update(
         &self,
         _state: &dyn Session,
+        _assignments: Vec<(String, Expr)>,
         _filters: Vec<Expr>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        // Simulate deleting 10 rows per partition
-        let deletion_sink = Arc::new(MockDeletionSink {
-            deleted_count: Arc::clone(&self.deleted_count),
-            count_to_delete: 10,
+        // Simulate updating 5 rows per partition
+        let update_sink = Arc::new(MockDeletionSink {
+            count: Arc::clone(&self.updated_count),
+            count_per_call: 5,
         });
 
-        Ok(Arc::new(DeletionExec::new(deletion_sink)))
+        Ok(Arc::new(DeletionExec::new(
+            update_sink,
+            &self.mem_table.schema(),
+        )))
     }
 }
 
-/// Mock deletion sink that simulates deletion and tracks deleted count
+/// Mock deletion sink that simulates deletion/update and tracks count
 struct MockDeletionSink {
-    deleted_count: Arc<RwLock<u64>>,
-    count_to_delete: u64,
+    count: Arc<RwLock<u64>>,
+    count_per_call: u64,
 }
 
 #[async_trait]
 impl DeletionSink for MockDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let mut guard = self.deleted_count.write().await;
-        *guard += self.count_to_delete;
-        Ok(self.count_to_delete)
+        let mut guard = self.count.write().await;
+        *guard += self.count_per_call;
+        Ok(self.count_per_call)
     }
 }
+
+#[async_trait]
+impl DeletionTableProvider for DeletablePartitionMemTable {
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        _filters: &[Expr],
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // Simulate deleting 10 rows per partition
+        let deletion_sink = Arc::new(MockDeletionSink {
+            count: Arc::clone(&self.deleted_count),
+            count_per_call: 10,
+        });
+
+        Ok(Arc::new(DeletionExec::new(
+            deletion_sink,
+            &self.mem_table.schema(),
+        )))
+    }
+}
+
 
 /// Partition creator that creates `DeletablePartitionMemTable` instances
 #[derive(Debug)]
@@ -2310,6 +2337,353 @@ async fn test_deletion_repeated_calls() -> Result<(), Box<dyn std::error::Error>
             "Iteration {i}: Expected 10 deleted rows"
         );
     }
+
+    Ok(())
+}
+
+// ============================================================================
+// Update Tests for PartitionTableProvider
+// ============================================================================
+
+#[tokio::test]
+async fn test_update_table_provider_single_partition() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let creator = Arc::new(DeletableTestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert data into a single partition
+    let df = ctx.read_batch(RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["us-east", "us-east", "us-east"])),
+            Arc::new(Int64Array::from(vec![100, 200, 300])),
+        ],
+    )?)?;
+    df.write_table("test_table", DataFrameWriteOptions::new())
+        .await?;
+
+    // Access PartitionTableProvider directly to call update
+    let table = ctx.table_provider("test_table").await?;
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .expect("Expected PartitionTableProvider");
+
+    let state = ctx.state();
+    let assignments = vec![("value".to_string(), lit(999i64))];
+    let update_plan = partition_provider
+        .update(&state, assignments, vec![])
+        .await?;
+
+    // Execute the update plan
+    let result = collect(update_plan, ctx.task_ctx()).await?;
+
+    // Check the result - should have updated 5 rows (mocked) from single partition
+    assert_eq!(result.len(), 1, "Expected 1 result batch");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        5,
+        "Expected 5 updated rows from single partition"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_update_table_provider_multiple_partitions() -> Result<(), Box<dyn std::error::Error>>
+{
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let creator = Arc::new(DeletableTestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert data into multiple partitions
+    let regions = vec!["us-east", "us-west", "eu-west"];
+    for region in &regions {
+        let df = ctx.read_batch(RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![*region, *region, *region])),
+                Arc::new(Int64Array::from(vec![100, 200, 300])),
+            ],
+        )?)?;
+        df.write_table("test_table", DataFrameWriteOptions::new())
+            .await?;
+    }
+
+    // Verify we have 3 partitions
+    let partitions = creator.get_partitions().await;
+    assert_eq!(partitions.len(), 3, "Expected 3 partitions");
+
+    // Get the table provider and call update
+    let table = ctx.table_provider("test_table").await?;
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .expect("Expected PartitionTableProvider");
+
+    let state = ctx.state();
+    let assignments = vec![("value".to_string(), lit(999i64))];
+    let update_plan = partition_provider
+        .update(&state, assignments, vec![])
+        .await?;
+
+    // Execute the update plan
+    let result = collect(update_plan, ctx.task_ctx()).await?;
+
+    // Check the result - should have updated 15 rows total (5 per partition * 3 partitions)
+    assert_eq!(result.len(), 1, "Expected 1 result batch");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        15,
+        "Expected 15 updated rows from 3 partitions"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_update_table_provider_with_filters() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let creator = Arc::new(DeletableTestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert data into partitions
+    let df = ctx.read_batch(RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["us-east", "us-west"])),
+            Arc::new(Int64Array::from(vec![100, 200])),
+        ],
+    )?)?;
+    df.write_table("test_table", DataFrameWriteOptions::new())
+        .await?;
+
+    // Get the table provider and call update with filters and assignments
+    let table = ctx.table_provider("test_table").await?;
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .expect("Expected PartitionTableProvider");
+
+    let state = ctx.state();
+    let assignments = vec![("value".to_string(), lit(999i64))];
+    let filters = vec![col("value").gt(lit(100i64))];
+    let update_plan = partition_provider
+        .update(&state, assignments, filters)
+        .await?;
+
+    // Execute the update plan
+    let result = collect(update_plan, ctx.task_ctx()).await?;
+
+    // The mock updates 5 per partition, so expect 10 total (2 partitions)
+    assert_eq!(result.len(), 1, "Expected 1 result batch");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        10,
+        "Expected 10 updated rows from 2 partitions"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_update_table_provider_empty_partitions() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+
+    let creator = Arc::new(DeletableTestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // No data inserted, so no partitions exist
+
+    let table = ctx.table_provider("test_table").await?;
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .expect("Expected PartitionTableProvider");
+
+    let state = ctx.state();
+    let assignments = vec![("id".to_string(), lit(0i64))];
+    let update_plan = partition_provider
+        .update(&state, assignments, vec![])
+        .await?;
+
+    let result = collect(update_plan, ctx.task_ctx()).await?;
+
+    // No partitions = 0 rows updated
+    assert_eq!(result.len(), 1, "Expected 1 result batch");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        0,
+        "Expected 0 updated rows for empty table"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_update_with_multiple_assignments() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let creator = Arc::new(DeletableTestPartitionCreator::new(Arc::clone(&schema)));
+    let partition_by = vec![PartitionedBy {
+        name: "region".to_string(),
+        expression: col("region"),
+    }];
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert data
+    let df = ctx.read_batch(RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])),
+            Arc::new(StringArray::from(vec!["us-east", "us-west"])),
+            Arc::new(Int64Array::from(vec![100, 200])),
+        ],
+    )?)?;
+    df.write_table("test_table", DataFrameWriteOptions::new())
+        .await?;
+
+    let table = ctx.table_provider("test_table").await?;
+    let partition_provider = table
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .expect("Expected PartitionTableProvider");
+
+    let state = ctx.state();
+    // Multiple assignments: SET value = 999, id = 0
+    let assignments = vec![
+        ("value".to_string(), lit(999i64)),
+        ("id".to_string(), lit(0i64)),
+    ];
+    let update_plan = partition_provider
+        .update(&state, assignments, vec![])
+        .await?;
+
+    let result = collect(update_plan, ctx.task_ctx()).await?;
+
+    // 2 partitions * 5 per partition = 10
+    assert_eq!(result.len(), 1, "Expected 1 result batch");
+    let count_col = result[0]
+        .column_by_name("count")
+        .expect("Expected count column");
+    let count_array = count_col
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("Expected UInt64Array");
+    assert_eq!(
+        count_array.value(0),
+        10,
+        "Expected 10 updated rows from 2 partitions"
+    );
 
     Ok(())
 }

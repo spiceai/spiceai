@@ -33,9 +33,10 @@ limitations under the License.
 use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::{
-    metadata::CreateTableOptions, CayenneCatalog, CayenneTableProvider, MetadataCatalog,
+    CayenneCatalog, CayenneTableProvider, MetadataCatalog, metadata::CreateTableOptions,
 };
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use data_components::delete::DeletionTableProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;

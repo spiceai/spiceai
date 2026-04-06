@@ -39,6 +39,7 @@ use std::sync::Arc;
 
 use arrow::array::{RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use cayenne::CayenneSchemaProvider;
 use cayenne::CayenneTableProviderBuilder;
 use cayenne::metadata::CreateTableOptions;
 use datafusion::catalog::{CatalogProviderList, SchemaProvider};
@@ -57,10 +58,10 @@ use runtime_table_partition::expression::PartitionedBy;
 use runtime_table_partition::provider::PartitionTableProvider;
 
 use super::get_cayenne_provider;
-use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::dataaccelerator::cayenne::CayennePartitionCreator;
 use crate::dataaccelerator::cayenne::transform_schema_for_vortex;
+use crate::datafusion::ddl::arrow_datatype_to_sql;
 
 /// Builds a filesystem-safe partition label for persisted metadata and Hive-style paths.
 ///
@@ -88,39 +89,6 @@ fn partition_label_for_expr(partition_expr: &Expr) -> String {
     }
 
     sanitized
-}
-
-/// Maps an Arrow [`DataType`] to a SQL type string suitable for DDL forwarding.
-///
-/// Returns a SQL type that `DataFusion`'s SQL parser can understand in a
-/// `CREATE TABLE` statement.
-fn arrow_datatype_to_sql(dt: &DataType) -> DFResult<String> {
-    match dt {
-        DataType::Boolean => Ok("BOOLEAN".to_string()),
-        DataType::Int8 => Ok("TINYINT".to_string()),
-        DataType::Int16 => Ok("SMALLINT".to_string()),
-        DataType::Int32 => Ok("INT".to_string()),
-        DataType::Int64 => Ok("BIGINT".to_string()),
-        DataType::UInt8 => Ok("TINYINT UNSIGNED".to_string()),
-        DataType::UInt16 => Ok("SMALLINT UNSIGNED".to_string()),
-        DataType::UInt32 => Ok("INT UNSIGNED".to_string()),
-        DataType::UInt64 => Ok("BIGINT UNSIGNED".to_string()),
-        DataType::Float16 | DataType::Float32 => Ok("FLOAT".to_string()),
-        DataType::Float64 => Ok("DOUBLE".to_string()),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok("VARCHAR".to_string()),
-        DataType::Binary
-        | DataType::LargeBinary
-        | DataType::BinaryView
-        | DataType::FixedSizeBinary(_) => Ok("BYTEA".to_string()),
-        DataType::Date32 | DataType::Date64 => Ok("DATE".to_string()),
-        DataType::Time32(_) | DataType::Time64(_) => Ok("TIME".to_string()),
-        DataType::Timestamp(_, _) => Ok("TIMESTAMP".to_string()),
-        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => Ok(format!("DECIMAL({p},{s})")),
-        DataType::Dictionary(_, value_type) => arrow_datatype_to_sql(value_type.as_ref()),
-        other => Err(DataFusionError::Execution(format!(
-            "Unsupported Arrow type for forwarded Cayenne DDL: {other}"
-        ))),
-    }
 }
 
 /// Forward a DDL statement (CREATE/DROP TABLE) to all connected executors.

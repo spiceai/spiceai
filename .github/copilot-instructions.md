@@ -394,9 +394,21 @@ testoperator run throughput -p test.yaml -s spiced --query-set tpch --concurrenc
 
 ### Snapshot Testing with Insta
 
+- **ALWAYS use named `.snap` files** for snapshot assertions — never inline snapshots (`@r"..."` syntax)
+  - Use `insta::assert_snapshot!("snapshot_name", value)` which stores snapshots in a `snapshots/` directory
+  - Named snapshots are easier to review in PRs, diff cleanly, and avoid bloating test source files
 - **NEVER manually edit snapshot files** (`.snap` files): Always use Insta to generate them
 - Run tests with `INSTA_UPDATE=1` to regenerate snapshots: `INSTA_UPDATE=1 cargo test`
 - Review generated snapshots carefully before accepting
+
+```rust
+// GOOD — named snapshot stored in snapshots/*.snap
+insta::assert_snapshot!("query_plan", plan_fmt);
+insta::assert_snapshot!("select_all_rows", rows_fmt);
+
+// BAD — inline snapshot bloats test file, hard to diff in PRs
+insta::assert_snapshot!(plan_fmt, @r#"..."#);
+```
 
 ## Feature Flags
 

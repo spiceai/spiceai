@@ -19,7 +19,7 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 use arrow::array::{Array, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use data_components::delete::{DeletionExec, DeletionSink};
+use data_components::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use datafusion::{
     catalog::{Session, TableProvider},
     common::{Constraints, DFSchema, Statistics, project_schema},
@@ -215,6 +215,42 @@ impl PartitionTableProvider {
     pub fn creator(&self) -> &Arc<dyn PartitionCreator> {
         &self.creator
     }
+
+    #[must_use]
+    pub fn partition_by(&self) -> &[PartitionedBy] {
+        &self.partition_by
+    }
+
+    /// Returns the provider for the given partition values, creating the partition if needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DataFusionError`] if the partition key cannot be encoded or if creating
+    /// the new partition fails.
+    pub async fn get_or_create_partition_provider(
+        &self,
+        partition_values: Vec<datafusion::scalar::ScalarValue>,
+    ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+        let partition_key = encode_composite_key(&partition_values).map_err(|e| {
+            DataFusionError::Execution(format!("Failed to encode partition key: {e}"))
+        })?;
+
+        // retain the write lock across the entire get-or-create instead of holding a .read() which releases the lock and could race
+        // with another get-or-create for the same partition key, resulting in duplicate partitions being created
+        let mut partitions_lock = self.partitions.write().await;
+        if let Some(partition) = partitions_lock.get(&partition_key) {
+            return Ok(Arc::clone(&partition.table_provider));
+        }
+
+        let partition = self
+            .creator
+            .create_partition(partition_values)
+            .await
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        let provider = Arc::clone(&partition.table_provider);
+        partitions_lock.insert(partition_key, partition);
+        Ok(provider)
+    }
 }
 
 #[async_trait]
@@ -392,10 +428,35 @@ impl TableProvider for PartitionTableProvider {
             .await
     }
 
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let partitions = self.partitions.read().await;
+        let partition_list: Vec<_> = partitions.values().cloned().collect();
+        drop(partitions);
+
+        let update_sink = Arc::new(PartitionedUpdateSink::new(
+            partition_list,
+            assignments,
+            filters,
+            state.task_ctx(),
+        ));
+
+        Ok(Arc::new(DeletionExec::new(update_sink, &self.schema)))
+    }
+}
+
+/// Implement `DeletionTableProvider` to support retention checks and delete operations
+/// on partitioned tables. Deletion is applied to all partitions.
+#[async_trait]
+impl DeletionTableProvider for PartitionTableProvider {
     async fn delete_from(
         &self,
         state: &dyn Session,
-        filters: Vec<Expr>,
+        filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         // Collect all partitions that need deletion
         let partitions = self.partitions.read().await;
@@ -405,11 +466,11 @@ impl TableProvider for PartitionTableProvider {
         // Create a deletion sink that will iterate over all partitions
         let deletion_sink = Arc::new(PartitionedDeletionSink::new(
             partition_list,
-            filters,
+            filters.to_vec(),
             state.task_ctx(),
         ));
 
-        Ok(Arc::new(DeletionExec::new(deletion_sink)))
+        Ok(Arc::new(DeletionExec::new(deletion_sink, &self.schema)))
     }
 }
 
@@ -464,6 +525,63 @@ impl DeletionSink for PartitionedDeletionSink {
         }
 
         Ok(total_deleted)
+    }
+}
+
+/// An update sink that applies update operations to all partitions in a partitioned table.
+struct PartitionedUpdateSink {
+    partitions: Vec<Partition>,
+    assignments: Vec<(String, Expr)>,
+    filters: Vec<Expr>,
+    task_ctx: Arc<TaskContext>,
+}
+
+impl PartitionedUpdateSink {
+    fn new(
+        partitions: Vec<Partition>,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+        task_ctx: Arc<TaskContext>,
+    ) -> Self {
+        Self {
+            partitions,
+            assignments,
+            filters,
+            task_ctx,
+        }
+    }
+}
+
+#[async_trait]
+impl DeletionSink for PartitionedUpdateSink {
+    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let mut total_updated = 0u64;
+
+        for partition in &self.partitions {
+            let session_ctx = datafusion::execution::context::SessionContext::new();
+            let state = session_ctx.state();
+
+            let plan = partition
+                .table_provider
+                .update(&state, self.assignments.clone(), self.filters.clone())
+                .await?;
+
+            let results = collect(plan, Arc::clone(&self.task_ctx)).await?;
+
+            for batch in results {
+                if let Some(count_col) = batch.column_by_name("count")
+                    && let Some(uint_array) = count_col.as_any().downcast_ref::<UInt64Array>()
+                {
+                    for i in 0..uint_array.len() {
+                        if !uint_array.is_null(i) {
+                            total_updated += uint_array.value(i);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(total_updated)
     }
 }
 
