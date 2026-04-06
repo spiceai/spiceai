@@ -433,6 +433,8 @@ mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
     use std::sync::{Arc, Mutex};
 
+    use runtime_request_context::{Protocol, RequestContextBuilder};
+
     use crate::extension::bytes_processed::{BytesEmittedCallback, BytesProcessedExec};
 
     fn make_test_table() -> Result<Arc<dyn TableProvider>> {
@@ -622,6 +624,105 @@ mod tests {
             "Expected non-zero bytes tracked after repartitioning"
         );
 
+        Ok(())
+    }
+
+    /// Verify that a stored `RequestContext` (via `with_request_context`) takes precedence
+    /// over a context supplied through the `TaskContext` session config extension.
+    #[tokio::test]
+    async fn test_stored_request_context_takes_precedence() -> Result<()> {
+        let ctx = make_test_context();
+        let test_table = make_test_table()?;
+        let data_source_exec = test_table.scan(&ctx.state(), None, &[], None).await?;
+
+        let stored_ctx = Arc::new(
+            RequestContextBuilder::new(Protocol::Flight)
+                .with_authorization_header(Some("Bearer stored-token".to_string()))
+                .build(),
+        );
+
+        let captured_protocol = Arc::new(Mutex::new(Vec::new()));
+        let captured_ref = Arc::clone(&captured_protocol);
+        let callback: Arc<BytesEmittedCallback> = Arc::new(Box::new(move |_bytes, dims| {
+            // The protocol dimension tells us which RequestContext was used.
+            for kv in dims {
+                if kv.key.as_str() == "protocol" {
+                    captured_ref
+                        .lock()
+                        .expect("mutex should not be poisoned")
+                        .push(kv.value.to_string());
+                }
+            }
+        }));
+
+        let exec = BytesProcessedExec::new(data_source_exec, callback)
+            .with_request_context(stored_ctx)
+            .fallback_to_new_context();
+
+        // Put a different protocol context on the session config so we can detect which one wins.
+        let session_req_ctx = RequestContextBuilder::new(Protocol::Http).build();
+        let session_with_ext = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_target_partitions(2)
+                .with_extension(Arc::new(session_req_ctx)),
+        );
+        let task_ctx = session_with_ext.task_ctx();
+        let _batches = collect(Arc::new(exec), task_ctx).await?;
+
+        let protocols = captured_protocol
+            .lock()
+            .expect("mutex should not be poisoned");
+        assert!(
+            !protocols.is_empty(),
+            "Expected at least one bytes-processed callback"
+        );
+        for p in protocols.iter() {
+            assert_eq!(
+                p, "flight",
+                "Expected stored context (Flight) to win over session context (Http)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Verify that `fallback_to_new_context()` creates an Internal protocol context
+    /// when no stored context or session extension is available.
+    #[tokio::test]
+    async fn test_fallback_to_new_context() -> Result<()> {
+        let ctx = make_test_context();
+        let test_table = make_test_table()?;
+        let data_source_exec = test_table.scan(&ctx.state(), None, &[], None).await?;
+
+        let captured_protocol = Arc::new(Mutex::new(Vec::new()));
+        let captured_ref = Arc::clone(&captured_protocol);
+        let callback: Arc<BytesEmittedCallback> = Arc::new(Box::new(move |_bytes, dims| {
+            for kv in dims {
+                if kv.key.as_str() == "protocol" {
+                    captured_ref
+                        .lock()
+                        .expect("mutex should not be poisoned")
+                        .push(kv.value.to_string());
+                }
+            }
+        }));
+
+        // No stored context, no session extension — fallback should produce Internal.
+        let exec = BytesProcessedExec::new(data_source_exec, callback).fallback_to_new_context();
+        let _batches = collect(Arc::new(exec), ctx.task_ctx()).await?;
+
+        let protocols = captured_protocol
+            .lock()
+            .expect("mutex should not be poisoned");
+        assert!(
+            !protocols.is_empty(),
+            "Expected at least one bytes-processed callback"
+        );
+        for p in protocols.iter() {
+            assert_eq!(
+                p, "internal",
+                "Expected fallback to produce Internal protocol"
+            );
+        }
         Ok(())
     }
 }

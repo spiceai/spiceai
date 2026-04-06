@@ -80,17 +80,7 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             return Ok(plan);
         }
 
-        if let Ok(node) = SchemaCastScanExecNode::decode(buf) {
-            let schema = datafusion_common::Schema::decode(&*node.schema)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-            let exec = Arc::new(SchemaCastScanExec::new(
-                Arc::clone(&inputs[0]),
-                Arc::new(Schema::try_from(&schema)?),
-            ));
-
-            Ok(exec)
-        } else if let Ok(node) = BytesProcessedExecNode::decode(buf) {
+        if let Ok(node) = BytesProcessedExecNode::decode(buf) {
             let request_context = request_context_from_proto(node.request_context);
             let mut exec = BytesProcessedExec::new(
                 Arc::clone(&inputs[0]),
@@ -101,6 +91,16 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
                 exec = exec.with_request_context(Arc::new(ctx));
             }
             Ok(Arc::new(exec))
+        } else if let Ok(node) = SchemaCastScanExecNode::decode(buf) {
+            let schema = datafusion_common::Schema::decode(&*node.schema)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            let exec = Arc::new(SchemaCastScanExec::new(
+                Arc::clone(&inputs[0]),
+                Arc::new(Schema::try_from(&schema)?),
+            ));
+
+            Ok(exec)
         } else if CayenneAccelerationExecNode::decode(buf).is_ok() {
             #[cfg(not(windows))]
             {
@@ -216,14 +216,16 @@ fn request_context_to_proto(ctx: &RequestContext) -> RequestContextProto {
 fn request_context_from_proto(proto: Option<RequestContextProto>) -> Option<RequestContext> {
     let proto = proto?;
 
-    let protocol = Protocol::from(proto.protocol as u8);
+    let protocol = match u8::try_from(proto.protocol).ok().map(Protocol::from) {
+        Some(Protocol::Invalid) | None => return None,
+        Some(protocol) => protocol,
+    };
 
     let trace_parent = match (proto.trace_id, proto.span_id) {
-        (Some(tid), Some(sid)) => {
-            let trace_id = TraceId::from_hex(&tid).ok()?;
-            let span_id = SpanId::from_hex(&sid).ok()?;
-            Some(TraceParent { trace_id, span_id })
-        }
+        (Some(tid), Some(sid)) => match (TraceId::from_hex(&tid), SpanId::from_hex(&sid)) {
+            (Ok(trace_id), Ok(span_id)) => Some(TraceParent { trace_id, span_id }),
+            _ => None,
+        },
         _ => None,
     };
 
