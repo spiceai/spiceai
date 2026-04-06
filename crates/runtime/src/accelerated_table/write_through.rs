@@ -52,14 +52,14 @@ use runtime_table_partition::provider::PartitionTableProvider;
 /// Target for Cayenne-based write-through operations.
 #[derive(Debug)]
 pub(crate) enum CayenneWriteTarget {
-    Staged(CayenneTableProvider),
+    Staged(Box<CayenneTableProvider>),
     Partitioned(Arc<dyn TableProvider>),
 }
 
 impl Clone for CayenneWriteTarget {
     fn clone(&self) -> Self {
         match self {
-            Self::Staged(provider) => Self::Staged(provider.clone_for_write_operations()),
+            Self::Staged(provider) => Self::Staged(Box::new(provider.clone_for_write_operations())),
             Self::Partitioned(provider) => Self::Partitioned(Arc::clone(provider)),
         }
     }
@@ -557,9 +557,9 @@ fn extract_cayenne_write_target(
         .as_any()
         .downcast_ref::<CayenneTableProvider>()
     {
-        return Some(CayenneWriteTarget::Staged(
+        return Some(CayenneWriteTarget::Staged(Box::new(
             cayenne.clone_for_write_operations(),
-        ));
+        )));
     }
 
     if let Some(partitioned) = table_provider

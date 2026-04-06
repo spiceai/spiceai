@@ -71,8 +71,10 @@ impl IcebergDdlAccelerationSource {
         acceleration: RuntimeAcceleration,
         time_column: Option<String>,
     ) -> Self {
-        let mut app = App::default();
-        app.name = app_name;
+        let app = App {
+            name: app_name,
+            ..Default::default()
+        };
 
         Self {
             app: Arc::new(app),
@@ -757,15 +759,15 @@ async fn create_accelerated_iceberg_table(
     source_provider: Arc<dyn datafusion::datasource::TableProvider>,
     acceleration: &Acceleration,
     dataset_options: &DatasetOptions,
-    catalog_name: &str,
-    schema_name: &str,
-    table_name: &str,
+    table_ident: (&str, &str, &str),
     partition_expr_sql: Option<&str>,
 ) -> Result<AcceleratedTable, DataFusionError> {
     use crate::accelerated_table::refresh::Refresh;
     use crate::component::dataset::TimeFormat;
     use crate::component::dataset::acceleration::RefreshMode;
     use crate::federated_table::FederatedTable;
+
+    let (catalog_name, schema_name, table_name) = table_ident;
 
     let df = datafusion.upgrade().ok_or_else(|| {
         DataFusionError::Execution(
@@ -911,9 +913,7 @@ async fn build_registered_provider(
         raw_provider,
         acceleration,
         dataset_options,
-        df_catalog_name,
-        df_schema_name,
-        &table_name,
+        (df_catalog_name, df_schema_name, &table_name),
         partition_expr_sql.map(String::as_str),
     )
     .await?;
@@ -1086,15 +1086,19 @@ fn build_forwarded_create_sql(
         options.push(format!("\"dataset.time_column\" = '{time_column}'"));
     }
     if let Some(time_format) = &dataset_options.time_format {
-        options.push(format!("\"dataset.time_format\" = '{}'", time_format));
+        options.push(format!("\"dataset.time_format\" = '{time_format}'"));
     }
 
     if !options.is_empty() {
-        sql.push_str(&format!(" WITH ({})", options.join(", ")));
+        use std::fmt::Write;
+        write!(sql, " WITH ({})", options.join(", "))
+            .map_err(|e| DataFusionError::Execution(format!("Failed to build SQL: {e}")))?;
     }
 
     if let Some(partition_expr_sql) = partition_expr_sql {
-        sql.push_str(&format!(" PARTITION BY {partition_expr_sql}"));
+        use std::fmt::Write;
+        write!(sql, " PARTITION BY {partition_expr_sql}")
+            .map_err(|e| DataFusionError::Execution(format!("Failed to build SQL: {e}")))?;
     }
 
     Ok(sql)
