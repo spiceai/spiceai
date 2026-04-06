@@ -32,9 +32,12 @@ use datafusion::sql::sqlparser::ast::{
     TableConstraint,
 };
 
+use crate::datafusion::cayenne_ddl::is_cayenne_catalog;
+use crate::datafusion::cayenne_ddl::logical_nodes::CayenneCreateTableNode;
 use crate::datafusion::ddl::acceleration_options::{
     CreateTableStatementExtension, SharedDdlExtensionStore, parse_ddl_table_options,
 };
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 /// Returns `true` if the `CREATE TABLE` has extensions we need to intercept:
 /// recognized `WITH (...)` options (`acceleration.*`, `dataset.*`) or a
@@ -185,6 +188,225 @@ fn extract_and_store_extensions(
     }
 
     Ok((create_table, Some(store_key)))
+}
+
+/// Plan a `CREATE TABLE ... (LIKE ...)` statement.
+///
+/// Resolves the source table from the catalog, extracts its schema and
+/// partition expression, and builds a [`CayenneCreateTableNode`] directly
+/// (bypassing `DataFusion`'s standard planner which doesn't support LIKE).
+pub(super) async fn plan_create_table_like(
+    statement: Statement,
+    session: &SessionState,
+    planner_ctx: &super::PlannerContext,
+) -> DFResult<LogicalPlan> {
+    use std::sync::Arc;
+
+    use datafusion::logical_expr::Extension;
+    use datafusion::sql::sqlparser::ast::CreateTableLikeKind;
+
+    // Decompose the Statement to take ownership of the CreateTable AST.
+    let Statement::Statement(sql_stmt) = statement else {
+        return Err(DataFusionError::Internal(
+            "Expected Statement::Statement for CREATE TABLE LIKE".to_string(),
+        ));
+    };
+    let SQLStatement::CreateTable(create_table) = *sql_stmt else {
+        return Err(DataFusionError::Internal(
+            "Expected SQLStatement::CreateTable for LIKE".to_string(),
+        ));
+    };
+
+    // Extract the source table name from the LIKE clause.
+    let like_kind = create_table.like.ok_or_else(|| {
+        DataFusionError::Internal("Expected LIKE clause in CreateTable".to_string())
+    })?;
+
+    // OR REPLACE is not supported with LIKE.
+    if create_table.or_replace {
+        return Err(DataFusionError::Plan(
+            "CREATE OR REPLACE TABLE ... LIKE is not supported. \
+             Use DROP TABLE followed by CREATE TABLE ... LIKE instead."
+                .to_string(),
+        ));
+    }
+
+    let like = match like_kind {
+        CreateTableLikeKind::Parenthesized(like) | CreateTableLikeKind::Plain(like) => like,
+    };
+
+    let source_name = like.name.to_string();
+    let source_table_ref = TableReference::parse_str(&source_name);
+    let source_catalog_name = source_table_ref
+        .catalog()
+        .unwrap_or(SPICE_DEFAULT_CATALOG)
+        .to_string();
+    let source_schema_name = source_table_ref
+        .schema()
+        .unwrap_or(SPICE_DEFAULT_SCHEMA)
+        .to_string();
+    let source_table_name = source_table_ref.table().to_string();
+
+    // Validate the source catalog is Cayenne-backed.
+    let catalog_list = session.catalog_list();
+    let source_catalog = catalog_list.catalog(&source_catalog_name).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "Source catalog '{source_catalog_name}' not found for LIKE"
+        ))
+    })?;
+
+    if !is_cayenne_catalog(source_catalog.as_ref()) {
+        return Err(DataFusionError::Plan(format!(
+            "CREATE TABLE ... (LIKE ...) is only supported for Cayenne catalog tables. \
+             Source table '{source_name}' is not in a Cayenne catalog."
+        )));
+    }
+
+    // Resolve the source table provider to get its schema.
+    let source_schema_provider = source_catalog.schema(&source_schema_name).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "Schema '{source_schema_name}' not found in catalog '{source_catalog_name}'"
+        ))
+    })?;
+
+    let source_provider = source_schema_provider
+        .table(&source_table_name)
+        .await
+        .map_err(|e| {
+            DataFusionError::Plan(format!(
+                "Failed to resolve source table '{source_name}': {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!("Source table '{source_name}' not found for LIKE"))
+        })?;
+
+    let arrow_schema = source_provider.schema();
+
+    // Resolve the source table's partition expression from the Cayenne catalog.
+    let partition_aware =
+        crate::datafusion::cayenne_ddl::as_partition_aware(source_catalog.as_ref());
+    let mut partition_expr_sql = if let Some(aware) = partition_aware {
+        aware
+            .table_partition_expr(&source_schema_name, &source_table_name)
+            .await
+            .map_err(|e| {
+                DataFusionError::Plan(format!(
+                    "Failed to get partition expression for source table '{source_name}': {e}"
+                ))
+            })?
+    } else {
+        None
+    };
+
+    // Build a fully-qualified source table reference (needed for partition metadata lookup).
+    let source_full_ref = TableReference::full(
+        source_catalog_name.clone(),
+        source_schema_name.clone(),
+        source_table_name.clone(),
+    );
+
+    // Resolve auto-generated labels (e.g. "expr0") to original SQL expressions
+    // by looking up the partition manager metadata.
+    if let Some(ref expr_str) = partition_expr_sql
+        && let Some(Ok(idx)) = expr_str.strip_prefix("expr").map(str::parse::<usize>)
+        && let Some(ref registry) = planner_ctx.executor_registry
+    {
+        let pm = registry.federated_partition_manager();
+        match pm.get_table_metadata(&source_full_ref).await {
+            Ok(Some(metadata)) => {
+                if let Some(original) = metadata.partition_expressions.get(idx) {
+                    // Strip outer parentheses — the state store stores expressions
+                    // like "(bucket(5, col))" but the SQL parser needs "bucket(5, col)".
+                    let resolved = original.trim();
+                    let resolved = if resolved.starts_with('(') && resolved.ends_with(')') {
+                        &resolved[1..resolved.len() - 1]
+                    } else {
+                        resolved
+                    };
+                    tracing::info!(
+                        source = %source_full_ref,
+                        label = %expr_str,
+                        resolved = %resolved,
+                        "Resolved auto-generated partition label to original SQL expression"
+                    );
+                    partition_expr_sql = Some(resolved.to_string());
+                } else {
+                    tracing::warn!(
+                        source = %source_full_ref,
+                        label = %expr_str,
+                        expressions = ?metadata.partition_expressions,
+                        "Partition expression index {idx} not found in metadata"
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    source = %source_full_ref,
+                    label = %expr_str,
+                    "No partition metadata found for source table"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    source = %source_full_ref,
+                    label = %expr_str,
+                    error = %e,
+                    "Failed to read partition metadata for source table"
+                );
+            }
+        }
+    }
+
+    // Pass the partition expression SQL through to the physical plan.
+    // The CayenneCreateTableExec will parse it against the schema at execution time
+    // using the full SessionContext (with all registered UDFs like bucket()).
+    let partition_expr = None;
+
+    // Resolve the target table reference.
+    let target_name = create_table.name.to_string();
+    let target_table_ref = TableReference::parse_str(&target_name);
+    let target_catalog_name = target_table_ref
+        .catalog()
+        .unwrap_or(SPICE_DEFAULT_CATALOG)
+        .to_string();
+    let target_schema_name = target_table_ref
+        .schema()
+        .unwrap_or(SPICE_DEFAULT_SCHEMA)
+        .to_string();
+    let target_table_name = target_table_ref.table().to_string();
+
+    // Validate the target catalog is also Cayenne-backed.
+    let target_catalog = catalog_list.catalog(&target_catalog_name).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "Target catalog '{target_catalog_name}' not found for LIKE"
+        ))
+    })?;
+
+    if !is_cayenne_catalog(target_catalog.as_ref()) {
+        return Err(DataFusionError::Plan(format!(
+            "CREATE TABLE ... LIKE is only supported for Cayenne catalog tables. \
+             Target catalog '{target_catalog_name}' is not a Cayenne catalog."
+        )));
+    }
+
+    // Build the CayenneCreateTableNode directly.
+    let node = CayenneCreateTableNode::builder(
+        target_table_name,
+        arrow_schema,
+        target_catalog_name,
+        target_schema_name,
+    )
+    .if_not_exists(create_table.if_not_exists)
+    .partition_expr(partition_expr)
+    .partition_expr_sql(partition_expr_sql)
+    .primary_key(vec![]) // LIKE never copies primary keys
+    .like_source_table(Some(source_full_ref))
+    .build();
+
+    Ok(LogicalPlan::Extension(Extension {
+        node: Arc::new(node),
+    }))
 }
 
 /// Remove a store entry on error (best-effort).
@@ -602,5 +824,43 @@ mod tests {
             .expect_err("should error")
             .to_string();
         assert!(err.contains("region"));
+    }
+
+    // -----------------------------------------------------------------------
+    // LIKE detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_like_plain_detected() {
+        let ct = parse_create_table("CREATE TABLE staging LIKE source_table");
+        assert!(
+            ct.like.is_some(),
+            "LIKE should be detected in CreateTable AST"
+        );
+    }
+
+    #[test]
+    fn test_like_if_not_exists_detected() {
+        let ct = parse_create_table("CREATE TABLE IF NOT EXISTS staging LIKE source_table");
+        assert!(ct.like.is_some());
+        assert!(ct.if_not_exists);
+    }
+
+    #[test]
+    fn test_like_qualified_source_detected() {
+        let ct = parse_create_table(
+            r#"CREATE TABLE IF NOT EXISTS "catalog"."schema"."staging" LIKE "catalog"."schema"."source""#,
+        );
+        assert!(ct.like.is_some());
+        assert!(ct.if_not_exists);
+    }
+
+    #[test]
+    fn test_like_not_treated_as_ddl_extension() {
+        let ct = parse_create_table("CREATE TABLE staging LIKE source_table");
+        assert!(
+            !has_ddl_extensions(&ct),
+            "LIKE should not be treated as a DDL extension"
+        );
     }
 }

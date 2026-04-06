@@ -85,6 +85,11 @@ pub struct PlannerContext {
     /// Shared store for DDL extensions extracted from `CREATE TABLE` statements.
     /// Populated by the planner, consumed by the analyzer rules.
     pub ddl_extension_store: SharedDdlExtensionStore,
+
+    /// Executor registry, if running in a distributed cluster.
+    /// Used by `CREATE TABLE ... LIKE` to resolve auto-generated partition
+    /// labels (e.g. `expr0`) back to the original SQL expression.
+    pub executor_registry: Option<Arc<crate::cluster::executor_registry::ExecutorRegistry>>,
 }
 
 /// Create a [`LogicalPlan`] from SQL, intercepting DDL extensions and
@@ -101,6 +106,21 @@ pub async fn create_logical_plan(
     // Step 2: Dispatch based on statement type
     if let Statement::Statement(ref sql_stmt) = statement {
         match sql_stmt.as_ref() {
+            // DDL: CREATE TABLE ... (LIKE ...) — resolve source table and
+            // build extension node directly, bypassing DataFusion's planner.
+            // Reject LIKE combined with DDL extensions (PARTITION BY, WITH)
+            // since LIKE inherits everything from the source table.
+            SQLStatement::CreateTable(ct) if ct.like.is_some() => {
+                if create_table::has_ddl_extensions(ct) {
+                    return Err(DataFusionError::Plan(
+                        "CREATE TABLE ... LIKE cannot be combined with PARTITION BY or WITH options. \
+                         The LIKE clause copies all properties from the source table."
+                            .to_string(),
+                    ));
+                }
+                return create_table::plan_create_table_like(statement, session, ctx).await;
+            }
+
             // DDL: CREATE TABLE with extensions (WITH options, PARTITION BY).
             // Intercepted regardless of catalog mode — extensions apply to
             // all catalog types (Cayenne, Iceberg, etc.).
