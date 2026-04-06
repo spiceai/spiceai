@@ -29,10 +29,7 @@ use tempfile::TempDir;
 
 /// Backend type for parameterized tests
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(
-    dead_code,
-    reason = "Shared test helper enum; variants are consumed by backend-matrix macro expansion in subset test modules"
-)]
+#[allow(dead_code)]
 pub enum BackendType {
     Sqlite,
     #[cfg(feature = "turso")]
@@ -40,10 +37,7 @@ pub enum BackendType {
 }
 
 impl BackendType {
-    #[expect(
-        dead_code,
-        reason = "Debug helper for backend-specific test output; not every test module uses it"
-    )]
+    #[allow(dead_code)]
     pub fn name(self) -> &'static str {
         match self {
             BackendType::Sqlite => "SQLite",
@@ -54,31 +48,19 @@ impl BackendType {
 }
 
 /// Test fixture that sets up a temporary directory and catalog
-#[expect(
-    dead_code,
-    reason = "Shared fixture type compiled into each integration test crate; only some tests construct it"
-)]
+#[allow(dead_code)]
 pub struct TestFixture {
-    #[expect(
-        dead_code,
-        reason = "Some tests keep TempDir only for lifetime management without direct field reads"
-    )]
+    #[allow(dead_code)]
     pub temp_dir: TempDir,
     pub catalog: Arc<CayenneCatalog>,
     pub data_path: std::path::PathBuf,
-    #[expect(
-        dead_code,
-        reason = "Backend marker is used by backend-parameterized tests only"
-    )]
+    #[allow(dead_code)]
     pub backend_type: BackendType,
 }
 
 impl TestFixture {
     /// Create a new test fixture with the specified backend
-    #[expect(
-        dead_code,
-        reason = "Fixture constructor is called from backend harness helpers used by a subset of tests"
-    )]
+    #[allow(dead_code)]
     pub async fn new(backend: BackendType) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         let data_path = temp_dir.path().join("data");
@@ -108,10 +90,7 @@ impl TestFixture {
     }
 
     /// Get the database path for SQLite-specific verification
-    #[expect(
-        dead_code,
-        reason = "SQLite-specific diagnostics helper used only by targeted tests"
-    )]
+    #[allow(dead_code)]
     pub fn db_path(&self) -> std::path::PathBuf {
         self.temp_dir.path().join("test.db")
     }
@@ -139,10 +118,7 @@ macro_rules! test_with_backends {
 }
 
 /// Helper to run a test function with a specific backend
-#[expect(
-    dead_code,
-    reason = "Backend harness helper used only by tests that invoke test_with_backends!"
-)]
+#[allow(dead_code)]
 pub async fn run_with_backend<F, Fut>(
     backend: BackendType,
     test_fn: F,
@@ -165,10 +141,7 @@ where
 /// Insert a single batch using `insert_into()` (append mode).
 ///
 /// Creates a temporary `SessionContext` internally.
-#[expect(
-    dead_code,
-    reason = "Convenience wrapper used by select tests; others call insert_batches directly"
-)]
+#[allow(dead_code)]
 pub async fn insert_batch(provider: &CayenneTableProvider, batch: RecordBatch) -> DFResult<u64> {
     insert_batches(provider, vec![batch]).await
 }
@@ -176,10 +149,7 @@ pub async fn insert_batch(provider: &CayenneTableProvider, batch: RecordBatch) -
 /// Insert record batches using `insert_into()` API (append mode).
 ///
 /// Creates a temporary `SessionContext` internally.
-#[expect(
-    dead_code,
-    reason = "Shared insert helper compiled into all test crates but only referenced by some tests"
-)]
+#[allow(dead_code)]
 pub async fn insert_batches(
     provider: &CayenneTableProvider,
     batches: Vec<RecordBatch>,
@@ -204,10 +174,7 @@ pub async fn insert_batches(
 }
 
 /// Extract the row count from insert result batches.
-#[expect(
-    dead_code,
-    reason = "Internal helper used only by insert helpers that are not referenced in every test crate"
-)]
+#[allow(dead_code)]
 fn extract_row_count(results: &[RecordBatch]) -> u64 {
     use arrow::datatypes::DataType;
 

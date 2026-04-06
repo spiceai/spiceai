@@ -63,6 +63,7 @@ use super::get_cayenne_provider;
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::dataaccelerator::cayenne::CayennePartitionCreator;
 use crate::dataaccelerator::cayenne::transform_schema_for_vortex;
+use crate::datafusion::ddl::arrow_datatype_to_sql;
 
 /// Builds a filesystem-safe partition label for persisted metadata and Hive-style paths.
 ///
