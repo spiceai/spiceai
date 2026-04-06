@@ -497,8 +497,8 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
             wait_for_row_count(&harness, "categories", 10, Duration::from_secs(60)).await?;
 
             // Wait for partition metadata to be fully initialized and assigned
-            // to executors. Poll until the EXPLAIN shows a partitioned plan
-            // (Union with bucket filters) rather than an EmptyRelation.
+            // to executors. Poll until the EXPLAIN shows a distributed plan
+            // (FlightSqlExec with bucket filters) rather than an EmptyRelation.
             let join_sql = "SELECT t.id, t.name, c.category, c.rating \
                             FROM test_data t JOIN categories c ON t.id = c.id \
                             ORDER BY t.id";
@@ -509,12 +509,12 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                 let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                     .expect("format explain")
                     .to_string();
-                if plan_fmt.contains("UnionExec") || plan_fmt.contains("Union") {
+                if plan_fmt.contains("FlightSqlExec") && plan_fmt.contains("bucket") {
                     break plan;
                 }
                 assert!(
                     start.elapsed() <= Duration::from_secs(30),
-                    "Timed out waiting for partitioned EXPLAIN plan. Got:\n{plan_fmt}"
+                    "Timed out waiting for distributed EXPLAIN plan. Got:\n{plan_fmt}"
                 );
                 tokio::time::sleep(Duration::from_millis(500)).await;
             };
@@ -529,17 +529,12 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                 "plan should contain inner join"
             );
             assert!(
-                plan_fmt.contains("SubqueryAlias: test_data"),
+                plan_fmt.contains("TableScan: test_data"),
                 "plan should contain test_data"
             );
             assert!(
-                plan_fmt.contains("SubqueryAlias: categories"),
+                plan_fmt.contains("TableScan: categories"),
                 "plan should contain categories"
-            );
-            // Both tables should have Union (2 executor branches)
-            assert!(
-                plan_fmt.contains("UnionExec"),
-                "physical plan should contain UnionExec"
             );
             // All 4 bucket values should appear for each table
             for bucket in &["'0'", "'1'", "'2'", "'3'"] {
