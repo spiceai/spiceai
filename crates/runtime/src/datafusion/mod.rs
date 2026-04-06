@@ -408,6 +408,9 @@ pub enum Error {
         "Invalid snapshot configuration: Only DuckDB, Turso and SQlite support snapshots"
     ))]
     UnsupportedAccelerationEngineForSnapshots,
+
+    #[snafu(display("Pre-refresh partition discovery failed for table '{table_name}': {reason}"))]
+    PreRefreshPartitionDiscoveryFailed { table_name: String, reason: String },
 }
 
 /// Validates that the acceleration engine is supported in distributed mode.
@@ -2118,12 +2121,21 @@ impl DataFusion {
         // runs on a 30-second interval) might not have discovered new partitions yet,
         // causing executors to drop data from unassigned partitions. (fixes #10075)
         if let Some(partition_manager) = &self.partition_manager {
-            self.discover_and_assign_partitions_for_refresh(
-                partition_manager,
-                executor_registry,
-                dataset_name,
-            )
-            .await;
+            let app = if let Some(app_lock) = &self.app {
+                app_lock.read().await.clone()
+            } else {
+                None
+            };
+
+            if let Some(app) = &app {
+                self.discover_and_assign_partitions_for_refresh(
+                    partition_manager,
+                    executor_registry,
+                    dataset_name,
+                    app,
+                )
+                .await?;
+            }
         }
 
         let overrides_json = match overrides {
@@ -2190,37 +2202,21 @@ impl DataFusion {
     /// before a refresh command is forwarded. This ensures executors have assignments for
     /// all current partition values, preventing data loss from new partitions.
     ///
-    /// If discovery fails for any reason, a warning is logged but the refresh still proceeds
-    /// (graceful degradation).
+    /// Returns an error if any step of partition discovery or assignment fails, which
+    /// prevents the refresh from proceeding with potentially incomplete partition state.
     async fn discover_and_assign_partitions_for_refresh(
         &self,
         partition_manager: &Arc<crate::cluster::PartitionManager>,
         executor_registry: &ExecutorRegistry,
         dataset_name: &TableReference,
-    ) {
+        app: &Arc<app::App>,
+    ) -> Result<()> {
         use crate::cluster::partition::discovery::table_partition_values;
         use crate::cluster::partition::partition_value_to_bytes;
         use runtime_proto::scheduler_control_message::Message as SchedulerControlMessageEnum;
         use runtime_proto::{BytesArray, SchedulerControlMessage, UpdatePartitions};
 
         let table_name = dataset_name.to_string();
-
-        // Read the app to get the dataset's partition_by config.
-        let Some(app_guard) = &self.app else {
-            tracing::debug!(
-                table = %table_name,
-                "No app reference available, skipping pre-refresh partition discovery"
-            );
-            return;
-        };
-        let app_opt = app_guard.read().await;
-        let Some(app) = app_opt.as_ref() else {
-            tracing::debug!(
-                table = %table_name,
-                "App not initialized, skipping pre-refresh partition discovery"
-            );
-            return;
-        };
 
         // Find the acceleration config for this dataset or view.
         let acceleration = app
@@ -2240,34 +2236,29 @@ impl DataFusion {
                 table = %table_name,
                 "No acceleration config found, skipping pre-refresh partition discovery"
             );
-            return;
+            return Ok(());
         };
 
         if acceleration.partition_by.is_empty() {
-            return; // Not partitioned, nothing to discover.
+            return Ok(()); // Not partitioned, nothing to discover.
         }
 
         let partition_by = acceleration.partition_by.clone();
-        // Drop the read guard before performing async operations that might be slow.
-        drop(app_opt);
 
         // Refresh partition manager cache from object store.
         if let Err(e) = partition_manager.refresh().await {
-            tracing::warn!(
-                table = %table_name,
-                error = %e,
-                "Failed to refresh partition manager cache before refresh, proceeding anyway"
-            );
-            return;
+            return Err(Error::PreRefreshPartitionDiscoveryFailed {
+                table_name: table_name.clone(),
+                reason: format!("Failed to refresh partition manager cache: {e}"),
+            });
         }
 
         // Get the self Arc for table_partition_values (it needs &Arc<DataFusion>).
         let Some(df_arc) = self.datafusion_ref.get().and_then(std::sync::Weak::upgrade) else {
-            tracing::warn!(
-                table = %table_name,
-                "DataFusion self-reference not available, skipping pre-refresh partition discovery"
-            );
-            return;
+            return Err(Error::PreRefreshPartitionDiscoveryFailed {
+                table_name: table_name.clone(),
+                reason: "DataFusion self-reference not available".to_string(),
+            });
         };
 
         // Discover current partition values from the source.
@@ -2275,17 +2266,15 @@ impl DataFusion {
             match table_partition_values(dataset_name, &partition_by, &df_arc).await {
                 Ok(values) => values,
                 Err(e) => {
-                    tracing::warn!(
-                        table = %table_name,
-                        error = %e,
-                        "Failed to discover partition values before refresh, proceeding anyway"
-                    );
-                    return;
+                    return Err(Error::PreRefreshPartitionDiscoveryFailed {
+                        table_name: table_name.clone(),
+                        reason: format!("Failed to discover partition values: {e}"),
+                    });
                 }
             };
 
         if source_partitions.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Get the current metadata to find new partitions.
@@ -2296,15 +2285,13 @@ impl DataFusion {
                     table = %table_name,
                     "No partition metadata found, skipping pre-refresh partition discovery"
                 );
-                return;
+                return Ok(());
             }
             Err(e) => {
-                tracing::warn!(
-                    table = %table_name,
-                    error = %e,
-                    "Failed to get partition metadata before refresh, proceeding anyway"
-                );
-                return;
+                return Err(Error::PreRefreshPartitionDiscoveryFailed {
+                    table_name: table_name.clone(),
+                    reason: format!("Failed to get partition metadata: {e}"),
+                });
             }
         };
 
@@ -2334,10 +2321,10 @@ impl DataFusion {
                 table = %table_name,
                 "No new partitions discovered before refresh"
             );
-            return;
+            return Ok(());
         }
 
-        tracing::info!(
+        tracing::debug!(
             table = %table_name,
             count = new_partitions.len(),
             "Discovered new partitions before refresh, assigning to executors"
@@ -2346,11 +2333,10 @@ impl DataFusion {
         // Get connected executors for round-robin assignment of new partitions.
         let executor_ids = executor_registry.connected_executors().await;
         if executor_ids.is_empty() {
-            tracing::warn!(
-                table = %table_name,
-                "No executors connected, cannot assign new partitions"
-            );
-            return;
+            return Err(Error::PreRefreshPartitionDiscoveryFailed {
+                table_name: table_name.clone(),
+                reason: "No executors connected, cannot assign new partitions".to_string(),
+            });
         }
 
         // Assign new partitions to executors using round-robin.
@@ -2364,12 +2350,10 @@ impl DataFusion {
             .add_and_assign_partitions(dataset_name, &assignments)
             .await
         {
-            tracing::warn!(
-                table = %table_name,
-                error = %e,
-                "Failed to add and assign new partitions before refresh, proceeding anyway"
-            );
-            return;
+            return Err(Error::PreRefreshPartitionDiscoveryFailed {
+                table_name: table_name.clone(),
+                reason: format!("Failed to add and assign new partitions: {e}"),
+            });
         }
 
         // Notify executors of the new partition assignments.
@@ -2388,11 +2372,10 @@ impl DataFusion {
                 match partition_value_to_bytes(p.clone(), dataset_name, &df_arc).await {
                     Ok(bytes) => partitions_bytes.push(bytes.to_vec()),
                     Err(e) => {
-                        tracing::warn!(
-                            table = %table_name,
-                            error = %e,
-                            "Failed to convert partition value to bytes, skipping notification for this partition"
-                        );
+                        return Err(Error::PreRefreshPartitionDiscoveryFailed {
+                            table_name: table_name.clone(),
+                            reason: format!("Failed to convert partition value to bytes: {e}"),
+                        });
                     }
                 }
             }
@@ -2418,19 +2401,19 @@ impl DataFusion {
             };
 
             if let Err(e) = executor_registry.send_command(executor_id, command).await {
-                tracing::warn!(
-                    executor_id = %executor_id,
-                    table = %table_name,
-                    error = %e,
-                    "Failed to notify executor of new partitions before refresh"
-                );
+                return Err(Error::PreRefreshPartitionDiscoveryFailed {
+                    table_name: table_name.clone(),
+                    reason: format!("Failed to notify executor '{executor_id}' of new partitions: {e}"),
+                });
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             table = %table_name,
             "Completed pre-refresh partition discovery and assignment"
         );
+
+        Ok(())
     }
 
     pub async fn update_refresh_sql(
