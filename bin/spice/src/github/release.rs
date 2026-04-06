@@ -235,8 +235,10 @@ pub async fn upgrade_cli_in_place(
         });
     }
 
-    // On Unix, we can replace the binary directly even while running
-    // On Windows, we need to rename the old binary first
+    // We cannot overwrite a running executable directly.
+    // Windows locks the file; Unix returns ETXTBSY. The fix is to remove/rename the
+    // old binary first — the OS keeps the inode (Unix) or handle (Windows) alive until
+    // the process exits, so the running process is unaffected.
     #[cfg(windows)]
     {
         let backup_path = current_exe.with_extension("old.exe");
@@ -247,8 +249,14 @@ pub async fn upgrade_cli_in_place(
             message: format!("Failed to backup current executable: {e}"),
         })?;
     }
+    #[cfg(unix)]
+    {
+        // Unlink the running binary so the new copy can be written to the same path.
+        // The kernel keeps the old inode alive until this process exits.
+        let _ = std::fs::remove_file(&current_exe);
+    }
 
-    // Copy the new binary to the current executable location
+    // Copy the new binary to the (now-vacant) executable location
     std::fs::copy(&extracted_binary, &current_exe).map_err(|e| GitHubError::Io {
         message: format!("Failed to replace CLI binary: {e}"),
     })?;
