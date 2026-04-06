@@ -96,7 +96,7 @@ fn partition_label_for_expr(partition_expr: &Expr) -> String {
 /// Maps an Arrow [`DataType`] to a SQL type string suitable for DDL forwarding.
 ///
 /// Returns a SQL type that `DataFusion`'s SQL parser can understand in a
-/// `CREATE TABLE` statement. DataFusion SQL does not support specifying
+/// `CREATE TABLE` statement. `DataFusion` SQL does not support specifying
 /// timestamp time units, so those are always `Nanosecond` after a roundtrip.
 /// Timezone presence is preserved via `TIMESTAMPTZ`.
 pub(super) fn arrow_datatype_to_sql(dt: &DataType) -> DFResult<String> {
@@ -1759,7 +1759,7 @@ mod tests {
     #[test]
     fn timestamp_without_tz_maps_to_timestamp() {
         let dt = DataType::Timestamp(TimeUnit::Nanosecond, None);
-        assert_eq!(arrow_datatype_to_sql(&dt).unwrap(), "TIMESTAMP");
+        assert_eq!(arrow_datatype_to_sql(&dt).expect("TIMESTAMP"), "TIMESTAMP");
     }
 
     #[test]
@@ -1767,21 +1767,21 @@ mod tests {
         // Microsecond with UTC timezone — common in Cayenne retention columns.
         let dt = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
         assert_eq!(
-            arrow_datatype_to_sql(&dt).unwrap(),
+            arrow_datatype_to_sql(&dt).expect("TIMESTAMP WITH TIME ZONE"),
             "TIMESTAMP WITH TIME ZONE"
         );
 
         // Nanosecond with UTC timezone.
         let dt = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
         assert_eq!(
-            arrow_datatype_to_sql(&dt).unwrap(),
+            arrow_datatype_to_sql(&dt).expect("TIMESTAMP WITH TIME ZONE"),
             "TIMESTAMP WITH TIME ZONE"
         );
 
         // Second with non-UTC timezone.
         let dt = DataType::Timestamp(TimeUnit::Second, Some("+05:30".into()));
         assert_eq!(
-            arrow_datatype_to_sql(&dt).unwrap(),
+            arrow_datatype_to_sql(&dt).expect("TIMESTAMP WITH TIME ZONE"),
             "TIMESTAMP WITH TIME ZONE"
         );
     }
@@ -1796,7 +1796,7 @@ mod tests {
         ] {
             let dt = DataType::Timestamp(unit, None);
             assert_eq!(
-                arrow_datatype_to_sql(&dt).unwrap(),
+                arrow_datatype_to_sql(&dt).expect("TIMESTAMP"),
                 "TIMESTAMP",
                 "Timestamp({unit:?}, None) should map to TIMESTAMP"
             );
@@ -1806,18 +1806,21 @@ mod tests {
     #[test]
     fn decimal_preserves_precision_and_scale() {
         let dt = DataType::Decimal128(18, 6);
-        assert_eq!(arrow_datatype_to_sql(&dt).unwrap(), "DECIMAL(18,6)");
+        assert_eq!(
+            arrow_datatype_to_sql(&dt).expect("DECIMAL(18,6)"),
+            "DECIMAL(18,6)"
+        );
     }
 
     #[test]
     fn dictionary_unwraps_to_value_type() {
         let dt = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
-        assert_eq!(arrow_datatype_to_sql(&dt).unwrap(), "VARCHAR");
+        assert_eq!(arrow_datatype_to_sql(&dt).expect("VARCHAR"), "VARCHAR");
     }
 
     #[test]
     fn unsupported_types_return_error() {
         let dt = DataType::Duration(TimeUnit::Second);
-        assert!(arrow_datatype_to_sql(&dt).is_err());
+        arrow_datatype_to_sql(&dt).expect_err("Duration should be unsupported");
     }
 }
