@@ -63,7 +63,6 @@ use super::get_cayenne_provider;
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::dataaccelerator::cayenne::CayennePartitionCreator;
 use crate::dataaccelerator::cayenne::transform_schema_for_vortex;
-use crate::datafusion::cayenne_ddl::create_table_if_not_exists;
 
 /// Builds a filesystem-safe partition label for persisted metadata and Hive-style paths.
 ///
@@ -170,8 +169,8 @@ async fn forward_to_executors(
         .iter()
         .map(|(executor_id, client)| {
             let client = client.clone();
-            let executor_id = executor_id.clone();
             let sql = sql.to_string();
+            let executor_id = executor_id.clone();
             async move {
                 let max_attempts = if require_all { MAX_DML_RETRIES + 1 } else { 1 };
                 let mut last_err: Option<String> = None;
@@ -266,7 +265,7 @@ async fn forward_to_executors(
 }
 
 /// Send a single SQL statement to one executor via `FlightSQL` execute + `do_get`.
-pub async fn forward_sql_to_executor(
+async fn forward_sql_to_executor(
     mut client: data_components::flightsql::FlightSqlClient,
     sql: &str,
 ) -> Result<(), String> {
@@ -476,6 +475,16 @@ impl ExecutionPlan for CayenneCreateTableExec {
         let runtime_env = context.runtime_env();
 
         let stream = futures::stream::once(async move {
+            // In distributed mode, at least one executor must be connected
+            // before creating Cayenne catalog tables.
+            if let Some(ref registry) = executor_registry
+                && registry.flight_sql_clients.read().await.is_empty()
+            {
+                return Err(DataFusionError::Execution(format!(
+                    "Failed to create table '{table_name}' in Cayenne catalog '{df_catalog_name}': no executors are currently connected. At least one executor must be connected before creating tables. Ensure an executor is running and connected to the scheduler."
+                )));
+            }
+
             // Get the Cayenne catalog provider
             let df_catalog = catalog_list.catalog(&df_catalog_name).ok_or_else(|| {
                 DataFusionError::Execution(format!("Catalog '{df_catalog_name}' not found"))
@@ -687,17 +696,17 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 Arc::clone(&new_schema) as Arc<dyn SchemaProvider>
             };
 
-            schema_provider.register_table(table_name.clone(), Arc::clone(&wrapped_provider))?;
+            schema_provider.register_table(table_name.clone(), wrapped_provider)?;
 
             // Initialize partition metadata so the scheduler can route queries by partition.
-            let table_ref = datafusion::sql::TableReference::full(
-                df_catalog_name.clone(),
-                df_schema_name.clone(),
-                table_name.clone(),
-            );
             if let Some(ref pe) = partition_expr
                 && let Some(ref registry) = executor_registry
             {
+                let table_ref = datafusion::sql::TableReference::full(
+                    df_catalog_name.clone(),
+                    df_schema_name.clone(),
+                    table_name.clone(),
+                );
                 let expr_sql = partition_expr_sql.clone().unwrap_or_else(|| pe.to_string());
                 let pm = registry.federated_partition_manager();
                 if let Err(e) = pm.initialize_metadata(&table_ref, vec![expr_sql]).await {
@@ -711,11 +720,35 @@ impl ExecutionPlan for CayenneCreateTableExec {
 
             // Forward the CREATE TABLE DDL to executor nodes
             if let Some(ref registry) = executor_registry {
-                let ddl_sql = create_table_if_not_exists(
-                    &table_ref,
-                    &wrapped_provider,
-                    partition_expr_sql.as_deref(),
-                )?;
+                let columns_sql: Vec<String> = arrow_schema
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        let null_str = if f.is_nullable() { "" } else { " NOT NULL" };
+                        let sql_type = arrow_datatype_to_sql(f.data_type())?;
+                        Ok(format!("\"{}\" {sql_type}{null_str}", f.name()))
+                    })
+                    .collect::<DFResult<Vec<_>>>()?;
+
+                let mut table_elements = columns_sql;
+                if !primary_key.is_empty() {
+                    let pk_cols = primary_key
+                        .iter()
+                        .map(|c| format!("\"{c}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    table_elements.push(format!("PRIMARY KEY ({pk_cols})"));
+                }
+
+                let ddl_sql = format!(
+                    "CREATE TABLE IF NOT EXISTS \"{df_catalog_name}\".\"{df_schema_name}\".\"{table_name}\" ({})",
+                    table_elements.join(", ")
+                );
+                let ddl_sql = if let Some(ref partition_sql) = partition_expr_sql {
+                    format!("{ddl_sql} PARTITION BY {partition_sql}")
+                } else {
+                    ddl_sql
+                };
                 forward_ddl_to_executors(registry, &ddl_sql).await?;
             }
 
