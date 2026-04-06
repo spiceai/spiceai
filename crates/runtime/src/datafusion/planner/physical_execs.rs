@@ -196,6 +196,7 @@ async fn execute_merge(
 
     // Normalize output to match the target table schema (including nullability).
     let target_schema = target_provider.schema();
+
     let normalized_batches = updated_batches
         .into_iter()
         .map(|batch| arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema)))
@@ -413,11 +414,13 @@ fn build_delete_filters(
         ));
     }
 
-    // Combine all row predicates with OR.
-    match row_predicates.into_iter().reduce(datafusion_expr::Expr::or) {
+    // Combine all row predicates with OR using a balanced binary tree.
+    // A linear fold creates O(N) depth causing stack overflow for large N.
+    // A balanced tree keeps depth at O(log N).
+    match util::expr::combine_exprs_balanced(row_predicates, datafusion::prelude::Expr::or) {
         Some(combined) => Ok(vec![combined]),
         None => Err(DataFusionError::Internal(
-            "Failed to build delete filters: reduce produced no result".to_string(),
+            "Failed to build delete filters: no row predicates generated".to_string(),
         )),
     }
 }

@@ -286,6 +286,8 @@ pub struct CayenneCreateTableExec {
     executor_registry: Option<Arc<ExecutorRegistry>>,
     partition_expr: Option<Expr>,
     partition_expr_sql: Option<String>,
+    like_source_table: Option<datafusion::sql::TableReference>,
+    ctx: Option<Arc<datafusion::prelude::SessionContext>>,
     properties: PlanProperties,
 }
 
@@ -312,6 +314,8 @@ pub struct CayenneCreateTableExecBuilder {
     executor_registry: Option<Arc<ExecutorRegistry>>,
     partition_expr: Option<Expr>,
     partition_expr_sql: Option<String>,
+    like_source_table: Option<datafusion::sql::TableReference>,
+    ctx: Option<Arc<datafusion::prelude::SessionContext>>,
 }
 
 impl CayenneCreateTableExecBuilder {
@@ -334,6 +338,8 @@ impl CayenneCreateTableExecBuilder {
             executor_registry: None,
             partition_expr: None,
             partition_expr_sql: None,
+            like_source_table: None,
+            ctx: None,
         }
     }
 
@@ -362,6 +368,21 @@ impl CayenneCreateTableExecBuilder {
     }
 
     #[must_use]
+    pub fn like_source_table(
+        mut self,
+        like_source_table: Option<datafusion::sql::TableReference>,
+    ) -> Self {
+        self.like_source_table = like_source_table;
+        self
+    }
+
+    #[must_use]
+    pub fn ctx(mut self, ctx: Option<Arc<datafusion::prelude::SessionContext>>) -> Self {
+        self.ctx = ctx;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> CayenneCreateTableExec {
         let schema = ddl_result_schema();
         let properties = PlanProperties::new(
@@ -381,6 +402,8 @@ impl CayenneCreateTableExecBuilder {
             executor_registry: self.executor_registry,
             partition_expr: self.partition_expr,
             partition_expr_sql: self.partition_expr_sql,
+            like_source_table: self.like_source_table,
+            ctx: self.ctx,
             properties,
         }
     }
@@ -435,7 +458,34 @@ impl ExecutionPlan for CayenneCreateTableExec {
         let executor_registry = self.executor_registry.clone();
         let partition_expr = self.partition_expr.clone();
         let partition_expr_sql = self.partition_expr_sql.clone();
-        let partition_label = partition_expr.as_ref().map(partition_label_for_expr);
+        let like_source_table = self.like_source_table.clone();
+        let ctx = self.ctx.clone();
+        let mut partition_label = partition_expr.as_ref().map(partition_label_for_expr);
+
+        // For LIKE tables where partition_expr is None but partition_expr_sql is
+        // Some, we need to set the partition label early so the Cayenne metadata
+        // is created with the correct partition_column. The full Expr will be
+        // parsed later in the provider creation branch.
+        if partition_label.is_none() && partition_expr_sql.is_some() {
+            partition_label = partition_expr_sql.as_ref().map(|sql| {
+                // Use the SQL expression to derive a safe label
+                // Try to parse it to get a proper label
+                use datafusion::sql::sqlparser::dialect::GenericDialect;
+                use datafusion::sql::sqlparser::parser::Parser;
+                let dialect = GenericDialect {};
+                if let Ok(mut parser) = Parser::new(&dialect).try_with_sql(sql) {
+                    if let Ok(sql_expr) = parser.parse_expr() {
+                        // Check if it's a simple column reference
+                        if let datafusion::sql::sqlparser::ast::Expr::Identifier(ident) = &sql_expr
+                        {
+                            return ident.value.clone();
+                        }
+                    }
+                }
+                // Fall back to auto-generated label
+                format!("expr0")
+            });
+        }
         let result_schema = ddl_result_schema();
         let runtime_env = context.runtime_env();
 
@@ -573,76 +623,148 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 })?;
 
             // Build the table provider: partitioned or non-partitioned
-            let wrapped_provider: Arc<dyn datafusion::catalog::TableProvider> =
-                if let Some(ref partition_expr) = partition_expr {
-                    let df_schema = vortex_schema.as_ref().clone().to_dfschema()?;
-                    let partition_expr_for_error = partition_expr_sql
-                        .clone()
-                        .unwrap_or_else(|| partition_expr.to_string());
-                    partition_expr.to_field(&df_schema).map_err(|e| {
+            let wrapped_provider: Arc<dyn datafusion::catalog::TableProvider> = if let Some(
+                ref partition_expr,
+            ) =
+                partition_expr
+            {
+                let df_schema = vortex_schema.as_ref().clone().to_dfschema()?;
+                let partition_expr_for_error = partition_expr_sql
+                    .clone()
+                    .unwrap_or_else(|| partition_expr.to_string());
+                tracing::info!(
+                    table = %table_name,
+                    partition_expr = %partition_expr_for_error,
+                    schema_fields = ?df_schema.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+                    "CayenneCreateTableExec: validating partition expression"
+                );
+                partition_expr.to_field(&df_schema).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Invalid PARTITION BY expression '{partition_expr_for_error}': {e}",
+                    ))
+                })?;
+
+                let partition_name = partition_label
+                    .clone()
+                    .unwrap_or_else(|| partition_label_for_expr(partition_expr));
+
+                let partition_by = vec![PartitionedBy {
+                    name: partition_name,
+                    expression: partition_expr.clone(),
+                }];
+
+                let creator = Arc::new(CayennePartitionCreator::new(
+                    metadata_table_name.clone(),
+                    PathBuf::from(&table_data_path),
+                    partition_by.clone(),
+                    Arc::clone(&vortex_schema),
+                    Arc::clone(&metadata_catalog),
+                    table_id,
+                    UnsupportedTypeAction::Error,
+                    Vec::new(), // retention_filters
+                    None,       // time_retention_filter_builder
+                    vortex_config.clone(),
+                    None, // object_store_config (local filesystem)
+                    primary_key.clone(),
+                    on_conflict.clone(),
+                    Arc::clone(&runtime_env),
+                ));
+
+                let partition_provider =
+                    PartitionTableProvider::new(creator, partition_by, Arc::clone(&vortex_schema))
+                        .await
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to create partitioned table '{table_name}': {e}"
+                            ))
+                        })?;
+
+                let partition_provider = Arc::new(partition_provider);
+                let deletion_provider: Arc<dyn DeletionTableProvider> = partition_provider;
+                Arc::new(DeletionTableProviderAdapter::new(deletion_provider))
+                    as Arc<dyn datafusion::catalog::TableProvider>
+            } else if let Some(ref expr_sql) = partition_expr_sql {
+                // LIKE path: partition_expr was not pre-parsed during planning
+                // (the SessionState snapshot may not have all UDFs). Parse it
+                // here using the SessionContext which has the full UDF registry.
+                let ctx_ref = ctx.as_ref().ok_or_else(|| {
                         DataFusionError::Execution(format!(
-                            "Invalid PARTITION BY expression '{partition_expr_for_error}': {e}",
+                            "SessionContext required to parse partition expression '{expr_sql}' for LIKE table '{table_name}'"
                         ))
                     })?;
+                let df_schema = vortex_schema.as_ref().clone().to_dfschema()?;
+                let parsed_expr = ctx_ref.parse_sql_expr(expr_sql, &df_schema).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Invalid PARTITION BY expression '{expr_sql}' for table '{table_name}': {e}"
+                    ))
+                })?;
 
-                    let partition_name = partition_label
-                        .clone()
-                        .unwrap_or_else(|| partition_label_for_expr(partition_expr));
+                parsed_expr.to_field(&df_schema).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Invalid PARTITION BY expression '{expr_sql}': {e}",
+                    ))
+                })?;
 
-                    let partition_by = vec![PartitionedBy {
-                        name: partition_name,
-                        expression: partition_expr.clone(),
-                    }];
+                // Set partition_label so Cayenne metadata gets the correct label.
+                if partition_label.is_none() {
+                    partition_label = Some(partition_label_for_expr(&parsed_expr));
+                }
 
-                    let creator = Arc::new(CayennePartitionCreator::new(
-                        metadata_table_name.clone(),
-                        PathBuf::from(&table_data_path),
-                        partition_by.clone(),
-                        Arc::clone(&vortex_schema),
-                        Arc::clone(&metadata_catalog),
-                        table_id,
-                        UnsupportedTypeAction::Error,
-                        Vec::new(), // retention_filters
-                        None,       // time_retention_filter_builder
-                        vortex_config.clone(),
-                        None, // object_store_config (local filesystem)
-                        primary_key.clone(),
-                        on_conflict.clone(),
-                        Arc::clone(&runtime_env),
-                    ));
+                let partition_name = partition_label
+                    .clone()
+                    .unwrap_or_else(|| partition_label_for_expr(&parsed_expr));
 
-                    let partition_provider = PartitionTableProvider::new(
-                        creator,
-                        partition_by,
-                        Arc::clone(&vortex_schema),
-                    )
-                    .await
-                    .map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "Failed to create partitioned table '{table_name}': {e}"
-                        ))
-                    })?;
+                let partition_by = vec![PartitionedBy {
+                    name: partition_name,
+                    expression: parsed_expr,
+                }];
 
-                    let partition_provider = Arc::new(partition_provider);
-                    let deletion_provider: Arc<dyn DeletionTableProvider> = partition_provider;
-                    Arc::new(DeletionTableProviderAdapter::new(deletion_provider))
-                        as Arc<dyn datafusion::catalog::TableProvider>
-                } else {
-                    // Non-partitioned: open the table we just created
-                    let builder = CayenneTableProviderBuilder::new(
-                        Arc::clone(&metadata_catalog),
-                        Arc::clone(&runtime_env),
-                    );
-                    let provider = builder.open(&metadata_table_name).await.map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "Failed to open Cayenne table '{table_name}': {e}"
-                        ))
-                    })?;
-                    let provider = Arc::new(provider);
-                    let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
-                    Arc::new(DeletionTableProviderAdapter::new(deletion_provider))
-                        as Arc<dyn datafusion::catalog::TableProvider>
-                };
+                let creator = Arc::new(CayennePartitionCreator::new(
+                    metadata_table_name.clone(),
+                    PathBuf::from(&table_data_path),
+                    partition_by.clone(),
+                    Arc::clone(&vortex_schema),
+                    Arc::clone(&metadata_catalog),
+                    table_id,
+                    UnsupportedTypeAction::Error,
+                    Vec::new(),
+                    None,
+                    vortex_config.clone(),
+                    None,
+                    primary_key.clone(),
+                    on_conflict.clone(),
+                    Arc::clone(&runtime_env),
+                ));
+
+                let partition_provider =
+                    PartitionTableProvider::new(creator, partition_by, Arc::clone(&vortex_schema))
+                        .await
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to create partitioned table '{table_name}': {e}"
+                            ))
+                        })?;
+
+                let partition_provider = Arc::new(partition_provider);
+                let deletion_provider: Arc<dyn DeletionTableProvider> = partition_provider;
+                Arc::new(DeletionTableProviderAdapter::new(deletion_provider))
+                    as Arc<dyn datafusion::catalog::TableProvider>
+            } else {
+                // Non-partitioned: open the table we just created
+                let builder = CayenneTableProviderBuilder::new(
+                    Arc::clone(&metadata_catalog),
+                    Arc::clone(&runtime_env),
+                );
+                let provider = builder.open(&metadata_table_name).await.map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to open Cayenne table '{table_name}': {e}"
+                    ))
+                })?;
+                let provider = Arc::new(provider);
+                let deletion_provider: Arc<dyn DeletionTableProvider> = provider;
+                Arc::new(DeletionTableProviderAdapter::new(deletion_provider))
+                    as Arc<dyn datafusion::catalog::TableProvider>
+            };
 
             // Ensure the schema exists, creating it on demand if needed
             let schema_provider = if let Some(s) = cayenne_provider.schema_provider(&df_schema_name)
@@ -664,26 +786,27 @@ impl ExecutionPlan for CayenneCreateTableExec {
             schema_provider.register_table(table_name.clone(), wrapped_provider)?;
 
             // Initialize partition metadata so the scheduler can route queries by partition.
-            if let Some(ref pe) = partition_expr
-                && let Some(ref registry) = executor_registry
-            {
-                let table_ref = datafusion::sql::TableReference::full(
-                    df_catalog_name.clone(),
-                    df_schema_name.clone(),
-                    table_name.clone(),
-                );
-                let expr_sql = partition_expr_sql.clone().unwrap_or_else(|| pe.to_string());
-                let pm = registry.federated_partition_manager();
-                if let Err(e) = pm.initialize_metadata(&table_ref, vec![expr_sql]).await {
-                    tracing::warn!(
-                        table = %table_ref,
-                        error = %e,
-                        "Failed to initialize partition metadata for table"
-                    );
+            let table_ref = datafusion::sql::TableReference::full(
+                df_catalog_name.clone(),
+                df_schema_name.clone(),
+                table_name.clone(),
+            );
+            if let Some(ref registry) = executor_registry {
+                let fallback = partition_expr.as_ref().map(|pe| pe.to_string());
+                let expr_sql = partition_expr_sql.as_ref().or(fallback.as_ref()).cloned();
+                if let Some(expr_sql) = expr_sql {
+                    let pm = registry.federated_partition_manager();
+                    if let Err(e) = pm.initialize_metadata(&table_ref, vec![expr_sql]).await {
+                        tracing::warn!(
+                            table = %table_ref,
+                            error = %e,
+                            "Failed to initialize partition metadata for table"
+                        );
+                    }
                 }
             }
 
-            // Forward the CREATE TABLE DDL to executor nodes
+            // Forward the CREATE TABLE DDL to executor nodes.
             if let Some(ref registry) = executor_registry {
                 let columns_sql: Vec<String> = arrow_schema
                     .fields()
@@ -710,6 +833,26 @@ impl ExecutionPlan for CayenneCreateTableExec {
                     table_elements.join(", ")
                 );
                 forward_ddl_to_executors(registry, &ddl_sql).await?;
+            }
+
+            // If this table was created via LIKE, copy partition-to-executor
+            // assignments from the source table so DoPut routes data to the
+            // same executors.
+            if let Some(ref source) = like_source_table
+                && let Some(ref registry) = executor_registry
+            {
+                let pm = registry.federated_partition_manager();
+                tracing::info!(
+                    source = %source,
+                    target = %table_ref,
+                    "Copying partition assignments from LIKE source table"
+                );
+                if let Err(e) = pm.copy_assignments(source, &table_ref).await {
+                    return Err(DataFusionError::Execution(format!(
+                        "Failed to create table '{table_name}': could not copy partition \
+                         assignments from source table {source}: {e}"
+                    )));
+                }
             }
 
             let batch = RecordBatch::try_new(
@@ -1642,7 +1785,17 @@ impl ExecutionPlan for DistributedCayenneMergeExec {
             .await?;
 
             // Forward the original MERGE SQL to all executors.
+            tracing::info!(
+                target = %target_table,
+                source = %source_table,
+                sql_len = original_sql.len(),
+                "Distributed MERGE: forwarding SQL to executors"
+            );
             forward_dml_to_executors(registry, &original_sql).await?;
+            tracing::info!(
+                target = %target_table,
+                "Distributed MERGE: all executors completed"
+            );
 
             RecordBatch::try_new(result_schema, vec![Arc::new(UInt64Array::from(vec![0u64]))])
                 .map_err(Into::into)
@@ -1700,18 +1853,78 @@ async fn validate_partition_compatibility(
         )));
     }
 
-    // Check that the partition column appears in the ON keys (target side).
-    let partition_in_on_keys = on_keys
-        .iter()
-        .any(|(target_col, _)| *target_col == target_part);
-    if !partition_in_on_keys {
+    // Parse the partition expression to extract column references. For transform
+    // partitions like bucket(5, c_nationkey), the referenced column is c_nationkey.
+    // For simple column partitions like n_regionkey, the column is n_regionkey.
+    let partition_cols = extract_partition_column_references(&target_part)?;
+    let all_covered = !partition_cols.is_empty()
+        && partition_cols
+            .iter()
+            .all(|pc| on_keys.iter().any(|(target_col, _)| target_col == pc));
+    if !all_covered {
         return Err(DataFusionError::Plan(format!(
-            "Distributed MERGE requires the partition column '{target_part}' to appear in the \
-             ON clause join keys for correct executor-local execution"
+            "Distributed MERGE requires the partition column(s) referenced by '{target_part}' \
+             to appear in the ON clause join keys for correct executor-local execution"
         )));
     }
 
     Ok(())
+}
+
+/// Extract column name references from a partition expression string by parsing
+/// it as a SQL expression and walking the AST with sqlparser's `Visitor`.
+///
+/// Handles simple column references (`c_nationkey`) and transform expressions
+/// (`bucket(5, c_nationkey)`) — numeric/string literals are naturally excluded
+/// since they parse as `Value` nodes, not `Identifier` nodes.
+fn extract_partition_column_references(partition_expr: &str) -> DFResult<Vec<String>> {
+    use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Visit, Visitor};
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use datafusion::sql::sqlparser::parser::Parser;
+    use std::ops::ControlFlow;
+
+    struct ColumnCollector {
+        columns: Vec<String>,
+    }
+
+    impl Visitor for ColumnCollector {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<Self::Break> {
+            match expr {
+                SqlExpr::Identifier(ident) => {
+                    self.columns.push(ident.value.clone());
+                }
+                SqlExpr::CompoundIdentifier(idents) => {
+                    if let Some(last) = idents.last() {
+                        self.columns.push(last.value.clone());
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let dialect = GenericDialect {};
+    let mut parser = Parser::new(&dialect)
+        .try_with_sql(partition_expr)
+        .map_err(|e| {
+            DataFusionError::Plan(format!(
+                "Failed to parse partition expression '{partition_expr}': {e}"
+            ))
+        })?;
+    let sql_expr = parser.parse_expr().map_err(|e| {
+        DataFusionError::Plan(format!(
+            "Failed to parse partition expression '{partition_expr}': {e}"
+        ))
+    })?;
+
+    let mut collector = ColumnCollector {
+        columns: Vec::new(),
+    };
+    let _ = sql_expr.visit(&mut collector);
+    Ok(collector.columns)
 }
 
 /// Schema for DML count results — single `count` column with `UInt64` type,
@@ -1728,7 +1941,7 @@ fn dml_count_schema() -> SchemaRef {
 mod tests {
     use datafusion::logical_expr::col;
 
-    use super::partition_label_for_expr;
+    use super::{extract_partition_column_references, partition_label_for_expr};
 
     #[test]
     fn partition_label_for_expr_uses_column_name_when_safe() {
@@ -1746,5 +1959,37 @@ mod tests {
     fn partition_label_for_expr_sanitizes_unsafe_column_names() {
         let expr = col("tenant/../id");
         assert_eq!(partition_label_for_expr(&expr), "tenant____id");
+    }
+
+    #[test]
+    fn extract_partition_cols_simple_column() {
+        let cols = extract_partition_column_references("c_nationkey").expect("simple column");
+        assert_eq!(cols, vec!["c_nationkey"]);
+    }
+
+    #[test]
+    fn extract_partition_cols_bucket_function() {
+        let cols =
+            extract_partition_column_references("bucket(5, c_nationkey)").expect("bucket fn");
+        assert_eq!(cols, vec!["c_nationkey"]);
+    }
+
+    #[test]
+    fn extract_partition_cols_parenthesized() {
+        let cols =
+            extract_partition_column_references("(bucket(5, c_nationkey))").expect("parenthesized");
+        assert_eq!(cols, vec!["c_nationkey"]);
+    }
+
+    #[test]
+    fn extract_partition_cols_quoted_column() {
+        let cols = extract_partition_column_references(r#""order_date""#).expect("quoted column");
+        assert_eq!(cols, vec!["order_date"]);
+    }
+
+    #[test]
+    fn extract_partition_cols_binary_op() {
+        let cols = extract_partition_column_references("a + b").expect("binary op");
+        assert_eq!(cols, vec!["a", "b"]);
     }
 }
