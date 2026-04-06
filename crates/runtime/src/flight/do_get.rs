@@ -25,7 +25,7 @@ use tonic::{Request, Response, Status};
 use crate::{
     datafusion::request_context_extension::get_current_datafusion,
     flight::{metrics, util::attach_cache_metadata},
-    timing::TimedStream,
+    telemetry::timing::TimedStream,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 

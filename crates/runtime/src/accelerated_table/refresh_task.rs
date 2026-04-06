@@ -33,7 +33,7 @@ use crate::datafusion::refresh_sql;
 use crate::datafusion::schema::BaseSchema;
 use crate::federated_table::FederatedTable;
 use crate::metrics::telemetry::track_bytes_processed;
-use crate::timing::MultiTimeMeasurement;
+use telemetry::timing::MultiTimeMeasurement;
 use crate::{
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,

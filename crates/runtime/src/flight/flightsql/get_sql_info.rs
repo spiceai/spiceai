@@ -36,7 +36,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     flight::{Service, metrics, to_tonic_err, util::set_flightsql_protocol},
-    timing::TimedStream,
+    telemetry::timing::TimedStream,
 };
 
 /// Get a `FlightInfo` for retrieving `SqlInfo`.

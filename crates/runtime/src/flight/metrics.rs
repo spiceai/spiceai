@@ -21,7 +21,7 @@ use opentelemetry::{
     metrics::{Counter, Histogram, Meter},
 };
 
-use crate::timing::TimeMeasurement;
+use telemetry::timing::TimeMeasurement;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("flight"));

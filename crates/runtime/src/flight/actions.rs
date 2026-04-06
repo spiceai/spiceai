@@ -19,7 +19,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     flight::{Service, async_actions, flightsql::prepared_statement_query, metrics, to_tonic_err},
-    timing::TimedStream,
+    telemetry::timing::TimedStream,
 };
 
 use arrow_flight::{

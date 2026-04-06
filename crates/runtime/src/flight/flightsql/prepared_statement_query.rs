@@ -48,7 +48,7 @@ use crate::{
         Service, metrics, to_tonic_err,
         util::{attach_cache_metadata, set_flightsql_protocol},
     },
-    timing::TimedStream,
+    telemetry::timing::TimedStream,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 

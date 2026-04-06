@@ -33,9 +33,7 @@ use crate::{
     flight::RateLimits,
     metrics, podswatcher,
     secrets::{self, Secrets},
-    status,
-    timing::TimeMeasurement,
-    tracers,
+    status, tracers,
 };
 use app::App;
 use spicepod::component::runtime::Runtime as SpicepodRuntime;
@@ -45,6 +43,7 @@ use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
+use telemetry::timing::TimeMeasurement;
 use util::in_tracing_context;
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
