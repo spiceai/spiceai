@@ -377,6 +377,33 @@ impl PartitionManager {
         }
     }
 
+    /// Copy partition-to-executor assignments from one table to another.
+    ///
+    /// Creates (or overwrites) the target table's metadata with the same
+    /// partition expressions, partition values, and executor assignments
+    /// as the source table. This ensures `DoPut` write-through routes data
+    /// to the same executors for both tables.
+    ///
+    /// If the source table has no partition metadata, this is a no-op because
+    /// the source exists but is unpartitioned and there is nothing to copy.
+    pub async fn copy_assignments(
+        &self,
+        source_table: &TableReference,
+        target_table: &TableReference,
+    ) -> Result<()> {
+        let Some(source_metadata) = self.get_table_metadata(source_table).await? else {
+            return Ok(());
+        };
+
+        let now_ms = now_ms()?;
+        let mut target_metadata = source_metadata;
+        target_metadata.table_name = target_table.to_string();
+        target_metadata.updated_at = now_ms;
+
+        let target_key = target_table.to_string();
+        self.write_metadata(&target_key, target_metadata).await
+    }
+
     /// Write metadata using `insert_or_update` with conflict handling.
     pub(crate) async fn write_metadata(
         &self,
@@ -409,10 +436,15 @@ fn now_ms() -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::memory::InMemory;
 
     fn in_memory_manager() -> PartitionManager {
-        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         PartitionManager::new(store)
+    }
+
+    fn test_manager() -> PartitionManager {
+        PartitionManager::new(Arc::new(InMemory::new())).with_prefix("test/")
     }
 
     fn table(name: &str) -> TableReference {
@@ -594,5 +626,103 @@ mod tests {
             .expect("get")
             .expect("exists");
         assert!(metadata.partitions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn copy_assignments_copies_metadata() {
+        let pm = test_manager();
+        let source = TableReference::parse_str("catalog.schema.source");
+        let target = TableReference::parse_str("catalog.schema.target");
+
+        // Initialize source with partition expressions
+        pm.initialize_metadata(&source, vec!["region".to_string()])
+            .await
+            .expect("should initialize");
+
+        // Add a partition and assign it
+        let pv = HashMap::from([("region".to_string(), "us-east-1".to_string())]);
+        pm.set_unassigned_partitions(&source, vec![pv], vec![])
+            .await
+            .expect("should set partitions");
+        let partition_value: PartitionValue =
+            HashMap::from([("region".to_string(), "us-east-1".to_string())]);
+        pm.assign_partition(&source, &partition_value, "executor-1")
+            .await
+            .expect("should assign");
+
+        // Copy assignments
+        pm.copy_assignments(&source, &target)
+            .await
+            .expect("should copy");
+
+        // Verify target has the same metadata
+        let target_meta = pm
+            .get_table_metadata(&target)
+            .await
+            .expect("should get")
+            .expect("should exist");
+
+        assert_eq!(target_meta.table_name, target.to_string());
+        assert_eq!(
+            target_meta.partition_expressions,
+            vec!["region".to_string()]
+        );
+        assert_eq!(target_meta.partitions.len(), 1);
+        assert!(target_meta.partitions[0].is_assigned_to("executor-1"));
+    }
+
+    #[tokio::test]
+    async fn copy_assignments_noop_when_source_missing() {
+        let pm = test_manager();
+        let source = TableReference::parse_str("catalog.schema.missing");
+        let target = TableReference::parse_str("catalog.schema.target");
+
+        // Missing source metadata is a no-op (source exists but is unpartitioned).
+        pm.copy_assignments(&source, &target)
+            .await
+            .expect("should be a no-op for missing source metadata");
+
+        // Target should have no metadata since nothing was copied.
+        let target_meta = pm.get_table_metadata(&target).await.expect("should get");
+        assert!(target_meta.is_none());
+    }
+
+    #[tokio::test]
+    async fn copy_assignments_overwrites_existing_target() {
+        let pm = test_manager();
+        let source = TableReference::parse_str("catalog.schema.source");
+        let target = TableReference::parse_str("catalog.schema.target");
+
+        // Initialize both
+        pm.initialize_metadata(&source, vec!["region".to_string()])
+            .await
+            .expect("should initialize source");
+        pm.initialize_metadata(&target, vec!["old_expr".to_string()])
+            .await
+            .expect("should initialize target");
+
+        // Add partition to source
+        let pv = HashMap::from([("region".to_string(), "eu-west-1".to_string())]);
+        pm.set_unassigned_partitions(&source, vec![pv], vec![])
+            .await
+            .expect("should set partitions");
+
+        // Copy should overwrite target
+        pm.copy_assignments(&source, &target)
+            .await
+            .expect("should copy");
+
+        let target_meta = pm
+            .get_table_metadata(&target)
+            .await
+            .expect("should get")
+            .expect("should exist");
+
+        assert_eq!(target_meta.table_name, target.to_string());
+        assert_eq!(
+            target_meta.partition_expressions,
+            vec!["region".to_string()]
+        );
+        assert_eq!(target_meta.partitions.len(), 1);
     }
 }

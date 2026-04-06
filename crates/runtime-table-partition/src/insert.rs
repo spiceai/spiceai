@@ -271,10 +271,17 @@ impl ExecutionPlan for PartitionerExec {
                 drop(partition_senders);
 
                 for handle in handles {
-                    if let Ok(output) = handle.await {
-                        output.map_err(|e| DataFusionError::Execution(
-                            format!("An error occurred while writing to one or more partition files. Some partitions may contain outdated or corrupted data. It is recommended to delete and recreate the accelerated files: {e}")
-                        ))?;
+                    match handle.await {
+                        Ok(result) => result.map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to insert into partition: {e}"
+                            ))
+                        })?,
+                        Err(e) => {
+                            return Err(DataFusionError::Execution(format!(
+                                "Failed to complete partition task: {e}"
+                            )));
+                        }
                     }
                 }
 

@@ -60,6 +60,7 @@ pub use context::CayenneContext;
 pub use deletion_strategy::{PkDeletionStrategy, PkDeletionStrategyWithCache};
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
+pub use staging_wal::CayenneStagedAppend;
 pub use table::{CayenneTableProvider, CayenneTableProviderBuilder};
 pub use vortex_format::{DeletionFilteringVortexFormat, attach_deletion_vectors_to_config};
 
