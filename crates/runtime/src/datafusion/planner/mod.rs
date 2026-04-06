@@ -236,10 +236,7 @@ async fn is_distributed_insert_table(session: &SessionState, table_name: &TableR
 }
 
 fn is_write_through_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
-    if let Some(accelerated) = table_provider
-        .as_any()
-        .downcast_ref::<AcceleratedTable>()
-    {
+    if let Some(accelerated) = table_provider.as_any().downcast_ref::<AcceleratedTable>() {
         return accelerated.is_write_through();
     }
 
@@ -248,10 +245,7 @@ fn is_write_through_table_provider(table_provider: &Arc<dyn TableProvider>) -> b
         .downcast_ref::<FederatedTableProviderAdaptor>()
         && let Some(inner_provider) = adaptor.table_provider.as_ref()
     {
-        if let Some(accelerated) = inner_provider
-            .as_any()
-            .downcast_ref::<AcceleratedTable>()
-        {
+        if let Some(accelerated) = inner_provider.as_any().downcast_ref::<AcceleratedTable>() {
             return accelerated.is_write_through();
         }
     }
