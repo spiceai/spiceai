@@ -709,11 +709,6 @@ impl ExecutionPlan for CayenneCreateTableExec {
                     "CREATE TABLE IF NOT EXISTS \"{df_catalog_name}\".\"{df_schema_name}\".\"{table_name}\" ({})",
                     table_elements.join(", ")
                 );
-                let ddl_sql = if let Some(ref partition_sql) = partition_expr_sql {
-                    format!("{ddl_sql} PARTITION BY {partition_sql}")
-                } else {
-                    ddl_sql
-                };
                 forward_ddl_to_executors(registry, &ddl_sql).await?;
             }
 
