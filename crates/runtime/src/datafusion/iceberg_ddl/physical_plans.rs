@@ -546,8 +546,11 @@ impl ExecutionPlan for IcebergCreateTableExec {
                                 table_name.clone(),
                                 provider,
                             );
-                        schema_provider
-                            .register_table(table_name.clone(), Arc::new(deletion_provider))?;
+                        let adapted: Arc<dyn datafusion::datasource::TableProvider> =
+                            Arc::new(data_components::delete::DeletionTableProviderAdapter::new(
+                                Arc::new(deletion_provider),
+                            ));
+                        schema_provider.register_table(table_name.clone(), adapted)?;
                         message = format!("Table '{table_name}' already exists");
                     }
 
@@ -610,8 +613,37 @@ impl ExecutionPlan for IcebergCreateTableExec {
                     ))
                 })?,
             );
-            let message;
-            if let Some(accel) = acceleration.as_ref().filter(|accel| accel.enabled) {
+            // Register in the DataFusion catalog's schema provider
+            let Some(df_catalog) = catalog_list.catalog(&df_catalog_name) else {
+                return Err(DataFusionError::Execution(format!(
+                    "Catalog '{df_catalog_name}' not found"
+                )));
+            };
+            let Some(schema_provider) = df_catalog.schema(&df_schema_name) else {
+                return Err(DataFusionError::Execution(format!(
+                    "Schema '{df_schema_name}' not found in catalog '{df_catalog_name}'"
+                )));
+            };
+            let register_raw_provider =
+                |raw_provider: Arc<dyn datafusion::datasource::TableProvider>| -> DFResult<()> {
+                    let deletion_provider =
+                        data_components::iceberg::delete::IcebergDeletionProvider::new(
+                            Arc::clone(&catalog),
+                            namespace.clone(),
+                            table_name.clone(),
+                            raw_provider,
+                        );
+                    let adapted: Arc<dyn datafusion::datasource::TableProvider> =
+                        Arc::new(data_components::delete::DeletionTableProviderAdapter::new(
+                            Arc::new(deletion_provider),
+                        ));
+                    schema_provider.register_table(table_name.clone(), adapted)?;
+                    Ok(())
+                };
+
+            let message = if let Some(ref accel) = acceleration
+                && accel.enabled
+            {
                 let wrapped_provider = match build_registered_provider(
                     &catalog,
                     namespace.clone(),
@@ -681,19 +713,13 @@ impl ExecutionPlan for IcebergCreateTableExec {
                     return Err(rollback_error);
                 }
 
-                message = format!(
+                format!(
                     "Table '{table_name}' created with acceleration (engine={})",
                     accel.engine.as_deref().unwrap_or("cayenne")
-                );
+                )
             } else {
                 // No acceleration — register raw IcebergTableProvider
-                if let Err(e) = register_raw_provider(
-                    &catalog,
-                    namespace.clone(),
-                    table_name.clone(),
-                    &schema_provider,
-                    provider,
-                ) {
+                if let Err(e) = register_raw_provider(provider) {
                     let rollback_error = rollback_created_iceberg_table(
                         &catalog,
                         &namespace,
@@ -704,8 +730,8 @@ impl ExecutionPlan for IcebergCreateTableExec {
                     .await;
                     return Err(rollback_error);
                 }
-                message = format!("Table '{table_name}' created");
-            }
+                format!("Table '{table_name}' created")
+            };
 
             let batch = RecordBatch::try_new(
                 result_schema,
@@ -862,28 +888,6 @@ fn validate_ddl_acceleration_runtime_requirements(
         ));
     }
 
-    Ok(())
-}
-
-fn register_raw_provider(
-    catalog: &Arc<dyn Catalog>,
-    namespace: NamespaceIdent,
-    table_name: String,
-    schema_provider: &Arc<dyn datafusion::catalog::SchemaProvider>,
-    raw_provider: Arc<dyn datafusion::datasource::TableProvider>,
-) -> DFResult<()> {
-    if schema_provider.table_exist(&table_name) {
-        let _ = schema_provider.deregister_table(&table_name);
-    }
-
-    let deletion_provider = data_components::iceberg::delete::IcebergDeletionProvider::new(
-        Arc::clone(catalog),
-        namespace,
-        table_name.clone(),
-        raw_provider,
-    );
-    let adapted: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(deletion_provider);
-    schema_provider.register_table(table_name, adapted)?;
     Ok(())
 }
 

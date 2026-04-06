@@ -24,6 +24,7 @@ use std::{any::Any, sync::Arc};
 
 use arrow::{compute::concat_batches, datatypes::SchemaRef};
 use async_trait::async_trait;
+use data_components::delete::DeletionTableProvider;
 use datafusion::{
     catalog::Session,
     common::Constraints,
@@ -45,8 +46,10 @@ use futures::StreamExt;
 /// This is used to handle the `UpsertDedup` `on_conflict` behavior, which removes
 /// duplicate rows (based on primary key) from incoming batches before insertion.
 pub struct UpsertDedupTableProvider {
-    /// The underlying table provider for write and delete operations
+    /// The underlying table provider for write operations
     inner: Arc<dyn TableProvider>,
+    /// The underlying deletion provider for delete operations
+    deletion_provider: Arc<dyn DeletionTableProvider>,
     /// Options controlling deduplication behavior
     upsert_options: UpsertOptions,
     /// Constraints for deduplication (e.g., primary key)
@@ -58,17 +61,20 @@ impl UpsertDedupTableProvider {
     /// Creates a new `UpsertDedupTableProvider` wrapping the given provider.
     ///
     /// # Arguments
-    /// * `inner` - The underlying table provider to wrap
+    /// * `inner` - The underlying table provider to wrap (must implement `DeletionTableProvider`)
     /// * `upsert_options` - Options controlling deduplication behavior
     /// * `constraints` - Constraints for deduplication (e.g., primary key)
     #[must_use]
     pub fn new(
-        inner: Arc<dyn TableProvider>,
+        inner: Arc<dyn DeletionTableProvider>,
         upsert_options: UpsertOptions,
         constraints: Constraints,
     ) -> Self {
+        // Clone the Arc as TableProvider for regular operations
+        let inner_tp: Arc<dyn TableProvider> = Arc::<dyn DeletionTableProvider>::clone(&inner);
         Self {
-            inner,
+            inner: inner_tp,
+            deletion_provider: inner,
             upsert_options,
             constraints,
         }
@@ -161,13 +167,16 @@ impl TableProvider for UpsertDedupTableProvider {
 
         self.inner.insert_into(state, dedup_exec, op).await
     }
+}
 
+#[async_trait]
+impl DeletionTableProvider for UpsertDedupTableProvider {
     async fn delete_from(
         &self,
         state: &dyn Session,
-        filters: Vec<Expr>,
+        filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        self.inner.delete_from(state, filters).await
+        DeletionTableProvider::delete_from(self.deletion_provider.as_ref(), state, filters).await
     }
 }
 
@@ -326,20 +335,24 @@ pub fn extract_upsert_options<S: std::hash::BuildHasher>(
 ///
 /// Returns the original provider if deduplication is not needed.
 #[must_use]
-pub fn wrap_with_upsert_dedup_if_needed<T: TableProvider + 'static, S: std::hash::BuildHasher>(
+pub fn wrap_with_upsert_dedup_if_needed<
+    T: DeletionTableProvider + 'static,
+    S: std::hash::BuildHasher,
+>(
     provider: Arc<T>,
     options: &std::collections::HashMap<String, String, S>,
     constraints: Constraints,
-) -> Arc<dyn TableProvider> {
+) -> (Arc<dyn TableProvider>, Arc<dyn DeletionTableProvider>) {
     let upsert_options = extract_upsert_options(options);
 
     if upsert_options.remove_duplicates || upsert_options.last_write_wins {
-        Arc::new(UpsertDedupTableProvider::new(
+        let wrapper = Arc::new(UpsertDedupTableProvider::new(
             provider,
             upsert_options,
             constraints,
-        ))
+        ));
+        (Arc::<UpsertDedupTableProvider>::clone(&wrapper), wrapper)
     } else {
-        provider
+        (Arc::<T>::clone(&provider), provider)
     }
 }

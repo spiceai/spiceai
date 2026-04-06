@@ -19,7 +19,7 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 use arrow::array::{Array, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use data_components::delete::{DeletionExec, DeletionSink};
+use data_components::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 use datafusion::{
     catalog::{Session, TableProvider},
     common::{Constraints, DFSchema, Statistics, project_schema},
@@ -423,10 +423,35 @@ impl TableProvider for PartitionTableProvider {
             .await
     }
 
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let partitions = self.partitions.read().await;
+        let partition_list: Vec<_> = partitions.values().cloned().collect();
+        drop(partitions);
+
+        let update_sink = Arc::new(PartitionedUpdateSink::new(
+            partition_list,
+            assignments,
+            filters,
+            state.task_ctx(),
+        ));
+
+        Ok(Arc::new(DeletionExec::new(update_sink, &self.schema)))
+    }
+}
+
+/// Implement `DeletionTableProvider` to support retention checks and delete operations
+/// on partitioned tables. Deletion is applied to all partitions.
+#[async_trait]
+impl DeletionTableProvider for PartitionTableProvider {
     async fn delete_from(
         &self,
         state: &dyn Session,
-        filters: Vec<Expr>,
+        filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         // Collect all partitions that need deletion
         let partitions = self.partitions.read().await;
@@ -436,11 +461,11 @@ impl TableProvider for PartitionTableProvider {
         // Create a deletion sink that will iterate over all partitions
         let deletion_sink = Arc::new(PartitionedDeletionSink::new(
             partition_list,
-            filters,
+            filters.to_vec(),
             state.task_ctx(),
         ));
 
-        Ok(Arc::new(DeletionExec::new(deletion_sink)))
+        Ok(Arc::new(DeletionExec::new(deletion_sink, &self.schema)))
     }
 }
 
@@ -467,34 +492,107 @@ impl DeletionSink for PartitionedDeletionSink {
         let mut total_deleted = 0u64;
 
         for partition in &self.partitions {
-            // Create a simple session state for executing the deletion
+            // Try to downcast the partition's table provider to DeletionTableProvider
+            // The partition's table provider might be a CayenneTableProvider or similar
+            // that implements DeletionTableProvider
+            let deletion_provider = data_components::delete::get_deletion_provider(Arc::clone(
+                &partition.table_provider,
+            ));
+
+            if let Some(deletion_provider) = deletion_provider {
+                // Create a simple session state for executing the deletion
+                let session_ctx = datafusion::execution::context::SessionContext::new();
+                let state = session_ctx.state();
+
+                // Execute deletion on this partition
+                let plan = DeletionTableProvider::delete_from(
+                    deletion_provider.as_ref(),
+                    &state,
+                    &self.filters,
+                )
+                .await?;
+
+                // Execute the deletion plan
+                let results = collect(plan, Arc::clone(&self.task_ctx)).await?;
+
+                // Extract the count from results
+                for batch in results {
+                    if let Some(count_col) = batch.column_by_name("count")
+                        && let Some(uint_array) = count_col.as_any().downcast_ref::<UInt64Array>()
+                    {
+                        for i in 0..uint_array.len() {
+                            if !uint_array.is_null(i) {
+                                total_deleted += uint_array.value(i);
+                            }
+                        }
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    partition_values = ?partition.partition_values,
+                    "Partition table provider does not support deletion. Skipping."
+                );
+            }
+        }
+
+        Ok(total_deleted)
+    }
+}
+
+/// An update sink that applies update operations to all partitions in a partitioned table.
+struct PartitionedUpdateSink {
+    partitions: Vec<Partition>,
+    assignments: Vec<(String, Expr)>,
+    filters: Vec<Expr>,
+    task_ctx: Arc<TaskContext>,
+}
+
+impl PartitionedUpdateSink {
+    fn new(
+        partitions: Vec<Partition>,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+        task_ctx: Arc<TaskContext>,
+    ) -> Self {
+        Self {
+            partitions,
+            assignments,
+            filters,
+            task_ctx,
+        }
+    }
+}
+
+#[async_trait]
+impl DeletionSink for PartitionedUpdateSink {
+    async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let mut total_updated = 0u64;
+
+        for partition in &self.partitions {
             let session_ctx = datafusion::execution::context::SessionContext::new();
             let state = session_ctx.state();
 
-            // Execute deletion on this partition using native TableProvider::delete_from
             let plan = partition
                 .table_provider
-                .delete_from(&state, self.filters.clone())
+                .update(&state, self.assignments.clone(), self.filters.clone())
                 .await?;
 
-            // Execute the deletion plan
             let results = collect(plan, Arc::clone(&self.task_ctx)).await?;
 
-            // Extract the count from results
             for batch in results {
                 if let Some(count_col) = batch.column_by_name("count")
                     && let Some(uint_array) = count_col.as_any().downcast_ref::<UInt64Array>()
                 {
                     for i in 0..uint_array.len() {
                         if !uint_array.is_null(i) {
-                            total_deleted += uint_array.value(i);
+                            total_updated += uint_array.value(i);
                         }
                     }
                 }
             }
         }
 
-        Ok(total_deleted)
+        Ok(total_updated)
     }
 }
 

@@ -54,6 +54,7 @@ limitations under the License.
 //! - **Data Files**: Metadata for virtual files (Vortex `ListingTables` at unique directories)
 
 pub mod catalog;
+pub mod catalog_provider;
 pub mod cayenne_catalog;
 pub mod metadata;
 pub mod metastore;
@@ -61,6 +62,9 @@ pub mod optimizer_rules;
 pub mod provider;
 
 pub use catalog::MetadataCatalog;
+pub use catalog_provider::{
+    CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,
+};
 pub use cayenne_catalog::CayenneCatalog;
 pub use metadata::{DataFile, DeleteFile, ObjectStoreConfig, PartitionMetadata, TableMetadata};
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};

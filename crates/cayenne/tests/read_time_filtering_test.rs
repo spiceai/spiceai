@@ -25,8 +25,10 @@ use arrow::array::{Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 
 use cayenne::{
-    metadata::CreateTableOptions, CayenneCatalog, CayenneTableProvider, MetadataCatalog,
+    CayenneCatalog, CayenneTableProvider, MetadataCatalog, metadata::CreateTableOptions,
 };
+
+use data_components::delete::DeletionTableProvider;
 
 use datafusion::datasource::TableProvider;
 
@@ -40,8 +42,8 @@ use tempfile::TempDir;
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-async fn setup_test_table(
-) -> TestResult<(Arc<CayenneTableProvider>, SessionContext, TempDir, TempDir)> {
+async fn setup_test_table()
+-> TestResult<(Arc<CayenneTableProvider>, SessionContext, TempDir, TempDir)> {
     // Create temporary directories for data and metadata
     let data_dir = TempDir::new()?;
     let metadata_dir = TempDir::new()?;
@@ -112,8 +114,7 @@ async fn delete_records(
     filter: Expr,
 ) -> TestResult<u64> {
     let ctx = SessionContext::new();
-    let plan = table_provider
-        .delete_from(&ctx.state(), vec![filter])
+    let plan = DeletionTableProvider::delete_from(table_provider.as_ref(), &ctx.state(), &[filter])
         .await?;
 
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;

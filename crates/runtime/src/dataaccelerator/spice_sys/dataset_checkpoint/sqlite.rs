@@ -242,6 +242,26 @@ impl DatasetCheckpoint {
             None => Ok(None),
         }
     }
+
+    pub(super) async fn delete_sqlite(&self, pool: &SqliteConnectionPool) -> Result<()> {
+        let dataset_name = self.dataset_name.clone();
+
+        let conn_sync = pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err(Error::DowncastFailed {
+                target: "SqliteConnection",
+            });
+        };
+
+        conn.conn
+            .call(move |conn| {
+                let delete = format!("DELETE FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?1");
+                conn.execute(&delete, [&dataset_name])?;
+                Ok::<(), rusqlite::Error>(())
+            })
+            .await
+            .map_err(Error::external)
+    }
 }
 
 #[cfg(test)]

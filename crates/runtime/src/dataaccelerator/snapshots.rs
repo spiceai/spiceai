@@ -29,6 +29,7 @@ use crate::{
 };
 use runtime_acceleration::snapshot::AccelerationEngine;
 use runtime_acceleration::snapshot::AccelerationLayout;
+use runtime_acceleration::snapshot::ForceCreate;
 use runtime_acceleration::{
     dataset_checkpoint::make_checkpointer_factory,
     snapshot::{SnapshotBehavior, SnapshotManager, metrics},
@@ -106,6 +107,69 @@ pub(super) async fn download_snapshot_if_needed(
         }
     } else {
         BootstrapStatus::none()
+    }
+}
+
+/// Creates a snapshot of the existing acceleration file before it is deleted or recreated.
+///
+/// Called during `file_create` and `file_update` (on schema mismatch) modes to preserve
+/// a copy of the current acceleration data before it is destroyed.
+///
+/// This is a best-effort operation: if snapshotting fails, a warning is logged and the
+/// caller proceeds with recreation.
+pub(crate) async fn snapshot_before_recreate(
+    acceleration: &Acceleration,
+    dataset_name: &str,
+    layout: AccelerationLayout,
+    engine: AccelerationEngine,
+    schema: Arc<arrow_schema::Schema>,
+) {
+    if !acceleration.snapshot_behavior.create_enabled() {
+        return;
+    }
+
+    let Some(manager) = SnapshotManager::try_new(
+        dataset_name.to_string(),
+        acceleration.snapshot_behavior.clone(),
+        layout,
+        engine,
+    )
+    .await
+    else {
+        return;
+    };
+
+    // If the caller provided an empty schema (e.g. during file_create init when the table
+    // provider isn't available yet), try to read the real schema from existing snapshot
+    // metadata. If no stored schema exists either, skip the snapshot to avoid storing an
+    // empty schema that would make this snapshot unrestorable.
+    let snapshot_schema = if schema.fields().is_empty() {
+        let Some(stored) = manager.current_stored_schema().await else {
+            tracing::debug!(dataset = %dataset_name, "No stored schema available for pre-recreation snapshot; skipping");
+            return;
+        };
+        stored
+    } else {
+        Arc::clone(&schema)
+    };
+
+    // Create a mutex just for this one-off snapshot; no other operations are concurrent at init time.
+    let mutex = Arc::new(tokio::sync::Mutex::new(()));
+    let lock_guard = mutex.lock_owned().await;
+
+    match manager
+        .create_snapshot(&snapshot_schema, lock_guard, None, None, ForceCreate(true))
+        .await
+    {
+        Ok(Some(path)) => {
+            tracing::info!(dataset = %dataset_name, snapshot = %path, "Created pre-recreation snapshot");
+        }
+        Ok(None) => {
+            tracing::debug!(dataset = %dataset_name, "No snapshot created before recreation");
+        }
+        Err(e) => {
+            tracing::warn!(dataset = %dataset_name, error = %e, "Failed to create pre-recreation snapshot; proceeding with recreation");
+        }
     }
 }
 
@@ -333,7 +397,7 @@ mod tests {
         fn is_file_accelerated(&self) -> bool {
             self.acceleration
                 .as_ref()
-                .is_some_and(|a| matches!(a.mode, Mode::File | Mode::FileCreate))
+                .is_some_and(|a| matches!(a.mode, Mode::File | Mode::FileCreate | Mode::FileUpdate))
         }
 
         fn app(&self) -> Arc<app::App> {

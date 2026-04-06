@@ -17,8 +17,8 @@ limitations under the License.
 //! Turso implementation of the metastore backend.
 
 use super::{
-    duplicate_delete_file_index_error_message, ExecuteParams, MetastoreBackend, MetastoreGetValue,
-    MetastoreRow, MetastoreTransaction, MetastoreValue, QueryParams, QueryRowParams,
+    ExecuteParams, MetastoreBackend, MetastoreGetValue, MetastoreRow, MetastoreTransaction,
+    MetastoreValue, QueryParams, QueryRowParams, duplicate_delete_file_index_error_message,
 };
 use crate::catalog::{CatalogError, CatalogResult};
 use async_trait::async_trait;
@@ -613,10 +613,10 @@ impl Drop for TursoTransaction {
                     "TursoTransaction dropped without explicit commit or rollback; \
                      attempting auto-rollback"
                 );
-                if let Some(conn) = guard.as_ref() {
-                    if let Err(err) = conn.execute("ROLLBACK", ()).await {
-                        tracing::error!("Failed to auto-rollback TursoTransaction on drop: {err}");
-                    }
+                if let Some(conn) = guard.as_ref()
+                    && let Err(err) = conn.execute("ROLLBACK", ()).await
+                {
+                    tracing::error!("Failed to auto-rollback TursoTransaction on drop: {err}");
                 }
                 // `guard` is dropped here, releasing the connection lock.
             });

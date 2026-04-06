@@ -23,6 +23,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use cayenne::{CayenneStagedAppend, CayenneTableProvider};
+use data_components::delete::DeletionTableProviderAdapter;
 use data_components::poly::PolyTableProvider;
 use datafusion::catalog::{ScanArgs, ScanResult, Session};
 use datafusion::common::{Constraints, DFSchema, DataFusionError, Statistics};
@@ -386,9 +387,7 @@ async fn write_all_with_partitioned_cayenne(
                         let partition_provider = partitioned
                             .get_or_create_partition_provider(partition_values)
                             .await?;
-                        let cayenne = partition_provider
-                            .as_any()
-                            .downcast_ref::<CayenneTableProvider>()
+                        let cayenne = downcast_to_cayenne(&partition_provider)
                             .ok_or_else(|| {
                                 DataFusionError::Execution(
                                     "Write-through partitioned Cayenne path requires Cayenne-backed partition providers"
@@ -484,6 +483,25 @@ async fn write_all_with_partitioned_cayenne(
             ))))
         }
     }
+}
+
+/// Attempts to downcast a partition provider to [`CayenneTableProvider`],
+/// unwrapping a [`DeletionTableProviderAdapter`] wrapper if present.
+fn downcast_to_cayenne(provider: &Arc<dyn TableProvider>) -> Option<&CayenneTableProvider> {
+    provider
+        .as_any()
+        .downcast_ref::<CayenneTableProvider>()
+        .or_else(|| {
+            provider
+                .as_any()
+                .downcast_ref::<DeletionTableProviderAdapter>()
+                .and_then(|adapter| {
+                    adapter
+                        .source()
+                        .as_any()
+                        .downcast_ref::<CayenneTableProvider>()
+                })
+        })
 }
 
 fn spawn_federated_insert(

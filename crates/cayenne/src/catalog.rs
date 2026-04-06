@@ -95,7 +95,9 @@ pub enum CatalogError {
     },
 
     /// Lock poisoning error
-    #[snafu(display("Lock poisoned during {operation}: a thread panicked while holding this lock. This indicates an internal error that requires restarting the runtime."))]
+    #[snafu(display(
+        "Lock poisoned during {operation}: a thread panicked while holding this lock. This indicates an internal error that requires restarting the runtime."
+    ))]
     LockPoisoned {
         /// The operation that failed due to lock poisoning
         operation: String,
@@ -107,7 +109,9 @@ pub enum CatalogError {
     #[snafu(display("The function '{function}' is not implemented"))]
     NotImplemented { function: String },
 
-    #[snafu(display("Cayenne metadata schema mismatch for table '{table}'. The metadata database format has changed and is incompatible with this version. To continue, clear your acceleration data (delete the Cayenne metadata directory) so it can be recreated. Existing accelerated data will be re-synced from the source."))]
+    #[snafu(display(
+        "Cayenne metadata schema mismatch for table '{table}'. The metadata database format has changed and is incompatible with this version. To continue, clear your acceleration data (delete the Cayenne metadata directory) so it can be recreated. Existing accelerated data will be re-synced from the source."
+    ))]
     SchemaMismatch { table: String },
 
     #[snafu(display(
@@ -180,10 +184,14 @@ pub enum CatalogError {
         message: String,
     },
 
-    #[snafu(display("Table '{table_name}' already exists with different configuration. Delete the acceleration, and try again."))]
+    #[snafu(display(
+        "Table '{table_name}' already exists with different configuration. Delete the acceleration, and try again."
+    ))]
     ChangedConfiguration { table_name: String },
 
-    #[snafu(display("Table '{table_name}' metadata is invalid or corrupted. Delete the acceleration, and try again. {source}"))]
+    #[snafu(display(
+        "Table '{table_name}' metadata is invalid or corrupted. Delete the acceleration, and try again. {source}"
+    ))]
     InvalidMetadata {
         table_name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -326,7 +334,7 @@ pub trait MetadataCatalog: Send + Sync {
     /// This is used when a protected snapshot is superseded by a newer one.
     /// The old sequence record becomes orphaned and can be cleaned up.
     async fn clear_snapshot_sequence(&self, table_id: &str, snapshot_id: &str)
-        -> CatalogResult<()>;
+    -> CatalogResult<()>;
 
     /// Atomically update snapshot and clear delete files in a single transaction.
     async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
