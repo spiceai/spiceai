@@ -204,7 +204,7 @@ indexmap = "2"
 insta = { version = "1.46.3", features = ["filters"] }
 itertools = "0.14"
 linkme = "0.3.35"
-logos = "0.16.0"
+logos = "0.16.1"
 mailparse = "0.16.1"
 moka = { version = "0.12", features = ["future"] }
 mongodb = { version = "3.5.1", features = ["openssl-tls"] }
