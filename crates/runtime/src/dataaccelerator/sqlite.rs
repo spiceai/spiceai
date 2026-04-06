@@ -375,13 +375,17 @@ impl DataAccelerator for SqliteAccelerator {
         let sqlite_writer = Arc::new(sqlite_writer.clone());
 
         // Wrap with upsert deduplication if needed
-        let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+        let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
             sqlite_writer,
             &cmd.options,
             cmd.constraints.clone(),
         );
 
-        let table_provider = Arc::new(PolyTableProvider::new(write_provider, read_provider));
+        let table_provider = Arc::new(PolyTableProvider::new(
+            write_provider,
+            delete_provider,
+            read_provider,
+        ));
 
         Ok(table_provider)
     }
@@ -431,6 +435,7 @@ mod tests {
         array::{Int64Array, RecordBatch, StringArray, UInt64Array},
         datatypes::{DataType, Schema},
     };
+    use data_components::delete::{DeletionTableProvider, get_deletion_provider};
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
@@ -495,6 +500,9 @@ mod tests {
             .await
             .expect("insert successful");
 
+        let table =
+            get_deletion_provider(table).expect("table should be returned as deletion provider");
+
         let filter = cast(
             col("time_in_string"),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
@@ -503,8 +511,7 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan = table
-            .delete_from(&ctx.state(), vec![filter])
+        let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter])
             .await
             .expect("deletion should be successful");
 
@@ -524,8 +531,7 @@ mod tests {
         assert_eq!(actual, &expected);
 
         let filter = col("time_int").lt(lit(1354360273));
-        let plan = table
-            .delete_from(&ctx.state(), vec![filter])
+        let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter])
             .await
             .expect("deletion should be successful");
 

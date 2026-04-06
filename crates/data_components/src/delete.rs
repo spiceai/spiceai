@@ -15,16 +15,20 @@ limitations under the License.
 */
 
 #![allow(clippy::missing_errors_doc)]
-use std::{any::Any, error::Error, sync::Arc};
+use std::{any::Any, borrow::Cow, error::Error, sync::Arc};
 
 use ::arrow::{
     array::{ArrayRef, RecordBatch, UInt64Array},
-    datatypes::{DataType, Field, Schema},
+    datatypes::{DataType, Field, Schema, SchemaRef},
 };
 use async_trait::async_trait;
 use datafusion::{
-    error::DataFusionError,
+    catalog::{ScanArgs, ScanResult, Session},
+    common::{Constraints, Statistics},
+    datasource::{TableProvider, TableType},
+    error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
+    logical_expr::{Expr, LogicalPlan, dml::InsertOp},
     physical_expr::EquivalenceProperties,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -32,6 +36,19 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
 };
+
+use crate::poly::PolyTableProvider;
+
+#[async_trait]
+pub trait DeletionTableProvider: TableProvider {
+    async fn delete_from(
+        &self,
+        _state: &dyn Session,
+        _filters: &[Expr],
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Err(DataFusionError::Plan("Not implemented".to_string()))
+    }
+}
 
 #[async_trait]
 pub trait DeletionSink: Send + Sync {

@@ -58,13 +58,13 @@ async fn insert_batch(
         .map_err(Into::into)
 }
 
-/// Helper to delete records from a table using the `delete_from` API
+/// Helper to delete records from a table using the `DeletionTableProvider` API
 async fn delete_records(
     table: &Arc<CayenneTableProvider>,
     filter: Expr,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let ctx = SessionContext::new();
-    let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     Ok(results
         .first()
