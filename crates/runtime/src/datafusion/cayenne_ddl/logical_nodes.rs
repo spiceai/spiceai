@@ -59,6 +59,9 @@ pub struct CayenneCreateTableNode {
     pub partition_expr_sql: Option<String>,
     /// Primary key column names extracted from SQL constraints.
     pub primary_key: Vec<String>,
+    /// Source table reference for `CREATE TABLE ... (LIKE ...)` syntax.
+    /// When set, partition-to-executor assignments are copied from the source table.
+    pub like_source_table: Option<TableReference>,
     /// Output schema (single "result" column).
     output_schema: DFSchemaRef,
 }
@@ -81,6 +84,7 @@ impl CayenneCreateTableNode {
             partition_expr: None,
             partition_expr_sql: None,
             primary_key: Vec::new(),
+            like_source_table: None,
         }
     }
 }
@@ -95,6 +99,7 @@ pub struct CayenneCreateTableNodeBuilder {
     partition_expr: Option<Expr>,
     partition_expr_sql: Option<String>,
     primary_key: Vec<String>,
+    like_source_table: Option<TableReference>,
 }
 
 impl CayenneCreateTableNodeBuilder {
@@ -129,6 +134,12 @@ impl CayenneCreateTableNodeBuilder {
     }
 
     #[must_use]
+    pub fn like_source_table(mut self, like_source_table: Option<TableReference>) -> Self {
+        self.like_source_table = like_source_table;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> CayenneCreateTableNode {
         CayenneCreateTableNode {
             table_name: self.table_name,
@@ -140,6 +151,7 @@ impl CayenneCreateTableNodeBuilder {
             partition_expr: self.partition_expr,
             partition_expr_sql: self.partition_expr_sql,
             primary_key: self.primary_key,
+            like_source_table: self.like_source_table,
             output_schema: ddl_output_schema(),
         }
     }
@@ -153,6 +165,7 @@ impl Hash for CayenneCreateTableNode {
         self.partition_expr.hash(state);
         self.partition_expr_sql.hash(state);
         self.primary_key.hash(state);
+        self.like_source_table.hash(state);
     }
 }
 
@@ -164,6 +177,7 @@ impl PartialEq for CayenneCreateTableNode {
             && self.partition_expr == other.partition_expr
             && self.partition_expr_sql == other.partition_expr_sql
             && self.primary_key == other.primary_key
+            && self.like_source_table == other.like_source_table
     }
 }
 
@@ -225,6 +239,7 @@ impl UserDefinedLogicalNodeCore for CayenneCreateTableNode {
             partition_expr,
             partition_expr_sql: self.partition_expr_sql.clone(),
             primary_key: self.primary_key.clone(),
+            like_source_table: self.like_source_table.clone(),
             output_schema: DFSchemaRef::clone(&self.output_schema),
         })
     }

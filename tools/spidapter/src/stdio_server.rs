@@ -63,6 +63,8 @@ enum RunState {
         flight_url: String,
         /// Normalized API base URL (stored separately from `cloud` to avoid tainted-struct logging).
         api_url: String,
+        /// SQL endpoint URL for DDL execution.
+        sql_url: String,
         /// Cloud client used during provisioning (reused for teardown).
         cloud: CloudClient,
     },
@@ -81,6 +83,20 @@ impl RunState {
         match self {
             Self::Scp { api_key, .. } => api_key.as_str(),
             Self::Local(_) => "",
+        }
+    }
+
+    fn sql_url(&self) -> &str {
+        match self {
+            Self::Scp { sql_url, .. } => sql_url.as_str(),
+            Self::Local(state) => state.sql_url.as_str(),
+        }
+    }
+
+    fn api_key(&self) -> Option<&str> {
+        match self {
+            Self::Scp { api_key, .. } => Some(api_key.as_str()),
+            Self::Local(state) => state.flight_api_key.as_deref(),
         }
     }
 }
@@ -189,6 +205,8 @@ fn sum_opt_f64_as_u64(
 struct SpidapterHandler {
     /// Active runs keyed by run ID.
     runs: HashMap<Uuid, RunState>,
+    /// Datasets from setup, keyed by run ID → dataset name → config.
+    run_datasets: HashMap<Uuid, HashMap<String, DatasetConfig>>,
     /// Full CLI args (includes all flags and env-var-backed configuration).
     args: StdioArgs,
 }
@@ -197,6 +215,7 @@ impl SpidapterHandler {
     fn new(args: &StdioArgs) -> Self {
         Self {
             runs: HashMap::new(),
+            run_datasets: HashMap::new(),
             args: args.clone(),
         }
     }
@@ -271,11 +290,16 @@ impl Handler for SpidapterHandler {
         };
 
         self.runs.insert(run_id, state);
+        self.run_datasets.insert(run_id, datasets);
 
         Ok(response)
     }
 
-    async fn metrics(&mut self, run_id: Uuid) -> std::result::Result<MetricsResponse, String> {
+    async fn metrics(
+        &mut self,
+        run_id: Uuid,
+        _final_scrape: bool,
+    ) -> std::result::Result<MetricsResponse, String> {
         let state = self
             .runs
             .get(&run_id)
@@ -300,6 +324,7 @@ impl Handler for SpidapterHandler {
                         disk_write_bytes: sum_opt_f64_as_u64(&pods, |p| p.disk_write_bytes),
                         disk_read_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_read_operations),
                         disk_write_iops: sum_opt_f64_as_u64(&pods, |p| p.disk_write_operations),
+                        num_compute_nodes: None,
                     }
                 };
 
@@ -331,6 +356,7 @@ impl Handler for SpidapterHandler {
             eprintln!("[stdio] teardown: run_id={run_id} not found (already torn down?)");
             return Ok(TeardownResponse { ok: true });
         };
+        self.run_datasets.remove(&run_id);
 
         match state {
             RunState::Scp {
@@ -353,6 +379,45 @@ impl Handler for SpidapterHandler {
         }
 
         Ok(TeardownResponse { ok: true })
+    }
+
+    async fn create_staging_table(
+        &mut self,
+        run_id: Uuid,
+        source_dataset: &str,
+        staging_table_name: &str,
+    ) -> std::result::Result<system_adapter_protocol::CreateStagingTableResponse, String> {
+        let state = self
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| format!("No active run found for {run_id}"))?;
+        if !self
+            .run_datasets
+            .get(&run_id)
+            .map_or(false, |ds| ds.contains_key(source_dataset))
+        {
+            return Err(format!(
+                "Source dataset '{source_dataset}' not found in run {run_id}"
+            ));
+        }
+
+        // Use CREATE TABLE ... LIKE ... to copy schema, partition expression,
+        // AND partition-to-executor assignments from the source table.
+        let quoted_staging = quote_identifier(staging_table_name);
+        let quoted_source = quote_identifier(source_dataset);
+        let ddl = format!(
+            "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_staging} LIKE spicebench.bench.{quoted_source}"
+        );
+
+        eprintln!(
+            "[stdio] create_staging_table: source={source_dataset}, staging={staging_table_name}, sql={ddl}"
+        );
+
+        execute_sql_statement(state.sql_url(), state.api_key(), &ddl)
+            .await
+            .map_err(|e| format!("Failed to execute staging table DDL: {e}"))?;
+
+        Ok(system_adapter_protocol::CreateStagingTableResponse { ok: true })
     }
 }
 
@@ -380,49 +445,9 @@ async fn post_setup_sink_action(
             return Ok(());
         }
 
-        let sql_client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60))
-            .build()?;
-
         for statement in create_table_statements {
             eprintln!("[stdio] Running post-setup SQL: {statement}");
-
-            let mut attempts = 0;
-
-            loop {
-                let mut request = sql_client.post(sql_url).body(statement.clone());
-                // Prefer non-streaming response path for DDL by setting row limit
-                request = request.header("X-Accept-Rows", "999");
-                if let Some(key) = api_key {
-                    request = request.header("X-API-Key", key);
-                }
-                let response = request.send().await?;
-
-                let status = response.status();
-                let body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-
-                if status.is_success() {
-                    break;
-                }
-
-                attempts += 1;
-
-                if attempts >= POST_SETUP_SQL_MAX_RETRIES {
-                    return Err(anyhow::anyhow!(
-                        "Failed to execute post-setup SQL against {sql_url} after {POST_SETUP_SQL_MAX_RETRIES} attempts: status={status}, sql={statement}, body={body}"
-                    ));
-                }
-
-                let backoff_seconds = attempts * 2;
-                eprintln!(
-                    "[stdio] Post-setup SQL failed (status={status}, body={body}), retrying in {backoff_seconds}s (attempt {attempts}/{POST_SETUP_SQL_MAX_RETRIES})"
-                );
-                sleep(Duration::from_secs(backoff_seconds)).await;
-            }
+            execute_sql_statement(sql_url, api_key, &statement).await?;
         }
 
         eprintln!("[stdio] ADBC post-setup table creation complete");
@@ -432,6 +457,50 @@ async fn post_setup_sink_action(
         );
     }
     Ok(())
+}
+
+/// Execute a single SQL statement against the system's HTTP SQL endpoint.
+async fn execute_sql_statement(
+    sql_url: &str,
+    api_key: Option<&str>,
+    statement: &str,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()?;
+
+    let mut attempts = 0;
+    loop {
+        let mut request = client.post(sql_url).body(statement.to_string());
+        request = request.header("X-Accept-Rows", "999");
+        if let Some(key) = api_key {
+            request = request.header("X-API-Key", key);
+        }
+        let response = request.send().await?;
+
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+        if status.is_success() {
+            return Ok(());
+        }
+
+        attempts += 1;
+        if attempts >= POST_SETUP_SQL_MAX_RETRIES {
+            return Err(anyhow::anyhow!(
+                "Failed to execute SQL against {sql_url} after {POST_SETUP_SQL_MAX_RETRIES} attempts: status={status}, sql={statement}, body={body}"
+            ));
+        }
+
+        let backoff_seconds = attempts * 2;
+        eprintln!(
+            "[stdio] SQL execution failed (status={status}, body={body}), retrying in {backoff_seconds}s (attempt {attempts}/{POST_SETUP_SQL_MAX_RETRIES})"
+        );
+        sleep(Duration::from_secs(backoff_seconds)).await;
+    }
 }
 
 fn generate_adbc_create_table_statements(
@@ -678,7 +747,6 @@ async fn provision_spice_cloud_app(
     commands::create_deployment(&cloud, app_id, args.channel.as_deref()).await?;
 
     let poll_client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(600))
         .build()?;
     commands::wait_for_deployment_ready(
@@ -719,6 +787,7 @@ async fn provision_spice_cloud_app(
         api_key,
         flight_url,
         api_url: api_url.to_owned(),
+        sql_url,
         cloud,
     })
 }
@@ -1199,7 +1268,6 @@ async fn wait_for_local_http_ready(
 ) -> anyhow::Result<()> {
     let ready_url = format!("{http_url}/health");
     let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(2))
         .build()?;
 
@@ -1229,7 +1297,6 @@ async fn wait_for_local_sql_ready(
     api_key: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(2))
         .build()?;
 
@@ -1310,7 +1377,6 @@ async fn wait_for_local_executor_count(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(2))
         .build()?;
     let metrics_url = format!("{scheduler_http_url}/metrics");

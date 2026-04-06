@@ -128,12 +128,7 @@ impl SpiceCloudPlatformCatalog {
         }
 
         let client = reqwest::Client::builder()
-            .user_agent(format!(
-                "spiceai/{} ({}; {})",
-                env!("CARGO_PKG_VERSION"),
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            ))
+            .user_agent(util::spiceai_user_agent())
             .use_rustls_tls()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
