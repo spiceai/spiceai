@@ -317,7 +317,7 @@ impl TestCases {
                 "SELECT id, trunc(_score, 3) as _score  FROM vector_search(qs, 'second', answer) order by _score desc, id desc LIMIT 4;".to_string()
             ),
             Self::VectorSearchSqlFilteredIndexOnly => SearchTestType::Sql(
-                "SELECT id, trunc(_score, 3) as _score FROM vector_search(qs, 'secondary', answer) WHERE subject != 'math' ORDER BY _score DESC, id LIMIT 4".to_string()
+                "SELECT id, trunc(_score, 3) as _score FROM vector_search(qs, 'secondary', answer, 4) WHERE subject != 'math' ORDER BY _score DESC, id".to_string()
             ),
        }
     }
