@@ -1327,7 +1327,7 @@ impl TableProvider for AcceleratedTable {
             } => write_through::insert_write_through(
                 input,
                 overwrite,
-                cayenne_target,
+                cayenne_target.as_ref(),
                 Arc::clone(federated_provider),
                 &self.refresher,
                 self.schema(),
