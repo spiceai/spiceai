@@ -25,13 +25,12 @@ use crate::{
     parameters::Parameters,
 };
 use async_trait::async_trait;
+use cayenne::{CayenneCatalogProvider, CayenneCatalogProviderConfig};
 use data_components::RefreshableCatalogProvider as _;
 use std::any::Any;
 use std::sync::Arc;
 
 pub mod provider;
-
-use provider::CayenneCatalogProvider;
 
 /// Catalog connector prefix for Cayenne catalogs.
 pub static PREFIX: &str = "cayenne";
@@ -77,6 +76,60 @@ impl CayenneCatalogConnector {
             params: params.parameters,
         })
     }
+
+    fn parse_provider_config(&self) -> CayenneCatalogProviderConfig {
+        let data_dir = self
+            .params
+            .get("cayenne_data_dir")
+            .expose()
+            .ok()
+            .map(ToOwned::to_owned);
+        let metadata_dir = self
+            .params
+            .get("cayenne_metadata_dir")
+            .expose()
+            .ok()
+            .map(ToOwned::to_owned);
+
+        let footer_cache_mb = self
+            .params
+            .get("cayenne_footer_cache_mb")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        let segment_cache_mb = self
+            .params
+            .get("cayenne_segment_cache_mb")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        let target_file_size_mb = self
+            .params
+            .get("cayenne_target_file_size_mb")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        let compression_strategy = self
+            .params
+            .get("cayenne_compression_strategy")
+            .expose()
+            .ok()
+            .and_then(|v| match v.to_lowercase().as_str() {
+                "zstd" => Some(cayenne::metadata::CompressionStrategy::Zstd),
+                "btrblocks" => Some(cayenne::metadata::CompressionStrategy::Btrblocks),
+                _ => None,
+            });
+
+        CayenneCatalogProviderConfig {
+            data_dir,
+            metadata_dir,
+            spice_data_base_path: crate::spice_data_base_path(),
+            footer_cache_mb,
+            segment_cache_mb,
+            target_file_size_mb,
+            compression_strategy,
+        }
+    }
 }
 
 #[async_trait]
@@ -91,8 +144,9 @@ impl CatalogConnector for CayenneCatalogConnector {
         catalog: &Catalog,
     ) -> super::Result<Arc<dyn data_components::RefreshableCatalogProvider>> {
         let runtime_env = runtime.datafusion().ctx.runtime_env();
+        let provider_config = self.parse_provider_config();
         let refreshable_provider = Arc::new(
-            CayenneCatalogProvider::try_new(self.params.clone(), catalog, runtime_env)
+            CayenneCatalogProvider::try_new(provider_config, runtime_env)
                 .await
                 .map_err(|e| super::Error::UnableToGetCatalogProvider {
                     connector: PREFIX.to_string(),

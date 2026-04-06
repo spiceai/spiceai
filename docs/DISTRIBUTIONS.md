@@ -6,6 +6,17 @@ The Spice open source project provides multiple distribution variants to support
 
 > **Note:** Variant distributions (data, allocators, CUDA) are only available in **nightly images** for the open source project. All features and distributions are available in the [Spice Cloud Platform](https://spice.ai/pricing) and [Spice.ai Enterprise](https://spice.ai/pricing).
 
+## Supported Platforms & Hardware Requirements
+
+| Platform | Architecture            | Minimum CPU Features                   | Build Prerequisites |
+| -------- | ----------------------- | -------------------------------------- | ------------------- |
+| Linux    | x86_64                  | AVX2, FMA, BMI1/2, LZCNT, POPCNT       | —                   |
+| Linux    | aarch64 (arm64)         | NEON, FP16 (FEAT_FP16), FHM (FEAT_FHM) | `clang`, `lld`      |
+| macOS    | aarch64 (Apple Silicon) | Native (build host)                    | —                   |
+| Windows  | x86_64 (MSVC)           | —                                      | MSVC toolchain      |
+
+> **Note:** Windows support is CLI (`spice`) only. The runtime daemon (`spiced`) is not supported on Windows natively — use WSL instead.
+
 ## Distribution Availability
 
 | Distribution / Variant | Open Source      | Spice Cloud | Enterprise |
@@ -216,6 +227,16 @@ These can be built locally for development and testing:
 ```bash
 make install-odbc
 ```
+
+### Linux arm64 Notes
+
+- **FP16 (FEAT_FP16)** is required because the `gemm` matrix multiplication library (used by the Candle ML framework) contains half-precision ARM inline assembly that requires the `fullfp16` CPU feature. This is supported on AWS Graviton2+, Ampere Altra, Apple M-series (via Linux VM), and most ARMv8.2-A+ processors.
+- **lld** is required as the linker because the spiced debug binary is large enough to exceed GNU ld's ±128 MiB branch range for `R_AARCH64_CALL26` relocations. lld automatically inserts range extension thunks.
+- Install prerequisites on Ubuntu/Debian: `sudo apt-get install -y clang lld`
+
+### Linux x86_64 Notes
+
+- Release builds target AVX2+ for optimized SIMD performance, covering Intel Haswell (2013+) and AMD Excavator (2015+) processors, including all current AWS x86_64 instance families (C6/C7/C8).
 
 ## Building Custom Distributions
 

@@ -1,12 +1,39 @@
-# ============================================================================
-# DISABLED: This workflow comes from upstream (spiceai/spiceai).
-# The enterprise version is ent_integration.yml
-# This file is kept only to prevent merge conflicts with upstream.
-# ============================================================================
 ---
-name: 'integration tests (upstream - disabled)'
+name: integration tests
 
-on: [workflow_dispatch]
+on:
+  push:
+    branches:
+      - trunk
+      - release/*
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+
+  workflow_dispatch:
+    inputs:
+      update_snapshots:
+        description: 'Update the snapshots?'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'always'
+          - 'no'
+      run_all_tests:
+        description: 'Run all tests'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -239,9 +266,9 @@ jobs:
         uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v2
         id: github-app-token
         with:
-          app-id: ${{ secrets.SPICEHQ_INTERNAL_GITHUB_APP_ID }}
-          private-key: ${{ secrets.SPICEHQ_INTERNAL_GITHUB_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
+          app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
+          private-key: ${{ secrets.ORG_MEMBERS_GITHUB_PRIVATE_KEY }}
+          owner: spiceai
           repositories: |
             spiceai
 

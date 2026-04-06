@@ -68,8 +68,6 @@ data/
 !test/nsql_bench/data
 !crates/runtime/tests/acceleration/data
 !crates/runtime/tests/acceleration/spicepods
-merge_conflict_report.md
-pr_body.md
 
 # Database files
 *.db
@@ -77,6 +75,14 @@ pr_body.md
 *.db.wal
 *.db-shm
 *.db-log
+*.duckdb
+*.duckdb.wal
 
 # Cluster logs
 cluster_logs/
+
+# Insta snapshot artifacts
+*.pending-snap
+
+# Claude worktrees
+.claude/worktrees/
