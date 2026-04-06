@@ -2403,7 +2403,9 @@ impl DataFusion {
             if let Err(e) = executor_registry.send_command(executor_id, command).await {
                 return Err(Error::PreRefreshPartitionDiscoveryFailed {
                     table_name: table_name.clone(),
-                    reason: format!("Failed to notify executor '{executor_id}' of new partitions: {e}"),
+                    reason: format!(
+                        "Failed to notify executor '{executor_id}' of new partitions: {e}"
+                    ),
                 });
             }
         }
