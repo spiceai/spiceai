@@ -473,17 +473,16 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 use datafusion::sql::sqlparser::dialect::GenericDialect;
                 use datafusion::sql::sqlparser::parser::Parser;
                 let dialect = GenericDialect {};
-                if let Ok(mut parser) = Parser::new(&dialect).try_with_sql(sql) {
-                    if let Ok(sql_expr) = parser.parse_expr() {
-                        // Check if it's a simple column reference
-                        if let datafusion::sql::sqlparser::ast::Expr::Identifier(ident) = &sql_expr
-                        {
-                            return ident.value.clone();
-                        }
+                if let Ok(mut parser) = Parser::new(&dialect).try_with_sql(sql)
+                    && let Ok(sql_expr) = parser.parse_expr()
+                {
+                    // Check if it's a simple column reference
+                    if let datafusion::sql::sqlparser::ast::Expr::Identifier(ident) = &sql_expr {
+                        return ident.value.clone();
                     }
                 }
                 // Fall back to auto-generated label
-                format!("expr0")
+                "expr0".to_string()
             });
         }
         let result_schema = ddl_result_schema();
@@ -792,7 +791,9 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 table_name.clone(),
             );
             if let Some(ref registry) = executor_registry {
-                let fallback = partition_expr.as_ref().map(|pe| pe.to_string());
+                let fallback = partition_expr
+                    .as_ref()
+                    .map(std::string::ToString::to_string);
                 let expr_sql = partition_expr_sql.as_ref().or(fallback.as_ref()).cloned();
                 if let Some(expr_sql) = expr_sql {
                     let pm = registry.federated_partition_manager();
