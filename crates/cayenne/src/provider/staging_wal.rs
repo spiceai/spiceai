@@ -94,26 +94,47 @@ impl CayenneStagedAppend {
     }
 
     /// Writes the staging WAL for the current `_staging/` files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing the WAL file fails.
     pub async fn write_wal(&self) -> Result<()> {
         self.table.write_staging_wal().await
     }
 
     /// Moves staged files into the current snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if moving the staged files fails.
     pub async fn move_staged_files(&self) -> Result<()> {
         self.table.move_files_to_current_snapshot().await
     }
 
     /// Removes the staging WAL after a successful move.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if removing the WAL file fails.
     pub async fn remove_wal(&self) -> Result<()> {
         self.table.remove_staging_wal().await
     }
 
     /// Refreshes the listing table so newly committed files become visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if refreshing the listing table fails.
     pub fn refresh_listing_table(&self) -> Result<()> {
         self.table.refresh_listing_table()
     }
 
     /// Executes the full WAL finalize sequence in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any step in the finalize sequence (write WAL, move files,
+    /// remove WAL, or refresh listing table) fails.
     pub async fn finalize_staged_write(&self) -> Result<()> {
         self.write_wal().await?;
         self.move_staged_files().await?;
@@ -123,6 +144,10 @@ impl CayenneStagedAppend {
     }
 
     /// Commits the staged append, making the new rows visible to readers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the finalize sequence fails.
     pub async fn commit(self) -> Result<u64> {
         self.finalize_staged_write().await?;
         let _ = self.write_guard;
@@ -130,6 +155,10 @@ impl CayenneStagedAppend {
     }
 
     /// Discards the staged append and removes any staged files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if clearing the staging directory fails.
     pub async fn rollback(self) -> Result<()> {
         let _ = self.write_guard;
         self.table.clear_staging_dir().await
@@ -163,6 +192,12 @@ impl CayenneTableProvider {
     ///
     /// This path supports append-only semantics and returns a handle that allows
     /// callers to commit or roll back once external coordination succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table has an incomplete write, uses a non-position-based
+    /// deletion strategy, has pending deletions, the incoming stream contains upsert or
+    /// on-conflict writes, or if writing the staged data fails.
     pub async fn begin_staged_append(
         &self,
         data: SendableRecordBatchStream,

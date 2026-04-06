@@ -222,6 +222,11 @@ impl PartitionTableProvider {
     }
 
     /// Returns the provider for the given partition values, creating the partition if needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DataFusionError`] if the partition key cannot be encoded or if creating
+    /// the new partition fails.
     pub async fn get_or_create_partition_provider(
         &self,
         partition_values: Vec<datafusion::scalar::ScalarValue>,
