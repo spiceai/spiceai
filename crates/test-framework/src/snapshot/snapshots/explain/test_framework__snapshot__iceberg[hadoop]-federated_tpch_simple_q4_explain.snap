@@ -18,6 +18,6 @@ description: "Query: tpch_simple_q4"
 |               |             RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1                                                        |
 |               |               CooperativeExec                                                                                                            |
 |               |                 BytesProcessedExec                                                                                                       |
-|               |                   IcebergTableScan projection:[l_linenumber,l_quantity,l_tax] predicate:[] limit:[]                                      |
+|               |                   IcebergTableScan projection:[l_linenumber,l_quantity,l_tax] predicate:[]                                               |
 |               |                                                                                                                                          |
 +---------------+------------------------------------------------------------------------------------------------------------------------------------------+
