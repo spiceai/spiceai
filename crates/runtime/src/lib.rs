@@ -131,7 +131,6 @@ pub mod timing;
 pub mod tls;
 pub mod token_providers;
 pub mod tools;
-pub mod topological_ordering;
 pub(crate) mod tracers;
 mod tracing_util;
 mod udtfs;

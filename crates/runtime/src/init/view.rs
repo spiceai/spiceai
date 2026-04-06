@@ -23,9 +23,6 @@ use crate::{
     metrics,
     secrets::Secrets,
     status,
-    topological_ordering::{
-        construct_effected_in_topological_order, construct_topological_ordering,
-    },
     view, warn_spaced,
 };
 use app::App;
@@ -35,6 +32,9 @@ use futures::stream::StreamExt;
 use itertools::Itertools;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
+use util::topological_ordering::{
+    construct_effected_in_topological_order, construct_topological_ordering,
+};
 
 /// Represents a validated view with its parsed dependencies
 pub(crate) struct ValidatedView {
