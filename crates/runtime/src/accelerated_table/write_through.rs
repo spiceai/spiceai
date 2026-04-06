@@ -77,7 +77,7 @@ pub(crate) enum WriteMode {
     /// Writes go simultaneously to both the federated source and the local Cayenne
     /// accelerator using staged append/commit/rollback semantics.
     WriteThrough {
-        cayenne_target: CayenneWriteTarget,
+        cayenne_target: Box<CayenneWriteTarget>,
         federated_provider: Arc<dyn TableProvider>,
     },
 }
@@ -117,7 +117,7 @@ impl WriteMode {
         })?;
 
         Ok(Self::WriteThrough {
-            cayenne_target,
+            cayenne_target: Box::new(cayenne_target),
             federated_provider,
         })
     }

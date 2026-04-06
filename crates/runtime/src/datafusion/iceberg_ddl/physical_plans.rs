@@ -19,6 +19,7 @@ limitations under the License.
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
+use std::fmt::Write as _;
 use std::sync::{Arc, Weak};
 
 use app::App;
@@ -759,7 +760,7 @@ async fn create_accelerated_iceberg_table(
     source_provider: Arc<dyn datafusion::datasource::TableProvider>,
     acceleration: &Acceleration,
     dataset_options: &DatasetOptions,
-    table_ident: (&str, &str, &str),
+    dataset_name: TableReference,
     partition_expr_sql: Option<&str>,
 ) -> Result<AcceleratedTable, DataFusionError> {
     use crate::accelerated_table::refresh::Refresh;
@@ -767,13 +768,15 @@ async fn create_accelerated_iceberg_table(
     use crate::component::dataset::acceleration::RefreshMode;
     use crate::federated_table::FederatedTable;
 
-    let (catalog_name, schema_name, table_name) = table_ident;
-
     let df = datafusion.upgrade().ok_or_else(|| {
         DataFusionError::Execution(
             "DataFusion runtime is no longer available for accelerated table creation".to_string(),
         )
     })?;
+
+    let table_name = dataset_name.table();
+    let catalog_name = dataset_name.catalog().unwrap_or_default();
+    let schema_name = dataset_name.schema().unwrap_or_default();
 
     // Convert spicepod Acceleration → runtime Acceleration (parses durations, engine, etc.)
     let mut runtime_accel = RuntimeAcceleration::try_from(acceleration.clone()).map_err(|e| {
@@ -796,11 +799,6 @@ async fn create_accelerated_iceberg_table(
     validate_write_through_acceleration(acceleration)?;
     validate_ddl_acceleration_runtime_requirements(acceleration)?;
 
-    let dataset_name = TableReference::full(
-        catalog_name.to_string(),
-        schema_name.to_string(),
-        table_name.to_string(),
-    );
     let source_string = format!("{catalog_name}.{schema_name}.{table_name}");
 
     let source_schema = source_provider.schema();
@@ -913,7 +911,11 @@ async fn build_registered_provider(
         raw_provider,
         acceleration,
         dataset_options,
-        (df_catalog_name, df_schema_name, &table_name),
+        TableReference::full(
+            df_catalog_name.to_string(),
+            df_schema_name.to_string(),
+            table_name,
+        ),
         partition_expr_sql.map(String::as_str),
     )
     .await?;
@@ -1090,15 +1092,11 @@ fn build_forwarded_create_sql(
     }
 
     if !options.is_empty() {
-        use std::fmt::Write;
-        write!(sql, " WITH ({})", options.join(", "))
-            .map_err(|e| DataFusionError::Execution(format!("Failed to build SQL: {e}")))?;
+        let _ = write!(sql, " WITH ({})", options.join(", "));
     }
 
     if let Some(partition_expr_sql) = partition_expr_sql {
-        use std::fmt::Write;
-        write!(sql, " PARTITION BY {partition_expr_sql}")
-            .map_err(|e| DataFusionError::Execution(format!("Failed to build SQL: {e}")))?;
+        let _ = write!(sql, " PARTITION BY {partition_expr_sql}");
     }
 
     Ok(sql)
