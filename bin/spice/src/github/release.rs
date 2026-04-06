@@ -214,8 +214,12 @@ pub async fn upgrade_cli_in_place(
         message: format!("Failed to get current executable path: {e}"),
     })?;
 
-    // Create a temporary directory for extraction
-    let temp_dir = tempfile::tempdir().map_err(|e| GitHubError::Io {
+    // Create a temporary directory next to the executable (not in /tmp) to guarantee
+    // the same filesystem, so that fs::rename works atomically without EXDEV.
+    let exe_dir = current_exe.parent().ok_or_else(|| GitHubError::Io {
+        message: "Failed to get executable parent directory".to_string(),
+    })?;
+    let temp_dir = tempfile::tempdir_in(exe_dir).map_err(|e| GitHubError::Io {
         message: format!("Failed to create temporary directory: {e}"),
     })?;
 
@@ -235,10 +239,11 @@ pub async fn upgrade_cli_in_place(
         });
     }
 
-    // We cannot overwrite a running executable directly.
-    // Windows locks the file; Unix returns ETXTBSY. The fix is to remove/rename the
-    // old binary first — the OS keeps the inode (Unix) or handle (Windows) alive until
-    // the process exits, so the running process is unaffected.
+    // We cannot overwrite a running executable directly — Linux returns ETXTBSY and
+    // Windows locks the file. Use rename to atomically swap the directory entry: the
+    // old inode stays alive (referenced by the running process) while the new binary
+    // takes the path. On Windows, rename-over-running-exe fails, so we rename the old
+    // binary away first.
     #[cfg(windows)]
     {
         let backup_path = current_exe.with_extension("old.exe");
@@ -249,15 +254,9 @@ pub async fn upgrade_cli_in_place(
             message: format!("Failed to backup current executable: {e}"),
         })?;
     }
-    #[cfg(unix)]
-    {
-        // Unlink the running binary so the new copy can be written to the same path.
-        // The kernel keeps the old inode alive until this process exits.
-        let _ = std::fs::remove_file(&current_exe);
-    }
 
-    // Copy the new binary to the (now-vacant) executable location
-    std::fs::copy(&extracted_binary, &current_exe).map_err(|e| GitHubError::Io {
+    // Atomically move the new binary into place.
+    std::fs::rename(&extracted_binary, &current_exe).map_err(|e| GitHubError::Io {
         message: format!("Failed to replace CLI binary: {e}"),
     })?;
 
