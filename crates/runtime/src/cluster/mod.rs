@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::Error::{self, FailedToStartClusterExecutor};
+use crate::auth::api_key_auth;
 use crate::cluster::datafusion::datafusion_and_cluster_physical_optimizers;
 use crate::cluster::partition::{
     executor_request_initial_partitions,
@@ -58,6 +59,7 @@ use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_expr::Expr;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
+use flight_client::Credentials;
 use futures::future::try_join_all;
 use runtime_datafusion::config::cluster_config::SpiceClusterConfig;
 use runtime_object_store::registry::default_runtime_env;
@@ -397,7 +399,7 @@ pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 /// enabling mutual TLS authentication between cluster nodes.
 #[derive(Debug, Clone)]
 pub struct ClusterTlsConfig {
-    /// CA certificate used to validate other cluster nodes and cloned into TLS clients as needed
+    /// CA certificate used to validate other cluster nodes
     pub ca_certificate: Certificate,
     /// Client TLS config with CA and client identity for mTLS
     pub client_tls_config: ClientTlsConfig,
@@ -1327,11 +1329,9 @@ pub async fn initialize_cluster_executor(
         }
     });
 
-    // Capture the cluster client TLS config (if mTLS is configured) for use in the can_connect
-    // check. The local Flight server uses the cluster's private CA and requires clients to present
-    // a certificate (mTLS), so passing the full ClientTlsConfig (with both CA and client identity)
-    // is required for the TLS handshake to succeed.
-    let cluster_client_tls = rt.df.cluster_config.client_tls_config().cloned();
+    let creds = credentials(app_def.runtime.auth.as_ref(), &rt)
+        .await
+        .unwrap_or(Credentials::anonymous());
     Ok(async move {
         let flight_addr = rt.datafusion().cluster_config.node_advertise_url();
         // Wait for our own flight service to be operational.
@@ -1341,14 +1341,12 @@ pub async fn initialize_cluster_executor(
             FibonacciBackoffBuilder::new().max_retries(Some(10)).build(),
             || {
                 let addr = flight_addr.clone();
-                let tls_config = cluster_client_tls.clone();
+                let creds = creds.clone();
                 async move {
-                    flight_client::can_connect(addr.clone(), tls_config)
+                    flight_client::can_connect(addr.clone(), Some(creds))
                         .await
                         .map_err(|e| {
-                            tracing::warn!(
-                                "Failed to connect to local Flight service at {addr:?}: {e}"
-                            );
+                            tracing::warn!("Failed to connect to local Flight service at {addr:?}");
                             util::RetryError::Transient {
                                 err: e,
                                 retry_after: None,
@@ -1362,13 +1360,13 @@ pub async fn initialize_cluster_executor(
             source: format!("Failed to connect to local Flight service: {err}").into(),
         })?;
 
-        tracing::debug!("Local Flight service is ready");
+        tracing::warn!("flight ready");
         // Bind the already-fetched app and initialize secrets for object store configuration
         executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;
-        tracing::debug!("executor_bind_app complete");
+        tracing::warn!("executor_bind_app ready");
 
         executor_bind_object_stores(Arc::clone(&rt)).await?;
-        tracing::debug!("executor_bind_object_stores complete");
+        tracing::warn!("executor_bind_object_stores ready");
 
         // Get initial allocation of Accelerated table partitions.
         // This also provides scheduler with executor_id to connect over FlightSQL to fetch partitions during SQL queries.
@@ -1382,7 +1380,7 @@ pub async fn initialize_cluster_executor(
             source: format!("Failed to allocate initial partitions from scheduler: {status}")
                 .into(),
         })?;
-        tracing::debug!("executor_request_initial_partitions complete");
+        tracing::warn!("executor_request_initial_partitions ready");
         rt.set_partition_assignments(initial_partitions).await;
 
         rt.status.update_cluster("executor", ComponentStatus::Ready);
@@ -1394,6 +1392,28 @@ pub async fn initialize_cluster_executor(
 
         Ok(())
     })
+}
+
+async fn credentials(
+    auth: Option<&spicepod::component::runtime::Auth>,
+    rt: &Arc<Runtime>,
+) -> Option<Credentials> {
+    let _credentials: Option<Credentials> = if let Some(spicepod::component::runtime::Auth {
+        api_key: Some(key_auth),
+    }) = auth
+    {
+        let secrets = rt.secrets();
+        let key = api_key_auth(&*secrets.read().await, key_auth)
+            .await
+            .api_keys
+            .first()?
+            .as_secret();
+
+        Some(Credentials::new("", key))
+    } else {
+        None
+    };
+    None
 }
 
 async fn create_scheduler_server(
