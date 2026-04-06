@@ -32,11 +32,13 @@ use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 
 use cayenne::{
-    metadata::CreateTableOptions, CayenneTableProvider, CayenneTableProviderBuilder,
-    MetadataCatalog,
+    CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
+    metadata::CreateTableOptions,
 };
 
 use common::TestFixture;
+
+use data_components::delete::DeletionTableProvider;
 
 use datafusion::datasource::TableProvider;
 
@@ -97,7 +99,7 @@ async fn test_detects_int64_pk_strategy_impl(fixture: TestFixture) -> TestResult
 
     // Delete and verify it works correctly (Int64Pk strategy)
     let filter = col("id").eq(lit(2i64));
-    let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     let deleted = results
         .first()
@@ -175,7 +177,7 @@ async fn test_detects_rowconverter_strategy_for_string_pk_impl(
 
     // Delete and verify
     let filter = col("code").eq(lit("B"));
-    let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     let deleted = results
         .first()
@@ -254,7 +256,7 @@ async fn test_detects_rowconverter_strategy_for_composite_pk_impl(
 
     // Delete with composite key
     let filter = col("region").eq(lit("US")).and(col("id").eq(lit(1i64)));
-    let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     let deleted = results
         .first()
@@ -329,7 +331,7 @@ async fn test_detects_position_based_strategy_impl(fixture: TestFixture) -> Test
 
     // Delete by value (not PK)
     let filter = col("value").eq(lit(3i64));
-    let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     let deleted = results
         .first()
@@ -399,7 +401,7 @@ async fn test_int32_pk_uses_rowconverter_impl(fixture: TestFixture) -> TestResul
 
     // Delete and verify
     let filter = col("id").eq(lit(2i32));
-    let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     let results = datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
     let deleted = results
         .first()
@@ -477,7 +479,7 @@ async fn test_strategy_persists_on_reopen_int64pk_impl(fixture: TestFixture) -> 
 
     // Delete a row
     let filter = col("id").eq(lit(3i64));
-    let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
 
     // Reopen table
@@ -490,7 +492,8 @@ async fn test_strategy_persists_on_reopen_int64pk_impl(fixture: TestFixture) -> 
 
     // Delete another row with reopened table
     let filter2 = col("id").eq(lit(5i64));
-    let plan2 = table2.delete_from(&ctx2.state(), vec![filter2]).await?;
+    let plan2 =
+        DeletionTableProvider::delete_from(table2.as_ref(), &ctx2.state(), &[filter2]).await?;
     datafusion_physical_plan::collect(plan2, ctx2.task_ctx()).await?;
 
     // Verify count
@@ -553,7 +556,7 @@ async fn test_strategy_persists_on_reopen_position_based_impl(
     // Delete
     let ctx = SessionContext::new();
     let filter = col("value").eq(lit(2i64));
-    let plan = table.delete_from(&ctx.state(), vec![filter]).await?;
+    let plan = DeletionTableProvider::delete_from(table.as_ref(), &ctx.state(), &[filter]).await?;
     datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?;
 
     // Reopen and delete more
@@ -564,7 +567,8 @@ async fn test_strategy_persists_on_reopen_position_based_impl(
             .await?,
     );
     let filter2 = col("value").eq(lit(1i64));
-    let plan2 = table2.delete_from(&ctx2.state(), vec![filter2]).await?;
+    let plan2 =
+        DeletionTableProvider::delete_from(table2.as_ref(), &ctx2.state(), &[filter2]).await?;
     datafusion_physical_plan::collect(plan2, ctx2.task_ctx()).await?;
 
     ctx2.register_table(
@@ -688,19 +692,28 @@ async fn test_multiple_strategies_same_session_impl(fixture: TestFixture) -> Tes
     insert_batch(&table3, batch3).await?;
 
     // Delete from each table
-    let plan1 = table1
-        .delete_from(&ctx.state(), vec![col("id").eq(lit(1i64))])
-        .await?;
+    let plan1 = DeletionTableProvider::delete_from(
+        table1.as_ref(),
+        &ctx.state(),
+        &[col("id").eq(lit(1i64))],
+    )
+    .await?;
     datafusion_physical_plan::collect(plan1, ctx.task_ctx()).await?;
 
-    let plan2 = table2
-        .delete_from(&ctx.state(), vec![col("key").eq(lit("X"))])
-        .await?;
+    let plan2 = DeletionTableProvider::delete_from(
+        table2.as_ref(),
+        &ctx.state(),
+        &[col("key").eq(lit("X"))],
+    )
+    .await?;
     datafusion_physical_plan::collect(plan2, ctx.task_ctx()).await?;
 
-    let plan3 = table3
-        .delete_from(&ctx.state(), vec![col("amount").eq(lit(100i64))])
-        .await?;
+    let plan3 = DeletionTableProvider::delete_from(
+        table3.as_ref(),
+        &ctx.state(),
+        &[col("amount").eq(lit(100i64))],
+    )
+    .await?;
     datafusion_physical_plan::collect(plan3, ctx.task_ctx()).await?;
 
     // Verify each table

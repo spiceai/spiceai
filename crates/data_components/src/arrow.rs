@@ -27,6 +27,8 @@ use datafusion_table_providers::util::on_conflict::OnConflict;
 use hash_index::HashIndexBuilder;
 use std::sync::Arc;
 
+use crate::delete::DeletionTableProviderAdapter;
+
 use self::indexed::SecondaryIndex;
 use self::write::MemTable;
 
@@ -257,7 +259,8 @@ impl TableProviderFactory for ArrowFactory {
                 indexed_table
             };
 
-            return Ok(Arc::new(indexed_table));
+            let delete_adapter = DeletionTableProviderAdapter::new(Arc::new(indexed_table));
+            return Ok(Arc::new(delete_adapter));
         }
 
         // Standard MemTable path (no primary key or hash index disabled)
@@ -288,7 +291,8 @@ impl TableProviderFactory for ArrowFactory {
             }
         }
 
-        Ok(Arc::new(mem_table))
+        let delete_adapter = DeletionTableProviderAdapter::new(Arc::new(mem_table));
+        Ok(Arc::new(delete_adapter))
     }
 }
 
@@ -345,7 +349,7 @@ mod tests {
             .expect("failed to create table");
 
         // The table should be created with an indexed structure
-        assert!(table.as_any().is::<IndexedMemTable>());
+        assert!(table.as_any().is::<DeletionTableProviderAdapter>());
     }
 
     #[tokio::test]
@@ -379,7 +383,7 @@ mod tests {
             .expect("failed to create table");
 
         // Without primary key, should still be a valid table
-        assert!(table.as_any().is::<MemTable>());
+        assert!(table.as_any().is::<DeletionTableProviderAdapter>());
     }
 
     #[tokio::test]
@@ -457,7 +461,7 @@ mod tests {
             .expect("failed to create table");
 
         // With hash_index not specified, should still create successfully (uses non-indexed table)
-        assert!(table.as_any().is::<MemTable>());
+        assert!(table.as_any().is::<DeletionTableProviderAdapter>());
     }
 
     // =============================================================================

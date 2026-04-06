@@ -94,6 +94,28 @@ pub struct ReplConfig {
     )]
     pub tls_root_certificate_file: Option<String>,
 
+    /// The path to the client certificate file for mTLS authentication.
+    /// Required when connecting to a cluster node that enforces mutual TLS.
+    /// Must be used together with --client-tls-key-file.
+    #[arg(
+        long,
+        requires = "client_tls_key_file",
+        value_name = "CLIENT_TLS_CERTIFICATE_FILE",
+        help_heading = "SQL REPL"
+    )]
+    pub client_tls_certificate_file: Option<String>,
+
+    /// The path to the client private key file for mTLS authentication.
+    /// Required when connecting to a cluster node that enforces mutual TLS.
+    /// Must be used together with --client-tls-certificate-file.
+    #[arg(
+        long,
+        requires = "client_tls_certificate_file",
+        value_name = "CLIENT_TLS_KEY_FILE",
+        help_heading = "SQL REPL"
+    )]
+    pub client_tls_key_file: Option<String>,
+
     /// The API key to use for authentication
     #[arg(long, value_name = "API_KEY", help_heading = "SQL REPL")]
     pub api_key: Option<String>,
@@ -272,6 +294,23 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
         new_agent.push_str(&user_agent);
         user_agent = new_agent;
     }
+    // Build mTLS client identity if both cert and key are provided.
+    // Clap `requires` on the CLI flags enforces that both are present or both absent.
+    let client_identity = if let (Some(cert_path), Some(key_path)) = (
+        &repl_config.client_tls_certificate_file,
+        &repl_config.client_tls_key_file,
+    ) {
+        let cert_pem = tokio::fs::read(cert_path).await.map_err(|e| {
+            format!("Failed to read TLS client certificate from '{cert_path}': {e}. Verify the file path and permissions.")
+        })?;
+        let key_pem = tokio::fs::read(key_path).await.map_err(|e| {
+            format!("Failed to read TLS client key from '{key_path}': {e}. Verify the file path and permissions.")
+        })?;
+        Some(tonic::transport::Identity::from_pem(cert_pem, key_pem))
+    } else {
+        None
+    };
+
     let channel = if let Some(tls_root_certificate_file) = repl_config.tls_root_certificate_file {
         let tls_root_certificate = tokio::fs::read(&tls_root_certificate_file)
             .await
@@ -279,18 +318,27 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 format!("Failed to read TLS root certificate from '{tls_root_certificate_file}': {e}. Verify the file path and permissions.")
             })?;
         let tls_root_certificate = tonic::transport::Certificate::from_pem(tls_root_certificate);
-        let client_tls_config = ClientTlsConfig::new().ca_certificate(tls_root_certificate);
-        if repl_flight_endpoint == "http://localhost:50051" {
-            repl_flight_endpoint = "https://localhost:50051".to_string();
+        let mut client_tls_config = ClientTlsConfig::new().ca_certificate(tls_root_certificate);
+        if let Some(identity) = client_identity {
+            client_tls_config = client_tls_config.identity(identity);
+        }
+        if repl_flight_endpoint.starts_with("http://") {
+            repl_flight_endpoint = repl_flight_endpoint.replacen("http://", "https://", 1);
         }
         Channel::from_shared(repl_flight_endpoint.clone())?
             .user_agent(user_agent.clone())?
             .tls_config(client_tls_config)?
             .connect()
             .await
-    } else if repl_flight_endpoint.starts_with("https://") {
-        // For HTTPS endpoints without a custom certificate, use system certificates
-        let client_tls_config = ClientTlsConfig::new().with_native_roots();
+    } else if client_identity.is_some() || repl_flight_endpoint.starts_with("https://") {
+        // For HTTPS endpoints or mTLS client identity without an explicit CA, use system certificates
+        let mut client_tls_config = ClientTlsConfig::new().with_native_roots();
+        if let Some(identity) = client_identity {
+            client_tls_config = client_tls_config.identity(identity);
+        }
+        if repl_flight_endpoint.starts_with("http://") {
+            repl_flight_endpoint = repl_flight_endpoint.replacen("http://", "https://", 1);
+        }
         Channel::from_shared(repl_flight_endpoint.clone())?
             .user_agent(user_agent.clone())?
             .tls_config(client_tls_config)?

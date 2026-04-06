@@ -24,7 +24,7 @@ use arrow_schema::SchemaRef;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion_common::ScalarValue;
 use snafu::prelude::*;
-use util::timestamp_filter::{data_type_to_timestamp_format, TimestampFilterConvert};
+use util::timestamp_filter::{TimestampFilterConvert, data_type_to_timestamp_format};
 
 /// Errors from [`TimeRetentionFilterBuilder`] construction.
 #[derive(Debug, Snafu)]

@@ -33,7 +33,7 @@ use super::DataConnectorFactory;
 use crate::{
     catalogconnector::iceberg::{
         ICEBERG_PARAM_LEN, get_rest_catalog, map_param_name_to_iceberg_prop,
-        parse_hadoop_table_url, parse_table_url, verify_s3_endpoint,
+        parse_hadoop_table_url, parse_table_url, s3_scheme_from_url, verify_s3_endpoint,
     },
     component::dataset::Dataset,
     dataconnector::{
@@ -186,8 +186,10 @@ impl IcebergDataConnector {
                     })?
                     .into_custom_loader();
 
+                let configured_scheme = s3_scheme_from_url(source);
+
                 Some(Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme: "s3".to_string(),
+                    configured_scheme,
                     customized_credential_load: Some(custom_loader),
                 }) as Arc<dyn StorageFactory>)
             } else {
@@ -299,9 +301,8 @@ impl IcebergDataConnector {
             if source.starts_with("gs://") || source.starts_with("gcs://") {
                 Arc::new(OpenDalStorageFactory::Gcs)
             } else if source.starts_with("s3://") || source.starts_with("s3a://") {
-                let scheme = source.split("://").next().unwrap_or("s3").to_string();
                 Arc::new(OpenDalStorageFactory::S3 {
-                    configured_scheme: scheme,
+                    configured_scheme: s3_scheme_from_url(source),
                     customized_credential_load: None,
                 })
             } else {
@@ -379,14 +380,18 @@ impl DataConnector for IcebergDataConnector {
             Err(e) => return Some(Err(e)),
         };
 
-        // Wrap in IcebergDeletionProvider for DELETE FROM support.
+        // Wrap in IcebergDeletionProvider for DELETE FROM support, then in
+        // DeletionTableProviderAdapter so get_deletion_provider can find it.
         let deletion_provider = data_components::iceberg::delete::IcebergDeletionProvider::new(
             parts.catalog,
             parts.namespace,
             parts.table_name,
             parts.provider,
         );
-        Some(Ok(Arc::new(deletion_provider)))
+        let adapted: Arc<dyn TableProvider> = Arc::new(
+            data_components::delete::DeletionTableProviderAdapter::new(Arc::new(deletion_provider)),
+        );
+        Some(Ok(adapted))
     }
 }
 
