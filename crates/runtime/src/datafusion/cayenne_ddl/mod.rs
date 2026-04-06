@@ -32,7 +32,6 @@ use cayenne::CayenneCatalogProvider;
 use super::composed_catalog::ComposedCatalogProvider;
 use crate::catalogconnector::PartitionAwareCatalog;
 
-
 /// Check whether the given catalog provider is a Cayenne-backed catalog.
 pub fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {
     get_cayenne_provider(provider).is_some()

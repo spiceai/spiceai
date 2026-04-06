@@ -1685,12 +1685,16 @@ mod tests {
             .expect("otel_exporter should be present");
         assert_eq!(otel_config.metrics.len(), 3);
         assert!(otel_config.metrics.contains(&"requests_total".to_string()));
-        assert!(otel_config
-            .metrics
-            .contains(&"request_duration_seconds".to_string()));
-        assert!(otel_config
-            .metrics
-            .contains(&"active_connections".to_string()));
+        assert!(
+            otel_config
+                .metrics
+                .contains(&"request_duration_seconds".to_string())
+        );
+        assert!(
+            otel_config
+                .metrics
+                .contains(&"active_connections".to_string())
+        );
     }
 
     #[test]
