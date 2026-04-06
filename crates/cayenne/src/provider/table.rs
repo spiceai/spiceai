@@ -361,6 +361,22 @@ impl CayenneTableProvider {
         &self.write_lock
     }
 
+    #[must_use]
+    pub(crate) fn write_lock_arc(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.write_lock)
+    }
+
+    #[must_use]
+    pub(crate) fn target_file_size_bytes(&self) -> usize {
+        self.context.target_file_size_bytes()
+    }
+
+    /// Returns a cheap clone that shares the underlying table state for write operations.
+    #[must_use]
+    pub fn clone_for_write_operations(&self) -> Self {
+        self.clone_for_write()
+    }
+
     /// Returns whether retention filters are configured for this table.
     #[must_use]
     pub(crate) fn has_retention_filters(&self) -> bool {
@@ -1540,7 +1556,7 @@ impl CayenneTableProvider {
     /// - Retention filters are table-wide predicates (e.g., "delete rows older than 30 days")
     /// - They must scan all table data, not just the newly written chunks
     /// - The write lock ensures atomicity: all writes + retention happen as one operation
-    fn clone_for_write(&self) -> Self {
+    pub(crate) fn clone_for_write(&self) -> Self {
         Self {
             table_metadata: self.table_metadata.clone(),
             catalog: Arc::clone(&self.catalog),

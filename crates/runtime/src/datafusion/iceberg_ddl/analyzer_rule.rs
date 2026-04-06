@@ -35,8 +35,15 @@ use datafusion::sql::TableReference;
 
 use super::acceleration_options::{DatasetOptions, SharedDdlExtensionStore};
 use super::composed_catalog_to_iceberg;
-use super::logical_nodes::{IcebergCreateTableNode, IcebergDropTableNode};
+use super::logical_nodes::{IcebergCreateSchemaNode, IcebergCreateTableNode, IcebergDropTableNode};
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+
+fn parse_qualified_schema_name(name: &str) -> (String, String) {
+    match name.split_once('.') {
+        Some((catalog_name, schema_name)) => (catalog_name.to_string(), schema_name.to_string()),
+        None => (SPICE_DEFAULT_CATALOG.to_string(), name.to_string()),
+    }
+}
 
 /// Analyzer rule that rewrites DDL targeting Iceberg catalogs into
 /// custom extension nodes that perform async Iceberg catalog operations.
@@ -136,15 +143,19 @@ impl AnalyzerRule for IcebergDdlAnalyzerRule {
                 let namespace = iceberg::NamespaceIdent::new(schema_name.clone());
 
                 // Look up DDL extensions from the store (consumed on use)
-                let (acceleration, dataset_options) = {
+                let (acceleration, dataset_options, partition_expr_sql) = {
                     let mut store = self.ddl_options.write().map_err(|e| {
                         DataFusionError::Execution(format!(
                             "Failed to acquire DDL extension store lock: {e}"
                         ))
                     })?;
                     match store.remove(&TableReference::parse_str(&acceleration_key)) {
-                        Some(ext) => (ext.acceleration, ext.dataset),
-                        None => (None, DatasetOptions::default()),
+                        Some(ext) => (
+                            ext.acceleration,
+                            ext.dataset,
+                            ext.partition_by.map(|expr| expr.to_string()),
+                        ),
+                        None => (None, DatasetOptions::default(), None),
                     }
                 };
 
@@ -159,6 +170,7 @@ impl AnalyzerRule for IcebergDdlAnalyzerRule {
                     schema_name,
                     acceleration,
                     dataset_options,
+                    partition_expr_sql,
                 );
 
                 Ok(LogicalPlan::Extension(Extension {
@@ -194,6 +206,31 @@ impl AnalyzerRule for IcebergDdlAnalyzerRule {
                     namespace,
                     table_name,
                     drop.if_exists,
+                    catalog_name,
+                    schema_name,
+                );
+
+                Ok(LogicalPlan::Extension(Extension {
+                    node: Arc::new(node),
+                }))
+            }
+            LogicalPlan::Ddl(DdlStatement::CreateCatalogSchema(create)) => {
+                let (catalog_name, schema_name) =
+                    parse_qualified_schema_name(create.schema_name.as_str());
+
+                if !self.is_ddl_enabled(&catalog_name) {
+                    return Ok(plan);
+                }
+
+                let Some(iceberg_catalog) = self.get_iceberg_catalog(&catalog_name) else {
+                    return Ok(plan);
+                };
+
+                let namespace = iceberg::NamespaceIdent::new(schema_name.clone());
+                let node = IcebergCreateSchemaNode::new(
+                    iceberg_catalog,
+                    namespace,
+                    create.if_not_exists,
                     catalog_name,
                     schema_name,
                 );

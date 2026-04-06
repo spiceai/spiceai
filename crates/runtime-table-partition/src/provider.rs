@@ -215,6 +215,37 @@ impl PartitionTableProvider {
     pub fn creator(&self) -> &Arc<dyn PartitionCreator> {
         &self.creator
     }
+
+    #[must_use]
+    pub fn partition_by(&self) -> &[PartitionedBy] {
+        &self.partition_by
+    }
+
+    /// Returns the provider for the given partition values, creating the partition if needed.
+    pub async fn get_or_create_partition_provider(
+        &self,
+        partition_values: Vec<datafusion::scalar::ScalarValue>,
+    ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+        let partition_key = encode_composite_key(&partition_values).map_err(|e| {
+            DataFusionError::Execution(format!("Failed to encode partition key: {e}"))
+        })?;
+
+        // retain the write lock across the entire get-or-create instead of holding a .read() which releases the lock and could race
+        // with another get-or-create for the same partition key, resulting in duplicate partitions being created
+        let mut partitions_lock = self.partitions.write().await;
+        if let Some(partition) = partitions_lock.get(&partition_key) {
+            return Ok(Arc::clone(&partition.table_provider));
+        }
+
+        let partition = self
+            .creator
+            .create_partition(partition_values)
+            .await
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        let provider = Arc::clone(&partition.table_provider);
+        partitions_lock.insert(partition_key, partition);
+        Ok(provider)
+    }
 }
 
 #[async_trait]

@@ -37,7 +37,7 @@ use cayenne::CayenneCatalogProvider;
 
 use super::composed_catalog::ComposedCatalogProvider;
 use crate::catalogconnector::PartitionAwareCatalog;
-use crate::datafusion::cayenne_ddl::physical_plans::arrow_datatype_to_sql;
+use crate::datafusion::ddl::arrow_datatype_to_sql;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 /// Check whether the given catalog provider is a Cayenne-backed catalog.
