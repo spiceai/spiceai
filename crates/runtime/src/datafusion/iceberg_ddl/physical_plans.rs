@@ -1100,34 +1100,7 @@ fn build_forwarded_create_sql(
     Ok(sql)
 }
 
-fn arrow_datatype_to_sql(dt: &DataType) -> Result<String, DataFusionError> {
-    match dt {
-        DataType::Boolean => Ok("BOOLEAN".to_string()),
-        DataType::Int8 => Ok("TINYINT".to_string()),
-        DataType::Int16 => Ok("SMALLINT".to_string()),
-        DataType::Int32 => Ok("INT".to_string()),
-        DataType::Int64 => Ok("BIGINT".to_string()),
-        DataType::UInt8 => Ok("TINYINT UNSIGNED".to_string()),
-        DataType::UInt16 => Ok("SMALLINT UNSIGNED".to_string()),
-        DataType::UInt32 => Ok("INT UNSIGNED".to_string()),
-        DataType::UInt64 => Ok("BIGINT UNSIGNED".to_string()),
-        DataType::Float16 | DataType::Float32 => Ok("FLOAT".to_string()),
-        DataType::Float64 => Ok("DOUBLE".to_string()),
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok("VARCHAR".to_string()),
-        DataType::Binary
-        | DataType::LargeBinary
-        | DataType::BinaryView
-        | DataType::FixedSizeBinary(_) => Ok("BYTEA".to_string()),
-        DataType::Date32 | DataType::Date64 => Ok("DATE".to_string()),
-        DataType::Time32(_) | DataType::Time64(_) => Ok("TIME".to_string()),
-        DataType::Timestamp(_, _) => Ok("TIMESTAMP".to_string()),
-        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => Ok(format!("DECIMAL({p},{s})")),
-        DataType::Dictionary(_, value_type) => arrow_datatype_to_sql(value_type.as_ref()),
-        other => Err(DataFusionError::Execution(format!(
-            "Unsupported Arrow type for forwarded Iceberg DDL: {other}"
-        ))),
-    }
-}
+use crate::datafusion::ddl::arrow_datatype_to_sql;
 
 fn render_refresh_mode(mode: &spicepod::acceleration::RefreshMode) -> &'static str {
     match mode {
