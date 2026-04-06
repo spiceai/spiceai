@@ -23,7 +23,7 @@ use std::sync::{Arc, Weak};
 
 use app::App;
 use arrow::array::{RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
