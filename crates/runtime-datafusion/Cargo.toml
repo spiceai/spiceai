@@ -29,6 +29,7 @@ search = { path = "../search", default-features = false }
 snafu.workspace = true
 tracing.workspace = true
 url.workspace = true
+util = { path = "../util", features = ["datafusion"] }
 
 [dev-dependencies]
 chrono.workspace = true

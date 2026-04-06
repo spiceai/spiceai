@@ -111,11 +111,11 @@ pub fn get_partition_filter_exprs(
     if partitions.is_empty() {
         return vec![];
     }
-    // Combine multiple partition expressions with OR (union of partitions),
-    // then wrap in a single-element Vec so `.filter()` applies it as one predicate.
-    let combined = partitions
-        .into_iter()
-        .reduce(Expr::or)
+    // Combine multiple partition expressions with OR (union of partitions) using a
+    // balanced tree to avoid O(n)-depth nesting that can exceed recursion limits
+    // during expression traversal/serialization. Wrap in a single-element Vec so
+    // `.filter()` applies it as one predicate.
+    let combined = util::expr::combine_exprs_balanced(partitions, Expr::or)
         .unwrap_or_else(|| unreachable!("partitions is not empty"));
     vec![combined]
 }
