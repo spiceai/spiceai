@@ -24,7 +24,10 @@ use crate::{
         },
         view::View,
     },
-    dataaccelerator::{FilePathError, snapshots::download_snapshot_if_needed},
+    dataaccelerator::{
+        FilePathError,
+        snapshots::{download_snapshot_if_needed, snapshot_before_recreate},
+    },
     datafusion::{
         dialect::new_duckdb_dialect,
         sort_columns::{SortColumn, parse_sort_columns},
@@ -50,7 +53,7 @@ use datafusion::{
 };
 use datafusion_table_providers::{
     duckdb::{
-        DuckDBSettingsRegistry, DuckDBTableProviderFactory,
+        DuckDB, DuckDBSettingsRegistry, DuckDBTableProviderFactory,
         write::{DuckDBTableWriter, WriteCompletionHandler},
     },
     sql::db_connection_pool::duckdbpool::{DuckDbConnectionPool, DuckDbConnectionPoolBuilder},
@@ -154,7 +157,7 @@ impl DuckDBAccelerator {
         })?;
 
         let pool = match (duckdb_file, acceleration.mode) {
-            (Ok(duckdb_file), Mode::File | Mode::FileCreate) => {
+            (Ok(duckdb_file), Mode::File | Mode::FileCreate | Mode::FileUpdate) => {
                 let num_accelerating_datasets = self.get_num_accelerating_datasets(
                     Some(duckdb_file.as_str()),
                     &source.app(),
@@ -185,7 +188,7 @@ impl DuckDBAccelerator {
                     .boxed()
                     .context(AccelerationCreationFailedSnafu)?
             }
-            (Err(e), Mode::File | Mode::FileCreate) => {
+            (Err(e), Mode::File | Mode::FileCreate | Mode::FileUpdate) => {
                 return Err(Error::InvalidConfiguration {
                     detail: Arc::from(e.to_string()),
                 });
@@ -212,8 +215,10 @@ impl DuckDBAccelerator {
 
                 // If the path is Some, we're counting the number of file instances
                 if let Some(this_file_path) = path {
-                    if matches!(acceleration.mode, Mode::File | Mode::FileCreate)
-                        && let Ok(file_path) = self.file_path(ds.as_ref())
+                    if matches!(
+                        acceleration.mode,
+                        Mode::File | Mode::FileCreate | Mode::FileUpdate
+                    ) && let Ok(file_path) = self.file_path(ds.as_ref())
                         && this_file_path == file_path
                     {
                         instance_usage += 1;
@@ -376,10 +381,21 @@ impl DataAccelerator for DuckDBAccelerator {
                 .into());
             }
 
-            // If mode is FileCreate, delete the existing file to start fresh
+            // If mode is FileCreate, snapshot the existing file (if enabled) then delete it to start fresh
             if acceleration.mode == Mode::FileCreate {
                 let file_path = std::path::Path::new(&path);
                 if file_path.exists() {
+                    snapshot_before_recreate(
+                        acceleration,
+                        &source.name().to_string(),
+                        runtime_acceleration::snapshot::AccelerationLayout::file(PathBuf::from(
+                            &path,
+                        )),
+                        AccelerationEngine::DuckDB,
+                        Arc::new(arrow_schema::Schema::empty()),
+                    )
+                    .await;
+
                     tracing::warn!(
                         "DuckDB acceleration mode is 'file_create', removing existing file: {}",
                         path
@@ -470,7 +486,10 @@ impl DataAccelerator for DuckDBAccelerator {
                     .filter_map(|other_source| {
                         if other_source.acceleration().is_some_and(|a| {
                             a.engine == Engine::DuckDB
-                                && matches!(a.mode, Mode::File | Mode::FileCreate)
+                                && matches!(
+                                    a.mode,
+                                    Mode::File | Mode::FileCreate | Mode::FileUpdate
+                                )
                         }) {
                             if other_source.name() == source.name() {
                                 None
@@ -564,6 +583,40 @@ impl DataAccelerator for DuckDBAccelerator {
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
     }
+
+    async fn drop_table(
+        &self,
+        table_name: &str,
+        source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let pool = Arc::new(self.get_shared_pool(source).await?);
+        let table_name = table_name.to_owned();
+
+        tokio::task::spawn_blocking(
+            move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                let mut conn = pool.connect_sync()?;
+                let duckdb_conn = DuckDB::duckdb_conn(&mut conn).boxed()?;
+                let escaped = table_name.replace('"', "\"\"");
+                let drop_sql = format!("DROP TABLE IF EXISTS \"{escaped}\"");
+                duckdb_conn
+                    .get_underlying_conn_mut()
+                    .execute(&drop_sql, [])
+                    .boxed()?;
+                // Also drop any internal DuckDB tables associated with this table
+                let internal_name = format!("__data_{table_name}").replace('"', "\"\"");
+                let internal_drop = format!("DROP TABLE IF EXISTS \"{internal_name}\"");
+                let _ = duckdb_conn
+                    .get_underlying_conn_mut()
+                    .execute(&internal_drop, []);
+                tracing::info!(
+                    "Dropped DuckDB table '{table_name}' for schema recreation (file_update mode)"
+                );
+                Ok(())
+            },
+        )
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+    }
 }
 
 pub(crate) async fn create_table_provider(
@@ -590,7 +643,7 @@ pub(crate) async fn create_table_provider(
     };
 
     // Wrap with upsert deduplication if needed
-    let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+    let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
         duckdb_writer,
         &cmd.options,
         cmd.constraints.clone(),
@@ -615,6 +668,7 @@ pub(crate) async fn create_table_provider(
 
     let table_provider = Arc::new(PolyTableProvider::new_with_schema_metadata(
         write_provider,
+        delete_provider,
         read_provider,
         schema_metadata,
     ));
@@ -800,6 +854,7 @@ mod tests {
         array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
         datatypes::{DataType, Field, Schema},
     };
+    use data_components::delete::{DeletionTableProvider, get_deletion_provider};
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
@@ -1162,6 +1217,9 @@ mod tests {
             .await
             .expect("insert successful");
 
+        let delete_table = get_deletion_provider(Arc::clone(&table))
+            .expect("table should be returned as deletion provider");
+
         let filter = cast(
             col("time_in_string"),
             DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
@@ -1170,10 +1228,10 @@ mod tests {
             Some(1354360272000),
             None,
         )));
-        let plan = table
-            .delete_from(&ctx.state(), vec![filter])
-            .await
-            .expect("deletion should be successful");
+        let plan =
+            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
+                .await
+                .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1189,10 +1247,10 @@ mod tests {
         assert_eq!(actual, &expected);
 
         let filter = col("time_int").lt(lit(1354360273));
-        let plan = table
-            .delete_from(&ctx.state(), vec![filter])
-            .await
-            .expect("deletion should be successful");
+        let plan =
+            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
+                .await
+                .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1220,14 +1278,17 @@ mod tests {
             .await
             .expect("insert successful");
 
+        let delete_table = get_deletion_provider(Arc::clone(&table))
+            .expect("table should be returned as deletion provider");
+
         let filter = col("time").lt(lit(ScalarValue::TimestampMillisecond(
             Some(1354360272000),
             None,
         )));
-        let plan = table
-            .delete_from(&ctx.state(), vec![filter])
-            .await
-            .expect("deletion should be successful");
+        let plan =
+            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
+                .await
+                .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1251,14 +1312,17 @@ mod tests {
             .await
             .expect("insert successful");
 
+        let delete_table = get_deletion_provider(Arc::clone(&table))
+            .expect("table should be returned as deletion provider");
+
         let filter = col("time_with_zone").lt(lit(ScalarValue::TimestampMillisecond(
             Some(1354360272000),
             None,
         )));
-        let plan = table
-            .delete_from(&ctx.state(), vec![filter])
-            .await
-            .expect("deletion should be successful");
+        let plan =
+            DeletionTableProvider::delete_from(delete_table.as_ref(), &ctx.state(), &[filter])
+                .await
+                .expect("deletion should be successful");
 
         let result = collect(plan, ctx.task_ctx())
             .await
@@ -1751,5 +1815,66 @@ mod tests {
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3, "should have 3 rows");
+    }
+
+    /// Tests that the DROP TABLE SQL used by `drop_table` correctly removes a table.
+    #[tokio::test]
+    async fn test_drop_table_sql_removes_table() {
+        use datafusion_table_providers::duckdb::DuckDB;
+        use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
+
+        let pool =
+            Arc::new(DuckDbConnectionPool::new_memory().expect("to create DuckDB connection pool"));
+        let mut conn = pool.connect_sync().expect("to get connection from pool");
+        let duckdb_conn = DuckDB::duckdb_conn(&mut conn).expect("to get DuckDB connection");
+
+        let table_name = "drop_test_table";
+        let underlying = duckdb_conn.get_underlying_conn_mut();
+
+        // Create a table
+        underlying
+            .execute(
+                &format!("CREATE TABLE \"{table_name}\" (id INTEGER, name VARCHAR)"),
+                [],
+            )
+            .expect("create table should succeed");
+
+        // Insert data
+        underlying
+            .execute(
+                &format!("INSERT INTO \"{table_name}\" VALUES (1, 'alice')"),
+                [],
+            )
+            .expect("insert should succeed");
+
+        // Verify table exists
+        let count: i32 = underlying
+            .query_row(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+                [table_name],
+                |row| row.get(0),
+            )
+            .expect("to query table count");
+        assert_eq!(count, 1, "table should exist before drop");
+
+        // Execute the same DROP TABLE SQL that drop_table() uses
+        underlying
+            .execute(&format!("DROP TABLE IF EXISTS \"{table_name}\""), [])
+            .expect("drop should succeed");
+
+        // Verify the table is gone
+        let count: i32 = underlying
+            .query_row(
+                "SELECT count(*) FROM information_schema.tables WHERE table_name = ?",
+                [table_name],
+                |row| row.get(0),
+            )
+            .expect("to query table count");
+        assert_eq!(count, 0, "table should not exist after drop");
+
+        // Verify DROP IF EXISTS on non-existent table doesn't error
+        underlying
+            .execute(&format!("DROP TABLE IF EXISTS \"{table_name}\""), [])
+            .expect("drop of non-existent table should succeed");
     }
 }

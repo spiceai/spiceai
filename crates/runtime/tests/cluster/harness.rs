@@ -47,6 +47,7 @@ use arrow::array::RecordBatch;
 use ballista_scheduler::state::executor_manager::ExecutorManager;
 use futures::TryStreamExt;
 use runtime::Runtime;
+use runtime::cluster::ExecutorRegistry;
 use runtime::cluster::ResolvedClusterConfig;
 use runtime::config::{ClusterConfig, ClusterRole, Config};
 use runtime::datafusion::query::QueryBuilder;
@@ -137,6 +138,8 @@ pub struct ClusterHarness {
     /// Background server handles — aborted on drop.
     handles: Vec<JoinHandle<RuntimeResult<()>>>,
     executor_manager: ExecutorManager,
+    /// Executor registry for checking flight SQL client readiness.
+    executor_registry: Option<Arc<ExecutorRegistry>>,
 }
 
 impl Drop for ClusterHarness {
@@ -178,7 +181,17 @@ impl ClusterHarness {
                 .await
                 .map_err(|e| anyhow::Error::msg(e.to_string()))?
                 .len();
-            if count == expected {
+
+            // Also verify flight SQL clients are ready — an executor may be in
+            // `connections` but not yet in `flight_sql_clients` during initial
+            // connection setup, which causes INSERT forwarding to fail.
+            let flight_clients_ready = if let Some(ref registry) = self.executor_registry {
+                registry.flight_sql_clients.read().await.len() >= expected
+            } else {
+                true
+            };
+
+            if count == expected && flight_clients_ready {
                 return Ok(());
             }
             if start.elapsed() > timeout {
@@ -250,6 +263,12 @@ impl ClusterHarnessBuilder {
         for _ in 0..n {
             self.executor_apps.push(None);
         }
+        self
+    }
+
+    /// Add a single executor with a specific `App` configuration.
+    pub fn executor_with_app(mut self, app: App) -> Self {
+        self.executor_apps.push(Some(app));
         self
     }
 
@@ -424,11 +443,14 @@ impl ClusterHarnessBuilder {
             .executor_manager
             .clone();
 
+        let executor_registry = scheduler_rt.datafusion().executor_registry.clone();
+
         Ok(ClusterHarness {
             scheduler: scheduler_rt,
             executors: executor_rts,
             handles,
             executor_manager,
+            executor_registry,
         })
     }
 }
