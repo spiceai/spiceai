@@ -156,7 +156,9 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
-                if let Some(partition_filter) = partition_exprs.into_iter().reduce(Expr::or) {
+                if let Some(partition_filter) =
+                    util::expr::combine_exprs_balanced(partition_exprs, Expr::or)
+                {
                     filters.push(partition_filter);
                 }
                 let plan = LogicalPlanBuilder::scan_with_filters(
