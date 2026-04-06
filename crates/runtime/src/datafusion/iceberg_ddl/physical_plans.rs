@@ -74,7 +74,7 @@ impl IcebergDdlAccelerationSource {
     ) -> Self {
         let app = App {
             name: app_name,
-            ..App::default()
+            ..Default::default()
         };
 
         Self {
