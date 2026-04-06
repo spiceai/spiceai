@@ -37,7 +37,6 @@ use spicepod::acceleration::Acceleration;
 
 use super::acceleration_options::DatasetOptions;
 use crate::accelerated_table::AcceleratedTable;
-use crate::accelerated_table::write_through::WriteThroughAcceleratedTableProvider;
 use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::datafusion::DataFusion;
 use crate::datafusion::composed_catalog::ComposedCatalogProvider;
@@ -449,11 +448,11 @@ impl ExecutionPlan for IcebergCreateTableExec {
                     "Catalog '{df_catalog_name}' not found"
                 )));
             };
-            let Some(schema_provider) = df_catalog.schema(&df_schema_name) else {
+            if df_catalog.schema(&df_schema_name).is_none() {
                 return Err(DataFusionError::Execution(format!(
                     "Schema '{df_schema_name}' not found in catalog '{df_catalog_name}'"
                 )));
-            };
+            }
 
             // Coerce Arrow types to Iceberg-compatible equivalents
             let arrow_schema = Arc::new(super::coerce_arrow_schema_for_iceberg_v2(&arrow_schema));
@@ -841,8 +840,8 @@ async fn create_accelerated_iceberg_table(
         refresh = refresh.time_format(TimeFormat::from(time_format.clone()));
     }
 
-    // Build the AcceleratedTable
-    let accelerated_table = AcceleratedTable::builder(
+    // Build the AcceleratedTable with write-through mode
+    let mut builder = AcceleratedTable::builder(
         Arc::clone(&df.runtime_status),
         dataset_name,
         federated_source,
@@ -850,10 +849,11 @@ async fn create_accelerated_iceberg_table(
         accelerated_table_provider,
         refresh,
         df.io_runtime.clone(),
-    )
-    .build()
-    .await
-    .map_err(|e| DataFusionError::Execution(format!("Failed to build accelerated table: {e}")))?;
+    );
+    builder.write_through();
+    let accelerated_table = builder.build().await.map_err(|e| {
+        DataFusionError::Execution(format!("Failed to build accelerated table: {e}"))
+    })?;
 
     Ok(accelerated_table)
 }
@@ -918,10 +918,7 @@ async fn build_registered_provider(
     )
     .await?;
 
-    let accelerated = Arc::new(accelerated);
-    let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(
-        WriteThroughAcceleratedTableProvider::try_new(Arc::clone(&accelerated))?,
-    );
+    let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(accelerated);
 
     Ok(provider)
 }

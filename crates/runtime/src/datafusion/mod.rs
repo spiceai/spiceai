@@ -2088,19 +2088,6 @@ impl DataFusion {
             )?;
 
             return Ok(notifier);
-        } else if let Some(write_through) = table
-            .as_any()
-            .downcast_ref::<crate::accelerated_table::write_through::WriteThroughAcceleratedTableProvider>()
-        {
-            let accelerated_table = write_through.inner();
-            let notifier = accelerated_table.refresher().on_complete_notification();
-            accelerated_table.trigger_refresh(overrides).await.context(
-                UnableToTriggerRefreshSnafu {
-                    dataset_name: dataset_name.to_string(),
-                },
-            )?;
-
-            return Ok(notifier);
         }
         NotAcceleratedTableSnafu {
             table_name: dataset_name.to_string(),
@@ -2212,17 +2199,6 @@ impl DataFusion {
                     dataset_name: dataset_name.to_string(),
                 },
             )?;
-        } else if let Some(write_through) = table
-            .as_any()
-            .downcast_ref::<crate::accelerated_table::write_through::WriteThroughAcceleratedTableProvider>()
-        {
-            write_through
-                .inner()
-                .update_refresh_sql(parsed)
-                .await
-                .context(UnableToTriggerRefreshSnafu {
-                    dataset_name: dataset_name.to_string(),
-                })?;
         }
 
         Ok(())
@@ -2240,17 +2216,6 @@ impl DataFusion {
 
         if let Some(accelerated_table) = table.as_any().downcast_ref::<AcceleratedTable>() {
             accelerated_table
-                .update_partition_filters(filters)
-                .await
-                .context(UnableToTriggerRefreshSnafu {
-                    dataset_name: dataset_name.to_string(),
-                })?;
-        } else if let Some(write_through) = table
-            .as_any()
-            .downcast_ref::<crate::accelerated_table::write_through::WriteThroughAcceleratedTableProvider>()
-        {
-            write_through
-                .inner()
                 .update_partition_filters(filters)
                 .await
                 .context(UnableToTriggerRefreshSnafu {
@@ -2955,13 +2920,6 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
 
     if let Some(accelerated) = table_provider.as_any().downcast_ref::<AcceleratedTable>() {
         return partition_expr_from_table_provider(&accelerated.get_accelerator());
-    }
-
-    if let Some(write_through) = table_provider
-        .as_any()
-        .downcast_ref::<crate::accelerated_table::write_through::WriteThroughAcceleratedTableProvider>()
-    {
-        return partition_expr_from_table_provider(&write_through.inner().get_accelerator());
     }
 
     if let Some(adaptor) = table_provider

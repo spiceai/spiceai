@@ -15,7 +15,6 @@ limitations under the License.
 */
 
 use std::any::Any;
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -25,12 +24,10 @@ use async_trait::async_trait;
 use cayenne::{CayenneStagedAppend, CayenneTableProvider};
 use data_components::delete::DeletionTableProviderAdapter;
 use data_components::poly::PolyTableProvider;
-use datafusion::catalog::{ScanArgs, ScanResult, Session};
-use datafusion::common::{Constraints, DFSchema, DataFusionError, Statistics};
-use datafusion::datasource::{TableProvider, TableType};
+use datafusion::common::{DFSchema, DataFusionError};
+use datafusion::datasource::TableProvider;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::metrics::MetricsSet;
@@ -43,15 +40,18 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::accelerated_table::AcceleratedTable;
+use crate::accelerated_table::refresh;
 use crate::dataaccelerator::cayenne::CayennePartitionCreator;
 use crate::dataaccelerator::upsert_dedup::UpsertDedupTableProvider;
 use crate::dataupdate::StreamingDataUpdateExecutionPlan;
+use crate::federated_table::FederatedTable;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_table_partition::insert::partition_batch_composite;
 use runtime_table_partition::provider::PartitionTableProvider;
 
-enum CayenneWriteTarget {
+/// Target for Cayenne-based write-through operations.
+#[derive(Debug)]
+pub(crate) enum CayenneWriteTarget {
     Staged(CayenneTableProvider),
     Partitioned(Arc<dyn TableProvider>),
 }
@@ -65,160 +65,111 @@ impl Clone for CayenneWriteTarget {
     }
 }
 
-impl std::fmt::Debug for CayenneWriteTarget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Staged(_) => f.write_str("CayenneWriteTarget::Staged"),
-            Self::Partitioned(_) => f.write_str("CayenneWriteTarget::Partitioned"),
-        }
+/// Controls where writes (INSERT INTO) are directed for an `AcceleratedTable`.
+#[derive(Debug, Clone)]
+pub(crate) enum WriteMode {
+    /// Writes go to the federated source only. The acceleration refresh mechanism
+    /// picks up new data on its next cycle. This is the default.
+    FederatedOnly,
+    /// Writes go only to the local accelerator (not replicated to the source).
+    /// Used when `on_conflict` is configured or for internal tables.
+    AcceleratorOnly,
+    /// Writes go simultaneously to both the federated source and the local Cayenne
+    /// accelerator using staged append/commit/rollback semantics.
+    WriteThrough {
+        cayenne_target: CayenneWriteTarget,
+        federated_provider: Arc<dyn TableProvider>,
+    },
+}
+
+impl WriteMode {
+    /// Returns `true` if this is a write-through mode.
+    #[must_use]
+    pub fn is_write_through(&self) -> bool {
+        matches!(self, Self::WriteThrough { .. })
     }
-}
 
-#[derive(Debug)]
-pub struct WriteThroughAcceleratedTableProvider {
-    inner: Arc<AcceleratedTable>,
-    accelerator: CayenneWriteTarget,
-    federated: Arc<dyn TableProvider>,
-}
-
-impl WriteThroughAcceleratedTableProvider {
-    pub fn try_new(inner: Arc<AcceleratedTable>) -> Result<Self, DataFusionError> {
-        let accelerator_provider = inner.get_accelerator();
-        let accelerator = extract_cayenne_write_target(&accelerator_provider).ok_or_else(|| {
-            DataFusionError::Execution(
-                "Write-through acceleration currently requires the Cayenne accelerator".to_string(),
-            )
+    /// Resolves a write-through mode from the accelerator and federated table.
+    pub(crate) fn resolve_write_through(
+        accelerator: &Arc<dyn TableProvider>,
+        federated: &Arc<FederatedTable>,
+    ) -> Result<Self, super::AcceleratedTableBuilderError> {
+        let cayenne_target = extract_cayenne_write_target(accelerator).ok_or_else(|| {
+            super::AcceleratedTableBuilderError::AcceleratedTableError {
+                source: super::Error::FailedToWriteData {
+                    source: DataFusionError::Execution(
+                        "Write-through acceleration currently requires the Cayenne accelerator"
+                            .to_string(),
+                    ),
+                },
+            }
         })?;
 
-        let federated = inner
-            .get_federated_table_ref()
-            .try_table_provider_sync()
-            .ok_or_else(|| {
-                DataFusionError::Execution(
-                    "Write-through acceleration requires an immediately available federated table provider"
-                        .to_string(),
-                )
-            })?;
+        let federated_provider = federated.try_table_provider_sync().ok_or_else(|| {
+            super::AcceleratedTableBuilderError::AcceleratedTableError {
+                source: super::Error::FailedToWriteData {
+                    source: DataFusionError::Execution(
+                        "Write-through acceleration requires an immediately available federated table provider"
+                            .to_string(),
+                    ),
+                },
+            }
+        })?;
 
-        Ok(Self {
-            inner,
-            accelerator,
-            federated,
+        Ok(Self::WriteThrough {
+            cayenne_target,
+            federated_provider,
         })
-    }
-
-    #[must_use]
-    pub fn inner(&self) -> &Arc<AcceleratedTable> {
-        &self.inner
     }
 }
 
-#[async_trait]
-impl TableProvider for WriteThroughAcceleratedTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.inner.schema()
-    }
-
-    fn table_type(&self) -> TableType {
-        self.inner.table_type()
-    }
-
-    fn constraints(&self) -> Option<&Constraints> {
-        self.inner.constraints()
-    }
-
-    fn statistics(&self) -> Option<Statistics> {
-        self.inner.statistics()
-    }
-
-    fn get_table_definition(&self) -> Option<&str> {
-        self.inner.get_table_definition()
-    }
-
-    fn get_logical_plan(&self) -> Option<Cow<'_, datafusion::logical_expr::LogicalPlan>> {
-        self.inner.get_logical_plan()
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> datafusion::common::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>>
-    {
-        self.inner.supports_filters_pushdown(filters)
-    }
-
-    async fn scan(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        self.inner.scan(state, projection, filters, limit).await
-    }
-
-    async fn scan_with_args<'a>(
-        &self,
-        state: &dyn Session,
-        args: ScanArgs<'a>,
-    ) -> datafusion::common::Result<ScanResult> {
-        self.inner.scan_with_args(state, args).await
-    }
-
-    async fn insert_into(
-        &self,
-        _state: &dyn Session,
-        input: Arc<dyn ExecutionPlan>,
-        overwrite: InsertOp,
-    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        match overwrite {
-            InsertOp::Append => Ok(Arc::new(DataSinkExec::new(
-                input,
-                Arc::new(WriteThroughDataSink::new(
-                    Arc::clone(&self.inner),
-                    self.accelerator.clone(),
-                    Arc::clone(&self.federated),
-                )),
-                None,
-            ))),
-            InsertOp::Overwrite | InsertOp::Replace => Err(DataFusionError::Plan(
-                "Write-through accelerated catalog tables currently support append writes only"
-                    .to_string(),
+/// Creates a `DataSinkExec` plan for write-through inserts.
+///
+/// Called from `AcceleratedTable::insert_into` when the write mode is `WriteThrough`.
+pub(crate) fn insert_write_through(
+    input: Arc<dyn ExecutionPlan>,
+    overwrite: InsertOp,
+    cayenne_target: &CayenneWriteTarget,
+    federated_provider: Arc<dyn TableProvider>,
+    refresher: &Arc<refresh::Refresher>,
+    schema: SchemaRef,
+) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+    match overwrite {
+        InsertOp::Append => Ok(Arc::new(DataSinkExec::new(
+            input,
+            Arc::new(WriteThroughDataSink::new(
+                cayenne_target.clone(),
+                federated_provider,
+                Arc::clone(refresher),
+                schema,
             )),
-        }
-    }
-
-    async fn delete_from(
-        &self,
-        state: &dyn Session,
-        filters: Vec<Expr>,
-    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        self.inner.delete_from(state, filters).await
+            None,
+        ))),
+        InsertOp::Overwrite | InsertOp::Replace => Err(DataFusionError::Plan(
+            "Write-through accelerated catalog tables currently support append writes only"
+                .to_string(),
+        )),
     }
 }
 
 struct WriteThroughDataSink {
-    inner: Arc<AcceleratedTable>,
     accelerator: CayenneWriteTarget,
     federated: Arc<dyn TableProvider>,
+    refresher: Arc<refresh::Refresher>,
     schema: SchemaRef,
 }
 
 impl WriteThroughDataSink {
     fn new(
-        inner: Arc<AcceleratedTable>,
         accelerator: CayenneWriteTarget,
         federated: Arc<dyn TableProvider>,
+        refresher: Arc<refresh::Refresher>,
+        schema: SchemaRef,
     ) -> Self {
-        let schema = inner.schema();
         Self {
-            inner,
             accelerator,
             federated,
+            refresher,
             schema,
         }
     }
@@ -258,7 +209,7 @@ impl DataSink for WriteThroughDataSink {
     ) -> datafusion::common::Result<u64> {
         if let CayenneWriteTarget::Partitioned(accelerator) = &self.accelerator {
             return write_all_with_partitioned_cayenne(
-                Arc::clone(&self.inner),
+                Arc::clone(&self.refresher),
                 Arc::clone(accelerator),
                 Arc::clone(&self.federated),
                 data,
@@ -320,7 +271,7 @@ impl DataSink for WriteThroughDataSink {
         match (staged_result, source_result, upstream_error) {
             (Ok(staged), Ok(()), None) => {
                 let row_count = staged.commit().await?;
-                self.inner.refresher().set_initial_load_completed(true);
+                self.refresher.set_initial_load_completed(true);
                 Ok(row_count)
             }
             (Ok(staged), source_result, upstream_error) => {
@@ -350,7 +301,7 @@ impl DataSink for WriteThroughDataSink {
 }
 
 async fn write_all_with_partitioned_cayenne(
-    inner: Arc<AcceleratedTable>,
+    refresher: Arc<refresh::Refresher>,
     accelerator: Arc<dyn TableProvider>,
     federated: Arc<dyn TableProvider>,
     mut data: SendableRecordBatchStream,
@@ -457,7 +408,7 @@ async fn write_all_with_partitioned_cayenne(
     match (staged_result, source_result, upstream_error) {
         (Ok(staged), Ok(()), None) => {
             let row_count = staged.commit().await?;
-            inner.refresher().set_initial_load_completed(true);
+            refresher.set_initial_load_completed(true);
             Ok(row_count)
         }
         (Ok(staged), source_result, upstream_error) => {

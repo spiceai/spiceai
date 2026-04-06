@@ -55,7 +55,7 @@ use datafusion_expr::WriteOp;
 use datafusion_expr::dml::InsertOp;
 use datafusion_federation::FederatedTableProviderAdaptor;
 
-use crate::accelerated_table::write_through::WriteThroughAcceleratedTableProvider;
+use crate::accelerated_table::AcceleratedTable;
 use crate::config::ClusterRole;
 use crate::datafusion::ddl::acceleration_options::SharedDdlExtensionStore;
 
@@ -236,12 +236,11 @@ async fn is_distributed_insert_table(session: &SessionState, table_name: &TableR
 }
 
 fn is_write_through_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
-    if table_provider
+    if let Some(accelerated) = table_provider
         .as_any()
-        .downcast_ref::<WriteThroughAcceleratedTableProvider>()
-        .is_some()
+        .downcast_ref::<AcceleratedTable>()
     {
-        return true;
+        return accelerated.is_write_through();
     }
 
     if let Some(adaptor) = table_provider
@@ -249,10 +248,12 @@ fn is_write_through_table_provider(table_provider: &Arc<dyn TableProvider>) -> b
         .downcast_ref::<FederatedTableProviderAdaptor>()
         && let Some(inner_provider) = adaptor.table_provider.as_ref()
     {
-        return inner_provider
+        if let Some(accelerated) = inner_provider
             .as_any()
-            .downcast_ref::<WriteThroughAcceleratedTableProvider>()
-            .is_some();
+            .downcast_ref::<AcceleratedTable>()
+        {
+            return accelerated.is_write_through();
+        }
     }
 
     false
