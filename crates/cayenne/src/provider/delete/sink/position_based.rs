@@ -34,6 +34,7 @@ use datafusion_common::utils::get_available_parallelism;
 use datafusion_expr::Expr;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::create_physical_expr;
+use datafusion_physical_expr::expressions as phys_expr;
 use futures::StreamExt;
 use object_store::ObjectStore;
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -187,6 +188,14 @@ impl CayenneDeletionSink {
             tracing::debug!("No new deletions to persist");
             return Ok(0);
         }
+
+        let total_new_deletions: usize = per_file_row_ids.values().map(std::vec::Vec::len).sum();
+        tracing::debug!(
+            table = %table_name,
+            total_new_deletions,
+            files_with_deletions = per_file_row_ids.len(),
+            "Position-based delete: persisting deletions"
+        );
 
         self.persist_position_based_deletions(per_file_row_ids)
             .await
@@ -471,24 +480,157 @@ fn build_vortex_filter(
         })
         .collect::<datafusion_common::Result<Vec<_>>>()?;
 
-    // Convert to Vortex expressions and combine with AND
+    // Convert to Vortex expressions and combine with AND.
+    // When direct conversion fails (e.g., struct() IN-list from composite-key
+    // deletes), try decomposing the expression into Vortex-compatible form.
     let mut combined: Option<vortex::expr::Expression> = None;
     for phys_filter in &physical_filters {
-        match expr_convertor.convert(phys_filter.as_ref()) {
-            Ok(vortex_expr) => {
-                combined = Some(match combined {
-                    Some(existing) => and(existing, vortex_expr),
-                    None => vortex_expr,
-                });
+        let vortex_expr = match expr_convertor.convert(phys_filter.as_ref()) {
+            Ok(expr) => expr,
+            Err(_) => {
+                match try_decompose_struct_in_list(phys_filter.as_ref(), &expr_convertor, df_schema)
+                {
+                    Some(decomposed) => decomposed,
+                    None => {
+                        return Err(format!(
+                            "Failed to convert filter to Vortex expression. Filter: {phys_filter}"
+                        )
+                        .into());
+                    }
+                }
             }
-            Err(e) => {
-                return Err(format!(
-                    "Failed to convert filter to Vortex expression: {e}. Filter: {phys_filter}"
-                )
-                .into());
-            }
-        }
+        };
+        combined = Some(match combined {
+            Some(existing) => and(existing, vortex_expr),
+            None => vortex_expr,
+        });
     }
 
     Ok(combined)
+}
+
+/// Decompose `struct(col1, col2, ...) IN (struct_lit1, struct_lit2, ...)` into a
+/// balanced OR-tree of AND-equalities that Vortex can evaluate.
+///
+/// `DataFusion` converts `(k1, k2) IN ((v1, w1), (v2, w2))` into
+/// `struct(k1, k2) IN (SET)` which Vortex's expression convertor doesn't support.
+/// This function decomposes it into:
+///   `(k1 = v1 AND k2 = w1) OR (k1 = v2 AND k2 = w2)`
+/// using a balanced binary tree to keep expression depth at O(log N).
+fn try_decompose_struct_in_list(
+    expr: &dyn datafusion_physical_expr::PhysicalExpr,
+    convertor: &DefaultExpressionConvertor,
+    df_schema: &DFSchema,
+) -> Option<vortex::expr::Expression> {
+    use datafusion_common::ScalarValue;
+
+    let in_list = expr.as_any().downcast_ref::<phys_expr::InListExpr>()?;
+
+    // Check that the value expression is struct(col1, col2, ...),
+    // possibly wrapped in a CAST (DataFusion may insert type coercion).
+    let value_expr: &dyn datafusion_physical_expr::PhysicalExpr = in_list.expr().as_ref();
+    let struct_fn = if let Some(sf) = value_expr
+        .as_any()
+        .downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>(
+    ) {
+        sf
+    } else if let Some(cast_expr) = value_expr.as_any().downcast_ref::<phys_expr::CastExpr>() {
+        cast_expr
+            .expr()
+            .as_any()
+            .downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>()?
+    } else {
+        return None;
+    };
+    if struct_fn.name() != "struct" {
+        return None;
+    }
+
+    // Convert each column in struct() args to a Vortex expression.
+    // Also record each column's native data type for literal casting.
+    let mut vortex_columns: Vec<vortex::expr::Expression> =
+        Vec::with_capacity(struct_fn.args().len());
+    let mut col_types: Vec<arrow::datatypes::DataType> = Vec::with_capacity(struct_fn.args().len());
+    let arrow_schema: arrow::datatypes::Schema = df_schema.as_arrow().as_ref().clone();
+    for arg in struct_fn.args() {
+        let vx = convertor.convert(arg.as_ref()).ok()?;
+        let dt = arg.data_type(&arrow_schema).ok()?;
+        vortex_columns.push(vx);
+        col_types.push(dt);
+    }
+
+    if vortex_columns.is_empty() {
+        return None;
+    }
+
+    // Build one AND-conjunction per list element: (col1 = v1 AND col2 = w1)
+    let row_predicates: Vec<vortex::expr::Expression> = in_list
+        .list()
+        .iter()
+        .filter_map(|elem| {
+            let literal = elem.as_any().downcast_ref::<phys_expr::Literal>()?;
+            let ScalarValue::Struct(struct_arr) = literal.value() else {
+                return None;
+            };
+
+            // Build (col1 = v1 AND col2 = w1) for this struct literal.
+            // Cast each field scalar to the column's native type to avoid
+            // Vortex DType mismatches (e.g., i64 literal vs i32 column).
+            let field_eqs: Vec<vortex::expr::Expression> = (0..vortex_columns.len())
+                .map(|i| {
+                    let field_scalar = ScalarValue::try_from_array(struct_arr.column(i), 0).ok()?;
+                    let cast_scalar = field_scalar
+                        .cast_to(&col_types[i])
+                        .ok()
+                        .unwrap_or(field_scalar);
+                    let phys_lit = phys_expr::Literal::new(cast_scalar);
+                    let vortex_lit = convertor.convert(&phys_lit).ok()?;
+                    Some(vortex::expr::eq(vortex_columns[i].clone(), vortex_lit))
+                })
+                .collect::<Option<Vec<_>>>()?;
+
+            let mut conj = field_eqs.into_iter();
+            let first = conj.next()?;
+            Some(conj.fold(first, vortex::expr::and))
+        })
+        .collect();
+
+    if row_predicates.is_empty() {
+        return None;
+    }
+
+    // Build a balanced binary OR-tree to keep depth at O(log N)
+    let result = balanced_or(row_predicates);
+
+    if in_list.negated() {
+        Some(vortex::expr::not(result))
+    } else {
+        Some(result)
+    }
+}
+
+/// Combine expressions with OR using a balanced binary tree.
+/// Depth is O(log N) instead of O(N) from a linear fold, avoiding stack overflow.
+fn balanced_or(mut exprs: Vec<vortex::expr::Expression>) -> vortex::expr::Expression {
+    use vortex::expr::or;
+    debug_assert!(!exprs.is_empty());
+    while exprs.len() > 1 {
+        let mut next = Vec::with_capacity(exprs.len().div_ceil(2));
+        let mut i = 0;
+        while i + 1 < exprs.len() {
+            // Take pairs — using swap_remove-style but preserving order
+            let right = exprs[i + 1].clone();
+            let left = exprs[i].clone();
+            next.push(or(left, right));
+            i += 2;
+        }
+        if i < exprs.len() {
+            next.push(exprs[i].clone());
+        }
+        exprs = next;
+    }
+    match exprs.into_iter().next() {
+        Some(expr) => expr,
+        None => unreachable!("balanced_or called with empty exprs"),
+    }
 }
