@@ -272,14 +272,15 @@ impl ExecutionPlan for PartitionerExec {
 
                 for handle in handles {
                     match handle.await {
-                        Ok(result) => result.map_err(|e| DataFusionError::Execution(
-                            format!("Failed to insert into partition: {e}")
-                        ))?,
+                        Ok(result) => result.map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to insert into partition: {e}"
+                            ))
+                        })?,
                         Err(e) => {
-                            tracing::error!("Partition insert task failed unexpectedly: {e}");
-                            return Err(DataFusionError::Execution(
-                                "Failed to insert into partition".to_string()
-                            ));
+                            return Err(DataFusionError::Execution(format!(
+                                "Failed to complete partition task: {e}"
+                            )));
                         }
                     }
                 }
