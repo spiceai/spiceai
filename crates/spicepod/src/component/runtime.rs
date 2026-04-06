@@ -16,7 +16,6 @@ limitations under the License.
 
 use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 
-use secrecy::SecretString;
 use subtle::ConstantTimeEq;
 
 use super::{
@@ -602,13 +601,6 @@ impl ApiKey {
             ApiKey::ReadOnly {
                 key: input.to_string(),
             }
-        }
-    }
-
-    #[must_use]
-    pub fn as_secret(&self) -> SecretString {
-        match self {
-            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => key.clone().into(),
         }
     }
 
@@ -1693,16 +1685,12 @@ mod tests {
             .expect("otel_exporter should be present");
         assert_eq!(otel_config.metrics.len(), 3);
         assert!(otel_config.metrics.contains(&"requests_total".to_string()));
-        assert!(
-            otel_config
-                .metrics
-                .contains(&"request_duration_seconds".to_string())
-        );
-        assert!(
-            otel_config
-                .metrics
-                .contains(&"active_connections".to_string())
-        );
+        assert!(otel_config
+            .metrics
+            .contains(&"request_duration_seconds".to_string()));
+        assert!(otel_config
+            .metrics
+            .contains(&"active_connections".to_string()));
     }
 
     #[test]

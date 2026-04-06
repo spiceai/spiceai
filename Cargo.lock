@@ -18302,7 +18302,6 @@ dependencies = [
  "object_store",
  "regex",
  "schemars 1.2.1",
- "secrecy",
  "serde",
  "serde-value",
  "serde_json",

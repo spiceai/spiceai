@@ -47,8 +47,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
-use datafusion_common::{Constraint, Constraints, DFSchema};
-use datafusion_execution::SendableRecordBatchStream;
+use datafusion_common::{Constraints, DFSchema};
 use datafusion_execution::cache::TableScopedPath;
 use datafusion_execution::config::SessionConfig;
 use datafusion_expr::dml::InsertOp;
@@ -134,8 +133,8 @@ pub struct CayenneTableProvider {
     /// `RowConverter` for converting primary key columns to byte representation.
     /// Only set for tables with composite or non-integer primary keys.
     pk_row_converter: Option<Arc<RowConverter>>,
-    /// `Constraint::PrimaryKey` in the table schema.
-    constraints: Constraints,
+    /// Indices of primary key columns in the table schema.
+    pk_column_indices: Vec<usize>,
     /// Write lock to serialize insert operations and prevent concurrent write races.
     /// This ensures that:
     /// - Only one `insert()` runs at a time per table
@@ -412,16 +411,6 @@ impl CayenneTableProvider {
                 })?;
         *listing_table_guard = new_listing_table;
         Ok(())
-    }
-
-    /// Return the primary key of the table as index(es) into the [`TableProvider::Schema`].
-    #[must_use]
-    pub fn pk_column_indices(&self) -> &[usize] {
-        // By construction, primary key is the only constraint.
-        if let Some(Constraint::PrimaryKey(pk)) = self.constraints.first() {
-            return pk;
-        }
-        &[]
     }
 
     /// Trigger cleanup of old snapshot directories in the background.
@@ -1222,11 +1211,7 @@ impl CayenneTableProvider {
             context,
             pk_deletion_strategy,
             pk_row_converter,
-            constraints: if has_primary_key {
-                Constraints::new_unverified(vec![Constraint::PrimaryKey(pk_column_indices)])
-            } else {
-                Constraints::default()
-            },
+            pk_column_indices,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             object_store_config,
             protected_snapshots: Arc::new(RwLock::new(protected_snapshots)),
@@ -1550,7 +1535,7 @@ impl CayenneTableProvider {
             time_retention_filter_builder: self.time_retention_filter_builder.clone(),
             pk_deletion_strategy: self.pk_deletion_strategy.clone(),
             pk_row_converter: self.pk_row_converter.as_ref().map(Arc::clone),
-            constraints: self.constraints.clone(),
+            pk_column_indices: self.pk_column_indices.clone(),
             write_lock: Arc::clone(&self.write_lock), // Shared across all clones for same table
             object_store_config: self.object_store_config.clone(),
             current_snapshot_id: Arc::clone(&self.current_snapshot_id),
@@ -2712,7 +2697,7 @@ impl CayenneTableProvider {
             &filters,
             self.pk_deletion_strategy.clone(),
             self.pk_row_converter.as_ref().map(Arc::clone),
-            self.pk_column_indices().to_vec(),
+            self.pk_column_indices.clone(),
             Vec::new(), // Retention filters don't need to scan protected snapshots
             Arc::clone(self.context.runtime_env()),
             None, // Already under write_lock from write_all_append
@@ -3809,11 +3794,7 @@ impl TableProvider for CayenneTableProvider {
     }
 
     fn constraints(&self) -> Option<&Constraints> {
-        if self.constraints.is_empty() {
-            None
-        } else {
-            Some(&self.constraints)
-        }
+        None
     }
 
     async fn scan(
@@ -3858,17 +3839,16 @@ impl TableProvider for CayenneTableProvider {
         // For PK-based deletion, we need to ensure PK columns are included in the projection
         // so we can filter by key. We may need to strip them out afterward if they weren't
         // originally requested.
-        let pk_column_indices = self.pk_column_indices();
         let (effective_projection, pk_indices_in_projection, need_projection_strip) =
             if need_pk_deletion {
                 if let Some(proj) = projection {
                     // Check which PK columns are missing from the projection
                     let mut extended_proj: Vec<usize> = proj.clone();
-
-                    let mut pk_indices: Vec<usize> = Vec::with_capacity(pk_column_indices.len());
+                    let mut pk_indices: Vec<usize> =
+                        Vec::with_capacity(self.pk_column_indices.len());
                     let mut added_columns = false;
 
-                    for &pk_idx in pk_column_indices {
+                    for &pk_idx in &self.pk_column_indices {
                         if let Some(pos) = extended_proj.iter().position(|&p| p == pk_idx) {
                             // PK column already in projection
                             pk_indices.push(pos);
@@ -3883,19 +3863,19 @@ impl TableProvider for CayenneTableProvider {
                     (Some(extended_proj), pk_indices, added_columns)
                 } else {
                     // No projection means all columns are selected
-                    (None, pk_column_indices.to_vec(), false)
+                    (None, self.pk_column_indices.clone(), false)
                 }
             } else {
                 // No PK-based deletion needed, use original projection
                 let pk_indices = if let Some(proj) = projection {
-                    pk_column_indices
+                    self.pk_column_indices
                         .iter()
                         .filter_map(|&orig_idx| {
                             proj.iter().position(|&proj_idx| proj_idx == orig_idx)
                         })
                         .collect()
                 } else {
-                    pk_column_indices.to_vec()
+                    self.pk_column_indices.clone()
                 };
                 (projection.cloned(), pk_indices, false)
             };
@@ -4265,7 +4245,7 @@ impl CayenneTableProvider {
                 filters,
                 self.pk_deletion_strategy.clone(),
                 self.pk_row_converter.as_ref().map(Arc::clone),
-                self.pk_column_indices().to_vec(),
+                self.pk_column_indices.clone(),
                 snapshot_tables,
                 Arc::clone(self.context.runtime_env()),
                 Some(Arc::clone(&self.write_lock)),
