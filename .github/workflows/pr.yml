@@ -1,12 +1,38 @@
-# ============================================================================
-# DISABLED: This workflow comes from upstream (spiceai/spiceai).
-# The enterprise version is ent_pr.yml
-# This file is kept only to prevent merge conflicts with upstream.
-# ============================================================================
 ---
-name: 'pr (upstream - disabled)'
+name: pr
 
-on: [workflow_dispatch]
+on:
+  pull_request:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+  merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
+  workflow_dispatch:
+    inputs:
+      profile_option:
+        description: 'Which Rust build profile to use? (Default is lint)'
+        required: false
+        type: choice
+        options:
+          - 'lint'
+          - 'release'
+          - 'release-lto'
+        default: 'lint'
+      update_snapshots:
+        description: 'Update the snapshots?'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'always'
+          - 'no'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -52,19 +78,9 @@ jobs:
 
   # Run Rust linting
   lint-rust:
-    name: ${{ matrix.variant.name }}
-    runs-on: spiceai-macos
+    name: Rust Lint
+    runs-on: spicehq-dev-runners
     needs: check_changes
-    strategy:
-      fail-fast: false
-      matrix:
-        variant:
-          - name: Rust Lint
-            command: lint-rust
-          - name: Rust Lint (Models)
-            command: lint-rust-models
-          - name: Rust Lint (NAS)
-            command: lint-rust-nas
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -108,9 +124,9 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: ./.github/actions/setup-cc
 
-      - name: Run ${{ matrix.variant.name }}
+      - name: Run Rust lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        run: make ${{ matrix.variant.command }}
+        run: make lint-rust
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
@@ -127,13 +143,11 @@ jobs:
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
 
-  # Build and test runs concurrently with linting
+  # Build and test
   build-test:
     name: Build and Test
     runs-on: spicehq-dev-runners
     needs: [check_changes]
-    env:
-      GOVER: 1.25.5
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -152,13 +166,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-
-      - name: Set up Go
-        if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
-        with:
-          go-version: ${{ env.GOVER }}
-          cache: false
 
       - name: Set up Rust
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -223,6 +230,10 @@ jobs:
 
       - name: Build testoperator
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: cargo build -p testoperator --all-features --locked
 
       - name: Show sccache stats

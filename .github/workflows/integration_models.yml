@@ -33,6 +33,11 @@ on:
       - 'bin/spice/**'
 
   merge_group:
+    branches:
+      - trunk
+      - release-*
+      - release/*
+      - feature-*
 
   schedule:
     - cron: '0 0 * * *' # Daily at midnight UTC
@@ -71,6 +76,7 @@ jobs:
   build:
     name: Build Test Binary (macOS)
     runs-on: spiceai-macos
+
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -79,10 +85,21 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set up spiceio
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -114,6 +131,18 @@ jobs:
           name: ai-integration-test-archive
           path: ./integration.tar.zst
           retention-days: 1
+
+      - name: Kill spiceio
+        if: always() && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: spiceio-models-build-logs
+          path: ${{ runner.temp }}/spiceio.log
+          if-no-files-found: ignore
 
   test-models:
     name: Test Models, AI & Search
@@ -357,6 +386,7 @@ jobs:
   build-extended:
     name: Build Test Binary (Extended)
     runs-on: spiceai-macos
+
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -365,10 +395,21 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Set up spiceio
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Set up Nextest
         uses: ./.github/actions/setup-nextest
@@ -397,3 +438,15 @@ jobs:
           name: ai-integration-test-archive-extended
           path: ./integration-extended.tar.zst
           retention-days: 1
+
+      - name: Kill spiceio
+        if: always() && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: spiceio-models-build-extended-logs
+          path: ${{ runner.temp }}/spiceio.log
+          if-no-files-found: ignore

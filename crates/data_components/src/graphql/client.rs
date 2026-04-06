@@ -21,7 +21,7 @@ use tokio::sync::Semaphore;
 
 use super::{
     ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, ReqwestInternalSnafu, Result,
-    is_retriable_error,
+    is_gateway_error, is_retriable_error,
 };
 use arrow::{
     array::RecordBatch,
@@ -37,6 +37,7 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use snafu::ResultExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
@@ -416,7 +417,12 @@ impl PaginationParameters {
                 }
                 graphql_parser::query::Selection::Field(field) => {
                     let field_name = field.name.as_ref();
-                    let new_path = format!("{current_path}/{field_name}");
+                    // Use alias when present — the JSON response uses aliases as keys.
+                    let response_key = field
+                        .alias
+                        .as_ref()
+                        .map_or_else(|| field_name, |a| a.as_ref());
+                    let new_path = format!("{current_path}/{response_key}");
 
                     // End of recursion, `pageInfo` field found
                     if field_name == "pageInfo" {
@@ -444,8 +450,13 @@ impl PaginationParameters {
                             );
                         }
 
-                        let json_pointer =
-                            data_field.map(|f| format!("/data{current_path}/{}", f.name.as_ref()));
+                        let json_pointer = data_field.map(|f| {
+                            let key = f
+                                .alias
+                                .as_ref()
+                                .map_or_else(|| f.name.as_ref(), |a| a.as_ref());
+                            format!("/data{current_path}/{key}")
+                        });
 
                         let pagination_argument =
                             match TryInto::<PaginationArgument>::try_into(parent_field) {
@@ -845,7 +856,11 @@ impl GraphQLClient {
         })
     }
 
-    #[expect(clippy::too_many_lines)]
+    #[must_use]
+    pub(crate) fn configured_schema(&self) -> Option<SchemaRef> {
+        self.schema.as_ref().map(Arc::clone)
+    }
+
     pub(crate) async fn execute(
         &self,
         query: &GraphQLQuery,
@@ -854,6 +869,30 @@ impl GraphQLClient {
         cursor: Option<String>,
         error_checker: Option<ErrorChecker>,
         query_cost: Option<u32>,
+    ) -> Result<GraphQLQueryResult> {
+        self.execute_inner(
+            query,
+            schema,
+            limit,
+            cursor,
+            error_checker,
+            query_cost,
+            false,
+        )
+        .await
+    }
+
+    #[expect(clippy::too_many_lines)]
+    #[expect(clippy::too_many_arguments)]
+    async fn execute_inner(
+        &self,
+        query: &GraphQLQuery,
+        schema: Option<SchemaRef>,
+        limit: Option<usize>,
+        cursor: Option<String>,
+        error_checker: Option<ErrorChecker>,
+        query_cost: Option<u32>,
+        close_connection: bool,
     ) -> Result<GraphQLQueryResult> {
         // Validate cursor if present
         if let Some(ref cursor_val) = cursor {
@@ -908,7 +947,21 @@ impl GraphQLClient {
 
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 
-        let mut request = self.client.post(self.endpoint.clone()).body(body);
+        // When close_connection is true (after a gateway error like 502), build a
+        // fresh reqwest::Client so the retry goes out on a new TCP connection instead
+        // of reusing the (possibly broken) pooled connection. Preserve user-agent and
+        // timeouts to match the original client — GitHub requires a User-Agent header.
+        let http_client = if close_connection {
+            reqwest::Client::builder()
+                .user_agent(util::spiceai_user_agent())
+                .pool_max_idle_per_host(0)
+                .build()
+                .context(ReqwestInternalSnafu)?
+        } else {
+            self.client.clone()
+        };
+
+        let mut request = http_client.post(self.endpoint.clone()).body(body);
         request = request_with_auth(request, self.auth.as_ref());
 
         // Replace separated semaphore with RateController semaphore: https://github.com/spiceai/spiceai/issues/8636
@@ -957,9 +1010,20 @@ impl GraphQLClient {
                     e,
                     preview
                 );
+
+                // For server errors returning HTML (e.g., upstream gateway/proxy errors),
+                // provide a clear message instead of exposing the JSON parse error.
+                let detail = if status.is_server_error() {
+                    "The server returned a non-JSON response (likely an upstream proxy error). This is a temporary issue and will be retried automatically. If the problem persists, contact support or check the API status page.".to_string()
+                } else {
+                    format!(
+                        "The response could not be parsed as JSON. Technical details: {e}"
+                    )
+                };
+
                 Error::JsonDecodeError {
                     status,
-                    error: e.to_string(),
+                    detail,
                     response_preview: preview,
                 }
             })?;
@@ -1250,17 +1314,32 @@ impl GraphQLClient {
             .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
             .build();
 
+        let close_connection = Arc::new(AtomicBool::new(false));
+
         retry(backoff, || {
             let schema = schema.clone();
             let cursor = cursor.clone();
             let error_checker = error_checker.clone();
+            let should_close = close_connection.swap(false, Ordering::Relaxed);
+            let close_conn = Arc::clone(&close_connection);
 
             async move {
                 client
-                    .execute(query, schema, limit, cursor, error_checker, query_cost)
+                    .execute_inner(
+                        query,
+                        schema,
+                        limit,
+                        cursor,
+                        error_checker,
+                        query_cost,
+                        should_close,
+                    )
                     .await
                     .map_err(|e| {
                         if is_retriable_error(&e) {
+                            if is_gateway_error(&e) {
+                                close_conn.store(true, Ordering::Relaxed);
+                            }
                             tracing::warn!("Page fetch failed, will retry: {e}");
                             RetryError::transient(e)
                         } else {
@@ -1324,6 +1403,16 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
         .flatten()
         .unwrap_or("No message provided")
         .to_string();
+
+        let message_lower = message.to_ascii_lowercase();
+
+        if status == StatusCode::TOO_MANY_REQUESTS || message_lower.contains("rate limit") {
+            return Err(Error::RateLimited {
+                message: format!(
+                    "The API rate limited the request (HTTP {status}). Retry later or reduce request concurrency. Details: {message}"
+                ),
+            });
+        }
 
         return match status {
             StatusCode::UNAUTHORIZED => Err(Error::InvalidCredentialsOrPermissions {
@@ -1448,7 +1537,7 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
             if error_type.to_lowercase() == "not_found" {
                 return Err(Error::ResourceNotFound {
                     message: format!(
-                        "The API returned a 'NOT_FOUND' error. Verify the requsted resource exists and is accessible. {message}"
+                        "The API returned a 'NOT_FOUND' error. Verify the requested resource exists and is accessible. {message}"
                     ),
                 });
             }
@@ -1479,6 +1568,9 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
 }
 
 fn format_query_with_context(query: &str, line: usize, column: usize) -> String {
+    if line == 0 || column == 0 {
+        return query.to_string();
+    }
     let query_lines: Vec<&str> = query.split('\n').collect();
     let error_line = query_lines.get(line - 1).unwrap_or(&"");
     let marker = " ".repeat(column - 1) + "^";
@@ -1647,6 +1739,42 @@ mod tests {
                         ],
                     }),
                     Some("/data/paginatedUsers/users".into()),
+                ),
+            },
+            TestPaginationParseCase {
+                name: "Aliased field with pageInfo uses alias in path",
+                query: r#"
+                    query {
+                        repository(owner: "org", name: "repo") {
+                            selected_ref: defaultBranchRef {
+                                target {
+                                    ... on Commit {
+                                        history(first: 100) {
+                                            pageInfo {
+                                                hasNextPage
+                                                endCursor
+                                            }
+                                            nodes {
+                                                oid
+                                                message
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                "#,
+                expected: (
+                    Some(PaginationParameters {
+                        resource_name: "history".to_owned(),
+                        pagination_argument: super::PaginationArgument::First(100),
+                        page_info_path: Some(
+                            "/repository/selected_ref/target/history/pageInfo".to_owned(),
+                        ),
+                        other_arguments: vec![],
+                    }),
+                    Some("/data/repository/selected_ref/target/history/nodes".into()),
                 ),
             },
         ];
@@ -1872,6 +2000,19 @@ mod tests {
             Err(e) => {
                 assert!(e.to_string().contains(message));
             }
+        }
+
+        let rate_limited_response =
+            serde_json::from_str(r#"{"message": "API rate limit exceeded for user"}"#)
+                .expect("Failed to construct json");
+        let rate_limited_result = handle_http_error(StatusCode::FORBIDDEN, &rate_limited_response);
+        match rate_limited_result {
+            Ok(()) => panic!("Expected rate-limited error"),
+            Err(super::Error::RateLimited { message }) => {
+                assert!(message.contains("rate limited"));
+                assert!(message.contains("HTTP 403"));
+            }
+            Err(other) => panic!("Expected rate-limited error, got {other}"),
         }
     }
 
@@ -2287,5 +2428,32 @@ mod tests {
             request.headers().get("authorization").is_none(),
             "Expected no authorization header"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // format_query_with_context regression tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_query_with_context_zero_line_does_not_panic() {
+        let query = "{ users { name } }";
+        // line=0 or column=0 should not panic, just return the raw query
+        let result = super::format_query_with_context(query, 0, 1);
+        assert_eq!(result, query);
+    }
+
+    #[test]
+    fn format_query_with_context_zero_column_does_not_panic() {
+        let query = "{ users { name } }";
+        let result = super::format_query_with_context(query, 1, 0);
+        assert_eq!(result, query);
+    }
+
+    #[test]
+    fn format_query_with_context_valid_position() {
+        let query = "{\n  users {\n    name\n  }\n}";
+        let result = super::format_query_with_context(query, 2, 3);
+        assert!(result.contains("  users {"), "should show the error line");
+        assert!(result.contains('^'), "should show the caret marker");
     }
 }
