@@ -34,7 +34,6 @@ object_store = { workspace = true }
 parking_lot = { workspace = true }
 roaring = { workspace = true }
 runtime-datafusion = { path = "../runtime-datafusion" }
-runtime-table-partition = { path = "../runtime-table-partition", optional = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 tokio-rusqlite = { workspace = true }
@@ -61,7 +60,6 @@ aegis = { version = "0.9.3", default-features = false, features = [
 [features]
 default = []
 turso = ["dep:turso"]
-partition-table-provider = ["dep:runtime-table-partition"]
 
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
