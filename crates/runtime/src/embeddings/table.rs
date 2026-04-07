@@ -858,7 +858,7 @@ mod tests {
             field("r_comment", DataType::Utf8),
         ]));
         let base_table: Arc<dyn TableProvider> = Arc::new(
-            datafusion::catalog::MemTable::try_new(schema, vec![]).expect("create MemTable"),
+            datafusion::catalog::MemTable::try_new(schema, vec![vec![]]).expect("create MemTable"),
         );
         let embedding_models = Arc::new(RwLock::new(HashMap::new()));
 
@@ -875,7 +875,7 @@ mod tests {
                 .await;
 
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.expect_err("expected row_id validation error");
         let err_msg = err.to_string();
         assert!(
             err_msg.contains("n_regionkey"),
@@ -894,7 +894,7 @@ mod tests {
             field("r_name", DataType::Utf8),
         ]));
         let base_table: Arc<dyn TableProvider> = Arc::new(
-            datafusion::catalog::MemTable::try_new(schema, vec![]).expect("create MemTable"),
+            datafusion::catalog::MemTable::try_new(schema, vec![vec![]]).expect("create MemTable"),
         );
         let embedding_models = Arc::new(RwLock::new(HashMap::new()));
 
@@ -912,7 +912,7 @@ mod tests {
                 .await;
 
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.expect_err("expected model-not-found error");
         // Should fail on model not found, not row_id validation
         assert!(
             matches!(err, Error::EmbeddingModelNotFound { .. }),
@@ -927,7 +927,7 @@ mod tests {
             field("r_name", DataType::Utf8),
         ]));
         let base_table: Arc<dyn TableProvider> = Arc::new(
-            datafusion::catalog::MemTable::try_new(schema, vec![]).expect("create MemTable"),
+            datafusion::catalog::MemTable::try_new(schema, vec![vec![]]).expect("create MemTable"),
         );
         let embedding_models = Arc::new(RwLock::new(HashMap::new()));
 
@@ -945,7 +945,7 @@ mod tests {
                 .await;
 
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.expect_err("expected model-not-found error");
         assert!(
             matches!(err, Error::EmbeddingModelNotFound { .. }),
             "Expected EmbeddingModelNotFound error, got: {err}"
@@ -959,7 +959,7 @@ mod tests {
             field("r_name", DataType::Utf8),
         ]));
         let base_table: Arc<dyn TableProvider> = Arc::new(
-            datafusion::catalog::MemTable::try_new(schema, vec![]).expect("create MemTable"),
+            datafusion::catalog::MemTable::try_new(schema, vec![vec![]]).expect("create MemTable"),
         );
         let embedding_models = Arc::new(RwLock::new(HashMap::new()));
 
@@ -976,7 +976,7 @@ mod tests {
                 .await;
 
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.expect_err("expected row_id validation error");
         let err_msg = err.to_string();
         assert!(
             err_msg.contains("nonexistent"),
