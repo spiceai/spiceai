@@ -29,7 +29,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{FlightSqlService, record_batches_to_flight_stream, to_tonic_err};
 
-pub(crate) async fn get_flight_info(
+pub(crate) fn get_flight_info(
     _query: &sql::CommandGetTables,
     request: Request<FlightDescriptor>,
 ) -> Response<FlightInfo> {

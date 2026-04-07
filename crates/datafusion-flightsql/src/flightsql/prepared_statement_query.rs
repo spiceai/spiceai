@@ -54,7 +54,7 @@ use crate::{FlightSqlService, to_tonic_err};
 // ── Arrow type → SQL cast name ────────────────────────────────────────────────
 
 /// NOTE: String types (`Utf8`, `LargeUtf8`) are intentionally NOT included.
-/// Adding CAST for strings prevents DataFusion's filter pushdown optimisation
+/// Adding CAST for strings prevents `DataFusion`'s filter pushdown optimisation
 /// from merging filters into `TableScan` as `full_filters`.
 fn arrow_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Option<&'static str> {
     use arrow::datatypes::DataType;
@@ -88,27 +88,25 @@ impl VisitorMut for ParameterCastRewriter<'_> {
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         if let Expr::Value(value_with_span) = expr
             && let Value::Placeholder(ref placeholder) = value_with_span.value
+            && let Some(stripped) = placeholder.strip_prefix('$')
+            && let Ok(idx) = stripped.parse::<usize>()
+            && let Some(sql_type) = self.param_types.get(&idx)
         {
-            if let Some(stripped) = placeholder.strip_prefix('$')
-                && let Ok(idx) = stripped.parse::<usize>()
-                && let Some(sql_type) = self.param_types.get(&idx)
-            {
-                let original_placeholder = placeholder.clone();
-                let cast_expr = Expr::Cast {
-                    expr: Box::new(Expr::Value(Value::Placeholder(original_placeholder).into())),
-                    data_type: datafusion::sql::sqlparser::ast::DataType::Custom(
-                        datafusion::sql::sqlparser::ast::ObjectName(vec![
-                            datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(
-                                datafusion::sql::sqlparser::ast::Ident::new(*sql_type),
-                            ),
-                        ]),
-                        vec![],
-                    ),
-                    format: None,
-                    kind: datafusion::sql::sqlparser::ast::CastKind::Cast,
-                };
-                *expr = cast_expr;
-            }
+            let original_placeholder = placeholder.clone();
+            let cast_expr = Expr::Cast {
+                expr: Box::new(Expr::Value(Value::Placeholder(original_placeholder).into())),
+                data_type: datafusion::sql::sqlparser::ast::DataType::Custom(
+                    datafusion::sql::sqlparser::ast::ObjectName(vec![
+                        datafusion::sql::sqlparser::ast::ObjectNamePart::Identifier(
+                            datafusion::sql::sqlparser::ast::Ident::new(*sql_type),
+                        ),
+                    ]),
+                    vec![],
+                ),
+                format: None,
+                kind: datafusion::sql::sqlparser::ast::CastKind::Cast,
+            };
+            *expr = cast_expr;
         }
         ControlFlow::Continue(())
     }
@@ -241,7 +239,7 @@ pub(crate) async fn do_action_create_prepared_statement(
     let dataset_schema_bytes = FlightSqlService::serialize_schema(&dataset_schema)?;
     let parameter_schema_bytes = parameter_schema
         .as_ref()
-        .map(|s| FlightSqlService::serialize_schema(s))
+        .map(FlightSqlService::serialize_schema)
         .transpose()?
         .unwrap_or_default();
 

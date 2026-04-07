@@ -23,11 +23,11 @@ use arrow::{
 use arrow_flight::{
     FlightDescriptor, FlightEndpoint, FlightInfo, Ticket, flight_service_server::FlightService, sql,
 };
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response};
 
 use crate::{FlightSqlService, record_batches_to_flight_stream};
 
-pub(crate) async fn get_flight_info(
+pub(crate) fn get_flight_info(
     _query: &sql::CommandGetPrimaryKeys,
     request: Request<FlightDescriptor>,
 ) -> Response<FlightInfo> {
@@ -42,10 +42,10 @@ pub(crate) async fn get_flight_info(
     })
 }
 
-/// Returns an empty primary keys result (DataFusion has no primary key concept).
-pub(crate) async fn do_get(
+/// Returns an empty primary keys result (`DataFusion` has no primary key concept).
+pub(crate) fn do_get(
     _query: &sql::CommandGetPrimaryKeys,
-) -> Result<Response<<FlightSqlService as FlightService>::DoGetStream>, Status> {
+) -> Response<<FlightSqlService as FlightService>::DoGetStream> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("catalog_name", DataType::Utf8, true),
         Field::new("db_schema_name", DataType::Utf8, true),
@@ -55,7 +55,5 @@ pub(crate) async fn do_get(
         Field::new("key_sequence", DataType::Int32, false),
     ]));
     let batch = RecordBatch::new_empty(schema);
-    Ok(Response::new(Box::pin(record_batches_to_flight_stream(
-        vec![batch],
-    ))))
+    Response::new(Box::pin(record_batches_to_flight_stream(vec![batch])))
 }

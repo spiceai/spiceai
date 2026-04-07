@@ -42,7 +42,7 @@ pub(crate) fn get_flight_info(
         .with_descriptor(fd)
 }
 
-pub(crate) async fn do_get(
+pub(crate) fn do_get(
     query: sql::CommandGetXdbcTypeInfo,
 ) -> Result<Response<<FlightSqlService as FlightService>::DoGetStream>, Status> {
     let builder = query.into_builder(get_xdbc_type_info_data());

@@ -42,25 +42,21 @@ pub(crate) async fn handle(
             flightsql::prepared_statement_query::get_flight_info(ctx, handle, request).await
         }
         Command::CommandPreparedStatementUpdate(handle) => {
-            flightsql::prepared_statement_update::get_flight_info(handle, request).await
+            flightsql::prepared_statement_update::get_flight_info(&handle, request)
         }
         Command::CommandGetCatalogs(cmd) => {
-            Ok(flightsql::get_catalogs::get_flight_info(cmd, request).await)
+            Ok(flightsql::get_catalogs::get_flight_info(cmd, request))
         }
         Command::CommandGetDbSchemas(cmd) => {
-            Ok(flightsql::get_schemas::get_flight_info(&cmd, request).await)
+            Ok(flightsql::get_schemas::get_flight_info(&cmd, request))
         }
-        Command::CommandGetTables(cmd) => {
-            Ok(flightsql::get_tables::get_flight_info(&cmd, request).await)
-        }
-        Command::CommandGetSqlInfo(cmd) => {
-            flightsql::get_sql_info::get_flight_info(&cmd, request).await
-        }
+        Command::CommandGetTables(cmd) => Ok(flightsql::get_tables::get_flight_info(&cmd, request)),
+        Command::CommandGetSqlInfo(cmd) => flightsql::get_sql_info::get_flight_info(&cmd, request),
         Command::CommandGetTableTypes(cmd) => {
-            Ok(flightsql::get_table_types::get_flight_info(cmd, request).await)
+            Ok(flightsql::get_table_types::get_flight_info(cmd, request))
         }
         Command::CommandGetPrimaryKeys(cmd) => {
-            Ok(flightsql::get_primary_keys::get_flight_info(&cmd, request).await)
+            Ok(flightsql::get_primary_keys::get_flight_info(&cmd, request))
         }
         Command::CommandGetXdbcTypeInfo(cmd) => Ok(Response::new(
             flightsql::get_xdbc_type_info::get_flight_info(cmd, request),

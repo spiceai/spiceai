@@ -44,15 +44,13 @@ pub(crate) async fn handle(
         Command::CommandPreparedStatementUpdate(cmd) => {
             Box::pin(flightsql::prepared_statement_update::do_get(ctx, cmd)).await
         }
-        Command::CommandGetCatalogs(cmd) => flightsql::get_catalogs::do_get(ctx, cmd).await,
-        Command::CommandGetDbSchemas(cmd) => flightsql::get_schemas::do_get(ctx, cmd).await,
+        Command::CommandGetCatalogs(cmd) => flightsql::get_catalogs::do_get(&ctx, cmd),
+        Command::CommandGetDbSchemas(cmd) => flightsql::get_schemas::do_get(&ctx, cmd),
         Command::CommandGetTables(cmd) => flightsql::get_tables::do_get(ctx, cmd).await,
-        Command::CommandGetPrimaryKeys(cmd) => flightsql::get_primary_keys::do_get(&cmd).await,
-        Command::CommandGetTableTypes(cmd) => flightsql::get_table_types::do_get(cmd).await,
-        Command::CommandGetSqlInfo(cmd) => flightsql::get_sql_info::do_get(cmd).await,
-        Command::CommandGetXdbcTypeInfo(cmd) => {
-            Box::pin(flightsql::get_xdbc_type_info::do_get(cmd)).await
-        }
+        Command::CommandGetPrimaryKeys(cmd) => Ok(flightsql::get_primary_keys::do_get(&cmd)),
+        Command::CommandGetTableTypes(cmd) => flightsql::get_table_types::do_get(cmd),
+        Command::CommandGetSqlInfo(cmd) => flightsql::get_sql_info::do_get(cmd),
+        Command::CommandGetXdbcTypeInfo(cmd) => flightsql::get_xdbc_type_info::do_get(cmd),
         Command::CommandStatementUpdate(_) => Err(Status::invalid_argument(
             "CommandStatementUpdate should be sent via DoPut, not DoGet",
         )),

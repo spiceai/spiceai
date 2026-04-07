@@ -44,7 +44,7 @@ pub(crate) async fn handle(
     };
 
     let Ok(message) = Any::decode(&*fd.cmd) else {
-        return do_put_raw(streaming_flight).await;
+        return do_put_raw(streaming_flight);
     };
 
     match Command::try_from(message).map_err(|e| Status::internal(format!("{e:?}")))? {
@@ -58,11 +58,11 @@ pub(crate) async fn handle(
         Command::CommandStatementIngest(_) => Err(Status::unimplemented(
             "CommandStatementIngest is not supported; use a SQL INSERT statement instead",
         )),
-        _ => do_put_raw(streaming_flight).await,
+        _ => do_put_raw(streaming_flight),
     }
 }
 
-async fn do_put_raw(
+fn do_put_raw(
     _streaming: Peekable<Streaming<FlightData>>,
 ) -> Result<Response<<FlightSqlService as FlightService>::DoPutStream>, Status> {
     Err(Status::unimplemented(

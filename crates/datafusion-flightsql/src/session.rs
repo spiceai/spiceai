@@ -150,6 +150,7 @@ impl SessionStore {
     /// Look up or create a session from HTTP headers.
     ///
     /// Returns `None` when no authorization/session header is present.
+    #[must_use]
     pub fn get_or_create_session_from_http(
         &self,
         headers: &HeaderMap,
@@ -190,39 +191,35 @@ impl Default for SessionStore {
 }
 
 fn extract_session_id(metadata: &MetadataMap) -> Option<String> {
-    if let Some(v) = metadata.get("x-session-id") {
-        if let Ok(s) = v.to_str() {
-            return Some(s.to_string());
-        }
+    if let Some(v) = metadata.get("x-session-id")
+        && let Ok(s) = v.to_str()
+    {
+        return Some(s.to_string());
     }
-    if let Some(v) = metadata.get("authorization") {
-        if let Ok(s) = v.to_str() {
-            if let Some(t) = s
-                .strip_prefix("Bearer ")
-                .or_else(|| s.strip_prefix("bearer "))
-            {
-                return Some(t.to_string());
-            }
-        }
+    if let Some(v) = metadata.get("authorization")
+        && let Ok(s) = v.to_str()
+        && let Some(t) = s
+            .strip_prefix("Bearer ")
+            .or_else(|| s.strip_prefix("bearer "))
+    {
+        return Some(t.to_string());
     }
     None
 }
 
 fn extract_session_id_from_headers(headers: &HeaderMap) -> Option<String> {
-    if let Some(v) = headers.get("x-session-id") {
-        if let Ok(s) = v.to_str() {
-            return Some(s.to_string());
-        }
+    if let Some(v) = headers.get("x-session-id")
+        && let Ok(s) = v.to_str()
+    {
+        return Some(s.to_string());
     }
-    if let Some(v) = headers.get("authorization") {
-        if let Ok(s) = v.to_str() {
-            if let Some(t) = s
-                .strip_prefix("Bearer ")
-                .or_else(|| s.strip_prefix("bearer "))
-            {
-                return Some(t.to_string());
-            }
-        }
+    if let Some(v) = headers.get("authorization")
+        && let Ok(s) = v.to_str()
+        && let Some(t) = s
+            .strip_prefix("Bearer ")
+            .or_else(|| s.strip_prefix("bearer "))
+    {
+        return Some(t.to_string());
     }
     None
 }

@@ -64,8 +64,7 @@ pub(crate) async fn do_action(
             ))
         }
         cmd => Err(Status::invalid_argument(format!(
-            "unsupported action command: {:?}",
-            cmd
+            "unsupported action command: {cmd:?}"
         ))),
     }
 }

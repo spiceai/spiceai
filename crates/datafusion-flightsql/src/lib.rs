@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Arrow Flight SQL service backed by a DataFusion [`SessionContext`].
+//! Arrow Flight SQL service backed by a `DataFusion` [`SessionContext`].
 //!
 //! # Overview
 //!
@@ -78,7 +78,7 @@ pub(crate) mod util;
 pub use session::SessionStore;
 pub(crate) use util::{handle_datafusion_error, record_batches_to_flight_stream, to_tonic_err};
 
-/// A FlightSQL service backed by an arbitrary DataFusion [`SessionContext`].
+/// A `FlightSQL` service backed by an arbitrary `DataFusion` [`SessionContext`].
 ///
 /// Create with [`FlightSqlService::new`] and wrap in
 /// [`FlightServiceServer`] to serve over gRPC.
@@ -143,7 +143,7 @@ impl FlightService for FlightSqlService {
         &self,
         request: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        handshake::handle(request.metadata(), &self.ctx, &self.session_store).await
+        handshake::handle(request.metadata(), &self.ctx, &self.session_store)
     }
 
     async fn list_flights(
@@ -256,7 +256,7 @@ impl FlightSqlService {
             df
         };
 
-        let schema = df.schema().inner().clone();
+        let schema = std::sync::Arc::clone(df.schema().inner());
         let data_stream = df.execute_stream().await.map_err(handle_datafusion_error)?;
 
         // Pre-compute schema flight data once, matching the runtime's approach.

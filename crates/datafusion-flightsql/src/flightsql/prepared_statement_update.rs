@@ -46,8 +46,8 @@ static AFFECTED_ROWS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     )]))
 });
 
-pub(crate) async fn get_flight_info(
-    handle: sql::CommandPreparedStatementUpdate,
+pub(crate) fn get_flight_info(
+    handle: &sql::CommandPreparedStatementUpdate,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
     let fd = request.into_inner();

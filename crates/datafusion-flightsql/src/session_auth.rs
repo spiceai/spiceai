@@ -27,8 +27,11 @@ use crate::SessionStore;
 pub trait FlightAuth: Send + Sync {
     /// Validate a `(username, password)` pair during the handshake.
     ///
-    /// Return the token/principal that should be stored with the session,
-    /// or an error string.
+    /// Return the token/principal that should be stored with the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the credentials are invalid.
     fn validate(&self, username: &str, password: &str) -> Result<String, String>;
 
     /// Validate a Bearer token on every non-handshake request.

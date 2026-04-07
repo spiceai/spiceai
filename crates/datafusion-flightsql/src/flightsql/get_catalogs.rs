@@ -27,7 +27,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{FlightSqlService, record_batches_to_flight_stream, to_tonic_err};
 
-pub(crate) async fn get_flight_info(
+pub(crate) fn get_flight_info(
     query: sql::CommandGetCatalogs,
     request: Request<FlightDescriptor>,
 ) -> Response<FlightInfo> {
@@ -42,8 +42,8 @@ pub(crate) async fn get_flight_info(
     )
 }
 
-pub(crate) async fn do_get(
-    ctx: Arc<SessionContext>,
+pub(crate) fn do_get(
+    ctx: &Arc<SessionContext>,
     query: sql::CommandGetCatalogs,
 ) -> Result<Response<<FlightSqlService as FlightService>::DoGetStream>, Status> {
     tracing::trace!("do_get get_catalogs: {query:?}");

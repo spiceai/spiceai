@@ -30,7 +30,7 @@ use crate::{FlightSqlService, record_batches_to_flight_stream, to_tonic_err};
 
 use super::get_tables::table_type_name;
 
-pub(crate) async fn get_flight_info(
+pub(crate) fn get_flight_info(
     _query: sql::CommandGetTableTypes,
     request: Request<FlightDescriptor>,
 ) -> Response<FlightInfo> {
@@ -45,7 +45,7 @@ pub(crate) async fn get_flight_info(
     })
 }
 
-pub(crate) async fn do_get(
+pub(crate) fn do_get(
     _query: sql::CommandGetTableTypes,
 ) -> Result<Response<<FlightSqlService as FlightService>::DoGetStream>, Status> {
     let schema = Schema::new(vec![Field::new("table_type", DataType::Utf8, false)]);

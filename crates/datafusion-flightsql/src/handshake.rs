@@ -36,7 +36,7 @@ type HandshakeStream = Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Statu
 /// Ignores any credentials present in the request metadata — authentication
 /// should be enforced upstream by a gRPC interceptor or Tower middleware
 /// before this is called.  A new session is always created from `base_ctx`.
-pub(crate) async fn handle(
+pub(crate) fn handle(
     _metadata: &tonic::metadata::MetadataMap,
     base_ctx: &Arc<SessionContext>,
     session_store: &SessionStore,

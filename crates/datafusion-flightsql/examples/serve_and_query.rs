@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Starts a Flight SQL server backed by an in-memory DataFusion
+//! Starts a Flight SQL server backed by an in-memory `DataFusion`
 //! [`SessionContext`] and blocks until Ctrl-C.
 //!
 //! ```text

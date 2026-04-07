@@ -36,7 +36,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{FlightSqlService, to_tonic_err};
 
-pub(crate) async fn get_flight_info(
+pub(crate) fn get_flight_info(
     query: &sql::CommandGetSqlInfo,
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
@@ -55,7 +55,7 @@ pub(crate) async fn get_flight_info(
     ))
 }
 
-pub(crate) async fn do_get(
+pub(crate) fn do_get(
     query: sql::CommandGetSqlInfo,
 ) -> Result<Response<<FlightSqlService as FlightService>::DoGetStream>, Status> {
     let builder = query.into_builder(get_sql_info_data());
