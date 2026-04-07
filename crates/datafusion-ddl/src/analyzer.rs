@@ -32,7 +32,6 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock, Weak};
 
-use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use datafusion::catalog::CatalogProviderList;
 use datafusion::common::DFSchemaRef;
@@ -48,7 +47,7 @@ use datafusion::sql::TableReference;
 
 use crate::handler::{CatalogDdlHandler, CreateSchemaParams, CreateTableParams, DropTableParams};
 use crate::{
-    SharedDdlExtensionStore, extract_primary_key_columns, is_ddl_enabled,
+    SharedDdlExtensionStore, ddl_output_schema, extract_primary_key_columns, is_ddl_enabled,
     parse_qualified_schema_name,
 };
 
@@ -77,17 +76,6 @@ impl DdlExtensionNode {
             output_schema: ddl_output_schema(),
         }
     }
-}
-
-fn ddl_output_schema() -> DFSchemaRef {
-    DFSchemaRef::new(
-        datafusion::common::DFSchema::try_from(Schema::new(vec![Field::new(
-            "result",
-            DataType::Utf8,
-            false,
-        )]))
-        .unwrap_or_else(|e| unreachable!("fixed DDL output schema must be valid: {e}")),
-    )
 }
 
 impl fmt::Debug for DdlExtensionNode {
