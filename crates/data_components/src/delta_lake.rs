@@ -321,7 +321,6 @@ impl DeltaTable {
             partition_cols.iter().map(|f| Arc::new(f.clone())).collect(),
         );
         tracing::trace!(
-            %self.table_url,
             table_parquet_options = ?self.table_parquet_options,
             "Creating Delta Lake ParquetSource"
         );
