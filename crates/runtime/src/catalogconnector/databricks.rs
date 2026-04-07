@@ -495,7 +495,7 @@ mod tests {
         }
     }
 
-    /// Regression test for https://github.com/spiceai/spiceai/issues/7904
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/7904>
     /// Storage locations ending with '/' must not get a second '/' appended.
     #[test]
     fn test_table_reference_creator_delta_lake_no_double_slash() {

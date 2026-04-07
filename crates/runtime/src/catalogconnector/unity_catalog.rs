@@ -285,10 +285,10 @@ mod tests {
         }
     }
 
-    /// Regression test for https://github.com/spiceai/spiceai/issues/7904
-    /// Unity Catalog API returns storage_location with a trailing slash.
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/7904>
+    /// Unity Catalog API returns `storage_location` with a trailing slash.
     /// Previously, `table_reference_creator` unconditionally appended another
-    /// slash, creating a double-slash path like "file:///path/to/table//"
+    /// slash, creating a double-slash path like `file:///path/to/table//`
     /// which caused Delta Lake to fail with "Path does not exist".
     #[test]
     fn test_table_reference_creator_no_double_slash_when_location_ends_with_slash() {
@@ -312,7 +312,7 @@ mod tests {
         }
     }
 
-    /// Edge case: storage_location pointing to a bucket root with no key/path.
+    /// Edge case: `storage_location` pointing to a bucket root with no key/path.
     #[test]
     fn test_table_reference_creator_bucket_root() {
         let table = make_uc_table(Some("s3://bucket"));
@@ -325,7 +325,7 @@ mod tests {
         }
     }
 
-    /// Edge case: storage_location with file:// scheme for local paths.
+    /// Edge case: `storage_location` with `file://` scheme for local paths.
     #[test]
     fn test_table_reference_creator_file_scheme() {
         let table = make_uc_table(Some("file:///tmp/marksheet_uniform/"));
