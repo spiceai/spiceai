@@ -408,7 +408,9 @@ fn test_cloud_secrets_crud_lifecycle() {
         .success();
     let list_output: serde_json::Value = serde_json::from_slice(&list_assert.get_output().stdout)
         .expect("list secrets should produce valid JSON");
-    let listed_entries = list_output.as_array().expect("listed entries should be an array");
+    let listed_entries = list_output
+        .as_array()
+        .expect("listed entries should be an array");
     assert!(
         listed_entries
             .iter()
@@ -522,10 +524,7 @@ fn test_cloud_multiple_secrets() {
         .as_array()
         .expect("listed items should be an array")
         .len();
-    assert!(
-        entries_count >= 3,
-        "should have at least 3 entries"
-    );
+    assert!(entries_count >= 3, "should have at least 3 entries");
 
     for i in 0..3 {
         let mut cmd = spice_cloud_cmd().expect("credentials required");
@@ -550,7 +549,9 @@ fn test_cloud_multiple_secrets() {
         .success();
     let after_output: serde_json::Value = serde_json::from_slice(&after_assert.get_output().stdout)
         .expect("list secrets should produce valid JSON");
-    let remaining_entries = after_output.as_array().expect("remaining entries should be an array");
+    let remaining_entries = after_output
+        .as_array()
+        .expect("remaining entries should be an array");
     assert!(
         !remaining_entries.iter().any(|s| s
             .get("name")
@@ -615,7 +616,7 @@ fn test_cloud_api_keys_get_and_regenerate() {
     let regen: serde_json::Value = serde_json::from_slice(&regen_assert.get_output().stdout)
         .expect("regenerate should produce valid JSON");
     assert_eq!(
-        regen.get("regenerated_key").and_then(|v| v.as_u64()),
+        regen.get("regenerated_key").and_then(serde_json::Value::as_u64),
         Some(1),
         "regenerated_key should be 1"
     );
@@ -728,10 +729,10 @@ fn test_cloud_create_deployment() {
     let deps = list_output
         .as_array()
         .expect("deployments should be an array");
-    let dep_id = deployment.get("id").and_then(|v| v.as_i64());
+    let dep_id = deployment.get("id").and_then(serde_json::Value::as_i64);
     assert!(
         deps.iter()
-            .any(|d| d.get("id").and_then(|v| v.as_i64()) == dep_id),
+            .any(|d| d.get("id").and_then(serde_json::Value::as_i64) == dep_id),
         "newly created deployment should appear in list"
     );
 
@@ -765,7 +766,7 @@ fn test_cloud_deployment_logs() {
         .expect("create deployment should produce valid JSON");
     let dep_id = deployment
         .get("id")
-        .and_then(|v| v.as_i64())
+        .and_then(serde_json::Value::as_i64)
         .expect("deployment should have an id");
 
     // Fetch logs (may be empty for a fresh deployment, but command must succeed)
@@ -837,7 +838,7 @@ fn test_cloud_rollback() {
     // Rollback to the second-to-last (older) deployment
     let target_id = deps
         .last()
-        .and_then(|d| d.get("id").and_then(|v| v.as_i64()))
+        .and_then(|d| d.get("id").and_then(serde_json::Value::as_i64))
         .expect("should get target deployment id");
 
     let mut cmd = spice_cloud_cmd().expect("credentials required");
