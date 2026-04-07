@@ -309,7 +309,25 @@ impl ClusterService for ClusterServiceImpl {
         let app_json = serde_json::to_string(app.as_ref())
             .map_err(|e| Status::internal(format!("Failed to serialize app: {e}")))?;
 
-        Ok(Response::new(GetAppDefinitionResponse { app_json }))
+        // Snapshot the DDL log so the joining executor can replay all DDL
+        // that was executed before it connected.  The snapshot is atomic under
+        // a read lock so no DDL committed before this call is missed.
+        let ddl_statements = self
+            .datafusion
+            .ddl_log()
+            .map(|log| log.snapshot())
+            .unwrap_or_default();
+
+        tracing::debug!(
+            executor_id = %request.executor_id,
+            ddl_count = ddl_statements.len(),
+            "Sending DDL log snapshot to joining executor"
+        );
+
+        Ok(Response::new(GetAppDefinitionResponse {
+            app_json,
+            ddl_statements,
+        }))
     }
 
     async fn expand_secret(

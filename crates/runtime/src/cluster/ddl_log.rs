@@ -1,5 +1,5 @@
 /*
-Copyright 2026, Spice AI, Inc.
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,9 +14,5 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Re-exports from `datafusion_ddl` for backwards compatibility.
-
-pub use datafusion_ddl::{
-    CreateTableStatementExtension, DatasetOptions, DdlExtensionStore, SharedDdlExtensionStore,
-    new_shared_store, parse_acceleration_options, parse_dataset_options, parse_ddl_table_options,
-};
+//! Re-export [`DdlLog`] from `datafusion_ddl` for use within the cluster module.
+pub use datafusion_ddl::DdlLog;

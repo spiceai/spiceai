@@ -399,6 +399,7 @@ fn update_scheduler_pollers(
 mod composite_flight_service;
 mod control_stream_client;
 pub mod datafusion;
+pub mod ddl_log;
 pub(crate) mod executor_registry;
 pub mod metrics_collector;
 pub mod partition;
@@ -407,6 +408,7 @@ mod servers;
 mod service;
 
 pub use control_stream_client::ControlStreamManager;
+pub use ddl_log::DdlLog;
 pub use executor_registry::{ExecutorRegistry, FederatedPartitionProvider};
 pub use partition::{PartitionManager, PartitionMetadata, TablePartitionMetadata};
 pub use scheduler_registry::start_scheduler_registry;
@@ -1009,7 +1011,9 @@ pub async fn initialize_cluster_executor(
             source: format!("Failed to get app definition from scheduler: {status}").into(),
         })?;
 
-    let app_json = response.into_inner().app_json;
+    let response_inner = response.into_inner();
+    let app_json = response_inner.app_json;
+    let ddl_statements = response_inner.ddl_statements;
 
     let app_def: App = serde_json::from_str(&app_json)
         .boxed()
@@ -1384,6 +1388,10 @@ pub async fn initialize_cluster_executor(
 
         // Bind the already-fetched app and initialize secrets for object store configuration
         executor_bind_app(&rt, executor_id, app_def, client_tls_config).await?;
+
+        // Replay DDL statements received from the scheduler.  Catalogs are
+        // loaded by executor_bind_app above, so Cayenne schemas are available.
+        executor_apply_ddl_statements(&rt, &ddl_statements).await;
 
         executor_bind_object_stores(Arc::clone(&rt)).await?;
 
@@ -1801,6 +1809,34 @@ async fn executor_bind_app(
     Arc::clone(rt).load_datasets().await;
 
     Ok(())
+}
+
+/// Replays DDL statements received from the scheduler on executor startup.
+///
+/// Called after [`executor_bind_app`] so that Cayenne catalogs are registered
+/// before DDL is applied.  Failures are logged as warnings rather than
+/// propagated — the Cayenne metadata catalog is the authoritative source of
+/// truth, and any missed statement will self-heal once the executor is
+/// registered and starts receiving new DDL forwards from the scheduler.
+async fn executor_apply_ddl_statements(rt: &Arc<Runtime>, statements: &[String]) {
+    if statements.is_empty() {
+        return;
+    }
+    tracing::info!(
+        count = statements.len(),
+        "Executor replaying DDL statements from scheduler"
+    );
+    for sql in statements {
+        tracing::debug!(sql, "Executor replaying DDL statement");
+        match rt.datafusion().query_builder(sql).build().run().await {
+            Ok(_) => tracing::debug!(sql, "Executor DDL replay succeeded"),
+            Err(e) => tracing::warn!(
+                sql,
+                error = %e,
+                "Executor DDL replay failed; catalog may be incomplete until next sync"
+            ),
+        }
+    }
 }
 
 /// Traverses dataset definitions and reifies `ListingTableUrl`s, triggering object store

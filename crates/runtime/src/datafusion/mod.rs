@@ -572,6 +572,10 @@ pub struct DataFusion {
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
     /// Executor registry for distributed write forwarding (scheduler mode only).
     pub executor_registry: Option<Arc<ExecutorRegistry>>,
+    /// Append-only log of DDL statements executed by this scheduler.
+    /// Sent to late-joining executors via `GetAppDefinition` so they can replay
+    /// the catalog history.  `None` on executors and standalone nodes.
+    pub ddl_log: Option<Arc<datafusion_ddl::DdlLog>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -2790,6 +2794,12 @@ impl DataFusion {
             .map_err(|_| Error::UnableToLockWritableExecutorStreamRegistry {})?;
         *executor_stream_registry = Some(registry);
         Ok(())
+    }
+
+    /// Returns the DDL log if one is set (scheduler mode only).
+    #[must_use]
+    pub fn ddl_log(&self) -> Option<Arc<datafusion_ddl::DdlLog>> {
+        self.ddl_log.clone()
     }
 
     /// Returns the executor stream registry if one is bound.

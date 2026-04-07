@@ -47,6 +47,12 @@ message GetAppDefinitionRequest {
 message GetAppDefinitionResponse {
     // JSON-serialized app definition.
     string app_json = 1;
+
+    // Ordered DDL SQL statements to replay on executor join.
+    // Contains the full log of DDL (CREATE TABLE, DROP TABLE, CREATE SCHEMA)
+    // executed by the scheduler since startup. Late-joining executors replay
+    // these to reach the same catalog state as existing nodes.
+    repeated string ddl_statements = 2;
 }
 
 // Request message for ExpandSecret RPC.
