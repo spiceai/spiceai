@@ -97,10 +97,7 @@ impl Default for EndpointAuth {
 }
 
 #[must_use]
-pub(crate) async fn api_key_auth(
-    secrets: &Secrets,
-    api_key_auth: &SpicepodApiKeyAuth,
-) -> Arc<ApiKeyAuth> {
+async fn api_key_auth(secrets: &Secrets, api_key_auth: &SpicepodApiKeyAuth) -> Arc<ApiKeyAuth> {
     let mut keys = Vec::with_capacity(api_key_auth.keys.len());
     for key in &api_key_auth.keys {
         let secret_key_box = secrets.inject_secrets("keys", ParamStr(key.as_ref())).await;

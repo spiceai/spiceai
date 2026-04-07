@@ -131,100 +131,100 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
     ) -> Result<LogicalPlan, DataFusionError> {
         let mut rewrite_occurred = false;
         plan.transform_up_with_subqueries(|plan| {
-            if let LogicalPlan::TableScan(scan) = &plan {
-                if !self.partition_provider.should_partition(scan) {
-                    return Ok(Transformed::no(plan));
+            let LogicalPlan::TableScan(scan) = &plan else {
+                // Push Sort(TopK) into each Union leg when Limit sits above Sort -> Union.
+                // DataFusion's optimizer pushes Limit through Union, but does not push
+                // Sort(TopK) through Union. Without this, each executor returns all rows
+                // and the scheduler sorts the full merged result.
+                //
+                // Only attempt this when at least one TableScan has been rewritten to a
+                // Union in this plan traversal. Note: this may fire for any matching
+                // Limit -> [Projection|SubqueryAlias]* -> Sort -> [Projection|SubqueryAlias]* -> Union
+                // subtree in the plan, not exclusively for unions produced by this rule.
+                //
+                // This is okay. This is just an optimisation. `push_sort_topk_into_union` will ensure it is an applicable `Limit`.
+                if rewrite_occurred && let LogicalPlan::Limit(limit) = plan {
+                    return push_sort_topk_into_union(limit);
                 }
-
-                let schema = scan.source.schema();
-                let providers = self
-                    .partition_provider
-                    .get_partitions(&scan.table_name, &schema);
-
-                tracing::debug!(
-                    "PartitionedTableScanRewrite: {} partitions for '{}' table.",
-                    providers.len(),
-                    scan.table_name
-                );
-
-                // Pre-compute DFSchema for partition expression parsing
-                let df_schema = schema.to_dfschema()?;
-
-                let mut sub_scans = Vec::with_capacity(providers.len());
-                for (provider, partition_values) in providers {
-                    let mut filters = scan.filters.clone();
-
-                    // Convert partition values (HashMap<String, String>) to filter Exprs and combine with OR.
-                    let partition_exprs: Vec<Expr> = partition_values
-                        .iter()
-                        .filter_map(|pv| {
-                            partition_value_to_expr(pv, &df_schema, &self.session_state).transpose()
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-
-                    if let Some(partition_filter) = partition_exprs.into_iter().reduce(Expr::or) {
-                        filters.push(partition_filter);
-                    }
-                    let plan = LogicalPlanBuilder::scan_with_filters(
-                        scan.table_name.clone(),
-                        Arc::new(DefaultTableSource::new(Arc::clone(&provider))),
-                        scan.projection.clone(),
-                        filters,
-                    )?
-                    .build()?;
-                    sub_scans.push(Arc::new(plan));
-                }
-
-                // If no partitions, return empty relation. This can happen if no partitions match the table (even if we want to partition it).
-                if sub_scans.is_empty() {
-                    return Ok(Transformed::yes(LogicalPlan::EmptyRelation(
-                        EmptyRelation {
-                            produce_one_row: false,
-                            schema: Arc::clone(plan.schema()),
-                        },
-                    )));
-                }
-
-                // Consume the vec so each Arc has a unique owner, allowing
-                // Arc::unwrap_or_clone to move out without a deep clone.
-                let mut sub_scans_iter = sub_scans.into_iter();
-                let first_scan = Arc::unwrap_or_clone(
-                    sub_scans_iter
-                        .next()
-                        .unwrap_or_else(|| unreachable!("sub_scans is non-empty; checked above")),
-                );
-                let sub_scans: Vec<_> = sub_scans_iter.collect();
-
-                // Single partition: no Union needed, just return the sub-scan directly.
-                if sub_scans.is_empty() {
-                    return Ok(Transformed::yes(first_scan));
-                }
-
-                let mut builder = LogicalPlanBuilder::from(first_scan);
-                for scan in sub_scans {
-                    builder = builder.union(Arc::unwrap_or_clone(scan))?;
-                }
-                let result = builder.alias(scan.table_name.clone())?.build()?;
-                rewrite_occurred = true;
-                return Ok(Transformed::yes(result));
+                return Ok(Transformed::no(plan));
+            };
+            if !self.partition_provider.should_partition(scan) {
+                return Ok(Transformed::no(plan));
             }
 
-            // Push Sort(TopK) into each Union leg when Limit sits above Sort -> Union.
-            // DataFusion's optimizer pushes Limit through Union, but does not push
-            // Sort(TopK) through Union. Without this, each executor returns all rows
-            // and the scheduler sorts the full merged result.
-            //
-            // Only attempt this when at least one TableScan has been rewritten to a
-            // Union in this plan traversal. Note: this may fire for any matching
-            // Limit -> [Projection|SubqueryAlias]* -> Sort -> [Projection|SubqueryAlias]* -> Union
-            // subtree in the plan, not exclusively for unions produced by this rule.
-            //
-            // This is okay. This is just an optimisation. `push_sort_topk_into_union` will ensure it is an applicable `Limit`.
-            if rewrite_occurred && let LogicalPlan::Limit(limit) = plan {
-                return push_sort_topk_into_union(limit);
+            let schema = scan.source.schema();
+            let providers = self
+                .partition_provider
+                .get_partitions(&scan.table_name, &schema);
+
+            tracing::debug!(
+                "PartitionedTableScanRewrite: {} partitions for '{}' table.",
+                providers.len(),
+                scan.table_name
+            );
+
+            // Pre-compute DFSchema for partition expression parsing
+            let df_schema = schema.to_dfschema()?;
+
+            let mut sub_scans = Vec::with_capacity(providers.len());
+            for (provider, partition_values) in providers {
+                let mut filters = scan.filters.clone();
+
+                // Convert partition values (HashMap<String, String>) to filter Exprs and combine with OR.
+                let partition_exprs: Vec<Expr> = partition_values
+                    .iter()
+                    .filter_map(|pv| {
+                        partition_value_to_expr(pv, &df_schema, &self.session_state).transpose()
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                if let Some(partition_filter) =
+                    util::expr::combine_exprs_balanced(partition_exprs, Expr::or)
+                {
+                    filters.push(partition_filter);
+                }
+                let plan = LogicalPlanBuilder::scan_with_filters(
+                    scan.table_name.clone(),
+                    Arc::new(DefaultTableSource::new(Arc::clone(&provider))),
+                    scan.projection.clone(),
+                    filters,
+                )?
+                .build()?;
+                sub_scans.push(Arc::new(plan));
             }
 
-            Ok(Transformed::no(plan))
+            // If no partitions, return empty relation. This can happen if no partitions match the table (even if we want to partition it).
+            if sub_scans.is_empty() {
+                return Ok(Transformed::yes(LogicalPlan::EmptyRelation(
+                    EmptyRelation {
+                        produce_one_row: false,
+                        schema: Arc::clone(plan.schema()),
+                    },
+                )));
+            }
+
+            // Consume the vec so each Arc has a unique owner, allowing
+            // Arc::unwrap_or_clone to move out without a deep clone.
+            let mut sub_scans_iter = sub_scans.into_iter();
+            let first_scan = Arc::unwrap_or_clone(
+                sub_scans_iter
+                    .next()
+                    .unwrap_or_else(|| unreachable!("sub_scans is non-empty; checked above")),
+            );
+            let sub_scans: Vec<_> = sub_scans_iter.collect();
+
+            // Single partition: no Union needed, just return the sub-scan directly.
+            if sub_scans.is_empty() {
+                return Ok(Transformed::yes(first_scan));
+            }
+
+            let mut builder = LogicalPlanBuilder::from(first_scan);
+            for scan in sub_scans {
+                builder = builder.union(Arc::unwrap_or_clone(scan))?;
+            }
+            let result = builder.alias(scan.table_name.clone())?.build()?;
+            rewrite_occurred = true;
+            Ok(Transformed::yes(result))
         })
         .data()
     }
