@@ -22,6 +22,7 @@ use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{DFSchema, exec_err};
+use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{
     DefaultParquetFileReaderFactory, ParquetAccessPlan, RowGroupAccess,
@@ -103,6 +104,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct DeltaTableFactory {
     params: HashMap<String, SecretString>,
     io_runtime: Handle,
+    table_parquet_options: TableParquetOptions,
 }
 
 impl std::fmt::Debug for DeltaTableFactory {
@@ -116,7 +118,17 @@ impl std::fmt::Debug for DeltaTableFactory {
 impl DeltaTableFactory {
     #[must_use]
     pub fn new(params: HashMap<String, SecretString>, io_runtime: Handle) -> Self {
-        Self { params, io_runtime }
+        Self {
+            params,
+            io_runtime,
+            table_parquet_options: TableParquetOptions::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_table_parquet_options(mut self, opts: TableParquetOptions) -> Self {
+        self.table_parquet_options = opts;
+        self
     }
 }
 
@@ -127,8 +139,9 @@ impl Read for DeltaTableFactory {
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let delta_path = table_reference.table().to_string();
-        let delta: DeltaTable =
-            DeltaTable::from(delta_path, self.params.clone(), &self.io_runtime).boxed()?;
+        let delta: DeltaTable = DeltaTable::from(delta_path, self.params.clone(), &self.io_runtime)
+            .boxed()?
+            .with_table_parquet_options(self.table_parquet_options.clone());
         Ok(Arc::new(delta))
     }
 }
@@ -146,6 +159,7 @@ pub struct DeltaTable {
     /// Pre-computed physical schema mapping for column mapping modes (`Name`/`Id`).
     /// `None` when the table uses no column mapping (physical names == logical names).
     physical_schema_mapping: Option<PhysicalSchemaMapping>,
+    table_parquet_options: TableParquetOptions,
 }
 
 impl DeltaTable {
@@ -245,7 +259,14 @@ impl DeltaTable {
             delta_schema,
             snapshot: RwLock::new(snapshot),
             physical_schema_mapping,
+            table_parquet_options: TableParquetOptions::default(),
         })
+    }
+
+    #[must_use]
+    pub fn with_table_parquet_options(mut self, opts: TableParquetOptions) -> Self {
+        self.table_parquet_options = opts;
+        self
     }
 
     /// Gets the latest snapshot by paginating object storage. It uses version hints from the currently
@@ -333,7 +354,12 @@ impl DeltaTable {
             Arc::clone(schema),
             partition_cols.iter().map(|f| Arc::new(f.clone())).collect(),
         );
+        tracing::trace!(
+            table_parquet_options = ?self.table_parquet_options,
+            "Creating Delta Lake ParquetSource"
+        );
         let parquet_source = ParquetSource::new(table_schema)
+            .with_table_parquet_options(self.table_parquet_options.clone())
             .with_parquet_file_reader_factory(Arc::clone(parquet_file_reader_factory))
             .with_predicate(Arc::clone(physical_expr));
 
