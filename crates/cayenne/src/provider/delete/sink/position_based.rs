@@ -613,7 +613,7 @@ fn try_decompose_struct_in_list(
 
 /// Decompose `struct(col1, col2, ...) = struct_literal` into `col1 = v1 AND col2 = v2 AND ...`.
 ///
-/// DataFusion optimizes single-element `IN` lists to equality: `(k1, k2) IN ((v1, v2))` becomes
+/// `DataFusion` optimizes single-element `IN` lists to equality: `(k1, k2) IN ((v1, v2))` becomes
 /// `struct(k1, k2) = {c0:v1, c1:v2}`. Vortex doesn't support struct equality, so we decompose
 /// it the same way `try_decompose_struct_in_list` handles the multi-element case.
 fn try_decompose_struct_eq(
@@ -736,7 +736,7 @@ mod tests {
         let args: Vec<Arc<dyn datafusion_physical_expr::PhysicalExpr>> = col_names
             .iter()
             .map(|name| {
-                Arc::new(Column::new_with_schema(name, schema).unwrap())
+                Arc::new(Column::new_with_schema(name, schema).expect("column exists in schema"))
                     as Arc<dyn datafusion_physical_expr::PhysicalExpr>
             })
             .collect();
@@ -747,7 +747,7 @@ mod tests {
             .map(|(i, name)| {
                 Field::new(
                     format!("c{i}"),
-                    schema.field_with_name(name).unwrap().data_type().clone(),
+                    schema.field_with_name(name).expect("field exists in schema").data_type().clone(),
                     true,
                 )
             })
@@ -775,7 +775,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, sv)| {
-                let arr = sv.to_array().unwrap();
+                let arr = sv.to_array().expect("scalar to array conversion");
                 let field = Arc::new(Field::new(format!("c{i}"), arr.data_type().clone(), true));
                 (field, arr)
             })
@@ -790,7 +790,7 @@ mod tests {
             Field::new("k1", DataType::Int32, false),
             Field::new("k2", DataType::Utf8, false),
         ]);
-        let df_schema = DFSchema::try_from(schema.clone()).unwrap();
+        let df_schema = DFSchema::try_from(schema.clone()).expect("schema conversion");
         (schema, df_schema)
     }
 
@@ -827,7 +827,7 @@ mod tests {
     #[test]
     fn decompose_struct_eq_single_column() {
         let schema = Schema::new(vec![Field::new("k1", DataType::Int64, false)]);
-        let df_schema = DFSchema::try_from(schema.clone()).unwrap();
+        let df_schema = DFSchema::try_from(schema.clone()).expect("schema conversion");
         let convertor = DefaultExpressionConvertor::default();
 
         let expr = Arc::new(BinaryExpr::new(
@@ -853,7 +853,7 @@ mod tests {
             Field::new("b", DataType::Int64, false),
             Field::new("c", DataType::Utf8, false),
         ]);
-        let df_schema = DFSchema::try_from(schema.clone()).unwrap();
+        let df_schema = DFSchema::try_from(schema.clone()).expect("schema conversion");
         let convertor = DefaultExpressionConvertor::default();
 
         let expr = Arc::new(BinaryExpr::new(
@@ -987,18 +987,18 @@ mod tests {
     #[test]
     fn build_filter_empty_returns_none() {
         let schema = Schema::new(vec![Field::new("k1", DataType::Int32, false)]);
-        let df_schema = DFSchema::try_from(schema).unwrap();
-        assert_eq!(build_vortex_filter(&[], &df_schema).unwrap(), None);
+        let df_schema = DFSchema::try_from(schema).expect("schema conversion");
+        assert_eq!(build_vortex_filter(&[], &df_schema).expect("build filter"), None);
     }
 
     #[test]
     fn build_filter_simple_eq() {
         let schema = Schema::new(vec![Field::new("k1", DataType::Int32, false)]);
-        let df_schema = DFSchema::try_from(schema).unwrap();
+        let df_schema = DFSchema::try_from(schema).expect("schema conversion");
 
         let filters =
             vec![datafusion_expr::col("k1").eq(datafusion_expr::lit(ScalarValue::Int32(Some(7))))];
-        let result = build_vortex_filter(&filters, &df_schema).unwrap();
+        let result = build_vortex_filter(&filters, &df_schema).expect("build filter");
         assert!(result.is_some());
     }
 
@@ -1008,14 +1008,14 @@ mod tests {
             Field::new("k1", DataType::Int32, false),
             Field::new("k2", DataType::Utf8, false),
         ]);
-        let df_schema = DFSchema::try_from(schema).unwrap();
+        let df_schema = DFSchema::try_from(schema).expect("schema conversion");
 
         let filters = vec![
             datafusion_expr::col("k1").eq(datafusion_expr::lit(ScalarValue::Int32(Some(1)))),
             datafusion_expr::col("k2")
                 .eq(datafusion_expr::lit(ScalarValue::Utf8(Some("a".into())))),
         ];
-        let result = build_vortex_filter(&filters, &df_schema).unwrap();
+        let result = build_vortex_filter(&filters, &df_schema).expect("build filter");
         let expected = vortex::expr::and(
             vortex::expr::eq(
                 vortex::expr::col("k1"),
@@ -1026,6 +1026,6 @@ mod tests {
                 vortex::expr::lit(vortex::scalar::Scalar::from("a")),
             ),
         );
-        assert_eq!(result.unwrap(), expected);
+        assert_eq!(result.expect("filter should be Some"), expected);
     }
 }
