@@ -22,7 +22,7 @@ use axum::http;
 use crate::{AuthVerdict, FlightBasicAuth, GrpcAuth, HttpAuth, error::Error};
 
 pub struct ApiKeyAuth {
-    pub api_keys: Vec<ApiKey>,
+    api_keys: Vec<ApiKey>,
 }
 
 impl ApiKeyAuth {
