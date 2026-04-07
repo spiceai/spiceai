@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::fmt::Debug;
+use std::{any::Any, fmt::Debug};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -28,6 +28,16 @@ use crate::Partition;
 pub mod filename;
 
 type StdError = Box<dyn std::error::Error + Send + Sync>;
+
+pub trait AsAny: Any {
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: Any> AsAny for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -43,7 +53,7 @@ pub enum Error {
 }
 
 #[async_trait]
-pub trait PartitionCreator: Debug + Send + Sync {
+pub trait PartitionCreator: AsAny + Debug + Send + Sync {
     /// Create a new [`Partition`] using the given partition values.
     ///
     /// For single-column partitions, pass a single-element vector.

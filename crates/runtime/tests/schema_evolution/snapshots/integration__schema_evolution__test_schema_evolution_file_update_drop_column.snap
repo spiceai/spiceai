@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/schema_evolution/mod.rs
+expression: "to_pretty_display(&record_batch).expect(\"pretty display\")"
+---
++----+----------+
+| id | town     |
++----+----------+
+| 1  | London   |
+| 2  | Paris    |
+| 3  | New York |
++----+----------+
