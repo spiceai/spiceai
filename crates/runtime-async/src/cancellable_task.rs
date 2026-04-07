@@ -67,10 +67,7 @@ pub fn spawn_cancellable_task<F, E, M>(
     task_cancellation: Option<CancellationToken>,
     task_fn: F,
     map_join_error: M,
-) -> (
-    impl Future<Output = Result<(), E>>,
-    CancellableTaskHandle,
-)
+) -> (impl Future<Output = Result<(), E>>, CancellableTaskHandle)
 where
     F: Future<Output = Result<(), E>> + Send + 'static,
     E: Send + 'static,

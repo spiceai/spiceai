@@ -22,8 +22,7 @@ use crate::{
     component::view::{View, ViewBuilder},
     metrics,
     secrets::Secrets,
-    status,
-    view, warn_spaced,
+    status, view, warn_spaced,
 };
 use app::App;
 use datafusion::sql::{TableReference, parser::DFParser, sqlparser::dialect::PostgreSqlDialect};

@@ -24,9 +24,9 @@ pub mod fibonacci_backoff;
 pub mod home_dir;
 pub mod levenshtein;
 pub mod retry_strategy;
-pub mod topological_ordering;
 #[cfg(feature = "datafusion")]
 pub mod security;
+pub mod topological_ordering;
 pub use backoff::Error as RetryError;
 pub use backoff::ExponentialBackoff;
 pub use backoff::future::retry;

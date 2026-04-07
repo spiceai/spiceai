@@ -27,10 +27,8 @@ use futures::{StreamExt, TryStreamExt, stream};
 use prost::Message;
 use tonic::{Request, Response, Status};
 
-use crate::{
-    flight::{Service, metrics, to_tonic_err, util::set_flightsql_protocol},
-    telemetry::timing::TimedStream,
-};
+use crate::flight::{Service, metrics, to_tonic_err, util::set_flightsql_protocol};
+use telemetry::timing::TimedStream;
 
 /// Get a `FlightInfo` for retrieving XDBC type information.
 pub(crate) fn get_flight_info(

@@ -44,8 +44,8 @@ use crate::{
     config::ClusterRole,
     datafusion::{DataFusion, request_context_extension::get_current_datafusion},
     dataupdate::{StreamingDataUpdate, UpdateType},
-    telemetry::timing::TimedStream,
 };
+use telemetry::timing::TimedStream;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{
