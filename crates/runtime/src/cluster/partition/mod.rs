@@ -18,6 +18,7 @@ mod discovery;
 pub mod executor_selection;
 mod manager;
 mod metadata;
+pub use manager::CopyAssignmentsResult;
 pub mod scheduler_task;
 mod startup;
 pub(crate) mod write_through;
