@@ -616,7 +616,9 @@ fn test_cloud_api_keys_get_and_regenerate() {
     let regen: serde_json::Value = serde_json::from_slice(&regen_assert.get_output().stdout)
         .expect("regenerate should produce valid JSON");
     assert_eq!(
-        regen.get("regenerated_key").and_then(serde_json::Value::as_u64),
+        regen
+            .get("regenerated_key")
+            .and_then(serde_json::Value::as_u64),
         Some(1),
         "regenerated_key should be 1"
     );
