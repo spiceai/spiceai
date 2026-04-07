@@ -730,11 +730,7 @@ fn select_least_loaded_executors(
         RecordBatch,
     )],
 ) -> Result<Vec<ExecutorId>> {
-    super::write_assignment::select_least_loaded_executors(
-        partitions_by_executor,
-        senders,
-        entries,
-    )
+    super::write_assignment::select_least_loaded_executors(partitions_by_executor, senders, entries)
 }
 
 /// Builds a physical filter expression per executor by OR-ing its partition expressions.
