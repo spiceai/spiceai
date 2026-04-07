@@ -104,7 +104,7 @@ fn provider_default_config(
         Some(ModelSource::Google) => google_config(model_id),
         Some(ModelSource::Xai) => xai_config(model_id, params),
         Some(ModelSource::Bedrock) => config(20, 800),
-        Some(ModelSource::Databricks) | Some(ModelSource::SpiceAI) => config(10, 500),
+        Some(ModelSource::Databricks | ModelSource::SpiceAI) => config(10, 500),
         // Local models: conservative concurrency (typically 1 GPU), no RPM limit.
         // Users with multi-GPU setups should override via max_concurrency.
         Some(ModelSource::HuggingFace | ModelSource::File) => RateLimitConfig {
