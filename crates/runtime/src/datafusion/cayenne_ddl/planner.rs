@@ -93,6 +93,10 @@ impl ExtensionPlanner for CayenneDdlExtensionPlanner {
                 .executor_registry(self.executor_registry.clone())
                 .partition_expr(create.partition_expr.clone())
                 .partition_expr_sql(create.partition_expr_sql.clone())
+                .like_source_table(create.like_source_table.clone())
+                .ctx(Some(Arc::new(
+                    datafusion::prelude::SessionContext::new_with_state(session_state.clone()),
+                )))
                 .build(),
             )));
         }

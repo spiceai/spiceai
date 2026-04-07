@@ -91,7 +91,16 @@ impl Secrets {
         expander: Box<dyn crate::stores::scheduler_rpc::ClusterSecretExpander>,
         executor_id: String,
     ) -> Self {
+        let expander: Arc<dyn crate::stores::scheduler_rpc::ClusterSecretExpander> =
+            Arc::from(expander);
         let mut stores = IndexMap::new();
+        stores.insert(
+            "env".to_string(),
+            Arc::new(SchedulerRPCSecretStore::new(
+                Arc::clone(&expander),
+                executor_id.clone(),
+            )) as Arc<dyn SecretStore>,
+        );
         stores.insert(
             "scheduler_rpc".to_string(),
             Arc::new(SchedulerRPCSecretStore::new(expander, executor_id)) as Arc<dyn SecretStore>,
@@ -441,7 +450,17 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use secrecy::ExposeSecret;
+
+    struct MockClusterSecretExpander;
+
+    #[async_trait]
+    impl super::ClusterSecretExpander for MockClusterSecretExpander {
+        async fn expand_secret(&self, executor_id: &str, key: &str) -> Result<String, String> {
+            Ok(format!("{executor_id}:{key}:expanded"))
+        }
+    }
 
     #[test]
     fn test_secret_store_provider() {
@@ -559,6 +578,26 @@ mod tests {
             )
             .await;
         assert_eq!("This is a secret: ! 🫡", result.expose_secret());
+    }
+
+    #[tokio::test]
+    async fn test_cluster_executor_env_references_expand_via_scheduler_rpc() {
+        let secrets = super::Secrets::new_for_cluster_executor(
+            Box::new(MockClusterSecretExpander),
+            "executor-1".to_string(),
+        );
+
+        let result = secrets
+            .inject_secrets(
+                "aws_access_key_id",
+                super::ParamStr("key=${ env:AWS_ACCESS_KEY_ID }"),
+            )
+            .await;
+
+        assert_eq!(
+            "key=executor-1:AWS_ACCESS_KEY_ID:expanded",
+            result.expose_secret()
+        );
     }
 
     #[test]
