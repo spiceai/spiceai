@@ -183,7 +183,15 @@ async fn login_spiceai(
     tracing::info!("Waiting for authentication...");
 
     // Poll for auth status
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .user_agent(format!(
+            "spice/{} ({}; {})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ))
+        .build()
+        .unwrap_or_default();
     let exchange_url = format!("{base_url}/auth/token/exchange");
 
     let access_token = loop {
@@ -350,7 +358,15 @@ async fn get_spice_auth_context(
         url = format!("{url}?{}", params.join("&"));
     }
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .user_agent(format!(
+            "spice/{} ({}; {})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ))
+        .build()
+        .unwrap_or_default();
     let response = client
         .get(&url)
         .header("Authorization", format!("Bearer {access_token}"))
