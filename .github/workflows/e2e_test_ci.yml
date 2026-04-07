@@ -1952,7 +1952,7 @@ jobs:
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 2
         run: |
-          killall spice
+          killall spice || true
           while pgrep -x spice > /dev/null; do sleep 1; done
           # Allow filesystem to sync after process exits
           sleep 2
@@ -2107,7 +2107,7 @@ jobs:
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 2
         run: |
-          killall spice
+          killall spice || true
           while pgrep -x spice > /dev/null; do sleep 1; done
           sleep 2
 
