@@ -17,11 +17,11 @@ limitations under the License.
 //! Per-model rate controller construction for AI UDF concurrency control.
 //!
 //! Provider defaults are sourced from official documentation:
-//! - OpenAI: <https://platform.openai.com/docs/guides/rate-limits>
+//! - `OpenAI`: <https://platform.openai.com/docs/guides/rate-limits>
 //! - Anthropic: <https://docs.anthropic.com/en/api/rate-limits>
 //! - Google Gemini: <https://ai.google.dev/gemini-api/docs/rate-limits>
 //! - xAI: <https://docs.x.ai/docs/rate-limits>
-//! - Azure OpenAI: <https://learn.microsoft.com/en-us/azure/ai-services/openai/quotas-limits>
+//! - `Azure OpenAI`: <https://learn.microsoft.com/en-us/azure/ai-services/openai/quotas-limits>
 
 use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 
@@ -138,8 +138,8 @@ fn openai_config(model_id: &str, params: &HashMap<String, SecretString>) -> Rate
         (Some(llms::openai::UsageTier::Tier1) | None, false) => 500,
         (Some(llms::openai::UsageTier::Tier1) | None, true) => 1000,
         (Some(llms::openai::UsageTier::Tier2 | llms::openai::UsageTier::Tier3), _) => 5000,
-        (Some(llms::openai::UsageTier::Tier4), _) => 10_000,
-        (Some(llms::openai::UsageTier::Tier5), false) => 10_000,
+        (Some(llms::openai::UsageTier::Tier4), _)
+        | (Some(llms::openai::UsageTier::Tier5), false) => 10_000,
         (Some(llms::openai::UsageTier::Tier5), true) => 30_000,
     };
 
@@ -172,7 +172,6 @@ fn anthropic_config(_model_id: &str, params: &HashMap<String, SecretString>) -> 
 
     match tier {
         Some(1) => config(10, 50),
-        Some(2) => config(50, 1000),
         Some(3) => config(100, 2000),
         Some(4) => config(200, 4000),
         _ => config(50, 1000), // Default: Tier 2
@@ -206,7 +205,6 @@ fn xai_config(_model_id: &str, params: &HashMap<String, SecretString>) -> RateLi
 
     match tier {
         Some(0) => config(2, 5),
-        Some(1) => config(10, 60),
         Some(2) => config(25, 200),
         Some(3) => config(50, 500),
         Some(4) => config(100, 1000),
@@ -284,7 +282,7 @@ mod tests {
     fn test_explicit_concurrency_only() {
         let cfg = resolve("openai:gpt-4o", "gpt-4o", &[("max_concurrency", "10")]);
         assert_eq!(cfg.max_concurrency, Some(10));
-        assert_eq!(cfg.requests_per_minute, None);
+        assert_eq!(cfg.requests_per_minute, Some(500)); // rpm set even when no 'usage_tier'.
     }
 
     #[test]
@@ -294,7 +292,7 @@ mod tests {
             "gpt-4o",
             &[("requests_per_minute_limit", "500")],
         );
-        assert_eq!(cfg.max_concurrency, None);
+        assert_eq!(cfg.max_concurrency, Some(50)); // max_concurrency set even when no 'usage_tier'.
         assert_eq!(cfg.requests_per_minute, Some(500));
     }
 
