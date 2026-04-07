@@ -466,10 +466,8 @@ mod tests {
     async fn test_built_controller_respects_concurrency() {
         let rc = config(2, 10000).build();
 
-        let p1 = rc.acquire().await;
-        let p2 = rc.acquire().await;
-        assert!(p1.is_ok());
-        assert!(p2.is_ok());
+        let p1 = rc.acquire().await.expect("p1 should be acquired");
+        let p2 = rc.acquire().await.expect("p2 should be acquired");
 
         tokio::select! {
             _ = rc.acquire() => panic!("Expected semaphore to block with concurrency=2"),
