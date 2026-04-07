@@ -136,6 +136,7 @@ pub(crate) mod search {
             ]
             .concat(),
             true,
+            true,
         )
         .await
     }
@@ -248,6 +249,7 @@ pub(crate) mod search {
             ]
             .concat(),
             true,
+            true,
         )
         .await
     }
@@ -324,7 +326,8 @@ pub(crate) mod search {
                     ),
                 ),
                 ]].concat(),
-            true
+            true,
+            true,
         )
         .await
     }
@@ -381,7 +384,8 @@ pub(crate) mod search {
                         "SELECT question, answer, trunc(_score, 3) as _score FROM vector_search(qs_view, 'secondary') where id > 10 order by _score desc, id LIMIT 4",
                     ),
                 )]].concat(),
-            true
+            true,
+            true,
         )
         .await
     }
@@ -455,7 +459,8 @@ pub(crate) mod search {
                         "SELECT id, _match, answer, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
                 )]].concat(),
-            true
+            true,
+            true,
         )
         .await
     }
@@ -531,7 +536,8 @@ pub(crate) mod search {
                         "SELECT id, _match, answer, trunc(_score, 3) FROM vector_search(qs_view, 'second') order by _score desc, id LIMIT 4",
                     ),
                 )]].concat(),
-            true
+            true,
+            true,
         )
         .await
     }
@@ -651,6 +657,7 @@ pub(crate) mod search {
                 ],
             ]
             .concat(),
+            true,
             true,
         )
         .await
