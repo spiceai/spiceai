@@ -214,25 +214,9 @@ fn test_cloud_app_crud_lifecycle() {
     let create_output: serde_json::Value =
         serde_json::from_slice(&create_assert.get_output().stdout)
             .expect("create app should produce valid JSON");
-    assert_eq!(
-        create_output.get("name").and_then(|v| v.as_str()),
-        Some(name.as_str()),
-        "created app name should match"
-    );
-
-    // Verify key fields in create response
-    assert_eq!(
-        create_output.get("description").and_then(|v| v.as_str()),
-        Some("Integration test app"),
-    );
-    assert_eq!(
-        create_output.get("visibility").and_then(|v| v.as_str()),
-        Some("private"),
-    );
-    assert!(
-        create_output.get("id").and_then(|v| v.as_i64()).is_some(),
-        "created app should have a numeric id"
-    );
+    insta_settings().bind(|| {
+        insta::assert_json_snapshot!(&create_output, @"");
+    });
 
     // --- Get ---
     let mut cmd = spice_cloud_cmd().expect("credentials required");
@@ -243,10 +227,9 @@ fn test_cloud_app_crud_lifecycle() {
 
     let get_output: serde_json::Value = serde_json::from_slice(&get_assert.get_output().stdout)
         .expect("get app should produce valid JSON");
-    assert_eq!(
-        get_output.get("name").and_then(|v| v.as_str()),
-        Some(name.as_str()),
-    );
+    insta_settings().bind(|| {
+        insta::assert_json_snapshot!(&get_output, @"");
+    });
 
     // --- Apps list (must contain our app) ---
     let mut cmd = spice_cloud_cmd().expect("credentials required");
@@ -281,10 +264,9 @@ fn test_cloud_app_crud_lifecycle() {
     let update_output: serde_json::Value =
         serde_json::from_slice(&update_assert.get_output().stdout)
             .expect("update app should produce valid JSON");
-    assert_eq!(
-        update_output.get("description").and_then(|v| v.as_str()),
-        Some("Updated description"),
-    );
+    insta_settings().bind(|| {
+        insta::assert_json_snapshot!(&update_output, @"");
+    });
 
     // --- Delete ---
     let mut cmd = spice_cloud_cmd().expect("credentials required");
@@ -414,10 +396,9 @@ fn test_cloud_secrets_crud_lifecycle() {
         .success();
     let secret: serde_json::Value = serde_json::from_slice(&get_assert.get_output().stdout)
         .expect("get secret should produce valid JSON");
-    assert_eq!(
-        secret.get("name").and_then(|v| v.as_str()),
-        Some("TEST_SECRET"),
-    );
+    insta_settings().bind(|| {
+        insta::assert_json_snapshot!(&secret, @"");
+    });
 
     // --- List secrets ---
     let mut cmd = spice_cloud_cmd().expect("credentials required");
@@ -877,13 +858,9 @@ fn test_cloud_rollback() {
     let rollback_output: serde_json::Value =
         serde_json::from_slice(&rollback_assert.get_output().stdout)
             .expect("rollback should produce valid JSON");
-    assert!(
-        rollback_output
-            .get("id")
-            .and_then(|v| v.as_i64())
-            .is_some_and(|id| id > 0),
-        "rollback should create a new deployment"
-    );
+    insta_settings().bind(|| {
+        insta::assert_json_snapshot!(&rollback_output, @"");
+    });
 
     cleanup_app(&org_app);
 }
