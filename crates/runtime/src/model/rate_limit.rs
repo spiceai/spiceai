@@ -62,7 +62,7 @@ impl RateLimitConfig {
 /// - `requests_per_minute_limit`: max RPM for this model
 ///
 /// If neither is set, provider-specific defaults are used based on the model source,
-/// model ID, and any provider-specific tier params (e.g. `usage_tier` for OpenAI).
+/// model ID, and any provider-specific tier params (e.g. `usage_tier` for `OpenAI`).
 #[must_use]
 pub fn build_model_rate_controller(
     model: &Model,
@@ -104,8 +104,7 @@ fn provider_default_config(
         Some(ModelSource::Google) => google_config(model_id),
         Some(ModelSource::Xai) => xai_config(model_id, params),
         Some(ModelSource::Bedrock) => config(20, 800),
-        Some(ModelSource::Databricks) => config(10, 500),
-        Some(ModelSource::SpiceAI) => config(10, 500),
+        Some(ModelSource::Databricks) | Some(ModelSource::SpiceAI) => config(10, 500),
         // Local models: conservative concurrency (typically 1 GPU), no RPM limit.
         // Users with multi-GPU setups should override via max_concurrency.
         Some(ModelSource::HuggingFace | ModelSource::File) => RateLimitConfig {
