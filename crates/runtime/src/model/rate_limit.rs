@@ -76,22 +76,19 @@ fn resolve_rate_limit_config(
     model: &Model,
     params: &HashMap<String, SecretString>,
 ) -> RateLimitConfig {
-    let max_concurrency = parse_param_u32(params, "max_concurrency");
-    let rpm = parse_param_u32(params, "requests_per_minute_limit");
-
-    if max_concurrency.is_some() || rpm.is_some() {
-        return RateLimitConfig {
-            max_concurrency: max_concurrency
-                .and_then(NonZeroU32::new)
-                .map(|nz| nz.get() as usize),
-            requests_per_minute: rpm,
-        };
-    }
-
-    // Fall back to provider-specific defaults
+    // Start with provider-specific defaults, then apply only the explicit user overrides.
     let source = model.get_source();
     let model_id = model.get_model_id().unwrap_or_default();
-    provider_default_config(source.as_ref(), &model_id, params)
+    let mut config = provider_default_config(source.as_ref(), &model_id, params);
+
+    if let Some(max_concurrency) = parse_param_u32(params, "max_concurrency") {
+        config.max_concurrency = NonZeroU32::new(max_concurrency).map(|nz| nz.get() as usize);
+    }
+
+    if let Some(rpm) = parse_param_u32(params, "requests_per_minute_limit") {
+        config.requests_per_minute = rpm;
+    }
+    config
 }
 
 /// Returns provider-specific default config.
