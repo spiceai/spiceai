@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Integration tests for AI UDF concurrent execution through DataFusion SQL.
+//! Integration tests for AI UDF concurrent execution through datafusion SQL.
 //!
-//! These tests register the AI UDF in a real DataFusion `SessionContext`, run SQL
+//! These tests register the AI UDF in a real datafusion `SessionContext`, run SQL
 //! queries against an in-memory table, and validate that:
 //! 1. Concurrent execution actually happens (not sequential)
 //! 2. Rate controller limits are enforced
@@ -122,7 +122,7 @@ fn setup_ctx(
     ctx
 }
 
-/// Validates that the AI UDF executes concurrently through a real DataFusion SQL query
+/// Validates that the AI UDF executes concurrently through a real datafusion SQL query
 /// and that the rate controller's concurrency limit is respected.
 #[tokio::test]
 async fn test_concurrent_execution_enforced_by_rate_controller() {
@@ -268,7 +268,7 @@ async fn test_explain_analyze_shows_ai_udf() {
 }
 
 /// Validates that without a rate controller, the UDF still executes correctly
-/// and uses DataFusion's target_partitions as the parallelism fallback.
+/// and uses datafusion's `target_partitions` as the parallelism fallback.
 #[tokio::test]
 async fn test_no_rate_controller_still_executes() {
     let model: Arc<dyn Chat> = Arc::new(ConcurrencyTrackingChat {
