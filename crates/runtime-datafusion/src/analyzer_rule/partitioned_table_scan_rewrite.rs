@@ -272,11 +272,8 @@ fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, D
     let union_plan = loop {
         match current {
             LogicalPlan::Union(u) => break u,
-            LogicalPlan::Projection(Projection { input, .. }) => {
-                intermediates.push(current);
-                current = input.as_ref();
-            }
-            LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => {
+            LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. })
+            | LogicalPlan::Projection(Projection { input, .. }) => {
                 intermediates.push(current);
                 current = input.as_ref();
             }
