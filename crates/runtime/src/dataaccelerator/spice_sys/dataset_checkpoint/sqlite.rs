@@ -73,6 +73,13 @@ impl DatasetCheckpoint {
                     )?;
                 }
 
+                if !columns.contains(&"refresh_sql".to_string()) {
+                    conn.execute(
+                        &format!("ALTER TABLE {CHECKPOINT_TABLE_NAME} ADD COLUMN refresh_sql TEXT"),
+                        [],
+                    )?;
+                }
+
                 Ok::<(), rusqlite::Error>(())
             })
             .await
@@ -139,9 +146,11 @@ impl DatasetCheckpoint {
         &self,
         pool: &SqliteConnectionPool,
         schema: &SchemaRef,
+        refresh_sql: Option<&str>,
     ) -> Result<()> {
         let dataset_name = self.dataset_name.clone();
         let schema_json = Self::serialize_schema(schema)?;
+        let refresh_sql_owned = refresh_sql.map(ToString::to_string);
 
         let conn_sync = pool.connect_sync();
         let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
@@ -153,14 +162,45 @@ impl DatasetCheckpoint {
         conn.conn
             .call(move |conn| {
                 let upsert = format!(
-                    "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, schema_json, updated_at)
-                     VALUES (?1, ?2, CURRENT_TIMESTAMP)
-                     ON CONFLICT (dataset_name) DO UPDATE 
-                     SET schema_json = ?2, updated_at = CURRENT_TIMESTAMP"
+                    "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, schema_json, refresh_sql, updated_at)
+                     VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
+                     ON CONFLICT (dataset_name) DO UPDATE
+                     SET schema_json = ?2, refresh_sql = ?3, updated_at = CURRENT_TIMESTAMP"
                 );
-                conn.execute(&upsert, [&dataset_name, &schema_json])?;
+                conn.execute(&upsert, rusqlite::params![&dataset_name, &schema_json, &refresh_sql_owned])?;
 
                 Ok::<(), rusqlite::Error>(())
+            })
+            .await
+            .map_err(Error::external)
+    }
+
+    pub(super) async fn get_refresh_sql_sqlite(
+        &self,
+        pool: &SqliteConnectionPool,
+    ) -> Result<Option<String>> {
+        let dataset_name = self.dataset_name.clone();
+
+        let conn_sync = pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err(Error::DowncastFailed {
+                target: "SqliteConnection",
+            });
+        };
+
+        conn.conn
+            .call(move |conn| {
+                let query = format!(
+                    "SELECT refresh_sql FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?"
+                );
+                let mut stmt = conn.prepare(&query)?;
+                let mut rows = stmt.query([dataset_name])?;
+
+                if let Some(row) = rows.next()? {
+                    Ok::<Option<String>, rusqlite::Error>(row.get(0)?)
+                } else {
+                    Ok(None)
+                }
             })
             .await
             .map_err(Error::external)
@@ -201,6 +241,26 @@ impl DatasetCheckpoint {
             Some(json) => Ok(Some(Self::deserialize_schema(&json)?)),
             None => Ok(None),
         }
+    }
+
+    pub(super) async fn delete_sqlite(&self, pool: &SqliteConnectionPool) -> Result<()> {
+        let dataset_name = self.dataset_name.clone();
+
+        let conn_sync = pool.connect_sync();
+        let Some(conn) = conn_sync.as_any().downcast_ref::<SqliteConnection>() else {
+            return Err(Error::DowncastFailed {
+                target: "SqliteConnection",
+            });
+        };
+
+        conn.conn
+            .call(move |conn| {
+                let delete = format!("DELETE FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?1");
+                conn.execute(&delete, [&dataset_name])?;
+                Ok::<(), rusqlite::Error>(())
+            })
+            .await
+            .map_err(Error::external)
     }
 }
 
@@ -303,7 +363,7 @@ mod tests {
         let schema_ref = std::sync::Arc::new(schema.clone());
 
         checkpoint
-            .checkpoint(&schema_ref)
+            .checkpoint(&schema_ref, None)
             .await
             .expect("Failed to save schema after migration");
 
@@ -332,7 +392,7 @@ mod tests {
 
         // Save the schema
         checkpoint
-            .checkpoint(&schema_ref)
+            .checkpoint(&schema_ref, None)
             .await
             .expect("Failed to save schema");
 
@@ -362,7 +422,7 @@ mod tests {
 
         // Create the checkpoint with schema
         checkpoint
-            .checkpoint(&schema_ref)
+            .checkpoint(&schema_ref, None)
             .await
             .expect("Failed to create checkpoint");
 
@@ -388,7 +448,7 @@ mod tests {
 
         // Create the initial checkpoint
         checkpoint
-            .checkpoint(&schema_ref1)
+            .checkpoint(&schema_ref1, None)
             .await
             .expect("Failed to create initial checkpoint");
 
@@ -404,7 +464,7 @@ mod tests {
 
         // Update the checkpoint with new schema
         checkpoint
-            .checkpoint(&schema_ref2)
+            .checkpoint(&schema_ref2, None)
             .await
             .expect("Failed to update checkpoint");
 
@@ -452,6 +512,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sqlite_refresh_sql_roundtrip() {
+        let checkpoint = create_in_memory_sqlite_checkpoint().await;
+
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let schema_ref = std::sync::Arc::new(schema);
+
+        // Store a refresh_sql
+        checkpoint
+            .checkpoint(&schema_ref, Some("SELECT * FROM source_table"))
+            .await
+            .expect("Failed to store checkpoint with refresh_sql");
+
+        let stored = checkpoint
+            .get_refresh_sql()
+            .await
+            .expect("Failed to get refresh_sql")
+            .expect("refresh_sql should be Some");
+        assert_eq!(stored, "SELECT * FROM source_table");
+
+        // Update to a different refresh_sql
+        checkpoint
+            .checkpoint(
+                &schema_ref,
+                Some("SELECT id FROM source_table WHERE id > 10"),
+            )
+            .await
+            .expect("Failed to update refresh_sql");
+
+        let updated = checkpoint
+            .get_refresh_sql()
+            .await
+            .expect("Failed to get updated refresh_sql")
+            .expect("refresh_sql should still be Some");
+        assert_eq!(updated, "SELECT id FROM source_table WHERE id > 10");
+
+        // Clear refresh_sql by passing None — should overwrite (no COALESCE)
+        checkpoint
+            .checkpoint(&schema_ref, None)
+            .await
+            .expect("Failed to clear refresh_sql");
+
+        let cleared = checkpoint
+            .get_refresh_sql()
+            .await
+            .expect("Failed to get cleared refresh_sql");
+        assert!(
+            cleared.is_none(),
+            "refresh_sql should be None after passing None (no COALESCE)"
+        );
+    }
+
+    #[tokio::test]
     async fn test_sqlite_last_checkpoint_time() {
         let checkpoint = create_in_memory_sqlite_checkpoint().await;
 
@@ -473,7 +585,7 @@ mod tests {
 
         // Create the checkpoint
         checkpoint
-            .checkpoint(&schema_ref)
+            .checkpoint(&schema_ref, None)
             .await
             .expect("Failed to create checkpoint");
 
@@ -496,7 +608,7 @@ mod tests {
 
         // Update the checkpoint
         checkpoint
-            .checkpoint(&schema_ref)
+            .checkpoint(&schema_ref, None)
             .await
             .expect("Failed to update checkpoint");
 

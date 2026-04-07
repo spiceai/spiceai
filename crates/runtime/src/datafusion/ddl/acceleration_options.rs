@@ -282,8 +282,9 @@ fn parse_mode(value: &str) -> DFResult<acceleration::Mode> {
         "memory" => Ok(acceleration::Mode::Memory),
         "file" => Ok(acceleration::Mode::File),
         "file_create" => Ok(acceleration::Mode::FileCreate),
+        "file_update" => Ok(acceleration::Mode::FileUpdate),
         _ => Err(DataFusionError::Plan(format!(
-            "Invalid value for 'acceleration.mode': '{value}'. Expected 'memory', 'file', or 'file_create'."
+            "Invalid value for 'acceleration.mode': '{value}'. Expected 'memory', 'file', 'file_create', or 'file_update'."
         ))),
     }
 }
@@ -354,6 +355,27 @@ mod tests {
         let result = parse_acceleration_options(&options);
         let err = result.expect_err("should return an error").to_string();
         assert!(err.contains("Unknown acceleration option"));
+    }
+
+    #[test]
+    fn test_parse_file_create_mode() {
+        let options = vec![("acceleration.mode".to_string(), "file_create".to_string())];
+        let accel = parse_acceleration_options(&options).expect("should parse");
+        assert_eq!(accel.mode, acceleration::Mode::FileCreate);
+    }
+
+    #[test]
+    fn test_parse_file_update_mode() {
+        let options = vec![("acceleration.mode".to_string(), "file_update".to_string())];
+        let accel = parse_acceleration_options(&options).expect("should parse");
+        assert_eq!(accel.mode, acceleration::Mode::FileUpdate);
+    }
+
+    #[test]
+    fn test_parse_file_mode() {
+        let options = vec![("acceleration.mode".to_string(), "file".to_string())];
+        let accel = parse_acceleration_options(&options).expect("should parse");
+        assert_eq!(accel.mode, acceleration::Mode::File);
     }
 
     #[test]

@@ -66,6 +66,10 @@ pub enum Mode {
     /// Always create a new file, truncating/overwriting any existing file on startup.
     /// Use this when you want a fresh acceleration on each startup.
     FileCreate,
+    /// Open an existing file if it exists, then check schema compatibility on refresh.
+    /// If the source schema is incompatible (non-additive change), snapshot (if enabled)
+    /// and recreate the acceleration file from scratch.
+    FileUpdate,
 }
 
 impl From<spicepod_acceleration::Mode> for Mode {
@@ -74,6 +78,7 @@ impl From<spicepod_acceleration::Mode> for Mode {
             spicepod_acceleration::Mode::Memory => Mode::Memory,
             spicepod_acceleration::Mode::File => Mode::File,
             spicepod_acceleration::Mode::FileCreate => Mode::FileCreate,
+            spicepod_acceleration::Mode::FileUpdate => Mode::FileUpdate,
         }
     }
 }
@@ -84,6 +89,7 @@ impl Display for Mode {
             Mode::Memory => write!(f, "memory"),
             Mode::File => write!(f, "file"),
             Mode::FileCreate => write!(f, "file_create"),
+            Mode::FileUpdate => write!(f, "file_update"),
         }
     }
 }

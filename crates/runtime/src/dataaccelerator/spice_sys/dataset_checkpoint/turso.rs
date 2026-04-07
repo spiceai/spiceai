@@ -63,6 +63,15 @@ impl DatasetCheckpoint {
             .map_err(Error::external)?;
         }
 
+        if !columns.contains(&"refresh_sql".to_string()) {
+            conn.execute(
+                &format!("ALTER TABLE {CHECKPOINT_TABLE_NAME} ADD COLUMN refresh_sql TEXT"),
+                (),
+            )
+            .await
+            .map_err(Error::external)?;
+        }
+
         Ok(())
     }
 
@@ -116,19 +125,21 @@ impl DatasetCheckpoint {
         &self,
         pool: &Arc<TursoConnectionPool>,
         schema: &SchemaRef,
+        refresh_sql: Option<&str>,
     ) -> Result<()> {
         let conn = pool.connect().await.map_err(Error::external)?;
         let schema_json = Self::serialize_schema(schema)?;
+        let refresh_sql_owned = refresh_sql.map(ToString::to_string);
 
         let upsert = format!(
-            "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, schema_json, updated_at)
-             VALUES (?1, ?2, CURRENT_TIMESTAMP)
-             ON CONFLICT (dataset_name) DO UPDATE 
-             SET schema_json = ?2, updated_at = CURRENT_TIMESTAMP"
+            "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, schema_json, refresh_sql, updated_at)
+             VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
+             ON CONFLICT (dataset_name) DO UPDATE
+             SET schema_json = ?2, refresh_sql = ?3, updated_at = CURRENT_TIMESTAMP"
         );
         conn.execute(
             &upsert,
-            turso::params![self.dataset_name.clone(), schema_json],
+            turso::params![self.dataset_name.clone(), schema_json, refresh_sql_owned],
         )
         .await
         .map_err(Error::external)?;
@@ -155,5 +166,37 @@ impl DatasetCheckpoint {
         } else {
             Ok(None)
         }
+    }
+
+    pub(super) async fn get_refresh_sql_turso(
+        &self,
+        pool: &Arc<TursoConnectionPool>,
+    ) -> Result<Option<String>> {
+        let conn = pool.connect().await.map_err(Error::external)?;
+
+        let query =
+            format!("SELECT refresh_sql FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?");
+        let mut rows = conn
+            .query(&query, turso::params![self.dataset_name.clone()])
+            .await
+            .map_err(Error::external)?;
+
+        if let Some(row) = rows.next().await.map_err(Error::external)? {
+            let refresh_sql: Option<String> = row.get(0).map_err(Error::external)?;
+            Ok(refresh_sql)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(super) async fn delete_turso(&self, pool: &Arc<TursoConnectionPool>) -> Result<()> {
+        let conn = pool.connect().await.map_err(Error::external)?;
+
+        let delete = format!("DELETE FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?");
+        conn.execute(&delete, turso::params![self.dataset_name.clone()])
+            .await
+            .map_err(Error::external)?;
+
+        Ok(())
     }
 }

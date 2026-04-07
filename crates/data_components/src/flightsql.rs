@@ -51,6 +51,7 @@ use datafusion::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream,
         execution_plan::{Boundedness, EmissionType},
+        metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time},
         project_schema,
         stream::RecordBatchStreamAdapter,
     },
@@ -420,7 +421,7 @@ impl TableProvider for FlightSQLTable {
 }
 
 #[derive(Clone)]
-struct FlightSqlExec {
+pub struct FlightSqlExec {
     projected_schema: SchemaRef,
     table_reference: TableReference,
     client: FlightSqlClient,
@@ -428,10 +429,11 @@ struct FlightSqlExec {
     limit: Option<usize>,
     properties: PlanProperties,
     cookie_store: Arc<CookieStore>,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl FlightSqlExec {
-    fn new(
+    pub fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
         table_reference: &TableReference,
@@ -454,10 +456,48 @@ impl FlightSqlExec {
                 Boundedness::Bounded,
             ),
             cookie_store,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 
-    fn sql(&self) -> Result<String> {
+    /// Returns a reference to the underlying `FlightSqlClient`.
+    #[must_use]
+    pub fn client(&self) -> &FlightSqlClient {
+        &self.client
+    }
+
+    /// Returns a reference to the table reference.
+    #[must_use]
+    pub fn table_reference(&self) -> &TableReference {
+        &self.table_reference
+    }
+
+    /// Returns a reference to the cookie store.
+    #[must_use]
+    pub fn cookie_store(&self) -> &Arc<CookieStore> {
+        &self.cookie_store
+    }
+
+    /// Returns a reference to the projected schema.
+    #[must_use]
+    pub fn projected_schema(&self) -> &SchemaRef {
+        &self.projected_schema
+    }
+
+    /// Returns the filter expressions.
+    #[must_use]
+    pub fn filters(&self) -> &[Expr] {
+        &self.filters
+    }
+
+    /// Returns the limit.
+    #[must_use]
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
+    /// Returns the SQL query that this exec will send to the `FlightSQL` endpoint.
+    pub fn sql(&self) -> Result<String> {
         let columns = self
             .projected_schema
             .fields()
@@ -541,19 +581,96 @@ impl ExecutionPlan for FlightSqlExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let sql = self.sql().map_err(to_execution_error)?;
         let target_schema = self.schema();
 
-        let stream = query_to_stream(self.client.clone(), sql, Arc::clone(&self.cookie_store)).map(
+        let first_batch_time =
+            MetricBuilder::new(&self.metrics).subset_time("first_batch_time", partition);
+        let fetch_time = MetricBuilder::new(&self.metrics).subset_time("fetch_time", partition);
+
+        let baseline = datafusion::common::instant::Instant::now();
+
+        let inner = query_to_stream(self.client.clone(), sql, Arc::clone(&self.cookie_store)).map(
             move |result| result.and_then(|batch| coerce_batch_to_schema(&batch, &target_schema)),
         );
 
-        let stream_adapter = RecordBatchStreamAdapter::new(self.schema(), stream);
+        let timed_stream = stream! {
+            futures::pin_mut!(inner);
+            let mut stream_metrics = FlightSqlStreamMetrics::new(first_batch_time, fetch_time, baseline);
+
+            while let Some(item) = inner.next().await {
+                if item.is_ok() {
+                    stream_metrics.record_first_batch();
+                }
+                yield item;
+            }
+
+            // For empty/error-only streams, record a fallback first-batch timing at completion.
+            stream_metrics.record_first_batch_if_unset();
+            stream_metrics.record_fetch();
+        };
+
+        let stream_adapter = RecordBatchStreamAdapter::new(self.schema(), timed_stream);
 
         Ok(Box::pin(stream_adapter))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+}
+
+struct FlightSqlStreamMetrics {
+    first_batch_time: Time,
+    fetch_time: Time,
+    baseline: datafusion::common::instant::Instant,
+    first_batch_recorded: bool,
+    fetch_recorded: bool,
+}
+
+impl FlightSqlStreamMetrics {
+    fn new(
+        first_batch_time: Time,
+        fetch_time: Time,
+        baseline: datafusion::common::instant::Instant,
+    ) -> Self {
+        Self {
+            first_batch_time,
+            fetch_time,
+            baseline,
+            first_batch_recorded: false,
+            fetch_recorded: false,
+        }
+    }
+
+    fn record_first_batch(&mut self) {
+        if !self.first_batch_recorded {
+            self.first_batch_time.add_elapsed(self.baseline);
+            self.first_batch_recorded = true;
+        }
+    }
+
+    fn record_first_batch_if_unset(&mut self) {
+        if !self.first_batch_recorded {
+            self.record_first_batch();
+        }
+    }
+
+    fn record_fetch(&mut self) {
+        if !self.fetch_recorded {
+            self.fetch_time.add_elapsed(self.baseline);
+            self.fetch_recorded = true;
+        }
+    }
+}
+
+impl Drop for FlightSqlStreamMetrics {
+    fn drop(&mut self) {
+        self.record_first_batch_if_unset();
+        self.record_fetch();
     }
 }
 
@@ -595,7 +712,7 @@ fn coerce_batch_to_schema(
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
-fn query_to_stream(
+pub fn query_to_stream(
     mut client: FlightSqlClient,
     sql: String,
     cookie_store: Arc<CookieStore>,
@@ -647,14 +764,17 @@ pub async fn get_client_for_flight_endpoint(
 #[cfg(test)]
 mod tests {
     use super::{FlightSqlClient, query_to_stream};
+    use crate::flightsql::FlightSqlExec;
+    use arrow::datatypes::{DataType, Field, Schema};
     use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
     use arrow_flight::{
         Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint,
         FlightInfo, Location, PollInfo, PutResult, SchemaResult, Ticket,
     };
     use bytes::Bytes;
+    use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan, sql::TableReference};
     use flight_client::cookie::{CookieService, CookieStore};
-    use futures::TryStreamExt;
+    use futures::{StreamExt, TryStreamExt};
     use std::net::SocketAddr;
     use std::sync::{
         Arc,
@@ -670,6 +790,12 @@ mod tests {
 
     const COOKIE_VALUE: &str = "AWSALB=abc123";
 
+    #[derive(Clone, Copy)]
+    enum DoGetMode {
+        Empty,
+        Error,
+    }
+
     struct TestServer {
         addr: SocketAddr,
         shutdown: Option<oneshot::Sender<()>>,
@@ -677,13 +803,13 @@ mod tests {
     }
 
     impl TestServer {
-        async fn start(cookie_seen: Arc<AtomicBool>) -> Self {
+        async fn start(cookie_seen: Arc<AtomicBool>, do_get_mode: DoGetMode) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("listener should bind");
             let addr = listener.local_addr().expect("listener should have addr");
             let location = format!("http://{addr}");
-            let service = CookieFlightSqlService::new(cookie_seen, location);
+            let service = CookieFlightSqlService::new(cookie_seen, location, do_get_mode);
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let handle = tokio::spawn(async move {
                 tonic::transport::Server::builder()
@@ -716,14 +842,16 @@ mod tests {
         cookie_required: Arc<AtomicBool>,
         cookie_seen: Arc<AtomicBool>,
         location: String,
+        do_get_mode: DoGetMode,
     }
 
     impl CookieFlightSqlService {
-        fn new(cookie_seen: Arc<AtomicBool>, location: String) -> Self {
+        fn new(cookie_seen: Arc<AtomicBool>, location: String, do_get_mode: DoGetMode) -> Self {
             Self {
                 cookie_required: Arc::new(AtomicBool::new(false)),
                 cookie_seen,
                 location,
+                do_get_mode,
             }
         }
     }
@@ -817,7 +945,10 @@ mod tests {
                 }
             }
             self.cookie_seen.store(true, Ordering::SeqCst);
-            Ok(Response::new(tokio_stream::empty()))
+            match self.do_get_mode {
+                DoGetMode::Empty => Ok(Response::new(tokio_stream::empty())),
+                DoGetMode::Error => Err(Status::internal("do_get failed")),
+            }
         }
 
         async fn do_put(
@@ -852,7 +983,7 @@ mod tests {
     #[tokio::test]
     async fn query_to_stream_sends_cookie_to_endpoint_client() {
         let cookie_seen = Arc::new(AtomicBool::new(false));
-        let server = TestServer::start(Arc::clone(&cookie_seen)).await;
+        let server = TestServer::start(Arc::clone(&cookie_seen), DoGetMode::Empty).await;
         let cookie_store = Arc::new(CookieStore::new());
         let channel = Channel::from_shared(format!("http://{}", server.addr))
             .expect("channel should parse")
@@ -869,6 +1000,89 @@ mod tests {
             .expect("query should succeed");
         assert!(batches.is_empty());
         assert!(cookie_seen.load(Ordering::SeqCst));
+
+        server.shutdown().await;
+    }
+
+    fn has_metric(metrics: &datafusion::physical_plan::metrics::MetricsSet, name: &str) -> bool {
+        metrics.sum_by_name(name).is_some()
+    }
+
+    fn build_exec(client: FlightSqlClient, cookie_store: Arc<CookieStore>) -> FlightSqlExec {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        FlightSqlExec::new(
+            None,
+            &schema,
+            &TableReference::bare("metrics_table"),
+            client,
+            &[],
+            None,
+            cookie_store,
+        )
+        .expect("exec should build")
+    }
+
+    #[tokio::test]
+    async fn flight_sql_exec_metrics_recorded_for_empty_stream() {
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let server = TestServer::start(Arc::clone(&cookie_seen), DoGetMode::Empty).await;
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{}", server.addr))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+
+        let exec = build_exec(client, Arc::clone(&cookie_store));
+        let stream = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute should succeed");
+        let output = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("stream should succeed");
+        assert!(output.is_empty());
+
+        let metrics = exec.metrics().expect("metrics should exist");
+        assert!(has_metric(&metrics, "first_batch_time"));
+        assert!(has_metric(&metrics, "fetch_time"));
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn flight_sql_exec_metrics_handle_error_item_and_early_drop() {
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let server = TestServer::start(Arc::clone(&cookie_seen), DoGetMode::Error).await;
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{}", server.addr))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+
+        let exec = build_exec(client, Arc::clone(&cookie_store));
+        let mut stream = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute should succeed");
+
+        let first = stream.next().await;
+        assert!(first.is_some());
+        first
+            .expect("item should exist")
+            .expect_err("item should be an error");
+
+        drop(stream);
+
+        let metrics = exec.metrics().expect("metrics should exist");
+        assert!(has_metric(&metrics, "first_batch_time"));
+        assert!(has_metric(&metrics, "fetch_time"));
 
         server.shutdown().await;
     }

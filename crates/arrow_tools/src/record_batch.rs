@@ -20,7 +20,7 @@ use arrow::{
     datatypes::{DataType, Field, SchemaRef},
     error::ArrowError,
 };
-use arrow_cast::cast;
+use arrow_cast::{CastOptions, cast_with_options};
 use arrow_schema::Schema;
 use datafusion::common::metadata::ScalarAndMetadata;
 use datafusion::{common::ParamValues, error::DataFusionError, scalar::ScalarValue};
@@ -69,6 +69,11 @@ pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<Recor
             .context(UnableToConvertRecordBatchSnafu);
     }
 
+    let cast_options = CastOptions {
+        safe: false,
+        ..CastOptions::default()
+    };
+
     let cols = schema
         .fields()
         .into_iter()
@@ -80,10 +85,8 @@ pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<Recor
                 if field.contains(existing_field) {
                     Ok(Arc::clone(column))
                 } else {
-                    {
-                        return cast(&*Arc::clone(column), field.data_type())
-                            .context(UnableToConvertRecordBatchSnafu);
-                    }
+                    cast_with_options(column.as_ref(), field.data_type(), &cast_options)
+                        .context(UnableToConvertRecordBatchSnafu)
                 }
             } else if field.is_nullable() {
                 Ok(new_null_array(field.data_type(), record_batch.num_rows()))
@@ -720,5 +723,82 @@ mod test {
         let expected = ParamValues::from(expected_map);
 
         assert_param_values_eq(result, expected);
+    }
+
+    /// Casting Decimal128(38,9) → Decimal128(38,27) must return an error when
+    /// the upscale would overflow, instead of silently producing NULL.
+    #[test]
+    fn test_try_cast_to_decimal_overflow_returns_error() {
+        use arrow::array::Decimal128Array;
+
+        // Value with 12 integer digits: 110_367_043_872.497010000
+        // Internal i128 at scale 9 = 110367043872497010000
+        let value_i128: i128 = 110_367_043_872_497_010_000;
+
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "sum_charge",
+            DataType::Decimal128(38, 9),
+            true,
+        )]));
+
+        let source_array = Decimal128Array::from(vec![Some(value_i128)])
+            .with_precision_and_scale(38, 9)
+            .expect("valid Decimal128(38,9)");
+
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(source_array)]).expect("valid batch");
+
+        // Target schema with wider scale (38,27) — only allows 11 integer digits
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "sum_charge",
+            DataType::Decimal128(38, 27),
+            true,
+        )]));
+
+        let err =
+            try_cast_to(batch, target_schema).expect_err("Decimal overflow should return an error");
+        assert!(
+            matches!(err, Error::UnableToConvertRecordBatch { .. }),
+            "Expected UnableToConvertRecordBatch, got: {err:?}"
+        );
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("is too large to store in a Decimal128"),
+            "Expected overflow message, got: {err_msg}"
+        );
+    }
+
+    /// Casting Decimal128 with values that fit should succeed.
+    #[test]
+    fn test_try_cast_to_decimal_no_overflow_succeeds() {
+        use arrow::array::Decimal128Array;
+
+        // Value with 11 integer digits: 99_999_999_999.000000000 (fits in 38-27=11 digits)
+        let value_i128: i128 = 99_999_999_999_000_000_000;
+
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(38, 9),
+            true,
+        )]));
+
+        let source_array = Decimal128Array::from(vec![Some(value_i128)])
+            .with_precision_and_scale(38, 9)
+            .expect("valid Decimal128(38,9)");
+
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(source_array)]).expect("valid batch");
+
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(38, 27),
+            true,
+        )]));
+
+        let result = try_cast_to(batch, target_schema);
+        assert!(
+            result.is_ok(),
+            "Decimal cast should succeed when value fits: {result:?}"
+        );
     }
 }

@@ -80,18 +80,19 @@ impl DatasetCheckpoint {
         &self,
         pool: &PostgresConnectionPool,
         schema: &SchemaRef,
+        refresh_sql: Option<&str>,
     ) -> Result<()> {
         let conn = pool.connect_direct().await.map_err(Error::external)?;
         let schema_json = Self::serialize_schema(schema)?;
 
         let upsert = format!(
-            "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, updated_at, schema_json)
-             VALUES ($1, CURRENT_TIMESTAMP, $2)
-             ON CONFLICT (dataset_name) DO UPDATE 
-             SET updated_at = CURRENT_TIMESTAMP, schema_json = $2"
+            "INSERT INTO {CHECKPOINT_TABLE_NAME} (dataset_name, updated_at, schema_json, refresh_sql)
+             VALUES ($1, CURRENT_TIMESTAMP, $2, $3)
+             ON CONFLICT (dataset_name) DO UPDATE
+             SET updated_at = CURRENT_TIMESTAMP, schema_json = $2, refresh_sql = $3"
         );
         conn.conn
-            .execute(&upsert, &[&self.dataset_name, &schema_json])
+            .execute(&upsert, &[&self.dataset_name, &schema_json, &refresh_sql])
             .await
             .map_err(Error::external)?;
 
@@ -102,6 +103,10 @@ impl DatasetCheckpoint {
         let conn = pool.connect_direct().await.map_err(Error::external)?;
         conn.conn
             .execute(SCHEMA_MIGRATION_01_STMT, &[])
+            .await
+            .map_err(Error::external)?;
+        conn.conn
+            .execute(super::REFRESH_SQL_MIGRATION_STMT, &[])
             .await
             .map_err(Error::external)?;
         Ok(())
@@ -130,5 +135,36 @@ impl DatasetCheckpoint {
             }
             None => Ok(None),
         }
+    }
+
+    pub(super) async fn get_refresh_sql_postgres(
+        &self,
+        pool: &PostgresConnectionPool,
+    ) -> Result<Option<String>> {
+        let conn = pool.connect_direct().await.map_err(Error::external)?;
+        let query =
+            format!("SELECT refresh_sql FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = $1");
+        let row = conn
+            .conn
+            .query_opt(&query, &[&self.dataset_name])
+            .await
+            .map_err(Error::external)?;
+
+        match row {
+            Some(row) => Ok(row.get(0)),
+            None => Ok(None),
+        }
+    }
+
+    pub(super) async fn delete_postgres(&self, pool: &PostgresConnectionPool) -> Result<()> {
+        let conn = pool.connect_direct().await.map_err(Error::external)?;
+
+        let delete = format!("DELETE FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = $1");
+        conn.conn
+            .execute(&delete, &[&self.dataset_name])
+            .await
+            .map_err(Error::external)?;
+
+        Ok(())
     }
 }
