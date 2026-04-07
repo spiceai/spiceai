@@ -466,7 +466,7 @@ mod tests {
     async fn test_built_controller_respects_concurrency() {
         let rc = config(2, 10000).build();
 
-        let p1 = rc.acquire().await.expect("p1 should be acquired");
+        let _p1 = rc.acquire().await.expect("p1 should be acquired");
         let p2 = rc.acquire().await.expect("p2 should be acquired");
 
         tokio::select! {
@@ -476,7 +476,7 @@ mod tests {
 
         drop(p2);
         tokio::select! {
-            result = rc.acquire() => { result.unwrap(); },
+            result = rc.acquire() => { result.expect("permit should be acquired after drop"); },
             () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                 panic!("Expected to acquire permit after drop");
             }
