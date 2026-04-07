@@ -277,9 +277,7 @@ pub(super) async fn plan_create_table_like(
                 "Failed to resolve source table '{source_name}': {e}"
             ))
         })?
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!("Table '{source_name}' not found"))
-        })?;
+        .ok_or_else(|| DataFusionError::Plan(format!("Table '{source_name}' not found")))?;
 
     let arrow_schema = source_provider.schema();
 

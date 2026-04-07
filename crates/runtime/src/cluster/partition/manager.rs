@@ -497,12 +497,7 @@ mod tests {
             .copy_assignments(&source, &target)
             .await
             .expect("should copy");
-        assert_eq!(
-            result,
-            CopyAssignmentsResult::Copied {
-                partition_count: 1
-            }
-        );
+        assert_eq!(result, CopyAssignmentsResult::Copied { partition_count: 1 });
 
         // Verify target has the same metadata
         let target_meta = pm
