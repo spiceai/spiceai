@@ -31,7 +31,7 @@ limitations under the License.
 //! - Without bloom filter: 1M hash table probes
 //! - With bloom filter: ~1000 hash table probes + 1M bit tests (much faster)
 
-use hash_index::{hash_key, BloomFilter};
+use hash_index::{BloomFilter, hash_key};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;

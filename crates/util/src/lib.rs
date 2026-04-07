@@ -45,6 +45,19 @@ pub mod timestamp_filter;
 
 pub const DATAFUSION_BUG_REPORT_MESSAGE: &str = "This issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues";
 
+/// Returns the default User-Agent string for the Spice runtime.
+///
+/// Format: `spiceai/{version} ({os}; {arch})`
+#[must_use]
+pub fn spiceai_user_agent() -> String {
+    format!(
+        "spiceai/{} ({}; {})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
+}
+
 #[must_use]
 pub fn sanitize_datafusion_error_message(message: &str) -> String {
     message
