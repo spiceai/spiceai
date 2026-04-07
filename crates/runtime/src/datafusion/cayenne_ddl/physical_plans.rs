@@ -16,8 +16,8 @@ limitations under the License.
 
 //! Physical execution plans for broadcast Cayenne DDL and distributed DML.
 //!
-//! **DDL (broadcast)**: `CayenneCreateTableExec` and `CayenneDropTableExec` call
-//! the single-node `cayenne::ddl::operations::*` functions, then add distributed
+//! **DDL (broadcast)**: `DistributedCayenneCreateTableExec` and `DistributedCayenneDropTableExec`
+//! call the single-node `cayenne::ddl::operations::*` functions, then add distributed
 //! steps (executor connectivity check, partition metadata init, DDL forwarding,
 //! LIKE assignment copy). `CayenneCreateSchemaExec` and `CayenneMergeExec` are
 //! re-exported directly from `cayenne::ddl::physical_plans` — schema creation
@@ -155,7 +155,7 @@ async fn forward_sql_to_executor(
         .map_err(|e| e.to_string())
 }
 
-// ── Broadcast CayenneCreateTableExec ─────────────────────────────────────────
+// ── DistributedCayenneCreateTableExec ────────────────────────────────────────
 
 /// Broadcast physical plan for `CREATE TABLE` on a Cayenne catalog.
 ///
@@ -164,10 +164,10 @@ async fn forward_sql_to_executor(
 /// 3. Initialises partition metadata on the scheduler.
 /// 4. Forwards the `CREATE TABLE` DDL SQL to all executor nodes.
 /// 5. Copies partition-to-executor assignments for `LIKE` tables.
-pub struct CayenneCreateTableExec {
+pub struct DistributedCayenneCreateTableExec {
     params: operations::CreateTableParams,
     catalog_list: Arc<dyn CatalogProviderList>,
-    executor_registry: Option<Arc<ExecutorRegistry>>,
+    executor_registry: Arc<ExecutorRegistry>,
     // Stashed for DDL SQL construction when forwarding to executors.
     arrow_schema_for_fwd: Arc<arrow::datatypes::Schema>,
     primary_key_for_fwd: Vec<String>,
@@ -175,21 +175,21 @@ pub struct CayenneCreateTableExec {
     properties: PlanProperties,
 }
 
-impl fmt::Debug for CayenneCreateTableExec {
+impl fmt::Debug for DistributedCayenneCreateTableExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CayenneCreateTableExec (broadcast)")
+        f.debug_struct("DistributedCayenneCreateTableExec")
             .field("table_name", &self.params.table_name)
             .field("catalog_name", &self.params.catalog_name)
             .finish_non_exhaustive()
     }
 }
 
-impl CayenneCreateTableExec {
+impl DistributedCayenneCreateTableExec {
     #[must_use]
     pub fn new(
         params: operations::CreateTableParams,
         catalog_list: Arc<dyn CatalogProviderList>,
-        executor_registry: Option<Arc<ExecutorRegistry>>,
+        executor_registry: Arc<ExecutorRegistry>,
         runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     ) -> Self {
         let arrow_schema_for_fwd = Arc::clone(&params.arrow_schema);
@@ -207,19 +207,19 @@ impl CayenneCreateTableExec {
     }
 }
 
-impl DisplayAs for CayenneCreateTableExec {
+impl DisplayAs for DistributedCayenneCreateTableExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "CayenneCreateTableExec(broadcast): {}.{}.{}",
+            "DistributedCayenneCreateTableExec: {}.{}.{}",
             self.params.catalog_name, self.params.schema_name, self.params.table_name
         )
     }
 }
 
-impl ExecutionPlan for CayenneCreateTableExec {
+impl ExecutionPlan for DistributedCayenneCreateTableExec {
     fn name(&self) -> &'static str {
-        "CayenneCreateTableExec"
+        "DistributedCayenneCreateTableExec"
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -259,10 +259,8 @@ impl ExecutionPlan for CayenneCreateTableExec {
         let result_schema = ddl_result_schema();
 
         let stream = futures::stream::once(async move {
-            // 1. Executor connectivity guard (distributed mode only).
-            if let Some(ref registry) = executor_registry
-                && registry.flight_sql_clients.read().await.is_empty()
-            {
+            // 1. Executor connectivity guard.
+            if executor_registry.flight_sql_clients.read().await.is_empty() {
                 return Err(DataFusionError::Execution(format!(
                     "Failed to create table '{table_name}' in Cayenne catalog '{catalog_name}': \
                      no executors are currently connected. At least one executor must be \
@@ -301,22 +299,19 @@ impl ExecutionPlan for CayenneCreateTableExec {
             );
 
             // 3. Initialise partition metadata so the scheduler can route queries.
-            if let Some(ref registry) = executor_registry {
-                let expr_sql = partition_expr_sql.as_ref().cloned();
-                if let Some(expr_sql) = expr_sql {
-                    let pm = registry.federated_partition_manager();
-                    if let Err(e) = pm.initialize_metadata(&table_ref, vec![expr_sql]).await {
-                        tracing::warn!(
-                            table = %table_ref,
-                            error = %e,
-                            "Failed to initialize partition metadata"
-                        );
-                    }
+            if let Some(expr_sql) = partition_expr_sql.as_ref().cloned() {
+                let pm = executor_registry.federated_partition_manager();
+                if let Err(e) = pm.initialize_metadata(&table_ref, vec![expr_sql]).await {
+                    tracing::warn!(
+                        table = %table_ref,
+                        error = %e,
+                        "Failed to initialize partition metadata"
+                    );
                 }
             }
 
             // 4. Build and forward CREATE TABLE DDL SQL.
-            if let Some(ref registry) = executor_registry {
+            {
                 let columns_sql: Vec<String> = arrow_schema_fwd
                     .fields()
                     .iter()
@@ -341,15 +336,13 @@ impl ExecutionPlan for CayenneCreateTableExec {
                      \"{catalog_name}\".\"{schema_name}\".\"{table_name}\" ({})",
                     table_elements.join(", ")
                 );
-                forward_ddl_to_executors(registry, &ddl_sql).await?;
+                forward_ddl_to_executors(&executor_registry, &ddl_sql).await?;
             }
 
             // 5. Copy partition assignments for LIKE tables.
-            if let Some(ref source) = like_source_table
-                && let Some(ref registry) = executor_registry
-            {
-                let pm = registry.federated_partition_manager();
-                if let Err(e) = pm.copy_assignments(&source, &table_ref).await {
+            if let Some(ref source) = like_source_table {
+                let pm = executor_registry.federated_partition_manager();
+                if let Err(e) = pm.copy_assignments(source, &table_ref).await {
                     return Err(DataFusionError::Execution(format!(
                         "Failed to create table '{table_name}': could not copy partition \
                          assignments from source table {source}: {e}"
@@ -371,29 +364,29 @@ impl ExecutionPlan for CayenneCreateTableExec {
     }
 }
 
-// ── Broadcast CayenneDropTableExec ────────────────────────────────────────────
+// ── DistributedCayenneDropTableExec ──────────────────────────────────────────
 
 /// Broadcast physical plan for `DROP TABLE` on a Cayenne catalog.
-pub struct CayenneDropTableExec {
+pub struct DistributedCayenneDropTableExec {
     table_name: String,
     if_exists: bool,
     df_catalog_name: String,
     df_schema_name: String,
     catalog_list: Arc<dyn CatalogProviderList>,
-    executor_registry: Option<Arc<ExecutorRegistry>>,
+    executor_registry: Arc<ExecutorRegistry>,
     properties: PlanProperties,
 }
 
-impl fmt::Debug for CayenneDropTableExec {
+impl fmt::Debug for DistributedCayenneDropTableExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CayenneDropTableExec (broadcast)")
+        f.debug_struct("DistributedCayenneDropTableExec")
             .field("table_name", &self.table_name)
             .field("catalog_name", &self.df_catalog_name)
             .finish_non_exhaustive()
     }
 }
 
-impl CayenneDropTableExec {
+impl DistributedCayenneDropTableExec {
     #[must_use]
     pub fn new(
         table_name: String,
@@ -401,7 +394,7 @@ impl CayenneDropTableExec {
         df_catalog_name: String,
         df_schema_name: String,
         catalog_list: Arc<dyn CatalogProviderList>,
-        executor_registry: Option<Arc<ExecutorRegistry>>,
+        executor_registry: Arc<ExecutorRegistry>,
     ) -> Self {
         let schema = ddl_result_schema();
         Self {
@@ -416,19 +409,19 @@ impl CayenneDropTableExec {
     }
 }
 
-impl DisplayAs for CayenneDropTableExec {
+impl DisplayAs for DistributedCayenneDropTableExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "CayenneDropTableExec(broadcast): {}.{}.{}",
+            "DistributedCayenneDropTableExec: {}.{}.{}",
             self.df_catalog_name, self.df_schema_name, self.table_name
         )
     }
 }
 
-impl ExecutionPlan for CayenneDropTableExec {
+impl ExecutionPlan for DistributedCayenneDropTableExec {
     fn name(&self) -> &'static str {
-        "CayenneDropTableExec"
+        "DistributedCayenneDropTableExec"
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -461,9 +454,7 @@ impl ExecutionPlan for CayenneDropTableExec {
 
         let stream = futures::stream::once(async move {
             // Executor connectivity guard.
-            if let Some(ref registry) = executor_registry
-                && registry.flight_sql_clients.read().await.is_empty()
-            {
+            if executor_registry.flight_sql_clients.read().await.is_empty() {
                 return Err(DataFusionError::Execution(format!(
                     "Failed to drop table '{table_name}' from Cayenne catalog '{catalog_name}': \
                      no executors are currently connected."
@@ -491,14 +482,12 @@ impl ExecutionPlan for CayenneDropTableExec {
             .await?;
 
             // Forward DROP TABLE to executors.
-            if let Some(ref registry) = executor_registry {
-                if outcome.message.contains("dropped") {
-                    let ddl_sql = format!(
-                        "DROP TABLE IF EXISTS \
-                         \"{catalog_name}\".\"{schema_name}\".\"{table_name}\""
-                    );
-                    forward_ddl_to_executors(registry, &ddl_sql).await?;
-                }
+            if outcome.message.contains("dropped") {
+                let ddl_sql = format!(
+                    "DROP TABLE IF EXISTS \
+                     \"{catalog_name}\".\"{schema_name}\".\"{table_name}\""
+                );
+                forward_ddl_to_executors(&executor_registry, &ddl_sql).await?;
             }
 
             RecordBatch::try_new(
@@ -519,7 +508,7 @@ impl ExecutionPlan for CayenneDropTableExec {
 
 pub struct DistributedCayenneDeleteExec {
     table_name: datafusion::sql::TableReference,
-    executor_registry: Option<Arc<ExecutorRegistry>>,
+    executor_registry: Arc<ExecutorRegistry>,
     filter_sql: Option<String>,
     input: Arc<dyn ExecutionPlan>,
     properties: PlanProperties,
@@ -527,7 +516,7 @@ pub struct DistributedCayenneDeleteExec {
 
 impl fmt::Debug for DistributedCayenneDeleteExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CayenneDeleteExec")
+        f.debug_struct("DistributedCayenneDeleteExec")
             .field("table_name", &self.table_name.to_string())
             .field("filter_sql", &self.filter_sql)
             .finish_non_exhaustive()
@@ -538,7 +527,7 @@ impl DistributedCayenneDeleteExec {
     #[must_use]
     pub fn new(
         table_name: datafusion::sql::TableReference,
-        executor_registry: Option<Arc<ExecutorRegistry>>,
+        executor_registry: Arc<ExecutorRegistry>,
         filter_sql: Option<String>,
         input: Arc<dyn ExecutionPlan>,
     ) -> Self {
@@ -556,13 +545,13 @@ impl DistributedCayenneDeleteExec {
 
 impl DisplayAs for DistributedCayenneDeleteExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "CayenneDeleteExec: {}", self.table_name)
+        write!(f, "DistributedCayenneDeleteExec: {}", self.table_name)
     }
 }
 
 impl ExecutionPlan for DistributedCayenneDeleteExec {
     fn name(&self) -> &'static str {
-        "CayenneDeleteExec"
+        "DistributedCayenneDeleteExec"
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -578,7 +567,9 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let input = children.into_iter().next().ok_or_else(|| {
-            DataFusionError::Internal("CayenneDeleteExec requires exactly one child".to_string())
+            DataFusionError::Internal(
+                "DistributedCayenneDeleteExec requires exactly one child".to_string(),
+            )
         })?;
         Ok(Arc::new(Self::new(
             self.table_name.clone(),
@@ -597,16 +588,11 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
         let filter_sql = self.filter_sql.clone();
         let result_schema = dml_count_schema();
         let stream = futures::stream::once(async move {
-            let Some(ref registry) = executor_registry else {
-                return Err(DataFusionError::Execution(format!(
-                    "DELETE on '{table_name}' cannot be forwarded: no executor registry"
-                )));
-            };
             let mut sql = format!("DELETE FROM {table_name}");
             if let Some(ref filter) = filter_sql {
                 let _ = write!(sql, " WHERE {filter}");
             }
-            forward_dml_to_executors(registry, &sql).await?;
+            forward_dml_to_executors(&executor_registry, &sql).await?;
             RecordBatch::try_new(result_schema, vec![Arc::new(UInt64Array::from(vec![0u64]))])
                 .map_err(Into::into)
         });
@@ -621,7 +607,7 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
 
 pub struct DistributedCayenneUpdateExec {
     table_name: datafusion::sql::TableReference,
-    executor_registry: Option<Arc<ExecutorRegistry>>,
+    executor_registry: Arc<ExecutorRegistry>,
     filter_sql: Option<String>,
     assignments_sql: Vec<(String, String)>,
     input: Arc<dyn ExecutionPlan>,
@@ -630,7 +616,7 @@ pub struct DistributedCayenneUpdateExec {
 
 impl fmt::Debug for DistributedCayenneUpdateExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CayenneUpdateExec")
+        f.debug_struct("DistributedCayenneUpdateExec")
             .field("table_name", &self.table_name.to_string())
             .finish_non_exhaustive()
     }
@@ -640,7 +626,7 @@ impl DistributedCayenneUpdateExec {
     #[must_use]
     pub fn new(
         table_name: datafusion::sql::TableReference,
-        executor_registry: Option<Arc<ExecutorRegistry>>,
+        executor_registry: Arc<ExecutorRegistry>,
         filter_sql: Option<String>,
         assignments_sql: Vec<(String, String)>,
         input: Arc<dyn ExecutionPlan>,
@@ -660,13 +646,13 @@ impl DistributedCayenneUpdateExec {
 
 impl DisplayAs for DistributedCayenneUpdateExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "CayenneUpdateExec: {}", self.table_name)
+        write!(f, "DistributedCayenneUpdateExec: {}", self.table_name)
     }
 }
 
 impl ExecutionPlan for DistributedCayenneUpdateExec {
     fn name(&self) -> &'static str {
-        "CayenneUpdateExec"
+        "DistributedCayenneUpdateExec"
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -682,7 +668,9 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let input = children.into_iter().next().ok_or_else(|| {
-            DataFusionError::Internal("CayenneUpdateExec requires exactly one child".to_string())
+            DataFusionError::Internal(
+                "DistributedCayenneUpdateExec requires exactly one child".to_string(),
+            )
         })?;
         Ok(Arc::new(Self::new(
             self.table_name.clone(),
@@ -703,11 +691,6 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
         let assignments_sql = self.assignments_sql.clone();
         let result_schema = dml_count_schema();
         let stream = futures::stream::once(async move {
-            let Some(ref registry) = executor_registry else {
-                return Err(DataFusionError::Execution(format!(
-                    "UPDATE on '{table_name}' cannot be forwarded: no executor registry"
-                )));
-            };
             if assignments_sql.is_empty() {
                 return Err(DataFusionError::Execution(format!(
                     "UPDATE on '{table_name}' has no SET assignments"
@@ -722,7 +705,7 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
             if let Some(ref filter) = filter_sql {
                 let _ = write!(sql, " WHERE {filter}");
             }
-            forward_dml_to_executors(registry, &sql).await?;
+            forward_dml_to_executors(&executor_registry, &sql).await?;
             RecordBatch::try_new(result_schema, vec![Arc::new(UInt64Array::from(vec![0u64]))])
                 .map_err(Into::into)
         });
@@ -737,7 +720,7 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
 
 pub struct DistributedCayenneInsertExec {
     table_name: datafusion::sql::TableReference,
-    executor_registry: Option<Arc<ExecutorRegistry>>,
+    executor_registry: Arc<ExecutorRegistry>,
     ctx: Arc<datafusion::prelude::SessionContext>,
     io_runtime: tokio::runtime::Handle,
     input: Arc<dyn ExecutionPlan>,
@@ -746,7 +729,7 @@ pub struct DistributedCayenneInsertExec {
 
 impl fmt::Debug for DistributedCayenneInsertExec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CayenneInsertExec")
+        f.debug_struct("DistributedCayenneInsertExec")
             .field("table_name", &self.table_name.to_string())
             .finish_non_exhaustive()
     }
@@ -756,7 +739,7 @@ impl DistributedCayenneInsertExec {
     #[must_use]
     pub fn new(
         table_name: datafusion::sql::TableReference,
-        executor_registry: Option<Arc<ExecutorRegistry>>,
+        executor_registry: Arc<ExecutorRegistry>,
         ctx: Arc<datafusion::prelude::SessionContext>,
         io_runtime: tokio::runtime::Handle,
         input: Arc<dyn ExecutionPlan>,
@@ -776,13 +759,13 @@ impl DistributedCayenneInsertExec {
 
 impl DisplayAs for DistributedCayenneInsertExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "CayenneInsertExec: {}", self.table_name)
+        write!(f, "DistributedCayenneInsertExec: {}", self.table_name)
     }
 }
 
 impl ExecutionPlan for DistributedCayenneInsertExec {
     fn name(&self) -> &'static str {
-        "CayenneInsertExec"
+        "DistributedCayenneInsertExec"
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -798,7 +781,9 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let input = children.into_iter().next().ok_or_else(|| {
-            DataFusionError::Internal("CayenneInsertExec requires exactly one child".to_string())
+            DataFusionError::Internal(
+                "DistributedCayenneInsertExec requires exactly one child".to_string(),
+            )
         })?;
         Ok(Arc::new(Self::new(
             self.table_name.clone(),
@@ -821,19 +806,14 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
         let result_schema = dml_count_schema();
         let task_ctx = context;
         let stream = futures::stream::once(async move {
-            let Some(ref registry) = executor_registry else {
-                return Err(DataFusionError::Execution(format!(
-                    "INSERT on '{table_name}' cannot be forwarded: no executor registry"
-                )));
-            };
-            if registry.flight_sql_clients.read().await.is_empty() {
+            if executor_registry.flight_sql_clients.read().await.is_empty() {
                 return Err(DataFusionError::Execution(format!(
                     "INSERT on '{table_name}' cannot be forwarded: no executors connected"
                 )));
             }
             let partition_expr = crate::datafusion::DataFusion::get_table_partition_expr_from_ctx(
                 &ctx,
-                registry,
+                &executor_registry,
                 &table_name,
             )
             .await
@@ -877,7 +857,7 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
                 },
             ));
             crate::cluster::partition::write_through::forward_partitioned_batches(
-                registry,
+                &executor_registry,
                 Arc::clone(&ctx),
                 io_runtime,
                 &table_name,
@@ -912,7 +892,7 @@ pub struct DistributedCayenneMergeExec {
     source_table: datafusion::sql::TableReference,
     on_keys: Vec<(String, String)>,
     original_sql: String,
-    executor_registry: Option<Arc<ExecutorRegistry>>,
+    executor_registry: Arc<ExecutorRegistry>,
     ctx: Arc<datafusion::prelude::SessionContext>,
     properties: PlanProperties,
 }
@@ -933,7 +913,7 @@ impl DistributedCayenneMergeExec {
         source_table: datafusion::sql::TableReference,
         on_keys: Vec<(String, String)>,
         original_sql: String,
-        executor_registry: Option<Arc<ExecutorRegistry>>,
+        executor_registry: Arc<ExecutorRegistry>,
         ctx: Arc<datafusion::prelude::SessionContext>,
     ) -> Self {
         let schema = dml_count_schema();
@@ -997,13 +977,8 @@ impl ExecutionPlan for DistributedCayenneMergeExec {
         let ctx = Arc::clone(&self.ctx);
         let result_schema = dml_count_schema();
         let stream = futures::stream::once(async move {
-            let Some(ref registry) = executor_registry else {
-                return Err(DataFusionError::Execution(format!(
-                    "MERGE on '{target_table}' cannot be forwarded: no executor registry"
-                )));
-            };
             validate_partition_compatibility(
-                registry,
+                &executor_registry,
                 &ctx,
                 &target_table,
                 &source_table,
@@ -1011,7 +986,7 @@ impl ExecutionPlan for DistributedCayenneMergeExec {
             )
             .await?;
             tracing::info!(target = %target_table, source = %source_table, "Distributed MERGE: forwarding to executors");
-            forward_dml_to_executors(registry, &original_sql).await?;
+            forward_dml_to_executors(&executor_registry, &original_sql).await?;
             tracing::info!(target = %target_table, "Distributed MERGE: all executors completed");
             RecordBatch::try_new(result_schema, vec![Arc::new(UInt64Array::from(vec![0u64]))])
                 .map_err(Into::into)

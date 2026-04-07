@@ -32,7 +32,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_ddl::{CatalogDdlHandler, CreateSchemaParams, CreateTableParams, DropTableParams};
 
 use super::get_cayenne_provider;
-use super::physical_plans::{CayenneCreateTableExec, CayenneDropTableExec};
+use super::physical_plans::{DistributedCayenneCreateTableExec, DistributedCayenneDropTableExec};
 use crate::cluster::executor_registry::ExecutorRegistry;
 use cayenne::ddl::operations;
 
@@ -44,20 +44,13 @@ use cayenne::ddl::operations;
 /// and then forward DDL to all connected executor nodes.
 #[derive(Debug)]
 pub struct DistributedCayenneDdlHandler {
-    pub executor_registry: Option<Arc<ExecutorRegistry>>,
-    pub io_runtime: Option<tokio::runtime::Handle>,
+    pub executor_registry: Arc<ExecutorRegistry>,
 }
 
 impl DistributedCayenneDdlHandler {
     #[must_use]
-    pub fn new(
-        executor_registry: Option<Arc<ExecutorRegistry>>,
-        io_runtime: Option<tokio::runtime::Handle>,
-    ) -> Self {
-        Self {
-            executor_registry,
-            io_runtime,
-        }
+    pub fn new(executor_registry: Arc<ExecutorRegistry>) -> Self {
+        Self { executor_registry }
     }
 }
 
@@ -83,7 +76,7 @@ impl CatalogDdlHandler for DistributedCayenneDdlHandler {
         catalog_list: Arc<dyn CatalogProviderList>,
         session_state: &SessionState,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(CayenneCreateTableExec::new(
+        Ok(Arc::new(DistributedCayenneCreateTableExec::new(
             operations::CreateTableParams {
                 table_name: params.table_name,
                 schema_name: params.schema_name,
@@ -108,7 +101,7 @@ impl CatalogDdlHandler for DistributedCayenneDdlHandler {
         params: DropTableParams,
         catalog_list: Arc<dyn CatalogProviderList>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(CayenneDropTableExec::new(
+        Ok(Arc::new(DistributedCayenneDropTableExec::new(
             params.table_name,
             params.if_exists,
             params.catalog_name,

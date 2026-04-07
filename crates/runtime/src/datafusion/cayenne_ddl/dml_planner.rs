@@ -104,14 +104,14 @@ use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 /// Extension planner for distributed Cayenne DML and local MERGE.
 #[derive(Debug)]
 pub struct CayenneDmlExtensionPlanner {
-    executor_registry: Option<Arc<ExecutorRegistry>>,
+    executor_registry: Arc<ExecutorRegistry>,
     io_runtime: Option<tokio::runtime::Handle>,
 }
 
 impl CayenneDmlExtensionPlanner {
     #[must_use]
     pub fn new(
-        executor_registry: Option<Arc<ExecutorRegistry>>,
+        executor_registry: Arc<ExecutorRegistry>,
         io_runtime: Option<tokio::runtime::Handle>,
     ) -> Self {
         Self {

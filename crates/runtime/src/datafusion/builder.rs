@@ -456,6 +456,19 @@ impl DataFusionBuilder {
                     as Arc<dyn TablePartitionProvider>,
                 &ctx,
             )));
+
+            // Distributed Cayenne DDL analyzer rule.
+            #[cfg(not(windows))]
+            ctx.add_analyzer_rule(Arc::new(datafusion_ddl::DdlAnalyzerRule::new(
+                ctx.state().catalog_list(),
+                &ddl_enabled_catalogs,
+                Arc::clone(&ddl_extension_store),
+                Arc::new(super::cayenne_ddl::DistributedCayenneDdlHandler::new(
+                    Arc::clone(executor_registry),
+                )),
+                SPICE_DEFAULT_SCHEMA,
+                SPICE_DEFAULT_CATALOG,
+            )));
         }
 
         // Iceberg DDL analyzer rule.
@@ -466,20 +479,6 @@ impl DataFusionBuilder {
             Arc::new(super::iceberg_ddl::IcebergDdlHandler::new(Arc::clone(
                 &datafusion_ref,
             ))),
-            SPICE_DEFAULT_SCHEMA,
-            SPICE_DEFAULT_CATALOG,
-        )));
-
-        // Cayenne DDL analyzer rule.
-        #[cfg(not(windows))]
-        ctx.add_analyzer_rule(Arc::new(datafusion_ddl::DdlAnalyzerRule::new(
-            ctx.state().catalog_list(),
-            &ddl_enabled_catalogs,
-            Arc::clone(&ddl_extension_store),
-            Arc::new(super::cayenne_ddl::DistributedCayenneDdlHandler::new(
-                self.executor_registry.clone(),
-                None, // io_runtime provided to the DML planner, not the DDL handler
-            )),
             SPICE_DEFAULT_SCHEMA,
             SPICE_DEFAULT_CATALOG,
         )));
@@ -628,21 +627,23 @@ pub(crate) fn default_extension_planners(
     executor_registry: Option<Arc<ExecutorRegistry>>,
     io_runtime: tokio::runtime::Handle,
 ) -> Vec<Arc<dyn ExtensionPlanner + Send + Sync>> {
-    vec![
+    let mut planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
         Arc::new(IndexTableScanExtensionPlanner::new()),
         Arc::new(FederatedPlanner::new()),
         Arc::new(CacheInvalidationExtensionPlanner::new()),
         // One stateless DDL planner handles all DdlExtensionNodes from any handler.
         Arc::new(datafusion_ddl::DdlExtensionPlanner),
-        // Distributed Cayenne DML + local MERGE.
-        #[cfg(not(windows))]
-        Arc::new(super::cayenne_ddl::CayenneDmlExtensionPlanner::new(
-            executor_registry,
-            Some(io_runtime),
-        )),
         #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
-    ]
+    ];
+    // Distributed Cayenne DML + local MERGE (only when an executor registry is present).
+    #[cfg(not(windows))]
+    if let Some(registry) = executor_registry {
+        planners.push(Arc::new(
+            super::cayenne_ddl::CayenneDmlExtensionPlanner::new(registry, Some(io_runtime)),
+        ));
+    }
+    planners
 }
 
 #[cfg(test)]
