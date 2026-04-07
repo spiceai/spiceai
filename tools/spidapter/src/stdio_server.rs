@@ -100,10 +100,14 @@ impl AdbcCatalogTarget {
     fn create_table_with_clause(self) -> Option<&'static str> {
         match self.mode {
             CatalogMode::Cayenne => None,
-            CatalogMode::IcebergWriteThrough => Some(
-                "\"acceleration.engine\" = 'cayenne', \"acceleration.mode\" = 'file', \"acceleration.refresh_mode\" = 'append'",
-            ),
+            CatalogMode::IcebergWriteThrough => {
+                Some("\"acceleration.engine\" = 'cayenne', \"acceleration.mode\" = 'file'")
+            }
         }
+    }
+
+    fn supports_primary_keys(self) -> bool {
+        matches!(self.mode, CatalogMode::Cayenne)
     }
 
     fn create_catalog(self, args: &StdioArgs) -> Catalog {
@@ -708,7 +712,10 @@ fn generate_adbc_create_table_statement(
     }
 
     let mut table_elements = column_definitions;
-    if include_primary_keys && !primary_key_columns.is_empty() {
+    if include_primary_keys
+        && !primary_key_columns.is_empty()
+        && catalog_target.supports_primary_keys()
+    {
         let schema_columns = schema
             .fields()
             .iter()
