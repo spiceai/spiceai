@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::process::{Child, Command as TokioCommand};
@@ -40,7 +41,7 @@ use system_adapter_protocol::{
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::args::StdioArgs;
+use crate::args::{CatalogMode, StdioArgs};
 use crate::commands;
 
 const LOCAL_BIND_HOST: &str = "0.0.0.0";
@@ -51,6 +52,127 @@ const POST_SETUP_SQL_MAX_RETRIES: u64 = 5;
 const SPIDAPTER_NUM_EXECUTORS_ENV: &str = "SPIDAPTER_NUM_EXECUTORS";
 const MAX_LOCAL_EXECUTORS: usize = 16;
 const LOCAL_EXECUTOR_REGISTRATION_METRIC_GRACE: Duration = Duration::from_secs(15);
+const ADBC_CAYENNE_CATALOG_NAME: &str = "spicebench";
+const ADBC_CAYENNE_SCHEMA_NAME: &str = "bench";
+const ADBC_ICEBERG_CATALOG_NAME: &str = "iceberg_catalog";
+const ADBC_ICEBERG_SCHEMA_NAME: &str = "cayenne";
+const ADBC_ICEBERG_GLUE_CATALOG_FROM: &str =
+    "iceberg:https://glue.us-west-1.amazonaws.com/iceberg/v1/catalogs/211125479522/namespaces";
+const ADBC_ICEBERG_S3_REGION: &str = "us-east-1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdbcCatalogTarget {
+    mode: CatalogMode,
+}
+
+impl AdbcCatalogTarget {
+    fn new(mode: CatalogMode) -> Self {
+        Self { mode }
+    }
+
+    fn catalog_name(self) -> &'static str {
+        match self.mode {
+            CatalogMode::Cayenne => ADBC_CAYENNE_CATALOG_NAME,
+            CatalogMode::IcebergWriteThrough => ADBC_ICEBERG_CATALOG_NAME,
+        }
+    }
+
+    fn schema_name(self) -> &'static str {
+        match self.mode {
+            CatalogMode::Cayenne => ADBC_CAYENNE_SCHEMA_NAME,
+            CatalogMode::IcebergWriteThrough => ADBC_ICEBERG_SCHEMA_NAME,
+        }
+    }
+
+    fn namespace(self) -> String {
+        format!("{}.{}", self.catalog_name(), self.schema_name())
+    }
+
+    fn qualified_table_name(self, table_name: &str) -> String {
+        format!(
+            "{}.{}.{}",
+            self.catalog_name(),
+            self.schema_name(),
+            quote_identifier(table_name)
+        )
+    }
+
+    fn create_table_with_clause(self) -> Option<&'static str> {
+        match self.mode {
+            CatalogMode::Cayenne => None,
+            CatalogMode::IcebergWriteThrough => Some(
+                "\"acceleration.engine\" = 'cayenne', \"acceleration.mode\" = 'file', \"acceleration.refresh_mode\" = 'append'",
+            ),
+        }
+    }
+
+    fn create_catalog(self, args: &StdioArgs) -> Catalog {
+        match self.mode {
+            CatalogMode::Cayenne => {
+                let mut catalog =
+                    Catalog::new("cayenne".to_string(), ADBC_CAYENNE_CATALOG_NAME.to_string())
+                        .with_access(AccessMode::ReadWriteCreate);
+
+                let mut params_map = HashMap::new();
+
+                if let Some(cayenne_data_dir) = &args
+                    .cayenne_data_dir
+                    .clone()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                {
+                    params_map.insert("cayenne_data_dir".to_string(), cayenne_data_dir.clone());
+                }
+
+                if let Some(cayenne_metadata_dir) = &args
+                    .cayenne_metadata_dir
+                    .clone()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                {
+                    params_map.insert(
+                        "cayenne_metadata_dir".to_string(),
+                        cayenne_metadata_dir.clone(),
+                    );
+                }
+
+                if !params_map.is_empty() {
+                    catalog.params = Some(Params::from_string_map(params_map));
+                }
+
+                catalog
+            }
+            CatalogMode::IcebergWriteThrough => {
+                let mut catalog = Catalog::new(
+                    ADBC_ICEBERG_GLUE_CATALOG_FROM.to_string(),
+                    ADBC_ICEBERG_CATALOG_NAME.to_string(),
+                )
+                .with_access(AccessMode::ReadWriteCreate);
+
+                catalog.params = Some(Params::from_string_map(HashMap::from([
+                    (
+                        "iceberg_s3_region".to_string(),
+                        ADBC_ICEBERG_S3_REGION.to_string(),
+                    ),
+                    (
+                        "iceberg_s3_access_key_id".to_string(),
+                        "${env:AWS_ACCESS_KEY_ID}".to_string(),
+                    ),
+                    (
+                        "iceberg_s3_secret_access_key".to_string(),
+                        "${env:AWS_SECRET_ACCESS_KEY}".to_string(),
+                    ),
+                    (
+                        "iceberg_s3_session_token".to_string(),
+                        "${env:AWS_SESSION_TOKEN}".to_string(),
+                    ),
+                ])));
+
+                catalog
+            }
+        }
+    }
+}
 
 /// State for an active benchmark run provisioned via `setup`.
 enum RunState {
@@ -285,7 +407,7 @@ impl Handler for SpidapterHandler {
             catalog_namespace: etl_sink_type
                 .as_ref()
                 .filter(|sink_type| matches!(sink_type, EtlSinkType::Adbc))
-                .map(|_| "spicebench.bench".to_string()),
+                .map(|_| AdbcCatalogTarget::new(self.args.catalog_mode).namespace()),
             read_driver: None,
         };
 
@@ -401,13 +523,20 @@ impl Handler for SpidapterHandler {
             ));
         }
 
-        // Use CREATE TABLE ... LIKE ... to copy schema, partition expression,
-        // AND partition-to-executor assignments from the source table.
-        let quoted_staging = quote_identifier(staging_table_name);
-        let quoted_source = quote_identifier(source_dataset);
-        let ddl = format!(
-            "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_staging} LIKE spicebench.bench.{quoted_source}"
-        );
+        let datasets = self
+            .run_datasets
+            .get(&run_id)
+            .ok_or_else(|| format!("No dataset config found for run {run_id}"))?;
+        let source_config = datasets.get(source_dataset).ok_or_else(|| {
+            format!("Source dataset '{source_dataset}' not found in run {run_id}")
+        })?;
+        let ddl = generate_adbc_staging_table_statement(
+            AdbcCatalogTarget::new(self.args.catalog_mode),
+            source_dataset,
+            staging_table_name,
+            source_config,
+        )
+        .map_err(|e| format!("Failed to generate staging table DDL: {e}"))?;
 
         eprintln!(
             "[stdio] create_staging_table: source={source_dataset}, staging={staging_table_name}, sql={ddl}"
@@ -433,13 +562,15 @@ pub async fn run_stdio_server(args: &StdioArgs) -> anyhow::Result<()> {
 async fn post_setup_sink_action(
     setup_config: &SetupConfig,
     datasets: &HashMap<String, DatasetConfig>,
+    catalog_target: AdbcCatalogTarget,
     sql_url: &str,
     api_key: Option<&str>,
 ) -> anyhow::Result<()> {
     if setup_config.sink_type == Some(EtlSinkType::Adbc) {
         eprintln!("[stdio] Executing post-setup actions for ADBC sink...");
 
-        let create_table_statements = generate_adbc_create_table_statements(datasets)?;
+        let create_table_statements =
+            generate_adbc_create_table_statements(datasets, catalog_target)?;
         if create_table_statements.is_empty() {
             eprintln!("[stdio] No datasets configured for ADBC sink, skipping table creation");
             return Ok(());
@@ -505,6 +636,7 @@ async fn execute_sql_statement(
 
 fn generate_adbc_create_table_statements(
     datasets: &HashMap<String, DatasetConfig>,
+    catalog_target: AdbcCatalogTarget,
 ) -> anyhow::Result<Vec<String>> {
     let mut dataset_names = datasets.keys().cloned().collect::<Vec<_>>();
     dataset_names.sort_unstable();
@@ -515,14 +647,45 @@ fn generate_adbc_create_table_statements(
             let dataset = datasets
                 .get(&dataset_name)
                 .ok_or_else(|| anyhow::anyhow!("Dataset '{dataset_name}' was not found"))?;
-            generate_adbc_create_table_statement(&dataset_name, dataset)
+            generate_adbc_create_table_statement(catalog_target, &dataset_name, dataset, true)
         })
         .collect()
 }
 
+fn generate_adbc_staging_table_statement(
+    catalog_target: AdbcCatalogTarget,
+    source_dataset_name: &str,
+    staging_table_name: &str,
+    dataset: &DatasetConfig,
+) -> anyhow::Result<String> {
+    if catalog_target.mode == CatalogMode::Cayenne {
+        return Ok(format!(
+            "CREATE TABLE IF NOT EXISTS {} LIKE {}",
+            catalog_target.qualified_table_name(staging_table_name),
+            catalog_target.qualified_table_name(source_dataset_name)
+        ));
+    }
+
+    let staging_dataset = DatasetConfig {
+        schema: Arc::clone(&dataset.schema),
+        location: dataset.location.clone(),
+        primary_key_columns: Vec::new(),
+        time_column: dataset.time_column.clone(),
+        partition_columns: dataset.partition_columns.clone(),
+    };
+    generate_adbc_create_table_statement(
+        catalog_target,
+        staging_table_name,
+        &staging_dataset,
+        false,
+    )
+}
+
 fn generate_adbc_create_table_statement(
+    catalog_target: AdbcCatalogTarget,
     dataset_name: &str,
     dataset: &DatasetConfig,
+    include_primary_keys: bool,
 ) -> anyhow::Result<String> {
     let DatasetConfig {
         schema,
@@ -530,7 +693,6 @@ fn generate_adbc_create_table_statement(
         partition_columns,
         ..
     } = dataset;
-    let quoted_dataset_name = quote_identifier(dataset_name);
 
     let column_definitions = schema
         .fields()
@@ -550,7 +712,7 @@ fn generate_adbc_create_table_statement(
     }
 
     let mut table_elements = column_definitions;
-    if !primary_key_columns.is_empty() {
+    if include_primary_keys && !primary_key_columns.is_empty() {
         let schema_columns = schema
             .fields()
             .iter()
@@ -586,10 +748,22 @@ fn generate_adbc_create_table_statement(
         format!("PARTITION BY ({})", partition_columns.join(", "))
     };
 
-    Ok(format!(
-        "CREATE TABLE IF NOT EXISTS spicebench.bench.{quoted_dataset_name} ({}) {partition_clause}",
+    let mut statement = format!(
+        "CREATE TABLE IF NOT EXISTS {} ({})",
+        catalog_target.qualified_table_name(dataset_name),
         table_elements.join(", ")
-    ))
+    );
+
+    if let Some(with_clause) = catalog_target.create_table_with_clause() {
+        statement.push_str(&format!(" WITH ({with_clause})"));
+    }
+
+    if !partition_clause.is_empty() {
+        statement.push(' ');
+        statement.push_str(&partition_clause);
+    }
+
+    Ok(statement)
 }
 
 fn adbc_sql_type_for_arrow(data_type: &DataType) -> anyhow::Result<String> {
@@ -780,7 +954,14 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] Spice Cloud deployment ready for app '{app_name}' at {flight_url}");
 
     let sql_url = format!("https://{cname}.spiceai.io/v1/sql");
-    post_setup_sink_action(setup_config, datasets, &sql_url, Some(&api_key)).await?;
+    post_setup_sink_action(
+        setup_config,
+        datasets,
+        AdbcCatalogTarget::new(args.catalog_mode),
+        &sql_url,
+        Some(&api_key),
+    )
+    .await?;
 
     Ok(RunState::Scp {
         app_id,
@@ -992,6 +1173,7 @@ async fn provision_local_spiced_cluster(
     if let Err(error) = post_setup_sink_action(
         setup_config,
         datasets,
+        AdbcCatalogTarget::new(args.catalog_mode),
         &scheduler_sql_url,
         local_flight_api_key.as_deref(),
     )
@@ -1592,39 +1774,9 @@ fn generate_adbc_spicepod(
         ..Runtime::default()
     };
 
-    let mut cayenne_catalog = Catalog::new("cayenne".to_string(), "spicebench".to_string())
-        .with_access(AccessMode::ReadWriteCreate);
-
-    let mut params_map = HashMap::new();
-
-    if let Some(cayenne_data_dir) = &args
-        .cayenne_data_dir
-        .clone()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        params_map.insert("cayenne_data_dir".to_string(), cayenne_data_dir.clone());
-    }
-
-    if let Some(cayenne_metadata_dir) = &args
-        .cayenne_metadata_dir
-        .clone()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        params_map.insert(
-            "cayenne_metadata_dir".to_string(),
-            cayenne_metadata_dir.clone(),
-        );
-    }
-
-    if !params_map.is_empty() {
-        cayenne_catalog.params = Some(Params::from_string_map(params_map));
-    }
-
-    spicepod
-        .catalogs
-        .push(ComponentOrReference::Component(cayenne_catalog));
+    spicepod.catalogs.push(ComponentOrReference::Component(
+        AdbcCatalogTarget::new(args.catalog_mode).create_catalog(args),
+    ));
     spicepod
 }
 
@@ -1694,6 +1846,7 @@ mod tests {
             api_key: None,
             backend: BackendMode::Scp,
             flight_url: None,
+            catalog_mode: CatalogMode::Cayenne,
             app_memory_limit: None,
             app_cpu_limit: None,
             app_cpu_request: None,
@@ -1745,7 +1898,7 @@ mod tests {
 
     #[test]
     fn backend_mode_parser_rejects_unknown_values() {
-        BackendMode::from_str("unexpected", true).expect("'BackendMode' should be constructed");
+        assert!(BackendMode::from_str("unexpected", true).is_err());
     }
 
     #[test]
@@ -1835,6 +1988,7 @@ mod tests {
         ]));
 
         let statement = generate_adbc_create_table_statement(
+            AdbcCatalogTarget::new(CatalogMode::Cayenne),
             "orders",
             &DatasetConfig {
                 schema,
@@ -1843,6 +1997,7 @@ mod tests {
                 time_column: None,
                 partition_columns: Vec::new(),
             },
+            true,
         )
         .expect("statement should generate");
 
@@ -1859,6 +2014,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
         let err = generate_adbc_create_table_statement(
+            AdbcCatalogTarget::new(CatalogMode::Cayenne),
             "events",
             &DatasetConfig {
                 schema,
@@ -1867,6 +2023,7 @@ mod tests {
                 time_column: None,
                 partition_columns: Vec::new(),
             },
+            true,
         )
         .expect_err("primary key not in schema should fail");
 
@@ -1885,6 +2042,7 @@ mod tests {
         )]));
 
         let err = generate_adbc_create_table_statement(
+            AdbcCatalogTarget::new(CatalogMode::Cayenne),
             "events",
             &DatasetConfig {
                 schema,
@@ -1893,6 +2051,7 @@ mod tests {
                 time_column: None,
                 partition_columns: Vec::new(),
             },
+            true,
         )
         .expect_err("unsupported Arrow type should fail");
 
@@ -1910,6 +2069,7 @@ mod tests {
         ]));
 
         let statement = generate_adbc_create_table_statement(
+            AdbcCatalogTarget::new(CatalogMode::Cayenne),
             "events",
             &DatasetConfig {
                 schema,
@@ -1918,6 +2078,7 @@ mod tests {
                 time_column: None,
                 partition_columns: vec!["region".to_string()],
             },
+            true,
         )
         .expect("statement should generate");
 
@@ -1932,6 +2093,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
         let statement = generate_adbc_create_table_statement(
+            AdbcCatalogTarget::new(CatalogMode::Cayenne),
             "events",
             &DatasetConfig {
                 schema,
@@ -1940,6 +2102,7 @@ mod tests {
                 time_column: None,
                 partition_columns: vec!["missing_col".to_string()],
             },
+            true,
         )
         .expect("partition column not in schema should still succeed");
 
@@ -1958,6 +2121,7 @@ mod tests {
         ]));
 
         let err = generate_adbc_create_table_statement(
+            AdbcCatalogTarget::new(CatalogMode::Cayenne),
             "events",
             &DatasetConfig {
                 schema,
@@ -1966,6 +2130,7 @@ mod tests {
                 time_column: None,
                 partition_columns: vec!["region".to_string(), "country".to_string()],
             },
+            true,
         )
         .expect_err("multiple partition columns should fail");
 
@@ -1974,5 +2139,93 @@ mod tests {
                 .contains("only a single partition column is supported"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn generate_adbc_spicepod_supports_iceberg_write_through_catalog() {
+        let mut args = test_stdio_args();
+        args.catalog_mode = CatalogMode::IcebergWriteThrough;
+
+        let spicepod = generate_adbc_spicepod(&Uuid::nil(), None, &args);
+        let spicepod_yaml =
+            serialize_spicepod(&spicepod).expect("spicepod should serialize to YAML");
+
+        assert!(spicepod_yaml.contains("name: iceberg_catalog"));
+        assert!(spicepod_yaml.contains(
+            "from: \"iceberg:https://glue.us-west-1.amazonaws.com/iceberg/v1/catalogs/211125479522/namespaces\""
+        ));
+        assert!(spicepod_yaml.contains("access: read_write_create"));
+        assert!(spicepod_yaml.contains("iceberg_s3_region: us-east-1"));
+        assert!(
+            spicepod_yaml.contains("iceberg_s3_access_key_id: \"${env:AWS_ACCESS_KEY_ID}\""),
+            "unexpected spicepod: {spicepod_yaml}"
+        );
+        assert!(
+            spicepod_yaml
+                .contains("iceberg_s3_secret_access_key: \"${env:AWS_SECRET_ACCESS_KEY}\""),
+            "unexpected spicepod: {spicepod_yaml}"
+        );
+        assert!(
+            spicepod_yaml.contains("iceberg_s3_session_token: \"${env:AWS_SESSION_TOKEN}\""),
+            "unexpected spicepod: {spicepod_yaml}"
+        );
+    }
+
+    #[test]
+    fn adbc_create_table_statement_supports_iceberg_write_through_catalog() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let statement = generate_adbc_create_table_statement(
+            AdbcCatalogTarget::new(CatalogMode::IcebergWriteThrough),
+            "orders",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/orders/".to_string()),
+                primary_key_columns: vec!["id".to_string()],
+                time_column: None,
+                partition_columns: vec!["name".to_string()],
+            },
+            true,
+        )
+        .expect("statement should generate");
+
+        assert!(
+            statement.contains("CREATE TABLE IF NOT EXISTS iceberg_catalog.cayenne.\"orders\"")
+        );
+        assert!(statement.contains("\"acceleration.engine\" = 'cayenne'"));
+        assert!(statement.contains("\"acceleration.mode\" = 'file'"));
+        assert!(statement.contains("\"acceleration.refresh_mode\" = 'append'"));
+        assert!(statement.contains("PRIMARY KEY (\"id\")"));
+        assert!(statement.contains("PARTITION BY (name)"));
+    }
+
+    #[test]
+    fn adbc_staging_table_statement_uses_explicit_schema_for_iceberg_mode() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        let statement = generate_adbc_staging_table_statement(
+            AdbcCatalogTarget::new(CatalogMode::IcebergWriteThrough),
+            "orders",
+            "orders_staging",
+            &DatasetConfig {
+                schema,
+                location: Some("s3://bucket/path/orders/".to_string()),
+                primary_key_columns: vec!["id".to_string()],
+                time_column: None,
+                partition_columns: Vec::new(),
+            },
+        )
+        .expect("statement should generate");
+
+        assert!(
+            statement
+                .contains("CREATE TABLE IF NOT EXISTS iceberg_catalog.cayenne.\"orders_staging\"")
+        );
+        assert!(statement.contains("\"acceleration.refresh_mode\" = 'append'"));
+        assert!(!statement.contains(" LIKE "));
+        assert!(!statement.contains("PRIMARY KEY"));
     }
 }

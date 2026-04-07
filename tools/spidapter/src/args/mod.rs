@@ -22,6 +22,12 @@ pub enum BackendMode {
     Local,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum CatalogMode {
+    Cayenne,
+    IcebergWriteThrough,
+}
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Run spidapter as a newline-delimited JSON-RPC server over stdio
@@ -77,6 +83,10 @@ pub struct StdioArgs {
     /// Override the Flight SQL endpoint URL instead of deriving it from the deployment cname.
     #[arg(long, env = "SPIDAPTER_FLIGHT_URL")]
     pub flight_url: Option<String>,
+
+    /// Runtime catalog mode for ADBC ETL: `cayenne` or `iceberg-write-through`.
+    #[arg(long, env = "SPIDAPTER_CATALOG_MODE", default_value = "cayenne")]
+    pub catalog_mode: CatalogMode,
 
     /// Memory limit for the Spice Cloud app (scheduler) pod (e.g. `16Gi`).
     #[arg(long, env = "SPIDAPTER_APP_MEMORY_LIMIT")]

@@ -152,6 +152,7 @@ Failed command execution returns JSON-RPC error code `-32001` with `data` contai
 
 `spidapter` now honors `setup(run_id, metadata)` values from SpiceBench to configure the runtime catalog for ETL:
 
+- `--catalog-mode`: ADBC runtime catalog mode. `cayenne` keeps the existing `spicebench.bench` catalog, while `iceberg-write-through` uses the static Glue-backed `iceberg_catalog.cayenne` namespace and creates tables with Cayenne write-through acceleration.
 - `etl_sink_mode`: `adbc` (default) or `iceberg-object-store`
 - `etl_iceberg_warehouse_uri`: required when `etl_sink_mode=iceberg-object-store` (for example `s3://my-bucket/etl-iceberg-output/tpch/<run-id>`)
 - `etl_iceberg_namespace`: optional namespace string (currently logged for visibility)
