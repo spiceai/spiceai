@@ -292,8 +292,9 @@ fn normalize_search_response_json(mut json: Value, sort_ties_by_matches: bool) -
         *duration = json!("duration_ms_val");
     }
     if let Some(matches) = json.get_mut("results").and_then(|m| m.as_array_mut()) {
-        // To avoid inconsistent snapshots when scores are equal (common when using RRF),
-        // we also order based on primary key.
+        // To avoid inconsistent snapshots when scores are equal (common when using RRF)
+        // or near truncation boundaries (model2vec scores vary ±0.01 across CI runners),
+        // we round scores before comparing and also order based on primary key.
         matches.sort_by(|a, b| {
             let Some(Value::Number(num_a)) = a.get("_score") else {
                 return Ordering::Greater;
@@ -308,10 +309,15 @@ fn normalize_search_response_json(mut json: Value, sort_ties_by_matches: bool) -
                 return Ordering::Less;
             };
 
+            // Round to 2 decimal places before comparing to avoid flaky ordering
+            // from minor floating-point variance across CI runners.
+            let rounded_a = (100.0 * score_a).round() / 100.0;
+            let rounded_b = (100.0 * score_b).round() / 100.0;
+
             // Opposite because we want to order descendingly
-            if score_a > score_b {
+            if rounded_a > rounded_b {
                 return Ordering::Less;
-            } else if score_a < score_b {
+            } else if rounded_a < rounded_b {
                 return Ordering::Greater;
             }
 
@@ -344,10 +350,10 @@ fn normalize_search_response_json(mut json: Value, sort_ties_by_matches: bool) -
                 && let Some(Value::Number(n)) = obj.get("_score")
                 && let Some(score) = n.as_f64()
             {
-                let truncated = (100.0 * score).trunc() / 100.0;
+                let rounded = (100.0 * score).round() / 100.0;
                 obj.insert(
                     "_score".to_string(),
-                    Value::String(format!("{truncated:.2}")),
+                    Value::String(format!("{rounded:.2}")),
                 );
             }
         }

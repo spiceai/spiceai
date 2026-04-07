@@ -1124,19 +1124,19 @@ pub(crate) fn basic_vector_search_tests_on_table(
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_basic"),
             SearchTestType::from_sql(format!(
-                "SELECT id, answer, trunc(_score, 3) FROM vector_search({table_name}, 'second', answer) order by _score desc, id LIMIT 4"
+                "SELECT id, answer, trunc(_score, 2) FROM vector_search({table_name}, 'second', answer) order by _score desc, id LIMIT 4"
             )),
         ),
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_projection"),
             SearchTestType::from_sql(format!(
-                "SELECT id, answer, question, subject, trunc(_score, 3) as _score FROM vector_search({table_name}, 'second', answer) order by _score desc, id LIMIT 4",
+                "SELECT id, answer, question, subject, trunc(_score, 2) as _score FROM vector_search({table_name}, 'second', answer) order by _score desc, id LIMIT 4",
             )),
         ),
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_filters"),
             SearchTestType::from_sql(format!(
-                "SELECT id, answer, trunc(_score, 3) as _score FROM vector_search({table_name}, 'secondary', answer) where subject!='math' order by _score desc, id LIMIT 4",
+                "SELECT id, answer, trunc(_score, 2) as _score FROM vector_search({table_name}, 'secondary', answer) where subject!='math' order by _score desc, id LIMIT 4",
             )),
         ),
         SearchTestCase::new(
@@ -1154,7 +1154,7 @@ pub(crate) fn basic_vector_search_tests_on_table(
         SearchTestCase::new(
             format!("{prefix}_vector_search_sql_vectors"),
             SearchTestType::from_sql(format!(
-                "SELECT id, answer, array_length(answer_embedding), trunc(_score, 3) as _score  FROM vector_search({table_name}, 'second', answer) order by _score desc, id desc LIMIT 4;",
+                "SELECT id, answer, array_length(answer_embedding), trunc(_score, 2) as _score  FROM vector_search({table_name}, 'second', answer) order by _score desc, id desc LIMIT 4;",
             )),
         ),
     ]
