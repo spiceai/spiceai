@@ -769,7 +769,7 @@ mod tests {
             struct_udf,
             args,
             return_field,
-            Default::default(),
+            Arc::default(),
         ))
     }
 
