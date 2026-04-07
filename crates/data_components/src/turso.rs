@@ -1120,6 +1120,23 @@ impl TursoTableProvider {
             Ok(ast)
         })
     }
+
+    /// Returns `true` if the expression contains any subquery or outer reference column.
+    fn contains_subquery_or_outer_ref(expr: &Expr) -> bool {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        let mut found = false;
+        let _ = expr.apply(|e| match e {
+            Expr::ScalarSubquery(_)
+            | Expr::InSubquery(_)
+            | Expr::Exists(_)
+            | Expr::OuterReferenceColumn(_, _) => {
+                found = true;
+                Ok(TreeNodeRecursion::Stop)
+            }
+            _ => Ok(TreeNodeRecursion::Continue),
+        });
+        found
+    }
 }
 
 #[async_trait]
@@ -1145,10 +1162,20 @@ impl TableProvider for TursoTableProvider {
 
         let mut filter_push_down = vec![];
         for filter in filters {
-            match unparser.expr_to_sql(filter) {
-                Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
-                Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
-            }
+            // Expressions containing subqueries or outer references must not be pushed down.
+            // For federated providers, subqueries are handled at the plan level and pushing them
+            // into `TableScan.full_filters` is not beneficial. Subqueries may also reference tables
+            // in other databases not accessible from this Turso connection, and outer references
+            // refer to columns from an enclosing query that the table provider cannot resolve.
+            let pushdown = if Self::contains_subquery_or_outer_ref(filter) {
+                TableProviderFilterPushDown::Unsupported
+            } else {
+                match unparser.expr_to_sql(filter) {
+                    Ok(_) => TableProviderFilterPushDown::Exact,
+                    Err(_) => TableProviderFilterPushDown::Unsupported,
+                }
+            };
+            filter_push_down.push(pushdown);
         }
         Ok(filter_push_down)
     }
