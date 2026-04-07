@@ -435,7 +435,11 @@ where
 
                     // Usage should be on last message, so we can add latency metrics here.
                     handle_metrics(self.started.elapsed(), false, &self.labels);
-                    handle_token_metrics(usage.prompt_tokens, usage.completion_tokens, &self.labels);
+                    handle_token_metrics(
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        &self.labels,
+                    );
                 }
                 Poll::Ready(Some(Ok(item)))
             }

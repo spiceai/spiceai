@@ -25,8 +25,8 @@ limitations under the License.
 #![cfg(feature = "models")]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, StringArray};
@@ -101,12 +101,18 @@ fn setup_ctx(
     ctx.register_udf(udf.into_async_udf().into_scalar_udf());
 
     // Create in-memory table
-    let schema = Arc::new(Schema::new(vec![Field::new("question", DataType::Utf8, false)]));
-    let questions: Vec<&str> = (0..num_rows).map(|i| match i % 3 {
-        0 => "What is 2+2?",
-        1 => "What is the capital of France?",
-        _ => "Tell me a joke",
-    }).collect();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "question",
+        DataType::Utf8,
+        false,
+    )]));
+    let questions: Vec<&str> = (0..num_rows)
+        .map(|i| match i % 3 {
+            0 => "What is 2+2?",
+            1 => "What is the capital of France?",
+            _ => "Tell me a joke",
+        })
+        .collect();
     let array = StringArray::from(questions);
     let batch =
         RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("should create RecordBatch");
@@ -171,7 +177,12 @@ async fn test_concurrent_execution_enforced_by_rate_controller() {
     }
 
     // All 9 rows should produce responses
-    assert_eq!(all_responses.len(), 9, "Expected 9 responses, got {}", all_responses.len());
+    assert_eq!(
+        all_responses.len(),
+        9,
+        "Expected 9 responses, got {}",
+        all_responses.len()
+    );
     for (i, resp) in all_responses.iter().enumerate() {
         assert!(
             resp.contains("Response from mock-llm"),
@@ -220,7 +231,7 @@ async fn test_explain_analyze_shows_ai_udf() {
     let ctx = setup_ctx(
         Arc::new(RwLock::new(model_store)),
         Arc::new(RwLock::new(HashMap::new())), // no rate controller
-        3, // 3 rows
+        3,                                     // 3 rows
     );
 
     let df = ctx

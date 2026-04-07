@@ -169,10 +169,7 @@ fn is_openai_mini_model(model_id: &str) -> bool {
 // Haiku has higher limits but we use the lower Opus/Sonnet limits as default.
 // ---------------------------------------------------------------------------
 
-fn anthropic_config(
-    _model_id: &str,
-    params: &HashMap<String, SecretString>,
-) -> RateLimitConfig {
+fn anthropic_config(_model_id: &str, params: &HashMap<String, SecretString>) -> RateLimitConfig {
     let tier = parse_param_u32(params, "anthropic_usage_tier")
         .or_else(|| parse_param_u32(params, "usage_tier"));
 
@@ -207,8 +204,8 @@ fn google_config(model_id: &str) -> RateLimitConfig {
 // ---------------------------------------------------------------------------
 
 fn xai_config(_model_id: &str, params: &HashMap<String, SecretString>) -> RateLimitConfig {
-    let tier = parse_param_u32(params, "xai_usage_tier")
-        .or_else(|| parse_param_u32(params, "usage_tier"));
+    let tier =
+        parse_param_u32(params, "xai_usage_tier").or_else(|| parse_param_u32(params, "usage_tier"));
 
     match tier {
         Some(0) => config(2, 5),
@@ -273,11 +270,15 @@ mod tests {
 
     #[test]
     fn test_explicit_params_override_provider_defaults() {
-        let cfg = resolve("openai:gpt-4o", "gpt-4o", &[
-            ("usage_tier", "free"),
-            ("max_concurrency", "50"),
-            ("requests_per_minute_limit", "2000"),
-        ]);
+        let cfg = resolve(
+            "openai:gpt-4o",
+            "gpt-4o",
+            &[
+                ("usage_tier", "free"),
+                ("max_concurrency", "50"),
+                ("requests_per_minute_limit", "2000"),
+            ],
+        );
         assert_eq!(cfg.max_concurrency, Some(50));
         assert_eq!(cfg.requests_per_minute, Some(2000));
     }
@@ -291,7 +292,11 @@ mod tests {
 
     #[test]
     fn test_explicit_rpm_only() {
-        let cfg = resolve("openai:gpt-4o", "gpt-4o", &[("requests_per_minute_limit", "500")]);
+        let cfg = resolve(
+            "openai:gpt-4o",
+            "gpt-4o",
+            &[("requests_per_minute_limit", "500")],
+        );
         assert_eq!(cfg.max_concurrency, None);
         assert_eq!(cfg.requests_per_minute, Some(500));
     }
@@ -322,14 +327,22 @@ mod tests {
 
     #[test]
     fn test_openai_free_tier() {
-        let cfg = resolve("openai:gpt-4o-mini", "gpt-4o-mini", &[("usage_tier", "free")]);
+        let cfg = resolve(
+            "openai:gpt-4o-mini",
+            "gpt-4o-mini",
+            &[("usage_tier", "free")],
+        );
         assert_eq!(cfg.max_concurrency, Some(1));
         assert_eq!(cfg.requests_per_minute, Some(3));
     }
 
     #[test]
     fn test_openai_tier1_mini_higher_rpm_than_full() {
-        let mini = resolve("openai:gpt-4o-mini", "gpt-4o-mini", &[("usage_tier", "tier1")]);
+        let mini = resolve(
+            "openai:gpt-4o-mini",
+            "gpt-4o-mini",
+            &[("usage_tier", "tier1")],
+        );
         let full = resolve("openai:gpt-4o", "gpt-4o", &[("usage_tier", "tier1")]);
         assert_eq!(mini.requests_per_minute, Some(1000));
         assert_eq!(full.requests_per_minute, Some(500));
@@ -338,7 +351,11 @@ mod tests {
 
     #[test]
     fn test_openai_tier5_nano() {
-        let cfg = resolve("openai:gpt-4.1-nano", "gpt-4.1-nano", &[("usage_tier", "tier5")]);
+        let cfg = resolve(
+            "openai:gpt-4.1-nano",
+            "gpt-4.1-nano",
+            &[("usage_tier", "tier5")],
+        );
         assert_eq!(cfg.max_concurrency, Some(200));
         assert_eq!(cfg.requests_per_minute, Some(30_000));
     }
@@ -361,14 +378,22 @@ mod tests {
 
     #[test]
     fn test_anthropic_tier1() {
-        let cfg = resolve("anthropic:claude-haiku-4-5", "haiku", &[("anthropic_usage_tier", "1")]);
+        let cfg = resolve(
+            "anthropic:claude-haiku-4-5",
+            "haiku",
+            &[("anthropic_usage_tier", "1")],
+        );
         assert_eq!(cfg.max_concurrency, Some(10));
         assert_eq!(cfg.requests_per_minute, Some(50));
     }
 
     #[test]
     fn test_anthropic_tier4() {
-        let cfg = resolve("anthropic:claude-opus-4-6", "opus", &[("anthropic_usage_tier", "4")]);
+        let cfg = resolve(
+            "anthropic:claude-opus-4-6",
+            "opus",
+            &[("anthropic_usage_tier", "4")],
+        );
         assert_eq!(cfg.max_concurrency, Some(200));
         assert_eq!(cfg.requests_per_minute, Some(4000));
     }

@@ -247,7 +247,11 @@ where
                                 prompt_tokens = %usage.input_tokens,
                                 "Usage info"
                             );
-                            handle_token_metrics(usage.input_tokens, usage.output_tokens, &self.labels);
+                            handle_token_metrics(
+                                usage.input_tokens,
+                                usage.output_tokens,
+                                &self.labels,
+                            );
                         }
 
                         response.model.clone_from(&self.model_public_name);

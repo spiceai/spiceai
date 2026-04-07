@@ -1911,7 +1911,9 @@ mod tests {
         assert_eq!(string_array.len(), 6);
         for i in 0..6 {
             assert!(
-                string_array.value(i).contains("Response from rate-limited-model"),
+                string_array
+                    .value(i)
+                    .contains("Response from rate-limited-model"),
                 "Row {} should have response",
                 i
             );
@@ -1976,5 +1978,4 @@ mod tests {
             observed_max
         );
     }
-
 }
