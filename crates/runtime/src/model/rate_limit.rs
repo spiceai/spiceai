@@ -86,7 +86,7 @@ fn resolve_rate_limit_config(
     }
 
     if let Some(rpm) = parse_param_u32(params, "requests_per_minute_limit") {
-        config.requests_per_minute = rpm;
+        config.requests_per_minute = Some(rpm);
     }
     config
 }
