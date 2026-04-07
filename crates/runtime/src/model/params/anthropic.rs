@@ -29,10 +29,12 @@ pub const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     COMMON_MODEL_PARAMETERS_WITH_DEPRECATED,
 );
 
-const ANTHROPIC_PARAM_LEN: usize = 3;
+const ANTHROPIC_PARAM_LEN: usize = 4;
 
 pub(crate) const ANTHROPIC_PARAMETERS: [ParameterSpec; ANTHROPIC_PARAM_LEN] = [
     ParameterSpec::runtime("endpoint").description("The Anthropic API base endpoint."),
     ParameterSpec::component("api_key").description("The Anthropic API key."),
     ParameterSpec::component("auth_token").description("The Anthropic Auth Token."),
+    ParameterSpec::component("usage_tier")
+        .description("Anthropic usage tier (1-4). Used for rate limit defaults."),
 ];
