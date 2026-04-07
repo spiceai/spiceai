@@ -476,7 +476,7 @@ mod tests {
 
         drop(p2);
         tokio::select! {
-            result = rc.acquire() => assert!(result.is_ok()),
+            result = rc.acquire() => { result.unwrap(); },
             () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                 panic!("Expected to acquire permit after drop");
             }
