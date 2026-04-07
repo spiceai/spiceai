@@ -1802,7 +1802,8 @@ async fn cayenne_catalog_merge_duplicate_source_keys_rejected() -> Result<(), St
                 merge_result.is_err(),
                 "MERGE with duplicate source keys should fail, got: {merge_result:?}"
             );
-            let err_msg = merge_result.unwrap_err();
+            let err_msg =
+                merge_result.expect_err("MERGE with duplicate source keys should return error");
             assert!(
                 err_msg.contains("duplicate"),
                 "Error should mention duplicate keys, got: {err_msg}"

@@ -26,7 +26,7 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
 use datafusion::{catalog::TableProvider, datasource::DefaultTableSource, sql::TableReference};
-use datafusion_expr::{Expr, TableScan};
+use datafusion_expr::TableScan;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::cookie::CookieStore;
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
@@ -122,8 +122,6 @@ impl ExecutorConnection {
     }
 }
 
-pub type TablePartitions = HashMap<TableReference, Vec<Expr>>;
-
 /// Registry for tracking executor control stream connections.
 ///
 /// Schedulers use this registry to:
@@ -138,9 +136,6 @@ pub struct ExecutorRegistry {
     /// Map of `executor_id` -> `FlightSqlClient`
     /// An executor may be in `connections` and not in `flight_sql_clients` (e.g. during initial connection).
     pub flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
-
-    /// Map of `executor_id` -> table partitions for that executor
-    pub partitions: Arc<RwLock<HashMap<String, TablePartitions>>>,
 
     /// Manager for accelerated partition metadata. Used to validate partition completeness
     /// and optimize executor selection. If None, fallback to legacy behavior.
@@ -159,7 +154,6 @@ impl ExecutorRegistry {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
             flight_sql_clients: Arc::new(RwLock::new(HashMap::new())),
-            partitions: Arc::new(RwLock::new(HashMap::new())),
             accelerations_partition_manager,
             federated_partition_manager,
         }

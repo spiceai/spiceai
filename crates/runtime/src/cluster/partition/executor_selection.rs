@@ -90,14 +90,17 @@ pub fn select_executors(
 
     // Greedy algorithm: repeatedly select executor with most coverage of remaining partitions
     while !needed.is_empty() {
-        // Find executor with maximum coverage of remaining needed partitions
+        // Find executor with maximum coverage of remaining needed partitions.
+        // Break ties by executor ID to ensure deterministic selection order.
         let best_executor = executor_partitions
             .iter()
             .map(|(exec_id, partitions)| {
                 let coverage = partitions.iter().filter(|p| needed.contains(p)).count();
                 (exec_id, partitions, coverage)
             })
-            .max_by_key(|(_, _, coverage)| *coverage);
+            .max_by(|(id_a, _, cov_a), (id_b, _, cov_b)| {
+                cov_a.cmp(cov_b).then_with(|| id_b.cmp(id_a))
+            });
 
         match best_executor {
             Some((exec_id, partitions, coverage)) if coverage > 0 => {

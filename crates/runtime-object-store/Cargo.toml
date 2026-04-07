@@ -32,6 +32,7 @@ suppaftp = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
+util = { path = "../util", default-features = false }
 
 [dev-dependencies]
 insta = { workspace = true, features = ["json", "redactions"] }

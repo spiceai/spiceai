@@ -99,7 +99,12 @@ mod results_cache;
 mod retention;
 mod s3;
 mod s3_location_pruning;
-#[cfg(feature = "postgres")]
+#[cfg(any(
+    feature = "postgres",
+    feature = "duckdb",
+    feature = "sqlite",
+    feature = "turso"
+))]
 mod schema_evolution;
 #[cfg(feature = "snapshots")]
 mod snapshot_integration;

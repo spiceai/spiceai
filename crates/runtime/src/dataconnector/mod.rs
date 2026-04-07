@@ -71,7 +71,7 @@ pub fn default_spice_client(content_type: &'static str) -> reqwest::Result<reqwe
     headers.append(CONTENT_TYPE, HeaderValue::from_static(content_type));
 
     reqwest::Client::builder()
-        .user_agent("spice")
+        .user_agent(util::spiceai_user_agent())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .default_headers(headers)

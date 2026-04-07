@@ -21,7 +21,7 @@ use tokio::sync::Semaphore;
 
 use super::{
     ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, ReqwestInternalSnafu, Result,
-    is_retriable_error,
+    is_gateway_error, is_retriable_error,
 };
 use arrow::{
     array::RecordBatch,
@@ -37,6 +37,7 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use snafu::ResultExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
@@ -860,7 +861,6 @@ impl GraphQLClient {
         self.schema.as_ref().map(Arc::clone)
     }
 
-    #[expect(clippy::too_many_lines)]
     pub(crate) async fn execute(
         &self,
         query: &GraphQLQuery,
@@ -869,6 +869,30 @@ impl GraphQLClient {
         cursor: Option<String>,
         error_checker: Option<ErrorChecker>,
         query_cost: Option<u32>,
+    ) -> Result<GraphQLQueryResult> {
+        self.execute_inner(
+            query,
+            schema,
+            limit,
+            cursor,
+            error_checker,
+            query_cost,
+            false,
+        )
+        .await
+    }
+
+    #[expect(clippy::too_many_lines)]
+    #[expect(clippy::too_many_arguments)]
+    async fn execute_inner(
+        &self,
+        query: &GraphQLQuery,
+        schema: Option<SchemaRef>,
+        limit: Option<usize>,
+        cursor: Option<String>,
+        error_checker: Option<ErrorChecker>,
+        query_cost: Option<u32>,
+        close_connection: bool,
     ) -> Result<GraphQLQueryResult> {
         // Validate cursor if present
         if let Some(ref cursor_val) = cursor {
@@ -923,7 +947,21 @@ impl GraphQLClient {
 
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 
-        let mut request = self.client.post(self.endpoint.clone()).body(body);
+        // When close_connection is true (after a gateway error like 502), build a
+        // fresh reqwest::Client so the retry goes out on a new TCP connection instead
+        // of reusing the (possibly broken) pooled connection. Preserve user-agent and
+        // timeouts to match the original client — GitHub requires a User-Agent header.
+        let http_client = if close_connection {
+            reqwest::Client::builder()
+                .user_agent(util::spiceai_user_agent())
+                .pool_max_idle_per_host(0)
+                .build()
+                .context(ReqwestInternalSnafu)?
+        } else {
+            self.client.clone()
+        };
+
+        let mut request = http_client.post(self.endpoint.clone()).body(body);
         request = request_with_auth(request, self.auth.as_ref());
 
         // Replace separated semaphore with RateController semaphore: https://github.com/spiceai/spiceai/issues/8636
@@ -972,9 +1010,20 @@ impl GraphQLClient {
                     e,
                     preview
                 );
+
+                // For server errors returning HTML (e.g., upstream gateway/proxy errors),
+                // provide a clear message instead of exposing the JSON parse error.
+                let detail = if status.is_server_error() {
+                    "The server returned a non-JSON response (likely an upstream proxy error). This is a temporary issue and will be retried automatically. If the problem persists, contact support or check the API status page.".to_string()
+                } else {
+                    format!(
+                        "The response could not be parsed as JSON. Technical details: {e}"
+                    )
+                };
+
                 Error::JsonDecodeError {
                     status,
-                    error: e.to_string(),
+                    detail,
                     response_preview: preview,
                 }
             })?;
@@ -1265,17 +1314,32 @@ impl GraphQLClient {
             .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
             .build();
 
+        let close_connection = Arc::new(AtomicBool::new(false));
+
         retry(backoff, || {
             let schema = schema.clone();
             let cursor = cursor.clone();
             let error_checker = error_checker.clone();
+            let should_close = close_connection.swap(false, Ordering::Relaxed);
+            let close_conn = Arc::clone(&close_connection);
 
             async move {
                 client
-                    .execute(query, schema, limit, cursor, error_checker, query_cost)
+                    .execute_inner(
+                        query,
+                        schema,
+                        limit,
+                        cursor,
+                        error_checker,
+                        query_cost,
+                        should_close,
+                    )
                     .await
                     .map_err(|e| {
                         if is_retriable_error(&e) {
+                            if is_gateway_error(&e) {
+                                close_conn.store(true, Ordering::Relaxed);
+                            }
                             tracing::warn!("Page fetch failed, will retry: {e}");
                             RetryError::transient(e)
                         } else {

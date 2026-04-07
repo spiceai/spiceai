@@ -64,7 +64,7 @@ use url::Url;
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
-    ParameterSpec, Parameters, default_spice_client,
+    ParameterSpec, Parameters,
 };
 
 mod commits;
@@ -290,6 +290,7 @@ impl Github {
             };
 
             let client = reqwest::Client::builder()
+                .user_agent(util::spiceai_user_agent())
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -368,7 +369,22 @@ impl Github {
 
         let rate_controller = get_github_auth_context_rate_controller(auth_context).await;
 
-        let client = default_spice_client("application/json").boxed()?;
+        let client = reqwest::Client::builder()
+            .user_agent(util::spiceai_user_agent())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))
+            .gzip(true)
+            .brotli(true)
+            .zstd(true)
+            .deflate(true)
+            .default_headers({
+                use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+                let mut headers = HeaderMap::new();
+                headers.append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                headers
+            })
+            .build()
+            .boxed()?;
 
         let gql_client_params = tbl.get_graphql_values();
 
