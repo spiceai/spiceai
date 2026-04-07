@@ -34,6 +34,7 @@ members = [
     "crates/runtime-api-types",
     "crates/runtime-auth",
     "crates/runtime-async",
+    "crates/datafusion-flightsql",
     "crates/runtime-datafusion",
     "crates/runtime-datafusion-index",
     "crates/runtime-datafusion-udfs",
