@@ -54,9 +54,7 @@ pub(crate) async fn handle(
         Command::CommandPreparedStatementUpdate(cmd) => {
             flightsql::prepared_statement_update::do_put_update(cmd, streaming_flight).await
         }
-        Command::CommandStatementUpdate(cmd) => {
-            flightsql::statement_update::do_put(ctx, cmd).await
-        }
+        Command::CommandStatementUpdate(cmd) => flightsql::statement_update::do_put(ctx, cmd).await,
         Command::CommandStatementIngest(_) => Err(Status::unimplemented(
             "CommandStatementIngest is not supported; use a SQL INSERT statement instead",
         )),

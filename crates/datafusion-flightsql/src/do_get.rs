@@ -37,9 +37,7 @@ pub(crate) async fn handle(
     };
 
     match Command::try_from(msg).map_err(to_tonic_err)? {
-        Command::CommandStatementQuery(cmd) => {
-            flightsql::statement_query::do_get(ctx, cmd).await
-        }
+        Command::CommandStatementQuery(cmd) => flightsql::statement_query::do_get(ctx, cmd).await,
         Command::CommandPreparedStatementQuery(cmd) => {
             Box::pin(flightsql::prepared_statement_query::do_get(ctx, cmd)).await
         }

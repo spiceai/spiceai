@@ -54,16 +54,16 @@ pub(crate) async fn do_get(
     let mut builder = query.into_builder();
 
     for catalog_name in catalogs {
-        let catalog = ctx.catalog(&catalog_name).ok_or_else(|| {
-            Status::internal(format!("catalog not found: {catalog_name}"))
-        })?;
+        let catalog = ctx
+            .catalog(&catalog_name)
+            .ok_or_else(|| Status::internal(format!("catalog not found: {catalog_name}")))?;
         for schema_name in catalog.schema_names() {
             builder.append(&catalog_name, schema_name);
         }
     }
 
     let record_batch = builder.build().map_err(to_tonic_err)?;
-    Ok(Response::new(Box::pin(record_batches_to_flight_stream(vec![
-        record_batch,
-    ]))))
+    Ok(Response::new(Box::pin(record_batches_to_flight_stream(
+        vec![record_batch],
+    ))))
 }

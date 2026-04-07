@@ -57,9 +57,9 @@ pub(crate) async fn do_get(
     let mut builder = query.into_builder();
 
     for catalog_name in catalogs {
-        let catalog = ctx.catalog(&catalog_name).ok_or_else(|| {
-            Status::internal(format!("catalog not found: {catalog_name}"))
-        })?;
+        let catalog = ctx
+            .catalog(&catalog_name)
+            .ok_or_else(|| Status::internal(format!("catalog not found: {catalog_name}")))?;
         for schema_name in catalog.schema_names() {
             let Some(schema_provider) = catalog.schema(&schema_name) else {
                 continue;
@@ -74,15 +74,21 @@ pub(crate) async fn do_get(
                 };
                 let table_type = table_type_name(table_provider.table_type());
                 let schema = with_native_types_metadata(table_provider.schema().as_ref());
-                builder.append(&catalog_name, &schema_name, &table_name, table_type, &schema)?;
+                builder.append(
+                    &catalog_name,
+                    &schema_name,
+                    &table_name,
+                    table_type,
+                    &schema,
+                )?;
             }
         }
     }
 
     let record_batch = builder.build().map_err(to_tonic_err)?;
-    Ok(Response::new(Box::pin(record_batches_to_flight_stream(vec![
-        record_batch,
-    ]))))
+    Ok(Response::new(Box::pin(record_batches_to_flight_stream(
+        vec![record_batch],
+    ))))
 }
 
 pub(crate) fn table_type_name(table_type: TableType) -> &'static str {

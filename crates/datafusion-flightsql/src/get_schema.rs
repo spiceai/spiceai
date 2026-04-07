@@ -17,8 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow_flight::{
-    FlightDescriptor, IpcMessage, SchemaAsIpc, SchemaResult,
-    flight_descriptor::DescriptorType,
+    FlightDescriptor, IpcMessage, SchemaAsIpc, SchemaResult, flight_descriptor::DescriptorType,
 };
 use arrow_ipc::writer::IpcWriteOptions;
 use datafusion::prelude::SessionContext;

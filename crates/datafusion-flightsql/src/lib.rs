@@ -60,17 +60,17 @@ use async_stream::try_stream;
 use bytes::Bytes;
 use datafusion::common::ParamValues;
 use datafusion::prelude::SessionContext;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use tonic::{Request, Response, Status, Streaming};
 
 mod actions;
 mod do_get;
 mod do_put;
+pub(crate) mod flightsql;
 mod get_flight_info;
 mod get_schema;
 mod handshake;
-pub(crate) mod flightsql;
 mod session;
 pub mod session_auth;
 pub(crate) mod util;
@@ -228,10 +228,7 @@ impl FlightSqlService {
         ctx: &Arc<SessionContext>,
         sql: &str,
     ) -> Result<Schema, Status> {
-        let df = ctx
-            .sql(sql)
-            .await
-            .map_err(handle_datafusion_error)?;
+        let df = ctx.sql(sql).await.map_err(handle_datafusion_error)?;
         let schema = df.schema().as_arrow().clone();
         Ok(arrow_tools::schema::expand_views_schema(&schema))
     }
@@ -250,10 +247,7 @@ impl FlightSqlService {
         sql: &str,
         parameters: Option<ParamValues>,
     ) -> Result<BoxStream<'static, Result<FlightData, Status>>, Status> {
-        let df = ctx
-            .sql(sql)
-            .await
-            .map_err(handle_datafusion_error)?;
+        let df = ctx.sql(sql).await.map_err(handle_datafusion_error)?;
 
         let df = if let Some(params) = parameters {
             df.with_param_values(params)
@@ -315,5 +309,3 @@ impl FlightSqlService {
         Ok(stream.boxed())
     }
 }
-
-

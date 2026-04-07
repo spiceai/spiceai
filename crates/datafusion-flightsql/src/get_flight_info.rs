@@ -81,8 +81,7 @@ async fn get_flight_info_simple(
     request: Request<FlightDescriptor>,
 ) -> Result<Response<FlightInfo>, Status> {
     let fd = request.into_inner();
-    let sql =
-        std::str::from_utf8(&fd.cmd).map_err(|e| Status::invalid_argument(e.to_string()))?;
+    let sql = std::str::from_utf8(&fd.cmd).map_err(|e| Status::invalid_argument(e.to_string()))?;
 
     let arrow_schema = FlightSqlService::get_arrow_schema(&ctx, sql).await?;
 

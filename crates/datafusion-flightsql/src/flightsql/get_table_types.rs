@@ -53,13 +53,10 @@ pub(crate) async fn do_get(
         table_type_name(TableType::Base),
         table_type_name(TableType::View),
     ];
-    let batch = RecordBatch::try_new(
-        Arc::new(schema),
-        vec![Arc::new(StringArray::from(types))],
-    )
-    .map_err(to_tonic_err)?;
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(StringArray::from(types))])
+        .map_err(to_tonic_err)?;
 
-    Ok(Response::new(Box::pin(record_batches_to_flight_stream(vec![
-        batch,
-    ]))))
+    Ok(Response::new(Box::pin(record_batches_to_flight_stream(
+        vec![batch],
+    ))))
 }

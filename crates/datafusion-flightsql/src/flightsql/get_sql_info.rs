@@ -72,33 +72,233 @@ pub(crate) async fn do_get(
 // ── Static SQL info keyword / function lists ──────────────────────────────────
 
 const SQL_INFO_SQL_KEYWORDS: &[&str] = &[
-    "absolute", "action", "add", "all", "allocate", "alter", "and", "any", "are", "as", "asc",
-    "assertion", "at", "authorization", "avg", "begin", "between", "bit", "bit_length", "both",
-    "by", "cascade", "cascaded", "case", "cast", "catalog", "char", "char_length", "character",
-    "character_length", "check", "close", "coalesce", "collate", "collation", "column", "commit",
-    "connect", "connection", "constraint", "constraints", "continue", "convert", "corresponding",
-    "count", "create", "cross", "current", "current_date", "current_time", "current_timestamp",
-    "current_user", "cursor", "date", "day", "deallocate", "dec", "decimal", "declare",
-    "default", "deferrable", "deferred", "delete", "desc", "describe", "descriptor",
-    "diagnostics", "disconnect", "distinct", "domain", "double", "drop", "else", "end",
-    "end-exec", "escape", "except", "exception", "exec", "execute", "exists", "external",
-    "extract", "false", "fetch", "first", "float", "for", "foreign", "found", "from", "full",
-    "get", "global", "go", "goto", "grant", "group", "having", "hour", "identity", "immediate",
-    "in", "indicator", "initially", "inner", "input", "insensitive", "insert", "int", "integer",
-    "intersect", "interval", "into", "is", "isolation", "join", "key", "language", "last",
-    "leading", "left", "level", "like", "local", "lower", "match", "max", "min", "minute",
-    "module", "month", "names", "national", "natural", "nchar", "next", "no", "not", "null",
-    "nullif", "numeric", "octet_length", "of", "on", "only", "open", "option", "or", "order",
-    "outer", "output", "overlaps", "pad", "partial", "position", "precision", "prepare",
-    "preserve", "primary", "prior", "privileges", "procedure", "public", "read", "real",
-    "references", "relative", "restrict", "revoke", "right", "rollback", "rows", "schema",
-    "scroll", "second", "section", "select", "session", "session_user", "set", "size",
-    "smallint", "some", "space", "sql", "sqlcode", "sqlerror", "sqlstate", "substring", "sum",
-    "system_user", "table", "temporary", "then", "time", "timestamp", "timezone_hour",
-    "timezone_minute", "to", "trailing", "transaction", "translate", "translation", "trim",
-    "true", "union", "unique", "unknown", "update", "upper", "usage", "user", "using", "value",
-    "values", "varchar", "varying", "view", "when", "whenever", "where", "with", "work",
-    "write", "year", "zone",
+    "absolute",
+    "action",
+    "add",
+    "all",
+    "allocate",
+    "alter",
+    "and",
+    "any",
+    "are",
+    "as",
+    "asc",
+    "assertion",
+    "at",
+    "authorization",
+    "avg",
+    "begin",
+    "between",
+    "bit",
+    "bit_length",
+    "both",
+    "by",
+    "cascade",
+    "cascaded",
+    "case",
+    "cast",
+    "catalog",
+    "char",
+    "char_length",
+    "character",
+    "character_length",
+    "check",
+    "close",
+    "coalesce",
+    "collate",
+    "collation",
+    "column",
+    "commit",
+    "connect",
+    "connection",
+    "constraint",
+    "constraints",
+    "continue",
+    "convert",
+    "corresponding",
+    "count",
+    "create",
+    "cross",
+    "current",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "cursor",
+    "date",
+    "day",
+    "deallocate",
+    "dec",
+    "decimal",
+    "declare",
+    "default",
+    "deferrable",
+    "deferred",
+    "delete",
+    "desc",
+    "describe",
+    "descriptor",
+    "diagnostics",
+    "disconnect",
+    "distinct",
+    "domain",
+    "double",
+    "drop",
+    "else",
+    "end",
+    "end-exec",
+    "escape",
+    "except",
+    "exception",
+    "exec",
+    "execute",
+    "exists",
+    "external",
+    "extract",
+    "false",
+    "fetch",
+    "first",
+    "float",
+    "for",
+    "foreign",
+    "found",
+    "from",
+    "full",
+    "get",
+    "global",
+    "go",
+    "goto",
+    "grant",
+    "group",
+    "having",
+    "hour",
+    "identity",
+    "immediate",
+    "in",
+    "indicator",
+    "initially",
+    "inner",
+    "input",
+    "insensitive",
+    "insert",
+    "int",
+    "integer",
+    "intersect",
+    "interval",
+    "into",
+    "is",
+    "isolation",
+    "join",
+    "key",
+    "language",
+    "last",
+    "leading",
+    "left",
+    "level",
+    "like",
+    "local",
+    "lower",
+    "match",
+    "max",
+    "min",
+    "minute",
+    "module",
+    "month",
+    "names",
+    "national",
+    "natural",
+    "nchar",
+    "next",
+    "no",
+    "not",
+    "null",
+    "nullif",
+    "numeric",
+    "octet_length",
+    "of",
+    "on",
+    "only",
+    "open",
+    "option",
+    "or",
+    "order",
+    "outer",
+    "output",
+    "overlaps",
+    "pad",
+    "partial",
+    "position",
+    "precision",
+    "prepare",
+    "preserve",
+    "primary",
+    "prior",
+    "privileges",
+    "procedure",
+    "public",
+    "read",
+    "real",
+    "references",
+    "relative",
+    "restrict",
+    "revoke",
+    "right",
+    "rollback",
+    "rows",
+    "schema",
+    "scroll",
+    "second",
+    "section",
+    "select",
+    "session",
+    "session_user",
+    "set",
+    "size",
+    "smallint",
+    "some",
+    "space",
+    "sql",
+    "sqlcode",
+    "sqlerror",
+    "sqlstate",
+    "substring",
+    "sum",
+    "system_user",
+    "table",
+    "temporary",
+    "then",
+    "time",
+    "timestamp",
+    "timezone_hour",
+    "timezone_minute",
+    "to",
+    "trailing",
+    "transaction",
+    "translate",
+    "translation",
+    "trim",
+    "true",
+    "union",
+    "unique",
+    "unknown",
+    "update",
+    "upper",
+    "usage",
+    "user",
+    "using",
+    "value",
+    "values",
+    "varchar",
+    "varying",
+    "view",
+    "when",
+    "whenever",
+    "where",
+    "with",
+    "work",
+    "write",
+    "year",
+    "zone",
 ];
 
 const SQL_INFO_NUMERIC_FUNCTIONS: &[&str] = &[
@@ -107,47 +307,111 @@ const SQL_INFO_NUMERIC_FUNCTIONS: &[&str] = &[
 ];
 
 const SQL_INFO_STRING_FUNCTIONS: &[&str] = &[
-    "arrow_typeof", "ascii", "bit_length", "btrim", "char_length", "character_length", "chr",
-    "concat", "concat_ws", "digest", "from_unixtime", "initcap", "left", "length", "lower",
-    "lpad", "ltrim", "md5", "octet_length", "random", "regexp_match", "regexp_replace", "repeat",
-    "replace", "reverse", "right", "rpad", "rtrim", "sha224", "sha256", "sha384", "sha512",
-    "split_part", "starts_with", "strpos", "substr", "to_hex", "translate", "trim", "upper",
+    "arrow_typeof",
+    "ascii",
+    "bit_length",
+    "btrim",
+    "char_length",
+    "character_length",
+    "chr",
+    "concat",
+    "concat_ws",
+    "digest",
+    "from_unixtime",
+    "initcap",
+    "left",
+    "length",
+    "lower",
+    "lpad",
+    "ltrim",
+    "md5",
+    "octet_length",
+    "random",
+    "regexp_match",
+    "regexp_replace",
+    "repeat",
+    "replace",
+    "reverse",
+    "right",
+    "rpad",
+    "rtrim",
+    "sha224",
+    "sha256",
+    "sha384",
+    "sha512",
+    "split_part",
+    "starts_with",
+    "strpos",
+    "substr",
+    "to_hex",
+    "translate",
+    "trim",
+    "upper",
     "uuid",
 ];
 
 const SQL_INFO_DATE_TIME_FUNCTIONS: &[&str] = &[
-    "current_date", "current_time", "date_bin", "date_part", "date_trunc", "datepart",
-    "datetrunc", "from_unixtime", "now", "to_timestamp", "to_timestamp_micros",
-    "to_timestamp_millis", "to_timestamp_seconds",
+    "current_date",
+    "current_time",
+    "date_bin",
+    "date_part",
+    "date_trunc",
+    "datepart",
+    "datetrunc",
+    "from_unixtime",
+    "now",
+    "to_timestamp",
+    "to_timestamp_micros",
+    "to_timestamp_millis",
+    "to_timestamp_seconds",
 ];
 
 const SQL_INFO_SYSTEM_FUNCTIONS: &[&str] = &["array", "arrow_typeof", "struct"];
 
-static SQL_DATA_TYPE_TO_ARROW_DATA_TYPE: std::sync::LazyLock<HashMap<SqlSupportsConvert, DataType>> =
-    std::sync::LazyLock::new(|| {
-        [
-            (SqlSupportsConvert::SqlConvertBigint, DataType::Int64),
-            (SqlSupportsConvert::SqlConvertBit, DataType::Boolean),
-            (SqlSupportsConvert::SqlConvertChar, DataType::Utf8),
-            (SqlSupportsConvert::SqlConvertDate, DataType::Date32),
-            (SqlSupportsConvert::SqlConvertDecimal, DataType::Decimal128(38, 2)),
-            (SqlSupportsConvert::SqlConvertFloat, DataType::Float32),
-            (SqlSupportsConvert::SqlConvertInteger, DataType::Int32),
-            (SqlSupportsConvert::SqlConvertIntervalDayTime, DataType::Interval(IntervalUnit::DayTime)),
-            (SqlSupportsConvert::SqlConvertIntervalYearMonth, DataType::Interval(IntervalUnit::YearMonth)),
-            (SqlSupportsConvert::SqlConvertLongvarchar, DataType::Utf8),
-            (SqlSupportsConvert::SqlConvertNumeric, DataType::Decimal128(38, 2)),
-            (SqlSupportsConvert::SqlConvertReal, DataType::Float32),
-            (SqlSupportsConvert::SqlConvertSmallint, DataType::Int16),
-            (SqlSupportsConvert::SqlConvertTime, DataType::Time64(TimeUnit::Nanosecond)),
-            (SqlSupportsConvert::SqlConvertTimestamp, DataType::Timestamp(TimeUnit::Nanosecond, None)),
-            (SqlSupportsConvert::SqlConvertTinyint, DataType::Int8),
-            (SqlSupportsConvert::SqlConvertVarchar, DataType::Utf8),
-        ]
-        .iter()
-        .cloned()
-        .collect()
-    });
+static SQL_DATA_TYPE_TO_ARROW_DATA_TYPE: std::sync::LazyLock<
+    HashMap<SqlSupportsConvert, DataType>,
+> = std::sync::LazyLock::new(|| {
+    [
+        (SqlSupportsConvert::SqlConvertBigint, DataType::Int64),
+        (SqlSupportsConvert::SqlConvertBit, DataType::Boolean),
+        (SqlSupportsConvert::SqlConvertChar, DataType::Utf8),
+        (SqlSupportsConvert::SqlConvertDate, DataType::Date32),
+        (
+            SqlSupportsConvert::SqlConvertDecimal,
+            DataType::Decimal128(38, 2),
+        ),
+        (SqlSupportsConvert::SqlConvertFloat, DataType::Float32),
+        (SqlSupportsConvert::SqlConvertInteger, DataType::Int32),
+        (
+            SqlSupportsConvert::SqlConvertIntervalDayTime,
+            DataType::Interval(IntervalUnit::DayTime),
+        ),
+        (
+            SqlSupportsConvert::SqlConvertIntervalYearMonth,
+            DataType::Interval(IntervalUnit::YearMonth),
+        ),
+        (SqlSupportsConvert::SqlConvertLongvarchar, DataType::Utf8),
+        (
+            SqlSupportsConvert::SqlConvertNumeric,
+            DataType::Decimal128(38, 2),
+        ),
+        (SqlSupportsConvert::SqlConvertReal, DataType::Float32),
+        (SqlSupportsConvert::SqlConvertSmallint, DataType::Int16),
+        (
+            SqlSupportsConvert::SqlConvertTime,
+            DataType::Time64(TimeUnit::Nanosecond),
+        ),
+        (
+            SqlSupportsConvert::SqlConvertTimestamp,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ),
+        (SqlSupportsConvert::SqlConvertTinyint, DataType::Int8),
+        (SqlSupportsConvert::SqlConvertVarchar, DataType::Utf8),
+    ]
+    .iter()
+    .cloned()
+    .collect()
+});
 
 pub(crate) static SQL_INFO_SUPPORTS_CONVERT: std::sync::LazyLock<HashMap<i32, Vec<i32>>> =
     std::sync::LazyLock::new(|| {
@@ -183,18 +447,30 @@ static INSTANCE: std::sync::LazyLock<SqlInfoData> = std::sync::LazyLock::new(|| 
     builder.append(SqlInfo::FlightSqlServerReadOnly, true);
     builder.append(SqlInfoFlightSqlServerSql, true);
     builder.append(SqlInfoFlightSqlServerSubstrait, false);
-    builder.append(SqlInfoFlightSqlServerTransaction, SqlSupportedTransactions::SqlTransactionUnspecified as i32);
+    builder.append(
+        SqlInfoFlightSqlServerTransaction,
+        SqlSupportedTransactions::SqlTransactionUnspecified as i32,
+    );
     builder.append(SqlInfoFlightSqlServerCancel, false);
     builder.append(SqlInfoFlightSqlServerStatementTimeout, 0i32);
     builder.append(SqlInfoFlightSqlServerTransactionTimeout, 0i32);
     builder.append(SqlInfo::SqlDdlCatalog, false);
     builder.append(SqlInfo::SqlDdlSchema, false);
     builder.append(SqlInfo::SqlDdlTable, false);
-    builder.append(SqlInfo::SqlIdentifierCase, SqlSupportedCaseSensitivity::SqlCaseSensitivityLowercase as i32);
+    builder.append(
+        SqlInfo::SqlIdentifierCase,
+        SqlSupportedCaseSensitivity::SqlCaseSensitivityLowercase as i32,
+    );
     builder.append(SqlInfo::SqlIdentifierQuoteChar, r#"""#);
-    builder.append(SqlInfo::SqlQuotedIdentifierCase, SqlSupportedCaseSensitivity::SqlCaseSensitivityCaseInsensitive as i32);
+    builder.append(
+        SqlInfo::SqlQuotedIdentifierCase,
+        SqlSupportedCaseSensitivity::SqlCaseSensitivityCaseInsensitive as i32,
+    );
     builder.append(SqlInfo::SqlAllTablesAreSelectable, true);
-    builder.append(SqlInfo::SqlNullOrdering, SqlNullOrdering::SqlNullsSortedHigh as i32);
+    builder.append(
+        SqlInfo::SqlNullOrdering,
+        SqlNullOrdering::SqlNullsSortedHigh as i32,
+    );
     builder.append(SqlInfo::SqlKeywords, SQL_INFO_SQL_KEYWORDS);
     builder.append(SqlInfo::SqlNumericFunctions, SQL_INFO_NUMERIC_FUNCTIONS);
     builder.append(SqlInfo::SqlStringFunctions, SQL_INFO_STRING_FUNCTIONS);
@@ -204,7 +480,10 @@ static INSTANCE: std::sync::LazyLock<SqlInfoData> = std::sync::LazyLock::new(|| 
     builder.append(SqlInfo::SqlExtraNameCharacters, "");
     builder.append(SqlInfo::SqlSupportsColumnAliasing, true);
     builder.append(SqlInfo::SqlNullPlusNullIsNull, true);
-    builder.append(SqlInfo::SqlSupportsConvert, SQL_INFO_SUPPORTS_CONVERT.clone());
+    builder.append(
+        SqlInfo::SqlSupportsConvert,
+        SQL_INFO_SUPPORTS_CONVERT.clone(),
+    );
     builder.append(SqlInfo::SqlSupportsTableCorrelationNames, false);
     builder.append(SqlInfo::SqlSupportsDifferentTableCorrelationNames, false);
     builder.append(SqlInfo::SqlSupportsExpressionsInOrderBy, true);
@@ -212,7 +491,10 @@ static INSTANCE: std::sync::LazyLock<SqlInfoData> = std::sync::LazyLock::new(|| 
     builder.append(SqlInfo::SqlSupportedGroupBy, 3i32);
     builder.append(SqlInfo::SqlSupportsLikeEscapeClause, true);
     builder.append(SqlInfo::SqlSupportsNonNullableColumns, true);
-    builder.append(SqlInfo::SqlSupportedGrammar, SupportedSqlGrammar::SqlCoreGrammar as i32);
+    builder.append(
+        SqlInfo::SqlSupportedGrammar,
+        SupportedSqlGrammar::SqlCoreGrammar as i32,
+    );
     builder.append(SqlInfo::SqlAnsi92SupportedLevel, 0b111_i32);
     builder.append(SqlInfo::SqlSupportsIntegrityEnhancementFacility, false);
     builder.append(SqlInfo::SqlOuterJoinsSupportLevel, 2i32);
@@ -254,10 +536,22 @@ static INSTANCE: std::sync::LazyLock<SqlInfoData> = std::sync::LazyLock::new(|| 
     builder.append(SqlInfo::SqlDataDefinitionCausesTransactionCommit, false);
     builder.append(SqlInfo::SqlDataDefinitionsInTransactionsIgnored, true);
     builder.append(SqlInfo::SqlSupportedResultSetTypes, 0i32);
-    builder.append(SqlInfo::SqlSupportedConcurrenciesForResultSetUnspecified, 0i32);
-    builder.append(SqlInfo::SqlSupportedConcurrenciesForResultSetForwardOnly, 0i32);
-    builder.append(SqlInfo::SqlSupportedConcurrenciesForResultSetScrollSensitive, 0i32);
-    builder.append(SqlInfo::SqlSupportedConcurrenciesForResultSetScrollInsensitive, 0i32);
+    builder.append(
+        SqlInfo::SqlSupportedConcurrenciesForResultSetUnspecified,
+        0i32,
+    );
+    builder.append(
+        SqlInfo::SqlSupportedConcurrenciesForResultSetForwardOnly,
+        0i32,
+    );
+    builder.append(
+        SqlInfo::SqlSupportedConcurrenciesForResultSetScrollSensitive,
+        0i32,
+    );
+    builder.append(
+        SqlInfo::SqlSupportedConcurrenciesForResultSetScrollInsensitive,
+        0i32,
+    );
     builder.append(SqlInfo::SqlBatchUpdatesSupported, false);
     builder.append(SqlInfo::SqlSavepointsSupported, false);
     builder.append(SqlInfo::SqlNamedParametersSupported, false);

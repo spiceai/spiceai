@@ -54,7 +54,7 @@ pub(crate) async fn do_get(
     }
     let record_batch = builder.build().map_err(to_tonic_err)?;
 
-    Ok(Response::new(Box::pin(record_batches_to_flight_stream(vec![
-        record_batch,
-    ]))))
+    Ok(Response::new(Box::pin(record_batches_to_flight_stream(
+        vec![record_batch],
+    ))))
 }

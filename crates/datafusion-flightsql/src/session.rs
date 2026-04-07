@@ -120,10 +120,7 @@ impl SessionStore {
     /// Look up the session context from gRPC request metadata, returning `None`
     /// when no recognisable session ID header is present.
     #[must_use]
-    pub fn get_session_from_metadata(
-        &self,
-        metadata: &MetadataMap,
-    ) -> Option<Arc<SessionContext>> {
+    pub fn get_session_from_metadata(&self, metadata: &MetadataMap) -> Option<Arc<SessionContext>> {
         let session_id = extract_session_id(metadata)?;
         self.get_session(&session_id)
     }
@@ -200,7 +197,10 @@ fn extract_session_id(metadata: &MetadataMap) -> Option<String> {
     }
     if let Some(v) = metadata.get("authorization") {
         if let Ok(s) = v.to_str() {
-            if let Some(t) = s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")) {
+            if let Some(t) = s
+                .strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+            {
                 return Some(t.to_string());
             }
         }
@@ -216,7 +216,10 @@ fn extract_session_id_from_headers(headers: &HeaderMap) -> Option<String> {
     }
     if let Some(v) = headers.get("authorization") {
         if let Ok(s) = v.to_str() {
-            if let Some(t) = s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")) {
+            if let Some(t) = s
+                .strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+            {
                 return Some(t.to_string());
             }
         }
@@ -258,9 +261,6 @@ mod tests {
             "authorization",
             "Bearer my-session".parse().expect("valid header value"),
         );
-        assert_eq!(
-            extract_session_id(&meta),
-            Some("my-session".to_string())
-        );
+        assert_eq!(extract_session_id(&meta), Some("my-session".to_string()));
     }
 }

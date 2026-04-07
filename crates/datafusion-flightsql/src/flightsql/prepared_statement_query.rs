@@ -159,13 +159,14 @@ fn convert_jdbc_parameter_placeholders(query: &str) -> Result<Cow<'_, str>, Erro
         return Ok(Cow::Borrowed(query));
     }
     let dialect = GenericDialect {};
-    let mut statements =
-        Parser::parse_sql(&dialect, query).context(InvalidQuerySnafu { query })?;
+    let mut statements = Parser::parse_sql(&dialect, query).context(InvalidQuerySnafu { query })?;
     ensure!(statements.len() == 1, MultipleStatementsSnafu);
     let Some(mut statement) = statements.pop() else {
         unreachable!("exactly one statement confirmed above");
     };
-    let mut visitor = ConvertJdbcPlaceholdersVisitor { next_placeholder: 1 };
+    let mut visitor = ConvertJdbcPlaceholdersVisitor {
+        next_placeholder: 1,
+    };
     visitor.visit_statement(&mut statement);
     Ok(Cow::Owned(statement.to_string()))
 }
@@ -212,10 +213,7 @@ pub(crate) async fn do_action_create_prepared_statement(
     ctx: Arc<SessionContext>,
     statement: sql::ActionCreatePreparedStatementRequest,
 ) -> Result<sql::ActionCreatePreparedStatementResult, Status> {
-    tracing::trace!(
-        "do_action_create_prepared_statement: {:?}",
-        statement.query
-    );
+    tracing::trace!("do_action_create_prepared_statement: {:?}", statement.query);
 
     let query = convert_jdbc_parameter_placeholders(&statement.query)
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
@@ -232,9 +230,7 @@ pub(crate) async fn do_action_create_prepared_statement(
                     || msg.contains("type inference")
                     || msg.contains("No field named")
                 {
-                    tracing::debug!(
-                        "schema inference deferred until execution: {msg}"
-                    );
+                    tracing::debug!("schema inference deferred until execution: {msg}");
                     (arrow::datatypes::Schema::empty(), None)
                 } else {
                     return Err(e);
@@ -332,8 +328,7 @@ pub(crate) async fn do_get(
         Cow::Borrowed(sql.as_str())
     };
 
-    let output =
-        FlightSqlService::sql_to_flight_stream(ctx, &sql_to_execute, param_values).await?;
+    let output = FlightSqlService::sql_to_flight_stream(ctx, &sql_to_execute, param_values).await?;
     Ok(Response::new(
         Box::pin(output) as <FlightSqlService as FlightService>::DoGetStream
     ))
@@ -347,8 +342,7 @@ pub(crate) async fn do_put_query(
 ) -> Result<Response<<FlightSqlService as FlightService>::DoPutStream>, Status> {
     tracing::debug!("do_put_query: binding parameters");
 
-    let streaming = streaming_flight
-        .map(|r| r.map_err(|s| FlightError::Tonic(Box::new(s))));
+    let streaming = streaming_flight.map(|r| r.map_err(|s| FlightError::Tonic(Box::new(s))));
     let mut decoder = FlightDataDecoder::new(streaming);
 
     let schema = decode_schema(&mut decoder).await?;
@@ -363,7 +357,7 @@ pub(crate) async fn do_put_query(
             DecodedPayload::Schema(_) => {
                 return Err(Status::invalid_argument(
                     "parameter flight data must contain a single schema",
-                ))
+                ));
             }
             DecodedPayload::RecordBatch(batch) => {
                 total_rows += batch.num_rows();
@@ -382,8 +376,8 @@ pub(crate) async fn do_put_query(
     // Persist the parameter schema for type-cast rewriting at execution time.
     let schema_bytes = {
         let mut bytes = Vec::new();
-        let mut writer =
-            arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &schema).map_err(error_to_status)?;
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &schema)
+            .map_err(error_to_status)?;
         writer.finish().map_err(error_to_status)?;
         bytes
     };
@@ -413,7 +407,7 @@ async fn decode_schema(decoder: &mut FlightDataDecoder) -> Result<SchemaRef, Sta
             DecodedPayload::RecordBatch(_) => {
                 return Err(Status::invalid_argument(
                     "parameter flight data must have a known schema",
-                ))
+                ));
             }
         }
     }

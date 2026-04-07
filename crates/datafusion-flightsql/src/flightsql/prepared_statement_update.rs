@@ -35,8 +35,8 @@ use std::sync::LazyLock;
 use tokio_stream::adapters::Peekable;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::{FlightSqlService, handle_datafusion_error, to_tonic_err};
 use super::prepared_statement_query::{PreparedStatement, decode_param_values, error_to_status};
+use crate::{FlightSqlService, handle_datafusion_error, to_tonic_err};
 
 static AFFECTED_ROWS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![Field::new(
@@ -78,7 +78,8 @@ pub(crate) async fn do_get(
 
     let df = ctx.sql(&sql).await.map_err(handle_datafusion_error)?;
     let df = if let Some(params) = param_values {
-        df.with_param_values(params).map_err(handle_datafusion_error)?
+        df.with_param_values(params)
+            .map_err(handle_datafusion_error)?
     } else {
         df
     };
@@ -101,9 +102,10 @@ pub(crate) async fn do_put_update(
     query: CommandPreparedStatementUpdate,
     streaming_flight: Peekable<Streaming<FlightData>>,
 ) -> Result<Response<<FlightSqlService as FlightService>::DoPutStream>, Status> {
-    let streaming = tokio_stream::StreamExt::map(streaming_flight, |r: Result<FlightData, tonic::Status>| {
-        r.map_err(|s| FlightError::Tonic(Box::new(s)))
-    });
+    let streaming =
+        tokio_stream::StreamExt::map(streaming_flight, |r: Result<FlightData, tonic::Status>| {
+            r.map_err(|s| FlightError::Tonic(Box::new(s)))
+        });
     let mut decoder = FlightDataDecoder::new(streaming);
     let schema = decode_schema(&mut decoder).await?;
 
@@ -117,7 +119,7 @@ pub(crate) async fn do_put_update(
             DecodedPayload::Schema(_) => {
                 return Err(Status::invalid_argument(
                     "parameter flight data must contain a single schema",
-                ))
+                ));
             }
             DecodedPayload::RecordBatch(batch) => {
                 total_rows += batch.num_rows();
@@ -155,7 +157,7 @@ async fn decode_schema(decoder: &mut FlightDataDecoder) -> Result<SchemaRef, Sta
             DecodedPayload::RecordBatch(_) => {
                 return Err(Status::invalid_argument(
                     "parameter flight data must have a known schema",
-                ))
+                ));
             }
         }
     }

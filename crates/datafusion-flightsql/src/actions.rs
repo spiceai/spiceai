@@ -83,7 +83,5 @@ pub(crate) fn list() -> Response<BoxStream<'static, Result<ActionType, Status>>>
             description: "Closes a prepared statement resource on the server.".to_string(),
         },
     ];
-    Response::new(Box::pin(futures::stream::iter(
-        actions.into_iter().map(Ok),
-    )))
+    Response::new(Box::pin(futures::stream::iter(actions.into_iter().map(Ok))))
 }
