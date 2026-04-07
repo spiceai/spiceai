@@ -1489,7 +1489,7 @@ impl SensitiveListingTableUrl {
 /// Always sets `pushdown_filters = true`. When a runtime is provided, reads
 /// `runtime.params.parquet_page_index` (`required` | `auto` | `skip`) and
 /// sets `enable_page_index` accordingly. When no runtime is available,
-/// `enable_page_index` retains the DataFusion default (`true`).
+/// `enable_page_index` retains the `DataFusion` default (`true`).
 pub async fn build_table_parquet_options(
     runtime: Option<&Runtime>,
 ) -> std::result::Result<TableParquetOptions, DataFusionError> {
