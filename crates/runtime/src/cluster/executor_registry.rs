@@ -41,6 +41,7 @@ use crate::{
         PartitionManager,
         partition::{PartitionValue, executor_selection},
     },
+    status::ComponentStatus,
 };
 
 /// Error type for executor registry operations.
@@ -142,6 +143,10 @@ pub struct ExecutorRegistry {
     accelerations_partition_manager: Arc<PartitionManager>,
 
     federated_partition_manager: Arc<PartitionManager>,
+
+    /// Per-executor dataset statuses reported via heartbeats and `DatasetStatusChange` messages.
+    /// Outer key: `executor_id`, inner key: dataset name, value: reported `ComponentStatus`.
+    executor_dataset_statuses: Arc<RwLock<HashMap<String, HashMap<String, ComponentStatus>>>>,
 }
 
 impl ExecutorRegistry {
@@ -156,6 +161,7 @@ impl ExecutorRegistry {
             flight_sql_clients: Arc::new(RwLock::new(HashMap::new())),
             accelerations_partition_manager,
             federated_partition_manager,
+            executor_dataset_statuses: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -192,18 +198,54 @@ impl ExecutorRegistry {
         pending_requests
     }
 
-    /// Unregisters an executor connection.
+    /// Unregisters an executor connection and cleans up its dataset statuses.
     pub async fn unregister(&self, executor_id: &str) {
         let mut connections = self.connections.write().await;
         if connections.remove(executor_id).is_some() {
             tracing::debug!("Executor {executor_id} disconnected");
         }
+        drop(connections);
+
+        let mut statuses = self.executor_dataset_statuses.write().await;
+        statuses.remove(executor_id);
     }
 
     /// Returns the list of currently connected executor IDs.
     pub async fn connected_executors(&self) -> Vec<String> {
         let connections = self.connections.read().await;
         connections.keys().cloned().collect()
+    }
+
+    /// Updates a single dataset status for an executor (from `DatasetStatusChange` messages).
+    pub async fn update_executor_dataset_status(
+        &self,
+        executor_id: &str,
+        dataset: &str,
+        status: ComponentStatus,
+    ) {
+        let mut statuses = self.executor_dataset_statuses.write().await;
+        statuses
+            .entry(executor_id.to_string())
+            .or_default()
+            .insert(dataset.to_string(), status);
+    }
+
+    /// Replaces the full dataset status snapshot for an executor (from heartbeat reconciliation).
+    pub async fn replace_executor_dataset_statuses(
+        &self,
+        executor_id: &str,
+        dataset_statuses: HashMap<String, ComponentStatus>,
+    ) {
+        let mut statuses = self.executor_dataset_statuses.write().await;
+        statuses.insert(executor_id.to_string(), dataset_statuses);
+    }
+
+    /// Returns a snapshot of all per-executor dataset statuses.
+    pub async fn get_executor_dataset_statuses(
+        &self,
+    ) -> HashMap<String, HashMap<String, ComponentStatus>> {
+        let statuses = self.executor_dataset_statuses.read().await;
+        statuses.clone()
     }
 
     /// Sends a control message to a specific executor.

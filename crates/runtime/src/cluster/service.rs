@@ -69,6 +69,7 @@ use tonic::{
     transport::{ClientTlsConfig, Endpoint},
 };
 
+use crate::cluster::partition::dataset_status::evaluate_dataset_readiness;
 use crate::cluster::{
     SchedulerPeers, executor_registry::ExecutorRegistry, partition::allocate_initial_partitions,
 };
@@ -181,6 +182,8 @@ pub struct ClusterServiceImpl {
     metrics_reader: Option<MetricsReader>,
     /// Registry of connected executor streams for [`PollNow`] broadcasts.
     executor_streams: ExecutorControlStreamRegistry,
+    /// Runtime status for updating dataset statuses on the scheduler.
+    runtime_status: Arc<crate::status::RuntimeStatus>,
 }
 
 impl ClusterServiceImpl {
@@ -194,6 +197,7 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
+        runtime_status: Arc<crate::status::RuntimeStatus>,
     ) -> Self {
         Self {
             app,
@@ -204,6 +208,7 @@ impl ClusterServiceImpl {
             executor_registry,
             metrics_reader,
             executor_streams: ExecutorControlStreamRegistry::new(),
+            runtime_status,
         }
     }
 
@@ -222,6 +227,7 @@ impl ClusterServiceImpl {
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
         executor_streams: ExecutorControlStreamRegistry,
+        runtime_status: Arc<crate::status::RuntimeStatus>,
     ) -> Self {
         Self {
             app,
@@ -231,8 +237,8 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
-
             executor_streams,
+            runtime_status,
         }
     }
 
@@ -470,9 +476,12 @@ impl ClusterService for ClusterServiceImpl {
         // Spawn a task to handle the bidirectional stream.
         let executor_registry = Arc::clone(&self.executor_registry);
         let datafusion = Arc::clone(&self.datafusion);
+        let runtime_status = self.runtime_status.clone();
         let outbound_tx_for_registry = outbound_tx.clone();
+        let outbound_tx_for_task = outbound_tx.clone();
         let metrics_node_id = self.advertise_address.clone();
         let inbound_task = tokio::spawn(async move {
+            let outbound_tx = outbound_tx_for_task;
             let executor_id = match inbound.next().await {
                 Some(Ok(msg)) => {
                     let executor_id = msg.executor_id.clone();
@@ -484,7 +493,15 @@ impl ClusterService for ClusterServiceImpl {
 
                     // Handle the first message if it contains data.
                     if let Some(message) = msg.message {
-                        handle_executor_message(&executor_id, &message, &datafusion).await;
+                        handle_executor_message(
+                            &executor_id,
+                            &message,
+                            &datafusion,
+                            &executor_registry,
+                            &runtime_status,
+                            &outbound_tx,
+                        )
+                        .await;
                     }
                     executor_id
                 }
@@ -536,6 +553,9 @@ impl ClusterService for ClusterServiceImpl {
                                             &executor_id,
                                             &message,
                                             &datafusion,
+                                            &executor_registry,
+                                            &runtime_status,
+                                            &outbound_tx,
                                         )
                                         .await;
                                     }
@@ -707,11 +727,14 @@ fn create_executor_flight_client(
     ))
 }
 
-/// Handles an executor control message (heartbeat, shutdown, etc.)
+/// Handles an executor control message (heartbeat, shutdown, component status update, etc.)
 async fn handle_executor_message(
     executor_id: &str,
     message: &ExecutorMessage,
     datafusion: &DataFusion,
+    executor_registry: &ExecutorRegistry,
+    runtime_status: &Arc<crate::status::RuntimeStatus>,
+    outbound_tx: &mpsc::Sender<SchedulerControlMessage>,
 ) {
     match message {
         ExecutorMessage::Heartbeat(heartbeat) => {
@@ -719,6 +742,42 @@ async fn handle_executor_message(
                 "Received heartbeat from executor {executor_id}: timestamp_ms={}",
                 heartbeat.timestamp_ms
             );
+        }
+        ExecutorMessage::ComponentStatus(update) => {
+            tracing::debug!(
+                "Received ComponentStatusUpdate from executor {executor_id}: component={}, status={}, update_id={}",
+                update.component_name,
+                update.status,
+                update.update_id
+            );
+            let status = crate::cluster::proto_conv::component_status_from_proto(update.status);
+
+            // Extract dataset name from "dataset:xxx" component_name
+            if let Some(dataset_name) = update.component_name.strip_prefix("dataset:") {
+                executor_registry
+                    .update_executor_dataset_status(executor_id, dataset_name, status)
+                    .await;
+                evaluate_dataset_readiness(
+                    dataset_name,
+                    &executor_registry.accelerations_partition_manager(),
+                    runtime_status,
+                    &executor_registry.get_executor_dataset_statuses().await,
+                );
+            }
+
+            // Send ack
+            let ack = SchedulerControlMessage {
+                message: Some(
+                    runtime_proto::scheduler_control_message::Message::ComponentStatusAck(
+                        runtime_proto::ComponentStatusAck {
+                            update_id: update.update_id.clone(),
+                        },
+                    ),
+                ),
+            };
+            if let Err(e) = outbound_tx.send(ack).await {
+                tracing::debug!("Failed to send ComponentStatusAck to executor {executor_id}: {e}");
+            }
         }
         ExecutorMessage::Metrics(_) => {
             // Metrics responses are handled separately in the stream handler
