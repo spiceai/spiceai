@@ -211,7 +211,11 @@ impl UserDefinedLogicalNodeCore for CayenneCreateTableNode {
             f,
             "CayenneCreateTable: {}.{}.{}",
             self.df_catalog_name, self.df_schema_name, self.table_name
-        )
+        )?;
+        if let Some(ref source) = self.like_source_table {
+            write!(f, " (LIKE {source})")?;
+        }
+        Ok(())
     }
 
     fn with_exprs_and_inputs(

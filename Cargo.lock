@@ -3492,6 +3492,7 @@ dependencies = [
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-federation",
+ "datafusion-functions",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
  "datafusion-table-providers",
