@@ -199,15 +199,13 @@ fn commits_filter_pushdown(expr: &Expr) -> FilterPushdownResult {
     if let Some((column, value, op)) = expr_to_match(expr)
         && column.name == "ref"
     {
-        return match op {
-            Operator::Eq if scalar_utf8_value(&value).is_some_and(|v| !v.is_empty()) => {
-                let ref_value = scalar_utf8_value(&value).expect("checked above");
-                FilterPushdownResult {
-                    filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Exact,
-                    expr: expr.clone(),
-                    context: Some(format!("ref:{ref_value}")),
-                }
-            }
+        let ref_value = scalar_utf8_value(&value).filter(|v| !v.is_empty());
+        return match (op, ref_value) {
+            (Operator::Eq, Some(ref_value)) => FilterPushdownResult {
+                filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Exact,
+                expr: expr.clone(),
+                context: Some(format!("ref:{ref_value}")),
+            },
             _ => FilterPushdownResult {
                 filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Unsupported,
                 expr: expr.clone(),
@@ -253,14 +251,9 @@ fn requested_ref_from_filter(
             if let Some((column, value, op)) = expr_to_match(expr)
                 && column.name == "ref"
             {
-                return match op {
-                    Operator::Eq if scalar_utf8_value(&value).is_some_and(|v| !v.is_empty()) => {
-                        Ok(Some(
-                            scalar_utf8_value(&value)
-                                .expect("checked above")
-                                .to_string(),
-                        ))
-                    }
+                let ref_value = scalar_utf8_value(&value).filter(|v| !v.is_empty());
+                return match (op, ref_value) {
+                    (Operator::Eq, Some(v)) => Ok(Some(v.to_string())),
                     _ => Err(unsupported_ref_filter_error()),
                 };
             }
