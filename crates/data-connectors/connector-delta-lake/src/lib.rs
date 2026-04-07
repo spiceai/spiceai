@@ -137,9 +137,7 @@ impl DataConnectorFactory for DeltaLakeFactory {
                 );
             }
 
-            let parquet_opts = build_table_parquet_options(params.runtime.as_deref())
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            let parquet_opts = build_table_parquet_options(params.runtime.as_deref()).await?;
 
             tracing::debug!(
                 ?parquet_opts,
