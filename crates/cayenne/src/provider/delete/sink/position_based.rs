@@ -489,8 +489,9 @@ fn build_vortex_filter(
             Ok(expr) => expr,
             Err(_) => {
                 match try_decompose_struct_in_list(phys_filter.as_ref(), &expr_convertor, df_schema)
-                    .or_else(|| try_decompose_struct_eq(phys_filter.as_ref(), &expr_convertor, df_schema))
-                {
+                    .or_else(|| {
+                        try_decompose_struct_eq(phys_filter.as_ref(), &expr_convertor, df_schema)
+                    }) {
                     Some(decomposed) => decomposed,
                     None => {
                         return Err(format!(
@@ -661,8 +662,7 @@ fn try_decompose_struct_eq(
     let arrow_schema: arrow::datatypes::Schema = df_schema.as_arrow().as_ref().clone();
     let mut vortex_columns: Vec<vortex::expr::Expression> =
         Vec::with_capacity(struct_fn.args().len());
-    let mut col_types: Vec<arrow::datatypes::DataType> =
-        Vec::with_capacity(struct_fn.args().len());
+    let mut col_types: Vec<arrow::datatypes::DataType> = Vec::with_capacity(struct_fn.args().len());
     for arg in struct_fn.args() {
         let vx = convertor.convert(arg.as_ref()).ok()?;
         let dt = arg.data_type(&arrow_schema).ok()?;
@@ -776,17 +776,12 @@ mod tests {
             .enumerate()
             .map(|(i, sv)| {
                 let arr = sv.to_array().unwrap();
-                let field = Arc::new(Field::new(
-                    format!("c{i}"),
-                    arr.data_type().clone(),
-                    true,
-                ));
+                let field = Arc::new(Field::new(format!("c{i}"), arr.data_type().clone(), true));
                 (field, arr)
             })
             .unzip();
 
-        let struct_arr =
-            arrow::array::StructArray::new(fields.into(), arrays, None);
+        let struct_arr = arrow::array::StructArray::new(fields.into(), arrays, None);
         ScalarValue::Struct(Arc::new(struct_arr))
     }
 
@@ -838,9 +833,9 @@ mod tests {
         let expr = Arc::new(BinaryExpr::new(
             make_struct_fn(&["k1"], &schema),
             datafusion_expr::Operator::Eq,
-            Arc::new(Literal::new(make_struct_literal(&[
-                ScalarValue::Int64(Some(99)),
-            ]))),
+            Arc::new(Literal::new(make_struct_literal(&[ScalarValue::Int64(
+                Some(99),
+            )]))),
         ));
 
         let result = try_decompose_struct_eq(expr.as_ref(), &convertor, &df_schema);
@@ -1001,9 +996,8 @@ mod tests {
         let schema = Schema::new(vec![Field::new("k1", DataType::Int32, false)]);
         let df_schema = DFSchema::try_from(schema).unwrap();
 
-        let filters = vec![
-            datafusion_expr::col("k1").eq(datafusion_expr::lit(ScalarValue::Int32(Some(7)))),
-        ];
+        let filters =
+            vec![datafusion_expr::col("k1").eq(datafusion_expr::lit(ScalarValue::Int32(Some(7))))];
         let result = build_vortex_filter(&filters, &df_schema).unwrap();
         assert!(result.is_some());
     }
@@ -1018,9 +1012,8 @@ mod tests {
 
         let filters = vec![
             datafusion_expr::col("k1").eq(datafusion_expr::lit(ScalarValue::Int32(Some(1)))),
-            datafusion_expr::col("k2").eq(datafusion_expr::lit(ScalarValue::Utf8(Some(
-                "a".into(),
-            )))),
+            datafusion_expr::col("k2")
+                .eq(datafusion_expr::lit(ScalarValue::Utf8(Some("a".into())))),
         ];
         let result = build_vortex_filter(&filters, &df_schema).unwrap();
         let expected = vortex::expr::and(
