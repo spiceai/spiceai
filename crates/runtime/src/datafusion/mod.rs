@@ -2721,6 +2721,7 @@ impl DataFusion {
             cluster_role: self.cluster_config.effective_role(),
             ddl_extension_store: Arc::clone(&self.ddl_extension_store),
             executor_registry: self.executor_registry.clone(),
+            ddl_handler: None,
         };
 
         planner::create_logical_plan(sql, session, &ctx).await

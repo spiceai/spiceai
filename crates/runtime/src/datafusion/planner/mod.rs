@@ -57,9 +57,8 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 
 use crate::accelerated_table::AcceleratedTable;
 use crate::config::ClusterRole;
-use crate::datafusion::ddl::acceleration_options::SharedDdlExtensionStore;
-
-use super::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use datafusion_ddl::{SharedDdlExtensionStore, has_ddl_extensions};
 
 /// The type of catalog backing the planner's DML interception.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +89,11 @@ pub struct PlannerContext {
     /// Used by `CREATE TABLE ... LIKE` to resolve auto-generated partition
     /// labels (e.g. `expr0`) back to the original SQL expression.
     pub executor_registry: Option<Arc<crate::cluster::executor_registry::ExecutorRegistry>>,
+
+    /// DDL handler for `CREATE TABLE ... LIKE`.
+    /// Used to produce a [`datafusion_ddl::DdlExtensionNode`] for the LIKE path,
+    /// bypassing the standard analyzer rule.
+    pub ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
 }
 
 /// Create a [`LogicalPlan`] from SQL, intercepting DDL extensions and
@@ -111,7 +115,7 @@ pub async fn create_logical_plan(
             // Reject LIKE combined with DDL extensions (PARTITION BY, WITH)
             // since LIKE inherits everything from the source table.
             SQLStatement::CreateTable(ct) if ct.like.is_some() => {
-                if create_table::has_ddl_extensions(ct) {
+                if has_ddl_extensions(ct) {
                     return Err(DataFusionError::Plan(
                         "CREATE TABLE ... LIKE cannot be combined with PARTITION BY or WITH options. \
                          The LIKE clause copies all properties from the source table."
@@ -124,7 +128,7 @@ pub async fn create_logical_plan(
             // DDL: CREATE TABLE with extensions (WITH options, PARTITION BY).
             // Intercepted regardless of catalog mode — extensions apply to
             // all catalog types (Cayenne, Iceberg, etc.).
-            SQLStatement::CreateTable(ct) if create_table::has_ddl_extensions(ct) => {
+            SQLStatement::CreateTable(ct) if has_ddl_extensions(ct) => {
                 return create_table::plan_create_table(
                     statement,
                     session,
