@@ -478,9 +478,20 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                     "id",
                 ))
                 .with_runtime(SpicepodRuntime {
-                    scheduler: Some(make_named_scheduler_config(
-                        "test_distributed_acceleration_join_two_partitioned_tables",
-                    )),
+                    scheduler: Some({
+                        let mut cfg = make_named_scheduler_config(
+                            "test_distributed_acceleration_join_two_partitioned_tables",
+                        );
+                        // Limit each executor to 2 of the 4 partitions per table so
+                        // that partitions are forced to split across the 2 executors,
+                        // producing a UnionExec in the query plan.
+                        cfg.partition_management = Some(PartitionManagement {
+                            interval: "1s".to_string(),
+                            max_partitions_per_executor: 2,
+                            ..Default::default()
+                        });
+                        cfg
+                    }),
                     ..SpicepodRuntime::default()
                 })
                 .build();
