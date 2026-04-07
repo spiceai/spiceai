@@ -21,12 +21,15 @@ limitations under the License.
 //! schedulers.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use arrow::compute::{SortOptions, sort_to_indices, take};
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use data_components::flightsql::FlightSqlClient;
 use datafusion::catalog::Session;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::TableProvider;
@@ -37,6 +40,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::execution_plan::execute_stream;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
+use flight_client::cookie::CookieStore;
 use futures::TryStreamExt;
 use futures::future::join_all;
 use runtime_proto::GetTaskHistoryRequest;
@@ -48,33 +52,36 @@ use crate::cluster::SchedulerPeers;
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
 use crate::task_history::DEFAULT_TASK_HISTORY_TABLE;
 
-/// A federated table provider that queries task history across all schedulers.
+/// A federated table provider that queries task history across all nodes in a cluster.
 ///
 /// When `scan()` is called, this provider:
 /// 1. Queries the local `task_history` table directly (via stored reference)
 /// 2. Fans out to all peer schedulers via the `GetTaskHistory` RPC
-/// 3. Combines all results into a single result set
+/// 3. Fans out to all connected executors via `FlightSQL`
+/// 4. Combines all results into a single result set sorted by `start_time`
 ///
-/// If any peer fails, the entire query fails with an error containing
-/// the identifiers of the failed peers.
+/// If any peer or executor fails, the entire query fails with an error containing
+/// the identifiers of the failed nodes.
 pub struct FederatedTaskHistoryTable {
-    /// Schema for the `task_history` table (with `scheduler_id` column)
+    /// Schema for the `task_history` table (with `node_id` column)
     schema: SchemaRef,
     /// Local `task_history` table provider (direct reference to avoid recursion)
     local_table: Arc<dyn TableProvider>,
     /// Peer schedulers for fan-out queries
     scheduler_peers: Arc<RwLock<SchedulerPeers>>,
+    /// `FlightSQL` clients for connected executors
+    executor_flight_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
     /// TLS configuration for connecting to peer schedulers
     client_tls_config: Option<ClientTlsConfig>,
     /// This scheduler's advertise address (to exclude from peer queries)
-    local_scheduler_id: String,
+    local_node_id: String,
 }
 
 impl std::fmt::Debug for FederatedTaskHistoryTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FederatedTaskHistoryTable")
             .field("schema", &self.schema)
-            .field("local_scheduler_id", &self.local_scheduler_id)
+            .field("local_node_id", &self.local_node_id)
             .finish_non_exhaustive()
     }
 }
@@ -86,15 +93,17 @@ impl FederatedTaskHistoryTable {
         schema: SchemaRef,
         local_table: Arc<dyn TableProvider>,
         scheduler_peers: Arc<RwLock<SchedulerPeers>>,
+        executor_flight_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
         client_tls_config: Option<ClientTlsConfig>,
-        local_scheduler_id: String,
+        local_node_id: String,
     ) -> Self {
         Self {
             schema,
             local_table,
             scheduler_peers,
+            executor_flight_clients,
             client_tls_config,
-            local_scheduler_id,
+            local_node_id,
         }
     }
 
@@ -157,6 +166,21 @@ impl FederatedTaskHistoryTable {
         Ok(batches)
     }
 
+    /// Executes a query against a single executor via `FlightSQL`.
+    async fn query_executor(
+        executor_id: String,
+        client: FlightSqlClient,
+        sql: String,
+    ) -> Result<Vec<RecordBatch>, (String, String)> {
+        let cookie_store = Arc::new(CookieStore::new());
+        let batches: Vec<RecordBatch> =
+            data_components::flightsql::query_to_stream(client, sql, cookie_store)
+                .try_collect()
+                .await
+                .map_err(|e| (executor_id, format!("FlightSQL query failed: {e}")))?;
+        Ok(batches)
+    }
+
     /// Executes a scan directly on the local table provider.
     async fn query_local(
         local_table: Arc<dyn TableProvider>,
@@ -208,21 +232,31 @@ impl TableProvider for FederatedTaskHistoryTable {
         let peers = self.scheduler_peers.read().await;
         let peer_addresses: Vec<String> = peers
             .keys()
-            .filter(|addr| *addr != &self.local_scheduler_id)
+            .filter(|addr| *addr != &self.local_node_id)
             .cloned()
             .collect();
         drop(peers);
 
-        // Build the SQL query to send to peers
+        // Get the list of connected executors' FlightSQL clients
+        let executor_clients: Vec<(String, FlightSqlClient)> = {
+            let clients = self.executor_flight_clients.read().await;
+            clients
+                .iter()
+                .map(|(id, client)| (id.clone(), client.clone()))
+                .collect()
+        };
+
+        // Build the SQL query to send to peers and executors
         let table_ref = format!("\"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\"");
-        let sql = build_peer_sql(&table_ref, filters, limit);
+        let sql = build_peer_sql(&table_ref, filters, limit)?;
 
         tracing::debug!(
-            "FederatedTaskHistoryTable executing federated query to {} peers: {sql}",
-            peer_addresses.len()
+            "FederatedTaskHistoryTable executing federated query to {} peers and {} executors: {sql}",
+            peer_addresses.len(),
+            executor_clients.len(),
         );
 
-        // Fan out to all peers in parallel
+        // Fan out to all peer schedulers in parallel
         let peer_futures: Vec<_> = peer_addresses
             .into_iter()
             .map(|addr| {
@@ -232,18 +266,28 @@ impl TableProvider for FederatedTaskHistoryTable {
             })
             .collect();
 
+        // Fan out to all executors via FlightSQL in parallel
+        let executor_futures: Vec<_> = executor_clients
+            .into_iter()
+            .map(|(executor_id, client)| {
+                let sql = sql.clone();
+                async move { Self::query_executor(executor_id, client, sql).await }
+            })
+            .collect();
+
         // Execute local query directly on the stored table provider
         let local_table = Arc::clone(&self.local_table);
         let local_filters: Vec<Expr> = filters.to_vec();
         let local_limit = limit;
 
         // Query local batches with the full schema and apply projection once after
-        // federating local + peer results.
+        // federating local + peer + executor results.
         let local_result =
             Self::query_local(local_table, state, None, &local_filters, local_limit).await;
 
-        // Wait for all peer results
-        let peer_results = join_all(peer_futures).await;
+        // Wait for all peer and executor results
+        let (peer_results, executor_results) =
+            futures::join!(join_all(peer_futures), join_all(executor_futures));
 
         // Collect all results, tracking failures
         let mut all_batches = Vec::new();
@@ -251,23 +295,33 @@ impl TableProvider for FederatedTaskHistoryTable {
 
         match local_result {
             Ok(batches) => all_batches.extend(batches),
-            Err((peer, error)) => failures.push(format!("{peer}: {error}")),
+            Err((node, error)) => failures.push(format!("{node}: {error}")),
         }
 
         for result in peer_results {
             match result {
                 Ok(batches) => all_batches.extend(batches),
-                Err((peer, error)) => failures.push(format!("{peer}: {error}")),
+                Err((node, error)) => failures.push(format!("{node}: {error}")),
             }
         }
 
-        // If any peer failed, return an error
+        for result in executor_results {
+            match result {
+                Ok(batches) => all_batches.extend(batches),
+                Err((node, error)) => failures.push(format!("{node}: {error}")),
+            }
+        }
+
+        // If any node failed, return an error
         if !failures.is_empty() {
             return Err(DataFusionError::Execution(format!(
-                "Failed to collect cluster task history: peers failed: [{}]",
+                "Failed to collect cluster task history: nodes failed: [{}]",
                 failures.join(", ")
             )));
         }
+
+        // Sort combined results by start_time
+        let all_batches = sort_batches_by_start_time(&all_batches, &self.schema)?;
 
         // Build the execution plan from the collected batches. Keep the source
         // schema unprojected and let MemorySourceConfig apply projection once.
@@ -285,8 +339,8 @@ impl TableProvider for FederatedTaskHistoryTable {
 
     /// Delegate inserts to the local task history table.
     ///
-    /// The federated table only federates reads across schedulers. Writes always
-    /// go to the local table since each scheduler manages its own task history.
+    /// The federated table only federates reads across cluster nodes. Writes always
+    /// go to the local table since each node manages its own task history.
     async fn insert_into(
         &self,
         state: &dyn Session,
@@ -297,28 +351,89 @@ impl TableProvider for FederatedTaskHistoryTable {
     }
 }
 
-/// Builds the SQL query to send to peer schedulers.
-fn build_peer_sql(table_ref: &str, filters: &[Expr], limit: Option<usize>) -> String {
+/// Sorts the collected record batches by the `start_time` column (ascending).
+///
+/// Concatenates all batches, sorts by `start_time`, and returns a single sorted batch.
+/// Returns an empty vec if the input is empty, or a single concatenated (unsorted) batch
+/// if the `start_time` column is missing from the schema.
+fn sort_batches_by_start_time(
+    batches: &[RecordBatch],
+    schema: &SchemaRef,
+) -> DataFusionResult<Vec<RecordBatch>> {
+    let non_empty: Vec<&RecordBatch> = batches.iter().filter(|b| b.num_rows() > 0).collect();
+    if non_empty.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let concatenated = arrow::compute::concat_batches(schema, non_empty.into_iter())
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+    let Ok(start_time_idx) = schema.index_of("start_time") else {
+        return Ok(vec![concatenated]);
+    };
+
+    let sort_column = concatenated.column(start_time_idx);
+    let indices = sort_to_indices(
+        sort_column,
+        Some(SortOptions {
+            descending: false,
+            nulls_first: false,
+        }),
+        None,
+    )
+    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+    let sorted_columns: Vec<_> = concatenated
+        .columns()
+        .iter()
+        .map(|col| take(col.as_ref(), &indices, None))
+        .collect::<Result<_, _>>()
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+    let sorted_batch = RecordBatch::try_new(Arc::clone(schema), sorted_columns)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+    Ok(vec![sorted_batch])
+}
+
+/// Builds the SQL query to send to peer schedulers and executors.
+///
+/// Uses `DataFusion`'s SQL unparser to convert filter expressions into valid SQL,
+/// ensuring literals and identifiers are encoded correctly for remote execution.
+///
+/// Returns an error if any filter expression cannot be converted to SQL, to prevent
+/// silently returning unfiltered (and therefore incorrect) results.
+fn build_peer_sql(
+    table_ref: &str,
+    filters: &[Expr],
+    limit: Option<usize>,
+) -> DataFusionResult<String> {
     if filters.is_empty() {
-        if let Some(limit) = limit {
+        return Ok(if let Some(limit) = limit {
             format!("SELECT * FROM {table_ref} LIMIT {limit}")
         } else {
             format!("SELECT * FROM {table_ref}")
-        }
-    } else {
-        // Convert filter expressions to SQL WHERE clause
-        let where_clause = filters
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(" AND ");
-
-        if let Some(limit) = limit {
-            format!("SELECT * FROM {table_ref} WHERE {where_clause} LIMIT {limit}")
-        } else {
-            format!("SELECT * FROM {table_ref} WHERE {where_clause}")
-        }
+        });
     }
+
+    let unparser = datafusion::sql::unparser::Unparser::default();
+    let mut sql_parts = Vec::with_capacity(filters.len());
+    for expr in filters {
+        let sql_expr = unparser.expr_to_sql(expr).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "Failed to convert filter expression to SQL for federated task_history query: {e}"
+            ))
+        })?;
+        sql_parts.push(sql_expr.to_string());
+    }
+
+    let where_clause = sql_parts.join(" AND ");
+
+    Ok(if let Some(limit) = limit {
+        format!("SELECT * FROM {table_ref} WHERE {where_clause} LIMIT {limit}")
+    } else {
+        format!("SELECT * FROM {table_ref} WHERE {where_clause}")
+    })
 }
 
 /// Normalizes a scheduler endpoint address to a URL with scheme.
@@ -366,13 +481,13 @@ mod tests {
 
         // No filters, no limit
         assert_eq!(
-            build_peer_sql(table_ref, &[], None),
+            build_peer_sql(table_ref, &[], None).expect("no filters, no limit"),
             "SELECT * FROM \"runtime\".\"task_history\""
         );
 
         // With limit
         assert_eq!(
-            build_peer_sql(table_ref, &[], Some(100)),
+            build_peer_sql(table_ref, &[], Some(100)).expect("limit only"),
             "SELECT * FROM \"runtime\".\"task_history\" LIMIT 100"
         );
     }
@@ -383,26 +498,26 @@ mod tests {
 
         let table_ref = "\"runtime\".\"task_history\"";
 
-        // Single filter
+        // Single filter — string literal should be properly quoted via SQL unparser
         let filter = col("status").eq(lit("completed"));
         assert_eq!(
-            build_peer_sql(table_ref, &[filter], None),
-            "SELECT * FROM \"runtime\".\"task_history\" WHERE status = Utf8(\"completed\")"
+            build_peer_sql(table_ref, &[filter], None).expect("single filter"),
+            "SELECT * FROM \"runtime\".\"task_history\" WHERE (\"status\" = 'completed')"
         );
 
         // Filter with limit
         let filter = col("task_id").eq(lit("task-123"));
         assert_eq!(
-            build_peer_sql(table_ref, &[filter], Some(50)),
-            "SELECT * FROM \"runtime\".\"task_history\" WHERE task_id = Utf8(\"task-123\") LIMIT 50"
+            build_peer_sql(table_ref, &[filter], Some(50)).expect("filter with limit"),
+            "SELECT * FROM \"runtime\".\"task_history\" WHERE (task_id = 'task-123') LIMIT 50"
         );
 
         // Multiple filters (combined with AND)
         let filter1 = col("status").eq(lit("running"));
         let filter2 = col("execution_time").gt(lit(100));
         assert_eq!(
-            build_peer_sql(table_ref, &[filter1, filter2], None),
-            "SELECT * FROM \"runtime\".\"task_history\" WHERE status = Utf8(\"running\") AND execution_time > Int32(100)"
+            build_peer_sql(table_ref, &[filter1, filter2], None).expect("multiple filters"),
+            "SELECT * FROM \"runtime\".\"task_history\" WHERE (\"status\" = 'running') AND (execution_time > 100)"
         );
     }
 
@@ -435,6 +550,7 @@ mod tests {
             Arc::clone(&schema),
             Arc::new(local_table),
             Arc::new(RwLock::new(SchedulerPeers::new())),
+            Arc::new(RwLock::new(HashMap::new())),
             None,
             "local-scheduler".to_string(),
         );
@@ -473,5 +589,69 @@ mod tests {
 
         assert_eq!(projected_col_0.value(0), "value_7");
         assert_eq!(projected_col_1.value(0), "value_10");
+    }
+
+    #[test]
+    fn test_sort_batches_by_start_time_sorts_across_batches() {
+        use arrow::array::TimestampNanosecondArray;
+        use arrow::datatypes::TimeUnit;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(
+                "start_time",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+        ]));
+
+        // Batch 1: timestamps 300, 100 (unsorted)
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["c", "a"])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![300, 100]).with_timezone("UTC"))
+                    as ArrayRef,
+            ],
+        )
+        .expect("batch1");
+
+        // Batch 2: timestamp 200 (interleaved between batch1 values)
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["b"])) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![200]).with_timezone("UTC"))
+                    as ArrayRef,
+            ],
+        )
+        .expect("batch2");
+
+        let sorted =
+            sort_batches_by_start_time(&[batch1, batch2], &schema).expect("sort should succeed");
+
+        assert_eq!(sorted.len(), 1, "should produce a single sorted batch");
+        let batch = &sorted[0];
+        assert_eq!(batch.num_rows(), 3);
+
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("id column");
+        assert_eq!(ids.value(0), "a"); // start_time=100
+        assert_eq!(ids.value(1), "b"); // start_time=200
+        assert_eq!(ids.value(2), "c"); // start_time=300
+    }
+
+    #[test]
+    fn test_sort_batches_empty_input() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "start_time",
+            DataType::Utf8,
+            false,
+        )]));
+        let result = sort_batches_by_start_time(&[], &schema).expect("empty input should succeed");
+        assert!(result.is_empty());
     }
 }

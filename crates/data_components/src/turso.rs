@@ -148,7 +148,7 @@ use snafu::prelude::*;
 use turso::{Builder, Connection, Database, Value as TursoValue};
 use turso_shared::{BEGIN_CONCURRENT_SQL, COMMIT_SQL, JOURNAL_MODE_SQL_LITERAL};
 
-use crate::delete::{DeletionExec, DeletionSink};
+use crate::delete::{DeletionExec, DeletionSink, DeletionTableProvider};
 
 /// Conversion constants for timestamp storage and conversion.
 ///
@@ -1120,6 +1120,23 @@ impl TursoTableProvider {
             Ok(ast)
         })
     }
+
+    /// Returns `true` if the expression contains any subquery or outer reference column.
+    fn contains_subquery_or_outer_ref(expr: &Expr) -> bool {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        let mut found = false;
+        let _ = expr.apply(|e| match e {
+            Expr::ScalarSubquery(_)
+            | Expr::InSubquery(_)
+            | Expr::Exists(_)
+            | Expr::OuterReferenceColumn(_, _) => {
+                found = true;
+                Ok(TreeNodeRecursion::Stop)
+            }
+            _ => Ok(TreeNodeRecursion::Continue),
+        });
+        found
+    }
 }
 
 #[async_trait]
@@ -1145,10 +1162,20 @@ impl TableProvider for TursoTableProvider {
 
         let mut filter_push_down = vec![];
         for filter in filters {
-            match unparser.expr_to_sql(filter) {
-                Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
-                Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
-            }
+            // Expressions containing subqueries or outer references must not be pushed down.
+            // For federated providers, subqueries are handled at the plan level and pushing them
+            // into `TableScan.full_filters` is not beneficial. Subqueries may also reference tables
+            // in other databases not accessible from this Turso connection, and outer references
+            // refer to columns from an enclosing query that the table provider cannot resolve.
+            let pushdown = if Self::contains_subquery_or_outer_ref(filter) {
+                TableProviderFilterPushDown::Unsupported
+            } else {
+                match unparser.expr_to_sql(filter) {
+                    Ok(_) => TableProviderFilterPushDown::Exact,
+                    Err(_) => TableProviderFilterPushDown::Unsupported,
+                }
+            };
+            filter_push_down.push(pushdown);
         }
         Ok(filter_push_down)
     }
@@ -1202,15 +1229,23 @@ impl TableProvider for TursoTableProvider {
         // Wrap in DataSinkExec to execute the insertion
         Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
+}
 
+#[async_trait]
+impl DeletionTableProvider for TursoTableProvider {
     async fn delete_from(
         &self,
         _state: &dyn Session,
-        filters: Vec<Expr>,
+        filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DeletionExec::new(Arc::new(
-            TursoDeletionSink::new(Arc::clone(&self.pool), self.table_name.clone(), &filters),
-        ))))
+        Ok(Arc::new(DeletionExec::new(
+            Arc::new(TursoDeletionSink::new(
+                Arc::clone(&self.pool),
+                self.table_name.clone(),
+                filters,
+            )),
+            &self.schema(),
+        )))
     }
 }
 

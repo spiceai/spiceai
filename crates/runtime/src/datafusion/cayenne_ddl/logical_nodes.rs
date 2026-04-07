@@ -59,6 +59,9 @@ pub struct CayenneCreateTableNode {
     pub partition_expr_sql: Option<String>,
     /// Primary key column names extracted from SQL constraints.
     pub primary_key: Vec<String>,
+    /// Source table reference for `CREATE TABLE ... (LIKE ...)` syntax.
+    /// When set, partition-to-executor assignments are copied from the source table.
+    pub like_source_table: Option<TableReference>,
     /// Output schema (single "result" column).
     output_schema: DFSchemaRef,
 }
@@ -81,6 +84,7 @@ impl CayenneCreateTableNode {
             partition_expr: None,
             partition_expr_sql: None,
             primary_key: Vec::new(),
+            like_source_table: None,
         }
     }
 }
@@ -95,6 +99,7 @@ pub struct CayenneCreateTableNodeBuilder {
     partition_expr: Option<Expr>,
     partition_expr_sql: Option<String>,
     primary_key: Vec<String>,
+    like_source_table: Option<TableReference>,
 }
 
 impl CayenneCreateTableNodeBuilder {
@@ -129,6 +134,12 @@ impl CayenneCreateTableNodeBuilder {
     }
 
     #[must_use]
+    pub fn like_source_table(mut self, like_source_table: Option<TableReference>) -> Self {
+        self.like_source_table = like_source_table;
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> CayenneCreateTableNode {
         CayenneCreateTableNode {
             table_name: self.table_name,
@@ -140,6 +151,7 @@ impl CayenneCreateTableNodeBuilder {
             partition_expr: self.partition_expr,
             partition_expr_sql: self.partition_expr_sql,
             primary_key: self.primary_key,
+            like_source_table: self.like_source_table,
             output_schema: ddl_output_schema(),
         }
     }
@@ -153,6 +165,7 @@ impl Hash for CayenneCreateTableNode {
         self.partition_expr.hash(state);
         self.partition_expr_sql.hash(state);
         self.primary_key.hash(state);
+        self.like_source_table.hash(state);
     }
 }
 
@@ -164,6 +177,7 @@ impl PartialEq for CayenneCreateTableNode {
             && self.partition_expr == other.partition_expr
             && self.partition_expr_sql == other.partition_expr_sql
             && self.primary_key == other.primary_key
+            && self.like_source_table == other.like_source_table
     }
 }
 
@@ -225,6 +239,7 @@ impl UserDefinedLogicalNodeCore for CayenneCreateTableNode {
             partition_expr,
             partition_expr_sql: self.partition_expr_sql.clone(),
             primary_key: self.primary_key.clone(),
+            like_source_table: self.like_source_table.clone(),
             output_schema: DFSchemaRef::clone(&self.output_schema),
         })
     }
@@ -703,5 +718,130 @@ impl UserDefinedLogicalNodeCore for DistributedCayenneInsertNode {
             input: Arc::new(input),
             output_schema: DFSchemaRef::clone(&self.output_schema),
         })
+    }
+}
+
+/// Logical plan node to forward `MERGE` DML operations to Cayenne tables
+/// across relevant executors in distributed mode.
+///
+/// Stores the original MERGE SQL verbatim for forwarding, plus decomposed
+/// fields for partition compatibility validation and `explain` output.
+#[derive(Debug, Clone)]
+pub struct DistributedCayenneMergeNode {
+    /// Fully qualified target table reference.
+    pub target_table: TableReference,
+    /// Fully qualified source table reference.
+    pub source_table: TableReference,
+    /// Scan qualifier for the target side (alias or table name).
+    pub target_qualifier: String,
+    /// Scan qualifier for the source side (alias or table name).
+    pub source_qualifier: String,
+    /// Equi-join key pairs as `(target_col, source_col)` bare column names.
+    pub on_keys: Vec<(String, String)>,
+    /// SET assignments as `(target_col, value_sql)` pairs.
+    pub assignments: Vec<(String, String)>,
+    /// Original MERGE SQL text, forwarded verbatim to executors.
+    pub original_sql: String,
+    /// Output schema: single `count: UInt64` column.
+    pub output_schema: DFSchemaRef,
+}
+
+impl DistributedCayenneMergeNode {
+    /// Create a new `DistributedCayenneMergeNode`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the output schema cannot be constructed.
+    pub fn try_new(
+        target_table: TableReference,
+        source_table: TableReference,
+        target_qualifier: String,
+        source_qualifier: String,
+        on_keys: Vec<(String, String)>,
+        assignments: Vec<(String, String)>,
+        original_sql: String,
+    ) -> datafusion::error::Result<Self> {
+        let output_schema = Arc::new(datafusion::common::DFSchema::try_from(Schema::new(vec![
+            Field::new("count", DataType::UInt64, false),
+        ]))?);
+
+        Ok(Self {
+            target_table,
+            source_table,
+            target_qualifier,
+            source_qualifier,
+            on_keys,
+            assignments,
+            original_sql,
+            output_schema,
+        })
+    }
+}
+
+impl Hash for DistributedCayenneMergeNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.target_table.hash(state);
+        self.source_table.hash(state);
+        self.target_qualifier.hash(state);
+        self.source_qualifier.hash(state);
+        self.on_keys.hash(state);
+        self.assignments.hash(state);
+        self.original_sql.hash(state);
+    }
+}
+
+impl PartialEq for DistributedCayenneMergeNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.target_table == other.target_table
+            && self.source_table == other.source_table
+            && self.target_qualifier == other.target_qualifier
+            && self.source_qualifier == other.source_qualifier
+            && self.on_keys == other.on_keys
+            && self.assignments == other.assignments
+            && self.original_sql == other.original_sql
+    }
+}
+
+impl Eq for DistributedCayenneMergeNode {}
+
+impl PartialOrd for DistributedCayenneMergeNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.target_table
+            .to_string()
+            .partial_cmp(&other.target_table.to_string())
+    }
+}
+
+impl UserDefinedLogicalNodeCore for DistributedCayenneMergeNode {
+    fn name(&self) -> &'static str {
+        "DistributedCayenneMerge"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![]
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        &self.output_schema
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        vec![]
+    }
+
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "DistributedCayenneMerge: target={}, source={}, keys={:?}",
+            self.target_table, self.source_table, self.on_keys
+        )
+    }
+
+    fn with_exprs_and_inputs(
+        &self,
+        _exprs: Vec<Expr>,
+        _inputs: Vec<LogicalPlan>,
+    ) -> datafusion::error::Result<Self> {
+        Ok(self.clone())
     }
 }

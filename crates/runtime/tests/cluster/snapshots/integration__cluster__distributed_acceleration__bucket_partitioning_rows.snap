@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/cluster/distributed_acceleration.rs
-expression: pretty
+expression: rows_fmt
 ---
 +----+--------------+-----+--------------+-------+
 | id | name         | age | city         | score |

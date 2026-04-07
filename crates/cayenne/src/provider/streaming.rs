@@ -21,11 +21,11 @@ limitations under the License.
 
 use arrow_schema::SchemaRef;
 use datafusion::execution::SendableRecordBatchStream as DFStream;
-use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType, Partitioning};
 use datafusion_physical_plan::DisplayAs;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::PlanProperties;
+use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType, Partitioning};
 use futures::StreamExt;
 use std::any::Any;
 use std::sync::Arc;

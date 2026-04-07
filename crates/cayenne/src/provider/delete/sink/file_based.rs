@@ -32,10 +32,10 @@ limitations under the License.
 //! data directory from disk.
 
 use crate::catalog::MetadataCatalog;
+use crate::provider::Error;
 use crate::provider::constants::LISTING_TABLE_LOCK_POISONED;
 use crate::provider::retention::extract_retention_column_and_threshold;
 use crate::provider::table::CayenneTableProvider;
-use crate::provider::Error;
 use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;

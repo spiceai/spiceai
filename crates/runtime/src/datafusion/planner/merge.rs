@@ -41,7 +41,9 @@ use datafusion::sql::sqlparser::ast::{
 };
 
 use super::logical_nodes::CayenneMergeNode;
-use super::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, is_cayenne_table};
+use super::{PlannerContext, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, is_cayenne_table};
+use crate::config::ClusterRole;
+use crate::datafusion::cayenne_ddl::logical_nodes::DistributedCayenneMergeNode;
 
 /// Plan a `MERGE INTO` statement for local Cayenne execution.
 ///
@@ -51,6 +53,8 @@ use super::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, is_cayenne_table};
 pub(super) async fn plan_merge(
     statement: Statement,
     session: &SessionState,
+    ctx: &PlannerContext,
+    original_sql: &str,
 ) -> DFResult<LogicalPlan> {
     let Statement::Statement(sql_stmt) = statement else {
         return Err(DataFusionError::Internal(
@@ -131,6 +135,23 @@ pub(super) async fn plan_merge(
     let assignments =
         validate_and_extract_assignments(&clauses[0], target_ref.table(), target_alias.as_deref())?;
 
+    // Distributed (scheduler) mode: produce forwarding node with original SQL.
+    if matches!(ctx.cluster_role, Some(ClusterRole::Scheduler)) {
+        let node = DistributedCayenneMergeNode::try_new(
+            target_ref,
+            source_ref,
+            target_qualifier,
+            source_qualifier,
+            on_keys,
+            assignments,
+            original_sql.to_string(),
+        )?;
+        return Ok(LogicalPlan::Extension(Extension {
+            node: Arc::new(node),
+        }));
+    }
+
+    // Local mode: produce local execution node.
     let node = CayenneMergeNode::try_new(
         target_ref,
         source_ref,
@@ -171,7 +192,7 @@ async fn validate_target_metadata(
     target_ref: &TableReference,
     target_name: &str,
 ) -> DFResult<()> {
-    use crate::catalogconnector::cayenne::provider::CayenneSchemaProvider;
+    use cayenne::CayenneSchemaProvider;
 
     let catalog_name = target_ref.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
     let schema_name = target_ref.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);

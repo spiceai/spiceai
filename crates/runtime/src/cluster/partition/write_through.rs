@@ -515,13 +515,13 @@ async fn route_batch_and_assign_unseen(
                 // Rebuild physical filter for this executor from its full predicate list.
                 let df_schema = DFSchema::try_from(batch.schema().as_ref().clone())
                     .context(CreateDFSchemaSnafu)?;
-                let combined = partitions_by_executor[&executor_id]
-                    .iter()
-                    .cloned()
-                    .reduce(Expr::or)
-                    .ok_or(Error::EmptyPartitionExprs {
-                        executor_id: executor_id.clone(),
-                    })?;
+                let combined = util::expr::combine_exprs_balanced(
+                    partitions_by_executor[&executor_id].clone(),
+                    Expr::or,
+                )
+                .ok_or(Error::EmptyPartitionExprs {
+                    executor_id: executor_id.clone(),
+                })?;
                 let physical = datafusion::physical_expr::create_physical_expr(
                     &combined,
                     &df_schema,
@@ -744,13 +744,11 @@ fn build_executor_filters(
     let mut filters = Vec::with_capacity(partitions_by_executor.len());
     for (executor_id, exprs) in partitions_by_executor {
         let combined =
-            exprs
-                .iter()
-                .cloned()
-                .reduce(Expr::or)
-                .ok_or_else(|| Error::EmptyPartitionExprs {
+            util::expr::combine_exprs_balanced(exprs.clone(), Expr::or).ok_or_else(|| {
+                Error::EmptyPartitionExprs {
                     executor_id: executor_id.clone(),
-                })?;
+                }
+            })?;
         let physical = datafusion::physical_expr::create_physical_expr(
             &combined,
             &df_schema,

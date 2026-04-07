@@ -26,9 +26,10 @@ limitations under the License.
 //!    delegating to `DataFusion`.
 //!
 //! 2. **DML interception** — DELETE and UPDATE statements targeting Cayenne
-//!    catalog tables are converted into [`LogicalPlan::Extension`] nodes
-//!    directly for distributed mode. Support for additional DML types
-//!    (INSERT, MERGE) may be added in the future.
+//!    catalog tables, plus INSERT statements targeting distributed
+//!    write-through tables, are converted into [`LogicalPlan::Extension`]
+//!    nodes directly for distributed mode. Support for additional DML types
+//!    (MERGE) may be added in the future.
 //!
 //! For everything else, the planner delegates to `DataFusion`'s standard
 //! `session.statement_to_plan()` path.
@@ -41,6 +42,9 @@ mod merge;
 pub mod physical_execs;
 mod update;
 
+use std::sync::Arc;
+
+use datafusion::catalog::TableProvider;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::LogicalPlan;
@@ -49,7 +53,9 @@ use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::Statement as SQLStatement;
 use datafusion_expr::WriteOp;
 use datafusion_expr::dml::InsertOp;
+use datafusion_federation::FederatedTableProviderAdaptor;
 
+use crate::accelerated_table::AcceleratedTable;
 use crate::config::ClusterRole;
 use crate::datafusion::ddl::acceleration_options::SharedDdlExtensionStore;
 
@@ -79,10 +85,15 @@ pub struct PlannerContext {
     /// Shared store for DDL extensions extracted from `CREATE TABLE` statements.
     /// Populated by the planner, consumed by the analyzer rules.
     pub ddl_extension_store: SharedDdlExtensionStore,
+
+    /// Executor registry, if running in a distributed cluster.
+    /// Used by `CREATE TABLE ... LIKE` to resolve auto-generated partition
+    /// labels (e.g. `expr0`) back to the original SQL expression.
+    pub executor_registry: Option<Arc<crate::cluster::executor_registry::ExecutorRegistry>>,
 }
 
 /// Create a [`LogicalPlan`] from SQL, intercepting DDL extensions and
-/// Cayenne DML at the statement level.
+/// distributed DML at the statement level.
 pub async fn create_logical_plan(
     sql: &str,
     session: &SessionState,
@@ -95,6 +106,21 @@ pub async fn create_logical_plan(
     // Step 2: Dispatch based on statement type
     if let Statement::Statement(ref sql_stmt) = statement {
         match sql_stmt.as_ref() {
+            // DDL: CREATE TABLE ... (LIKE ...) — resolve source table and
+            // build extension node directly, bypassing DataFusion's planner.
+            // Reject LIKE combined with DDL extensions (PARTITION BY, WITH)
+            // since LIKE inherits everything from the source table.
+            SQLStatement::CreateTable(ct) if ct.like.is_some() => {
+                if create_table::has_ddl_extensions(ct) {
+                    return Err(DataFusionError::Plan(
+                        "CREATE TABLE ... LIKE cannot be combined with PARTITION BY or WITH options. \
+                         The LIKE clause copies all properties from the source table."
+                            .to_string(),
+                    ));
+                }
+                return create_table::plan_create_table_like(statement, session, ctx).await;
+            }
+
             // DDL: CREATE TABLE with extensions (WITH options, PARTITION BY).
             // Intercepted regardless of catalog mode — extensions apply to
             // all catalog types (Cayenne, Iceberg, etc.).
@@ -109,17 +135,17 @@ pub async fn create_logical_plan(
 
             // DML: DELETE on Cayenne tables (only when Cayenne is active)
             SQLStatement::Delete(_) if ctx.catalog_mode == CatalogMode::Cayenne => {
-                return plan_cayenne_dml(statement, session, ctx, WriteOp::Delete).await;
+                return plan_distributed_dml(statement, session, ctx, WriteOp::Delete).await;
             }
 
             // DML: UPDATE on Cayenne tables (only when Cayenne is active)
             SQLStatement::Update { .. } if ctx.catalog_mode == CatalogMode::Cayenne => {
-                return plan_cayenne_dml(statement, session, ctx, WriteOp::Update).await;
+                return plan_distributed_dml(statement, session, ctx, WriteOp::Update).await;
             }
 
-            // DML: INSERT on Cayenne tables
+            // DML: INSERT on distributed write-through tables.
             SQLStatement::Insert(_) => {
-                return plan_cayenne_dml(
+                return plan_distributed_dml(
                     statement,
                     session,
                     ctx,
@@ -128,14 +154,9 @@ pub async fn create_logical_plan(
                 .await;
             }
 
-            // DML: MERGE on Cayenne tables (local single-node only)
+            // DML: MERGE on Cayenne tables
             SQLStatement::Merge { .. } if ctx.catalog_mode == CatalogMode::Cayenne => {
-                if matches!(ctx.cluster_role, Some(ClusterRole::Scheduler)) {
-                    return Err(DataFusionError::Plan(
-                        "MERGE INTO is not supported in distributed mode".to_string(),
-                    ));
-                }
-                return merge::plan_merge(statement, session).await;
+                return merge::plan_merge(statement, session, ctx, sql).await;
             }
 
             _ => {}
@@ -146,15 +167,15 @@ pub async fn create_logical_plan(
     session.statement_to_plan(statement).await
 }
 
-/// Plan a DML statement (DELETE or UPDATE), producing either a local or
-/// distributed Cayenne extension node.
+/// Plan a DML statement, producing either a local or distributed extension
+/// node.
 ///
-/// For local mode, returns the standard `DataFusion` plan unchanged — Cayenne's
-/// `TableProvider` implementation handles DML natively.
+/// For local mode, returns the standard `DataFusion` plan unchanged.
 ///
 /// For distributed (scheduler) mode, wraps the plan into a distributed
-/// extension node that forwards the operation to executors.
-async fn plan_cayenne_dml(
+/// extension node that forwards the operation to executors when the target
+/// table supports scheduler-side routing.
+async fn plan_distributed_dml(
     statement: Statement,
     session: &SessionState,
     ctx: &PlannerContext,
@@ -163,8 +184,7 @@ async fn plan_cayenne_dml(
     // Let DataFusion plan the DML to get the validated DmlStatement
     let df_plan = session.statement_to_plan(statement).await?;
 
-    // If not in distributed mode, Cayenne's TableProvider handles DML
-    // natively through DataFusion's standard physical planning. Return as-is.
+    // If not in distributed mode, keep the standard DataFusion plan.
     if !matches!(ctx.cluster_role, Some(ClusterRole::Scheduler)) {
         return Ok(df_plan);
     }
@@ -182,8 +202,12 @@ async fn plan_cayenne_dml(
         )));
     }
 
-    // Check if the target table is in a Cayenne catalog
-    if !is_cayenne_table(session, &dml.table_name) {
+    let should_rewrite = match &expected_op {
+        WriteOp::Insert(_) => is_distributed_insert_table(session, &dml.table_name).await,
+        _ => is_cayenne_table(session, &dml.table_name),
+    };
+
+    if !should_rewrite {
         return Ok(df_plan);
     }
 
@@ -206,6 +230,46 @@ fn is_cayenne_table(session: &SessionState, table_name: &TableReference) -> bool
     } else {
         false
     }
+}
+
+async fn is_distributed_insert_table(session: &SessionState, table_name: &TableReference) -> bool {
+    if is_cayenne_table(session, table_name) {
+        return true;
+    }
+
+    let catalog_name = table_name.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
+    let schema_name = table_name.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
+
+    let Some(catalog) = session.catalog_list().catalog(catalog_name) else {
+        return false;
+    };
+
+    let Some(schema) = catalog.schema(schema_name) else {
+        return false;
+    };
+
+    let Ok(Some(table_provider)) = schema.table(table_name.table()).await else {
+        return false;
+    };
+
+    is_write_through_table_provider(&table_provider)
+}
+
+fn is_write_through_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
+    if let Some(accelerated) = table_provider.as_any().downcast_ref::<AcceleratedTable>() {
+        return accelerated.is_write_through();
+    }
+
+    if let Some(adaptor) = table_provider
+        .as_any()
+        .downcast_ref::<FederatedTableProviderAdaptor>()
+        && let Some(inner_provider) = adaptor.table_provider.as_ref()
+        && let Some(accelerated) = inner_provider.as_any().downcast_ref::<AcceleratedTable>()
+    {
+        return accelerated.is_write_through();
+    }
+
+    false
 }
 
 /// Check if `WriteOp` matches the expected operation.
