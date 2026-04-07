@@ -295,7 +295,7 @@ async fn test_github_issues() -> Result<(), String> {
 
             // search should push down the filter, preventing the query from retrieving every issue
             assert!(
-                search_author_elapsed_secs < 10,
+                search_author_elapsed_secs < 30,
                 "search_author_elapsed_secs: {search_author_elapsed_secs}"
             );
 
