@@ -248,7 +248,7 @@ impl TableProvider for FederatedTaskHistoryTable {
 
         // Build the SQL query to send to peers and executors
         let table_ref = format!("\"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\"");
-        let sql = build_peer_sql(&table_ref, filters, limit);
+        let sql = build_peer_sql(&table_ref, filters, limit)?;
 
         tracing::debug!(
             "FederatedTaskHistoryTable executing federated query to {} peers and {} executors: {sql}",
@@ -354,7 +354,8 @@ impl TableProvider for FederatedTaskHistoryTable {
 /// Sorts the collected record batches by the `start_time` column (ascending).
 ///
 /// Concatenates all batches, sorts by `start_time`, and returns a single sorted batch.
-/// Returns an empty vec if the input is empty or unsorted batches if `start_time` is missing.
+/// Returns an empty vec if the input is empty, or a single concatenated (unsorted) batch
+/// if the `start_time` column is missing from the schema.
 fn sort_batches_by_start_time(
     batches: &[RecordBatch],
     schema: &SchemaRef,
@@ -399,41 +400,40 @@ fn sort_batches_by_start_time(
 ///
 /// Uses `DataFusion`'s SQL unparser to convert filter expressions into valid SQL,
 /// ensuring literals and identifiers are encoded correctly for remote execution.
-fn build_peer_sql(table_ref: &str, filters: &[Expr], limit: Option<usize>) -> String {
-    let base = if let Some(limit) = limit {
-        format!("SELECT * FROM {table_ref} LIMIT {limit}")
-    } else {
-        format!("SELECT * FROM {table_ref}")
-    };
-
+///
+/// Returns an error if any filter expression cannot be converted to SQL, to prevent
+/// silently returning unfiltered (and therefore incorrect) results.
+fn build_peer_sql(
+    table_ref: &str,
+    filters: &[Expr],
+    limit: Option<usize>,
+) -> DataFusionResult<String> {
     if filters.is_empty() {
-        return base;
+        return Ok(if let Some(limit) = limit {
+            format!("SELECT * FROM {table_ref} LIMIT {limit}")
+        } else {
+            format!("SELECT * FROM {table_ref}")
+        });
     }
 
     let unparser = datafusion::sql::unparser::Unparser::default();
     let mut sql_parts = Vec::with_capacity(filters.len());
     for expr in filters {
-        match unparser.expr_to_sql(expr) {
-            Ok(sql_expr) => sql_parts.push(sql_expr.to_string()),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to convert filter expression to SQL, omitting all filters for safety: {e}"
-                );
-                return base;
-            }
-        }
+        let sql_expr = unparser.expr_to_sql(expr).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "Failed to convert filter expression to SQL for federated task_history query: {e}"
+            ))
+        })?;
+        sql_parts.push(sql_expr.to_string());
     }
 
     let where_clause = sql_parts.join(" AND ");
-    if where_clause.is_empty() {
-        return base;
-    }
 
-    if let Some(limit) = limit {
+    Ok(if let Some(limit) = limit {
         format!("SELECT * FROM {table_ref} WHERE {where_clause} LIMIT {limit}")
     } else {
         format!("SELECT * FROM {table_ref} WHERE {where_clause}")
-    }
+    })
 }
 
 /// Normalizes a scheduler endpoint address to a URL with scheme.
@@ -481,13 +481,13 @@ mod tests {
 
         // No filters, no limit
         assert_eq!(
-            build_peer_sql(table_ref, &[], None),
+            build_peer_sql(table_ref, &[], None).expect("no filters, no limit"),
             "SELECT * FROM \"runtime\".\"task_history\""
         );
 
         // With limit
         assert_eq!(
-            build_peer_sql(table_ref, &[], Some(100)),
+            build_peer_sql(table_ref, &[], Some(100)).expect("limit only"),
             "SELECT * FROM \"runtime\".\"task_history\" LIMIT 100"
         );
     }
@@ -501,14 +501,14 @@ mod tests {
         // Single filter — string literal should be properly quoted via SQL unparser
         let filter = col("status").eq(lit("completed"));
         assert_eq!(
-            build_peer_sql(table_ref, &[filter], None),
+            build_peer_sql(table_ref, &[filter], None).expect("single filter"),
             "SELECT * FROM \"runtime\".\"task_history\" WHERE (\"status\" = 'completed')"
         );
 
         // Filter with limit
         let filter = col("task_id").eq(lit("task-123"));
         assert_eq!(
-            build_peer_sql(table_ref, &[filter], Some(50)),
+            build_peer_sql(table_ref, &[filter], Some(50)).expect("filter with limit"),
             "SELECT * FROM \"runtime\".\"task_history\" WHERE (task_id = 'task-123') LIMIT 50"
         );
 
@@ -516,7 +516,7 @@ mod tests {
         let filter1 = col("status").eq(lit("running"));
         let filter2 = col("execution_time").gt(lit(100));
         assert_eq!(
-            build_peer_sql(table_ref, &[filter1, filter2], None),
+            build_peer_sql(table_ref, &[filter1, filter2], None).expect("multiple filters"),
             "SELECT * FROM \"runtime\".\"task_history\" WHERE (\"status\" = 'running') AND (execution_time > 100)"
         );
     }
