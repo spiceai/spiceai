@@ -162,10 +162,6 @@ impl AdbcCatalogTarget {
                         "iceberg_s3_secret_access_key".to_string(),
                         "${env:AWS_SECRET_ACCESS_KEY}".to_string(),
                     ),
-                    (
-                        "iceberg_s3_session_token".to_string(),
-                        "${env:AWS_SESSION_TOKEN}".to_string(),
-                    ),
                 ])));
 
                 catalog
@@ -2165,10 +2161,7 @@ mod tests {
                 .contains("iceberg_s3_secret_access_key: \"${env:AWS_SECRET_ACCESS_KEY}\""),
             "unexpected spicepod: {spicepod_yaml}"
         );
-        assert!(
-            spicepod_yaml.contains("iceberg_s3_session_token: \"${env:AWS_SESSION_TOKEN}\""),
-            "unexpected spicepod: {spicepod_yaml}"
-        );
+        assert!(!spicepod_yaml.contains("iceberg_s3_session_token"));
     }
 
     #[test]
