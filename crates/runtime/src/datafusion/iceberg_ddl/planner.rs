@@ -27,8 +27,10 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 
 use super::SharedDataFusionRef;
-use super::logical_nodes::{IcebergCreateTableNode, IcebergDropTableNode};
-use super::physical_plans::{IcebergCreateTableExec, IcebergDropTableExec};
+use super::logical_nodes::{IcebergCreateSchemaNode, IcebergCreateTableNode, IcebergDropTableNode};
+use super::physical_plans::{
+    IcebergCreateSchemaExec, IcebergCreateTableExec, IcebergDropTableExec,
+};
 
 /// Extension planner for Iceberg DDL operations.
 ///
@@ -75,6 +77,19 @@ impl ExtensionPlanner for IcebergDdlExtensionPlanner {
                 catalog_list,
                 create.acceleration.clone(),
                 create.dataset_options.clone(),
+                create.partition_expr_sql.clone(),
+                datafusion_weak,
+            ))));
+        }
+
+        if let Some(create_schema) = node.as_any().downcast_ref::<IcebergCreateSchemaNode>() {
+            return Ok(Some(Arc::new(IcebergCreateSchemaExec::new(
+                Arc::clone(&create_schema.catalog),
+                create_schema.namespace.clone(),
+                create_schema.if_not_exists,
+                create_schema.df_catalog_name.clone(),
+                create_schema.df_schema_name.clone(),
+                catalog_list,
                 datafusion_weak,
             ))));
         }
