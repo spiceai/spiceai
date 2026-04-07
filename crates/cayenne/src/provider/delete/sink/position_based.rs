@@ -747,7 +747,11 @@ mod tests {
             .map(|(i, name)| {
                 Field::new(
                     format!("c{i}"),
-                    schema.field_with_name(name).expect("field exists in schema").data_type().clone(),
+                    schema
+                        .field_with_name(name)
+                        .expect("field exists in schema")
+                        .data_type()
+                        .clone(),
                     true,
                 )
             })
@@ -988,7 +992,10 @@ mod tests {
     fn build_filter_empty_returns_none() {
         let schema = Schema::new(vec![Field::new("k1", DataType::Int32, false)]);
         let df_schema = DFSchema::try_from(schema).expect("schema conversion");
-        assert_eq!(build_vortex_filter(&[], &df_schema).expect("build filter"), None);
+        assert_eq!(
+            build_vortex_filter(&[], &df_schema).expect("build filter"),
+            None
+        );
     }
 
     #[test]
