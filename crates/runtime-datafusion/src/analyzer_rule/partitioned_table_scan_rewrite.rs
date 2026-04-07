@@ -129,7 +129,7 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
         plan: LogicalPlan,
         _config: &ConfigOptions,
     ) -> Result<LogicalPlan, DataFusionError> {
-        let mut rewrite_occurred = false; // Cell::new(false);
+        let mut rewrite_occurred = false;
         plan.transform_up_with_subqueries(|plan| {
             if let LogicalPlan::TableScan(scan) = &plan {
                 if !self.partition_provider.should_partition(scan) {
@@ -176,16 +176,24 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                 }
 
                 // If no partitions, return empty relation. This can happen if no partitions match the table (even if we want to partition it).
-                let Some(first_scan) = sub_scans.first() else {
+                if sub_scans.is_empty() {
                     return Ok(Transformed::yes(LogicalPlan::EmptyRelation(
                         EmptyRelation {
                             produce_one_row: false,
                             schema: Arc::clone(plan.schema()),
                         },
                     )));
-                };
-                let first_scan = Arc::unwrap_or_clone(Arc::clone(first_scan));
-                let sub_scans = sub_scans.into_iter().skip(1).collect::<Vec<_>>();
+                }
+
+                // Consume the vec so each Arc has a unique owner, allowing
+                // Arc::unwrap_or_clone to move out without a deep clone.
+                let mut sub_scans_iter = sub_scans.into_iter();
+                let first_scan = Arc::unwrap_or_clone(
+                    sub_scans_iter
+                        .next()
+                        .unwrap_or_else(|| unreachable!("sub_scans is non-empty; checked above")),
+                );
+                let sub_scans: Vec<_> = sub_scans_iter.collect();
 
                 // Single partition: no Union needed, just return the sub-scan directly.
                 if sub_scans.is_empty() {
@@ -205,7 +213,13 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
             // DataFusion's optimizer pushes Limit through Union, but does not push
             // Sort(TopK) through Union. Without this, each executor returns all rows
             // and the scheduler sorts the full merged result.
-            // Only attempt this when the partition rewrite created a union above.
+            //
+            // Only attempt this when at least one TableScan has been rewritten to a
+            // Union in this plan traversal. Note: this may fire for any matching
+            // Limit -> [Projection|SubqueryAlias]* -> Sort -> [Projection|SubqueryAlias]* -> Union
+            // subtree in the plan, not exclusively for unions produced by this rule.
+            //
+            // This is okay. This is just an optimisation. `push_sort_topk_into_union` will ensure it is an applicable `Limit`.
             if rewrite_occurred && let LogicalPlan::Limit(limit) = plan {
                 return push_sort_topk_into_union(limit);
             }
