@@ -60,6 +60,20 @@ pub struct PartitionManager {
     state: ObjectState<TablePartitionMetadata>,
 }
 
+/// Result of copying partition assignments from one table to another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyAssignmentsResult {
+    /// Assignments were copied from the source table.
+    Copied {
+        /// Number of partition values with executor assignments that were copied.
+        partition_count: usize,
+    },
+    /// Source table had no partition metadata (unpartitioned or newly created).
+    NoSourceMetadata,
+    /// Source table had partition metadata but no assigned partitions.
+    NoAssignments,
+}
+
 #[derive(Debug, Clone)]
 pub struct AllocationResult {
     pub previously_assigned: Vec<PartitionValue>,
@@ -390,10 +404,16 @@ impl PartitionManager {
         &self,
         source_table: &TableReference,
         target_table: &TableReference,
-    ) -> Result<()> {
+    ) -> Result<CopyAssignmentsResult> {
         let Some(source_metadata) = self.get_table_metadata(source_table).await? else {
-            return Ok(());
+            return Ok(CopyAssignmentsResult::NoSourceMetadata);
         };
+
+        let assigned_count = source_metadata
+            .partitions
+            .iter()
+            .filter(|p| p.is_assigned())
+            .count();
 
         let now_ms = now_ms()?;
         let mut target_metadata = source_metadata;
@@ -401,7 +421,15 @@ impl PartitionManager {
         target_metadata.updated_at = now_ms;
 
         let target_key = target_table.to_string();
-        self.write_metadata(&target_key, target_metadata).await
+        self.write_metadata(&target_key, target_metadata).await?;
+
+        if assigned_count == 0 {
+            Ok(CopyAssignmentsResult::NoAssignments)
+        } else {
+            Ok(CopyAssignmentsResult::Copied {
+                partition_count: assigned_count,
+            })
+        }
     }
 
     /// Write metadata using `insert_or_update` with conflict handling.
@@ -465,9 +493,16 @@ mod tests {
             .expect("should assign");
 
         // Copy assignments
-        pm.copy_assignments(&source, &target)
+        let result = pm
+            .copy_assignments(&source, &target)
             .await
             .expect("should copy");
+        assert_eq!(
+            result,
+            CopyAssignmentsResult::Copied {
+                partition_count: 1
+            }
+        );
 
         // Verify target has the same metadata
         let target_meta = pm
@@ -492,9 +527,11 @@ mod tests {
         let target = TableReference::parse_str("catalog.schema.target");
 
         // Missing source metadata is a no-op (source exists but is unpartitioned).
-        pm.copy_assignments(&source, &target)
+        let result = pm
+            .copy_assignments(&source, &target)
             .await
             .expect("should be a no-op for missing source metadata");
+        assert_eq!(result, CopyAssignmentsResult::NoSourceMetadata);
 
         // Target should have no metadata since nothing was copied.
         let target_meta = pm.get_table_metadata(&target).await.expect("should get");
@@ -522,9 +559,11 @@ mod tests {
             .expect("should set partitions");
 
         // Copy should overwrite target
-        pm.copy_assignments(&source, &target)
+        let result = pm
+            .copy_assignments(&source, &target)
             .await
             .expect("should copy");
+        assert_eq!(result, CopyAssignmentsResult::NoAssignments);
 
         let target_meta = pm
             .get_table_metadata(&target)
