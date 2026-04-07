@@ -117,7 +117,7 @@ aws-sdk-cognitoidentity = "1.96.0"
 aws-sdk-cognitoidentityprovider = "1.110.0"
 aws-sdk-dynamodb = "1.107.0"
 aws-sdk-dynamodbstreams = "1.96.0"
-aws-sdk-glue = "1.139.0"
+aws-sdk-glue = "1.142.0"
 aws-sdk-s3 = "1.124.0"
 aws-sdk-s3vectors = "1.21.0"
 aws-sdk-secretsmanager = "1.103.0"
@@ -204,11 +204,11 @@ indexmap = "2"
 insta = { version = "1.46.3", features = ["filters"] }
 itertools = "0.14"
 linkme = "0.3.35"
-logos = "0.16.0"
+logos = "0.16.1"
 mailparse = "0.16.1"
 moka = { version = "0.12", features = ["future"] }
 mongodb = { version = "3.5.1", features = ["openssl-tls"] }
-mysql_async = { version = "0.36.1", features = ["native-tls-tls", "chrono"] }
+mysql_async = { version = "0.36.2", features = ["native-tls-tls", "chrono"] }
 nix = "0.30"
 num_cpus = "1.16"
 object_store = { version = "0.12.4", features = [

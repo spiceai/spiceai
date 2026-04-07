@@ -200,8 +200,8 @@ where
         .transpose()?
         .flatten();
 
-    // Compute scheduler_id for cluster mode: "host:port"
-    let scheduler_id: Option<Arc<str>> = df.cluster_config.effective_role().and_then(|_| {
+    // Compute node_id for cluster mode: "host:port"
+    let node_id: Option<Arc<str>> = df.cluster_config.effective_role().and_then(|_| {
         let host = df.cluster_config.node_advertise_address()?;
         let port = df.cluster_config.node_bind_address().port();
         Some(format!("{host}:{port}").into())
@@ -213,7 +213,7 @@ where
         min_sql_duration_ms,
         captured_plan,
         min_plan_duration_ms,
-        scheduler_id,
+        node_id,
     );
 
     let zipkin_exporter = zipkin_task_history_otel_exporter(config).await?;
