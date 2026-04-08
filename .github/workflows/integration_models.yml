@@ -86,6 +86,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up spiceio
+        if: runner.os == 'macOS' && secrets.UNAS_SMB_PASS != ''
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
         with:
@@ -96,6 +97,7 @@ jobs:
           region: us-west-1
 
       - name: Set up sccache
+        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
@@ -133,7 +135,7 @@ jobs:
           retention-days: 1
 
       - name: Kill spiceio
-        if: always() && steps.setup-spiceio.outputs.pid != ''
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
       - name: Upload spiceio logs
@@ -396,6 +398,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up spiceio
+        if: runner.os == 'macOS' && secrets.UNAS_SMB_PASS != ''
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
         with:
@@ -406,6 +409,7 @@ jobs:
           region: us-west-1
 
       - name: Set up sccache
+        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
@@ -440,7 +444,7 @@ jobs:
           retention-days: 1
 
       - name: Kill spiceio
-        if: always() && steps.setup-spiceio.outputs.pid != ''
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
       - name: Upload spiceio logs
