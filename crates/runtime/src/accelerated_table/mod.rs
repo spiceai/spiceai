@@ -754,7 +754,9 @@ impl Builder {
         refresher.caching(&self.caching);
         refresher.checkpointer(self.checkpointer);
         refresher.refresh_on_startup(self.refresh_on_startup);
-        refresher.set_initial_load_completed(self.initial_load_complete);
+        // Write-through tables are immediately ready — there is no initial load from
+        // the federated source because writes go directly to both targets.
+        refresher.set_initial_load_completed(self.initial_load_complete || self.write_through);
         refresher.disable_federation(self.disable_federation);
         refresher.with_metrics(self.metrics);
         if let Some(synchronize_with) = &self.synchronize_with {
@@ -774,14 +776,22 @@ impl Builder {
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
 
         let (refresh_handle, refresh_trigger) =
-            if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
-                // Accelerated tables aren't accelerated on scheduler. Immediately ready.
+            if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) || self.write_through {
+                // Refresh is skipped in two cases:
+                // 1. Scheduler: accelerated tables aren't accelerated locally on the scheduler.
+                // 2. Write-through: the write-through mechanism keeps the accelerator in sync
+                //    with the federated source directly during INSERT operations. Running a
+                //    refresh would race with write-through inserts and load ALL data from
+                //    the shared federated source (e.g. Iceberg) into each executor's local
+                //    accelerator, causing each executor to hold the complete dataset instead
+                //    of just its assigned partition — resulting in 2x data on distributed queries.
+                //
                 // Set refresh_trigger to None because the receiver will be dropped
                 // (refresher.start() is not called), making the channel dead.
                 self.runtime_status
                     .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
                 // Notify immediately so schedule creation doesn't block waiting for
-                // a refresh that will never happen locally on the scheduler.
+                // a refresh that will never happen locally.
                 on_complete_notification.notify_waiters();
                 (None, None)
             } else {
