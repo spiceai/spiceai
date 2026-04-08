@@ -17,8 +17,10 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::delta_lake::DeltaTableFactory;
+use datafusion::config::TableParquetOptions;
 use datafusion::datasource::TableProvider;
 use runtime::component::dataset::Dataset;
+use runtime::dataconnector::listing::build_table_parquet_options;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -38,9 +40,14 @@ pub struct DeltaLake {
 impl DeltaLake {
     #[must_use]
     #[expect(clippy::needless_pass_by_value)]
-    pub fn new(params: Parameters, io_runtime: Handle) -> Self {
+    pub fn new(
+        params: Parameters,
+        io_runtime: Handle,
+        table_parquet_options: TableParquetOptions,
+    ) -> Self {
         Self {
-            delta_table_factory: DeltaTableFactory::new(params.to_secret_map(), io_runtime),
+            delta_table_factory: DeltaTableFactory::new(params.to_secret_map(), io_runtime)
+                .with_table_parquet_options(table_parquet_options),
         }
     }
 }
@@ -130,7 +137,13 @@ impl DataConnectorFactory for DeltaLakeFactory {
                 );
             }
 
-            let delta = DeltaLake::new(params.parameters, params.io_runtime);
+            let parquet_opts = build_table_parquet_options(params.runtime.as_deref()).await?;
+
+            tracing::debug!(
+                ?parquet_opts,
+                "Creating Delta Lake connector with parquet options"
+            );
+            let delta = DeltaLake::new(params.parameters, params.io_runtime, parquet_opts);
             Ok(Arc::new(delta) as Arc<dyn DataConnector>)
         })
     }

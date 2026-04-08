@@ -48,6 +48,7 @@ use arrow::{
 use arrow_schema::SchemaRef;
 use async_stream::stream;
 use data_components::poly::PolyTableProvider;
+use datafusion::catalog::MemoryCatalogProvider;
 use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::context::SessionContext;
@@ -1161,6 +1162,21 @@ impl RefreshTask {
             Err(_) => {
                 unreachable!("The default catalog should always exist");
             }
+        }
+
+        if let Some(catalog_name) = dataset_name.catalog()
+            && ctx.catalog(catalog_name).is_none()
+        {
+            ctx.register_catalog(catalog_name, Arc::new(MemoryCatalogProvider::new()));
+        }
+
+        let target_catalog = dataset_name.catalog().unwrap_or(&default_catalog);
+        if let Err(e) = schema::ensure_schema_exists(&ctx, target_catalog, dataset_name) {
+            tracing::error!(
+                "Unable to ensure schema exists for refresh context {}.{}: {e}",
+                target_catalog,
+                dataset_name.schema().unwrap_or_default()
+            );
         }
 
         if let Err(e) = ctx.register_table(dataset_name.clone(), federated_provider) {

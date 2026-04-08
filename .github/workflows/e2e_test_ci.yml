@@ -1890,6 +1890,7 @@ jobs:
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         run: |
           ./simulate_append_data.sh &
+          echo $! > /tmp/simulate_pid
 
       - name: Configure Spicepod
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
@@ -1904,11 +1905,21 @@ jobs:
         run: |
           spice run &> spice.log &
 
-      - name: Wait for dataset to be ready
+      - name: Wait for Spice runtime to be ready
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
         timeout-minutes: 1
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Verify data_upsert dataset is queryable
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: data_upsert
+
+      - name: Verify data_drop dataset is queryable
+        uses: ./.github/actions/verify-dataset
+        with:
+          name: data_drop
 
       - name: Run test workfload for 120s
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
@@ -1916,12 +1927,35 @@ jobs:
         run: |
           ./oha --method POST "http://127.0.0.1:8090/v1/sql" -D append_query.sql -z 120s -c 10
 
+      - name: Stop append data simulation before shutdown
+        if: always()
+        run: |
+          if [ -f /tmp/simulate_pid ]; then
+            pid="$(cat /tmp/simulate_pid)"
+            kill "$pid" 2>/dev/null || true
+
+            # wait for the process to exit (not a child, so use kill -0 polling)
+            timeout_secs=30
+            elapsed=0
+            while kill -0 "$pid" 2>/dev/null; do
+              if [ "$elapsed" -ge "$timeout_secs" ]; then
+                kill -9 "$pid" 2>/dev/null || true
+                break
+              fi
+              sleep 1
+              elapsed=$((elapsed + 1))
+            done
+          fi
+          pkill -f simulate_append_data || true
+
       - name: Send SIGTERM to Spice
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
-        timeout-minutes: 0.5
+        timeout-minutes: 2
         run: |
-          killall spice
-          while pgrep spice > /dev/null; do sleep 1; done
+          killall spice || true
+          while pgrep -x spice > /dev/null; do sleep 1; done
+          # Allow filesystem to sync after process exits
+          sleep 2
 
       - name: Verify local DuckDB database
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
@@ -1939,6 +1973,7 @@ jobs:
             echo "Verification successful: accelerated_duckdb.db.wal does not exist."
           else
             echo "Verification failed: accelerated_duckdb.db.wal exists."
+            ls -la .spice/data/accelerated_duckdb.db.wal
             exit 1
           fi
 
@@ -1947,6 +1982,7 @@ jobs:
         if: always()
         run: |
           killall spice || true
+          pkill -f simulate_append_data || true
           cat spice.log
           if grep -iE "(failed|error)" spice.log; then
             echo "Failures detected in spice.log"
@@ -2069,10 +2105,11 @@ jobs:
 
       - name: Send SIGTERM to Spice
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
-        timeout-minutes: 0.5
+        timeout-minutes: 2
         run: |
-          killall spice
-          while pgrep spice > /dev/null; do sleep 1; done
+          killall spice || true
+          while pgrep -x spice > /dev/null; do sleep 1; done
+          sleep 2
 
       - name: Verify local DuckDB database
         working-directory: ./test/spicepods/tpch/sf1/accelerated/constraints
@@ -2090,6 +2127,7 @@ jobs:
             echo "Verification successful: accelerated_duckdb.db.wal does not exist."
           else
             echo "Verification failed: accelerated_duckdb.db.wal exists."
+            ls -la .spice/data/accelerated_duckdb.db.wal
             exit 1
           fi
 

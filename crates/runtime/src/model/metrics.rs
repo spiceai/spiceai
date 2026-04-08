@@ -47,6 +47,20 @@ pub(crate) static LLM_INTERNAL_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock:
         .build()
 });
 
+pub(crate) static LLM_PROMPT_TOKENS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("llm_prompt_tokens_total")
+        .with_description("Total prompt (input) tokens consumed by LLM requests.")
+        .build()
+});
+
+pub(crate) static LLM_COMPLETION_TOKENS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("llm_completion_tokens_total")
+        .with_description("Total completion (output) tokens produced by LLM requests.")
+        .build()
+});
+
 pub(crate) fn request_labels(req: &CreateChatCompletionRequest) -> Vec<KeyValue> {
     #[expect(clippy::cast_possible_wrap)]
     let mut labels = vec![
@@ -139,4 +153,14 @@ pub(crate) fn handle_metrics(duration: Duration, is_failure: bool, labels: &[Key
     if is_failure {
         FAILURES.add(1, labels);
     }
+}
+
+/// Records token usage metrics from a completed LLM request.
+pub(crate) fn handle_token_metrics(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    labels: &[KeyValue],
+) {
+    LLM_PROMPT_TOKENS.add(u64::from(prompt_tokens), labels);
+    LLM_COMPLETION_TOKENS.add(u64::from(completion_tokens), labels);
 }

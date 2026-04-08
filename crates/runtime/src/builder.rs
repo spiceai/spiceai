@@ -362,6 +362,7 @@ impl RuntimeBuilder {
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
             completion_llms: Arc::new(RwLock::new(HashMap::new())),
+            model_rate_controllers: Arc::new(RwLock::new(HashMap::new())),
             responses_llms: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
