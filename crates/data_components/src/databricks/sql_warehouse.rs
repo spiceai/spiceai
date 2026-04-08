@@ -247,13 +247,30 @@ impl SqlWarehouseApi {
 
     async fn get_schema(&self, table: &TableReference) -> Result<SchemaRef, Error> {
         let token = self.token_provider.get_token();
-        let payload = self.create_schema_payload(table)?;
+        let payload = self.create_schema_payload(table, "full_data_type")?;
         let response = self.execute_sql_statement(&token, &payload).await?;
         let response = self.wait_for_statement_completion(&token, response).await?;
-        schema_from_json(&response, &table.to_string())
+
+        match schema_from_json(&response, &table.to_string()) {
+            Ok(schema) => Ok(schema),
+            Err(Error::QueryFailure { ref message })
+                if message.contains("UNRESOLVED_COLUMN") =>
+            {
+                tracing::warn!("Databricks information_schema does not have 'full_data_type' column, falling back to 'data_type'. Complex types (ARRAY, MAP, STRUCT) may lose inner type details.");
+                let payload = self.create_schema_payload(table, "data_type")?;
+                let response = self.execute_sql_statement(&token, &payload).await?;
+                let response = self.wait_for_statement_completion(&token, response).await?;
+                schema_from_json(&response, &table.to_string())
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    fn create_schema_payload(&self, table: &TableReference) -> Result<Value, Error> {
+    fn create_schema_payload(
+        &self,
+        table: &TableReference,
+        data_type_column: &str,
+    ) -> Result<Value, Error> {
         let table_schema = table.schema().ok_or_else(|| Error::FullyQualifiedPath {
             reason: "missing schema".into(),
         })?;
@@ -265,7 +282,7 @@ impl SqlWarehouseApi {
         let escaped_schema = table_schema.replace('\'', "''");
         let escaped_catalog = table_catalog.replace('\'', "''");
         let sql = format!(
-            "SELECT column_name, full_data_type, is_nullable FROM information_schema.columns WHERE table_name = '{escaped_table}' AND table_schema = '{escaped_schema}' AND table_catalog = '{escaped_catalog}'"
+            "SELECT column_name, {data_type_column}, is_nullable FROM information_schema.columns WHERE table_name = '{escaped_table}' AND table_schema = '{escaped_schema}' AND table_catalog = '{escaped_catalog}'"
         );
         // Databricks SQL Statements API max wait_timeout is 50s.
         // https://docs.databricks.com/api/workspace/statementexecution/executestatement
@@ -891,7 +908,7 @@ mod tests {
         assert_eq!(schema.field(4).data_type(), &DataType::Date32);
         assert_eq!(
             schema.field(5).data_type(),
-            &DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, Some("UTC".into()))
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
         );
         assert_eq!(schema.field(6).data_type(), &DataType::Binary);
         assert_eq!(schema.field(7).data_type(), &DataType::Decimal128(10, 2));
@@ -1158,7 +1175,7 @@ mod tests {
         let table = TableReference::full("my_catalog", "my_schema", "my_table");
 
         let payload = api
-            .create_schema_payload(&table)
+            .create_schema_payload(&table, "full_data_type")
             .expect("should create payload");
 
         assert_eq!(payload["format"], "JSON_ARRAY");
@@ -1186,7 +1203,7 @@ mod tests {
         let table = TableReference::bare("just_table");
 
         let err = api
-            .create_schema_payload(&table)
+            .create_schema_payload(&table, "full_data_type")
             .expect_err("should fail without schema");
         assert!(
             matches!(&err, Error::FullyQualifiedPath { reason } if reason.contains("missing schema")),
@@ -1205,7 +1222,7 @@ mod tests {
         let table = TableReference::partial("my_schema", "my_table");
 
         let err = api
-            .create_schema_payload(&table)
+            .create_schema_payload(&table, "full_data_type")
             .expect_err("should fail without catalog");
         assert!(
             matches!(&err, Error::FullyQualifiedPath { reason } if reason.contains("missing catalog")),
@@ -1224,7 +1241,7 @@ mod tests {
         let table = TableReference::full("cat'alog", "sch'ema", "tab'le");
 
         let payload = api
-            .create_schema_payload(&table)
+            .create_schema_payload(&table, "full_data_type")
             .expect("should create payload");
         let stmt = payload["statement"]
             .as_str()
@@ -1514,5 +1531,255 @@ mod tests {
         assert_eq!(schema.fields().len(), 2);
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(1).name(), "name");
+    }
+
+    #[test]
+    fn test_create_schema_payload_uses_data_type_column() {
+        let api = SqlWarehouseApi::new(
+            "host.example.com",
+            "wh-1",
+            Arc::new(StaticTokenProvider("t".to_string())),
+        )
+        .expect("should create api");
+        let table = TableReference::full("my_catalog", "my_schema", "my_table");
+
+        let payload_full = api
+            .create_schema_payload(&table, "full_data_type")
+            .expect("should create payload with full_data_type");
+        let stmt_full = payload_full["statement"]
+            .as_str()
+            .expect("statement should be string");
+        assert!(
+            stmt_full.contains("full_data_type"),
+            "SQL should reference full_data_type: {stmt_full}"
+        );
+        assert!(
+            !stmt_full.contains(", data_type,"),
+            "SQL should not reference plain data_type: {stmt_full}"
+        );
+
+        let payload_plain = api
+            .create_schema_payload(&table, "data_type")
+            .expect("should create payload with data_type");
+        let stmt_plain = payload_plain["statement"]
+            .as_str()
+            .expect("statement should be string");
+        assert!(
+            stmt_plain.contains(", data_type,"),
+            "SQL should reference data_type: {stmt_plain}"
+        );
+        assert!(
+            !stmt_plain.contains("full_data_type"),
+            "SQL should not reference full_data_type: {stmt_plain}"
+        );
+    }
+
+    #[test]
+    fn test_schema_from_json_parameterless_complex_types() {
+        // When using `data_type` column, complex types lack inner type info.
+        let response = make_schema_response(&json!([
+            ["id", "int", "NO"],
+            ["tags", "ARRAY", "YES"],
+            ["metadata", "MAP", "YES"],
+            ["details", "STRUCT", "YES"],
+            ["price", "DECIMAL", "YES"]
+        ]));
+
+        let schema = schema_from_json(&response, "test_table")
+            .expect("should parse parameterless complex types");
+        assert_eq!(schema.fields().len(), 5);
+
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+
+        // ARRAY without type params falls back to List(Utf8)
+        assert_eq!(schema.field(1).name(), "tags");
+        assert!(
+            matches!(schema.field(1).data_type(), DataType::List(_)),
+            "ARRAY should become List, got {:?}",
+            schema.field(1).data_type()
+        );
+
+        // MAP without type params falls back to Map(Utf8, Utf8)
+        assert_eq!(schema.field(2).name(), "metadata");
+        assert!(
+            matches!(schema.field(2).data_type(), DataType::Map(_, _)),
+            "MAP should become Map, got {:?}",
+            schema.field(2).data_type()
+        );
+
+        // STRUCT without type params falls back to Utf8
+        assert_eq!(schema.field(3).name(), "details");
+        assert_eq!(schema.field(3).data_type(), &DataType::Utf8);
+
+        // DECIMAL without precision/scale falls back to Decimal128(38,10)
+        assert_eq!(schema.field(4).name(), "price");
+        assert_eq!(schema.field(4).data_type(), &DataType::Decimal128(38, 10));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_get_schema_falls_back_to_data_type_on_unresolved_column() {
+        // First call returns UNRESOLVED_COLUMN error (full_data_type doesn't exist).
+        // Second call returns a successful schema response using data_type column.
+        let unresolved_column_response = json!({
+            "status": {
+                "state": "FAILED",
+                "error": {
+                    "message": "[UNRESOLVED_COLUMN.WITH_SUGGESTION] A column or function parameter with name `full_data_type` cannot be resolved."
+                }
+            },
+            "statement_id": "stmt-1"
+        });
+        let success_response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "stmt-2",
+            "result": {
+                "data_array": [
+                    ["id", "int", "NO"],
+                    ["name", "string", "YES"]
+                ]
+            }
+        });
+
+        let port =
+            start_mock_server(vec![unresolved_column_response, success_response], json!({})).await;
+        let api = create_test_api(port);
+        let table = TableReference::full("my_catalog", "my_schema", "my_table");
+
+        let schema = api
+            .get_schema(&table)
+            .await
+            .expect("should succeed via data_type fallback");
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "name");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_get_schema_succeeds_with_full_data_type() {
+        let success_response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "stmt-1",
+            "result": {
+                "data_array": [
+                    ["id", "bigint", "NO"],
+                    ["amount", "decimal(10,2)", "YES"]
+                ]
+            }
+        });
+
+        let port = start_mock_server(vec![success_response], json!({})).await;
+        let api = create_test_api(port);
+        let table = TableReference::full("catalog", "schema", "orders");
+
+        let schema = api
+            .get_schema(&table)
+            .await
+            .expect("should succeed on first try with full_data_type");
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).data_type(), &DataType::Decimal128(10, 2));
+    }
+
+    /// Regression test: Databricks sends timestamps as `Timestamp(Microsecond, "Etc/UTC")`
+    /// in Arrow IPC. The declared schema must also use Microsecond so that `try_cast_to`
+    /// doesn't attempt a µs→ns multiplication that overflows for far-future sentinel
+    /// values like year 9999 (253402300799999000 µs × 1000 > i64::MAX).
+    #[test]
+    fn test_schema_from_json_timestamp_microsecond_avoids_overflow() {
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow_tools::record_batch::try_cast_to;
+
+        // Parse schema from a Databricks JSON response with timestamp columns
+        let response = make_schema_response(&json!([
+            ["id", "int", "NO"],
+            ["edw_end_datetime", "timestamp", "YES"],
+            ["created_ntz", "timestamp_ntz", "YES"]
+        ]));
+        let declared_schema =
+            schema_from_json(&response, "test_table").expect("should parse schema");
+
+        // Verify both timestamp fields use Microsecond
+        assert_eq!(
+            declared_schema.field(1).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+            "TIMESTAMP must be Microsecond"
+        );
+        assert_eq!(
+            declared_schema.field(2).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            "TIMESTAMP_NTZ must be Microsecond"
+        );
+
+        // Simulate Databricks Arrow IPC: data arrives as Timestamp(Microsecond, "Etc/UTC")
+        // with a far-future sentinel value (year 9999).
+        let sentinel_us: i64 = 253_402_300_799_999_000; // 9999-12-31T23:59:59.999 in µs
+        let ipc_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "edw_end_datetime",
+                DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    Some("Etc/UTC".into()),
+                ),
+                true,
+            ),
+            Field::new(
+                "created_ntz",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&ipc_schema),
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1])),
+                Arc::new(TimestampMicrosecondArray::from(vec![sentinel_us]).with_timezone("Etc/UTC")),
+                Arc::new(TimestampMicrosecondArray::from(vec![sentinel_us])),
+            ],
+        )
+        .expect("should create batch");
+
+        // Cast from IPC schema to declared schema — must NOT overflow
+        let result = try_cast_to(batch, declared_schema);
+        assert!(
+            result.is_ok(),
+            "try_cast_to should not overflow for year-9999 sentinel: {:?}",
+            result.err()
+        );
+
+        let casted = result.expect("already checked");
+        let ts_col = casted
+            .column(1)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("should be TimestampMicrosecondArray");
+        assert_eq!(ts_col.value(0), sentinel_us, "sentinel value must be preserved");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_get_schema_propagates_non_unresolved_column_errors() {
+        // A FAILED response that is NOT about UNRESOLVED_COLUMN should not trigger fallback.
+        let other_failure = json!({
+            "status": {
+                "state": "FAILED",
+                "error": { "message": "Table or view not found: my_table" }
+            },
+            "statement_id": "stmt-1"
+        });
+
+        let port = start_mock_server(vec![other_failure], json!({})).await;
+        let api = create_test_api(port);
+        let table = TableReference::full("catalog", "schema", "my_table");
+
+        let err = api
+            .get_schema(&table)
+            .await
+            .expect_err("should propagate non-UNRESOLVED_COLUMN error");
+        assert!(
+            matches!(&err, Error::QueryFailure { message } if message.contains("Table or view not found")),
+            "unexpected error: {err}"
+        );
     }
 }
