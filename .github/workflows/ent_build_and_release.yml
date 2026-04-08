@@ -164,7 +164,7 @@ jobs:
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
     env:
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || (startsWith(github.ref, 'refs/tags/v') && 'release-lto' || 'release') }}
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_NET_GIT_FETCH_WITH_CLI: true
@@ -255,7 +255,7 @@ jobs:
 
       - name: tar spiced binary
         run: |
-          mv target/release/spiced spiced
+          mv target/${{ env.RUST_PROFILE }}/spiced spiced
           chmod +x spiced
           tar czf spiced${{ matrix.flavor.suffix }}_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced
 
@@ -281,12 +281,12 @@ jobs:
       - name: Build spiced (metal)
         if: matrix.target.target_os == 'darwin' && matrix.flavor.name == 'models'
         working-directory: bin/spiced
-        run: cargo build --release --features ${{ matrix.flavor.features }},metal --target-dir ../../target
+        run: cargo build --profile ${{ env.RUST_PROFILE }} --features ${{ matrix.flavor.features }},metal --target-dir ../../target
 
       - name: tar binary (metal)
         if: matrix.target.target_os == 'darwin' && matrix.flavor.name == 'models'
         run: |
-          mv target/release/spiced spiced
+          mv target/${{ env.RUST_PROFILE }}/spiced spiced
           chmod +x spiced
           tar czf spiced_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spiced
 
@@ -304,7 +304,7 @@ jobs:
       - name: tar CLI binary
         if: matrix.flavor.name == 'default'
         run: |
-          mv target/release/spice spice
+          mv target/${{ env.RUST_PROFILE }}/spice spice
           chmod +x spice
           tar czf spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz spice
 
@@ -338,7 +338,7 @@ jobs:
       startswith(github.ref, 'refs/heads/release/') ||
       github.event_name == 'workflow_dispatch'
     env:
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || (startsWith(github.ref, 'refs/tags/v') && 'release-lto' || 'release') }}
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_NET_GIT_FETCH_WITH_CLI: true
@@ -362,7 +362,7 @@ jobs:
 
       - name: tar CLI binary
         run: |
-          mv target/release/spice.exe spice.exe
+          mv target/${{ env.RUST_PROFILE }}/spice.exe spice.exe
           tar czf spice.exe_windows_x86_64.tar.gz spice.exe
 
       - name: Print CLI version

@@ -91,9 +91,9 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: ubuntu-22.04
+    runs-on: spicehq-dev-runners
     env:
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
       CARGO_TERM_COLOR: always
 
     steps:
@@ -134,13 +134,13 @@ jobs:
 
       - name: tar spiced binary
         run: |
-          mv target/release/spiced spiced
+          mv target/${{ env.RUST_PROFILE }}/spiced spiced
           chmod +x spiced
           tar czf spiced_linux_x86_64.tar.gz spiced
 
       - name: tar spice CLI binary
         run: |
-          mv target/release/spice spice
+          mv target/${{ env.RUST_PROFILE }}/spice spice
           chmod +x spice
           tar czf spice_linux_x86_64.tar.gz spice
 
@@ -166,7 +166,7 @@ jobs:
 
     runs-on: hosted-linux-arm-runner
     env:
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
       CARGO_TERM_COLOR: always
 
     steps:
@@ -207,13 +207,13 @@ jobs:
 
       - name: tar spiced binary
         run: |
-          mv target/release/spiced spiced
+          mv target/${{ env.RUST_PROFILE }}/spiced spiced
           chmod +x spiced
           tar czf spiced_linux_aarch64.tar.gz spiced
 
       - name: tar spice CLI binary
         run: |
-          mv target/release/spice spice
+          mv target/${{ env.RUST_PROFILE }}/spice spice
           chmod +x spice
           tar czf spice_linux_aarch64.tar.gz spice
 
@@ -239,7 +239,7 @@ jobs:
 
     runs-on: spiceai-macos
     env:
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
       CARGO_TERM_COLOR: always
 
     steps:
@@ -279,13 +279,13 @@ jobs:
 
       - name: tar spiced binary
         run: |
-          mv target/release/spiced spiced
+          mv target/${{ env.RUST_PROFILE }}/spiced spiced
           chmod +x spiced
           tar czf spiced_darwin_aarch64.tar.gz spiced
 
       - name: tar spice CLI binary
         run: |
-          mv target/release/spice spice
+          mv target/${{ env.RUST_PROFILE }}/spice spice
           chmod +x spice
           tar czf spice_darwin_aarch64.tar.gz spice
 

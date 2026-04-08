@@ -120,7 +120,7 @@ jobs:
     runs-on: hosted-linux-arm-runner
     env:
       SELECTED_VARIANT: ${{ needs.setup.outputs.variant }}
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -227,7 +227,7 @@ jobs:
     runs-on: spicehq-dev-runners
     env:
       SELECTED_VARIANT: ${{ needs.setup.outputs.variant }}
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6

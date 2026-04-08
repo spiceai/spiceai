@@ -340,6 +340,7 @@ spiceai = { git = "https://github.com/spiceai/spice-rs.git", rev = "4c63970cf1d7
 [profile.release-lto]
 inherits = "release"
 lto = true
+codegen-units = 1
 
 # Production-like profile with debug symbols for crash investigation
 [profile.release-debug]

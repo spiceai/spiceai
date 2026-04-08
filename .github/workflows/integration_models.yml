@@ -100,7 +100,6 @@ jobs:
         if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Set up Nextest
@@ -133,6 +132,9 @@ jobs:
           name: ai-integration-test-archive
           path: ./integration.tar.zst
           retention-days: 1
+
+      - name: Show sccache stats
+        run: sccache --show-stats
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
@@ -412,7 +414,6 @@ jobs:
         if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Set up Nextest
@@ -422,8 +423,6 @@ jobs:
       - name: Build AI integration test binary
         env:
           RUSTC_WRAPPER: sccache
-          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
           FEATURES="flightsql,models,s3_vectors,kafka,duckdb"
           if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]] || [[ "${{ github.event_name }}" == "schedule" ]]; then
@@ -442,6 +441,9 @@ jobs:
           name: ai-integration-test-archive-extended
           path: ./integration-extended.tar.zst
           retention-days: 1
+
+      - name: Show sccache stats
+        run: sccache --show-stats
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
