@@ -2077,4 +2077,80 @@ mod tests {
         assert_eq!(schema.field(13).data_type(), &DataType::Decimal128(38, 10));
         assert_eq!(schema.field(16).data_type(), &DataType::Int32);
     }
+
+    /// Schema with geometry, decimal(22,4), and all common scalar types
+    /// from a real Databricks `information_schema` dump using `full_data_type`.
+    #[test]
+    fn test_schema_from_json_real_mixed_types_with_geometry() {
+        let response = make_schema_response(&json!([
+            ["id", "string", "YES"],
+            ["distance_ft", "double", "YES"],
+            ["state", "string", "YES"],
+            ["score", "double", "YES"],
+            ["count", "int", "YES"],
+            ["flag", "int", "YES"],
+            ["created_at", "timestamp", "YES"],
+            ["census", "bigint", "YES"],
+            ["coverage_a", "decimal(22,4)", "YES"],
+            ["spend_dt", "date", "YES"],
+            ["geom", "geometry(5070)", "YES"]
+        ]));
+
+        let schema = schema_from_json(&response, "catalog.test_schema.mixed_types")
+            .expect("should parse mixed types including geometry");
+        assert_eq!(schema.fields().len(), 11);
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(1).data_type(), &DataType::Float64);
+        assert_eq!(schema.field(4).data_type(), &DataType::Int32);
+        assert_eq!(
+            schema.field(6).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(7).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(8).data_type(), &DataType::Decimal128(22, 4));
+        assert_eq!(schema.field(9).data_type(), &DataType::Date32);
+        assert_eq!(
+            schema.field(10).data_type(),
+            &DataType::Binary,
+            "GEOMETRY should map to Binary"
+        );
+    }
+
+    /// Same mixed schema using `data_type` column (uppercase, GEOMETRY without SRID).
+    #[test]
+    fn test_schema_from_json_real_mixed_types_data_type_fallback() {
+        let response = make_schema_response(&json!([
+            ["id", "STRING", "YES"],
+            ["distance_ft", "DOUBLE", "YES"],
+            ["state", "STRING", "YES"],
+            ["score", "DOUBLE", "YES"],
+            ["count", "INT", "YES"],
+            ["flag", "INT", "YES"],
+            ["created_at", "TIMESTAMP", "YES"],
+            ["census", "LONG", "YES"],
+            ["coverage_a", "DECIMAL", "YES"],
+            ["spend_dt", "DATE", "YES"],
+            ["geom", "GEOMETRY", "YES"]
+        ]));
+
+        let schema = schema_from_json(&response, "catalog.test_schema.mixed_types")
+            .expect("should parse mixed types with data_type fallback");
+        assert_eq!(schema.fields().len(), 11);
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(1).data_type(), &DataType::Float64);
+        assert_eq!(schema.field(4).data_type(), &DataType::Int32);
+        assert_eq!(
+            schema.field(6).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(7).data_type(), &DataType::Int64);
+        // DECIMAL without params falls back to Decimal128(38,10)
+        assert_eq!(schema.field(8).data_type(), &DataType::Decimal128(38, 10));
+        assert_eq!(schema.field(9).data_type(), &DataType::Date32);
+        assert_eq!(
+            schema.field(10).data_type(),
+            &DataType::Binary,
+            "GEOMETRY should map to Binary"
+        );
+    }
 }

@@ -229,6 +229,19 @@ impl<'input> Parser<'input> {
             }
             Some(Ok(Token::Map)) => self.parse_map_with_depth(depth),
             Some(Ok(Token::Struct)) => self.parse_struct_with_depth(depth),
+            // GEOMETRY is not a first-class Arrow type; treat as Binary (WKB).
+            // The lexer emits it as Identifier("GEOMETRY") since it has no
+            // dedicated token. Consume any trailing `(SRID)` if present.
+            Some(Ok(Token::Identifier(id))) if id.eq_ignore_ascii_case("GEOMETRY") => {
+                self.advance();
+                // Skip optional parenthesized SRID, e.g. `geometry(5070)`
+                if self.current == Some(Ok(Token::LParen)) {
+                    self.advance(); // skip `(`
+                    self.advance(); // skip SRID number
+                    self.expect(&Token::RParen)?;
+                }
+                Ok(ArrowDataType::Binary)
+            }
             _ => Err(format!("Unexpected token: {:?}", self.current)),
         }
     }
@@ -549,6 +562,16 @@ mod tests {
         let mut parser = Parser::new("DECIMAL");
         let result = parser.parse().expect("parse DECIMAL without params");
         assert_eq!(result, ArrowDataType::Decimal128(38, 10));
+
+        // GEOMETRY with SRID → Binary
+        let mut parser = Parser::new("geometry(5070)");
+        let result = parser.parse().expect("parse GEOMETRY with SRID");
+        assert_eq!(result, ArrowDataType::Binary);
+
+        // GEOMETRY without SRID → Binary
+        let mut parser = Parser::new("GEOMETRY");
+        let result = parser.parse().expect("parse GEOMETRY without SRID");
+        assert_eq!(result, ArrowDataType::Binary);
     }
 
     /// Databricks sends Arrow IPC data with `Timestamp(Microsecond, ...)` but
