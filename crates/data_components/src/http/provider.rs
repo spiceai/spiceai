@@ -146,7 +146,8 @@ pub struct PaginationConfig {
     /// Example: `/next`, `/pagination/cursor`, `/links/next`
     pub next_pointer: Option<String>,
 
-    /// Use the HTTP `Link` header with `rel="next"` for pagination.
+    /// Use the HTTP `Link` header with `rel="next"` for pagination. Default: `true`.
+    /// Set to `false` to disable Link header auto-detection.
     pub use_link_header: bool,
 
     /// When set, the value from `next_pointer` is treated as a cursor/token
@@ -167,7 +168,7 @@ impl Default for PaginationConfig {
     fn default() -> Self {
         Self {
             next_pointer: None,
-            use_link_header: false,
+            use_link_header: true,
             token_param: None,
             data_pointer: None,
             max_pages: DEFAULT_PAGINATION_MAX_PAGES,
@@ -3955,10 +3956,23 @@ mod tests {
     #[test]
     fn test_pagination_config_validation_requires_next_source() {
         let provider = base_provider();
-        let result = provider.with_pagination(PaginationConfig::default());
+        let result = provider.with_pagination(PaginationConfig {
+            use_link_header: false,
+            ..Default::default()
+        });
         assert!(
             result.is_err(),
             "should require next_pointer or link_header"
+        );
+    }
+
+    #[test]
+    fn test_pagination_default_enables_link_header() {
+        let provider = base_provider();
+        let result = provider.with_pagination(PaginationConfig::default());
+        assert!(
+            result.is_ok(),
+            "default config with link_header=true should be valid"
         );
     }
 

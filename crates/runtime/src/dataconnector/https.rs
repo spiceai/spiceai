@@ -146,7 +146,7 @@ impl Https {
             .get("pagination")
             .expose()
             .ok()
-            .is_some_and(util::parse_enabled);
+            .map_or(true, |v| v != "disabled");
 
         has_allowed_paths || has_query_filters || has_body_filters || has_pagination
     }
@@ -262,14 +262,18 @@ impl Https {
             .ok()
             .map(std::string::ToString::to_string);
 
-        let pagination_enabled = self
-            .params
-            .get("pagination")
-            .expose()
-            .ok()
-            .is_some_and(util::parse_enabled);
+        let pagination_mode =
+            self.params
+                .get("pagination")
+                .expose()
+                .ok()
+                .map_or("auto", |v| match v {
+                    "enabled" | "true" => "enabled",
+                    "disabled" | "false" => "disabled",
+                    _ => "auto",
+                });
 
-        let pagination = if pagination_enabled {
+        let pagination = if pagination_mode != "disabled" {
             let next_pointer = self
                 .params
                 .get("pagination_next_pointer")
@@ -282,7 +286,7 @@ impl Https {
                 .get("pagination_link_header")
                 .expose()
                 .ok()
-                .is_some_and(util::parse_enabled);
+                .map_or(true, util::parse_enabled);
 
             let token_param = self
                 .params
@@ -306,13 +310,28 @@ impl Https {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES);
 
-            Some(data_components::http::provider::PaginationConfig {
-                next_pointer,
-                use_link_header,
-                token_param,
-                data_pointer,
-                max_pages,
-            })
+            // In 'auto' mode with no explicit config, use Link header detection only
+            if pagination_mode == "auto"
+                && next_pointer.is_none()
+                && token_param.is_none()
+                && data_pointer.is_none()
+            {
+                Some(data_components::http::provider::PaginationConfig {
+                    next_pointer: None,
+                    use_link_header: true,
+                    token_param: None,
+                    data_pointer: None,
+                    max_pages,
+                })
+            } else {
+                Some(data_components::http::provider::PaginationConfig {
+                    next_pointer,
+                    use_link_header,
+                    token_param,
+                    data_pointer,
+                    max_pages,
+                })
+            }
         } else {
             None
         };
@@ -661,8 +680,8 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("health_probe")
             .description("Custom health probe path for endpoint validation (e.g., '/health', '/api/status'). The endpoint must return a 2xx status code to pass validation. If not set, a random path is used and any status (including 404) is accepted."),
         ParameterSpec::runtime("pagination")
-            .description("Set to 'enabled' to enable paginated fetching. Requires at least one of 'pagination_next_pointer' or 'pagination_link_header'.")
-            .one_of(&["enabled", "disabled"]),
+            .description("Pagination mode. 'auto' (default): auto-detects Link headers. 'enabled': explicitly enable with config. 'disabled': no pagination.")
+            .one_of(&["auto", "enabled", "disabled"]),
         ParameterSpec::runtime("pagination_next_pointer")
             .description("JSON pointer (RFC 6901) to the next page URL or cursor in the response body (e.g., '/next', '/pagination/cursor', '/links/next')."),
         ParameterSpec::runtime("pagination_link_header")
