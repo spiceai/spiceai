@@ -215,15 +215,14 @@ async fn get_m2m_access_token(
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    let response =
-        send_request_with_retry("Databricks", "request M2M access token", || {
-            client
-                .post(&token_endpoint_url)
-                .basic_auth(client_id.as_str(), Some(client_secret.expose_secret()))
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .form(&[("grant_type", "client_credentials"), ("scope", "all-apis")])
-        })
-        .await?;
+    let response = send_request_with_retry("Databricks", "request M2M access token", || {
+        client
+            .post(&token_endpoint_url)
+            .basic_auth(client_id.as_str(), Some(client_secret.expose_secret()))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .form(&[("grant_type", "client_credentials"), ("scope", "all-apis")])
+    })
+    .await?;
 
     if !response.status().is_success() {
         let status = response.status();
