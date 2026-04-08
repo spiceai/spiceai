@@ -282,19 +282,22 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
             })?;
 
             // 2. Core create — metadata catalog + DataFusion registration.
-            let ops_params = operations::CreateTableParams {
-                table_name: table_name.clone(),
-                schema_name: schema_name.clone(),
-                catalog_name: catalog_name.clone(),
-                arrow_schema,
-                primary_key,
-                partition_expr_sql: partition_expr_sql.clone(),
-                if_not_exists,
-                like_source_table: like_source_table.clone(),
-                ctx: ctx_opt,
-            };
-            let outcome =
-                create_table(ops_params, cayenne_provider, Arc::clone(&runtime_env)).await?;
+            let _ = create_table(
+                operations::CreateTableParams {
+                    table_name: table_name.clone(),
+                    schema_name: schema_name.clone(),
+                    catalog_name: catalog_name.clone(),
+                    arrow_schema,
+                    primary_key,
+                    partition_expr_sql: partition_expr_sql.clone(),
+                    if_not_exists,
+                    like_source_table: like_source_table.clone(),
+                    ctx: ctx_opt,
+                },
+                cayenne_provider,
+                Arc::clone(&runtime_env),
+            )
+            .await?;
 
             let table_ref = datafusion::sql::TableReference::full(
                 catalog_name.clone(),

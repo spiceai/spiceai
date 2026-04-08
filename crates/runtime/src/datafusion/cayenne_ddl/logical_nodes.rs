@@ -32,17 +32,6 @@ use datafusion::common::DFSchemaRef;
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 use datafusion::sql::TableReference;
 
-fn dml_count_schema() -> DFSchemaRef {
-    DFSchemaRef::new(
-        datafusion::common::DFSchema::try_from(Schema::new(vec![Field::new(
-            "count",
-            DataType::UInt64,
-            false,
-        )]))
-        .unwrap_or_else(|e| unreachable!("fixed DML count schema must be valid: {e}")),
-    )
-}
-
 // ── DistributedCayenneDeleteNode ──────────────────────────────────────────────
 
 /// Logical plan node to forward `DELETE` DML to Cayenne executors in distributed mode.
