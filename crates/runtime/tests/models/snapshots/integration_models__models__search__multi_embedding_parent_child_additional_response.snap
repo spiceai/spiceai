@@ -16,11 +16,11 @@ expression: "normalize_search_response_json(resp, true)"
           "DEPARTMENT"
         ],
         "cp_description": [
-          "In general basic characters welcome. Clearly lively friends conv"
+          "Programmes receive just likely, key homes. Relevant,"
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 1
+        "cp_catalog_page_sk": 11
       }
     },
     {
@@ -34,11 +34,11 @@ expression: "normalize_search_response_json(resp, true)"
           "DEPARTMENT"
         ],
         "cp_description": [
-          "Programmes receive just likely, key homes. Relevant,"
+          "In general basic characters welcome. Clearly lively friends conv"
         ]
       },
       "primary_key": {
-        "cp_catalog_page_sk": 11
+        "cp_catalog_page_sk": 1
       }
     }
   ]
