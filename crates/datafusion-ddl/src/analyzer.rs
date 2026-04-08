@@ -154,7 +154,7 @@ impl UserDefinedLogicalNodeCore for DdlExtensionNode {
 /// The DDL operation kind and its full parameters, stored inside [`DdlExtensionNode`].
 #[derive(Debug, Clone)]
 pub enum DdlNodeOp {
-    CreateTable(CreateTableParams),
+    CreateTable(Box<CreateTableParams>),
     DropTable(DropTableParams),
     CreateSchema(CreateSchemaParams),
 }
@@ -192,7 +192,7 @@ impl DdlNodeOp {
 
 // ── DdlAnalyzerRule ───────────────────────────────────────────────────────────
 
-/// Generic DataFusion analyzer rule for Spice catalog DDL.
+/// Generic `DataFusion` analyzer rule for Spice catalog DDL.
 ///
 /// Intercepts `CREATE TABLE` / `DROP TABLE` / `CREATE SCHEMA` plans,
 /// performs the DDL-enabled check, extracts Arrow schema + primary keys,
@@ -297,7 +297,7 @@ impl AnalyzerRule for DdlAnalyzerRule {
                     like_source_table: None,
                 };
                 let node = DdlExtensionNode::new(
-                    DdlNodeOp::CreateTable(params),
+                    DdlNodeOp::CreateTable(Box::new(params)),
                     Arc::clone(&self.handler),
                 );
                 Ok(LogicalPlan::Extension(Extension {

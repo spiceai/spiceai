@@ -119,8 +119,21 @@ pub(crate) fn transform_schema_for_vortex(
     schema: &arrow::datatypes::Schema,
     unsupported_type_action: UnsupportedTypeAction,
 ) -> Result<arrow::datatypes::Schema> {
-    cayenne::transform_schema_for_vortex(schema, unsupported_type_action)
-        .map_err(|e| Error::UnableToCreateTable { source: e })
+    match cayenne::transform_schema_for_vortex(schema, unsupported_type_action) {
+        Ok(schema) => Ok(schema),
+        Err(datafusion::error::DataFusionError::Execution(msg))
+            if msg.starts_with("Unsupported data type(s) in schema:") =>
+        {
+            // Extract just the field list from the structured error message.
+            let details = msg
+                .strip_prefix("Unsupported data type(s) in schema: ")
+                .and_then(|s| s.split(". By default").next())
+                .unwrap_or(&msg)
+                .to_string();
+            Err(Error::UnsupportedDataTypes { details })
+        }
+        Err(source) => Err(Error::UnableToCreateTable { source }),
+    }
 }
 
 pub struct CayenneAccelerator {

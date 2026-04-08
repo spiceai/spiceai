@@ -107,6 +107,10 @@ pub trait CatalogDdlHandler: fmt::Debug + Send + Sync {
     ///
     /// `session_state` is provided for access to `runtime_env()`,
     /// `SessionContext` construction, and SQL expression parsing.
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be created (e.g. catalog not found,
+    /// schema mismatch, or underlying storage failure).
     fn create_table_exec(
         &self,
         params: CreateTableParams,
@@ -115,6 +119,11 @@ pub trait CatalogDdlHandler: fmt::Debug + Send + Sync {
     ) -> DFResult<Arc<dyn ExecutionPlan>>;
 
     /// Produce an [`ExecutionPlan`] that drops the described table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table cannot be dropped (e.g. catalog not found
+    /// or underlying storage failure).
     fn drop_table_exec(
         &self,
         params: DropTableParams,
@@ -122,6 +131,11 @@ pub trait CatalogDdlHandler: fmt::Debug + Send + Sync {
     ) -> DFResult<Arc<dyn ExecutionPlan>>;
 
     /// Produce an [`ExecutionPlan`] that creates the described schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the schema cannot be created (e.g. catalog not found
+    /// or underlying storage failure).
     fn create_schema_exec(
         &self,
         params: CreateSchemaParams,

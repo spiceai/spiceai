@@ -390,9 +390,19 @@ pub(super) async fn plan_create_table_like(
             // Encode the partition SQL back into the extension's partition_by field
             // as a bare identifier — the handler will call .to_string() on it.
             ext.partition_by = partition_expr_sql.map(|sql| {
-                Box::new(datafusion::sql::sqlparser::ast::Expr::Identifier(
-                    datafusion::sql::sqlparser::ast::Ident::new(sql),
-                ))
+                use datafusion::sql::sqlparser::dialect::GenericDialect;
+                use datafusion::sql::sqlparser::parser::Parser;
+                // Parse back into a real AST expression so that function calls
+                // like `bucket(4, region)` are not mangled into an identifier.
+                Parser::new(&GenericDialect {})
+                    .try_with_sql(&sql)
+                    .and_then(|mut p| p.parse_expr())
+                    .map(Box::new)
+                    .unwrap_or_else(|_| {
+                        Box::new(datafusion::sql::sqlparser::ast::Expr::Identifier(
+                            datafusion::sql::sqlparser::ast::Ident::new(sql),
+                        ))
+                    })
             });
             ext
         },
@@ -402,7 +412,7 @@ pub(super) async fn plan_create_table_like(
     };
 
     let node = datafusion_ddl::DdlExtensionNode::new(
-        datafusion_ddl::DdlNodeOp::CreateTable(params),
+        datafusion_ddl::DdlNodeOp::CreateTable(Box::new(params)),
         handler,
     );
 

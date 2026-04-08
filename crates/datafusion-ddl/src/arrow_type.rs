@@ -23,6 +23,10 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 /// `CREATE TABLE` statement. `DataFusion` SQL does not support specifying
 /// timestamp time units, so those are always `Nanosecond` after a roundtrip.
 /// Timezone presence is preserved via `TIMESTAMP WITH TIME ZONE`.
+/// # Errors
+///
+/// Returns an error if `dt` has no direct SQL equivalent (e.g. nested or
+/// complex Arrow types not representable as a SQL column type).
 pub fn arrow_datatype_to_sql(dt: &DataType) -> DFResult<String> {
     match dt {
         DataType::Boolean => Ok("BOOLEAN".to_string()),

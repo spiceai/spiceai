@@ -463,6 +463,8 @@ impl DataFusionBuilder {
                         )) as Arc<dyn datafusion_ddl::CatalogDdlHandler>,
                     )
                 }
+                #[cfg(windows)]
+                None
             } else {
                 // Single node spice uses default [`cayenne::CayenneDdlHandler`].
                 if cfg!(windows) {
@@ -524,6 +526,7 @@ impl DataFusionBuilder {
             executor: RwLock::new(None),
             executor_stream_registry: RwLock::new(None),
             executor_registry: self.executor_registry,
+            #[cfg(not(windows))]
             cayenne_ddl_handler,
         }
     }

@@ -39,6 +39,7 @@ use datafusion_table_providers::util::on_conflict::OnConflict;
 use runtime_table_partition::expression::PartitionedBy;
 use runtime_table_partition::provider::PartitionTableProvider;
 
+use crate::catalog::CatalogError;
 use crate::catalog_provider::{CayenneCatalogProvider, CayenneSchemaProvider};
 use crate::metadata::CreateTableOptions;
 use crate::partition_creator::CayennePartitionCreator;
@@ -110,10 +111,11 @@ pub async fn create_table(
     let metadata_table_name = format!("{}/{}", params.schema_name, params.table_name);
 
     // ── Existence check ───────────────────────────────────────────────────────
-    let exists = metadata_catalog
-        .get_table(&metadata_table_name)
-        .await
-        .is_ok();
+    let exists = match metadata_catalog.get_table(&metadata_table_name).await {
+        Ok(_) => true,
+        Err(CatalogError::TableNotFound { .. }) => false,
+        Err(e) => return Err(DataFusionError::External(Box::new(e))),
+    };
     if exists {
         if params.if_not_exists {
             // Re-register in the in-memory schema provider if absent (e.g. after restart).
