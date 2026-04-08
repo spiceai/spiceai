@@ -348,6 +348,6 @@ mod tests {
         )];
 
         let result = select_least_loaded_executors(&partitions_by_executor, &senders, &entries);
-        assert!(result.is_err());
+        result.unwrap_err();
     }
 }
