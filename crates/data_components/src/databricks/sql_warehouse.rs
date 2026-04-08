@@ -247,9 +247,43 @@ impl SqlWarehouseApi {
 
     async fn get_schema(&self, table: &TableReference) -> Result<SchemaRef, Error> {
         let token = self.token_provider.get_token();
-        let payload = self.create_schema_payload(table, "full_data_type")?;
+        let table_name = table.to_string();
+
+        match self.get_schema_from_information_schema(&token, table).await {
+            Ok(schema) => return Ok(schema),
+            Err(Error::TableSchemaNotRegistered { .. } | Error::NoColumnsInDataset { .. }) => {
+                tracing::warn!(
+                    table = %table,
+                    "information_schema.columns has no metadata for this table, falling back to DESCRIBE TABLE. Column nullability will default to nullable."
+                );
+            }
+            Err(Error::ParseError { ref reason }) => {
+                tracing::warn!(
+                    table = %table,
+                    reason,
+                    "information_schema.columns returned unparseable type names (likely source-native types from a federated table), falling back to DESCRIBE TABLE. Column nullability will default to nullable."
+                );
+            }
+            Err(e) => return Err(e),
+        }
+
+        let payload = self.create_describe_payload(table)?;
         let response = self.execute_sql_statement(&token, &payload).await?;
         let response = self.wait_for_statement_completion(&token, response).await?;
+        schema_from_describe_json(&response, &table_name)
+    }
+
+    /// Attempts to read the schema from `information_schema.columns`,
+    /// trying `full_data_type` first and falling back to `data_type` if
+    /// the column does not exist.
+    async fn get_schema_from_information_schema(
+        &self,
+        token: &str,
+        table: &TableReference,
+    ) -> Result<SchemaRef, Error> {
+        let payload = self.create_schema_payload(table, "full_data_type")?;
+        let response = self.execute_sql_statement(token, &payload).await?;
+        let response = self.wait_for_statement_completion(token, response).await?;
 
         match schema_from_json(&response, &table.to_string()) {
             Ok(schema) => Ok(schema),
@@ -261,8 +295,8 @@ impl SqlWarehouseApi {
                     "Databricks information_schema does not have 'full_data_type' column, falling back to 'data_type'. Complex types (ARRAY, MAP, STRUCT) may lose inner type details."
                 );
                 let payload = self.create_schema_payload(table, "data_type")?;
-                let response = self.execute_sql_statement(&token, &payload).await?;
-                let response = self.wait_for_statement_completion(&token, response).await?;
+                let response = self.execute_sql_statement(token, &payload).await?;
+                let response = self.wait_for_statement_completion(token, response).await?;
                 schema_from_json(&response, &table.to_string())
             }
             Err(e) => Err(e),
@@ -289,6 +323,36 @@ impl SqlWarehouseApi {
         );
         // Databricks SQL Statements API max wait_timeout is 50s.
         // https://docs.databricks.com/api/workspace/statementexecution/executestatement
+        Ok(json!({
+            "warehouse_id": self.sql_warehouse_id,
+            "catalog": table_catalog,
+            "schema": table_schema,
+            "statement": sql,
+            "format": "JSON_ARRAY",
+            "disposition": "INLINE",
+            "wait_timeout": "50s",
+            "on_wait_timeout": "CONTINUE",
+        }))
+    }
+
+    /// Builds a `DESCRIBE TABLE` payload for tables where
+    /// `information_schema.columns` has no metadata (e.g. Lakehouse
+    /// Federation foreign tables).
+    fn create_describe_payload(&self, table: &TableReference) -> Result<Value, Error> {
+        let table_schema = table.schema().ok_or_else(|| Error::FullyQualifiedPath {
+            reason: "missing schema".into(),
+        })?;
+        let table_catalog = table.catalog().ok_or_else(|| Error::FullyQualifiedPath {
+            reason: "missing catalog".into(),
+        })?;
+        // Use backtick quoting for DESCRIBE TABLE identifiers. Escape
+        // embedded backticks by doubling them.
+        let sql = format!(
+            "DESCRIBE TABLE `{}`.`{}`.`{}`",
+            table_catalog.replace('`', "``"),
+            table_schema.replace('`', "``"),
+            table.table().replace('`', "``"),
+        );
         Ok(json!({
             "warehouse_id": self.sql_warehouse_id,
             "catalog": table_catalog,
@@ -670,6 +734,91 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
         let field: Field = Field::new(col_name, data_type, nullable);
 
         fields.push(field);
+    }
+
+    if fields.is_empty() {
+        return Err(Error::NoColumnsInDataset {
+            dataset_name: dataset_name.to_string(),
+        });
+    }
+
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// Parses a schema from a `DESCRIBE TABLE` response.
+///
+/// `DESCRIBE TABLE` returns rows of `[col_name, data_type, comment]`.
+/// Since it does not include nullability information, all columns default
+/// to nullable. Blank separator rows are skipped, and metadata rows
+/// (starting with `#`) stop parsing.
+fn schema_from_describe_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef, Error> {
+    tracing::trace!("Parsing schema from DESCRIBE TABLE response: {json_value}");
+
+    SqlWarehouseApi::verify_response_status(json_value)?;
+
+    let result = json_value
+        .get("result")
+        .ok_or_else(|| Error::UnexpectedSchemaResponse {
+            dataset_name: dataset_name.to_string(),
+            reason: "missing result object in DESCRIBE TABLE response".to_string(),
+        })?;
+
+    let data_array = result
+        .get("data_array")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::UnexpectedSchemaResponse {
+            dataset_name: dataset_name.to_string(),
+            reason: "missing or invalid data_array in DESCRIBE TABLE response".to_string(),
+        })?;
+
+    let mut fields = Vec::new();
+
+    for (i, row) in data_array.iter().enumerate() {
+        let row_array = row
+            .as_array()
+            .ok_or_else(|| Error::UnexpectedSchemaResponse {
+                dataset_name: dataset_name.to_string(),
+                reason: format!("data_array[{i}] is not an array"),
+            })?;
+
+        if row_array.len() < 2 {
+            return Err(Error::UnexpectedSchemaResponse {
+                dataset_name: dataset_name.to_string(),
+                reason: format!("data_array[{i}] has fewer than 2 fields"),
+            });
+        }
+
+        let col_name = row_array[0]
+            .as_str()
+            .ok_or_else(|| Error::UnexpectedSchemaResponse {
+                dataset_name: dataset_name.to_string(),
+                reason: format!("data_array[{i}][0] (column name) is not a string"),
+            })?;
+
+        // Metadata rows start with #; stop parsing here.
+        if col_name.starts_with('#') {
+            break;
+        }
+
+        // Skip blank separator rows between columns and metadata.
+        if col_name.trim().is_empty() {
+            continue;
+        }
+
+        let data_type_str =
+            row_array[1]
+                .as_str()
+                .ok_or_else(|| Error::UnexpectedSchemaResponse {
+                    dataset_name: dataset_name.to_string(),
+                    reason: format!("data_array[{i}][1] (data type) is not a string"),
+                })?;
+
+        let data_type = datatypes::Parser::new(data_type_str)
+            .parse()
+            .map_err(|reason| Error::ParseError { reason })?;
+
+        // DESCRIBE TABLE does not report nullability; default to nullable.
+        fields.push(Field::new(col_name, data_type, true));
     }
 
     if fields.is_empty() {
@@ -2152,5 +2301,359 @@ mod tests {
             &DataType::Binary,
             "GEOMETRY should map to Binary"
         );
+    }
+
+    // ---- DESCRIBE TABLE fallback tests ----
+
+    /// Basic DESCRIBE TABLE response: [`col_name`, `data_type`, comment].
+    /// All columns should default to nullable.
+    #[test]
+    fn test_schema_from_describe_json_basic() {
+        let response = make_schema_response(&json!([
+            ["id", "int", "primary key"],
+            ["name", "string", "user name"],
+            ["amount", "double", ""]
+        ]));
+
+        let schema = schema_from_describe_json(&response, "test_table")
+            .expect("should parse DESCRIBE TABLE response");
+        assert_eq!(schema.fields().len(), 3);
+
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert!(
+            schema.field(0).is_nullable(),
+            "DESCRIBE TABLE defaults to nullable"
+        );
+
+        assert_eq!(schema.field(1).name(), "name");
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert!(schema.field(1).is_nullable());
+
+        assert_eq!(schema.field(2).name(), "amount");
+        assert_eq!(schema.field(2).data_type(), &DataType::Float64);
+    }
+
+    /// DESCRIBE TABLE with metadata rows (partition info) after a blank separator.
+    #[test]
+    fn test_schema_from_describe_json_with_metadata_rows() {
+        let response = make_schema_response(&json!([
+            ["id", "int", ""],
+            ["name", "string", ""],
+            ["", "", ""],
+            ["# Partition Information", "", ""],
+            ["# col_name", "data_type", "comment"],
+            ["part_col", "string", ""]
+        ]));
+
+        let schema = schema_from_describe_json(&response, "test_table")
+            .expect("should stop before metadata rows");
+        assert_eq!(schema.fields().len(), 2, "only real columns, not metadata");
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "name");
+    }
+
+    /// DESCRIBE TABLE for a Lakehouse Federation foreign table using
+    /// Spark SQL types (uppercase, no params on DECIMAL).
+    #[test]
+    fn test_schema_from_describe_json_federation_table() {
+        let response = make_schema_response(&json!([
+            ["record_skey", "LONG", ""],
+            ["record_hkey", "STRING", ""],
+            ["address_latitude", "DOUBLE", ""],
+            ["start_datetime", "TIMESTAMP", ""],
+            ["is_current_flag", "BOOLEAN", ""],
+            ["spend_dt", "DATE", ""],
+            ["total_amt", "DECIMAL", ""],
+            ["count", "INT", ""],
+            ["geom", "GEOMETRY", ""]
+        ]));
+
+        let schema = schema_from_describe_json(&response, "neon_pg_foreign.public.test_table")
+            .expect("should parse federation table DESCRIBE");
+        assert_eq!(schema.fields().len(), 9);
+
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(2).data_type(), &DataType::Float64);
+        assert_eq!(
+            schema.field(3).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(4).data_type(), &DataType::Boolean);
+        assert_eq!(schema.field(5).data_type(), &DataType::Date32);
+        assert_eq!(schema.field(6).data_type(), &DataType::Decimal128(38, 10));
+        assert_eq!(schema.field(7).data_type(), &DataType::Int32);
+        assert_eq!(schema.field(8).data_type(), &DataType::Binary);
+
+        // All columns should be nullable
+        for field in schema.fields() {
+            assert!(field.is_nullable(), "{} should be nullable", field.name());
+        }
+    }
+
+    /// DESCRIBE TABLE with only blank/metadata rows should return an error.
+    #[test]
+    fn test_schema_from_describe_json_no_columns() {
+        let response = make_schema_response(&json!([
+            ["", "", ""],
+            ["# Detailed Table Information", "", ""],
+            ["Database", "test_schema", ""]
+        ]));
+
+        let err = schema_from_describe_json(&response, "test_table")
+            .expect_err("should fail with no columns");
+        assert!(
+            matches!(&err, Error::NoColumnsInDataset { .. }),
+            "expected NoColumnsInDataset, got {err:?}"
+        );
+    }
+
+    /// DESCRIBE TABLE with missing `data_array` should return an error.
+    #[test]
+    fn test_schema_from_describe_json_missing_data_array() {
+        let response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "test-stmt-id",
+            "result": {}
+        });
+
+        let err = schema_from_describe_json(&response, "test_table")
+            .expect_err("should fail with missing data_array");
+        assert!(
+            matches!(&err, Error::UnexpectedSchemaResponse { .. }),
+            "expected UnexpectedSchemaResponse, got {err:?}"
+        );
+    }
+
+    /// DESCRIBE TABLE fallback for the `dim_records` CSV schema.
+    /// Types match the `data_type` column: LONG, STRING, DOUBLE,
+    /// TIMESTAMP, BOOLEAN.
+    #[test]
+    fn test_schema_from_describe_json_dim_records() {
+        let response = make_schema_response(&json!([
+            ["record_skey", "LONG", ""],
+            ["record_hkey", "STRING", ""],
+            ["address_city", "STRING", ""],
+            ["address_latitude", "DOUBLE", ""],
+            ["address_longitude", "DOUBLE", ""],
+            ["start_datetime", "TIMESTAMP", ""],
+            ["end_datetime", "TIMESTAMP", ""],
+            ["is_current_flag", "BOOLEAN", ""],
+            ["is_deleted_flag", "BOOLEAN", ""]
+        ]));
+
+        let schema = schema_from_describe_json(&response, "neon_pg_foreign.public.dim_records")
+            .expect("should parse dim_records DESCRIBE");
+        assert_eq!(schema.fields().len(), 9);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(3).data_type(), &DataType::Float64);
+        assert_eq!(
+            schema.field(5).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(7).data_type(), &DataType::Boolean);
+        for field in schema.fields() {
+            assert!(field.is_nullable(), "{} should be nullable", field.name());
+        }
+    }
+
+    /// DESCRIBE TABLE fallback for the `bridge_entities` CSV schema.
+    /// Types: LONG, STRING, TIMESTAMP, BOOLEAN.
+    #[test]
+    fn test_schema_from_describe_json_bridge_entities() {
+        let response = make_schema_response(&json!([
+            ["bridge_id", "LONG", ""],
+            ["entity_id", "LONG", ""],
+            ["entity_skey", "LONG", ""],
+            ["entity_hkey", "STRING", ""],
+            ["snapshot_id", "LONG", ""],
+            ["related_id", "LONG", ""],
+            ["related_address", "STRING", ""],
+            ["related_skey", "LONG", ""],
+            ["related_hkey", "STRING", ""],
+            ["created_datetime_utc", "TIMESTAMP", ""],
+            ["updated_datetime_utc", "TIMESTAMP", ""],
+            ["valid_from_datetime", "TIMESTAMP", ""],
+            ["end_datetime", "TIMESTAMP", ""],
+            ["is_current_flag", "BOOLEAN", ""],
+            ["is_deleted_flag", "BOOLEAN", ""]
+        ]));
+
+        let schema = schema_from_describe_json(&response, "neon_pg_foreign.public.bridge_entities")
+            .expect("should parse bridge_entities DESCRIBE");
+        assert_eq!(schema.fields().len(), 15);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(6).data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema.field(12).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(13).data_type(), &DataType::Boolean);
+        for field in schema.fields() {
+            assert!(field.is_nullable(), "{} should be nullable", field.name());
+        }
+    }
+
+    /// DESCRIBE TABLE fallback for the `cohorted_spend` CSV schema.
+    /// Types: DATE, STRING, DECIMAL (bare), INT.
+    #[test]
+    fn test_schema_from_describe_json_cohorted_spend() {
+        let response = make_schema_response(&json!([
+            ["spend_dt", "DATE", ""],
+            ["source_nm", "STRING", ""],
+            ["channel_id", "STRING", ""],
+            ["campaign_nm", "STRING", ""],
+            ["brand_campaign_nm", "STRING", ""],
+            ["state_cd", "STRING", ""],
+            ["county_cd", "STRING", ""],
+            ["designated_market_area", "STRING", ""],
+            ["zip_code_cd", "STRING", ""],
+            ["region_cd", "STRING", ""],
+            ["lead_tier_id", "STRING", ""],
+            ["sub_id", "STRING", ""],
+            ["publisher_nm", "STRING", ""],
+            ["non_experiment__decimal_amt", "DECIMAL", ""],
+            ["mrktng_spnd_amt", "DECIMAL", ""],
+            ["mrktng_spnd_exprmnt_amt", "DECIMAL", ""],
+            ["lead_cnt", "INT", ""],
+            ["new_lead_cnt", "INT", ""],
+            ["returning_lead_cnt", "INT", ""],
+            ["leads_with_assgnmnts_cnt", "INT", ""],
+            ["leads_with_any_rep_assgnmnts_cnt", "INT", ""],
+            ["bind_cnt", "INT", ""],
+            ["cohort_binds_0_days_amt", "DECIMAL", ""],
+            ["cohort_binds_1_days_amt", "DECIMAL", ""],
+            ["cohort_binds_3_days_amt", "DECIMAL", ""],
+            ["cohort_binds_7_days_amt", "DECIMAL", ""],
+            ["cohort_binds_14_days_amt", "DECIMAL", ""],
+            ["cohort_binds_30_days_amt", "DECIMAL", ""],
+            ["cohort_binds_45_days_amt", "DECIMAL", ""],
+            ["cohort_binds_60_days_amt", "DECIMAL", ""],
+            ["cohort_binds_90_days_amt", "DECIMAL", ""],
+            ["cohort_bound_premium_0_days_amt", "DECIMAL", ""],
+            ["cohort_bound_premium_1_days_amt", "DECIMAL", ""],
+            ["cohort_bound_premium_3_days_amt", "DECIMAL", ""],
+            ["cohort_bound_premium_7_days_amt", "DECIMAL", ""],
+            ["cohort_bound_premium_14_days_amt", "DECIMAL", ""],
+            ["cohort_bound_premium_30_days_amt", "DECIMAL", ""],
+            ["cohort_bound_premium_45_days_amt", "DECIMAL", ""],
+            ["cohort_bound_premium_60_days_amt", "DECIMAL", ""],
+            ["cohort_bound_premium_90_days_amt", "DECIMAL", ""],
+            ["bound_premium_amt", "DECIMAL", ""]
+        ]));
+
+        let schema = schema_from_describe_json(
+            &response,
+            "neon_pg_foreign.ext_dbt_dwh_v.mart_mrktng_cohorted_spend_v",
+        )
+        .expect("should parse cohorted spend DESCRIBE");
+        assert_eq!(schema.fields().len(), 41);
+        assert_eq!(schema.field(0).data_type(), &DataType::Date32);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        // DECIMAL without params falls back to Decimal128(38,10)
+        assert_eq!(schema.field(13).data_type(), &DataType::Decimal128(38, 10));
+        assert_eq!(schema.field(16).data_type(), &DataType::Int32);
+        for field in schema.fields() {
+            assert!(field.is_nullable(), "{} should be nullable", field.name());
+        }
+    }
+
+    /// DESCRIBE TABLE fallback for the mixed types CSV schema with GEOMETRY.
+    /// Types: STRING, DOUBLE, INT, TIMESTAMP, LONG, DATE, DECIMAL, GEOMETRY.
+    #[test]
+    fn test_schema_from_describe_json_mixed_types() {
+        let response = make_schema_response(&json!([
+            ["id", "STRING", ""],
+            ["distance_ft", "DOUBLE", ""],
+            ["state", "STRING", ""],
+            ["score", "DOUBLE", ""],
+            ["count", "INT", ""],
+            ["flag", "INT", ""],
+            ["created_at", "TIMESTAMP", ""],
+            ["census", "LONG", ""],
+            ["coverage_a", "DECIMAL", ""],
+            ["spend_dt", "DATE", ""],
+            ["geom", "GEOMETRY", ""]
+        ]));
+
+        let schema = schema_from_describe_json(&response, "neon_pg_foreign.public.mixed_types")
+            .expect("should parse mixed types DESCRIBE");
+        assert_eq!(schema.fields().len(), 11);
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(1).data_type(), &DataType::Float64);
+        assert_eq!(schema.field(4).data_type(), &DataType::Int32);
+        assert_eq!(
+            schema.field(6).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(7).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(8).data_type(), &DataType::Decimal128(38, 10));
+        assert_eq!(schema.field(9).data_type(), &DataType::Date32);
+        assert_eq!(
+            schema.field(10).data_type(),
+            &DataType::Binary,
+            "GEOMETRY should map to Binary"
+        );
+        for field in schema.fields() {
+            assert!(field.is_nullable(), "{} should be nullable", field.name());
+        }
+    }
+
+    /// DESCRIBE TABLE response for a Neon `PostgreSQL` foreign table.
+    /// DESCRIBE TABLE returns Spark SQL types (consistent with `full_data_type`).
+    #[test]
+    fn test_schema_from_describe_json_neon_pg_table() {
+        let response = make_schema_response(&json!([
+            ["id", "int", ""],
+            ["name", "string", ""],
+            ["amount", "decimal(10,2)", ""],
+            ["created_at", "timestamp", ""],
+            ["active", "boolean", ""]
+        ]));
+
+        let schema =
+            schema_from_describe_json(&response, "neon_pg_foreign.public.test_schema_repro")
+                .expect("should parse Neon PG DESCRIBE TABLE");
+        assert_eq!(schema.fields().len(), 5);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(2).data_type(), &DataType::Decimal128(10, 2));
+        assert_eq!(
+            schema.field(3).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(4).data_type(), &DataType::Boolean);
+        for field in schema.fields() {
+            assert!(field.is_nullable(), "{} should be nullable", field.name());
+        }
+    }
+
+    /// `information_schema.columns.data_type` for a Neon `PostgreSQL` foreign
+    /// table returns source-native type names (`integer`, `text`, `numeric`,
+    /// `timestamp without time zone`). These must parse correctly.
+    #[test]
+    fn test_schema_from_json_neon_pg_native_types() {
+        let response = make_schema_response(&json!([
+            ["id", "integer", "YES"],
+            ["name", "text", "YES"],
+            ["amount", "numeric", "YES"],
+            ["created_at", "timestamp without time zone", "YES"],
+            ["active", "boolean", "YES"]
+        ]));
+
+        let schema = schema_from_json(&response, "neon_pg_foreign.public.test_schema_repro")
+            .expect("should parse Neon PG source-native types");
+        assert_eq!(schema.fields().len(), 5);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(2).data_type(), &DataType::Decimal128(38, 10));
+        assert_eq!(
+            schema.field(3).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            "timestamp without time zone maps to Timestamp(Microsecond, None)"
+        );
+        assert_eq!(schema.field(4).data_type(), &DataType::Boolean);
     }
 }

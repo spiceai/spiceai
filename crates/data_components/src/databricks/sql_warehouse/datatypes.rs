@@ -176,6 +176,12 @@ impl<'input> Parser<'input> {
             Some(Ok(Token::Decimal)) => self.parse_decimal(),
             Some(Ok(Token::Double)) => {
                 self.advance();
+                // Consume optional trailing "precision" from source-native
+                // type name (e.g. PostgreSQL "double precision").
+                if matches!(&self.current, Some(Ok(Token::Identifier(id))) if id.eq_ignore_ascii_case("precision"))
+                {
+                    self.advance();
+                }
                 Ok(ArrowDataType::Float64)
             }
             Some(Ok(Token::Float)) => {
@@ -200,6 +206,27 @@ impl<'input> Parser<'input> {
             }
             Some(Ok(Token::Timestamp)) => {
                 self.advance();
+                // Handle source-native multi-word timestamp types from
+                // Lakehouse Federation (e.g. PostgreSQL).
+                if matches!(&self.current, Some(Ok(Token::Identifier(id))) if id.eq_ignore_ascii_case("without"))
+                {
+                    // "timestamp without time zone" → TimestampNtz
+                    self.advance(); // consume "without"
+                    self.advance(); // consume "time"
+                    self.advance(); // consume "zone"
+                    return Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None));
+                }
+                if matches!(&self.current, Some(Ok(Token::Identifier(id))) if id.eq_ignore_ascii_case("with"))
+                {
+                    // "timestamp with time zone" → Timestamp(UTC)
+                    self.advance(); // consume "with"
+                    self.advance(); // consume "time"
+                    self.advance(); // consume "zone"
+                    return Ok(ArrowDataType::Timestamp(
+                        TimeUnit::Microsecond,
+                        Some("UTC".into()),
+                    ));
+                }
                 Ok(ArrowDataType::Timestamp(
                     TimeUnit::Microsecond,
                     Some("UTC".into()),
@@ -241,6 +268,72 @@ impl<'input> Parser<'input> {
                     self.expect(&Token::RParen)?;
                 }
                 Ok(ArrowDataType::Binary)
+            }
+            // Source-native type names from Lakehouse Federation. These
+            // appear in `information_schema.columns.data_type` for foreign
+            // tables backed by PostgreSQL, MySQL, SQL Server, etc.
+            Some(Ok(Token::Identifier(id))) if id.eq_ignore_ascii_case("INTEGER") => {
+                self.advance();
+                Ok(ArrowDataType::Int32)
+            }
+            Some(Ok(Token::Identifier(id))) if id.eq_ignore_ascii_case("TEXT") => {
+                self.advance();
+                Ok(ArrowDataType::Utf8)
+            }
+            Some(Ok(Token::Identifier(id))) if id.eq_ignore_ascii_case("NUMERIC") => {
+                self.advance();
+                // Accept optional (precision, scale) like DECIMAL.
+                if self.current == Some(Ok(Token::LParen)) {
+                    // Re-use the DECIMAL parser by faking a rewind.
+                    // We already advanced past "NUMERIC", and parse_decimal
+                    // also starts after advancing past "DECIMAL". However,
+                    // parse_decimal expects to be called with current = LParen
+                    // after its own advance. We need to inline the param
+                    // parsing here.
+                    self.advance(); // skip `(`
+                    let precision = if let Some(Ok(Token::Number(p))) = self.current {
+                        self.advance();
+                        p
+                    } else {
+                        return Err("Expected number for NUMERIC precision".to_string());
+                    };
+                    self.expect(&Token::Comma)?;
+                    let scale = if let Some(Ok(Token::Number(s))) = self.current {
+                        self.advance();
+                        s
+                    } else {
+                        return Err("Expected number for NUMERIC scale".to_string());
+                    };
+                    self.expect(&Token::RParen)?;
+                    Ok(ArrowDataType::Decimal128(
+                        u8::try_from(precision)
+                            .map_err(|e| format!("truncated NUMERIC precision: {e}"))?,
+                        i8::try_from(scale).map_err(|e| format!("truncated NUMERIC scale: {e}"))?,
+                    ))
+                } else {
+                    Ok(ArrowDataType::Decimal128(38, 10))
+                }
+            }
+            Some(Ok(Token::Identifier(id))) if id.eq_ignore_ascii_case("REAL") => {
+                self.advance();
+                Ok(ArrowDataType::Float32)
+            }
+            Some(Ok(Token::Identifier(id)))
+                if id.eq_ignore_ascii_case("CHARACTER") || id.eq_ignore_ascii_case("VARCHAR") =>
+            {
+                self.advance();
+                // Consume optional trailing "varying" from "character varying"
+                if matches!(&self.current, Some(Ok(Token::Identifier(id))) if id.eq_ignore_ascii_case("varying"))
+                {
+                    self.advance();
+                }
+                // Consume optional (length) from "varchar(255)"
+                if self.current == Some(Ok(Token::LParen)) {
+                    self.advance(); // skip `(`
+                    self.advance(); // skip length
+                    self.expect(&Token::RParen)?;
+                }
+                Ok(ArrowDataType::Utf8)
             }
             _ => Err(format!("Unexpected token: {:?}", self.current)),
         }
@@ -662,6 +755,100 @@ mod tests {
             let mut parser = Parser::new(input);
             let result = parser.parse().expect("should parse data_type value");
             assert_eq!(result, *expected, "Failed for data_type input: {input}");
+        }
+    }
+
+    /// Source-native type names from Lakehouse Federation foreign tables
+    /// (e.g. `PostgreSQL`). These appear in `information_schema.columns.data_type`
+    /// when querying federated tables.
+    #[test]
+    fn test_source_native_types() {
+        let cases = vec![
+            ("integer", ArrowDataType::Int32),
+            ("INTEGER", ArrowDataType::Int32),
+            ("text", ArrowDataType::Utf8),
+            ("TEXT", ArrowDataType::Utf8),
+            ("numeric", ArrowDataType::Decimal128(38, 10)),
+            ("NUMERIC", ArrowDataType::Decimal128(38, 10)),
+            ("numeric(10,2)", ArrowDataType::Decimal128(10, 2)),
+            ("NUMERIC(18,4)", ArrowDataType::Decimal128(18, 4)),
+            ("real", ArrowDataType::Float32),
+            ("REAL", ArrowDataType::Float32),
+            ("double precision", ArrowDataType::Float64),
+            ("DOUBLE PRECISION", ArrowDataType::Float64),
+            ("character varying", ArrowDataType::Utf8),
+            ("CHARACTER VARYING", ArrowDataType::Utf8),
+            ("varchar", ArrowDataType::Utf8),
+            ("varchar(255)", ArrowDataType::Utf8),
+            ("VARCHAR(100)", ArrowDataType::Utf8),
+            (
+                "timestamp without time zone",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            (
+                "TIMESTAMP WITHOUT TIME ZONE",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            (
+                "timestamp with time zone",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            (
+                "TIMESTAMP WITH TIME ZONE",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+        ];
+        for (input, expected) in &cases {
+            let mut parser = Parser::new(input);
+            let result = parser
+                .parse()
+                .unwrap_or_else(|e| panic!("should parse native type '{input}': {e}"));
+            assert_eq!(result, *expected, "Failed for source-native type: {input}");
+        }
+    }
+
+    /// Schema test for the Neon `PostgreSQL` foreign table from a real
+    /// DESCRIBE TABLE response (Spark SQL types).
+    #[test]
+    fn test_neon_pg_describe_table_types() {
+        let cases = vec![
+            ("int", ArrowDataType::Int32),
+            ("string", ArrowDataType::Utf8),
+            ("decimal(10,2)", ArrowDataType::Decimal128(10, 2)),
+            (
+                "timestamp",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            ("boolean", ArrowDataType::Boolean),
+        ];
+        for (input, expected) in &cases {
+            let mut parser = Parser::new(input);
+            let result = parser.parse().expect("should parse DESCRIBE TABLE type");
+            assert_eq!(result, *expected, "Failed for DESCRIBE TABLE type: {input}");
+        }
+    }
+
+    /// Schema test for the Neon `PostgreSQL` foreign table from
+    /// `information_schema.columns.data_type` (source-native types).
+    #[test]
+    fn test_neon_pg_information_schema_native_types() {
+        let cases = vec![
+            ("integer", ArrowDataType::Int32),
+            ("text", ArrowDataType::Utf8),
+            ("numeric", ArrowDataType::Decimal128(38, 10)),
+            (
+                "timestamp without time zone",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            ("boolean", ArrowDataType::Boolean),
+        ];
+        for (input, expected) in &cases {
+            let mut parser = Parser::new(input);
+            let result = parser.parse().expect("should parse native type");
+            assert_eq!(
+                result, *expected,
+                "Failed for information_schema native type: {input}"
+            );
         }
     }
 }
