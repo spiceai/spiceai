@@ -1699,7 +1699,7 @@ mod tests {
         // Parse schema from a Databricks JSON response with timestamp columns
         let response = make_schema_response(&json!([
             ["id", "int", "NO"],
-            ["edw_end_datetime", "timestamp", "YES"],
+            ["end_datetime", "timestamp", "YES"],
             ["created_ntz", "timestamp_ntz", "YES"]
         ]));
         let declared_schema =
@@ -1723,7 +1723,7 @@ mod tests {
         let ipc_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new(
-                "edw_end_datetime",
+                "end_datetime",
                 DataType::Timestamp(
                     arrow::datatypes::TimeUnit::Microsecond,
                     Some("Etc/UTC".into()),
@@ -1833,13 +1833,13 @@ mod tests {
             ["address_state", "string", "NO"],
             ["address_latitude", "double", "NO"],
             ["address_longitude", "double", "NO"],
-            ["edw_start_datetime", "timestamp", "NO"],
-            ["edw_end_datetime", "timestamp", "NO"],
-            ["edw_is_current_flag", "boolean", "NO"],
-            ["edw_is_deleted_flag", "boolean", "NO"]
+            ["start_datetime", "timestamp", "NO"],
+            ["end_datetime", "timestamp", "NO"],
+            ["is_current_flag", "boolean", "NO"],
+            ["is_deleted_flag", "boolean", "NO"]
         ]));
 
-        let schema = schema_from_json(&response, "catalog.edw.dim_records")
+        let schema = schema_from_json(&response, "catalog.test_schema.dim_records")
             .expect("should parse real full_data_type schema");
         assert_eq!(schema.fields().len(), 10);
 
@@ -1869,13 +1869,13 @@ mod tests {
             ["address_city", "STRING", "NO"],
             ["address_latitude", "DOUBLE", "NO"],
             ["address_longitude", "DOUBLE", "NO"],
-            ["edw_start_datetime", "TIMESTAMP", "NO"],
-            ["edw_end_datetime", "TIMESTAMP", "NO"],
-            ["edw_is_current_flag", "BOOLEAN", "NO"],
-            ["edw_is_deleted_flag", "BOOLEAN", "NO"]
+            ["start_datetime", "TIMESTAMP", "NO"],
+            ["end_datetime", "TIMESTAMP", "NO"],
+            ["is_current_flag", "BOOLEAN", "NO"],
+            ["is_deleted_flag", "BOOLEAN", "NO"]
         ]));
 
-        let schema = schema_from_json(&response, "catalog.edw.dim_records")
+        let schema = schema_from_json(&response, "catalog.test_schema.dim_records")
             .expect("should parse real data_type fallback schema");
         assert_eq!(schema.fields().len(), 9);
 
@@ -1907,13 +1907,13 @@ mod tests {
             ["related_hkey", "string", "YES"],
             ["created_datetime_utc", "timestamp", "YES"],
             ["updated_datetime_utc", "timestamp", "YES"],
-            ["edw_valid_from_datetime", "timestamp", "YES"],
-            ["edw_end_datetime", "timestamp", "YES"],
-            ["edw_is_current_flag", "boolean", "YES"],
-            ["edw_is_deleted_flag", "boolean", "YES"]
+            ["valid_from_datetime", "timestamp", "YES"],
+            ["end_datetime", "timestamp", "YES"],
+            ["is_current_flag", "boolean", "YES"],
+            ["is_deleted_flag", "boolean", "YES"]
         ]));
 
-        let schema = schema_from_json(&response, "catalog.edw.bridge_entities")
+        let schema = schema_from_json(&response, "catalog.test_schema.bridge_entities")
             .expect("should parse bridge table schema");
         assert_eq!(schema.fields().len(), 15);
         assert_eq!(schema.field(0).data_type(), &DataType::Int64);
@@ -1940,13 +1940,13 @@ mod tests {
             ["related_hkey", "STRING", "YES"],
             ["created_datetime_utc", "TIMESTAMP", "YES"],
             ["updated_datetime_utc", "TIMESTAMP", "YES"],
-            ["edw_valid_from_datetime", "TIMESTAMP", "YES"],
-            ["edw_end_datetime", "TIMESTAMP", "YES"],
-            ["edw_is_current_flag", "BOOLEAN", "YES"],
-            ["edw_is_deleted_flag", "BOOLEAN", "YES"]
+            ["valid_from_datetime", "TIMESTAMP", "YES"],
+            ["end_datetime", "TIMESTAMP", "YES"],
+            ["is_current_flag", "BOOLEAN", "YES"],
+            ["is_deleted_flag", "BOOLEAN", "YES"]
         ]));
 
-        let schema = schema_from_json(&response, "catalog.edw.bridge_entities")
+        let schema = schema_from_json(&response, "catalog.test_schema.bridge_entities")
             .expect("should parse bridge table with data_type fallback values");
         assert_eq!(schema.fields().len(), 15);
         assert_eq!(schema.field(0).data_type(), &DataType::Int64);
