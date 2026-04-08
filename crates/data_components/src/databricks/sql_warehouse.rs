@@ -49,6 +49,8 @@ use util::{
     format_datafusion_error,
 };
 
+use crate::resilient_http::{enable_supported_compression, send_request_with_retry};
+
 mod datatypes;
 
 #[derive(Debug, Snafu)]
@@ -232,7 +234,7 @@ impl SqlWarehouseApi {
         sql_warehouse_id: &str,
         token_provider: Arc<dyn TokenProvider>,
     ) -> Result<Self, Error> {
-        let client = ClientBuilder::new()
+        let client = enable_supported_compression(ClientBuilder::new())
             .user_agent(super::user_agent())
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
@@ -362,18 +364,16 @@ impl SqlWarehouseApi {
 
     async fn execute_sql_statement(&self, token: &str, payload: &Value) -> Result<Value, Error> {
         let url = format!("{}/api/2.0/sql/statements/", self.base_url);
-        self.client
-            .post(&url)
-            .bearer_auth(token)
-            .json(payload)
-            .send()
-            .await
-            .context(HttpRequestFailedSnafu)?
-            .error_for_status()
-            .context(HttpRequestFailedSnafu)?
-            .json()
-            .await
-            .context(JsonParsingFailedSnafu)
+        send_request_with_retry("Databricks SQL Warehouse", "execute SQL statement", || {
+            self.client.post(&url).bearer_auth(token).json(payload)
+        })
+        .await
+        .context(HttpRequestFailedSnafu)?
+        .error_for_status()
+        .context(HttpRequestFailedSnafu)?
+        .json()
+        .await
+        .context(JsonParsingFailedSnafu)
     }
 
     async fn get_sql_statement_status(
@@ -382,17 +382,18 @@ impl SqlWarehouseApi {
         statement_id: &str,
     ) -> Result<Value, Error> {
         let url = format!("{}/api/2.0/sql/statements/{statement_id}", self.base_url);
-        self.client
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .context(HttpRequestFailedSnafu)?
-            .error_for_status()
-            .context(HttpRequestFailedSnafu)?
-            .json()
-            .await
-            .context(JsonParsingFailedSnafu)
+        send_request_with_retry(
+            "Databricks SQL Warehouse",
+            "poll SQL statement status",
+            || self.client.get(&url).bearer_auth(token),
+        )
+        .await
+        .context(HttpRequestFailedSnafu)?
+        .error_for_status()
+        .context(HttpRequestFailedSnafu)?
+        .json()
+        .await
+        .context(JsonParsingFailedSnafu)
     }
 
     // Fetch the arrow data at the external links, repeating for each chunk
@@ -405,10 +406,13 @@ impl SqlWarehouseApi {
 
         // If no external link, return an empty stream
         if initial_external_link.is_none() {
+            let empty_stream: Pin<
+                Box<dyn Stream<Item = Result<RecordBatch, DataFusionError>> + Send>,
+            > = Box::pin(stream::empty::<Result<RecordBatch, DataFusionError>>());
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 Arc::new(Schema::empty()),
-                Box::pin(stream::empty()),
-            )));
+                empty_stream,
+            )) as SendableRecordBatchStream);
         }
 
         let token = token.clone();
@@ -437,16 +441,15 @@ impl SqlWarehouseApi {
                 let next_link = match link.next_chunk_internal_link {
                     Some(path) => {
                         let url = format!("{}{path}", api.base_url);
-                        match api
-                            .client
-                            .get(&url)
-                            .bearer_auth(&token)
-                            .send()
-                            .await
-                            .context(HttpRequestFailedSnafu)
-                            .and_then(|resp| {
-                                resp.error_for_status().context(HttpRequestFailedSnafu)
-                            }) {
+                        match send_request_with_retry(
+                            "Databricks SQL Warehouse",
+                            "fetch next external chunk link",
+                            || api.client.get(&url).bearer_auth(&token),
+                        )
+                        .await
+                        .context(HttpRequestFailedSnafu)
+                        .and_then(|resp| resp.error_for_status().context(HttpRequestFailedSnafu))
+                        {
                             Ok(response) => match response
                                 .json()
                                 .await
@@ -480,21 +483,26 @@ impl SqlWarehouseApi {
             Some(Ok(batch)) => batch,
             Some(Err(e)) => return Err(e),
             None => {
+                let empty_stream: Pin<
+                    Box<dyn Stream<Item = Result<RecordBatch, DataFusionError>> + Send>,
+                > = Box::pin(stream::empty::<Result<RecordBatch, DataFusionError>>());
                 return Ok(Box::pin(RecordBatchStreamAdapter::new(
                     Arc::new(Schema::empty()),
-                    Box::pin(stream::empty()),
-                )));
+                    empty_stream,
+                )) as SendableRecordBatchStream);
             }
         };
 
         let schema = first_batch.schema();
         let run_once = stream::once(async move { Ok(first_batch) });
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            Box::pin(run_once.chain(batch_stream))
-                .map_err(|e| DataFusionError::Execution(e.to_string())),
-        )))
+        let stream: Pin<Box<dyn Stream<Item = Result<RecordBatch, DataFusionError>> + Send>> =
+            Box::pin(
+                Box::pin(run_once.chain(batch_stream))
+                    .map_err(|e| DataFusionError::Execution(e.to_string())),
+            );
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)) as SendableRecordBatchStream)
     }
 
     /// Deserializes the first [`ExternalLink`] in the `external_links` array, or None if missing or empty
@@ -520,16 +528,18 @@ impl SqlWarehouseApi {
     }
 
     async fn fetch_chunk_data(&self, url: &str) -> Result<bytes::Bytes, Error> {
-        self.client
-            .get(url)
-            .send()
-            .await
-            .context(HttpRequestFailedSnafu)?
-            .error_for_status()
-            .context(HttpRequestFailedSnafu)?
-            .bytes()
-            .await
-            .context(HttpRequestFailedSnafu)
+        send_request_with_retry(
+            "Databricks SQL Warehouse",
+            "fetch statement result chunk",
+            || self.client.get(url),
+        )
+        .await
+        .context(HttpRequestFailedSnafu)?
+        .error_for_status()
+        .context(HttpRequestFailedSnafu)?
+        .bytes()
+        .await
+        .context(HttpRequestFailedSnafu)
     }
 
     fn read_arrow_batches(
@@ -1466,8 +1476,77 @@ mod tests {
         port
     }
 
+    #[derive(Clone)]
+    struct MockHttpResponse {
+        status_line: &'static str,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    async fn start_mock_http_server(
+        responses: Vec<MockHttpResponse>,
+        default_response: MockHttpResponse,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::{
+            collections::VecDeque,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind to a port");
+        let port = listener
+            .local_addr()
+            .expect("should have an address")
+            .port();
+        let responses = Arc::new(tokio::sync::Mutex::new(VecDeque::from(responses)));
+        let default = Arc::new(default_response);
+        let requests = Arc::new(AtomicUsize::new(0));
+
+        let requests_for_server = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let responses = Arc::clone(&responses);
+                let default = Arc::clone(&default);
+                let requests = Arc::clone(&requests_for_server);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    requests.fetch_add(1, Ordering::SeqCst);
+
+                    let response = {
+                        let mut q = responses.lock().await;
+                        q.pop_front().unwrap_or_else(|| (*default).clone())
+                    };
+
+                    let mut http_response = format!(
+                        "HTTP/1.1 {}\r\nContent-Length: {}\r\n",
+                        response.status_line,
+                        response.body.len()
+                    );
+                    for (header_name, header_value) in response.headers {
+                        http_response.push_str(&format!("{header_name}: {header_value}\r\n"));
+                    }
+                    http_response.push_str("\r\n");
+                    http_response.push_str(&response.body);
+
+                    let _ = stream.write_all(http_response.as_bytes()).await;
+                });
+            }
+        });
+
+        (port, requests)
+    }
+
     fn create_test_api(port: u16) -> SqlWarehouseApi {
-        let client = ClientBuilder::new().build().expect("should build client");
+        let client = enable_supported_compression(ClientBuilder::new())
+            .build()
+            .expect("should build client");
         SqlWarehouseApi {
             client,
             base_url: format!("http://127.0.0.1:{port}"),
@@ -1704,7 +1783,6 @@ mod tests {
             !stmt_full.contains(", data_type,"),
             "SQL should not reference plain data_type: {stmt_full}"
         );
-
         let payload_plain = api
             .create_schema_payload(&table, "data_type")
             .expect("should create payload with data_type");
@@ -1718,6 +1796,53 @@ mod tests {
         assert!(
             !stmt_plain.contains("full_data_type"),
             "SQL should not reference full_data_type: {stmt_plain}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_execute_sql_statement_retries_rate_limited_response() {
+        let success_body = json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "stmt-1",
+            "result": { "data_array": [] }
+        })
+        .to_string();
+
+        let (port, requests) = start_mock_http_server(
+            vec![
+                MockHttpResponse {
+                    status_line: "429 Too Many Requests",
+                    headers: vec![
+                        ("Content-Type".to_string(), "application/json".to_string()),
+                        ("Retry-After".to_string(), "0".to_string()),
+                    ],
+                    body: json!({"error_code": "RATE_LIMITED"}).to_string(),
+                },
+                MockHttpResponse {
+                    status_line: "200 OK",
+                    headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                    body: success_body,
+                },
+            ],
+            MockHttpResponse {
+                status_line: "200 OK",
+                headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                body: json!({"ok": true}).to_string(),
+            },
+        )
+        .await;
+
+        let api = create_test_api(port);
+        let response = api
+            .execute_sql_statement("token", &json!({"statement": "SELECT 1"}))
+            .await
+            .expect("SQL statement should succeed after retrying the rate-limited response");
+
+        assert_eq!(response["status"]["state"], "SUCCEEDED");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "expected the SQL statement request to be retried once"
         );
     }
 

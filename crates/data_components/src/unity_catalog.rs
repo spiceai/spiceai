@@ -23,6 +23,8 @@ use url::Url;
 
 use token_provider::TokenProvider;
 
+use crate::resilient_http::{enable_supported_compression, send_request_with_retry};
+
 pub mod provider;
 
 #[derive(Debug, Snafu)]
@@ -114,7 +116,7 @@ impl UnityCatalog {
             };
         }
 
-        let client = reqwest::Client::builder()
+        let client = enable_supported_compression(reqwest::Client::builder())
             .user_agent(util::spiceai_user_agent())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
@@ -191,7 +193,7 @@ impl UnityCatalog {
     pub async fn get_table(&self, table_reference: &TableReference) -> Result<Option<UCTable>> {
         let table_name = table_reference.to_string();
         let path = format!("/api/2.1/unity-catalog/tables/{table_name}");
-        let response = self.get_req(&path).send().await.context(ConnectionSnafu)?;
+        let response = self.send_get_with_retry("get table", &path).await?;
 
         if response.status().is_success() {
             let api_response: UCTable = response.json().await.context(ConnectionSnafu)?;
@@ -208,7 +210,7 @@ impl UnityCatalog {
 
     pub async fn get_catalog(&self, catalog_id: &str) -> Result<Option<UCCatalog>> {
         let path = format!("/api/2.1/unity-catalog/catalogs/{catalog_id}");
-        let response = self.get_req(&path).send().await.context(ConnectionSnafu)?;
+        let response = self.send_get_with_retry("get catalog", &path).await?;
 
         tracing::debug!("get_catalog: Response status: {}", response.status());
 
@@ -227,7 +229,7 @@ impl UnityCatalog {
 
     pub async fn list_schemas(&self, catalog_id: &str) -> Result<Option<Vec<UCSchema>>> {
         let path = format!("/api/2.1/unity-catalog/schemas?catalog_name={catalog_id}");
-        let response = self.get_req(&path).send().await.context(ConnectionSnafu)?;
+        let response = self.send_get_with_retry("list schemas", &path).await?;
 
         tracing::debug!("list_schemas: Response status: {}", response.status());
 
@@ -252,7 +254,7 @@ impl UnityCatalog {
         let path = format!(
             "/api/2.1/unity-catalog/tables?catalog_name={catalog_id}&schema_name={schema_name}"
         );
-        let response = self.get_req(&path).send().await.context(ConnectionSnafu)?;
+        let response = self.send_get_with_retry("list tables", &path).await?;
 
         tracing::debug!("list_tables: Response status: {}", response.status());
 
@@ -283,6 +285,12 @@ impl UnityCatalog {
         }
 
         builder
+    }
+
+    async fn send_get_with_retry(&self, operation: &str, path: &str) -> Result<reqwest::Response> {
+        send_request_with_retry("Unity Catalog", operation, || self.get_req(path))
+            .await
+            .context(ConnectionSnafu)
     }
 }
 

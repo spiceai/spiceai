@@ -15,20 +15,39 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+use reqwest::{
+    RequestBuilder, Response, StatusCode,
+    header::{ACCEPT_ENCODING, HeaderMap, RETRY_AFTER},
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use snafu::prelude::*;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::{fmt, sync::Arc};
 use token_provider::{Result, TokenProvider};
 use tokio::{sync::watch, task::JoinHandle, time::sleep};
-use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::{
+    fibonacci_backoff::FibonacciBackoffBuilder,
+    retry_strategy::{Backoff, BackoffMethod, RetryBackoffBuilder},
+};
 
 use crate::request::DatabricksAuthExtension;
 use runtime_request_context::RequestContext;
 
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
+const MAX_TOKEN_REQUEST_RETRIES: usize = 6;
+const MAX_TOKEN_REQUEST_BACKOFF: Duration = Duration::from_secs(300);
+const RETRY_AFTER_MS_HEADER: &str = "retry-after-ms";
+const X_RETRY_AFTER_MS_HEADER: &str = "x-retry-after-ms";
+const SUPPORTED_ACCEPT_ENCODINGS: &str = "zstd, br, gzip, deflate";
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum RetryReason {
+    RateLimit,
+    ServerError,
+    Network,
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -117,6 +136,7 @@ impl DatabricksM2MTokenProvider {
                         expires_in,
                         ..
                     }) => {
+                        backoff.reset();
                         tracing::debug!("M2M token refreshed; expires in {}", expires_in);
                         let _ = cloned_tx.send(access_token.clone());
                         next_wait = Duration::from_secs(expires_in - TOKEN_REFRESH_BUFFER_SECS);
@@ -204,21 +224,26 @@ async fn get_m2m_access_token(
     client_id: String,
     client_secret: SecretString,
 ) -> Result<TokenResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let token_endpoint_url = format!("https://{databricks_endpoint}/oidc/v1/token");
+    let token_endpoint_url = databricks_token_endpoint_url(&databricks_endpoint);
 
     let client = reqwest::Client::builder()
+        .gzip(true)
+        .brotli(true)
+        .zstd(true)
+        .deflate(true)
         .user_agent(util::spiceai_user_agent())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    let response = client
-        .post(&token_endpoint_url)
-        .basic_auth(client_id, Some(client_secret.expose_secret()))
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .form(&[("grant_type", "client_credentials"), ("scope", "all-apis")])
-        .send()
-        .await?;
+    let response = send_databricks_token_request_with_retry("request M2M access token", || {
+        client
+            .post(&token_endpoint_url)
+            .basic_auth(client_id.as_str(), Some(client_secret.expose_secret()))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .form(&[("grant_type", "client_credentials"), ("scope", "all-apis")])
+    })
+    .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -234,6 +259,184 @@ async fn get_m2m_access_token(
     );
 
     Ok(token_response)
+}
+
+fn databricks_token_endpoint_url(databricks_endpoint: &str) -> String {
+    let endpoint = databricks_endpoint.trim_end_matches('/');
+    let base_url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("https://{endpoint}")
+    };
+
+    format!("{base_url}/oidc/v1/token")
+}
+
+async fn send_databricks_token_request_with_retry<F>(
+    operation_name: &str,
+    build_request: F,
+) -> Result<Response, reqwest::Error>
+where
+    F: Fn() -> RequestBuilder,
+{
+    let mut transient_backoff = RetryBackoffBuilder::new()
+        .method(BackoffMethod::Fibonacci)
+        .max_duration(Some(MAX_TOKEN_REQUEST_BACKOFF))
+        .build();
+    let mut rate_limit_backoff = RetryBackoffBuilder::new()
+        .method(BackoffMethod::Exponential)
+        .base_interval(Duration::from_secs(1))
+        .max_duration(Some(MAX_TOKEN_REQUEST_BACKOFF))
+        .build();
+
+    let mut retries = 0usize;
+
+    loop {
+        match add_supported_accept_encoding_header(build_request())
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                if let Some(reason) = retry_reason_from_status(status) {
+                    if retries >= MAX_TOKEN_REQUEST_RETRIES {
+                        tracing::warn!(
+                            operation = operation_name,
+                            status = %status,
+                            retries,
+                            max_retries = MAX_TOKEN_REQUEST_RETRIES,
+                            "Databricks token request retries exhausted after retryable response"
+                        );
+                        return Ok(response);
+                    }
+
+                    retries += 1;
+                    let retry_after = retry_after_duration(response.headers());
+                    let backoff =
+                        next_backoff(reason, &mut transient_backoff, &mut rate_limit_backoff);
+                    let delay = retry_after.map_or(backoff, |retry_after| retry_after.max(backoff));
+
+                    tracing::warn!(
+                        operation = operation_name,
+                        attempt = retries,
+                        max_retries = MAX_TOKEN_REQUEST_RETRIES,
+                        status = %status,
+                        retry_after = ?retry_after,
+                        delay = ?delay,
+                        "Retrying Databricks token request after retryable response"
+                    );
+
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                return Ok(response);
+            }
+            Err(error) => {
+                let Some(reason) = retry_reason_from_error(&error) else {
+                    return Err(error);
+                };
+
+                if retries >= MAX_TOKEN_REQUEST_RETRIES {
+                    tracing::warn!(
+                        operation = operation_name,
+                        retries,
+                        max_retries = MAX_TOKEN_REQUEST_RETRIES,
+                        error = %error,
+                        "Databricks token request retries exhausted after transient failure"
+                    );
+                    return Err(error);
+                }
+
+                retries += 1;
+                let delay = next_backoff(reason, &mut transient_backoff, &mut rate_limit_backoff);
+
+                tracing::warn!(
+                    operation = operation_name,
+                    attempt = retries,
+                    max_retries = MAX_TOKEN_REQUEST_RETRIES,
+                    delay = ?delay,
+                    error = %error,
+                    "Retrying Databricks token request after transient failure"
+                );
+
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+fn add_supported_accept_encoding_header(request: RequestBuilder) -> RequestBuilder {
+    request.header(ACCEPT_ENCODING, SUPPORTED_ACCEPT_ENCODINGS)
+}
+
+fn next_backoff(
+    reason: RetryReason,
+    transient_backoff: &mut impl Backoff,
+    rate_limit_backoff: &mut impl Backoff,
+) -> Duration {
+    match reason {
+        RetryReason::RateLimit => rate_limit_backoff
+            .next_backoff()
+            .unwrap_or(MAX_TOKEN_REQUEST_BACKOFF),
+        RetryReason::ServerError | RetryReason::Network => transient_backoff
+            .next_backoff()
+            .unwrap_or(MAX_TOKEN_REQUEST_BACKOFF),
+    }
+}
+
+fn retry_reason_from_error(error: &reqwest::Error) -> Option<RetryReason> {
+    if error.is_connect() || error.is_timeout() {
+        return Some(RetryReason::Network);
+    }
+
+    error.status().and_then(retry_reason_from_status)
+}
+
+fn retry_reason_from_status(status: StatusCode) -> Option<RetryReason> {
+    match status.as_u16() {
+        408 | 429 => Some(RetryReason::RateLimit),
+        500..=599 => Some(RetryReason::ServerError),
+        _ => None,
+    }
+}
+
+fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
+    retry_after_millis_duration(headers).or_else(|| {
+        headers
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| retry_after_duration_from_value(value, SystemTime::now()))
+    })
+}
+
+fn retry_after_millis_duration(headers: &HeaderMap) -> Option<Duration> {
+    [RETRY_AFTER_MS_HEADER, X_RETRY_AFTER_MS_HEADER]
+        .into_iter()
+        .find_map(|header_name| {
+            headers
+                .get(header_name)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(Duration::from_millis)
+        })
+}
+
+fn retry_after_duration_from_value(value: &str, now: SystemTime) -> Option<Duration> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    trimmed
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+        .or_else(|| {
+            httpdate::parse_http_date(trimmed)
+                .ok()
+                .map(|retry_after| retry_after.duration_since(now).unwrap_or(Duration::ZERO))
+        })
 }
 
 #[derive(Debug)]
@@ -423,4 +626,196 @@ pub async fn get_u2m_token_provider(
         .map_err(|err| Error::UnableToGetToken {
             source: Box::new(err),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    #[derive(Clone)]
+    struct MockHttpResponse {
+        status_line: &'static str,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl MockHttpResponse {
+        fn json(status_line: &'static str, body: serde_json::Value) -> Self {
+            Self {
+                status_line,
+                headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                body: serde_json::to_string(&body).expect("mock JSON should serialize"),
+            }
+        }
+    }
+
+    async fn start_mock_server(
+        responses: Vec<MockHttpResponse>,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<tokio::sync::Mutex<Vec<String>>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind to a port");
+        let addr = listener
+            .local_addr()
+            .expect("should have a listener address");
+        let responses = Arc::new(tokio::sync::Mutex::new(VecDeque::from(responses)));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let captured_requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let requests_for_server = Arc::clone(&requests);
+        let captured_requests_for_server = Arc::clone(&captured_requests);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+
+                let responses = Arc::clone(&responses);
+                let requests = Arc::clone(&requests_for_server);
+                let captured_requests = Arc::clone(&captured_requests_for_server);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                    let mut buf = vec![0u8; 4096];
+                    let bytes_read = stream.read(&mut buf).await.unwrap_or_default();
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    captured_requests
+                        .lock()
+                        .await
+                        .push(String::from_utf8_lossy(&buf[..bytes_read]).into_owned());
+
+                    let response =
+                        responses.lock().await.pop_front().unwrap_or_else(|| {
+                            MockHttpResponse::json("200 OK", json!({"ok": true}))
+                        });
+
+                    let mut http_response = format!(
+                        "HTTP/1.1 {}\r\nContent-Length: {}\r\n",
+                        response.status_line,
+                        response.body.len()
+                    );
+                    for (header_name, header_value) in response.headers {
+                        http_response.push_str(&format!("{header_name}: {header_value}\r\n"));
+                    }
+                    http_response.push_str("\r\n");
+                    http_response.push_str(&response.body);
+
+                    let _ = stream.write_all(http_response.as_bytes()).await;
+                });
+            }
+        });
+
+        (format!("http://{addr}"), requests, captured_requests)
+    }
+
+    fn token_response_body() -> serde_json::Value {
+        json!({
+            "access_token": "test-access-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "scope": "all-apis"
+        })
+    }
+
+    #[test]
+    fn test_databricks_token_endpoint_url_normalizes_host() {
+        assert_eq!(
+            databricks_token_endpoint_url("dbc.example.databricks.com"),
+            "https://dbc.example.databricks.com/oidc/v1/token"
+        );
+        assert_eq!(
+            databricks_token_endpoint_url("http://127.0.0.1:1234/"),
+            "http://127.0.0.1:1234/oidc/v1/token"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_get_m2m_access_token_retries_rate_limited_response() {
+        let (endpoint, requests, _) = start_mock_server(vec![
+            MockHttpResponse {
+                status_line: "429 Too Many Requests",
+                headers: vec![
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                    ("Retry-After".to_string(), "0".to_string()),
+                ],
+                body: json!({"error": "rate limited"}).to_string(),
+            },
+            MockHttpResponse::json("200 OK", token_response_body()),
+        ])
+        .await;
+
+        let response = get_m2m_access_token(
+            endpoint,
+            "client-id".to_string(),
+            SecretString::from("client-secret"),
+        )
+        .await
+        .expect("token request should succeed after retrying the rate-limited response");
+
+        assert_eq!(response.expires_in, 3600);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_get_m2m_access_token_retries_server_error_response() {
+        let (endpoint, requests, _) = start_mock_server(vec![
+            MockHttpResponse::json("503 Service Unavailable", json!({"error": "busy"})),
+            MockHttpResponse::json("200 OK", token_response_body()),
+        ])
+        .await;
+
+        let response = get_m2m_access_token(
+            endpoint,
+            "client-id".to_string(),
+            SecretString::from("client-secret"),
+        )
+        .await
+        .expect("token request should succeed after retrying the transient server error");
+
+        assert_eq!(response.expires_in, 3600);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_get_m2m_access_token_requests_supported_encodings() {
+        let (endpoint, requests, captured_requests) =
+            start_mock_server(vec![MockHttpResponse::json(
+                "200 OK",
+                token_response_body(),
+            )])
+            .await;
+
+        let response = get_m2m_access_token(
+            endpoint,
+            "client-id".to_string(),
+            SecretString::from("client-secret"),
+        )
+        .await
+        .expect("token request should succeed");
+
+        let request = captured_requests
+            .lock()
+            .await
+            .remove(0)
+            .to_ascii_lowercase();
+
+        assert_eq!(response.expires_in, 3600);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(
+            request.contains("accept-encoding: zstd, br, gzip, deflate"),
+            "request should advertise all supported encodings: {request}"
+        );
+    }
 }
