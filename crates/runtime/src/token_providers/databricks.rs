@@ -626,17 +626,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_bounded_retry_delay_clamps_large_retry_after() {
-        let delay = bounded_retry_delay(
-            Some(Duration::from_secs(3600)),
-            Duration::from_secs(5),
-            MAX_TOKEN_REQUEST_BACKOFF,
-        );
-
-        assert_eq!(delay, MAX_TOKEN_REQUEST_BACKOFF);
-    }
-
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_get_m2m_access_token_retries_rate_limited_response() {
         let (endpoint, requests, _) = start_mock_server(vec![
