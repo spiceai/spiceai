@@ -452,6 +452,8 @@ async fn msal_device_code_flow(
             std::env::consts::OS,
             std::env::consts::ARCH
         ))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_default();
     let device_response = client

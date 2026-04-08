@@ -85,6 +85,11 @@ pub enum Error {
     #[snafu(display("Unable to connect to Spice Cloud: {source}"))]
     UnableToConnectToSpiceCloud { source: reqwest::Error },
 
+    #[snafu(display(
+        "Spice Cloud HTTP client not initialized. Ensure the extension is initialized before use."
+    ))]
+    ClientNotInitialized {},
+
     #[snafu(display("Unable to build accelerated table: {source}"))]
     UnableToBuildAcceleratedTable {
         source: AcceleratedTableBuilderError,
@@ -94,6 +99,7 @@ pub enum Error {
 pub struct SpiceExtension {
     manifest: ExtensionManifest,
     api_key: String,
+    client: Option<reqwest::Client>,
 }
 
 impl SpiceExtension {
@@ -102,6 +108,7 @@ impl SpiceExtension {
         SpiceExtension {
             manifest,
             api_key: String::new(),
+            client: None,
         }
     }
 
@@ -145,12 +152,7 @@ impl SpiceExtension {
         path: &str,
         body: Req,
     ) -> Result<Resp, Error> {
-        let client = reqwest::Client::builder()
-            .use_rustls_tls()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(1800))
-            .build()
-            .context(UnableToConnectToSpiceCloudSnafu)?;
+        let client = self.client.as_ref().ok_or(Error::ClientNotInitialized {})?;
         let response = client
             .post(format!("{}{path}", self.spice_http_url()))
             .json(&body)
@@ -240,7 +242,7 @@ impl SpiceExtension {
 
 impl Default for SpiceExtension {
     fn default() -> Self {
-        SpiceExtension::new(ExtensionManifest::default())
+        Self::new(ExtensionManifest::default())
     }
 }
 
@@ -254,6 +256,16 @@ impl Extension for SpiceExtension {
         if !self.manifest.enabled {
             return Ok(());
         }
+
+        self.client = Some(
+            reqwest::Client::builder()
+                .use_rustls_tls()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(1800))
+                .build()
+                .boxed()
+                .map_err(|source| ExtensionError::UnableToInitializeExtension { source })?,
+        );
 
         let api_key = self
             .get_spice_api_key(runtime)
@@ -286,10 +298,7 @@ impl SpiceExtensionFactory {
 
 impl ExtensionFactory for SpiceExtensionFactory {
     fn create(&self) -> Box<dyn Extension> {
-        Box::new(SpiceExtension {
-            manifest: self.manifest.clone(),
-            api_key: String::new(),
-        })
+        Box::new(SpiceExtension::new(self.manifest.clone()))
     }
 }
 
