@@ -120,11 +120,7 @@ pub async fn create_logical_plan(
                 let has_columns = !ct.columns.is_empty();
                 let has_partition_by = ct.partition_by.is_some();
                 let has_with = !matches!(ct.table_options, CreateTableOptions::None);
-                if has_columns
-                    || has_partition_by
-                    || has_with
-                    || has_ddl_extensions(ct)
-                {
+                if has_columns || has_partition_by || has_with || has_ddl_extensions(ct) {
                     return Err(DataFusionError::Plan(
                         "CREATE TABLE ... (LIKE ...) cannot be combined with PARTITION BY, WITH \
                          options, or additional column definitions. The new table inherits all \

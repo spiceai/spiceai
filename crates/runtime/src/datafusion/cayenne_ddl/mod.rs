@@ -19,7 +19,7 @@ limitations under the License.
 //! DDL: [`BroadcastCayenneDdlHandler`] implements [`CatalogDdlHandler`] and is
 //! paired with `datafusion_ddl::DdlAnalyzerRule` + `DdlExtensionPlanner`.
 //!
-//! DML: [`CayenneDmlExtensionPlanner`] handles the distributed DML extension
+//! DML: [`CayenneDmlExtensionPlanner`] handles local MERGE, [`DistributedCayenneDmlExtensionPlanner`] handles distributed DML extension
 //! nodes (`DistributedCayenneDelete/Update/Insert/Merge`) and the local
 //! `CayenneMerge` node.
 
@@ -28,7 +28,10 @@ pub mod handler;
 pub mod logical_nodes;
 pub mod physical_plans;
 
-pub use dml_planner::{CayenneDmlExtensionPlanner, extract_filter_sql, extract_update_assignments};
+pub use dml_planner::{
+    CayenneDmlExtensionPlanner, DistributedCayenneDmlExtensionPlanner, extract_filter_sql,
+    extract_update_assignments,
+};
 pub use handler::DistributedCayenneDdlHandler;
 
 use datafusion::catalog::CatalogProvider;

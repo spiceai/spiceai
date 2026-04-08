@@ -14,15 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Extension planner for distributed Cayenne DML nodes and local MERGE.
+//! Extension planners for Cayenne DML nodes.
 //!
 //! DDL nodes are handled by `datafusion_ddl::DdlExtensionPlanner`.
-//! This planner handles:
-//! - [`DistributedCayenneDeleteNode`] → [`DistributedCayenneDeleteExec`]
-//! - [`DistributedCayenneUpdateNode`] → [`DistributedCayenneUpdateExec`]
-//! - [`DistributedCayenneInsertNode`] → [`DistributedCayenneInsertExec`]
-//! - [`DistributedCayenneMergeNode`] → [`DistributedCayenneMergeExec`]
-//! - [`CayenneMergeNode`] → [`CayenneMergeExec`] (local delete+insert merge)
+//!
+//! This module provides two planners:
+//!
+//! - [`CayenneDmlExtensionPlanner`] — stateless, handles local (single-node)
+//!   [`CayenneMergeNode`] → [`CayenneMergeExec`]. Always registered.
+//!
+//! - [`DistributedCayenneDmlExtensionPlanner`] — handles the four distributed
+//!   DML nodes (DELETE, UPDATE, INSERT, MERGE) that forward operations to
+//!   executor nodes. Only registered when an [`ExecutorRegistry`] is present.
 
 use std::sync::Arc;
 
@@ -99,16 +102,46 @@ pub fn extract_update_assignments(
     }
     Ok(assignments)
 }
-use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
-/// Extension planner for distributed Cayenne DML and local MERGE.
+// ── CayenneDmlExtensionPlanner ────────────────────────────────────────────────
+
+/// Stateless extension planner for local (single-node) Cayenne DML.
+///
+/// Handles only [`CayenneMergeNode`] → [`CayenneMergeExec`].
+/// Always registered; does not require a distributed [`ExecutorRegistry`].
+#[derive(Debug, Default)]
+pub struct CayenneDmlExtensionPlanner;
+
+#[async_trait]
+impl ExtensionPlanner for CayenneDmlExtensionPlanner {
+    async fn plan_extension(
+        &self,
+        _planner: &dyn PhysicalPlanner,
+        node: &dyn UserDefinedLogicalNode,
+        _logical_inputs: &[&LogicalPlan],
+        _physical_inputs: &[Arc<dyn ExecutionPlan>],
+        session_state: &datafusion::execution::SessionState,
+    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+        if let Some(merge) = node.as_any().downcast_ref::<CayenneMergeNode>() {
+            return plan_local_merge(merge, session_state).await;
+        }
+        Ok(None)
+    }
+}
+
+// ── DistributedCayenneDmlExtensionPlanner ─────────────────────────────────────
+
+/// Extension planner for distributed Cayenne DML nodes.
+///
+/// Handles DELETE, UPDATE, INSERT, and MERGE nodes that forward operations
+/// to executor nodes. Only registered when an [`ExecutorRegistry`] is present.
 #[derive(Debug)]
-pub struct CayenneDmlExtensionPlanner {
+pub struct DistributedCayenneDmlExtensionPlanner {
     executor_registry: Arc<ExecutorRegistry>,
     io_runtime: Option<tokio::runtime::Handle>,
 }
 
-impl CayenneDmlExtensionPlanner {
+impl DistributedCayenneDmlExtensionPlanner {
     #[must_use]
     pub fn new(
         executor_registry: Arc<ExecutorRegistry>,
@@ -122,7 +155,7 @@ impl CayenneDmlExtensionPlanner {
 }
 
 #[async_trait]
-impl ExtensionPlanner for CayenneDmlExtensionPlanner {
+impl ExtensionPlanner for DistributedCayenneDmlExtensionPlanner {
     async fn plan_extension(
         &self,
         _planner: &dyn PhysicalPlanner,
@@ -197,13 +230,13 @@ impl ExtensionPlanner for CayenneDmlExtensionPlanner {
             ))));
         }
 
-        if let Some(merge) = node.as_any().downcast_ref::<CayenneMergeNode>() {
-            return plan_local_merge(merge, session_state).await;
-        }
-
         Ok(None)
     }
 }
+
+// ── Local merge ───────────────────────────────────────────────────────────────
+
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 /// Build the physical plan for a local (single-node) `CayenneMergeNode`.
 async fn plan_local_merge(

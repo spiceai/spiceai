@@ -651,13 +651,18 @@ pub(crate) fn default_extension_planners(
         #[cfg(feature = "duckdb")]
         DuckDBLogicalExtensionPlanner::new(),
     ];
-    // Distributed Cayenne DML + local MERGE (only when an executor registry is present).
+    // Cayenne DML (DELETE, UPDATE, INSERT, MERGE forwarding): either single or distributed.
     #[cfg(not(windows))]
     if let Some(registry) = executor_registry {
         planners.push(Arc::new(
-            super::cayenne_ddl::CayenneDmlExtensionPlanner::new(registry, Some(io_runtime)),
+            super::cayenne_ddl::DistributedCayenneDmlExtensionPlanner::new(
+                registry,
+                Some(io_runtime),
+            ),
         ));
-    }
+    } else {
+        planners.push(Arc::new(super::cayenne_ddl::CayenneDmlExtensionPlanner));
+    };
     planners
 }
 

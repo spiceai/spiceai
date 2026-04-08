@@ -571,9 +571,9 @@ fn extract_primary_key_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion_ddl::new_shared_store;
     use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
     use datafusion::sql::sqlparser::parser::Parser;
+    use datafusion_ddl::new_shared_store;
 
     /// Parse SQL into a `CreateTable` AST node for testing.
     fn parse_create_table(sql: &str) -> CreateTable {
