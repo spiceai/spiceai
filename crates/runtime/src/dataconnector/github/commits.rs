@@ -503,11 +503,12 @@ enum RefFetchMode {
 
 fn merge_ref_fetch_modes(current: RefFetchMode, next: RefFetchMode) -> RefFetchMode {
     match (current, next) {
-        (RefFetchMode::Dynamic, _) | (_, RefFetchMode::Dynamic) => RefFetchMode::Dynamic,
         (RefFetchMode::Exact(current), RefFetchMode::Exact(next)) if current == next => {
             RefFetchMode::Exact(current)
         }
-        (RefFetchMode::Exact(_), RefFetchMode::Exact(_)) => RefFetchMode::Dynamic,
+        (RefFetchMode::Dynamic, _)
+        | (_, RefFetchMode::Dynamic)
+        | (RefFetchMode::Exact(_), RefFetchMode::Exact(_)) => RefFetchMode::Dynamic,
         (RefFetchMode::Exact(current), RefFetchMode::None)
         | (RefFetchMode::None, RefFetchMode::Exact(current)) => RefFetchMode::Exact(current),
         (RefFetchMode::None, RefFetchMode::None) => RefFetchMode::None,
