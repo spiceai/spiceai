@@ -122,8 +122,12 @@ pub fn is_retriable_error(error: &Error) -> bool {
         }
         Error::JsonDecodeError { status, .. } => {
             // JSON decode errors with server error status codes are often due to
-            // truncated responses from timeouts or server issues
-            status.is_server_error()
+            // truncated responses from timeouts or server issues.
+            // A non-JSON 403 is also retriable: it indicates a transient upstream
+            // proxy/abuse-detection block (e.g. GitHub's "Request forbidden by
+            // administrative rules"), not a genuine credentials/permissions error
+            // (which would return valid JSON).
+            status.is_server_error() || *status == StatusCode::FORBIDDEN
         }
         Error::ReqwestInternal { source } => {
             // Check for transient network/connection errors:
@@ -278,10 +282,10 @@ mod tests {
     #[test]
     fn test_json_decode_client_error_not_retriable() {
         // JSON decode errors with client status codes (4xx) should NOT be retriable
+        // (except 403, which is retriable — see test_json_decode_forbidden_retriable)
         let client_error_codes = [
             StatusCode::BAD_REQUEST,          // 400
             StatusCode::UNAUTHORIZED,         // 401
-            StatusCode::FORBIDDEN,            // 403
             StatusCode::NOT_FOUND,            // 404
             StatusCode::UNPROCESSABLE_ENTITY, // 422
         ];
@@ -297,6 +301,22 @@ mod tests {
                 "JsonDecodeError with client status {status} should NOT be retriable"
             );
         }
+    }
+
+    #[test]
+    fn test_json_decode_forbidden_retriable() {
+        // A non-JSON 403 response indicates a transient upstream proxy or abuse-detection
+        // block (e.g. GitHub's "Request forbidden by administrative rules"), not a genuine
+        // credentials/permissions error (which returns valid JSON and is handled separately).
+        let error = Error::JsonDecodeError {
+            status: StatusCode::FORBIDDEN,
+            detail: "expected value at line 2 column 1".to_string(),
+            response_preview: "Request forbidden by administrative rules.".to_string(),
+        };
+        assert!(
+            is_retriable_error(&error),
+            "JsonDecodeError with 403 Forbidden should be retriable (transient abuse detection)"
+        );
     }
 
     #[test]

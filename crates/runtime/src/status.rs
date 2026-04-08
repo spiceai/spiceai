@@ -23,7 +23,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
 use datafusion::sql::TableReference;
@@ -53,6 +53,9 @@ pub struct RuntimeStatus {
     ready_state: Arc<RwLock<RuntimeReadyState>>,
     /// Per-component notifiers for status change subscriptions.
     notifiers: Arc<RwLock<HashMap<String, watch::Sender<ComponentStatus>>>>,
+    /// Broadcast channel that emits `(component_name, new_status)` on every status change.
+    /// Used by executors to send `ComponentStatusUpdate` messages to the scheduler.
+    component_status_tx: broadcast::Sender<(String, ComponentStatus)>,
     /// Cancellation token that is cancelled when the runtime is shutting down.
     /// Used to make background retry loops promptly exit on shutdown.
     shutdown_token: CancellationToken,
@@ -66,6 +69,7 @@ impl Default for RuntimeStatus {
             is_shutdown: Arc::new(AtomicBool::new(false)),
             ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
             notifiers: Arc::new(RwLock::new(HashMap::new())),
+            component_status_tx: broadcast::channel(256).0,
             shutdown_token: CancellationToken::new(),
         }
     }
@@ -80,6 +84,7 @@ impl RuntimeStatus {
             is_shutdown: Arc::new(AtomicBool::new(false)),
             ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
             notifiers: Arc::new(RwLock::new(HashMap::new())),
+            component_status_tx: broadcast::channel(256).0,
             shutdown_token: CancellationToken::new(),
         })
     }
@@ -99,11 +104,13 @@ impl RuntimeStatus {
 
     /// Updates the status of a component and tracks if it has ever been ready.
     pub(crate) fn update_component_status(&self, component_name: &str, status: ComponentStatus) {
-        let mut statuses = match self.statuses.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        statuses.insert(component_name.to_string(), status.clone());
+        {
+            let mut statuses = match self.statuses.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            statuses.insert(component_name.to_string(), status.clone());
+        }
 
         if status == ComponentStatus::Ready {
             let mut ever_ready = match self.ever_ready_components.write() {
@@ -113,13 +120,18 @@ impl RuntimeStatus {
             ever_ready.insert(component_name.to_string());
         }
 
-        // Notify subscribers of the status change
+        // Broadcast the change event to subscribers (lock already dropped).
+        let _ = self
+            .component_status_tx
+            .send((component_name.to_string(), status.clone()));
+
+        // Notify per-component watch subscribers.
         let notifiers = self
             .notifiers
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sender) = notifiers.get(component_name) {
-            let _ = sender.send(status); // Ignore error if no receivers
+            let _ = sender.send(status);
         }
     }
 
@@ -201,6 +213,15 @@ impl RuntimeStatus {
 
         self.update_component_status(&format!("cluster:{cluster_node_name}"), status);
         metrics::cluster::set_node_status(&cluster_node_name, node_name, status_value);
+    }
+
+    /// Subscribes to component status change events.
+    /// Returns a receiver that yields `(component_name, new_status)` on each change.
+    #[must_use]
+    pub fn subscribe_component_status_changes(
+        &self,
+    ) -> broadcast::Receiver<(String, ComponentStatus)> {
+        self.component_status_tx.subscribe()
     }
 
     /// Get the status of a worker
