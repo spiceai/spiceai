@@ -26,7 +26,6 @@ use super::{
 };
 use crate::cluster::ResolvedClusterConfig;
 use crate::cluster::executor_registry::ExecutorRegistry;
-use crate::cluster::partition::PartitionManager;
 use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, status};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;

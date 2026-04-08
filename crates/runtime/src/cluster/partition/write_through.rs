@@ -47,7 +47,7 @@ use tonic::{Response, Streaming};
 
 use crate::{
     cluster::{
-        PartitionManager, executor_registry::ExecutorRegistry, partition::metadata::PartitionValue,
+        PartitionStore, executor_registry::ExecutorRegistry, partition::metadata::PartitionValue,
     },
     datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA},
     flight::Service as FlightSvc,
@@ -58,7 +58,7 @@ pub enum Error {
     #[snafu(display("Failed to create partition metadata for table {table}"))]
     CreateMetadata {
         table: String,
-        source: Box<super::manager::Error>,
+        source: Box<super::store::Error>,
     },
 
     #[snafu(display("Cannot find partition metadata for table {table}"))]
@@ -139,7 +139,7 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to persist partition assignment: {source}"))]
-    PersistAssignment { source: Box<super::manager::Error> },
+    PersistAssignment { source: Box<super::store::Error> },
 
     #[snafu(display("Upstream execution error: {source}"))]
     UpstreamExecution {
@@ -269,18 +269,18 @@ pub(crate) async fn forward_partitioned_batches(
     mut batches: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>,
     raw_partition_by: &[String],
 ) -> Result<()> {
-    let partition_manager = executor_registry.federated_partition_manager();
-    let table_partitions = match partition_manager.get_table_metadata(path).await {
+    let partition_store = executor_registry.federated_partition_store();
+    let table_partitions = match partition_store.get_table_metadata(path).await {
         Ok(Some(metadata)) => metadata,
         Ok(None) => {
-            partition_manager
+            partition_store
                 .initialize_metadata(path, raw_partition_by.to_vec())
                 .await
                 .map_err(|source| Error::CreateMetadata {
                     table: path.to_string(),
                     source: Box::new(source),
                 })?;
-            partition_manager
+            partition_store
                 .get_cached_table_metadata(path)
                 .ok_or_else(|| Error::FindMetadata {
                     table: path.to_string(),
@@ -334,7 +334,7 @@ pub(crate) async fn forward_partitioned_batches(
     )
     .await?;
 
-    let partition_manager = executor_registry.federated_partition_manager();
+    let partition_store = executor_registry.federated_partition_store();
 
     // Route each batch through partition filters to the appropriate executor.
     let mut routing_error: Option<Error> = None;
@@ -353,7 +353,7 @@ pub(crate) async fn forward_partitioned_batches(
             &partition_phys_exprs,
             raw_partition_by,
             &mut partitions_by_executor,
-            &partition_manager,
+            &partition_store,
             path,
         )
         .await
@@ -411,7 +411,7 @@ async fn route_batch_and_assign_unseen(
     partition_expr_keys: &[String],
     // For each executor, the PartitionValue boolean expressions it currently has.
     partitions_by_executor: &mut HashMap<String, Vec<Expr>>,
-    partition_manager: &Arc<PartitionManager>,
+    partition_store: &Arc<PartitionStore>,
     path: &TableReference,
 ) -> Result<()> {
     // Partition rows by executor filter, collecting (executor_id, batch) pairs
@@ -481,7 +481,7 @@ async fn route_batch_and_assign_unseen(
         .map(|((_, pv, _), eid)| (pv, eid.as_str()))
         .collect();
 
-    partition_manager
+    partition_store
         .add_and_assign_partitions(path, &assignments)
         .await
         .map_err(|source| Error::PersistAssignment {

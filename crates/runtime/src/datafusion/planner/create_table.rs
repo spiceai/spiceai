@@ -310,7 +310,7 @@ pub(super) async fn plan_create_table_like(
         && let Some(Ok(idx)) = expr_str.strip_prefix("expr").map(str::parse::<usize>)
         && let Some(ref registry) = planner_ctx.executor_registry
     {
-        let pm = registry.federated_partition_manager();
+        let pm = registry.federated_partition_store();
         match pm.get_table_metadata(&source_full_ref).await {
             Ok(Some(metadata)) => {
                 if let Some(original) = metadata.partition_expressions.get(idx) {

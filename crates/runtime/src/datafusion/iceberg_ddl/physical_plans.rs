@@ -941,7 +941,7 @@ async fn initialize_partition_metadata(
             table_name.to_string(),
         );
         if let Err(error) = registry
-            .federated_partition_manager()
+            .federated_partition_store()
             .initialize_metadata(&table_ref, vec![expr_sql.clone()])
             .await
         {

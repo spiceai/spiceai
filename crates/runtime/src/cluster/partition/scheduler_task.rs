@@ -18,14 +18,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use snafu::prelude::*;
-use tokio::sync::RwLock;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use crate::CLUSTER_PARTITION_MANAGEMENT_TASK;
 use crate::datafusion::DataFusion;
 use crate::status::{ComponentStatus, RuntimeStatus};
-use app::App;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -229,7 +227,7 @@ impl PartitionManagementTask {
         };
 
         service
-            .discover_and_assign_all(&self.df)
+            .discover_and_assign_all_tables(&self.df)
             .await
             .map_err(|e| Error::AssignmentCycle { source: e })
     }
@@ -249,7 +247,7 @@ impl PartitionManagementTask {
             return Ok(());
         };
 
-        super::initialize_partition_metadata(Arc::clone(&self.df), app, &service.partition_manager)
+        super::initialize_partition_metadata(Arc::clone(&self.df), app, &service.partition_store)
             .await
     }
 }

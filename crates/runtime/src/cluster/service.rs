@@ -630,7 +630,7 @@ impl ClusterService for ClusterServiceImpl {
 
         let mut table_partitions: HashMap<String, BytesArray> = HashMap::new();
 
-        let partition_manager = self.executor_registry().accelerations_partition_manager();
+        let partition_store = self.executor_registry().accelerations_partition_store();
         let app_guard = self.app.read().await;
         let mut total_assigned: usize = 0;
         if let Some(app) = app_guard.as_ref() {
@@ -649,7 +649,7 @@ impl ClusterService for ClusterServiceImpl {
                 }
                 let remaining = max_partitions_per_executor.saturating_sub(total_assigned);
 
-                if partition_manager
+                if partition_store
                     .get_cached_table_metadata(table_ref)
                     .is_none()
                 {
@@ -658,7 +658,7 @@ impl ClusterService for ClusterServiceImpl {
                     );
                     continue;
                 }
-                match partition_manager
+                match partition_store
                     .allocate_partitions(table_ref, executor_id, remaining)
                     .await
                 {
@@ -794,7 +794,7 @@ async fn handle_executor_message(
                     .await;
                 evaluate_dataset_readiness(
                     dataset_name,
-                    &executor_registry.accelerations_partition_manager(),
+                    &executor_registry.accelerations_partition_store(),
                     runtime_status,
                     &executor_registry.get_executor_dataset_statuses().await,
                 );

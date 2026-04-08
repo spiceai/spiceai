@@ -17,9 +17,9 @@ limitations under the License.
 pub(crate) mod dataset_status;
 mod discovery;
 pub mod executor_selection;
-mod manager;
 mod metadata;
-pub use manager::CopyAssignmentsResult;
+mod store;
+pub use store::CopyAssignmentsResult;
 pub mod scheduler_task;
 pub(crate) mod service;
 mod startup;
@@ -29,7 +29,6 @@ use std::collections::HashMap;
 
 use datafusion::sql::TableReference;
 use datafusion_expr::Expr;
-pub use manager::PartitionManager;
 pub use metadata::{
     PartitionMetadata, PartitionValue, TablePartitionMetadata, partition_value_to_bytes,
 };
@@ -38,6 +37,7 @@ pub use startup::{
     accelerated_tables, build_partition_metadata_store, executor_request_initial_partitions,
     initialize_partition_metadata, validate_partition_keys,
 };
+pub use store::PartitionStore;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -49,7 +49,7 @@ pub enum Error {
     #[snafu(display("Failed to initialize partition metadata for table {table}: {source}"))]
     PartitionMetadataInit {
         table: String,
-        source: Box<manager::Error>,
+        source: Box<store::Error>,
     },
 
     #[snafu(display("Failed to discover partitions for table {table}: {source}"))]

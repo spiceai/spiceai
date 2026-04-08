@@ -800,7 +800,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                     .map(std::string::ToString::to_string);
                 let expr_sql = partition_expr_sql.as_ref().or(fallback.as_ref()).cloned();
                 if let Some(expr_sql) = expr_sql {
-                    let pm = registry.federated_partition_manager();
+                    let pm = registry.federated_partition_store();
                     if let Err(e) = pm.initialize_metadata(&table_ref, vec![expr_sql]).await {
                         tracing::warn!(
                             table = %table_ref,
@@ -847,7 +847,7 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 && let Some(ref registry) = executor_registry
             {
                 use crate::cluster::partition::CopyAssignmentsResult;
-                let pm = registry.federated_partition_manager();
+                let pm = registry.federated_partition_store();
                 tracing::info!(
                     source = %source,
                     target = %table_ref,

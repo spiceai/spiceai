@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::cluster::DistributedNode;
 use crate::cluster::ExecutorRegistry;
-use crate::cluster::PartitionManager;
+use crate::cluster::PartitionStore;
 use crate::cluster::ResolvedClusterConfig;
 use crate::cluster::partition;
 use crate::cluster::partition::scheduler_task::PartitionManagementConfig;
@@ -273,12 +273,11 @@ impl RuntimeBuilder {
                     Arc::new(object_store::memory::InMemory::new())
                 };
 
-                let partition_manager = Arc::new(PartitionManager::new(Arc::clone(&store)));
+                let partition_store = Arc::new(PartitionStore::new(Arc::clone(&store)));
                 let executor_registry = Arc::new(ExecutorRegistry::new(
-                    Arc::clone(&partition_manager),
+                    Arc::clone(&partition_store),
                     Arc::new(
-                        PartitionManager::new(Arc::clone(&store))
-                            .with_prefix("catalog/partitions/"),
+                        PartitionStore::new(Arc::clone(&store)).with_prefix("catalog/partitions/"),
                     ),
                 ));
                 let assignment_config = self
@@ -293,7 +292,7 @@ impl RuntimeBuilder {
                         discovery_timeout: pm_config.discovery_timeout,
                     });
                 let partition_service = Arc::new(PartitionService::new(
-                    Arc::clone(&partition_manager),
+                    Arc::clone(&partition_store),
                     Arc::clone(&executor_registry),
                     assignment_config,
                     Arc::new(RwLock::new(self.app.clone())),
@@ -303,7 +302,7 @@ impl RuntimeBuilder {
                     peers: Arc::new(RwLock::new(HashMap::new())),
                     job_executor: Arc::new(RwLock::new(None)),
                     executor_registry,
-                    partition_manager,
+                    partition_store,
                     partition_service,
                 })
             }

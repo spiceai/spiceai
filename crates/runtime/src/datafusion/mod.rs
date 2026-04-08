@@ -48,9 +48,7 @@ use crate::view::prepare_view;
 use crate::{status, view};
 
 use {
-    crate::cluster::{
-        ExecutorControlStreamRegistry, ExecutorRegistry, PartitionManager, ResolvedClusterConfig,
-    },
+    crate::cluster::{ExecutorControlStreamRegistry, ExecutorRegistry, ResolvedClusterConfig},
     ballista_executor::executor::Executor,
     ballista_scheduler::scheduler_server::SchedulerServer,
     datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode},
@@ -2901,7 +2899,7 @@ async fn resolve_table_partition_expr(
     let Some(expr_string) = expr_string.or(provider_expr_string).or_else(|| {
         executor_registry.and_then(|registry| {
             registry
-                .federated_partition_manager()
+                .federated_partition_store()
                 .get_cached_table_metadata(table_reference)
                 .and_then(|metadata| metadata.partition_expressions.first().cloned())
         })
@@ -2913,7 +2911,7 @@ async fn resolve_table_partition_expr(
     if let Some(Ok(idx)) = expr_string.strip_prefix("expr").map(str::parse::<usize>)
         && let Some(executor_registry) = executor_registry
         && let Some(metadata) = executor_registry
-            .federated_partition_manager()
+            .federated_partition_store()
             .get_table_metadata(table_reference)
             .await
             .boxed()

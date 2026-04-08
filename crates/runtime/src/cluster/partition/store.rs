@@ -56,7 +56,7 @@ static PARTITION_PREFIX: &str = "accelerations/partitions/";
 /// Uses optimistic concurrency control to safely coordinate partition assignments
 /// across multiple schedulers without locks.
 #[derive(Debug)]
-pub struct PartitionManager {
+pub struct PartitionStore {
     state: ObjectState<TablePartitionMetadata>,
 }
 
@@ -94,8 +94,8 @@ impl AllocationResult {
     }
 }
 
-impl PartitionManager {
-    /// Creates a new partition manager with the given object store.
+impl PartitionStore {
+    /// Creates a new partition store with the given object store.
     ///
     /// All partition metadata will be stored under the "partitions/" prefix.
     #[must_use]
@@ -466,13 +466,13 @@ mod tests {
     use super::*;
     use object_store::memory::InMemory;
 
-    fn in_memory_manager() -> PartitionManager {
+    fn in_memory_store() -> PartitionStore {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        PartitionManager::new(store)
+        PartitionStore::new(store)
     }
 
-    fn test_manager() -> PartitionManager {
-        PartitionManager::new(Arc::new(InMemory::new())).with_prefix("test/")
+    fn test_store() -> PartitionStore {
+        PartitionStore::new(Arc::new(InMemory::new())).with_prefix("test/")
     }
 
     fn table(name: &str) -> TableReference {
@@ -488,7 +488,7 @@ mod tests {
     /// mechanism used by the pre-refresh partition discovery fix (#10075).
     #[tokio::test]
     async fn test_add_and_assign_new_partitions() {
-        let pm = in_memory_manager();
+        let pm = in_memory_store();
         let tbl = table("my_table");
 
         // Initialize empty metadata
@@ -545,7 +545,7 @@ mod tests {
     /// already-existing partitions that are already assigned.
     #[tokio::test]
     async fn test_add_and_assign_idempotent() {
-        let pm = in_memory_manager();
+        let pm = in_memory_store();
         let tbl = table("my_table");
 
         pm.initialize_metadata(&tbl, vec!["bucket(2, id)".to_string()])
@@ -582,7 +582,7 @@ mod tests {
     /// that were not present during the initial partition management cycle.
     #[tokio::test]
     async fn test_add_new_partitions_alongside_existing() {
-        let pm = in_memory_manager();
+        let pm = in_memory_store();
         let tbl = table("my_table");
 
         pm.initialize_metadata(&tbl, vec!["region".to_string()])
@@ -636,7 +636,7 @@ mod tests {
     /// is a no-op (does not error or modify metadata).
     #[tokio::test]
     async fn test_add_and_assign_empty_is_noop() {
-        let pm = in_memory_manager();
+        let pm = in_memory_store();
         let tbl = table("my_table");
 
         pm.initialize_metadata(&tbl, vec!["col".to_string()])
@@ -658,7 +658,7 @@ mod tests {
 
     #[tokio::test]
     async fn copy_assignments_copies_metadata() {
-        let pm = test_manager();
+        let pm = test_store();
         let source = TableReference::parse_str("catalog.schema.source");
         let target = TableReference::parse_str("catalog.schema.target");
 
@@ -703,7 +703,7 @@ mod tests {
 
     #[tokio::test]
     async fn copy_assignments_noop_when_source_missing() {
-        let pm = test_manager();
+        let pm = test_store();
         let source = TableReference::parse_str("catalog.schema.missing");
         let target = TableReference::parse_str("catalog.schema.target");
 
@@ -721,7 +721,7 @@ mod tests {
 
     #[tokio::test]
     async fn copy_assignments_overwrites_existing_target() {
-        let pm = test_manager();
+        let pm = test_store();
         let source = TableReference::parse_str("catalog.schema.source");
         let target = TableReference::parse_str("catalog.schema.target");
 

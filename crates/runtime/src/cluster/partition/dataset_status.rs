@@ -20,7 +20,7 @@ use std::collections::HashMap;
 
 use datafusion::sql::TableReference;
 
-use crate::cluster::partition::PartitionManager;
+use crate::cluster::partition::PartitionStore;
 use crate::status::{ComponentStatus, RuntimeStatus};
 
 /// Evaluate readiness for a single dataset and promote it to [`ComponentStatus::Ready`]
@@ -29,12 +29,12 @@ use crate::status::{ComponentStatus, RuntimeStatus};
 /// `executor_statuses` is the pre-fetched snapshot from [`ExecutorRegistry::get_executor_dataset_statuses`].
 pub(crate) fn evaluate_dataset_readiness(
     table_name: &str,
-    partition_manager: &PartitionManager,
+    partition_store: &PartitionStore,
     status: &RuntimeStatus,
     executor_statuses: &HashMap<String, HashMap<String, ComponentStatus>>,
 ) {
     let table_ref = TableReference::parse_str(table_name);
-    let Some(metadata) = partition_manager.get_cached_table_metadata(&table_ref) else {
+    let Some(metadata) = partition_store.get_cached_table_metadata(&table_ref) else {
         return;
     };
 
@@ -90,11 +90,11 @@ mod tests {
     }
 
     /// Helper to set up a partition manager with pre-populated metadata.
-    async fn setup_partition_manager(
+    async fn setup_partition_store(
         tables: Vec<(&str, Vec<PartitionMetadata>)>,
-    ) -> Arc<PartitionManager> {
+    ) -> Arc<PartitionStore> {
         let store = Arc::new(InMemory::new());
-        let manager = Arc::new(PartitionManager::new(store));
+        let manager = Arc::new(PartitionStore::new(store));
 
         for (table_name, partitions) in tables {
             let table_ref = TableReference::parse_str(table_name);
@@ -138,7 +138,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_assigned_and_executors_ready_marks_dataset_ready() {
-        let pm = setup_partition_manager(vec![(
+        let pm = setup_partition_store(vec![(
             "test_table",
             vec![
                 make_assigned_partition("date", "2024-01-01", "executor1"),
@@ -167,7 +167,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unassigned_partitions_keeps_initializing() {
-        let pm = setup_partition_manager(vec![(
+        let pm = setup_partition_store(vec![(
             "test_table",
             vec![
                 make_assigned_partition("date", "2024-01-01", "executor1"),
@@ -198,7 +198,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_partitions_marks_dataset_ready() {
-        let pm = setup_partition_manager(vec![("test_table", vec![])]).await;
+        let pm = setup_partition_store(vec![("test_table", vec![])]).await;
         let es = HashMap::new();
 
         let status = RuntimeStatus::new();
@@ -218,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_all_unassigned_partitions_keeps_initializing() {
-        let pm = setup_partition_manager(vec![(
+        let pm = setup_partition_store(vec![(
             "test_table",
             vec![
                 make_unassigned_partition("date", "2024-01-01"),
@@ -244,9 +244,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_table_not_in_partition_manager() {
+    async fn test_table_not_in_partition_store() {
         let store = Arc::new(InMemory::new());
-        let pm = PartitionManager::new(store);
+        let pm = PartitionStore::new(store);
         let es = HashMap::new();
 
         let status = RuntimeStatus::new();
@@ -266,7 +266,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_executor_not_ready_stays_initializing() {
-        let pm = setup_partition_manager(vec![(
+        let pm = setup_partition_store(vec![(
             "test_table",
             vec![
                 make_assigned_partition("date", "2024-01-01", "executor1"),
@@ -301,7 +301,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_executor_reports_error_stays_initializing() {
-        let pm = setup_partition_manager(vec![(
+        let pm = setup_partition_store(vec![(
             "test_table",
             vec![make_assigned_partition("date", "2024-01-01", "executor1")],
         )])
@@ -329,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_executor_status_reported_stays_initializing() {
-        let pm = setup_partition_manager(vec![(
+        let pm = setup_partition_store(vec![(
             "test_table",
             vec![make_assigned_partition("date", "2024-01-01", "executor1")],
         )])
@@ -356,7 +356,7 @@ mod tests {
     #[tokio::test]
     async fn test_partition_with_multiple_executors_one_ready_is_queryable() {
         // Partition assigned to two executors, only one reports Ready
-        let pm = setup_partition_manager(vec![(
+        let pm = setup_partition_store(vec![(
             "test_table",
             vec![{
                 let mut p = PartitionMetadata::new(make_partition("date", "2024-01-01"));
@@ -393,7 +393,7 @@ mod tests {
     #[tokio::test]
     async fn test_end_to_end_runtime_readiness() {
         // End-to-end: dataset Initializing → partitions assigned → executors report Ready → runtime ready
-        let pm = setup_partition_manager(vec![(
+        let pm = setup_partition_store(vec![(
             "test_table",
             vec![
                 make_unassigned_partition("date", "2024-01-01"),

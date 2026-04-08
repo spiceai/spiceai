@@ -34,7 +34,7 @@ use spicepod::partitioning::PartitionedBy;
 use tokio::{runtime::Handle, sync::RwLock};
 use tonic::transport::Channel;
 
-use super::{PartitionManager, Result};
+use super::{PartitionStore, Result};
 use crate::{
     cluster::partition::{
         MissingPartitionKeysSnafu, ObjectStoreBuildSnafu, PartitionAllocationRequestSnafu,
@@ -74,7 +74,7 @@ pub async fn build_partition_metadata_store(
 pub async fn initialize_partition_metadata(
     df: Arc<DataFusion>,
     app: Arc<App>,
-    partition_manager: &PartitionManager,
+    partition_store: &PartitionStore,
 ) -> Result<()> {
     let tables = accelerated_tables(&app);
 
@@ -89,7 +89,7 @@ pub async fn initialize_partition_metadata(
     );
 
     // Get existing tables from partition manager
-    let existing_tables: HashSet<String> = partition_manager
+    let existing_tables: HashSet<String> = partition_store
         .list_tables()
         .await
         .map_err(|e| super::Error::PartitionMetadataInit {
@@ -126,7 +126,7 @@ pub async fn initialize_partition_metadata(
         let partition_expressions: Vec<String> =
             partitioning.iter().map(|p| p.expression.clone()).collect();
 
-        match partition_manager
+        match partition_store
             .set_unassigned_partitions(&table, partition_values, partition_expressions)
             .await
         {

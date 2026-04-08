@@ -96,7 +96,7 @@ pub enum DistributedNode {
         executor_registry: Arc<ExecutorRegistry>,
 
         /// Manager for accelerated table partition metadata (initialized when scheduler config is available)
-        partition_manager: Arc<PartitionManager>,
+        partition_store: Arc<PartitionStore>,
 
         /// Partition service for discovery, assignment, and executor notification.
         partition_service: Arc<PartitionService>,
@@ -413,7 +413,7 @@ mod service;
 use crate::cluster::partition::service::PartitionService;
 pub use control_stream_client::ControlStreamManager;
 pub use executor_registry::{ExecutorRegistry, FederatedPartitionProvider};
-pub use partition::{PartitionManager, PartitionMetadata, TablePartitionMetadata};
+pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
@@ -821,7 +821,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     };
 
     if let Some(config) = app.runtime.scheduler.clone() {
-        if let Some(partition_manager) = rt.partition_manager() {
+        if let Some(partition_store) = rt.partition_store() {
             // Validate all accelerated datasets/views have partition keys
             // for distributed partition management.
             partition::validate_partition_keys(&app).map_err(|e| {
@@ -834,7 +834,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
             if let Err(err) = partition::initialize_partition_metadata(
                 rt.datafusion(),
                 Arc::clone(&app),
-                &partition_manager,
+                &partition_store,
             )
             .await
             {

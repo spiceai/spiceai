@@ -75,7 +75,7 @@ use tokio::sync::{RwLock, oneshot::error::RecvError};
 use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
-use crate::cluster::{DistributedNode, PartitionManager, SchedulerPeers};
+use crate::cluster::{DistributedNode, PartitionStore, SchedulerPeers};
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
 pub mod accelerated_table;
@@ -769,11 +769,11 @@ impl Runtime {
 
     /// Returns the partition manager for accelerated table partition metadata (scheduler only).
     #[must_use]
-    pub fn partition_manager(&self) -> Option<Arc<PartitionManager>> {
+    pub fn partition_store(&self) -> Option<Arc<PartitionStore>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler {
-                partition_manager, ..
-            }) => Some(Arc::clone(partition_manager)),
+                partition_store, ..
+            }) => Some(Arc::clone(partition_store)),
             _ => None,
         }
     }
