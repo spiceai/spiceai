@@ -1212,8 +1212,10 @@ async fn test_cayenne_dml_comprehensive() -> Result<(), String> {
     let data_dir = temp_dir.path().join("data");
     let metadata_dir = temp_dir.path().join("metadata");
 
+    // Box::pin the inner future to heap-allocate it. The 17 test scenarios
+    // produce a state machine struct too large for the default thread stack.
     test_request_context()
-        .scope(async {
+        .scope(Box::pin(async {
             let mut h = CayenneTestHarness::new(&data_dir, &metadata_dir).await?;
 
             // ---------------------------------------------------------------
@@ -1959,6 +1961,6 @@ async fn test_cayenne_dml_comprehensive() -> Result<(), String> {
             .await?;
 
             Ok(())
-        })
+        }))
         .await
 }

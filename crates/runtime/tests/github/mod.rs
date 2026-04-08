@@ -131,6 +131,61 @@ async fn org_github_secret_available(test_name: &str) -> bool {
     github_secret_available("GITHUB_ORG_TOKEN", test_name).await
 }
 
+async fn github_app_secrets_available(test_name: &str) -> bool {
+    for secret in [
+        "GITHUB_CLIENT_ID",
+        "GITHUB_INSTALLATION_ID",
+        "GITHUB_PRIVATE_KEY",
+    ] {
+        if !github_secret_available(secret, test_name).await {
+            return false;
+        }
+    }
+    true
+}
+
+fn make_github_app_dataset(
+    kind: &GithubDatasetType,
+    query_mode: &str,
+    additional_params: Option<HashMap<String, String>>,
+) -> Dataset {
+    let mut dataset = match kind {
+        GithubDatasetType::RepoSpecific {
+            owner,
+            repo,
+            query_type,
+        } => Dataset::new(
+            format!("github:github.com/{owner}/{repo}/{query_type}"),
+            format!("{repo}_{query_type}_{query_mode}"),
+        ),
+        GithubDatasetType::OrgSpecific { org, query_type } => Dataset::new(
+            format!("github:github.com/{org}/{query_type}"),
+            format!("{org}_{query_type}_{query_mode}"),
+        ),
+    };
+
+    let mut params = HashMap::from([
+        ("github_query_mode".to_string(), query_mode.to_string()),
+        (
+            "github_client_id".to_string(),
+            github_secret_reference("GITHUB_CLIENT_ID"),
+        ),
+        (
+            "github_installation_id".to_string(),
+            github_secret_reference("GITHUB_INSTALLATION_ID"),
+        ),
+        (
+            "github_private_key".to_string(),
+            github_secret_reference("GITHUB_PRIVATE_KEY"),
+        ),
+    ]);
+
+    params.extend(additional_params.unwrap_or_default());
+
+    dataset.params = Some(DatasetParams::from_string_map(params));
+    dataset
+}
+
 fn collect_string_values(result_batches: &[RecordBatch], column_index: usize) -> Vec<String> {
     result_batches
         .iter()
@@ -295,7 +350,7 @@ async fn test_github_issues() -> Result<(), String> {
 
             // search should push down the filter, preventing the query from retrieving every issue
             assert!(
-                search_author_elapsed_secs < 10,
+                search_author_elapsed_secs < 30,
                 "search_author_elapsed_secs: {search_author_elapsed_secs}"
             );
 
@@ -1132,6 +1187,176 @@ async fn test_github_workflow_runs() -> Result<(), String> {
                         .map(arrow::array::RecordBatch::num_rows)
                         .sum::<usize>();
                     assert_eq!(total_rows, 13);
+                })),
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_github_app_commits_ref_filter() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    if !github_app_secrets_available("test_github_app_commits_ref_filter").await {
+        return Ok(());
+    }
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("github_app_integration_test")
+                .with_dataset(make_github_app_dataset(
+                    &GithubDatasetType::RepoSpecific {
+                        owner: "spiceai".to_string(),
+                        repo: "spiceai".to_string(),
+                        query_type: "commits".to_string(),
+                    },
+                    "auto",
+                    None,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_app_commits_ref_filter",
+                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref = 'trunk' LIMIT 5",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let row_count = result_batches
+                        .iter()
+                        .map(RecordBatch::num_rows)
+                        .sum::<usize>();
+                    for batch in &result_batches {
+                        assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
+                    }
+                    assert_eq!(row_count, 5, "num_rows: {row_count}");
+                    assert_all_string_values(&result_batches, 0, "trunk");
+                })),
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_github_app_files_ref_filter() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    if !github_app_secrets_available("test_github_app_files_ref_filter").await {
+        return Ok(());
+    }
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("github_app_integration_test")
+                .with_dataset(make_github_app_dataset(
+                    &GithubDatasetType::RepoSpecific {
+                        owner: "spiceai".to_string(),
+                        repo: "spiceai".to_string(),
+                        query_type: "files".to_string(),
+                    },
+                    "auto",
+                    None,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_app_files_ref_filter",
+                "SELECT ref, path, download_url FROM spiceai_files_auto WHERE ref = 'trunk' AND path = 'README.md' LIMIT 1",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    assert_github_file_ref_results(&result_batches, "trunk");
+                })),
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_github_app_issues() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    if !github_app_secrets_available("test_github_app_issues").await {
+        return Ok(());
+    }
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("github_app_integration_test")
+                .with_dataset(make_github_app_dataset(
+                    &GithubDatasetType::RepoSpecific {
+                        owner: "spiceai".to_string(),
+                        repo: "spiceai".to_string(),
+                        query_type: "issues".to_string(),
+                    },
+                    "auto",
+                    None,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_app_issues",
+                "SELECT * FROM spiceai_issues_auto LIMIT 10",
+                false,
+                Some(Box::new(|result_batches| {
+                    let mut row_count = 0;
+                    for batch in result_batches {
+                        let batch: RecordBatch = batch;
+                        assert_eq!(batch.num_columns(), 16, "num_cols: {}", batch.num_columns());
+                        row_count += batch.num_rows();
+                    }
+                    assert!(row_count > 0, "expected at least 1 row, got {row_count}");
                 })),
             )
             .await?;

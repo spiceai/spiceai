@@ -470,7 +470,7 @@ tests:
             "s3[parquet]-turso[file].yaml"
         );
         assert_eq!(test_file.tests.load[0].bench_args.query_set, QuerySet::Tpch);
-        assert_eq!(test_file.tests.load[0].bench_args.ready_wait, Some(300));
+        assert_eq!(test_file.tests.load[0].bench_args.ready_wait, None); // stripped by load deserializer
         assert_eq!(test_file.tests.load[0].concurrency, Some(128));
         assert_eq!(test_file.tests.load[0].duration, Some(1800));
         assert_eq!(test_file.tests.load[0].random_param_set_count, Some(1000));
@@ -494,7 +494,7 @@ tests:
     - spicepod_path: s3[parquet]-turso[file].yaml
       query_set: tpch
       ready_wait: 600
-      runner_type: spicehq-dev-large-runners
+      runner_type: spiceai-dev-large-runners
       concurrency: 256
       duration: 3600
       random_param_set_count: 2000
@@ -521,7 +521,7 @@ tests:
             "s3[parquet]-turso[file].yaml"
         );
         assert_eq!(test_file.tests.load[0].bench_args.query_set, QuerySet::Tpch);
-        assert_eq!(test_file.tests.load[0].bench_args.ready_wait, Some(300));
+        assert_eq!(test_file.tests.load[0].bench_args.ready_wait, None); // stripped by load deserializer
         assert_eq!(test_file.tests.load[0].concurrency, Some(128));
         assert_eq!(test_file.tests.load[0].duration, Some(1800));
         assert_eq!(test_file.tests.load[0].random_param_set_count, Some(1000));
@@ -535,7 +535,7 @@ tests:
             "s3[parquet]-turso[file].yaml"
         );
         assert_eq!(test_file.tests.load[1].bench_args.query_set, QuerySet::Tpch);
-        assert_eq!(test_file.tests.load[1].bench_args.ready_wait, Some(600));
+        assert_eq!(test_file.tests.load[1].bench_args.ready_wait, None); // stripped by load deserializer
         assert_eq!(test_file.tests.load[1].concurrency, Some(256));
         assert_eq!(test_file.tests.load[1].duration, Some(3600));
         assert_eq!(test_file.tests.load[1].random_param_set_count, Some(2000));
@@ -549,7 +549,7 @@ tests:
             "different-spicepod.yaml"
         );
         assert_eq!(test_file.tests.load[2].bench_args.query_set, QuerySet::Tpch);
-        assert_eq!(test_file.tests.load[2].bench_args.ready_wait, Some(120));
+        assert_eq!(test_file.tests.load[2].bench_args.ready_wait, None); // stripped by load deserializer
         assert_eq!(test_file.tests.load[2].concurrency, Some(64));
         assert_eq!(test_file.tests.load[2].duration, Some(900));
         assert_eq!(test_file.tests.load[2].random_param_set_count, Some(500));
