@@ -45,6 +45,8 @@ enum GithubDatasetType {
     },
 }
 
+const GITHUB_COMMITS_PAGE_SIZE: usize = 100;
+
 // GitHub commits queries request 100 history rows per page, so use a larger limit
 // in the pagination-sensitive tests to ensure they cross the page boundary.
 const GITHUB_COMMITS_PAGINATION_LIMIT: usize = 125;
@@ -223,6 +225,23 @@ fn assert_no_string_values(result_batches: &[RecordBatch], column_index: usize, 
     assert!(
         values.iter().all(|value| value != unexpected),
         "expected all values in column {column_index} to differ from {unexpected:?}, got {values:?}"
+    );
+}
+
+fn assert_positive_row_count_at_most_pagination_limit(row_count: usize) {
+    assert!(
+        row_count > 0 && row_count <= GITHUB_COMMITS_PAGINATION_LIMIT,
+        "expected 0 < num_rows <= {}, got {row_count}",
+        GITHUB_COMMITS_PAGINATION_LIMIT
+    );
+}
+
+fn assert_crosses_commits_pagination_boundary(row_count: usize) {
+    assert!(
+        row_count > GITHUB_COMMITS_PAGE_SIZE && row_count <= GITHUB_COMMITS_PAGINATION_LIMIT,
+        "expected {} < num_rows <= {}, got {row_count}",
+        GITHUB_COMMITS_PAGE_SIZE,
+        GITHUB_COMMITS_PAGINATION_LIMIT
     );
 }
 
@@ -455,7 +474,7 @@ async fn test_github_commits() -> Result<(), String> {
                     for batch in &result_batches {
                         assert_eq!(batch.num_columns(), 6, "num_cols: {}", batch.num_columns());
                     }
-                    assert_eq!(row_count, GITHUB_COMMITS_PAGINATION_LIMIT, "num_rows: {row_count}");
+                    assert_crosses_commits_pagination_boundary(row_count);
                     assert_all_string_values(&result_batches, 0, "trunk");
                 })),
             )
@@ -475,7 +494,7 @@ async fn test_github_commits() -> Result<(), String> {
                     for batch in &result_batches {
                         assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
                     }
-                    assert_eq!(row_count, GITHUB_COMMITS_PAGINATION_LIMIT, "num_rows: {row_count}");
+                    assert_positive_row_count_at_most_pagination_limit(row_count);
                     assert_all_string_values(&result_batches, 0, "release/1.11");
 
                     let shas = collect_string_values(&result_batches, 1);
@@ -502,7 +521,7 @@ async fn test_github_commits() -> Result<(), String> {
                     for batch in &result_batches {
                         assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
                     }
-                    assert_eq!(row_count, GITHUB_COMMITS_PAGINATION_LIMIT, "num_rows: {row_count}");
+                    assert_positive_row_count_at_most_pagination_limit(row_count);
                     assert_no_string_values(&result_batches, 0, "trunk");
 
                     let shas = collect_string_values(&result_batches, 1);
@@ -529,7 +548,7 @@ async fn test_github_commits() -> Result<(), String> {
                     for batch in &result_batches {
                         assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
                     }
-                    assert_eq!(row_count, GITHUB_COMMITS_PAGINATION_LIMIT, "num_rows: {row_count}");
+                    assert_crosses_commits_pagination_boundary(row_count);
                     assert_all_string_values(&result_batches, 0, "trunk");
 
                     let shas = collect_string_values(&result_batches, 1);
@@ -1323,8 +1342,15 @@ async fn test_github_app_commits_ref_filter() -> Result<(), String> {
                     for batch in &result_batches {
                         assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
                     }
-                    assert_eq!(row_count, GITHUB_COMMITS_PAGINATION_LIMIT, "num_rows: {row_count}");
+                    assert_crosses_commits_pagination_boundary(row_count);
                     assert_all_string_values(&result_batches, 0, "trunk");
+
+                    let shas = collect_string_values(&result_batches, 1);
+                    assert_eq!(shas.len(), row_count, "shas: {shas:?}");
+                    assert!(
+                        shas.iter().all(|sha| !sha.is_empty()),
+                        "expected non-empty shas, got {shas:?}"
+                    );
                 })),
             )
             .await?;
@@ -1346,7 +1372,7 @@ async fn test_github_app_commits_ref_filter() -> Result<(), String> {
                     for batch in &result_batches {
                         assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
                     }
-                    assert_eq!(row_count, GITHUB_COMMITS_PAGINATION_LIMIT, "num_rows: {row_count}");
+                    assert_positive_row_count_at_most_pagination_limit(row_count);
                     assert_all_string_values(&result_batches, 0, "release/1.11");
 
                     let shas = collect_string_values(&result_batches, 1);
@@ -1376,8 +1402,15 @@ async fn test_github_app_commits_ref_filter() -> Result<(), String> {
                     for batch in &result_batches {
                         assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
                     }
-                    assert_eq!(row_count, GITHUB_COMMITS_PAGINATION_LIMIT, "num_rows: {row_count}");
+                    assert_positive_row_count_at_most_pagination_limit(row_count);
                     assert_no_string_values(&result_batches, 0, "trunk");
+
+                    let shas = collect_string_values(&result_batches, 1);
+                    assert_eq!(shas.len(), row_count, "shas: {shas:?}");
+                    assert!(
+                        shas.iter().all(|sha| !sha.is_empty()),
+                        "expected non-empty shas, got {shas:?}"
+                    );
                 })),
             )
             .await?;

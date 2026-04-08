@@ -165,14 +165,14 @@ impl std::fmt::Debug for CommitsTableProvider {
 impl CommitsTableProvider {
     pub fn new(
         delegate: Arc<dyn TableProvider>,
-        client: GraphQLClient,
+        client: Arc<GraphQLClient>,
         rest_client: GithubRestClient,
         table_args: Arc<CommitsTableArgs>,
     ) -> Self {
         Self {
             schema: delegate.schema(),
             delegate,
-            client: Arc::new(client),
+            client,
             rest_client,
             table_args,
         }
@@ -213,10 +213,11 @@ impl CommitsTableProvider {
         limit: Option<usize>,
     ) -> std::result::Result<Vec<arrow::array::RecordBatch>, Box<dyn std::error::Error + Send + Sync>>
     {
-        let candidate_refs = self.resolve_requested_ref_names(requested_ref).await?;
+        let mut attempted_refs = Vec::new();
         let mut last_not_found_error = None;
 
-        for candidate_ref in candidate_refs {
+        for candidate_ref in requested_ref_candidates(requested_ref) {
+            attempted_refs.push(candidate_ref.clone());
             match self
                 .fetch_commits_for_ref(pushdown_filters, &candidate_ref, limit)
                 .await
@@ -226,6 +227,26 @@ impl CommitsTableProvider {
                     last_not_found_error = Some(err);
                 }
                 Err(err) => return Err(err),
+            }
+        }
+
+        if !requested_ref.starts_with("refs/") {
+            let fallback_refs = self.fetch_repository_refs().await?;
+            for candidate_ref in resolve_requested_ref_candidates(requested_ref, &fallback_refs) {
+                if attempted_refs.contains(&candidate_ref) {
+                    continue;
+                }
+
+                match self
+                    .fetch_commits_for_ref(pushdown_filters, &candidate_ref, limit)
+                    .await
+                {
+                    Ok(batches) => return Ok(batches),
+                    Err(err) if is_resource_not_found_error(err.as_ref()) => {
+                        last_not_found_error = Some(err);
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         }
 
@@ -245,24 +266,6 @@ impl CommitsTableProvider {
         self.rest_client
             .fetch_qualified_refs(&self.table_args.owner, &self.table_args.repo)
             .await
-    }
-
-    async fn resolve_requested_ref_names(
-        &self,
-        requested_ref: &str,
-    ) -> std::result::Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        if requested_ref.starts_with("refs/") {
-            return Ok(vec![requested_ref.to_string()]);
-        }
-
-        let refs = self.fetch_repository_refs().await?;
-        let mut candidate_refs = resolve_requested_ref_candidates(requested_ref, &refs);
-
-        if candidate_refs.is_empty() {
-            candidate_refs.push(requested_ref.to_string());
-        }
-
-        Ok(candidate_refs)
     }
 
     async fn resolve_dynamic_refs(
@@ -357,19 +360,19 @@ impl TableProvider for CommitsTableProvider {
             return self.delegate.scan(state, projection, filters, limit).await;
         }
 
+        validate_dynamic_ref_scan(filters, limit)?;
+
         let refs = self
             .resolve_dynamic_refs(filters)
             .await
             .map_err(DataFusionError::External)?;
 
-        let stop_early = limit.is_some() && filters.iter().all(expr_is_ref_only);
         let mut remaining = limit;
         let mut batches = Vec::new();
 
         for git_ref in refs {
-            let ref_limit = if stop_early { remaining } else { None };
             let ref_batches = self
-                .fetch_commits_for_ref(&pushdown_filters, &git_ref.qualified_name, ref_limit)
+                .fetch_commits_for_ref(&pushdown_filters, &git_ref.qualified_name, remaining)
                 .await
                 .map_err(DataFusionError::External)?;
 
@@ -384,7 +387,7 @@ impl TableProvider for CommitsTableProvider {
 
             batches.extend(ref_batches);
 
-            if stop_early && let Some(remaining_rows) = remaining.as_mut() {
+            if let Some(remaining_rows) = remaining.as_mut() {
                 *remaining_rows = remaining_rows.saturating_sub(fetched_rows);
                 if *remaining_rows == 0 {
                     break;
@@ -503,16 +506,26 @@ enum RefFetchMode {
 
 fn merge_ref_fetch_modes(current: RefFetchMode, next: RefFetchMode) -> RefFetchMode {
     match (current, next) {
-        (RefFetchMode::Exact(current), RefFetchMode::Exact(next)) if current == next => {
+        (RefFetchMode::Exact(current), _) | (_, RefFetchMode::Exact(current)) => {
             RefFetchMode::Exact(current)
         }
-        (RefFetchMode::Dynamic, _)
-        | (_, RefFetchMode::Dynamic)
-        | (RefFetchMode::Exact(_), RefFetchMode::Exact(_)) => RefFetchMode::Dynamic,
-        (RefFetchMode::Exact(current), RefFetchMode::None)
-        | (RefFetchMode::None, RefFetchMode::Exact(current)) => RefFetchMode::Exact(current),
+        (RefFetchMode::Dynamic, _) | (_, RefFetchMode::Dynamic) => RefFetchMode::Dynamic,
         (RefFetchMode::None, RefFetchMode::None) => RefFetchMode::None,
     }
+}
+
+fn requested_ref_candidates(requested_ref: &str) -> Vec<String> {
+    if requested_ref.starts_with("refs/") {
+        return vec![requested_ref.to_string()];
+    }
+
+    let mut candidate_refs = vec![
+        format!("refs/heads/{requested_ref}"),
+        format!("refs/tags/{requested_ref}"),
+        requested_ref.to_string(),
+    ];
+    candidate_refs.dedup();
+    candidate_refs
 }
 
 fn resolve_requested_ref_candidates(requested_ref: &str, refs: &[GithubRef]) -> Vec<String> {
@@ -544,6 +557,25 @@ fn is_resource_not_found_error(error: &(dyn std::error::Error + 'static)) -> boo
                 data_components::graphql::Error::ResourceNotFound { .. }
             )
         })
+}
+
+fn validate_dynamic_ref_scan(
+    filters: &[Expr],
+    limit: Option<usize>,
+) -> datafusion::error::Result<()> {
+    if limit.is_none() {
+        return Err(DataFusionError::Execution(
+            "GitHub commits dynamic ref scans require a LIMIT to keep source fetches bounded. Add a LIMIT clause or use an exact ref = '<value>' predicate.".to_string(),
+        ));
+    }
+
+    if !filters.iter().all(expr_is_ref_only) {
+        return Err(DataFusionError::Execution(
+            "GitHub commits dynamic ref scans only support predicates on ref. Add an exact ref = '<value>' predicate or remove additional filters.".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn ref_fetch_mode_from_expr(expr: &Expr) -> RefFetchMode {
@@ -1021,6 +1053,22 @@ mod tests {
     }
 
     #[test]
+    fn test_ref_fetch_mode_from_filters_prefers_exact_ref_for_conjunctive_predicate() {
+        let filters = vec![FilterPushdownResult {
+            filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Unsupported,
+            expr: datafusion::prelude::col("ref")
+                .eq(datafusion::prelude::lit("release/1.11"))
+                .and(datafusion::prelude::col("ref").not_eq(datafusion::prelude::lit("trunk"))),
+            context: None,
+        }];
+
+        assert_eq!(
+            ref_fetch_mode_from_filter_results(&filters),
+            RefFetchMode::Exact("release/1.11".to_string())
+        );
+    }
+
+    #[test]
     fn test_evaluate_ref_expr_supports_not_eq() {
         let expr = datafusion::prelude::col("ref").not_eq(datafusion::prelude::lit("main"));
 
@@ -1068,5 +1116,42 @@ mod tests {
                 "refs/tags/release".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_requested_ref_candidates_try_common_qualified_refs_first() {
+        assert_eq!(
+            requested_ref_candidates("release/1.11"),
+            vec![
+                "refs/heads/release/1.11".to_string(),
+                "refs/tags/release/1.11".to_string(),
+                "release/1.11".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_validate_dynamic_ref_scan_requires_limit() {
+        let filters =
+            vec![datafusion::prelude::col("ref").not_eq(datafusion::prelude::lit("trunk"))];
+
+        let err = validate_dynamic_ref_scan(&filters, None)
+            .expect_err("dynamic ref scans without limit should fail");
+
+        assert!(err.to_string().contains("require a LIMIT"));
+    }
+
+    #[test]
+    fn test_validate_dynamic_ref_scan_requires_ref_only_filters() {
+        let filters = vec![
+            datafusion::prelude::col("ref")
+                .not_eq(datafusion::prelude::lit("trunk"))
+                .and(datafusion::prelude::col("sha").eq(datafusion::prelude::lit("abc123"))),
+        ];
+
+        let err = validate_dynamic_ref_scan(&filters, Some(125))
+            .expect_err("dynamic ref scans with non-ref filters should fail");
+
+        assert!(err.to_string().contains("only support predicates on ref"));
     }
 }

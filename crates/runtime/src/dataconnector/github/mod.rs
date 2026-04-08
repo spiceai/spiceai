@@ -29,7 +29,7 @@ use data_components::{
         self, FilterPushdownResult, GraphQLContext,
         builder::GraphQLClientBuilder,
         client::{GraphQLClient, GraphQLQuery, PaginationParameters},
-        provider::GraphQLTableProviderBuilder,
+        provider::{GraphQLTableProvider, GraphQLTableProviderBuilder},
     },
     rate_limit::RateLimiter,
 };
@@ -440,6 +440,17 @@ impl Github {
         context: Option<Arc<dyn GraphQLContext>>,
         health_check_query_string: String,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        self.build_gql_table_provider(table_args, context, health_check_query_string)
+            .await
+            .map(|provider| Arc::new(provider) as Arc<dyn TableProvider>)
+    }
+
+    async fn build_gql_table_provider(
+        &self,
+        table_args: Arc<dyn GitHubTableArgs>,
+        context: Option<Arc<dyn GraphQLContext>>,
+        health_check_query_string: String,
+    ) -> super::DataConnectorResult<GraphQLTableProvider> {
         let connector_component_name = format!("{}", table_args.get_component());
         let graphql_values = table_args.get_graphql_values();
         let client = self.create_graphql_client(&table_args).await.context(
@@ -472,7 +483,7 @@ impl Github {
             .build(graphql_values.query.as_ref())
             .await
         {
-            Ok(provider) => return Ok(Arc::new(provider) as Arc<dyn TableProvider>),
+            Ok(provider) => return Ok(provider),
             Err(e) => e,
         };
 
@@ -501,7 +512,6 @@ impl Github {
 
             return fallback_builder
                 .build_without_validation(graphql_values.query.as_ref())
-                .map(|provider| Arc::new(provider) as Arc<dyn TableProvider>)
                 .map_err(|e| DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "github".to_string(),
                     connector_component: table_args.get_component(),
@@ -617,20 +627,15 @@ impl Github {
         let gql_table_args = Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>;
         let gql_context = Arc::clone(&table_args) as Arc<dyn GraphQLContext>;
 
-        let delegate = self
-            .create_gql_table_provider(
+        let delegate_provider = self
+            .build_gql_table_provider(
                 Arc::clone(&gql_table_args),
                 Some(gql_context),
                 Github::get_health_check_for_owner_and_repo(owner, repo),
             )
             .await?;
-
-        let client = self.create_graphql_client(&gql_table_args).await.context(
-            super::UnableToGetReadProviderSnafu {
-                dataconnector: "github".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-            },
-        )?;
+        let client = delegate_provider.client();
+        let delegate = Arc::new(delegate_provider) as Arc<dyn TableProvider>;
 
         let rest_client =
             self.create_rest_client()
