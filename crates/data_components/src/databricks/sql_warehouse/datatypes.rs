@@ -590,9 +590,7 @@ mod tests {
     fn test_long_maps_to_int64() {
         for input in ["LONG", "long", "Long"] {
             let mut parser = Parser::new(input);
-            let result = parser
-                .parse()
-                .unwrap_or_else(|e| panic!("parse {input}: {e}"));
+            let result = parser.parse().expect("should parse LONG variant");
             assert_eq!(result, ArrowDataType::Int64, "Failed for input: {input}");
         }
     }
@@ -614,9 +612,7 @@ mod tests {
         ];
         for (input, expected) in &cases {
             let mut parser = Parser::new(input);
-            let result = parser
-                .parse()
-                .unwrap_or_else(|e| panic!("parse {input}: {e}"));
+            let result = parser.parse().expect("should parse full_data_type value");
             assert_eq!(
                 result, *expected,
                 "Failed for full_data_type input: {input}"
@@ -641,9 +637,7 @@ mod tests {
         ];
         for (input, expected) in &cases {
             let mut parser = Parser::new(input);
-            let result = parser
-                .parse()
-                .unwrap_or_else(|e| panic!("parse {input}: {e}"));
+            let result = parser.parse().expect("should parse data_type value");
             assert_eq!(result, *expected, "Failed for data_type input: {input}");
         }
     }

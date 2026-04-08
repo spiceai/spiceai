@@ -257,6 +257,7 @@ impl SqlWarehouseApi {
                 if message.contains("UNRESOLVED_COLUMN") && message.contains("full_data_type") =>
             {
                 tracing::warn!(
+                    table = %table,
                     "Databricks information_schema does not have 'full_data_type' column, falling back to 'data_type'. Complex types (ARRAY, MAP, STRUCT) may lose inner type details."
                 );
                 let payload = self.create_schema_payload(table, "data_type")?;
