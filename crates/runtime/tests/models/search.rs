@@ -374,9 +374,9 @@ fn normalize_search_response_json(
                 && let Some(Value::Number(n)) = obj.get("_score")
                 && let Some(score) = n.as_f64()
             {
-                // Use rounding for non-deterministic embeddings (model2vec/s3vectors)
-                // to stabilize scores that vary ±0.002 across CI runners.
-                // Use truncation for deterministic embeddings (OpenAI/HF) to preserve
+                // Use rounding for non-deterministic embeddings (model2vec/s3vectors/OpenAI)
+                // to stabilize scores that vary ±0.01 across CI runs.
+                // Use truncation for deterministic embeddings (HF) to preserve
                 // exact snapshot values.
                 let display_score = if round_scores {
                     (100.0 * score).round() / 100.0
