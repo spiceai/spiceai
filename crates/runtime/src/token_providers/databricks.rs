@@ -24,7 +24,7 @@ use std::time::Duration;
 use std::{fmt, sync::Arc};
 use token_provider::{Result, TokenProvider};
 use tokio::{sync::watch, task::JoinHandle, time::sleep};
-use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use util::fibonacci_backoff::{Backoff as _, FibonacciBackoffBuilder};
 
 use crate::request::DatabricksAuthExtension;
 use runtime_request_context::RequestContext;
