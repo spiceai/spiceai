@@ -1052,7 +1052,6 @@ impl ExecutionPlan for DistributedCayenneMergeExec {
     }
 }
 
-#[expect(clippy::items_after_statements)]
 async fn validate_partition_compatibility(
     registry: &ExecutorRegistry,
     ctx: &datafusion::prelude::SessionContext,
