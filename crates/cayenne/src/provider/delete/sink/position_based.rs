@@ -489,7 +489,9 @@ fn build_vortex_filter(
             Ok(expr) => expr,
             Err(_) => {
                 match try_decompose_struct_in_list(phys_filter.as_ref(), &expr_convertor, df_schema)
-                {
+                    .or_else(|| {
+                        try_decompose_struct_eq(phys_filter.as_ref(), &expr_convertor, df_schema)
+                    }) {
                     Some(decomposed) => decomposed,
                     None => {
                         return Err(format!(
@@ -609,6 +611,86 @@ fn try_decompose_struct_in_list(
     }
 }
 
+/// Decompose `struct(col1, col2, ...) = struct_literal` into `col1 = v1 AND col2 = v2 AND ...`.
+///
+/// `DataFusion` optimizes single-element `IN` lists to equality: `(k1, k2) IN ((v1, v2))` becomes
+/// `struct(k1, k2) = {c0:v1, c1:v2}`. Vortex doesn't support struct equality, so we decompose
+/// it the same way `try_decompose_struct_in_list` handles the multi-element case.
+fn try_decompose_struct_eq(
+    expr: &dyn datafusion_physical_expr::PhysicalExpr,
+    convertor: &DefaultExpressionConvertor,
+    df_schema: &DFSchema,
+) -> Option<vortex::expr::Expression> {
+    use datafusion_common::ScalarValue;
+
+    let bin_expr = expr
+        .as_any()
+        .downcast_ref::<datafusion_physical_expr::expressions::BinaryExpr>()?;
+    if *bin_expr.op() != datafusion_expr::Operator::Eq {
+        return None;
+    }
+
+    // LHS must be struct(col1, col2, ...), possibly wrapped in CAST.
+    let lhs: &dyn datafusion_physical_expr::PhysicalExpr = bin_expr.left().as_ref();
+    let struct_fn = if let Some(sf) = lhs
+        .as_any()
+        .downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>()
+    {
+        sf
+    } else if let Some(cast_expr) = lhs.as_any().downcast_ref::<phys_expr::CastExpr>() {
+        cast_expr
+            .expr()
+            .as_any()
+            .downcast_ref::<datafusion_physical_expr::ScalarFunctionExpr>()?
+    } else {
+        return None;
+    };
+    if struct_fn.name() != "struct" {
+        return None;
+    }
+
+    // RHS must be a struct literal.
+    let rhs_literal = bin_expr
+        .right()
+        .as_any()
+        .downcast_ref::<phys_expr::Literal>()?;
+    let ScalarValue::Struct(struct_arr) = rhs_literal.value() else {
+        return None;
+    };
+
+    // Convert each column arg to a Vortex expression and collect native types.
+    let arrow_schema: arrow::datatypes::Schema = df_schema.as_arrow().as_ref().clone();
+    let mut vortex_columns: Vec<vortex::expr::Expression> =
+        Vec::with_capacity(struct_fn.args().len());
+    let mut col_types: Vec<arrow::datatypes::DataType> = Vec::with_capacity(struct_fn.args().len());
+    for arg in struct_fn.args() {
+        let vx = convertor.convert(arg.as_ref()).ok()?;
+        let dt = arg.data_type(&arrow_schema).ok()?;
+        vortex_columns.push(vx);
+        col_types.push(dt);
+    }
+    if vortex_columns.is_empty() {
+        return None;
+    }
+
+    // Build col1 = v1 AND col2 = v2 AND ...
+    let field_eqs: Vec<vortex::expr::Expression> = (0..vortex_columns.len())
+        .map(|i| {
+            let field_scalar = ScalarValue::try_from_array(struct_arr.column(i), 0).ok()?;
+            let cast_scalar = field_scalar
+                .cast_to(&col_types[i])
+                .ok()
+                .unwrap_or(field_scalar);
+            let phys_lit = phys_expr::Literal::new(cast_scalar);
+            let vortex_lit = convertor.convert(&phys_lit).ok()?;
+            Some(vortex::expr::eq(vortex_columns[i].clone(), vortex_lit))
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    let mut conj = field_eqs.into_iter();
+    let first = conj.next()?;
+    Some(conj.fold(first, vortex::expr::and))
+}
 /// Combine expressions with OR using a balanced binary tree.
 /// Depth is O(log N) instead of O(N) from a linear fold, avoiding stack overflow.
 fn balanced_or(mut exprs: Vec<vortex::expr::Expression>) -> vortex::expr::Expression {
@@ -632,5 +714,325 @@ fn balanced_or(mut exprs: Vec<vortex::expr::Expression>) -> vortex::expr::Expres
     match exprs.into_iter().next() {
         Some(expr) => expr,
         None => unreachable!("balanced_or called with empty exprs"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::DFSchema;
+    use datafusion_common::ScalarValue;
+    use datafusion_physical_expr::ScalarFunctionExpr;
+    use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
+    use std::sync::Arc;
+    use vortex_datafusion::DefaultExpressionConvertor;
+
+    /// Build a `struct(col1, col2, ...)` [`ScalarFunctionExpr`] over the given columns.
+    fn make_struct_fn(
+        col_names: &[&str],
+        schema: &Schema,
+    ) -> Arc<dyn datafusion_physical_expr::PhysicalExpr> {
+        let args: Vec<Arc<dyn datafusion_physical_expr::PhysicalExpr>> = col_names
+            .iter()
+            .map(|name| {
+                Arc::new(Column::new_with_schema(name, schema).expect("column exists in schema"))
+                    as Arc<dyn datafusion_physical_expr::PhysicalExpr>
+            })
+            .collect();
+
+        let struct_fields: Vec<Field> = col_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                Field::new(
+                    format!("c{i}"),
+                    schema
+                        .field_with_name(name)
+                        .expect("field exists in schema")
+                        .data_type()
+                        .clone(),
+                    true,
+                )
+            })
+            .collect();
+        let return_field = Arc::new(Field::new(
+            "struct",
+            DataType::Struct(struct_fields.into()),
+            false,
+        ));
+
+        let struct_udf: Arc<datafusion_expr::ScalarUDF> =
+            Arc::new(datafusion_functions::core::r#struct::StructFunc::new().into());
+        Arc::new(ScalarFunctionExpr::new(
+            "struct",
+            struct_udf,
+            args,
+            return_field,
+            Arc::default(),
+        ))
+    }
+
+    /// Build a [`ScalarValue::Struct`] literal from a slice of scalar values.
+    fn make_struct_literal(values: &[ScalarValue]) -> ScalarValue {
+        let (fields, arrays): (Vec<_>, Vec<_>) = values
+            .iter()
+            .enumerate()
+            .map(|(i, sv)| {
+                let arr = sv.to_array().expect("scalar to array conversion");
+                let field = Arc::new(Field::new(format!("c{i}"), arr.data_type().clone(), true));
+                (field, arr)
+            })
+            .unzip();
+
+        let struct_arr = arrow::array::StructArray::new(fields.into(), arrays, None);
+        ScalarValue::Struct(Arc::new(struct_arr))
+    }
+
+    fn two_col_schema() -> (Schema, DFSchema) {
+        let schema = Schema::new(vec![
+            Field::new("k1", DataType::Int32, false),
+            Field::new("k2", DataType::Utf8, false),
+        ]);
+        let df_schema = DFSchema::try_from(schema.clone()).expect("schema conversion");
+        (schema, df_schema)
+    }
+
+    // ── try_decompose_struct_eq ──────────────────────────────────────────
+
+    #[test]
+    fn decompose_struct_eq_two_columns() {
+        let (schema, df_schema) = two_col_schema();
+        let convertor = DefaultExpressionConvertor::default();
+
+        let expr = Arc::new(BinaryExpr::new(
+            make_struct_fn(&["k1", "k2"], &schema),
+            datafusion_expr::Operator::Eq,
+            Arc::new(Literal::new(make_struct_literal(&[
+                ScalarValue::Int32(Some(42)),
+                ScalarValue::Utf8(Some("hello".into())),
+            ]))),
+        ));
+
+        let result = try_decompose_struct_eq(expr.as_ref(), &convertor, &df_schema);
+        let expected = vortex::expr::and(
+            vortex::expr::eq(
+                vortex::expr::col("k1"),
+                vortex::expr::lit(vortex::scalar::Scalar::from(42_i32)),
+            ),
+            vortex::expr::eq(
+                vortex::expr::col("k2"),
+                vortex::expr::lit(vortex::scalar::Scalar::from("hello")),
+            ),
+        );
+        assert_eq!(result, Some(expected));
+    }
+
+    #[test]
+    fn decompose_struct_eq_single_column() {
+        let schema = Schema::new(vec![Field::new("k1", DataType::Int64, false)]);
+        let df_schema = DFSchema::try_from(schema.clone()).expect("schema conversion");
+        let convertor = DefaultExpressionConvertor::default();
+
+        let expr = Arc::new(BinaryExpr::new(
+            make_struct_fn(&["k1"], &schema),
+            datafusion_expr::Operator::Eq,
+            Arc::new(Literal::new(make_struct_literal(&[ScalarValue::Int64(
+                Some(99),
+            )]))),
+        ));
+
+        let result = try_decompose_struct_eq(expr.as_ref(), &convertor, &df_schema);
+        let expected = vortex::expr::eq(
+            vortex::expr::col("k1"),
+            vortex::expr::lit(vortex::scalar::Scalar::from(99_i64)),
+        );
+        assert_eq!(result, Some(expected));
+    }
+
+    #[test]
+    fn decompose_struct_eq_three_columns() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int64, false),
+            Field::new("c", DataType::Utf8, false),
+        ]);
+        let df_schema = DFSchema::try_from(schema.clone()).expect("schema conversion");
+        let convertor = DefaultExpressionConvertor::default();
+
+        let expr = Arc::new(BinaryExpr::new(
+            make_struct_fn(&["a", "b", "c"], &schema),
+            datafusion_expr::Operator::Eq,
+            Arc::new(Literal::new(make_struct_literal(&[
+                ScalarValue::Int32(Some(1)),
+                ScalarValue::Int64(Some(2)),
+                ScalarValue::Utf8(Some("three".into())),
+            ]))),
+        ));
+
+        let result = try_decompose_struct_eq(expr.as_ref(), &convertor, &df_schema);
+        // fold produces: and(and(a=1, b=2), c='three')
+        let expected = vortex::expr::and(
+            vortex::expr::and(
+                vortex::expr::eq(
+                    vortex::expr::col("a"),
+                    vortex::expr::lit(vortex::scalar::Scalar::from(1_i32)),
+                ),
+                vortex::expr::eq(
+                    vortex::expr::col("b"),
+                    vortex::expr::lit(vortex::scalar::Scalar::from(2_i64)),
+                ),
+            ),
+            vortex::expr::eq(
+                vortex::expr::col("c"),
+                vortex::expr::lit(vortex::scalar::Scalar::from("three")),
+            ),
+        );
+        assert_eq!(result, Some(expected));
+    }
+
+    #[test]
+    fn decompose_struct_eq_with_cast_wrapping() {
+        let (schema, df_schema) = two_col_schema();
+        let convertor = DefaultExpressionConvertor::default();
+
+        // CAST(struct(k1, k2) AS Struct<c0:Int32, c1:Utf8>) = {c0:42, c1:"hello"}
+        let cast_expr = Arc::new(phys_expr::CastExpr::new(
+            make_struct_fn(&["k1", "k2"], &schema),
+            DataType::Struct(
+                vec![
+                    Field::new("c0", DataType::Int32, true),
+                    Field::new("c1", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+            None,
+        ));
+        let expr = Arc::new(BinaryExpr::new(
+            cast_expr,
+            datafusion_expr::Operator::Eq,
+            Arc::new(Literal::new(make_struct_literal(&[
+                ScalarValue::Int32(Some(42)),
+                ScalarValue::Utf8(Some("hello".into())),
+            ]))),
+        ));
+
+        let result = try_decompose_struct_eq(expr.as_ref(), &convertor, &df_schema);
+        let expected = vortex::expr::and(
+            vortex::expr::eq(
+                vortex::expr::col("k1"),
+                vortex::expr::lit(vortex::scalar::Scalar::from(42_i32)),
+            ),
+            vortex::expr::eq(
+                vortex::expr::col("k2"),
+                vortex::expr::lit(vortex::scalar::Scalar::from("hello")),
+            ),
+        );
+        assert_eq!(result, Some(expected));
+    }
+
+    // ── Negative / rejection cases ──────────────────────────────────────
+
+    #[test]
+    fn decompose_struct_eq_rejects_not_eq_operator() {
+        let (schema, df_schema) = two_col_schema();
+        let convertor = DefaultExpressionConvertor::default();
+
+        let expr = Arc::new(BinaryExpr::new(
+            make_struct_fn(&["k1", "k2"], &schema),
+            datafusion_expr::Operator::NotEq,
+            Arc::new(Literal::new(make_struct_literal(&[
+                ScalarValue::Int32(Some(1)),
+                ScalarValue::Utf8(Some("x".into())),
+            ]))),
+        ));
+        assert_eq!(
+            try_decompose_struct_eq(expr.as_ref(), &convertor, &df_schema),
+            None,
+        );
+    }
+
+    #[test]
+    fn decompose_struct_eq_rejects_non_struct_lhs() {
+        let (_, df_schema) = two_col_schema();
+        let convertor = DefaultExpressionConvertor::default();
+
+        // k1 = 42  (plain column, not struct(...))
+        let expr = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("k1", 0)),
+            datafusion_expr::Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(42)))),
+        ));
+        assert_eq!(
+            try_decompose_struct_eq(expr.as_ref(), &convertor, &df_schema),
+            None,
+        );
+    }
+
+    #[test]
+    fn decompose_struct_eq_rejects_non_struct_rhs() {
+        let (schema, df_schema) = two_col_schema();
+        let convertor = DefaultExpressionConvertor::default();
+
+        // struct(k1, k2) = 42  (RHS is scalar, not struct literal)
+        let expr = Arc::new(BinaryExpr::new(
+            make_struct_fn(&["k1", "k2"], &schema),
+            datafusion_expr::Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(42)))),
+        ));
+        assert_eq!(
+            try_decompose_struct_eq(expr.as_ref(), &convertor, &df_schema),
+            None,
+        );
+    }
+
+    // ── build_vortex_filter integration ─────────────────────────────────
+
+    #[test]
+    fn build_filter_empty_returns_none() {
+        let schema = Schema::new(vec![Field::new("k1", DataType::Int32, false)]);
+        let df_schema = DFSchema::try_from(schema).expect("schema conversion");
+        assert_eq!(
+            build_vortex_filter(&[], &df_schema).expect("build filter"),
+            None
+        );
+    }
+
+    #[test]
+    fn build_filter_simple_eq() {
+        let schema = Schema::new(vec![Field::new("k1", DataType::Int32, false)]);
+        let df_schema = DFSchema::try_from(schema).expect("schema conversion");
+
+        let filters =
+            vec![datafusion_expr::col("k1").eq(datafusion_expr::lit(ScalarValue::Int32(Some(7))))];
+        let result = build_vortex_filter(&filters, &df_schema).expect("build filter");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn build_filter_multiple_filters_anded() {
+        let schema = Schema::new(vec![
+            Field::new("k1", DataType::Int32, false),
+            Field::new("k2", DataType::Utf8, false),
+        ]);
+        let df_schema = DFSchema::try_from(schema).expect("schema conversion");
+
+        let filters = vec![
+            datafusion_expr::col("k1").eq(datafusion_expr::lit(ScalarValue::Int32(Some(1)))),
+            datafusion_expr::col("k2")
+                .eq(datafusion_expr::lit(ScalarValue::Utf8(Some("a".into())))),
+        ];
+        let result = build_vortex_filter(&filters, &df_schema).expect("build filter");
+        let expected = vortex::expr::and(
+            vortex::expr::eq(
+                vortex::expr::col("k1"),
+                vortex::expr::lit(vortex::scalar::Scalar::from(1_i32)),
+            ),
+            vortex::expr::eq(
+                vortex::expr::col("k2"),
+                vortex::expr::lit(vortex::scalar::Scalar::from("a")),
+            ),
+        );
+        assert_eq!(result.expect("filter should be Some"), expected);
     }
 }

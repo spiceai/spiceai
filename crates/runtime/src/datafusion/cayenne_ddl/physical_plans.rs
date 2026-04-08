@@ -415,7 +415,11 @@ impl DisplayAs for CayenneCreateTableExec {
             f,
             "CayenneCreateTableExec: {}.{}.{}",
             self.df_catalog_name, self.df_schema_name, self.table_name
-        )
+        )?;
+        if let Some(ref source) = self.like_source_table {
+            write!(f, " (LIKE {source})")?;
+        }
+        Ok(())
     }
 }
 
@@ -839,28 +843,77 @@ impl ExecutionPlan for CayenneCreateTableExec {
             // If this table was created via LIKE, copy partition-to-executor
             // assignments from the source table so DoPut routes data to the
             // same executors.
-            if let Some(ref source) = like_source_table
+            let like_detail = if let Some(ref source) = like_source_table
                 && let Some(ref registry) = executor_registry
             {
+                use crate::cluster::partition::CopyAssignmentsResult;
                 let pm = registry.federated_partition_manager();
                 tracing::info!(
                     source = %source,
                     target = %table_ref,
                     "Copying partition assignments from LIKE source table"
                 );
-                if let Err(e) = pm.copy_assignments(source, &table_ref).await {
-                    return Err(DataFusionError::Execution(format!(
-                        "Failed to create table '{table_name}': could not copy partition \
-                         assignments from source table {source}: {e}"
-                    )));
+                match pm.copy_assignments(source, &table_ref).await {
+                    Ok(CopyAssignmentsResult::Copied { partition_count }) => {
+                        tracing::info!(
+                            source = %source,
+                            target = %table_ref,
+                            partition_count,
+                            "Partition assignments copied from LIKE source table"
+                        );
+                        Some(format!(
+                            "LIKE '{source}': schema, partition expression, \
+                             partition assignments copied"
+                        ))
+                    }
+                    Ok(CopyAssignmentsResult::NoAssignments) => {
+                        tracing::info!(
+                            source = %source,
+                            target = %table_ref,
+                            "Source table has no partition assignments to copy"
+                        );
+                        Some(format!(
+                            "LIKE '{source}': schema and partition expression copied; \
+                             no partition assignments to copy"
+                        ))
+                    }
+                    Ok(CopyAssignmentsResult::NoSourceMetadata) => {
+                        tracing::info!(
+                            source = %source,
+                            target = %table_ref,
+                            "Source table has no partition metadata"
+                        );
+                        Some(format!("LIKE '{source}': schema copied"))
+                    }
+                    Err(e) => {
+                        return Err(DataFusionError::Execution(format!(
+                            "Failed to create table '{table_name}': could not copy partition \
+                             assignments from source table {source}: {e}"
+                        )));
+                    }
                 }
-            }
+            } else if let Some(ref source) = like_source_table {
+                // No executor registry (non-distributed mode) — schema was still copied.
+                if partition_expr_sql.is_some() {
+                    Some(format!(
+                        "LIKE '{source}': schema and partition expression copied"
+                    ))
+                } else {
+                    Some(format!("LIKE '{source}': schema copied"))
+                }
+            } else {
+                None
+            };
+
+            let result_msg = if let Some(detail) = like_detail {
+                format!("Table '{table_name}' created ({detail})")
+            } else {
+                format!("Table '{table_name}' created")
+            };
 
             let batch = RecordBatch::try_new(
                 result_schema,
-                vec![Arc::new(StringArray::from(vec![format!(
-                    "Table '{table_name}' created"
-                )]))],
+                vec![Arc::new(StringArray::from(vec![result_msg]))],
             )?;
             Ok(batch)
         });
