@@ -19,7 +19,7 @@ limitations under the License.
 //! Produces [`CayenneCreateTableExec`], [`CayenneDropTableExec`], and
 //! [`CayenneCreateSchemaExec`] physical plans.  No executor forwarding or
 //! distributed partition metadata — those concerns belong in the runtime's
-//! `BroadcastCayenneDdlHandler`.
+//! `DistributedCayenneDdlHandler`.
 
 use std::sync::Arc;
 

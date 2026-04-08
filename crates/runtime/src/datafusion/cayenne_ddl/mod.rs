@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Broadcast (distributed) Cayenne DDL and DML support for the runtime.
 //!
-//! DDL: [`BroadcastCayenneDdlHandler`] implements [`CatalogDdlHandler`] and is
+//! DDL: [`DistributedCayenneDdlHandler`] implements [`CatalogDdlHandler`] and is
 //! paired with `datafusion_ddl::DdlAnalyzerRule` + `DdlExtensionPlanner`.
 //!
 //! DML: [`CayenneDmlExtensionPlanner`] handles local MERGE, [`DistributedCayenneDmlExtensionPlanner`] handles distributed DML extension

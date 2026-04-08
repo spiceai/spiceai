@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! [`BroadcastCayenneDdlHandler`] — distributed Cayenne DDL handler for the runtime.
+//! [`DistributedCayenneDdlHandler`] — distributed Cayenne DDL handler for the runtime.
 //!
 //! Extends the single-node [`CayenneDdlHandler`] with:
 //! - Detection of `ComposedCatalogProvider`-wrapped Cayenne catalogs.
