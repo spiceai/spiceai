@@ -38,9 +38,6 @@ use super::physical_plans::CayenneMergeExec;
 ///
 /// Handles [`CayenneMergeNode`] → [`CayenneMergeExec`]. Always registered;
 /// does not require a distributed executor registry.
-///
-/// `default_catalog` and `default_schema` are used when a [`TableReference`]
-/// in the MERGE node does not carry an explicit catalog or schema component.
 #[derive(Debug)]
 pub struct CayenneDmlExtensionPlanner {
     default_catalog: &'static str,
@@ -48,6 +45,8 @@ pub struct CayenneDmlExtensionPlanner {
 }
 
 impl CayenneDmlExtensionPlanner {
+    /// Creates a [`CayenneDmlExtensionPlanner`] that assumes [`TableReference`] that are not fully
+    /// resolved have `default_catalog` and `default_schema`.
     #[must_use]
     pub fn new(default_catalog: &'static str, default_schema: &'static str) -> Self {
         Self {
