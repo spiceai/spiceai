@@ -141,9 +141,9 @@ fn cast_column(
 ) -> Result<ArrayRef> {
     match cast_with_options(column.as_ref(), target_field.data_type(), strict_options) {
         Ok(casted) => Ok(casted),
-        Err(ArrowError::CastError(ref msg))
+        Err(ref e)
             if is_timestamp_unit_cast(source_type, target_field.data_type())
-                && msg.contains("Overflow") =>
+                && is_overflow_error(e) =>
         {
             tracing::warn!(
                 "Timestamp overflow casting column '{}' from {source_type:?} to {:?}. Values outside the representable range will be NULL.",
@@ -159,6 +159,14 @@ fn cast_column(
         }
         Err(e) => Err(e).context(UnableToConvertRecordBatchSnafu),
     }
+}
+
+fn is_overflow_error(e: &ArrowError) -> bool {
+    matches!(
+        e,
+        ArrowError::CastError(msg) | ArrowError::ArithmeticOverflow(msg)
+            if msg.contains("Overflow") || msg.contains("overflow")
+    )
 }
 
 /// Flattens a list of struct types with a single field into a list of primitive types.
