@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Optimizer rule for that commutes a `Join` of two disjoin `Union`s when it can be guaranteed that the join operation can be applied pair-wise. For example, when the tables are partitioned by their respective `Join` predicates.
+//! Optimizer rule for that commutes a `Join` of two disjoint `Union`s when it can be guaranteed that the join operation can be applied pair-wise. For example, when the tables are partitioned by their respective `Join` predicates.
 //!
 //! # Transformation
 //!

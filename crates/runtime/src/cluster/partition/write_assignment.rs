@@ -24,15 +24,17 @@ limitations under the License.
 //! - **Bucket-deterministic**: For tables partitioned with `bucket(N, col)`,
 //!   the executor is chosen as `sorted_executors[k % len(sorted_executors)]`
 //!   where `k` is the bucket scalar value and executors are alphabetically
-//!   ordered. This distributes buckets evenly across available executors and
-//!   guarantees co-location of the same bucket index across different tables,
-//!   enabling local joins without data shuffling.
+//!   ordered. This guarantees stable co-location of the same bucket index
+//!   across different tables, enabling local joins without data shuffling.
+//!   Note: distribution is only perfectly even when `N` is a multiple of the
+//!   executor count; otherwise some executors may hold more buckets than others.
 //!
 //! - **Least-loaded**: Fallback for non-bucket partitions. Picks the executor
 //!   with the fewest existing partition assignments, incrementally accounting
 //!   for each pick within the same batch.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use arrow::array::RecordBatch;
 use datafusion::scalar::ScalarValue;
@@ -130,36 +132,45 @@ fn try_bucket_assignment(
     // Verify this is a bucket partition; we don't use N for indexing.
     let _n = parse_bucket_n(key)?;
 
-    let k = scalar_to_u16(&scalar_values[0])?;
-    let idx = usize::from(k) % sorted_executors.len();
+    let k = scalar_to_usize(&scalar_values[0])?;
+    let idx = k % sorted_executors.len();
     Some(sorted_executors[idx].to_string())
 }
 
-/// Parses the `N` from a partition key of the form `bucket(N, …)`.
-/// Returns `None` if the key does not match this pattern.
-fn parse_bucket_n(key: &str) -> Option<u16> {
-    // Match optional surrounding parentheses, whitespace, then bucket(N, ...)
-    // Captures the number N in the first group
-    Regex::new(r"^\s*\(?\s*bucket\s*\(\s*(\d+)\s*,.*\)\s*\)?\s*$")
-        .ok()?
+/// Compiled once at first use; case-insensitive to handle `BUCKET(...)` and `bucket(...)`.
+static BUCKET_REGEX: OnceLock<Regex> = OnceLock::new();
+
+fn bucket_regex() -> &'static Regex {
+    BUCKET_REGEX.get_or_init(|| {
+        Regex::new(r"(?i)^\s*\(?\s*bucket\s*\(\s*(\d+)\s*,.*\)\s*\)?\s*$")
+            .expect("valid bucket regex")
+    })
+}
+
+/// Parses the `N` from a partition key of the form `bucket(N, …)` (case-insensitive).
+/// Returns `None` if the key does not match this pattern or if `N` is 0.
+fn parse_bucket_n(key: &str) -> Option<u64> {
+    let n: u64 = bucket_regex()
         .captures(key)?
         .get(1)?
         .as_str()
-        .parse::<u16>()
-        .ok()
+        .parse()
+        .ok()?;
+    if n == 0 { None } else { Some(n) }
 }
 
-/// Converts a [`ScalarValue`] to `u16`, supporting common integer and unsigned types.
-fn scalar_to_u16(scalar: &ScalarValue) -> Option<u16> {
+/// Converts a [`ScalarValue`] to `usize`, supporting common integer types.
+/// Negative values and `None` return `None`.
+fn scalar_to_usize(scalar: &ScalarValue) -> Option<usize> {
     match scalar {
-        ScalarValue::Int8(Some(v)) => u16::try_from(*v).ok(),
-        ScalarValue::Int16(Some(v)) => u16::try_from(*v).ok(),
-        ScalarValue::Int32(Some(v)) => u16::try_from(*v).ok(),
-        ScalarValue::Int64(Some(v)) => u16::try_from(*v).ok(),
-        ScalarValue::UInt8(Some(v)) => Some(u16::from(*v)),
-        ScalarValue::UInt16(Some(v)) => Some(*v),
-        ScalarValue::UInt32(Some(v)) => u16::try_from(*v).ok(),
-        ScalarValue::UInt64(Some(v)) => u16::try_from(*v).ok(),
+        ScalarValue::Int8(Some(v)) => usize::try_from(*v).ok(),
+        ScalarValue::Int16(Some(v)) => usize::try_from(*v).ok(),
+        ScalarValue::Int32(Some(v)) => usize::try_from(*v).ok(),
+        ScalarValue::Int64(Some(v)) => usize::try_from(*v).ok(),
+        ScalarValue::UInt8(Some(v)) => Some(usize::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Some(usize::from(*v)),
+        ScalarValue::UInt32(Some(v)) => usize::try_from(*v).ok(),
+        ScalarValue::UInt64(Some(v)) => usize::try_from(*v).ok(),
         _ => None,
     }
 }
@@ -207,19 +218,38 @@ mod tests {
 
     #[test]
     fn test_parse_bucket_n_zero() {
-        assert_eq!(parse_bucket_n("bucket(0, col)"), Some(0));
+        // N=0 is invalid; should return None
+        assert_eq!(parse_bucket_n("bucket(0, col)"), None);
     }
 
     #[test]
-    fn test_scalar_to_u16() {
-        assert_eq!(scalar_to_u16(&ScalarValue::Int32(Some(7))), Some(7));
-        assert_eq!(scalar_to_u16(&ScalarValue::UInt8(Some(255))), Some(255));
-        assert_eq!(scalar_to_u16(&ScalarValue::Int64(Some(42))), Some(42));
-        assert_eq!(scalar_to_u16(&ScalarValue::Int32(Some(-1))), None);
-        assert_eq!(scalar_to_u16(&ScalarValue::Int32(None)), None);
+    fn test_parse_bucket_n_uppercase() {
+        // BUCKET(...) should be handled case-insensitively
+        assert_eq!(parse_bucket_n("BUCKET(10, col)"), Some(10));
+        assert_eq!(parse_bucket_n("Bucket(5, col)"), Some(5));
+    }
+
+    #[test]
+    fn test_parse_bucket_n_large() {
+        // N up to MAX_NUM_BUCKETS (1,000,000) must work
+        assert_eq!(parse_bucket_n("bucket(1000000, col)"), Some(1_000_000));
+    }
+
+    #[test]
+    fn test_scalar_to_usize() {
+        assert_eq!(scalar_to_usize(&ScalarValue::Int32(Some(7))), Some(7));
+        assert_eq!(scalar_to_usize(&ScalarValue::UInt8(Some(255))), Some(255));
+        assert_eq!(scalar_to_usize(&ScalarValue::Int64(Some(42))), Some(42));
+        assert_eq!(scalar_to_usize(&ScalarValue::Int32(Some(-1))), None);
+        assert_eq!(scalar_to_usize(&ScalarValue::Int32(None)), None);
         assert_eq!(
-            scalar_to_u16(&ScalarValue::Utf8(Some("hello".to_string()))),
+            scalar_to_usize(&ScalarValue::Utf8(Some("hello".to_string()))),
             None
+        );
+        // Large values that would overflow u16 must work with usize
+        assert_eq!(
+            scalar_to_usize(&ScalarValue::Int64(Some(100_000))),
+            Some(100_000)
         );
     }
 
