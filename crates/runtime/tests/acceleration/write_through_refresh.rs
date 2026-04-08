@@ -204,77 +204,91 @@ async fn test_write_through_acceleration_does_not_refresh_from_federated() {
 /// 1. Each executor's local accelerator contains ONLY its partition (not all data)
 /// 2. The federated source contains the combined data from both executors
 /// 3. The total row count across both accelerators equals the source count (no duplication)
+/// 4. Querying *through* each AcceleratedTable returns only that executor's partition
 ///
-/// Without the fix, the refresh task on each executor would load the full federated
-/// dataset into each local accelerator, and a distributed query unioning both
-/// executors would return 2x the expected rows.
+/// Point 4 is the critical query-path check: `AcceleratedTable::scan()` must read
+/// from the accelerator (not fall back to the federated source), and the accelerator
+/// must contain only this executor's partition. Without the fix, the refresh would
+/// load ALL rows from the shared federated source into every executor's accelerator,
+/// and scanning through the AcceleratedTable would return 6 rows per executor instead
+/// of 3, giving 12 total in a distributed UNION ALL.
 #[tokio::test]
 #[cfg(not(target_os = "windows"))]
 async fn test_write_through_distributed_no_duplication() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let schema = test_schema();
 
-    // Create a shared MemTable as the federated source (simulates shared Iceberg).
-    // Start empty — the write-through inserts will populate it.
-    let shared_federated_mem =
-        MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("create shared MemTable");
-    let shared_federated_provider: Arc<dyn TableProvider> = Arc::new(shared_federated_mem);
+    // Shared federated source (simulates Iceberg). Pre-populated with data from
+    // both partitions — this represents the state AFTER both executors have already
+    // written via write-through. In production, this is the shared Iceberg table
+    // visible to all executors.
+    //
+    // Must be Cayenne (not MemTable) because the refresh task uses InsertOp::Overwrite
+    // which MemTable doesn't support — using MemTable would silently fail the refresh
+    // and mask the bug.
+    let shared_federated_cayenne =
+        create_cayenne_table(Arc::clone(&schema), temp_dir.path(), "shared_federated").await;
+    let shared_federated_provider: Arc<dyn TableProvider> = Arc::new(shared_federated_cayenne);
 
-    // Executor 1: owns partition with ids 1-3
+    // Pre-populate the shared federated source with all 6 rows (as if both executors
+    // already wrote their partitions via write-through).
+    {
+        let ctx = SessionContext::new();
+        ctx.register_table("federated", Arc::clone(&shared_federated_provider))
+            .expect("register federated");
+        ctx.sql("INSERT INTO federated (id, value) VALUES \
+                 (1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)")
+            .await
+            .expect("plan federated insert")
+            .collect()
+            .await
+            .expect("populate federated source");
+    }
+    assert_eq!(count_rows(&shared_federated_provider).await, 6);
+
+    // Executor 1: build AcceleratedTable with write-through.
+    // The accelerator starts empty. Without the fix, the Full refresh will
+    // immediately load ALL 6 rows from the shared federated source into it.
     let cayenne_exec1 =
         create_cayenne_table(Arc::clone(&schema), temp_dir.path(), "exec1").await;
     let accel_exec1: Arc<dyn TableProvider> = Arc::new(cayenne_exec1);
     let federated_exec1 =
         Arc::new(FederatedTable::new_unchecked(Arc::clone(&shared_federated_provider)));
-    let table_exec1 = build_write_through_table(
+    let table_exec1 = Arc::new(build_write_through_table(
         Arc::clone(&accel_exec1),
         federated_exec1,
         "exec1",
     )
-    .await;
+    .await);
 
-    // Executor 2: owns partition with ids 4-6
+    // Executor 2: same setup.
     let cayenne_exec2 =
         create_cayenne_table(Arc::clone(&schema), temp_dir.path(), "exec2").await;
     let accel_exec2: Arc<dyn TableProvider> = Arc::new(cayenne_exec2);
     let federated_exec2 =
         Arc::new(FederatedTable::new_unchecked(Arc::clone(&shared_federated_provider)));
-    let table_exec2 = build_write_through_table(
+    let table_exec2 = Arc::new(build_write_through_table(
         Arc::clone(&accel_exec2),
         federated_exec2,
         "exec2",
     )
-    .await;
+    .await);
 
-    // Allow time for any background refresh to complete (should not run).
+    // Allow time for the refresh task to run if it was started.
+    // Without the fix, the refresh runs immediately (Duration::ZERO delay) and loads
+    // all 6 rows from the federated source into each accelerator.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    // Both accelerators should start empty (no refresh loaded data).
-    assert_eq!(
-        count_rows(&accel_exec1).await,
-        0,
-        "Executor 1 accelerator should be empty before any inserts"
-    );
-    assert_eq!(
-        count_rows(&accel_exec2).await,
-        0,
-        "Executor 2 accelerator should be empty before any inserts"
-    );
-
-    // Simulate distributed INSERT: scheduler routes partition data to each executor.
-    // Each executor's write-through writes to both its local Cayenne and the shared
-    // federated source.
-    //
-    // Register each executor's AcceleratedTable in a SessionContext so we can use
-    // SQL INSERT to exercise the full write-through pipeline.
+    // Now simulate each executor's write-through INSERT for its partition.
+    // In production this happens via DoPut from the scheduler.
     let ctx_exec1 = SessionContext::new();
     ctx_exec1
-        .register_table("wt_table", Arc::new(table_exec1))
+        .register_table("wt_table", Arc::clone(&table_exec1) as Arc<dyn TableProvider>)
         .expect("register exec1 table");
 
     let ctx_exec2 = SessionContext::new();
     ctx_exec2
-        .register_table("wt_table", Arc::new(table_exec2))
+        .register_table("wt_table", Arc::clone(&table_exec2) as Arc<dyn TableProvider>)
         .expect("register exec2 table");
 
     // Executor 1 receives and writes its partition (ids 1-3).
@@ -296,39 +310,70 @@ async fn test_write_through_distributed_no_duplication() {
         .expect("write-through insert for executor 2 should succeed");
 
     // Allow time for any background refresh that might have been started.
+    // The refresh uses Duration::ZERO delay so 2 seconds is more than enough.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    // Verify: each executor's accelerator has ONLY its own partition.
-    let exec1_rows = count_rows(&accel_exec1).await;
-    let exec2_rows = count_rows(&accel_exec2).await;
+    // ---- Verify the raw accelerators (insert path correctness) ----
+
+    let exec1_accel_rows = count_rows(&accel_exec1).await;
+    let exec2_accel_rows = count_rows(&accel_exec2).await;
 
     assert_eq!(
-        exec1_rows, 3,
+        exec1_accel_rows, 3,
         "Executor 1 accelerator should contain exactly 3 rows (its partition). \
-         Found {exec1_rows} — if > 3, the refresh loaded other executors' data."
+         Found {exec1_accel_rows} — if > 3, the refresh loaded other executors' data."
     );
     assert_eq!(
-        exec2_rows, 3,
+        exec2_accel_rows, 3,
         "Executor 2 accelerator should contain exactly 3 rows (its partition). \
-         Found {exec2_rows} — if > 3, the refresh loaded other executors' data."
+         Found {exec2_accel_rows} — if > 3, the refresh loaded other executors' data."
     );
 
-    // Verify: the shared federated source has ALL 6 rows (both partitions).
+    // ---- Verify the shared federated source ----
+    // Pre-populated 6 + executor1 appended 3 + executor2 appended 3 = 12.
     let federated_rows = count_rows(&shared_federated_provider).await;
     assert_eq!(
-        federated_rows, 6,
-        "Shared federated source should contain all 6 rows from both executors. \
-         Found {federated_rows}."
+        federated_rows, 12,
+        "Shared federated source should contain 12 rows \
+         (6 pre-populated + 3 from exec1 + 3 from exec2). Found {federated_rows}."
     );
 
-    // The key assertion: a distributed query unions both executors and should
-    // return exactly 6 rows (no duplication). Without the fix, each accelerator
-    // would have all 6 rows (from refresh), and the union would return 12.
-    let total_from_accelerators = exec1_rows + exec2_rows;
+    // ---- Verify the query path through AcceleratedTable::scan() ----
+    //
+    // This is the critical check: querying through the AcceleratedTable must return
+    // only this executor's partition (from the accelerator), not the full federated
+    // dataset. In production the scheduler's PartitionedTableScanRewrite rewrites
+    // queries into UNION ALL across executors, so each executor's scan must return
+    // only its own data.
+    //
+    // Without the fix there are two failure modes:
+    //   a) initial_load_completed is false → scan falls back to the federated
+    //      source and returns ALL 6 rows instead of 3.
+    //   b) The refresh ran and loaded ALL 6 rows from the federated source into
+    //      the local accelerator → scan reads 6 rows from the accelerator.
+    // Either way the query returns 6 per executor instead of 3.
+
+    let exec1_query_rows = count_rows(&(table_exec1 as Arc<dyn TableProvider>)).await;
+    let exec2_query_rows = count_rows(&(table_exec2 as Arc<dyn TableProvider>)).await;
+
     assert_eq!(
-        total_from_accelerators, 6,
-        "Total rows across both accelerators should equal source row count (6). \
-         Got {total_from_accelerators} — this means a distributed UNION ALL query \
-         would return duplicates."
+        exec1_query_rows, 3,
+        "Querying through executor 1's AcceleratedTable should return 3 rows. \
+         Found {exec1_query_rows} — if 6, the scan fell back to the federated source \
+         or the refresh duplicated data into the accelerator."
+    );
+    assert_eq!(
+        exec2_query_rows, 3,
+        "Querying through executor 2's AcceleratedTable should return 3 rows. \
+         Found {exec2_query_rows} — if 6, the scan fell back to the federated source \
+         or the refresh duplicated data into the accelerator."
+    );
+
+    // Simulate what a distributed query returns: UNION ALL of both executors.
+    let total_distributed_rows = exec1_query_rows + exec2_query_rows;
+    assert_eq!(
+        total_distributed_rows, 6,
+        "A distributed query (UNION ALL of both executors) should return exactly 6 rows. \
+         Got {total_distributed_rows} — duplicates detected."
     );
 }
