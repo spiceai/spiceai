@@ -257,7 +257,8 @@ impl SqlWarehouseApi {
                 if message.contains("UNRESOLVED_COLUMN") && message.contains("full_data_type") =>
             {
                 tracing::warn!(
-                    "Databricks information_schema for '{table}' does not have 'full_data_type' column, falling back to 'data_type'. Complex types (ARRAY, MAP, STRUCT) may lose inner type details."
+                    table = %table,
+                    "Databricks information_schema does not have 'full_data_type' column, falling back to 'data_type'. Complex types (ARRAY, MAP, STRUCT) may lose inner type details."
                 );
                 let payload = self.create_schema_payload(table, "data_type")?;
                 let response = self.execute_sql_statement(&token, &payload).await?;
@@ -1690,7 +1691,7 @@ mod tests {
     /// Regression test: Databricks sends timestamps as `Timestamp(Microsecond, "Etc/UTC")`
     /// in Arrow IPC. The declared schema must also use Microsecond so that `try_cast_to`
     /// doesn't attempt a µs→ns multiplication that overflows for far-future sentinel
-    /// values like year 9999 (253402300799999000 µs × 1000 > i64::MAX).
+    /// values like year 9999 (253402300799999000 µs × 1000 > `i64::MAX`).
     #[test]
     fn test_schema_from_json_timestamp_microsecond_avoids_overflow() {
         use arrow::array::TimestampMicrosecondArray;
@@ -1699,7 +1700,7 @@ mod tests {
         // Parse schema from a Databricks JSON response with timestamp columns
         let response = make_schema_response(&json!([
             ["id", "int", "NO"],
-            ["edw_end_datetime", "timestamp", "YES"],
+            ["end_datetime", "timestamp", "YES"],
             ["created_ntz", "timestamp_ntz", "YES"]
         ]));
         let declared_schema =
@@ -1723,7 +1724,7 @@ mod tests {
         let ipc_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new(
-                "edw_end_datetime",
+                "end_datetime",
                 DataType::Timestamp(
                     arrow::datatypes::TimeUnit::Microsecond,
                     Some("Etc/UTC".into()),
@@ -1818,6 +1819,338 @@ mod tests {
         assert!(
             matches!(&err, Error::QueryFailure { message } if message.contains("UNRESOLVED_COLUMN")),
             "unexpected error: {err}"
+        );
+    }
+
+    /// Schema parsed from `full_data_type` column values matching a real
+    /// Databricks `information_schema` dump (bigint, string, timestamp,
+    /// boolean, double).
+    #[test]
+    fn test_schema_from_json_real_full_data_type_schema() {
+        let response = make_schema_response(&json!([
+            ["record_skey", "bigint", "YES"],
+            ["record_hkey", "string", "NO"],
+            ["address_city", "string", "NO"],
+            ["address_state", "string", "NO"],
+            ["address_latitude", "double", "NO"],
+            ["address_longitude", "double", "NO"],
+            ["start_datetime", "timestamp", "NO"],
+            ["end_datetime", "timestamp", "NO"],
+            ["is_current_flag", "boolean", "NO"],
+            ["is_deleted_flag", "boolean", "NO"]
+        ]));
+
+        let schema = schema_from_json(&response, "catalog.test_schema.dim_records")
+            .expect("should parse real full_data_type schema");
+        assert_eq!(schema.fields().len(), 10);
+
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert!(schema.field(0).is_nullable());
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(4).data_type(), &DataType::Float64);
+        assert_eq!(
+            schema.field(6).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(
+            schema.field(7).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(8).data_type(), &DataType::Boolean);
+    }
+
+    /// Schema parsed from `data_type` column values matching a real
+    /// Databricks `information_schema` dump. The fallback path receives
+    /// LONG instead of bigint, and all types are uppercase.
+    #[test]
+    fn test_schema_from_json_real_data_type_fallback_schema() {
+        let response = make_schema_response(&json!([
+            ["record_skey", "LONG", "YES"],
+            ["record_hkey", "STRING", "NO"],
+            ["address_city", "STRING", "NO"],
+            ["address_latitude", "DOUBLE", "NO"],
+            ["address_longitude", "DOUBLE", "NO"],
+            ["start_datetime", "TIMESTAMP", "NO"],
+            ["end_datetime", "TIMESTAMP", "NO"],
+            ["is_current_flag", "BOOLEAN", "NO"],
+            ["is_deleted_flag", "BOOLEAN", "NO"]
+        ]));
+
+        let schema = schema_from_json(&response, "catalog.test_schema.dim_records")
+            .expect("should parse real data_type fallback schema");
+        assert_eq!(schema.fields().len(), 9);
+
+        // LONG must map to Int64
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert!(schema.field(0).is_nullable());
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(3).data_type(), &DataType::Float64);
+        assert_eq!(
+            schema.field(5).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(7).data_type(), &DataType::Boolean);
+    }
+
+    /// Full bridge table schema from real Databricks `information_schema`,
+    /// using `full_data_type` values (bigint, string, timestamp, boolean).
+    #[test]
+    fn test_schema_from_json_real_bridge_table_full_data_type() {
+        let response = make_schema_response(&json!([
+            ["bridge_id", "bigint", "YES"],
+            ["entity_id", "bigint", "YES"],
+            ["entity_skey", "bigint", "YES"],
+            ["entity_hkey", "string", "YES"],
+            ["snapshot_id", "bigint", "YES"],
+            ["related_id", "bigint", "YES"],
+            ["related_address", "string", "YES"],
+            ["related_skey", "bigint", "YES"],
+            ["related_hkey", "string", "YES"],
+            ["created_datetime_utc", "timestamp", "YES"],
+            ["updated_datetime_utc", "timestamp", "YES"],
+            ["valid_from_datetime", "timestamp", "YES"],
+            ["end_datetime", "timestamp", "YES"],
+            ["is_current_flag", "boolean", "YES"],
+            ["is_deleted_flag", "boolean", "YES"]
+        ]));
+
+        let schema = schema_from_json(&response, "catalog.test_schema.bridge_entities")
+            .expect("should parse bridge table schema");
+        assert_eq!(schema.fields().len(), 15);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(6).data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema.field(12).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(13).data_type(), &DataType::Boolean);
+    }
+
+    /// Same bridge table but using `data_type` column values (LONG instead of bigint).
+    #[test]
+    fn test_schema_from_json_real_bridge_table_data_type_fallback() {
+        let response = make_schema_response(&json!([
+            ["bridge_id", "LONG", "YES"],
+            ["entity_id", "LONG", "YES"],
+            ["entity_skey", "LONG", "YES"],
+            ["entity_hkey", "STRING", "YES"],
+            ["snapshot_id", "LONG", "YES"],
+            ["related_id", "LONG", "YES"],
+            ["related_address", "STRING", "YES"],
+            ["related_skey", "LONG", "YES"],
+            ["related_hkey", "STRING", "YES"],
+            ["created_datetime_utc", "TIMESTAMP", "YES"],
+            ["updated_datetime_utc", "TIMESTAMP", "YES"],
+            ["valid_from_datetime", "TIMESTAMP", "YES"],
+            ["end_datetime", "TIMESTAMP", "YES"],
+            ["is_current_flag", "BOOLEAN", "YES"],
+            ["is_deleted_flag", "BOOLEAN", "YES"]
+        ]));
+
+        let schema = schema_from_json(&response, "catalog.test_schema.bridge_entities")
+            .expect("should parse bridge table with data_type fallback values");
+        assert_eq!(schema.fields().len(), 15);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(6).data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema.field(12).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(13).data_type(), &DataType::Boolean);
+    }
+
+    /// Cohorted spend view — `full_data_type` column: date, string, decimal(26,2), int.
+    #[test]
+    fn test_schema_from_json_real_cohorted_spend_full_data_type() {
+        let response = make_schema_response(&json!([
+            ["spend_dt", "date", "YES"],
+            ["source_nm", "string", "YES"],
+            ["channel_id", "string", "YES"],
+            ["campaign_nm", "string", "YES"],
+            ["brand_campaign_nm", "string", "YES"],
+            ["state_cd", "string", "YES"],
+            ["county_cd", "string", "YES"],
+            ["designated_market_area", "string", "YES"],
+            ["zip_code_cd", "string", "YES"],
+            ["region_cd", "string", "YES"],
+            ["lead_tier_id", "string", "YES"],
+            ["sub_id", "string", "YES"],
+            ["publisher_nm", "string", "YES"],
+            ["non_experiment__decimal_amt", "decimal(26,2)", "YES"],
+            ["mrktng_spnd_amt", "decimal(26,2)", "YES"],
+            ["mrktng_spnd_exprmnt_amt", "decimal(26,2)", "YES"],
+            ["lead_cnt", "int", "YES"],
+            ["new_lead_cnt", "int", "YES"],
+            ["returning_lead_cnt", "int", "YES"],
+            ["leads_with_assgnmnts_cnt", "int", "YES"],
+            ["leads_with_any_rep_assgnmnts_cnt", "int", "YES"],
+            ["bind_cnt", "int", "YES"],
+            ["cohort_binds_0_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_binds_1_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_binds_3_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_binds_7_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_binds_14_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_binds_30_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_binds_45_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_binds_60_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_binds_90_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_0_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_1_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_3_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_7_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_14_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_30_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_45_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_60_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_90_days_amt", "decimal(26,2)", "YES"],
+            ["bound_premium_amt", "decimal(26,2)", "YES"]
+        ]));
+
+        let schema = schema_from_json(
+            &response,
+            "catalog.ext_dbt_dwh_v.mart_mrktng_cohorted_spend_v",
+        )
+        .expect("should parse cohorted spend schema");
+        assert_eq!(schema.fields().len(), 41);
+        assert_eq!(schema.field(0).data_type(), &DataType::Date32);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(13).data_type(), &DataType::Decimal128(26, 2));
+        assert_eq!(schema.field(16).data_type(), &DataType::Int32);
+    }
+
+    /// Same cohorted spend view using `data_type` column (DATE, STRING, DECIMAL, INT).
+    #[test]
+    fn test_schema_from_json_real_cohorted_spend_data_type_fallback() {
+        let response = make_schema_response(&json!([
+            ["spend_dt", "DATE", "YES"],
+            ["source_nm", "STRING", "YES"],
+            ["channel_id", "STRING", "YES"],
+            ["campaign_nm", "STRING", "YES"],
+            ["brand_campaign_nm", "STRING", "YES"],
+            ["state_cd", "STRING", "YES"],
+            ["county_cd", "STRING", "YES"],
+            ["designated_market_area", "STRING", "YES"],
+            ["zip_code_cd", "STRING", "YES"],
+            ["region_cd", "STRING", "YES"],
+            ["lead_tier_id", "STRING", "YES"],
+            ["sub_id", "STRING", "YES"],
+            ["publisher_nm", "STRING", "YES"],
+            ["non_experiment__decimal_amt", "DECIMAL", "YES"],
+            ["mrktng_spnd_amt", "DECIMAL", "YES"],
+            ["mrktng_spnd_exprmnt_amt", "DECIMAL", "YES"],
+            ["lead_cnt", "INT", "YES"],
+            ["new_lead_cnt", "INT", "YES"],
+            ["returning_lead_cnt", "INT", "YES"],
+            ["leads_with_assgnmnts_cnt", "INT", "YES"],
+            ["leads_with_any_rep_assgnmnts_cnt", "INT", "YES"],
+            ["bind_cnt", "INT", "YES"],
+            ["cohort_binds_0_days_amt", "DECIMAL", "YES"],
+            ["cohort_binds_1_days_amt", "DECIMAL", "YES"],
+            ["cohort_binds_3_days_amt", "DECIMAL", "YES"],
+            ["cohort_binds_7_days_amt", "DECIMAL", "YES"],
+            ["cohort_binds_14_days_amt", "DECIMAL", "YES"],
+            ["cohort_binds_30_days_amt", "DECIMAL", "YES"],
+            ["cohort_binds_45_days_amt", "DECIMAL", "YES"],
+            ["cohort_binds_60_days_amt", "DECIMAL", "YES"],
+            ["cohort_binds_90_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_0_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_1_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_3_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_7_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_14_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_30_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_45_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_60_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_90_days_amt", "DECIMAL", "YES"],
+            ["bound_premium_amt", "DECIMAL", "YES"]
+        ]));
+
+        let schema = schema_from_json(
+            &response,
+            "catalog.ext_dbt_dwh_v.mart_mrktng_cohorted_spend_v",
+        )
+        .expect("should parse cohorted spend with data_type fallback");
+        assert_eq!(schema.fields().len(), 41);
+        assert_eq!(schema.field(0).data_type(), &DataType::Date32);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        // DECIMAL without params falls back to Decimal128(38,10)
+        assert_eq!(schema.field(13).data_type(), &DataType::Decimal128(38, 10));
+        assert_eq!(schema.field(16).data_type(), &DataType::Int32);
+    }
+
+    /// Schema with geometry, decimal(22,4), and all common scalar types
+    /// from a real Databricks `information_schema` dump using `full_data_type`.
+    #[test]
+    fn test_schema_from_json_real_mixed_types_with_geometry() {
+        let response = make_schema_response(&json!([
+            ["id", "string", "YES"],
+            ["distance_ft", "double", "YES"],
+            ["state", "string", "YES"],
+            ["score", "double", "YES"],
+            ["count", "int", "YES"],
+            ["flag", "int", "YES"],
+            ["created_at", "timestamp", "YES"],
+            ["census", "bigint", "YES"],
+            ["coverage_a", "decimal(22,4)", "YES"],
+            ["spend_dt", "date", "YES"],
+            ["geom", "geometry(5070)", "YES"]
+        ]));
+
+        let schema = schema_from_json(&response, "catalog.test_schema.mixed_types")
+            .expect("should parse mixed types including geometry");
+        assert_eq!(schema.fields().len(), 11);
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(1).data_type(), &DataType::Float64);
+        assert_eq!(schema.field(4).data_type(), &DataType::Int32);
+        assert_eq!(
+            schema.field(6).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(7).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(8).data_type(), &DataType::Decimal128(22, 4));
+        assert_eq!(schema.field(9).data_type(), &DataType::Date32);
+        assert_eq!(
+            schema.field(10).data_type(),
+            &DataType::Binary,
+            "GEOMETRY should map to Binary"
+        );
+    }
+
+    /// Same mixed schema using `data_type` column (uppercase, GEOMETRY without SRID).
+    #[test]
+    fn test_schema_from_json_real_mixed_types_data_type_fallback() {
+        let response = make_schema_response(&json!([
+            ["id", "STRING", "YES"],
+            ["distance_ft", "DOUBLE", "YES"],
+            ["state", "STRING", "YES"],
+            ["score", "DOUBLE", "YES"],
+            ["count", "INT", "YES"],
+            ["flag", "INT", "YES"],
+            ["created_at", "TIMESTAMP", "YES"],
+            ["census", "LONG", "YES"],
+            ["coverage_a", "DECIMAL", "YES"],
+            ["spend_dt", "DATE", "YES"],
+            ["geom", "GEOMETRY", "YES"]
+        ]));
+
+        let schema = schema_from_json(&response, "catalog.test_schema.mixed_types")
+            .expect("should parse mixed types with data_type fallback");
+        assert_eq!(schema.fields().len(), 11);
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(1).data_type(), &DataType::Float64);
+        assert_eq!(schema.field(4).data_type(), &DataType::Int32);
+        assert_eq!(
+            schema.field(6).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(7).data_type(), &DataType::Int64);
+        // DECIMAL without params falls back to Decimal128(38,10)
+        assert_eq!(schema.field(8).data_type(), &DataType::Decimal128(38, 10));
+        assert_eq!(schema.field(9).data_type(), &DataType::Date32);
+        assert_eq!(
+            schema.field(10).data_type(),
+            &DataType::Binary,
+            "GEOMETRY should map to Binary"
         );
     }
 }
