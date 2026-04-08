@@ -89,7 +89,7 @@ pub struct CreateTableParams {
 
 // ── Operations ────────────────────────────────────────────────────────────────
 
-/// Register a new table in the Cayenne metadata catalog and DataFusion schema provider.
+/// Register a new table in the Cayenne metadata catalog and `DataFusion` schema provider.
 ///
 /// Handles both partitioned and non-partitioned tables, and the `CREATE TABLE ... LIKE`
 /// path.  Does **not** forward DDL to executor nodes or initialise partition metadata —

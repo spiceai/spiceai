@@ -50,14 +50,11 @@ impl CatalogDdlHandler for CayenneDdlHandler {
         catalog_name: &str,
         catalog_list: &Arc<dyn CatalogProviderList>,
     ) -> bool {
-        catalog_list
-            .catalog(catalog_name)
-            .map(|c| {
-                c.as_any()
-                    .downcast_ref::<CayenneCatalogProvider>()
-                    .is_some()
-            })
-            .unwrap_or(false)
+        catalog_list.catalog(catalog_name).is_some_and(|c| {
+            c.as_any()
+                .downcast_ref::<CayenneCatalogProvider>()
+                .is_some()
+        })
     }
 
     fn create_table_exec(

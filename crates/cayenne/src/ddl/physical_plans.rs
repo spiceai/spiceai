@@ -616,7 +616,7 @@ fn extract_dml_count(batches: &[RecordBatch]) -> u64 {
             b.column_by_name("count")
                 .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
                 .into_iter()
-                .flat_map(|a| a.iter())
+                .flat_map(UInt64Array::iter)
                 .flatten()
         })
         .sum()
