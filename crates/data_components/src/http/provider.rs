@@ -1765,28 +1765,83 @@ fn extract_next_page_info(
     Ok(None)
 }
 
+/// Split a Link header value on a delimiter only when it appears at the
+/// top level — outside `<...>` URI references and `"..."` quoted strings.
+fn split_link_header_top_level(value: &str, delimiter: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_angle = false;
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for (idx, ch) in value.char_indices() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_quotes = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_quotes = true,
+            '<' => in_angle = true,
+            '>' => in_angle = false,
+            _ if ch == delimiter && !in_angle => {
+                parts.push(value[start..idx].trim());
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    parts.push(value[start..].trim());
+    parts
+}
+
 /// Parse an HTTP `Link` header to find a URI with `rel="next"`.
 /// Handles quoted (`rel="next"`), single-quoted (`rel='next'`), and
 /// unquoted (`rel=next`) forms, as well as multi-value rel lists
 /// (e.g., `rel="next prev"`).
+///
+/// Splits on commas and semicolons only at the top level (outside `<...>`
+/// and `"..."`) so that URIs containing commas are handled correctly per
+/// RFC 8288.
 fn parse_link_header_next(header_value: &str) -> Option<String> {
-    for link in header_value.split(',') {
+    for link in split_link_header_top_level(header_value, ',') {
         let link = link.trim();
-        let mut parts = link.split(';');
-        let url_part = parts.next()?.trim();
-        let is_next = parts.any(|p| {
-            let p = p.trim().to_lowercase();
-            // Strip "rel=" prefix, then strip optional quotes
-            if let Some(val) = p.strip_prefix("rel=") {
-                let val = val.trim_matches('"').trim_matches('\'');
-                // Check if "next" is one of the space-separated rel values
-                val.split_whitespace().any(|v| v == "next")
-            } else {
-                false
-            }
-        });
-        if is_next && url_part.starts_with('<') && url_part.ends_with('>') {
-            return Some(url_part[1..url_part.len() - 1].to_string());
+        if !link.starts_with('<') {
+            continue;
+        }
+
+        let end = link.find('>')?;
+        let url_part = &link[1..end];
+        let params = link[end + 1..].trim();
+
+        let is_next = split_link_header_top_level(params, ';')
+            .into_iter()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .any(|param| {
+                let Some((name, value)) = param.split_once('=') else {
+                    return false;
+                };
+                if !name.trim().eq_ignore_ascii_case("rel") {
+                    return false;
+                }
+                let value = value.trim().trim_matches('"').trim_matches('\'');
+                value
+                    .split_whitespace()
+                    .any(|relation| relation.eq_ignore_ascii_case("next"))
+            });
+
+        if is_next {
+            return Some(url_part.to_string());
         }
     }
     None
@@ -4333,6 +4388,23 @@ mod tests {
         assert_eq!(
             parse_link_header_next(r#"<https://api.example.com/items?page=2>; rel="next prev""#),
             Some("https://api.example.com/items?page=2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_uri_with_comma() {
+        // URI containing a comma inside <...> must not be split
+        assert_eq!(
+            parse_link_header_next(r#"<https://api.example.com/items?a=1,2&page=2>; rel="next""#),
+            Some("https://api.example.com/items?a=1,2&page=2".to_string())
+        );
+
+        // Multiple links where the first URI contains a comma
+        assert_eq!(
+            parse_link_header_next(
+                r#"<https://api.example.com/items?x=a,b>; rel="prev", <https://api.example.com/items?page=3>; rel="next""#
+            ),
+            Some("https://api.example.com/items?page=3".to_string())
         );
     }
 
