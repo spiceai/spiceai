@@ -25,7 +25,7 @@ const MAX_HTTP_RETRIES: usize = 6;
 const MAX_HTTP_BACKOFF: Duration = Duration::from_secs(300);
 const RETRY_AFTER_MS_HEADER: &str = "retry-after-ms";
 const X_RETRY_AFTER_MS_HEADER: &str = "x-retry-after-ms";
-pub(crate) const SUPPORTED_ACCEPT_ENCODINGS: &str = "zstd, br, gzip, deflate";
+pub const SUPPORTED_ACCEPT_ENCODINGS: &str = "zstd, br, gzip, deflate";
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum RetryReason {
@@ -34,7 +34,7 @@ enum RetryReason {
     Network,
 }
 
-pub(crate) async fn send_request_with_retry<F>(
+pub async fn send_request_with_retry<F>(
     service_name: &str,
     operation_name: &str,
     build_request: F,
@@ -135,7 +135,7 @@ where
     }
 }
 
-pub(crate) fn enable_supported_compression(builder: ClientBuilder) -> ClientBuilder {
+pub fn enable_supported_compression(builder: ClientBuilder) -> ClientBuilder {
     builder.gzip(true).brotli(true).zstd(true).deflate(true)
 }
 

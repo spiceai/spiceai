@@ -15,40 +15,22 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use reqwest::{
-    RequestBuilder, Response, StatusCode,
-    header::{ACCEPT_ENCODING, HeaderMap, RETRY_AFTER},
-};
+use data_components::resilient_http::{enable_supported_compression, send_request_with_retry};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use snafu::prelude::*;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use std::{fmt, sync::Arc};
 use token_provider::{Result, TokenProvider};
 use tokio::{sync::watch, task::JoinHandle, time::sleep};
-use util::{
-    fibonacci_backoff::FibonacciBackoffBuilder,
-    retry_strategy::{Backoff, BackoffMethod, RetryBackoffBuilder},
-};
+use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 use crate::request::DatabricksAuthExtension;
 use runtime_request_context::RequestContext;
 
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 const MIN_TOKEN_REFRESH_WAIT_SECS: u64 = 1;
-const MAX_TOKEN_REQUEST_RETRIES: usize = 6;
-const MAX_TOKEN_REQUEST_BACKOFF: Duration = Duration::from_secs(300);
-const RETRY_AFTER_MS_HEADER: &str = "retry-after-ms";
-const X_RETRY_AFTER_MS_HEADER: &str = "x-retry-after-ms";
-const SUPPORTED_ACCEPT_ENCODINGS: &str = "zstd, br, gzip, deflate";
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum RetryReason {
-    RateLimit,
-    ServerError,
-    Network,
-}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -227,24 +209,21 @@ async fn get_m2m_access_token(
 ) -> Result<TokenResponse, Box<dyn std::error::Error + Send + Sync>> {
     let token_endpoint_url = databricks_token_endpoint_url(&databricks_endpoint);
 
-    let client = reqwest::Client::builder()
-        .gzip(true)
-        .brotli(true)
-        .zstd(true)
-        .deflate(true)
+    let client = enable_supported_compression(reqwest::Client::builder())
         .user_agent(util::spiceai_user_agent())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .build()?;
 
-    let response = send_databricks_token_request_with_retry("request M2M access token", || {
-        client
-            .post(&token_endpoint_url)
-            .basic_auth(client_id.as_str(), Some(client_secret.expose_secret()))
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .form(&[("grant_type", "client_credentials"), ("scope", "all-apis")])
-    })
-    .await?;
+    let response =
+        send_request_with_retry("Databricks", "request M2M access token", || {
+            client
+                .post(&token_endpoint_url)
+                .basic_auth(client_id.as_str(), Some(client_secret.expose_secret()))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .form(&[("grant_type", "client_credentials"), ("scope", "all-apis")])
+        })
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -279,209 +258,6 @@ fn next_token_refresh_wait(expires_in: u64) -> Duration {
             .saturating_sub(TOKEN_REFRESH_BUFFER_SECS)
             .max(MIN_TOKEN_REFRESH_WAIT_SECS),
     )
-}
-
-async fn send_databricks_token_request_with_retry<F>(
-    operation_name: &str,
-    build_request: F,
-) -> Result<Response, reqwest::Error>
-where
-    F: Fn() -> RequestBuilder,
-{
-    let mut transient_backoff = RetryBackoffBuilder::new()
-        .method(BackoffMethod::Fibonacci)
-        .max_duration(Some(MAX_TOKEN_REQUEST_BACKOFF))
-        .build();
-    let mut rate_limit_backoff = RetryBackoffBuilder::new()
-        .method(BackoffMethod::Exponential)
-        .base_interval(Duration::from_secs(1))
-        .max_duration(Some(MAX_TOKEN_REQUEST_BACKOFF))
-        .build();
-
-    let mut retries = 0usize;
-
-    loop {
-        match add_supported_accept_encoding_header(build_request())
-            .send()
-            .await
-        {
-            Ok(response) => {
-                let status = response.status();
-                if let Some(reason) = retry_reason_from_status(status) {
-                    if retries >= MAX_TOKEN_REQUEST_RETRIES {
-                        tracing::warn!(
-                            operation = operation_name,
-                            status = %status,
-                            retries,
-                            max_retries = MAX_TOKEN_REQUEST_RETRIES,
-                            "Databricks token request retries exhausted after retryable response"
-                        );
-                        return Ok(response);
-                    }
-
-                    retries += 1;
-                    let retry_after = retry_after_duration(response.headers());
-                    let backoff =
-                        next_backoff(reason, &mut transient_backoff, &mut rate_limit_backoff);
-                    let delay =
-                        bounded_retry_delay(retry_after, backoff, MAX_TOKEN_REQUEST_BACKOFF);
-
-                    tracing::warn!(
-                        operation = operation_name,
-                        attempt = retries,
-                        max_retries = MAX_TOKEN_REQUEST_RETRIES,
-                        status = %status,
-                        retry_after = ?retry_after,
-                        delay = ?delay,
-                        "Retrying Databricks token request after retryable response"
-                    );
-
-                    drain_retry_response_body(response, operation_name, retries, status).await;
-                    tokio::time::sleep(delay).await;
-                    continue;
-                }
-
-                return Ok(response);
-            }
-            Err(error) => {
-                let Some(reason) = retry_reason_from_error(&error) else {
-                    return Err(error);
-                };
-
-                if retries >= MAX_TOKEN_REQUEST_RETRIES {
-                    tracing::warn!(
-                        operation = operation_name,
-                        retries,
-                        max_retries = MAX_TOKEN_REQUEST_RETRIES,
-                        error = %error,
-                        "Databricks token request retries exhausted after transient failure"
-                    );
-                    return Err(error);
-                }
-
-                retries += 1;
-                let delay = next_backoff(reason, &mut transient_backoff, &mut rate_limit_backoff);
-
-                tracing::warn!(
-                    operation = operation_name,
-                    attempt = retries,
-                    max_retries = MAX_TOKEN_REQUEST_RETRIES,
-                    delay = ?delay,
-                    error = %error,
-                    "Retrying Databricks token request after transient failure"
-                );
-
-                tokio::time::sleep(delay).await;
-            }
-        }
-    }
-}
-
-fn add_supported_accept_encoding_header(request: RequestBuilder) -> RequestBuilder {
-    request.header(ACCEPT_ENCODING, SUPPORTED_ACCEPT_ENCODINGS)
-}
-
-async fn drain_retry_response_body(
-    mut response: Response,
-    operation_name: &str,
-    attempt: usize,
-    status: StatusCode,
-) {
-    loop {
-        match response.chunk().await {
-            Ok(Some(_)) => {}
-            Ok(None) => return,
-            Err(error) => {
-                tracing::debug!(
-                    operation = operation_name,
-                    attempt,
-                    status = %status,
-                    error = %error,
-                    "Failed to drain Databricks token retry response body before retry"
-                );
-                return;
-            }
-        }
-    }
-}
-
-fn next_backoff(
-    reason: RetryReason,
-    transient_backoff: &mut impl Backoff,
-    rate_limit_backoff: &mut impl Backoff,
-) -> Duration {
-    match reason {
-        RetryReason::RateLimit => rate_limit_backoff
-            .next_backoff()
-            .unwrap_or(MAX_TOKEN_REQUEST_BACKOFF),
-        RetryReason::ServerError | RetryReason::Network => transient_backoff
-            .next_backoff()
-            .unwrap_or(MAX_TOKEN_REQUEST_BACKOFF),
-    }
-}
-
-fn retry_reason_from_error(error: &reqwest::Error) -> Option<RetryReason> {
-    if error.is_connect() || error.is_timeout() {
-        return Some(RetryReason::Network);
-    }
-
-    error.status().and_then(retry_reason_from_status)
-}
-
-fn retry_reason_from_status(status: StatusCode) -> Option<RetryReason> {
-    match status.as_u16() {
-        408 | 429 => Some(RetryReason::RateLimit),
-        500..=599 => Some(RetryReason::ServerError),
-        _ => None,
-    }
-}
-
-fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
-    retry_after_millis_duration(headers).or_else(|| {
-        headers
-            .get(RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| retry_after_duration_from_value(value, SystemTime::now()))
-    })
-}
-
-fn bounded_retry_delay(
-    retry_after: Option<Duration>,
-    backoff: Duration,
-    max_delay: Duration,
-) -> Duration {
-    retry_after
-        .map_or(backoff, |retry_after| retry_after.max(backoff))
-        .min(max_delay)
-}
-
-fn retry_after_millis_duration(headers: &HeaderMap) -> Option<Duration> {
-    [RETRY_AFTER_MS_HEADER, X_RETRY_AFTER_MS_HEADER]
-        .into_iter()
-        .find_map(|header_name| {
-            headers
-                .get(header_name)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.trim().parse::<u64>().ok())
-                .map(Duration::from_millis)
-        })
-}
-
-fn retry_after_duration_from_value(value: &str, now: SystemTime) -> Option<Duration> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    trimmed
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
-        .or_else(|| {
-            httpdate::parse_http_date(trimmed)
-                .ok()
-                .map(|retry_after| retry_after.duration_since(now).unwrap_or(Duration::ZERO))
-        })
 }
 
 #[derive(Debug)]
