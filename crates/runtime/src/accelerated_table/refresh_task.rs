@@ -1945,6 +1945,7 @@ mod tests {
     use arrow::datatypes::TimeUnit;
     use arrow_schema::{DataType, Field, Schema};
     use data_components::arrow::write::MemTable;
+    use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion::physical_plan::collect;
     use datafusion::physical_plan::memory::MemoryStream;
     use datafusion::prelude::SessionContext;
@@ -2467,8 +2468,12 @@ mod tests {
         )
         .build();
 
-        // The refresh must have a time_column so the dedup path is entered
-        let refresh = Refresh::new(RefreshMode::Append).time_column("ts".to_string());
+        // The refresh must have a time_column so the dedup path is entered.
+        // append_overlap of 1s ensures the overlap window includes the existing
+        // row at ts=1000ns (query becomes ts > max_ts - 1s = ts > 0).
+        let refresh = Refresh::new(RefreshMode::Append)
+            .time_column("ts".to_string())
+            .append_overlap(Duration::from_secs(1));
 
         // Build the update stream with the SUBSET schema (only ts + id, no extra_col)
         let update_batch = RecordBatch::try_new(
