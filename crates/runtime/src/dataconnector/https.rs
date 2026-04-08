@@ -146,11 +146,13 @@ impl Https {
             .get("pagination")
             .expose()
             .ok()
-            .is_some_and(|v| v == "enabled" || v == "true")
+            .is_some_and(|v| v == "enabled" || v == "true" || v == "auto")
             || [
                 "pagination_next_pointer",
                 "pagination_token_param",
                 "pagination_data_pointer",
+                "pagination_link_header",
+                "pagination_max_pages",
             ]
             .iter()
             .any(|key| self.params.get(key).expose().ok().is_some());
@@ -280,7 +282,9 @@ impl Https {
                     _ => "auto",
                 });
 
-        let pagination = if pagination_mode != "disabled" {
+        let pagination = if pagination_mode == "disabled" {
+            None
+        } else {
             let next_pointer = self
                 .params
                 .get("pagination_next_pointer")
@@ -293,7 +297,7 @@ impl Https {
                 .get("pagination_link_header")
                 .expose()
                 .ok()
-                .map_or(true, util::parse_enabled);
+                .is_none_or(util::parse_enabled);
 
             let token_param = self
                 .params
@@ -339,8 +343,6 @@ impl Https {
                     max_pages,
                 })
             }
-        } else {
-            None
         };
 
         HttpProviderParams {
@@ -692,7 +694,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("pagination_next_pointer")
             .description("JSON pointer (RFC 6901) to the next page URL or cursor in the response body (e.g., '/next', '/pagination/cursor', '/links/next')."),
         ParameterSpec::runtime("pagination_link_header")
-            .description("Set to 'enabled' to use the HTTP Link header with rel=\"next\" for pagination.")
+            .description("Whether to follow HTTP Link headers with rel=\"next\" for pagination. Default: 'enabled' (auto-detected). Set to 'disabled' to ignore Link headers.")
             .one_of(&["enabled", "disabled"]),
         ParameterSpec::runtime("pagination_token_param")
             .description("When set, the value from 'pagination_next_pointer' is treated as a cursor/token and passed as this query parameter name in subsequent requests. When not set, the value is treated as a full URL."),

@@ -1464,12 +1464,28 @@ impl ExecutionPlan for HttpExec {
                         // Fetch this page
                         let fetch_result = if state.page == 0 {
                             let path_val = state.path.as_deref().unwrap_or("");
-                            let query_val = state.query.as_deref();
                             let body_val = state.body.as_deref();
+                            // Merge base URL query params with partition query,
+                            // consistent with how subsequent pages handle queries.
+                            let merged_query =
+                                match (provider.base_url.query(), state.query.as_deref()) {
+                                    (Some(base_query), Some(state_query))
+                                        if !base_query.is_empty() && !state_query.is_empty() =>
+                                    {
+                                        Some(format!("{base_query}&{state_query}"))
+                                    }
+                                    (Some(base_query), _) if !base_query.is_empty() => {
+                                        Some(base_query.to_string())
+                                    }
+                                    (_, Some(state_query)) if !state_query.is_empty() => {
+                                        Some(state_query.to_string())
+                                    }
+                                    _ => None,
+                                };
                             state.last_page_path = state.path.clone();
-                            state.last_page_query = state.query.clone();
+                            state.last_page_query = merged_query.clone();
                             provider
-                                .get_response(path_val, query_val, body_val)
+                                .get_response(path_val, merged_query.as_deref(), body_val)
                                 .await
                                 .map_err(DataFusionError::from)?
                         } else {
@@ -1478,6 +1494,23 @@ impl ExecutionPlan for HttpExec {
                             // under the same key as the base request.
                             match &state.next_info {
                                 Some(NextPageInfo::Url(url)) => {
+                                    if let Some((globset, patterns)) = &provider.allowed_paths
+                                        && !globset.is_match(url.path())
+                                    {
+                                        return Err(DataFusionError::External(Box::new(
+                                            Error::Pagination {
+                                                message: format!(
+                                                    "Next page URL path '{}' does not match any allowed path patterns: [{}]. Update 'allowed_request_paths' to include a matching pattern.",
+                                                    url.path(),
+                                                    patterns
+                                                        .iter()
+                                                        .map(|p| format!("'{p}'"))
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ")
+                                                ),
+                                            },
+                                        )));
+                                    }
                                     state.last_page_path = Some(url.path().to_string());
                                     state.last_page_query = url.query().map(ToString::to_string);
                                     provider
