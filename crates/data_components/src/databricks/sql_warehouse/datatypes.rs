@@ -40,6 +40,8 @@ pub enum Token<'input> {
     Float,
     #[regex("(?i)INT")]
     Int,
+    #[regex("(?i)LONG")]
+    Long,
     #[regex("(?i)VOID")]
     Void,
     #[regex("(?i)SMALLINT")]
@@ -155,7 +157,7 @@ impl<'input> Parser<'input> {
         }
 
         match self.current.clone() {
-            Some(Ok(Token::BigInt)) => {
+            Some(Ok(Token::BigInt | Token::Long)) => {
                 self.advance();
                 Ok(ArrowDataType::Int64)
             }
@@ -240,7 +242,7 @@ impl<'input> Parser<'input> {
             let entry_struct = Arc::new(ArrowField::new_struct(
                 "entries",
                 vec![key_field, value_field],
-                true,
+                false,
             ));
             return Ok(ArrowDataType::Map(entry_struct, false));
         }
@@ -254,7 +256,7 @@ impl<'input> Parser<'input> {
         let entry_struct = Arc::new(ArrowField::new_struct(
             "entries",
             vec![key_field, value_field],
-            true,
+            false,
         ));
         Ok(ArrowDataType::Map(entry_struct, false))
     }
@@ -296,6 +298,7 @@ impl<'input> Parser<'input> {
                 | Token::Double
                 | Token::Float
                 | Token::Int
+                | Token::Long
                 | Token::Void
                 | Token::SmallInt
                 | Token::String
@@ -504,7 +507,7 @@ mod tests {
                             let entry_struct = Arc::new(ArrowField::new_struct(
                                 "entries",
                                 vec![key_field, value_field],
-                                true,
+                                false,
                             ));
                             ArrowDataType::Map(entry_struct, false)
                         },
@@ -535,7 +538,7 @@ mod tests {
         let result = parser.parse().expect("parse MAP without params");
         let key = Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false));
         let val = Arc::new(ArrowField::new("value", ArrowDataType::Utf8, true));
-        let entries = Arc::new(ArrowField::new_struct("entries", vec![key, val], true));
+        let entries = Arc::new(ArrowField::new_struct("entries", vec![key, val], false));
         let expected_map = ArrowDataType::Map(entries, false);
         assert_eq!(result, expected_map);
 
@@ -579,5 +582,69 @@ mod tests {
             sentinel_us.checked_mul(1000).is_none(),
             "year-9999 sentinel must overflow when converting µs→ns"
         );
+    }
+
+    /// Databricks `data_type` column returns `LONG` for what `full_data_type`
+    /// calls `bigint`. Both must parse to `Int64`.
+    #[test]
+    fn test_long_maps_to_int64() {
+        for input in ["LONG", "long", "Long"] {
+            let mut parser = Parser::new(input);
+            let result = parser
+                .parse()
+                .unwrap_or_else(|e| panic!("parse {input}: {e}"));
+            assert_eq!(result, ArrowDataType::Int64, "Failed for input: {input}");
+        }
+    }
+
+    /// Covers the exact `full_data_type` values from a real Databricks
+    /// `information_schema.columns` dump: bigint, string, timestamp,
+    /// boolean, double.
+    #[test]
+    fn test_full_data_type_column_values() {
+        let cases = vec![
+            ("bigint", ArrowDataType::Int64),
+            ("string", ArrowDataType::Utf8),
+            (
+                "timestamp",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            ("boolean", ArrowDataType::Boolean),
+            ("double", ArrowDataType::Float64),
+        ];
+        for (input, expected) in &cases {
+            let mut parser = Parser::new(input);
+            let result = parser
+                .parse()
+                .unwrap_or_else(|e| panic!("parse {input}: {e}"));
+            assert_eq!(
+                result, *expected,
+                "Failed for full_data_type input: {input}"
+            );
+        }
+    }
+
+    /// Covers the exact `data_type` column values from a real Databricks
+    /// `information_schema.columns` dump: LONG, STRING, TIMESTAMP,
+    /// BOOLEAN, DOUBLE. These are what the fallback path receives.
+    #[test]
+    fn test_data_type_column_values() {
+        let cases = vec![
+            ("LONG", ArrowDataType::Int64),
+            ("STRING", ArrowDataType::Utf8),
+            (
+                "TIMESTAMP",
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ),
+            ("BOOLEAN", ArrowDataType::Boolean),
+            ("DOUBLE", ArrowDataType::Float64),
+        ];
+        for (input, expected) in &cases {
+            let mut parser = Parser::new(input);
+            let result = parser
+                .parse()
+                .unwrap_or_else(|e| panic!("parse {input}: {e}"));
+            assert_eq!(result, *expected, "Failed for data_type input: {input}");
+        }
     }
 }
