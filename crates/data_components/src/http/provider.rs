@@ -1219,9 +1219,11 @@ impl HttpExec {
                     let values: Vec<&str> = content_rows.iter().map(String::as_str).collect();
                     Ok(Arc::new(StringArray::from(values)) as ArrayRef)
                 }
-                "response_status" => {
-                    Ok(Arc::new(UInt16Array::from(vec![fetch_result.response_status; num_rows])) as ArrayRef)
-                }
+                "response_status" => Ok(Arc::new(UInt16Array::from(vec![
+                    fetch_result
+                        .response_status;
+                    num_rows
+                ])) as ArrayRef),
                 "response_headers" => {
                     let mut builder = MapBuilder::new(
                         Some(MapFieldNames {
@@ -1421,11 +1423,10 @@ impl ExecutionPlan for HttpExec {
                     })?;
 
                     if state.page >= config.max_pages {
-                        tracing::warn!(
-                            "Reached maximum pagination limit of {} pages",
+                        return Err(DataFusionError::Execution(format!(
+                            "HTTP pagination was cut off after {} pages due to the configured safety limit. Results may be incomplete. Increase `pagination_max_pages` to fetch additional pages.",
                             config.max_pages
-                        );
-                        return Ok(None);
+                        )));
                     }
 
                     if let Some(limit) = state.limit
@@ -1457,8 +1458,7 @@ impl ExecutionPlan for HttpExec {
                                 .map_err(DataFusionError::from)?,
                             Some(NextPageInfo::Token(token)) => {
                                 let path_val = state.path.as_deref().unwrap_or("");
-                                let token_param =
-                                    config.token_param.as_deref().unwrap_or("cursor");
+                                let token_param = config.token_param.as_deref().unwrap_or("cursor");
                                 let new_query = build_query_with_token(
                                     state.query.as_deref(),
                                     token_param,
@@ -1484,11 +1484,8 @@ impl ExecutionPlan for HttpExec {
                         }
                     };
 
-                    // Extract data rows using data_pointer if configured
-                    let content_rows =
-                        extract_page_data(&fetch_result.content, config, page_limit);
-
-                    // Extract next page info
+                    // Extract next page info first (before checking rows)
+                    // so we don't terminate pagination prematurely on empty pages
                     let next_info = extract_next_page_info(
                         &fetch_result.content,
                         &fetch_result.response_headers,
@@ -1497,8 +1494,25 @@ impl ExecutionPlan for HttpExec {
                     )
                     .map_err(DataFusionError::from)?;
 
+                    // Extract data rows using data_pointer if configured
+                    let content_rows = extract_page_data(&fetch_result.content, config, page_limit);
+
+                    // Update pagination state before deciding whether to yield a batch
+                    state.page += 1;
+                    state.next_info = next_info;
+                    if state.next_info.is_none() {
+                        state.done = true;
+                    }
+
                     if content_rows.is_empty() {
-                        return Ok(None);
+                        // No data rows on this page — if there's a next page, continue;
+                        // otherwise stop.
+                        if state.done {
+                            return Ok(None);
+                        }
+                        // Yield an empty batch to continue the stream
+                        let batch = RecordBatch::new_empty(Arc::clone(&exec.projected_schema));
+                        return Ok(Some((batch, state)));
                     }
 
                     let num_rows = content_rows.len();
@@ -1510,19 +1524,14 @@ impl ExecutionPlan for HttpExec {
                         &fetch_result,
                     )?;
 
+                    state.rows_fetched += num_rows;
+
                     tracing::debug!(
                         "Pagination page {}: {} rows fetched, total so far: {}",
-                        state.page,
+                        state.page - 1,
                         num_rows,
-                        state.rows_fetched + num_rows
+                        state.rows_fetched
                     );
-
-                    state.page += 1;
-                    state.rows_fetched += num_rows;
-                    state.next_info = next_info;
-                    if state.next_info.is_none() {
-                        state.done = true;
-                    }
 
                     Ok(Some((batch, state)))
                 }
@@ -1570,7 +1579,32 @@ struct PaginationState {
     done: bool,
 }
 
+/// Resolve a next-page URL string (absolute or relative) against the base URL
+/// and validate same-origin for SSRF protection.
+fn resolve_and_validate_url(raw: &str, base_url: &Url, context: &str) -> Result<Url> {
+    // Try absolute first, fall back to resolving relative against base
+    let resolved = Url::parse(raw)
+        .or_else(|_| base_url.join(raw))
+        .map_err(|e| Error::Pagination {
+            message: format!("Invalid next page URL in {context}: '{raw}': {e}"),
+        })?;
+    if resolved.origin() != base_url.origin() {
+        return Err(Error::Pagination {
+            message: format!(
+                "{context} URL origin '{}' does not match base URL origin '{}'. The next page URL must stay on the same origin.",
+                resolved.origin().ascii_serialization(),
+                base_url.origin().ascii_serialization(),
+            ),
+        });
+    }
+    Ok(resolved)
+}
+
 /// Extract the next page info from an HTTP response body and/or headers.
+///
+/// When `next_pointer` finds an explicit termination signal (null or empty string),
+/// pagination stops immediately. When the pointer path is missing from the response,
+/// we fall through to check the `Link` header (if configured) before giving up.
 fn extract_next_page_info(
     content: &str,
     response_headers: &[(String, String)],
@@ -1578,39 +1612,27 @@ fn extract_next_page_info(
     base_url: &Url,
 ) -> Result<Option<NextPageInfo>> {
     // Try response body JSON pointer first
-    if let Some(ref pointer) = config.next_pointer
-        && let Ok(json) = serde_json::from_str::<serde_json::Value>(content)
-    {
-        if let Some(value) = json.pointer(pointer) {
+    if let Some(ref pointer) = config.next_pointer {
+        let parsed = serde_json::from_str::<serde_json::Value>(content).ok();
+        if let Some(value) = parsed.as_ref().and_then(|json| json.pointer(pointer)) {
             if let Some(next_str) = value.as_str()
                 && !next_str.is_empty()
             {
                 if config.token_param.is_some() {
                     return Ok(Some(NextPageInfo::Token(next_str.to_string())));
                 }
-                let next_url =
-                    Url::parse(next_str).map_err(|e| Error::Pagination {
-                        message: format!(
-                            "Invalid next page URL at '{pointer}': '{next_str}': {e}"
-                        ),
-                    })?;
-                // SSRF protection: the next page URL must have the same origin
-                if next_url.origin() != base_url.origin() {
-                    return Err(Error::Pagination {
-                        message: format!(
-                            "Next page URL origin '{}' does not match base URL origin '{}'. The next page URL must stay on the same origin.",
-                            next_url.origin().ascii_serialization(),
-                            base_url.origin().ascii_serialization(),
-                        ),
-                    });
-                }
+                let next_url = resolve_and_validate_url(
+                    next_str,
+                    base_url,
+                    &format!("JSON pointer '{pointer}'"),
+                )?;
                 return Ok(Some(NextPageInfo::Url(next_url)));
             }
-            // Value is null, empty, or non-string — no more pages
+            // Value is null, empty, or non-string — explicit end of pagination
             return Ok(None);
         }
-        // Pointer path not found — no more pages
-        return Ok(None);
+        // Pointer path not found in response — fall through to Link header
+        // (the API may not include the field on the last page)
     }
 
     // Try HTTP Link header with rel="next"
@@ -1619,21 +1641,7 @@ fn extract_next_page_info(
             if name.eq_ignore_ascii_case("link")
                 && let Some(next_url_str) = parse_link_header_next(value)
             {
-                let next_url =
-                    Url::parse(&next_url_str).map_err(|e| Error::Pagination {
-                        message: format!(
-                            "Invalid URL in Link header: '{next_url_str}': {e}"
-                        ),
-                    })?;
-                if next_url.origin() != base_url.origin() {
-                    return Err(Error::Pagination {
-                        message: format!(
-                            "Link header URL origin '{}' does not match base URL origin '{}'. The next page URL must stay on the same origin.",
-                            next_url.origin().ascii_serialization(),
-                            base_url.origin().ascii_serialization(),
-                        ),
-                    });
-                }
+                let next_url = resolve_and_validate_url(&next_url_str, base_url, "Link header")?;
                 return Ok(Some(NextPageInfo::Url(next_url)));
             }
         }
@@ -1688,26 +1696,21 @@ fn extract_page_data(
 }
 
 /// Build a query string by adding or replacing a token parameter.
+/// Uses `url::form_urlencoded` for proper percent-encoding.
 fn build_query_with_token(existing_query: Option<&str>, param: &str, token: &str) -> String {
-    if let Some(existing) = existing_query {
-        // Remove any existing token param and add the new one
-        let cleaned: String = existing
-            .split('&')
-            .filter(|part| {
-                part.split('=')
-                    .next()
-                    .is_none_or(|key| key != param)
-            })
-            .collect::<Vec<&str>>()
-            .join("&");
-        if cleaned.is_empty() {
-            format!("{param}={token}")
-        } else {
-            format!("{cleaned}&{param}={token}")
-        }
+    let mut pairs: Vec<(String, String)> = if let Some(existing) = existing_query {
+        url::form_urlencoded::parse(existing.as_bytes())
+            .filter(|(key, _)| key != param)
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
     } else {
-        format!("{param}={token}")
-    }
+        Vec::new()
+    };
+    pairs.push((param.to_string(), token.to_string()));
+
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish()
 }
 
 impl HttpTableProvider {
@@ -3758,10 +3761,7 @@ mod tests {
         let headers = vec![];
 
         let result = extract_next_page_info(content, &headers, &config, &base_url);
-        assert!(
-            result.is_err(),
-            "should reject cross-origin next page URLs"
-        );
+        assert!(result.is_err(), "should reject cross-origin next page URLs");
         let err_msg = result.expect_err("expected error").to_string();
         assert!(
             err_msg.contains("does not match"),
@@ -3776,7 +3776,7 @@ mod tests {
             use_link_header: true,
             ..Default::default()
         };
-        let content = r#"[1, 2, 3]"#;
+        let content = r"[1, 2, 3]";
         let headers = vec![(
             "link".to_string(),
             r#"<https://api.example.com/items?page=2>; rel="next""#.to_string(),
@@ -3909,8 +3909,7 @@ mod tests {
             next_pointer: Some("/pagination/next_url".to_string()),
             ..Default::default()
         };
-        let content =
-            r#"{"data": [], "pagination": {"next_url": "https://api.example.com/items?offset=20"}}"#;
+        let content = r#"{"data": [], "pagination": {"next_url": "https://api.example.com/items?offset=20"}}"#;
         let headers = vec![];
 
         let result =
@@ -3938,6 +3937,93 @@ mod tests {
         assert!(
             result.is_none(),
             "empty string next should mean no more pages"
+        );
+    }
+
+    #[test]
+    fn test_extract_next_page_info_relative_url() {
+        let base_url = Url::parse("https://api.example.com/v1").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/next".to_string()),
+            ..Default::default()
+        };
+        let content = r#"{"data": [1], "next": "/v1/items?page=2"}"#;
+        let headers = vec![];
+
+        let result =
+            extract_next_page_info(content, &headers, &config, &base_url).expect("should succeed");
+        match result {
+            Some(NextPageInfo::Url(url)) => {
+                assert_eq!(url.as_str(), "https://api.example.com/v1/items?page=2");
+            }
+            other => panic!("Expected Url from relative path, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_next_page_info_relative_link_header() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            use_link_header: true,
+            ..Default::default()
+        };
+        let content = r"[1, 2]";
+        let headers = vec![(
+            "link".to_string(),
+            r#"</items?page=3>; rel="next""#.to_string(),
+        )];
+
+        let result =
+            extract_next_page_info(content, &headers, &config, &base_url).expect("should succeed");
+        match result {
+            Some(NextPageInfo::Url(url)) => {
+                assert_eq!(url.as_str(), "https://api.example.com/items?page=3");
+            }
+            other => panic!("Expected Url from relative Link header, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_next_page_info_pointer_missing_falls_through_to_link_header() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/pagination/next_url".to_string()),
+            use_link_header: true,
+            ..Default::default()
+        };
+        // Response has no /pagination/next_url field, but does have a Link header
+        let content = r#"{"data": [1, 2]}"#;
+        let headers = vec![(
+            "link".to_string(),
+            r#"<https://api.example.com/items?page=2>; rel="next""#.to_string(),
+        )];
+
+        let result =
+            extract_next_page_info(content, &headers, &config, &base_url).expect("should succeed");
+        match result {
+            Some(NextPageInfo::Url(url)) => {
+                assert_eq!(
+                    url.as_str(),
+                    "https://api.example.com/items?page=2",
+                    "should fall through to Link header when pointer is missing"
+                );
+            }
+            other => panic!("Expected Url from Link header fallthrough, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_query_with_token_special_chars() {
+        // Tokens with special characters should be properly percent-encoded
+        let result = build_query_with_token(None, "cursor", "abc 123&foo=bar");
+        // url::form_urlencoded encodes spaces as + and & as %26
+        assert!(
+            result.contains("cursor="),
+            "should contain cursor param: {result}"
+        );
+        assert!(
+            !result.contains("&foo="),
+            "special chars in token should be encoded, not treated as params: {result}"
         );
     }
 }
