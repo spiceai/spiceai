@@ -103,11 +103,6 @@ impl SearchTestCase {
         self
     }
 
-    pub fn round_scores(mut self) -> Self {
-        self.round_scores = true;
-        self
-    }
-
     pub fn replace_table(&self, from: &TableReference, to: &TableReference) -> Self {
         let body = match self.body.clone() {
             SearchTestType::Http(Value::Object(mut v)) => {

@@ -215,7 +215,7 @@ mod search {
                 ),
             ],
             false,
-            true,
+            false,
         )
         .await
     }
@@ -289,7 +289,7 @@ mod search {
                 ),
             ],
             false,
-            true,
+            false,
         )
         .await
     }
