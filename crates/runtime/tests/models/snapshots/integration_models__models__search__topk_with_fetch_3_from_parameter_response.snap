@@ -4,7 +4,7 @@ expression: normalize_search_response(result.clone(), false)
 ---
 [
   {
-    "plan": "Sort: vector_search(spice.public.basic_embedding_search, Utf8(\"basic\"), Int64(3))._score DESC NULLS FIRST\n  TableScan: vector_search(spice.public.basic_embedding_search, Utf8(\"basic\"), Int64(3)) projection=[cp_catalog_page_sk, _score]",
+    "plan": "Sort: vector_search(spice.public.basic_embedding_search, Utf8(\"basic\"), Int64(2))._score DESC NULLS FIRST\n  TableScan: vector_search(spice.public.basic_embedding_search, Utf8(\"basic\"), Int64(2)) projection=[cp_catalog_page_sk, _score]",
     "plan_type": "logical_plan"
   },
   {
