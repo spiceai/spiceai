@@ -253,7 +253,9 @@ impl SqlWarehouseApi {
 
         match schema_from_json(&response, &table.to_string()) {
             Ok(schema) => Ok(schema),
-            Err(Error::QueryFailure { ref message }) if message.contains("UNRESOLVED_COLUMN") => {
+            Err(Error::QueryFailure { ref message })
+                if message.contains("UNRESOLVED_COLUMN") && message.contains("full_data_type") =>
+            {
                 tracing::warn!(
                     "Databricks information_schema does not have 'full_data_type' column, falling back to 'data_type'. Complex types (ARRAY, MAP, STRUCT) may lose inner type details."
                 );
@@ -1790,5 +1792,169 @@ mod tests {
             matches!(&err, Error::QueryFailure { message } if message.contains("Table or view not found")),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_get_schema_no_fallback_for_unresolved_column_other_than_full_data_type() {
+        // UNRESOLVED_COLUMN for a column other than full_data_type should NOT trigger fallback.
+        let unresolved_other = json!({
+            "status": {
+                "state": "FAILED",
+                "error": {
+                    "message": "[UNRESOLVED_COLUMN.WITH_SUGGESTION] A column or function parameter with name `some_other_col` cannot be resolved."
+                }
+            },
+            "statement_id": "stmt-1"
+        });
+
+        let port = start_mock_server(vec![unresolved_other], json!({})).await;
+        let api = create_test_api(port);
+        let table = TableReference::full("catalog", "schema", "my_table");
+
+        let err = api
+            .get_schema(&table)
+            .await
+            .expect_err("should not fall back for unrelated UNRESOLVED_COLUMN");
+        assert!(
+            matches!(&err, Error::QueryFailure { message } if message.contains("UNRESOLVED_COLUMN")),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Schema parsed from `full_data_type` column values matching a real
+    /// Databricks information_schema dump (bigint, string, timestamp,
+    /// boolean, double).
+    #[test]
+    fn test_schema_from_json_real_full_data_type_schema() {
+        let response = make_schema_response(&json!([
+            ["record_skey", "bigint", "YES"],
+            ["record_hkey", "string", "NO"],
+            ["address_city", "string", "NO"],
+            ["address_state", "string", "NO"],
+            ["address_latitude", "double", "NO"],
+            ["address_longitude", "double", "NO"],
+            ["edw_start_datetime", "timestamp", "NO"],
+            ["edw_end_datetime", "timestamp", "NO"],
+            ["edw_is_current_flag", "boolean", "NO"],
+            ["edw_is_deleted_flag", "boolean", "NO"]
+        ]));
+
+        let schema = schema_from_json(&response, "catalog.edw.dim_records")
+            .expect("should parse real full_data_type schema");
+        assert_eq!(schema.fields().len(), 10);
+
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert!(schema.field(0).is_nullable());
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(4).data_type(), &DataType::Float64);
+        assert_eq!(
+            schema.field(6).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(
+            schema.field(7).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(8).data_type(), &DataType::Boolean);
+    }
+
+    /// Schema parsed from `data_type` column values matching a real
+    /// Databricks information_schema dump. The fallback path receives
+    /// LONG instead of bigint, and all types are uppercase.
+    #[test]
+    fn test_schema_from_json_real_data_type_fallback_schema() {
+        let response = make_schema_response(&json!([
+            ["record_skey", "LONG", "YES"],
+            ["record_hkey", "STRING", "NO"],
+            ["address_city", "STRING", "NO"],
+            ["address_latitude", "DOUBLE", "NO"],
+            ["address_longitude", "DOUBLE", "NO"],
+            ["edw_start_datetime", "TIMESTAMP", "NO"],
+            ["edw_end_datetime", "TIMESTAMP", "NO"],
+            ["edw_is_current_flag", "BOOLEAN", "NO"],
+            ["edw_is_deleted_flag", "BOOLEAN", "NO"]
+        ]));
+
+        let schema = schema_from_json(&response, "catalog.edw.dim_records")
+            .expect("should parse real data_type fallback schema");
+        assert_eq!(schema.fields().len(), 9);
+
+        // LONG must map to Int64
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert!(schema.field(0).is_nullable());
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(3).data_type(), &DataType::Float64);
+        assert_eq!(
+            schema.field(5).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(7).data_type(), &DataType::Boolean);
+    }
+
+    /// Full bridge table schema from real Databricks information_schema,
+    /// using full_data_type values (bigint, string, timestamp, boolean).
+    #[test]
+    fn test_schema_from_json_real_bridge_table_full_data_type() {
+        let response = make_schema_response(&json!([
+            ["bridge_id", "bigint", "YES"],
+            ["entity_id", "bigint", "YES"],
+            ["entity_skey", "bigint", "YES"],
+            ["entity_hkey", "string", "YES"],
+            ["snapshot_id", "bigint", "YES"],
+            ["related_id", "bigint", "YES"],
+            ["related_address", "string", "YES"],
+            ["related_skey", "bigint", "YES"],
+            ["related_hkey", "string", "YES"],
+            ["created_datetime_utc", "timestamp", "YES"],
+            ["updated_datetime_utc", "timestamp", "YES"],
+            ["edw_valid_from_datetime", "timestamp", "YES"],
+            ["edw_end_datetime", "timestamp", "YES"],
+            ["edw_is_current_flag", "boolean", "YES"],
+            ["edw_is_deleted_flag", "boolean", "YES"]
+        ]));
+
+        let schema = schema_from_json(&response, "catalog.edw.bridge_entities")
+            .expect("should parse bridge table schema");
+        assert_eq!(schema.fields().len(), 15);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(6).data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema.field(12).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(13).data_type(), &DataType::Boolean);
+    }
+
+    /// Same bridge table but using data_type column values (LONG instead of bigint).
+    #[test]
+    fn test_schema_from_json_real_bridge_table_data_type_fallback() {
+        let response = make_schema_response(&json!([
+            ["bridge_id", "LONG", "YES"],
+            ["entity_id", "LONG", "YES"],
+            ["entity_skey", "LONG", "YES"],
+            ["entity_hkey", "STRING", "YES"],
+            ["snapshot_id", "LONG", "YES"],
+            ["related_id", "LONG", "YES"],
+            ["related_address", "STRING", "YES"],
+            ["related_skey", "LONG", "YES"],
+            ["related_hkey", "STRING", "YES"],
+            ["created_datetime_utc", "TIMESTAMP", "YES"],
+            ["updated_datetime_utc", "TIMESTAMP", "YES"],
+            ["edw_valid_from_datetime", "TIMESTAMP", "YES"],
+            ["edw_end_datetime", "TIMESTAMP", "YES"],
+            ["edw_is_current_flag", "BOOLEAN", "YES"],
+            ["edw_is_deleted_flag", "BOOLEAN", "YES"]
+        ]));
+
+        let schema = schema_from_json(&response, "catalog.edw.bridge_entities")
+            .expect("should parse bridge table with data_type fallback values");
+        assert_eq!(schema.fields().len(), 15);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(6).data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema.field(12).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(schema.field(13).data_type(), &DataType::Boolean);
     }
 }
