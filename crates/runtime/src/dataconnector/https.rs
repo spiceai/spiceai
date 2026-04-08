@@ -292,12 +292,8 @@ impl Https {
                 .ok()
                 .map(std::string::ToString::to_string);
 
-            let use_link_header = self
-                .params
-                .get("pagination_link_header")
-                .expose()
-                .ok()
-                .is_none_or(util::parse_enabled);
+            let link_header_param = self.params.get("pagination_link_header").expose().ok();
+            let use_link_header = link_header_param.as_deref().is_none_or(util::parse_enabled);
 
             let token_param = self
                 .params
@@ -321,11 +317,13 @@ impl Https {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES);
 
-            // In 'auto' mode with no explicit config, use Link header detection only
+            // In 'auto' mode with no explicit pagination sub-params,
+            // use Link header detection only (respecting pagination_link_header if set).
             if pagination_mode == "auto"
                 && next_pointer.is_none()
                 && token_param.is_none()
                 && data_pointer.is_none()
+                && link_header_param.is_none()
             {
                 Some(data_components::http::provider::PaginationConfig {
                     next_pointer: None,

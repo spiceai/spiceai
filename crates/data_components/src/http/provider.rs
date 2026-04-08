@@ -1465,23 +1465,10 @@ impl ExecutionPlan for HttpExec {
                         let fetch_result = if state.page == 0 {
                             let path_val = state.path.as_deref().unwrap_or("");
                             let body_val = state.body.as_deref();
-                            // Merge base URL query params with partition query,
-                            // consistent with how subsequent pages handle queries.
-                            let merged_query =
-                                match (provider.base_url.query(), state.query.as_deref()) {
-                                    (Some(base_query), Some(state_query))
-                                        if !base_query.is_empty() && !state_query.is_empty() =>
-                                    {
-                                        Some(format!("{base_query}&{state_query}"))
-                                    }
-                                    (Some(base_query), _) if !base_query.is_empty() => {
-                                        Some(base_query.to_string())
-                                    }
-                                    (_, Some(state_query)) if !state_query.is_empty() => {
-                                        Some(state_query.to_string())
-                                    }
-                                    _ => None,
-                                };
+                            let merged_query = merge_base_and_partition_queries(
+                                provider.base_url.query(),
+                                state.query.as_deref(),
+                            );
                             state.last_page_path = state.path.clone();
                             state.last_page_query = merged_query.clone();
                             provider
@@ -1885,15 +1872,19 @@ fn extract_page_data(
 /// Merge base URL query params, partition query params, and a pagination token
 /// into a single query string. Base URL params come first, then partition params
 /// (overriding any base duplicates), then the token param (overriding any existing).
-fn merge_queries(
+/// Merge base URL query params with partition query params.
+/// Partition params override base params with the same key.
+/// Returns `None` if both inputs are `None`.
+fn merge_base_and_partition_queries(
     base_query: Option<&str>,
     partition_query: Option<&str>,
-    token_param: &str,
-    token: &str,
-) -> String {
+) -> Option<String> {
+    if base_query.is_none() && partition_query.is_none() {
+        return None;
+    }
+
     let mut pairs: Vec<(String, String)> = Vec::new();
 
-    // Start with base URL query params
     if let Some(base) = base_query {
         pairs.extend(
             url::form_urlencoded::parse(base.as_bytes())
@@ -1901,17 +1892,34 @@ fn merge_queries(
         );
     }
 
-    // Override/add partition query params
     if let Some(partition) = partition_query {
         for (key, value) in url::form_urlencoded::parse(partition.as_bytes()) {
-            // Remove any existing base param with the same key
             let key_str: &str = &key;
             pairs.retain(|(k, _)| k != key_str);
             pairs.push((key.into_owned(), value.into_owned()));
         }
     }
 
-    // Remove any existing token param before adding the new one
+    Some(
+        url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(pairs)
+            .finish(),
+    )
+}
+
+fn merge_queries(
+    base_query: Option<&str>,
+    partition_query: Option<&str>,
+    token_param: &str,
+    token: &str,
+) -> String {
+    let merged = merge_base_and_partition_queries(base_query, partition_query).unwrap_or_default();
+
+    // Parse the merged result, add the token param
+    let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(merged.as_bytes())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
     pairs.retain(|(k, _)| k != token_param);
     pairs.push((token_param.to_string(), token.to_string()));
 
@@ -4591,6 +4599,37 @@ mod tests {
         assert!(
             result.contains("cursor=abc123"),
             "should include token: {result}"
+        );
+    }
+
+    #[test]
+    fn test_merge_base_and_partition_queries() {
+        // Both present — partition overrides base
+        let result =
+            merge_base_and_partition_queries(Some("api_key=secret&page=1"), Some("page=2"));
+        let result = result.expect("should return Some");
+        assert!(result.contains("api_key=secret"), "base param: {result}");
+        assert!(result.contains("page=2"), "partition override: {result}");
+        assert_eq!(
+            result.matches("page=").count(),
+            1,
+            "no duplicates: {result}"
+        );
+
+        // Only base
+        let result = merge_base_and_partition_queries(Some("api_key=secret"), None);
+        let result = result.expect("should return Some");
+        assert!(result.contains("api_key=secret"), "base only: {result}");
+
+        // Only partition
+        let result = merge_base_and_partition_queries(None, Some("filter=active"));
+        let result = result.expect("should return Some");
+        assert!(result.contains("filter=active"), "partition only: {result}");
+
+        // Neither
+        assert!(
+            merge_base_and_partition_queries(None, None).is_none(),
+            "both None should return None"
         );
     }
 }
