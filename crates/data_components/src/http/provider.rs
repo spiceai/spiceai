@@ -1436,142 +1436,168 @@ impl ExecutionPlan for HttpExec {
                 let provider = Arc::clone(&provider);
 
                 async move {
-                    if state.done {
-                        return Ok::<_, DataFusionError>(None);
-                    }
-
-                    let config = provider.pagination.as_ref().ok_or_else(|| {
-                        DataFusionError::Internal("Pagination config missing".to_string())
-                    })?;
-
-                    if state.page >= config.max_pages {
-                        return Err(DataFusionError::Execution(format!(
-                            "HTTP pagination was cut off after {} pages due to the configured safety limit. Results may be incomplete. Increase `pagination_max_pages` to fetch additional pages.",
-                            config.max_pages
-                        )));
-                    }
-
-                    if let Some(limit) = state.limit
-                        && state.rows_fetched >= limit
-                    {
-                        return Ok(None);
-                    }
-
-                    let page_limit = state.limit.map(|l| l.saturating_sub(state.rows_fetched));
-
-                    // Fetch this page
-                    let fetch_result = if state.page == 0 {
-                        let path_val = state.path.as_deref().unwrap_or("");
-                        let query_val = state.query.as_deref();
-                        let body_val = state.body.as_deref();
-                        state.last_page_path = state.path.clone();
-                        state.last_page_query = state.query.clone();
-                        provider
-                            .get_response(path_val, query_val, body_val)
-                            .await
-                            .map_err(DataFusionError::from)?
-                    } else {
-                        // Subsequent pages bypass the HTTP cache intentionally:
-                        // each page has unique content that shouldn't be cached
-                        // under the same key as the base request.
-                        match &state.next_info {
-                            Some(NextPageInfo::Url(url)) => {
-                                state.last_page_path = Some(url.path().to_string());
-                                state.last_page_query = url.query().map(ToString::to_string);
-                                provider
-                                    .perform_request_with_retry(
-                                        url.clone(),
-                                        state.body.as_deref(),
-                                        &format!("page_{}", state.page),
-                                    )
-                                    .await
-                                    .map_err(DataFusionError::from)?
-                            }
-                            Some(NextPageInfo::Token(token)) => {
-                                let path_val = state.path.as_deref().unwrap_or("");
-                                let token_param = config.token_param.as_deref().unwrap_or("cursor");
-                                // Merge base URL query, partition query, and token param
-                                let base_query = provider.base_url.query();
-                                let merged_query = merge_queries(
-                                    base_query,
-                                    state.query.as_deref(),
-                                    token_param,
-                                    token,
-                                );
-                                state.last_page_path = state.path.clone();
-                                state.last_page_query = Some(merged_query.clone());
-                                let url = provider
-                                    .build_request_url(path_val, Some(&merged_query))
-                                    .map_err(DataFusionError::from)?;
-                                provider
-                                    .perform_request_with_retry(
-                                        url,
-                                        state.body.as_deref(),
-                                        &format!("page_{}", state.page),
-                                    )
-                                    .await
-                                    .map_err(DataFusionError::from)?
-                            }
-                            None => {
-                                return Err(DataFusionError::Internal(
-                                    "page > 0 but no next page info".to_string(),
-                                ));
-                            }
-                        }
-                    };
-
-                    // Extract next page info first (before checking rows)
-                    // so we don't terminate pagination prematurely on empty pages
-                    let next_info = extract_next_page_info(
-                        &fetch_result.content,
-                        &fetch_result.response_headers,
-                        config,
-                        &provider.base_url,
-                    )
-                    .map_err(DataFusionError::from)?;
-
-                    // Extract data rows using data_pointer if configured
-                    let content_rows =
-                        extract_page_data(&fetch_result.content, config, page_limit)?;
-
-                    // Update pagination state before deciding whether to yield a batch
-                    state.page += 1;
-                    state.next_info = next_info;
-                    if state.next_info.is_none() {
-                        state.done = true;
-                    }
-
-                    // Skip empty pages internally instead of yielding empty batches
-                    if content_rows.is_empty() {
+                    loop {
                         if state.done {
+                            return Ok::<_, DataFusionError>(None);
+                        }
+
+                        let config = provider.pagination.as_ref().ok_or_else(|| {
+                            DataFusionError::Internal("Pagination config missing".to_string())
+                        })?;
+
+                        if state.page >= config.max_pages {
+                            return Err(DataFusionError::Execution(format!(
+                                "HTTP pagination query was aborted after reaching the configured safety limit of {} pages. Increase `pagination_max_pages` to fetch additional pages.",
+                                config.max_pages
+                            )));
+                        }
+
+                        if let Some(limit) = state.limit
+                            && state.rows_fetched >= limit
+                        {
                             return Ok(None);
                         }
-                        // Continue to next iteration — try_unfold will call us again
-                        return Ok(Some((
-                            RecordBatch::new_empty(Arc::clone(&exec.projected_schema)),
-                            state,
-                        )));
+
+                        let page_limit = state.limit.map(|l| l.saturating_sub(state.rows_fetched));
+
+                        // Fetch this page
+                        let fetch_result = if state.page == 0 {
+                            let path_val = state.path.as_deref().unwrap_or("");
+                            let query_val = state.query.as_deref();
+                            let body_val = state.body.as_deref();
+                            state.last_page_path = state.path.clone();
+                            state.last_page_query = state.query.clone();
+                            provider
+                                .get_response(path_val, query_val, body_val)
+                                .await
+                                .map_err(DataFusionError::from)?
+                        } else {
+                            // Subsequent pages bypass the HTTP cache intentionally:
+                            // each page has unique content that shouldn't be cached
+                            // under the same key as the base request.
+                            match &state.next_info {
+                                Some(NextPageInfo::Url(url)) => {
+                                    state.last_page_path = Some(url.path().to_string());
+                                    state.last_page_query = url.query().map(ToString::to_string);
+                                    provider
+                                        .perform_request_with_retry(
+                                            url.clone(),
+                                            state.body.as_deref(),
+                                            &format!("page_{}", state.page),
+                                        )
+                                        .await
+                                        .map_err(DataFusionError::from)?
+                                }
+                                Some(NextPageInfo::Token(token)) => {
+                                    let path_val = state.path.as_deref().unwrap_or("");
+                                    let token_param =
+                                        config.token_param.as_deref().unwrap_or("cursor");
+                                    let base_query = provider.base_url.query();
+                                    let merged_query = merge_queries(
+                                        base_query,
+                                        state.query.as_deref(),
+                                        token_param,
+                                        token,
+                                    );
+                                    state.last_page_path = state.path.clone();
+                                    state.last_page_query = Some(merged_query.clone());
+                                    let url = provider
+                                        .build_request_url(path_val, Some(&merged_query))
+                                        .map_err(DataFusionError::from)?;
+                                    provider
+                                        .perform_request_with_retry(
+                                            url,
+                                            state.body.as_deref(),
+                                            &format!("page_{}", state.page),
+                                        )
+                                        .await
+                                        .map_err(DataFusionError::from)?
+                                }
+                                None => {
+                                    return Err(DataFusionError::Internal(
+                                        "page > 0 but no next page info".to_string(),
+                                    ));
+                                }
+                            }
+                        };
+
+                        // Parse response JSON once for both next-page and data extraction
+                        let parsed_json = if config.next_pointer.is_some()
+                            || config.data_pointer.is_some()
+                        {
+                            Some(
+                                    serde_json::from_str::<serde_json::Value>(
+                                        &fetch_result.content,
+                                    )
+                                    .map_err(|source| {
+                                        let pointers: Vec<&str> = [
+                                            config.next_pointer.as_deref(),
+                                            config.data_pointer.as_deref(),
+                                        ]
+                                        .into_iter()
+                                        .flatten()
+                                        .collect();
+                                        DataFusionError::Execution(format!(
+                                            "Failed to parse paginated HTTP response as JSON for pointer(s) {pointers:?}: {source}"
+                                        ))
+                                    })?,
+                                )
+                        } else {
+                            None
+                        };
+
+                        // Extract next page info first (before checking rows)
+                        let next_info = extract_next_page_info(
+                            parsed_json.as_ref(),
+                            &fetch_result.response_headers,
+                            config,
+                            &provider.base_url,
+                        )
+                        .map_err(DataFusionError::from)?;
+
+                        // Extract data rows using data_pointer if configured
+                        let content_rows = extract_page_data(
+                            &fetch_result.content,
+                            parsed_json.as_ref(),
+                            config,
+                            page_limit,
+                        )?;
+
+                        // Update pagination state
+                        state.page += 1;
+                        state.next_info = next_info;
+                        if state.next_info.is_none() {
+                            state.done = true;
+                        }
+
+                        // Skip empty pages internally — loop again instead of yielding
+                        if content_rows.is_empty() {
+                            if state.done {
+                                return Ok(None);
+                            }
+                            continue;
+                        }
+
+                        let num_rows = content_rows.len();
+                        let batch = exec.create_batch_from_rows(
+                            state.last_page_path.as_deref(),
+                            state.last_page_query.as_deref(),
+                            state.body.as_deref(),
+                            &content_rows,
+                            &fetch_result,
+                        )?;
+
+                        state.rows_fetched += num_rows;
+
+                        tracing::debug!(
+                            "Pagination page {}: {} rows fetched, total so far: {}",
+                            state.page - 1,
+                            num_rows,
+                            state.rows_fetched
+                        );
+
+                        return Ok(Some((batch, state)));
                     }
-
-                    let num_rows = content_rows.len();
-                    let batch = exec.create_batch_from_rows(
-                        state.last_page_path.as_deref(),
-                        state.last_page_query.as_deref(),
-                        state.body.as_deref(),
-                        &content_rows,
-                        &fetch_result,
-                    )?;
-
-                    state.rows_fetched += num_rows;
-
-                    tracing::debug!(
-                        "Pagination page {}: {} rows fetched, total so far: {}",
-                        state.page - 1,
-                        num_rows,
-                        state.rows_fetched
-                    );
-
-                    Ok(Some((batch, state)))
                 }
             });
 
@@ -1648,19 +1674,16 @@ fn resolve_and_validate_url(raw: &str, base_url: &Url, context: &str) -> Result<
 /// pagination stops immediately. When the pointer path is missing from the response,
 /// we fall through to check the `Link` header (if configured) before giving up.
 fn extract_next_page_info(
-    content: &str,
+    parsed_json: Option<&serde_json::Value>,
     response_headers: &[(String, String)],
     config: &PaginationConfig,
     base_url: &Url,
 ) -> Result<Option<NextPageInfo>> {
     // Try response body JSON pointer first
     if let Some(ref pointer) = config.next_pointer {
-        let parsed = serde_json::from_str::<serde_json::Value>(content)
-            .map_err(|source| Error::Pagination {
-                message: format!(
-                    "Failed to parse pagination response body as JSON for pointer '{pointer}': {source}"
-                ),
-            })?;
+        let parsed = parsed_json.ok_or_else(|| Error::Pagination {
+            message: format!("JSON not parsed but next_pointer '{pointer}' is configured"),
+        })?;
 
         if let Some(value) = parsed.pointer(pointer) {
             match value {
@@ -1738,13 +1761,14 @@ fn parse_link_header_next(header_value: &str) -> Option<String> {
 /// Extract data rows from a page response, using `data_pointer` if configured.
 fn extract_page_data(
     content: &str,
+    parsed_json: Option<&serde_json::Value>,
     config: &PaginationConfig,
     limit: Option<usize>,
 ) -> DataFusionResult<Vec<String>> {
     if let Some(ref pointer) = config.data_pointer {
-        let json = serde_json::from_str::<serde_json::Value>(content).map_err(|source| {
+        let json = parsed_json.ok_or_else(|| {
             DataFusionError::Execution(format!(
-                "Failed to extract paginated HTTP response data: response is not valid JSON for configured data pointer '{pointer}': {source}"
+                "JSON not parsed but data_pointer '{pointer}' is configured"
             ))
         })?;
 
@@ -2134,6 +2158,41 @@ mod tests {
     /// Build a query string by adding or replacing a token parameter.
     fn build_query_with_token(existing_query: Option<&str>, param: &str, token: &str) -> String {
         merge_queries(None, existing_query, param, token)
+    }
+
+    /// Test helper: parse content and call `extract_next_page_info`
+    fn extract_next_page_info(
+        content: &str,
+        headers: &[(String, String)],
+        config: &PaginationConfig,
+        base_url: &Url,
+    ) -> super::Result<Option<NextPageInfo>> {
+        let parsed = if config.next_pointer.is_some() {
+            Some(
+                serde_json::from_str::<serde_json::Value>(content)
+                    .expect("test content should be valid JSON"),
+            )
+        } else {
+            None
+        };
+        super::extract_next_page_info(parsed.as_ref(), headers, config, base_url)
+    }
+
+    /// Test helper: parse content and call `extract_page_data`
+    fn extract_page_data(
+        content: &str,
+        config: &PaginationConfig,
+        limit: Option<usize>,
+    ) -> datafusion::common::Result<Vec<String>> {
+        let parsed = if config.data_pointer.is_some() {
+            Some(
+                serde_json::from_str::<serde_json::Value>(content)
+                    .expect("test content should be valid JSON"),
+            )
+        } else {
+            None
+        };
+        super::extract_page_data(content, parsed.as_ref(), config, limit)
     }
 
     fn base_provider() -> HttpTableProvider {
@@ -4146,13 +4205,13 @@ mod tests {
             next_pointer: Some("/next".to_string()),
             ..Default::default()
         };
-        let content = "this is not json";
+        // When next_pointer is set but parsed_json is None, it should error
         let headers = vec![];
 
-        let result = extract_next_page_info(content, &headers, &config, &base_url);
+        let result = super::extract_next_page_info(None, &headers, &config, &base_url);
         assert!(
             result.is_err(),
-            "invalid JSON should return error when next_pointer is configured"
+            "missing parsed JSON should return error when next_pointer is configured"
         );
     }
 
@@ -4174,16 +4233,16 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_page_data_invalid_json() {
+    fn test_extract_page_data_missing_json() {
         let config = PaginationConfig {
             data_pointer: Some("/results".to_string()),
             ..Default::default()
         };
-        let content = "not valid json";
-        let result = extract_page_data(content, &config, None);
+        // When data_pointer is set but parsed_json is None, it should error
+        let result = super::extract_page_data("", None, &config, None);
         assert!(
             result.is_err(),
-            "invalid JSON should return error when data_pointer is configured"
+            "missing parsed JSON should return error when data_pointer is configured"
         );
     }
 

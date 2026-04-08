@@ -146,7 +146,14 @@ impl Https {
             .get("pagination")
             .expose()
             .ok()
-            .map_or(true, |v| v != "disabled");
+            .is_some_and(|v| v == "enabled" || v == "true")
+            || [
+                "pagination_next_pointer",
+                "pagination_token_param",
+                "pagination_data_pointer",
+            ]
+            .iter()
+            .any(|key| self.params.get(key).expose().ok().is_some());
 
         has_allowed_paths || has_query_filters || has_body_filters || has_pagination
     }
