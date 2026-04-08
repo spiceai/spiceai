@@ -450,6 +450,3 @@ vortex-datafusion = { git = "https://github.com/spiceai/vortex.git", rev = "8a09
 vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "8a09bc796245a957ad03c49c3cdfee477f483237" } # spiceai-52
 vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "8a09bc796245a957ad03c49c3cdfee477f483237" } # spiceai-52
 vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "8a09bc796245a957ad03c49c3cdfee477f483237" } # spiceai-52
-
-[patch.'https://github.com/spiceai/datafusion-federation.git']
-datafusion-federation = { path = "/Users/jeadie/Github/datafusion-federation/datafusion-federation" }
