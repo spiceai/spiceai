@@ -113,7 +113,6 @@ pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub mod composed_catalog;
-pub mod ddl;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
@@ -541,7 +540,7 @@ pub struct DataFusion {
     /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
     ddl_enabled_catalogs: Arc<RwLock<HashSet<String>>>,
     /// Shared store for DDL extensions from `CREATE TABLE` statements.
-    ddl_extension_store: ddl::acceleration_options::SharedDdlExtensionStore,
+    ddl_extension_store: datafusion_ddl::SharedDdlExtensionStore,
     /// Shared weak self-reference, populated after `Arc::new(DataFusion)`.
     /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
@@ -904,7 +903,7 @@ impl DataFusion {
     /// `CREATE TABLE` statements (e.g. `WITH (acceleration.*, dataset.*)` or
     /// `PARTITION BY`), which are then consumed by catalog-specific analyzer rules.
     #[must_use]
-    pub fn ddl_extension_store(&self) -> &ddl::acceleration_options::SharedDdlExtensionStore {
+    pub fn ddl_extension_store(&self) -> &datafusion_ddl::SharedDdlExtensionStore {
         &self.ddl_extension_store
     }
 

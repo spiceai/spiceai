@@ -564,7 +564,7 @@ fn extract_primary_key_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datafusion::ddl::acceleration_options::new_shared_store;
+    use datafusion_ddl::new_shared_store;
     use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
     use datafusion::sql::sqlparser::parser::Parser;
 

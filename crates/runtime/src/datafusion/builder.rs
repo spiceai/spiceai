@@ -433,7 +433,7 @@ impl DataFusionBuilder {
         let caching = self.caching.unwrap_or(Arc::new(Caching::default()));
 
         let ddl_enabled_catalogs = Arc::new(RwLock::new(HashSet::new()));
-        let ddl_extension_store = super::ddl::acceleration_options::new_shared_store(
+        let ddl_extension_store = datafusion_ddl::new_shared_store(
             SPICE_DEFAULT_CATALOG,
             SPICE_DEFAULT_SCHEMA,
         );
