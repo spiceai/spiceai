@@ -41,6 +41,110 @@ fn ddl_output_schema() -> DFSchemaRef {
     )
 }
 
+/// Logical plan node for `CREATE SCHEMA` on an Iceberg catalog.
+#[derive(Debug)]
+pub struct IcebergCreateSchemaNode {
+    /// The Iceberg catalog to create the namespace in.
+    pub catalog: Arc<dyn Catalog>,
+    /// The namespace (schema) to create.
+    pub namespace: NamespaceIdent,
+    /// If true, do not error if the schema already exists.
+    pub if_not_exists: bool,
+    /// The `DataFusion` catalog name.
+    pub df_catalog_name: String,
+    /// The `DataFusion` schema name.
+    pub df_schema_name: String,
+    /// Output schema (single "result" column).
+    output_schema: DFSchemaRef,
+}
+
+impl IcebergCreateSchemaNode {
+    #[must_use]
+    pub fn new(
+        catalog: Arc<dyn Catalog>,
+        namespace: NamespaceIdent,
+        if_not_exists: bool,
+        df_catalog_name: String,
+        df_schema_name: String,
+    ) -> Self {
+        Self {
+            catalog,
+            namespace,
+            if_not_exists,
+            df_catalog_name,
+            df_schema_name,
+            output_schema: ddl_output_schema(),
+        }
+    }
+}
+
+impl Hash for IcebergCreateSchemaNode {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.namespace.to_string().hash(state);
+        self.df_catalog_name.hash(state);
+        self.df_schema_name.hash(state);
+    }
+}
+
+impl PartialEq for IcebergCreateSchemaNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.namespace == other.namespace
+            && self.df_catalog_name == other.df_catalog_name
+            && self.df_schema_name == other.df_schema_name
+    }
+}
+
+impl Eq for IcebergCreateSchemaNode {}
+
+impl PartialOrd for IcebergCreateSchemaNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.namespace
+            .to_string()
+            .partial_cmp(&other.namespace.to_string())
+    }
+}
+
+impl UserDefinedLogicalNodeCore for IcebergCreateSchemaNode {
+    fn name(&self) -> &'static str {
+        "IcebergCreateSchema"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![]
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        &self.output_schema
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        vec![]
+    }
+
+    fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "IcebergCreateSchema: {}.{}",
+            self.df_catalog_name, self.df_schema_name
+        )
+    }
+
+    fn with_exprs_and_inputs(
+        &self,
+        _exprs: Vec<Expr>,
+        _inputs: Vec<LogicalPlan>,
+    ) -> datafusion::error::Result<Self> {
+        Ok(Self {
+            catalog: Arc::clone(&self.catalog),
+            namespace: self.namespace.clone(),
+            if_not_exists: self.if_not_exists,
+            df_catalog_name: self.df_catalog_name.clone(),
+            df_schema_name: self.df_schema_name.clone(),
+            output_schema: DFSchemaRef::clone(&self.output_schema),
+        })
+    }
+}
+
 /// Logical plan node for `CREATE TABLE` on an Iceberg catalog.
 #[derive(Debug)]
 pub struct IcebergCreateTableNode {
@@ -64,6 +168,8 @@ pub struct IcebergCreateTableNode {
     pub acceleration: Option<Acceleration>,
     /// Dataset options from `WITH (dataset.*)`, if any.
     pub dataset_options: DatasetOptions,
+    /// Partition expression SQL used for distributed ingest and refresh partition filters.
+    pub partition_expr_sql: Option<String>,
     /// Output schema (single "result" column).
     output_schema: DFSchemaRef,
 }
@@ -82,6 +188,7 @@ impl IcebergCreateTableNode {
         df_schema_name: String,
         acceleration: Option<Acceleration>,
         dataset_options: DatasetOptions,
+        partition_expr_sql: Option<String>,
     ) -> Self {
         Self {
             catalog,
@@ -94,6 +201,7 @@ impl IcebergCreateTableNode {
             df_schema_name,
             acceleration,
             dataset_options,
+            partition_expr_sql,
             output_schema: ddl_output_schema(),
         }
     }
@@ -166,6 +274,7 @@ impl UserDefinedLogicalNodeCore for IcebergCreateTableNode {
             df_schema_name: self.df_schema_name.clone(),
             acceleration: self.acceleration.clone(),
             dataset_options: self.dataset_options.clone(),
+            partition_expr_sql: self.partition_expr_sql.clone(),
             output_schema: DFSchemaRef::clone(&self.output_schema),
         })
     }

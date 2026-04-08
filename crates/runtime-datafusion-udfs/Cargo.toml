@@ -17,6 +17,7 @@ async-trait.workspace = true
 datafusion.workspace = true
 futures.workspace = true
 llms = { path = "../llms", default-features = false, optional = true }
+runtime-rate-control = { path = "../runtime-rate-control" }
 runtime-request-context = { path = "../runtime-request-context" }
 snafu.workspace = true
 tokio.workspace = true
@@ -25,6 +26,7 @@ util = { path = "../util" }
 
 [dev-dependencies]
 async-stream.workspace = true
+governor.workspace = true
 insta.workspace = true
 tracing-subscriber.workspace = true
 tracing-test = "0.2"

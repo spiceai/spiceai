@@ -254,6 +254,16 @@ impl Github {
         repo: Option<&str>,
         resource_type: &str,
     ) -> Result<(), String> {
+        // Skip validation when token-based auth is used (token takes precedence over app auth).
+        // The `installation_id` parameter may be present due to secret autoloading from .env,
+        // even when the dataset was explicitly configured with a token.
+        if self.params.get("token").ok().is_some() {
+            tracing::debug!(
+                "Skipping GitHub App access validation because token-based auth is active"
+            );
+            return Ok(());
+        }
+
         // Check if we're using a GitHub App token provider with an installation ID
         let installation_id = self.params.get("installation_id").expose().ok();
 
@@ -1381,6 +1391,15 @@ static GITHUB_FILTER_PUSHDOWNS_SUPPORTED: LazyLock<HashMap<&'static str, GitHubP
         m
     });
 
+pub(crate) fn scalar_utf8_value(scalar: &ScalarValue) -> Option<&str> {
+    match scalar {
+        ScalarValue::Utf8(Some(v))
+        | ScalarValue::LargeUtf8(Some(v))
+        | ScalarValue::Utf8View(Some(v)) => Some(v.as_str()),
+        _ => None,
+    }
+}
+
 pub(crate) fn expr_to_match(expr: &Expr) -> Option<(Column, ScalarValue, Operator)> {
     match expr {
         Expr::BinaryExpr(binary_expr) => {
@@ -1459,16 +1478,18 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
             column.name.as_str()
         };
 
-        let value = match value {
-            ScalarValue::Utf8(Some(v)) => {
+        let value = match &value {
+            ScalarValue::Utf8(Some(v))
+            | ScalarValue::LargeUtf8(Some(v))
+            | ScalarValue::Utf8View(Some(v)) => {
                 if column.name == "state" {
                     v.to_lowercase()
                 } else {
-                    v
+                    v.clone()
                 }
             }
             ScalarValue::TimestampMillisecond(Some(millis), _) => {
-                let dt = Utc.timestamp_millis_opt(millis);
+                let dt = Utc.timestamp_millis_opt(*millis);
                 match dt {
                     LocalResult::Single(dt) => match column_name {
                         "updated" | "created" | "closed" | "merged" => dt.to_rfc3339(),
