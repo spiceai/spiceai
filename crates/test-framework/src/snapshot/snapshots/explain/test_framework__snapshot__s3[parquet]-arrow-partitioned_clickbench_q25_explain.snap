@@ -18,14 +18,14 @@ description: "Query: clickbench_q25"
 |               |           SchemaCastScanExec                                                                                                                    |
 |               |             PartitionedUnionExec                                                                                                                |
 |               |               BytesProcessedExec                                                                                                                |
-|               |                 DataSourceExec: partitions=16, partition_sizes=[110, 110, 110, 110, 110, 110, 110, 110, 110, 109, 109, 109, 109, 122, 172, 452] |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[111, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 110, 123, 173, 459] |
 |               |               BytesProcessedExec                                                                                                                |
-|               |                 DataSourceExec: partitions=16, partition_sizes=[140, 140, 139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 142, 186, 496] |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 139, 142, 187, 499] |
 |               |               BytesProcessedExec                                                                                                                |
-|               |                 DataSourceExec: partitions=16, partition_sizes=[20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 19, 19, 19, 19, 23, 190]                |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[21, 21, 21, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 24, 193]                |
 |               |               BytesProcessedExec                                                                                                                |
-|               |                 DataSourceExec: partitions=16, partition_sizes=[36, 36, 36, 36, 36, 35, 35, 35, 35, 35, 35, 35, 35, 36, 52, 269]                |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 37, 36, 36, 53, 276]                |
 |               |               BytesProcessedExec                                                                                                                |
-|               |                 DataSourceExec: partitions=16, partition_sizes=[78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 78, 79, 461]                |
+|               |                 DataSourceExec: partitions=16, partition_sizes=[76, 76, 76, 76, 76, 76, 76, 76, 76, 76, 75, 75, 75, 75, 76, 463]                |
 |               |                                                                                                                                                 |
 +---------------+-------------------------------------------------------------------------------------------------------------------------------------------------+
