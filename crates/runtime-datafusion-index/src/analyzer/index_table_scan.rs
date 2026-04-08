@@ -1110,4 +1110,47 @@ mod test {
 
         assert_eq!(1, idx_add.compute_index_calls());
     }
+
+    /// Regression test for #10223: batches whose schema metadata differs from
+    /// the plan's advertised schema must not trigger a false "changed schema"
+    /// error when the index returns the batch unchanged.
+    #[tokio::test]
+    async fn pipeline_tolerates_metadata_only_schema_difference() {
+        let ctx = get_ctx();
+
+        // Pass-through index that returns the batch with extra schema-level metadata.
+        // The fields are identical but the schema metadata differs.
+        let idx = Arc::new(TestIndex::new(
+            vec!["id".to_string()],
+            Some(|batches| {
+                let b = batches.into_iter().next().expect("one batch");
+                let mut metadata = b.schema().metadata().clone();
+                metadata.insert("extra_key".to_string(), "extra_value".to_string());
+                let new_schema = Arc::new(
+                    Schema::new(b.schema().fields().to_vec()).with_metadata(metadata),
+                );
+                let columns: Vec<ArrayRef> =
+                    (0..b.num_columns()).map(|i| Arc::clone(b.column(i))).collect();
+                let out = RecordBatch::try_new(new_schema, columns)
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                Ok(vec![out])
+            }),
+        ));
+
+        let table = mem_table_from_batches(vec![one_row_batch()]);
+        let provider = IndexedTableProvider::new(table)
+            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>);
+
+        ctx.register_table(
+            "metadata_diff_table",
+            Arc::new(provider) as Arc<dyn TableProvider>,
+        )
+        .expect("valid");
+
+        let df = ctx.table("metadata_diff_table").await.expect("valid");
+        // Must succeed — metadata-only differences are benign.
+        let results = df.collect().await.expect("metadata-only difference should not error");
+        assert_eq!(results.len(), 1);
+        assert_eq!(1, idx.compute_index_calls());
+    }
 }
