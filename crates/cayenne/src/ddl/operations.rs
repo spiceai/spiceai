@@ -68,9 +68,9 @@ pub struct DropTableOutcome {
 pub struct CreateTableParams {
     /// Unqualified table name.
     pub table_name: String,
-    /// DataFusion schema name.
+    /// `DataFusion` schema name.
     pub schema_name: String,
-    /// DataFusion catalog name.
+    /// `DataFusion` catalog name.
     pub catalog_name: String,
     /// Arrow schema for the new table.
     pub arrow_schema: Arc<Schema>,
@@ -232,7 +232,7 @@ pub async fn create_table(
             &table_data_path,
             &parsed_expr,
             Some(&label),
-            &params.partition_expr_sql,
+            params.partition_expr_sql.as_ref(),
             &vortex_schema,
             &metadata_catalog,
             &table_id,
@@ -272,7 +272,7 @@ pub async fn create_table(
     })
 }
 
-/// Remove a table from the Cayenne metadata catalog and DataFusion schema provider.
+/// Remove a table from the Cayenne metadata catalog and `DataFusion` schema provider.
 ///
 /// Does **not** forward the DROP to executor nodes — that is a distribution concern
 /// handled by the runtime's broadcast exec.
@@ -402,7 +402,7 @@ async fn build_partitioned_provider(
     table_data_path: &str,
     partition_expr: &Expr,
     partition_name: Option<&str>,
-    partition_expr_sql: &Option<String>,
+    partition_expr_sql: Option<&String>,
     vortex_schema: &Arc<Schema>,
     metadata_catalog: &Arc<dyn MetadataCatalog>,
     table_id: &str,
@@ -412,9 +412,8 @@ async fn build_partitioned_provider(
     runtime_env: &Arc<RuntimeEnv>,
 ) -> DFResult<Arc<dyn datafusion::catalog::TableProvider>> {
     let df_schema = vortex_schema.as_ref().clone().to_dfschema()?;
-    let partition_expr_for_error = partition_expr_sql
-        .clone()
-        .unwrap_or_else(|| partition_expr.to_string());
+    let partition_expr_for_error =
+        partition_expr_sql.map_or_else(|| partition_expr.to_string(), String::clone);
 
     tracing::info!(
         table = %table_name,
@@ -427,9 +426,8 @@ async fn build_partitioned_provider(
         ))
     })?;
 
-    let pname = partition_name
-        .map(str::to_string)
-        .unwrap_or_else(|| partition_label_for_expr(partition_expr));
+    let pname =
+        partition_name.map_or_else(|| partition_label_for_expr(partition_expr), str::to_string);
     let partition_by = vec![PartitionedBy {
         name: pname,
         expression: partition_expr.clone(),
@@ -498,7 +496,7 @@ fn parse_label_from_sql(sql: &str) -> Option<String> {
     let dialect = GenericDialect {};
     let mut parser = Parser::new(&dialect).try_with_sql(sql).ok()?;
     if let Ok(datafusion::sql::sqlparser::ast::Expr::Identifier(ident)) = parser.parse_expr() {
-        Some(ident.value.clone())
+        Some(ident.value)
     } else {
         None
     }
