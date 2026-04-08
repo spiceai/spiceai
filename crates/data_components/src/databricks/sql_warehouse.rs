@@ -1688,7 +1688,7 @@ mod tests {
     /// Regression test: Databricks sends timestamps as `Timestamp(Microsecond, "Etc/UTC")`
     /// in Arrow IPC. The declared schema must also use Microsecond so that `try_cast_to`
     /// doesn't attempt a µs→ns multiplication that overflows for far-future sentinel
-    /// values like year 9999 (253402300799999000 µs × 1000 > i64::MAX).
+    /// values like year 9999 (253402300799999000 µs × 1000 > `i64::MAX`).
     #[test]
     fn test_schema_from_json_timestamp_microsecond_avoids_overflow() {
         use arrow::array::TimestampMicrosecondArray;

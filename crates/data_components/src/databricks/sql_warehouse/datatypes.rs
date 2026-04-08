@@ -551,7 +551,7 @@ mod tests {
     /// Databricks sends Arrow IPC data with `Timestamp(Microsecond, ...)` but
     /// the schema parser previously declared `Timestamp(Nanosecond, ...)`,
     /// causing arithmetic overflow when casting far-future sentinel values
-    /// (e.g. year 9999: 253402300799999000 µs × 1000 > i64::MAX).
+    /// (e.g. year 9999: 253402300799999000 µs × 1000 > `i64::MAX`).
     ///
     /// This test ensures the parser declares Microsecond to match the wire format.
     #[test]
