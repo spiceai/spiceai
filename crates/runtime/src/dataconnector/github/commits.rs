@@ -362,7 +362,7 @@ impl TableProvider for CommitsTableProvider {
             .await
             .map_err(DataFusionError::External)?;
 
-        let stop_early = limit.is_some() && filters.iter().all(|expr| expr_is_ref_only(expr));
+        let stop_early = limit.is_some() && filters.iter().all(expr_is_ref_only);
         let mut remaining = limit;
         let mut batches = Vec::new();
 
