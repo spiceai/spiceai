@@ -14,5 +14,4 @@ expression: pretty_batches
 | E2E Test Release Installation | .github/workflows/e2e_test_release_install.yml  |
 | Generate Acknowledgements     | .github/workflows/generate_acknowledgements.yml |
 | Test types support            | .github/workflows/types_check.yml               |
-| integration tests             | .github/workflows/integration.yml               |
 +-------------------------------+-------------------------------------------------+
