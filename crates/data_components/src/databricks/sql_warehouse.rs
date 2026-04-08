@@ -234,6 +234,8 @@ impl SqlWarehouseApi {
     ) -> Result<Self, Error> {
         let client = ClientBuilder::new()
             .user_agent(super::user_agent())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .context(ClientBuildFailedSnafu)?;
 
