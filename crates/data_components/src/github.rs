@@ -193,15 +193,26 @@ impl GithubFilesTableProvider {
     }
 }
 
+fn scalar_utf8_value(scalar: &ScalarValue) -> Option<&str> {
+    match scalar {
+        ScalarValue::Utf8(Some(v))
+        | ScalarValue::LargeUtf8(Some(v))
+        | ScalarValue::Utf8View(Some(v)) => Some(v.as_str()),
+        _ => None,
+    }
+}
+
 fn ref_from_filter(expr: &Expr) -> Option<String> {
     match expr {
         Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Eq => {
             match (&*binary_expr.left, &*binary_expr.right) {
-                (Expr::Column(column), Expr::Literal(ScalarValue::Utf8(Some(value)), _))
-                | (Expr::Literal(ScalarValue::Utf8(Some(value)), _), Expr::Column(column))
-                    if column.name == "ref" && !value.is_empty() =>
+                (Expr::Column(column), Expr::Literal(value, _))
+                | (Expr::Literal(value, _), Expr::Column(column))
+                    if column.name == "ref" =>
                 {
-                    Some(value.clone())
+                    scalar_utf8_value(value)
+                        .filter(|v| !v.is_empty())
+                        .map(ToString::to_string)
                 }
                 _ => None,
             }
@@ -280,7 +291,7 @@ impl TableProvider for GithubFilesTableProvider {
             .iter()
             .map(|filter| {
                 if ref_from_filter(filter).is_some() {
-                    TableProviderFilterPushDown::Inexact
+                    TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
                 }
@@ -1805,6 +1816,7 @@ mod tests {
         github_response_message_from_text, ref_from_filter, requested_ref_from_filters,
     };
     use datafusion::prelude::{col, lit};
+    use datafusion::scalar::ScalarValue;
     use reqwest::StatusCode;
     use serde_json::json;
 
@@ -1813,6 +1825,35 @@ mod tests {
         let expr = col("ref").eq(lit("trunk"));
 
         assert_eq!(ref_from_filter(&expr).as_deref(), Some("trunk"));
+    }
+
+    #[test]
+    fn test_ref_from_filter_supports_utf8view_literal() {
+        use datafusion::logical_expr::Expr;
+        let expr = col("ref").eq(Expr::Literal(
+            ScalarValue::Utf8View(Some("trunk".to_string())),
+            None,
+        ));
+
+        assert_eq!(ref_from_filter(&expr).as_deref(), Some("trunk"));
+    }
+
+    #[test]
+    fn test_ref_from_filter_supports_large_utf8_literal() {
+        use datafusion::logical_expr::Expr;
+        let expr = col("ref").eq(Expr::Literal(
+            ScalarValue::LargeUtf8(Some("trunk".to_string())),
+            None,
+        ));
+
+        assert_eq!(ref_from_filter(&expr).as_deref(), Some("trunk"));
+    }
+
+    #[test]
+    fn test_ref_from_filter_rejects_empty_string() {
+        let expr = col("ref").eq(lit(""));
+
+        assert_eq!(ref_from_filter(&expr), None);
     }
 
     #[test]
