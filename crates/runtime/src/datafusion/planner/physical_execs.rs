@@ -211,19 +211,18 @@ async fn execute_merge(
     // would fail, leaving permanently missing rows.
     validate_no_duplicate_target_keys(&normalized_batches, &target_key_columns)?;
 
-    // Step 3: Build deletion filters from the matched key values.
-    // Uses tuple-aware OR-of-ANDs to avoid cross-product matches with composite keys.
-    let delete_filters = build_delete_filters(&normalized_batches, &target_key_columns)?;
+    // Step 3: Build deletion filter from the matched key values.
+    let delete_filter = build_delete_filter(&normalized_batches, &target_key_columns)?;
 
     // Step 4: Delete matched rows from the target.
     let delete_plan = target_provider
-        .delete_from(&session_state, delete_filters)
+        .delete_from(&session_state, vec![delete_filter])
         .await?;
     let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
     let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
+    let delete_count = extract_dml_count(&delete_batches);
 
     // Verify the delete count matches the expected number of rows.
-    let delete_count = extract_dml_count(&delete_batches);
     if delete_count != total_rows as u64 {
         return Err(DataFusionError::Execution(format!(
             "MERGE delete count mismatch: expected {total_rows} rows deleted, got {delete_count}"
@@ -332,18 +331,18 @@ fn validate_no_duplicate_target_keys(
     Ok(())
 }
 
-/// Build deletion filter expressions from matched key column values.
+/// Build a deletion filter from matched key column values.
 ///
 /// For single-column keys, builds `key_col IN (val1, val2, ...)`.
 /// For composite keys, builds tuple-aware OR-of-ANDs to avoid cross-product matches:
 ///   `(k1 = a1 AND k2 = b1) OR (k1 = a2 AND k2 = b2)`
-fn build_delete_filters(
+fn build_delete_filter(
     batches: &[RecordBatch],
     key_columns: &[String],
-) -> Result<Vec<datafusion::prelude::Expr>, DataFusionError> {
+) -> Result<datafusion::prelude::Expr, DataFusionError> {
     use datafusion::prelude::*;
 
-    // Fast path: single key column uses simple IN-list.
+    // Fast path: single key column uses a single IN-list.
     if key_columns.len() == 1 {
         let key_col = &key_columns[0];
         let mut values: Vec<datafusion::prelude::Expr> = Vec::new();
@@ -365,7 +364,7 @@ fn build_delete_filters(
                     .to_string(),
             ));
         }
-        return Ok(vec![col(key_col).in_list(values, false)]);
+        return Ok(col(key_col).in_list(values, false));
     }
 
     // Composite keys: build OR-of-ANDs for exact tuple matching.
@@ -414,11 +413,9 @@ fn build_delete_filters(
         ));
     }
 
-    // Combine all row predicates with OR using a balanced binary tree.
-    // A linear fold creates O(N) depth causing stack overflow for large N.
-    // A balanced tree keeps depth at O(log N).
+    // Combine row predicates with OR using a balanced binary tree.
     match util::expr::combine_exprs_balanced(row_predicates, datafusion::prelude::Expr::or) {
-        Some(combined) => Ok(vec![combined]),
+        Some(combined) => Ok(combined),
         None => Err(DataFusionError::Internal(
             "Failed to build delete filters: no row predicates generated".to_string(),
         )),

@@ -50,6 +50,7 @@ impl CloudClient {
     /// [`Self::with_timeout`] to override the default 30-second timeout.
     pub fn new(base_url: &str) -> Result<Self> {
         let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
             .timeout(DEFAULT_TIMEOUT)
             .https_only(true)
             .build()
@@ -81,6 +82,7 @@ impl CloudClient {
     /// Returns an error if the HTTP client cannot be rebuilt with the given timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self> {
         self.client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
             .timeout(timeout)
             .https_only(true)
             .build()

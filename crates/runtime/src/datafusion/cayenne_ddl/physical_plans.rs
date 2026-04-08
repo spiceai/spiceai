@@ -478,10 +478,12 @@ impl ExecutionPlan for CayenneCreateTableExec {
                 use datafusion::sql::sqlparser::parser::Parser;
                 let dialect = GenericDialect {};
                 if let Ok(mut parser) = Parser::new(&dialect).try_with_sql(sql)
-                    && let Ok(datafusion::sql::sqlparser::ast::Expr::Identifier(ident)) =
-                        parser.parse_expr().as_ref()
+                    && let Ok(sql_expr) = parser.parse_expr()
                 {
-                    return ident.value.clone();
+                    // Check if it's a simple column reference
+                    if let datafusion::sql::sqlparser::ast::Expr::Identifier(ident) = &sql_expr {
+                        return ident.value.clone();
+                    }
                 }
                 // Fall back to auto-generated label
                 "expr0".to_string()

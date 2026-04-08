@@ -248,6 +248,8 @@ fn create_http_exporter(endpoint: &str) -> Result<MetricExporter> {
     };
 
     let http_client = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| Error::ExporterCreationFailed {
             message: format!("Failed to build OTEL HTTP client: {e}"),
