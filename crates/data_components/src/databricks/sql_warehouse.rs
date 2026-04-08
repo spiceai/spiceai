@@ -1530,9 +1530,11 @@ mod tests {
                         response.status_line,
                         response.body.len()
                     );
-                    use std::fmt::Write as _;
                     for (header_name, header_value) in response.headers {
-                        let _ = write!(http_response, "{header_name}: {header_value}\r\n");
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut http_response,
+                            format_args!("{header_name}: {header_value}\r\n"),
+                        );
                     }
                     http_response.push_str("\r\n");
                     http_response.push_str(&response.body);
