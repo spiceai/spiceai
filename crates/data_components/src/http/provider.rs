@@ -4409,6 +4409,124 @@ mod tests {
     }
 
     #[test]
+    fn test_split_link_header_top_level_basic() {
+        // Comma outside angle brackets splits normally
+        let result = split_link_header_top_level("<a>; rel=prev, <b>; rel=next", ',');
+        assert_eq!(result, vec!["<a>; rel=prev", "<b>; rel=next"]);
+
+        // Comma inside angle brackets is preserved
+        let result = split_link_header_top_level("<a?x=1,2>; rel=next", ',');
+        assert_eq!(result, vec!["<a?x=1,2>; rel=next"]);
+
+        // Semicolons inside quoted strings are not split
+        let result = split_link_header_top_level(r#"<a>; title="a;b"; rel=next"#, ';');
+        assert_eq!(result, vec!["<a>", r#"title="a;b""#, "rel=next"]);
+    }
+
+    #[test]
+    fn test_split_link_header_top_level_escaped_quotes() {
+        // Escaped quote inside a quoted string should not close the string
+        let result =
+            split_link_header_top_level(r#"<a>; title="has \"escaped\" quotes"; rel=next"#, ';');
+        assert_eq!(
+            result,
+            vec!["<a>", r#"title="has \"escaped\" quotes""#, "rel=next"]
+        );
+    }
+
+    #[test]
+    fn test_split_link_header_top_level_empty_and_single() {
+        assert_eq!(split_link_header_top_level("", ','), vec![""]);
+        assert_eq!(
+            split_link_header_top_level("<a>; rel=next", ','),
+            vec!["<a>; rel=next"]
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_case_insensitive_rel() {
+        // REL and NEXT should be matched case-insensitively
+        assert_eq!(
+            parse_link_header_next(r#"<https://api.example.com/page2>; REL="NEXT""#),
+            Some("https://api.example.com/page2".to_string())
+        );
+
+        assert_eq!(
+            parse_link_header_next("<https://api.example.com/page2>; Rel=Next"),
+            Some("https://api.example.com/page2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_extra_params() {
+        // Link with additional params like type and title
+        assert_eq!(
+            parse_link_header_next(
+                r#"<https://api.example.com/page2>; rel="next"; type="application/json"; title="Next Page""#
+            ),
+            Some("https://api.example.com/page2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_whitespace_variations() {
+        // No spaces around semicolons
+        assert_eq!(
+            parse_link_header_next(r#"<https://api.example.com/page2>;rel="next""#),
+            Some("https://api.example.com/page2".to_string())
+        );
+
+        // Extra whitespace
+        assert_eq!(
+            parse_link_header_next(r#"  <https://api.example.com/page2> ;  rel="next"  "#),
+            Some("https://api.example.com/page2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_malformed() {
+        // Missing angle brackets
+        assert_eq!(
+            parse_link_header_next(r#"https://api.example.com/page2; rel="next""#),
+            None
+        );
+
+        // No rel param at all
+        assert_eq!(
+            parse_link_header_next(r#"<https://api.example.com/page2>; type="text/html""#),
+            None
+        );
+
+        // rel="last" only
+        assert_eq!(
+            parse_link_header_next(r#"<https://api.example.com/page2>; rel="last""#),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_next_is_second_link() {
+        // rel="next" is on the second link, not the first
+        assert_eq!(
+            parse_link_header_next(
+                r#"<https://api.example.com/page1>; rel="first", <https://api.example.com/page2>; rel="next", <https://api.example.com/page99>; rel="last""#
+            ),
+            Some("https://api.example.com/page2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_semicolon_in_quoted_title() {
+        // Semicolons inside quoted title param must not break parsing
+        assert_eq!(
+            parse_link_header_next(
+                r#"<https://api.example.com/page2>; title="Page; 2"; rel="next""#
+            ),
+            Some("https://api.example.com/page2".to_string())
+        );
+    }
+
+    #[test]
     fn test_merge_queries_all_sources() {
         let result = merge_queries(
             Some("api_key=secret"),
