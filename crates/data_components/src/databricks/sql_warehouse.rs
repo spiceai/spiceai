@@ -253,10 +253,10 @@ impl SqlWarehouseApi {
 
         match schema_from_json(&response, &table.to_string()) {
             Ok(schema) => Ok(schema),
-            Err(Error::QueryFailure { ref message })
-                if message.contains("UNRESOLVED_COLUMN") =>
-            {
-                tracing::warn!("Databricks information_schema does not have 'full_data_type' column, falling back to 'data_type'. Complex types (ARRAY, MAP, STRUCT) may lose inner type details.");
+            Err(Error::QueryFailure { ref message }) if message.contains("UNRESOLVED_COLUMN") => {
+                tracing::warn!(
+                    "Databricks information_schema does not have 'full_data_type' column, falling back to 'data_type'. Complex types (ARRAY, MAP, STRUCT) may lose inner type details."
+                );
                 let payload = self.create_schema_payload(table, "data_type")?;
                 let response = self.execute_sql_statement(&token, &payload).await?;
                 let response = self.wait_for_statement_completion(&token, response).await?;
@@ -1641,8 +1641,11 @@ mod tests {
             }
         });
 
-        let port =
-            start_mock_server(vec![unresolved_column_response, success_response], json!({})).await;
+        let port = start_mock_server(
+            vec![unresolved_column_response, success_response],
+            json!({}),
+        )
+        .await;
         let api = create_test_api(port);
         let table = TableReference::full("my_catalog", "my_schema", "my_table");
 
@@ -1735,7 +1738,9 @@ mod tests {
             Arc::clone(&ipc_schema),
             vec![
                 Arc::new(arrow::array::Int32Array::from(vec![1])),
-                Arc::new(TimestampMicrosecondArray::from(vec![sentinel_us]).with_timezone("Etc/UTC")),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![sentinel_us]).with_timezone("Etc/UTC"),
+                ),
                 Arc::new(TimestampMicrosecondArray::from(vec![sentinel_us])),
             ],
         )
@@ -1755,7 +1760,11 @@ mod tests {
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
             .expect("should be TimestampMicrosecondArray");
-        assert_eq!(ts_col.value(0), sentinel_us, "sentinel value must be preserved");
+        assert_eq!(
+            ts_col.value(0),
+            sentinel_us,
+            "sentinel value must be preserved"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

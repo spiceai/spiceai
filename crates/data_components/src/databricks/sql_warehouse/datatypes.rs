@@ -527,19 +527,15 @@ mod tests {
         // come without type parameters (e.g. just "ARRAY" instead of "ARRAY<STRING>").
         let mut parser = Parser::new("ARRAY");
         let result = parser.parse().expect("parse ARRAY without params");
-        let expected_array = ArrowDataType::List(Arc::new(ArrowField::new(
-            "item",
-            ArrowDataType::Utf8,
-            true,
-        )));
+        let expected_array =
+            ArrowDataType::List(Arc::new(ArrowField::new("item", ArrowDataType::Utf8, true)));
         assert_eq!(result, expected_array);
 
         let mut parser = Parser::new("MAP");
         let result = parser.parse().expect("parse MAP without params");
         let key = Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false));
         let val = Arc::new(ArrowField::new("value", ArrowDataType::Utf8, true));
-        let entries =
-            Arc::new(ArrowField::new_struct("entries", vec![key, val], true));
+        let entries = Arc::new(ArrowField::new_struct("entries", vec![key, val], true));
         let expected_map = ArrowDataType::Map(entries, false);
         assert_eq!(result, expected_map);
 

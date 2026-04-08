@@ -876,15 +876,12 @@ mod test {
             true,
         )]));
 
-        let source_array = TimestampMicrosecondArray::from(vec![
-            Some(sentinel_us),
-            Some(normal_us),
-            None,
-        ])
-        .with_timezone("UTC");
+        let source_array =
+            TimestampMicrosecondArray::from(vec![Some(sentinel_us), Some(normal_us), None])
+                .with_timezone("UTC");
 
-        let batch = RecordBatch::try_new(source_schema, vec![Arc::new(source_array)])
-            .expect("valid batch");
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(source_array)]).expect("valid batch");
 
         let target_schema = Arc::new(Schema::new(vec![Field::new(
             "ts",
@@ -932,8 +929,8 @@ mod test {
         let source_array =
             TimestampMicrosecondArray::from(vec![Some(value_us)]).with_timezone("UTC");
 
-        let batch = RecordBatch::try_new(source_schema, vec![Arc::new(source_array)])
-            .expect("valid batch");
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(source_array)]).expect("valid batch");
 
         let target_schema = Arc::new(Schema::new(vec![Field::new(
             "ts",
@@ -971,8 +968,8 @@ mod test {
             .with_precision_and_scale(38, 9)
             .expect("valid");
 
-        let batch = RecordBatch::try_new(source_schema, vec![Arc::new(source_array)])
-            .expect("valid batch");
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(source_array)]).expect("valid batch");
 
         let target_schema = Arc::new(Schema::new(vec![Field::new(
             "amount",
