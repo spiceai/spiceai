@@ -253,9 +253,11 @@ impl SqlWarehouseApi {
 
         match schema_from_json(&response, &table.to_string()) {
             Ok(schema) => Ok(schema),
-            Err(Error::QueryFailure { ref message }) if message.contains("UNRESOLVED_COLUMN") => {
+            Err(Error::QueryFailure { ref message })
+                if message.contains("UNRESOLVED_COLUMN") && message.contains("full_data_type") =>
+            {
                 tracing::warn!(
-                    "Databricks information_schema does not have 'full_data_type' column, falling back to 'data_type'. Complex types (ARRAY, MAP, STRUCT) may lose inner type details."
+                    "Databricks information_schema for '{table}' does not have 'full_data_type' column, falling back to 'data_type'. Complex types (ARRAY, MAP, STRUCT) may lose inner type details."
                 );
                 let payload = self.create_schema_payload(table, "data_type")?;
                 let response = self.execute_sql_statement(&token, &payload).await?;
@@ -1788,6 +1790,33 @@ mod tests {
             .expect_err("should propagate non-UNRESOLVED_COLUMN error");
         assert!(
             matches!(&err, Error::QueryFailure { message } if message.contains("Table or view not found")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_get_schema_no_fallback_for_unresolved_column_other_than_full_data_type() {
+        // UNRESOLVED_COLUMN for a column other than full_data_type should NOT trigger fallback.
+        let unresolved_other = json!({
+            "status": {
+                "state": "FAILED",
+                "error": {
+                    "message": "[UNRESOLVED_COLUMN.WITH_SUGGESTION] A column or function parameter with name `some_other_col` cannot be resolved."
+                }
+            },
+            "statement_id": "stmt-1"
+        });
+
+        let port = start_mock_server(vec![unresolved_other], json!({})).await;
+        let api = create_test_api(port);
+        let table = TableReference::full("catalog", "schema", "my_table");
+
+        let err = api
+            .get_schema(&table)
+            .await
+            .expect_err("should not fall back for unrelated UNRESOLVED_COLUMN");
+        assert!(
+            matches!(&err, Error::QueryFailure { message } if message.contains("UNRESOLVED_COLUMN")),
             "unexpected error: {err}"
         );
     }
