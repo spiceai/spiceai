@@ -571,6 +571,8 @@ pub struct DataFusion {
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
     /// Executor registry for distributed write forwarding (scheduler mode only).
     pub executor_registry: Option<Arc<ExecutorRegistry>>,
+    #[cfg(not(windows))]
+    pub(crate) cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -2720,7 +2722,7 @@ impl DataFusion {
             cluster_role: self.cluster_config.effective_role(),
             ddl_extension_store: Arc::clone(&self.ddl_extension_store),
             executor_registry: self.executor_registry.clone(),
-            ddl_handler: None,
+            ddl_handler: self.cayenne_ddl_handler.clone(),
         };
 
         planner::create_logical_plan(sql, session, &ctx).await
