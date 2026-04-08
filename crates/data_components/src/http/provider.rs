@@ -1235,10 +1235,9 @@ impl HttpExec {
                 "request_body" => {
                     Ok(Arc::new(StringArray::from(vec![body_for_batch; num_rows])) as ArrayRef)
                 }
-                "content" => {
-                    let values: Vec<&str> = content_rows.iter().map(String::as_str).collect();
-                    Ok(Arc::new(StringArray::from(values)) as ArrayRef)
-                }
+                "content" => Ok(Arc::new(StringArray::from_iter_values(
+                    content_rows.iter().map(String::as_str),
+                )) as ArrayRef),
                 "response_status" => Ok(Arc::new(UInt16Array::from(vec![
                     fetch_result
                         .response_status;
@@ -1427,6 +1426,8 @@ impl ExecutionPlan for HttpExec {
                 body,
                 limit,
                 done: false,
+                last_page_path: None,
+                last_page_query: None,
             };
 
             let stream = futures::stream::try_unfold(initial_state, move |mut state| {
@@ -1462,30 +1463,44 @@ impl ExecutionPlan for HttpExec {
                         let path_val = state.path.as_deref().unwrap_or("");
                         let query_val = state.query.as_deref();
                         let body_val = state.body.as_deref();
+                        state.last_page_path = state.path.clone();
+                        state.last_page_query = state.query.clone();
                         provider
                             .get_response(path_val, query_val, body_val)
                             .await
                             .map_err(DataFusionError::from)?
                     } else {
+                        // Subsequent pages bypass the HTTP cache intentionally:
+                        // each page has unique content that shouldn't be cached
+                        // under the same key as the base request.
                         match &state.next_info {
-                            Some(NextPageInfo::Url(url)) => provider
-                                .perform_request_with_retry(
-                                    url.clone(),
-                                    state.body.as_deref(),
-                                    &format!("page_{}", state.page),
-                                )
-                                .await
-                                .map_err(DataFusionError::from)?,
+                            Some(NextPageInfo::Url(url)) => {
+                                state.last_page_path = Some(url.path().to_string());
+                                state.last_page_query = url.query().map(ToString::to_string);
+                                provider
+                                    .perform_request_with_retry(
+                                        url.clone(),
+                                        state.body.as_deref(),
+                                        &format!("page_{}", state.page),
+                                    )
+                                    .await
+                                    .map_err(DataFusionError::from)?
+                            }
                             Some(NextPageInfo::Token(token)) => {
                                 let path_val = state.path.as_deref().unwrap_or("");
                                 let token_param = config.token_param.as_deref().unwrap_or("cursor");
-                                let new_query = build_query_with_token(
+                                // Merge base URL query, partition query, and token param
+                                let base_query = provider.base_url.query();
+                                let merged_query = merge_queries(
+                                    base_query,
                                     state.query.as_deref(),
                                     token_param,
                                     token,
                                 );
+                                state.last_page_path = state.path.clone();
+                                state.last_page_query = Some(merged_query.clone());
                                 let url = provider
-                                    .build_request_url(path_val, Some(&new_query))
+                                    .build_request_url(path_val, Some(&merged_query))
                                     .map_err(DataFusionError::from)?;
                                 provider
                                     .perform_request_with_retry(
@@ -1525,21 +1540,22 @@ impl ExecutionPlan for HttpExec {
                         state.done = true;
                     }
 
+                    // Skip empty pages internally instead of yielding empty batches
                     if content_rows.is_empty() {
-                        // No data rows on this page — if there's a next page, continue;
-                        // otherwise stop.
                         if state.done {
                             return Ok(None);
                         }
-                        // Yield an empty batch to continue the stream
-                        let batch = RecordBatch::new_empty(Arc::clone(&exec.projected_schema));
-                        return Ok(Some((batch, state)));
+                        // Continue to next iteration — try_unfold will call us again
+                        return Ok(Some((
+                            RecordBatch::new_empty(Arc::clone(&exec.projected_schema)),
+                            state,
+                        )));
                     }
 
                     let num_rows = content_rows.len();
                     let batch = exec.create_batch_from_rows(
-                        state.path.as_deref(),
-                        state.query.as_deref(),
+                        state.last_page_path.as_deref(),
+                        state.last_page_query.as_deref(),
                         state.body.as_deref(),
                         &content_rows,
                         &fetch_result,
@@ -1598,6 +1614,10 @@ struct PaginationState {
     body: Option<String>,
     limit: Option<usize>,
     done: bool,
+    /// The actual path/query used for the most recent page fetch.
+    /// Used to populate accurate `request_path`/`request_query` columns.
+    last_page_path: Option<String>,
+    last_page_query: Option<String>,
 }
 
 /// Resolve a next-page URL string (absolute or relative) against the base URL
@@ -1688,6 +1708,9 @@ fn extract_next_page_info(
 }
 
 /// Parse an HTTP `Link` header to find a URI with `rel="next"`.
+/// Handles quoted (`rel="next"`), single-quoted (`rel='next'`), and
+/// unquoted (`rel=next`) forms, as well as multi-value rel lists
+/// (e.g., `rel="next prev"`).
 fn parse_link_header_next(header_value: &str) -> Option<String> {
     for link in header_value.split(',') {
         let link = link.trim();
@@ -1695,7 +1718,14 @@ fn parse_link_header_next(header_value: &str) -> Option<String> {
         let url_part = parts.next()?.trim();
         let is_next = parts.any(|p| {
             let p = p.trim().to_lowercase();
-            p == "rel=\"next\"" || p == "rel='next'"
+            // Strip "rel=" prefix, then strip optional quotes
+            if let Some(val) = p.strip_prefix("rel=") {
+                let val = val.trim_matches('"').trim_matches('\'');
+                // Check if "next" is one of the space-separated rel values
+                val.split_whitespace().any(|v| v == "next")
+            } else {
+                false
+            }
         });
         if is_next && url_part.starts_with('<') && url_part.ends_with('>') {
             return Some(url_part[1..url_part.len() - 1].to_string());
@@ -1738,18 +1768,38 @@ fn extract_page_data(
     Ok(HttpExec::parse_content(content, limit))
 }
 
-/// Build a query string by adding or replacing a token parameter.
-/// Uses `url::form_urlencoded` for proper percent-encoding.
-fn build_query_with_token(existing_query: Option<&str>, param: &str, token: &str) -> String {
-    let mut pairs: Vec<(String, String)> = if let Some(existing) = existing_query {
-        url::form_urlencoded::parse(existing.as_bytes())
-            .filter(|(key, _)| key != param)
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    pairs.push((param.to_string(), token.to_string()));
+/// Merge base URL query params, partition query params, and a pagination token
+/// into a single query string. Base URL params come first, then partition params
+/// (overriding any base duplicates), then the token param (overriding any existing).
+fn merge_queries(
+    base_query: Option<&str>,
+    partition_query: Option<&str>,
+    token_param: &str,
+    token: &str,
+) -> String {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    // Start with base URL query params
+    if let Some(base) = base_query {
+        pairs.extend(
+            url::form_urlencoded::parse(base.as_bytes())
+                .map(|(k, v)| (k.into_owned(), v.into_owned())),
+        );
+    }
+
+    // Override/add partition query params
+    if let Some(partition) = partition_query {
+        for (key, value) in url::form_urlencoded::parse(partition.as_bytes()) {
+            // Remove any existing base param with the same key
+            let key_str: &str = &key;
+            pairs.retain(|(k, _)| k != key_str);
+            pairs.push((key.into_owned(), value.into_owned()));
+        }
+    }
+
+    // Remove any existing token param before adding the new one
+    pairs.retain(|(k, _)| k != token_param);
+    pairs.push((token_param.to_string(), token.to_string()));
 
     url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(pairs)
@@ -2079,6 +2129,11 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use url::Url;
+
+    /// Build a query string by adding or replacing a token parameter.
+    fn build_query_with_token(existing_query: Option<&str>, param: &str, token: &str) -> String {
+        merge_queries(None, existing_query, param, token)
+    }
 
     fn base_provider() -> HttpTableProvider {
         HttpTableProvider::new(
@@ -4154,6 +4209,91 @@ mod tests {
         assert!(
             result.is_err(),
             "data_pointer without leading '/' should fail"
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_unquoted_rel() {
+        assert_eq!(
+            parse_link_header_next("<https://api.example.com/items?page=2>; rel=next"),
+            Some("https://api.example.com/items?page=2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_link_header_multi_rel() {
+        // rel with multiple values: "next prev"
+        assert_eq!(
+            parse_link_header_next(r#"<https://api.example.com/items?page=2>; rel="next prev""#),
+            Some("https://api.example.com/items?page=2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_merge_queries_all_sources() {
+        let result = merge_queries(
+            Some("api_key=secret"),
+            Some("filter=active"),
+            "cursor",
+            "abc123",
+        );
+        assert!(
+            result.contains("api_key=secret"),
+            "should include base URL params: {result}"
+        );
+        assert!(
+            result.contains("filter=active"),
+            "should include partition params: {result}"
+        );
+        assert!(
+            result.contains("cursor=abc123"),
+            "should include token: {result}"
+        );
+    }
+
+    #[test]
+    fn test_merge_queries_partition_overrides_base() {
+        let result = merge_queries(
+            Some("page=1&api_key=secret"),
+            Some("page=5"),
+            "cursor",
+            "abc",
+        );
+        // "page" from partition should override base
+        let page_count = result.matches("page=").count();
+        assert_eq!(
+            page_count, 1,
+            "partition should override base param, got: {result}"
+        );
+        assert!(
+            result.contains("page=5"),
+            "partition value should win: {result}"
+        );
+    }
+
+    #[test]
+    fn test_merge_queries_no_base() {
+        let result = merge_queries(None, Some("filter=active"), "cursor", "abc123");
+        assert!(
+            result.contains("filter=active"),
+            "should include partition params: {result}"
+        );
+        assert!(
+            result.contains("cursor=abc123"),
+            "should include token: {result}"
+        );
+    }
+
+    #[test]
+    fn test_merge_queries_no_partition() {
+        let result = merge_queries(Some("api_key=secret"), None, "cursor", "abc123");
+        assert!(
+            result.contains("api_key=secret"),
+            "should include base params: {result}"
+        );
+        assert!(
+            result.contains("cursor=abc123"),
+            "should include token: {result}"
         );
     }
 }
