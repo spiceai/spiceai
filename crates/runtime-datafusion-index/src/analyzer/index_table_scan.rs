@@ -472,14 +472,12 @@ impl ExecutionPlan for IndexerExec {
         context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
         let schema = self.input_exec.schema();
-        let expected_schema = Arc::clone(&schema);
         let indexes = self.indexes.clone();
         let stream = self
             .input_exec
             .execute(partition, Arc::clone(&context))?
             .and_then(move |batch| {
                 let indexes = indexes.clone();
-                let expected_schema = Arc::clone(&expected_schema);
                 async move {
                     let mut b = batch;
 
@@ -487,6 +485,7 @@ impl ExecutionPlan for IndexerExec {
                     // the same schema. The indexes are executed in order, with the output of the
                     // first index becoming the input of the second, etc.
                     for idx in &indexes {
+                        let schema_before = b.schema();
                         let mut out = idx.compute_index(vec![b]).await?;
 
                         match out.len() {
@@ -494,15 +493,15 @@ impl ExecutionPlan for IndexerExec {
                                 b = out
                                     .pop()
                                     .unwrap_or_else(|| unreachable!("length is checked"));
-                                if b.schema().as_ref() != expected_schema.as_ref() {
-                                    let exp = schema_signature(expected_schema.as_ref());
+                                if b.schema().fields() != schema_before.fields() {
+                                    let exp = schema_signature(schema_before.as_ref());
                                     let got = schema_signature(b.schema().as_ref());
                                     return Err(DataFusionError::Execution(format!(
                                         "Index {} changed schema.\
                                         Expected fields ({}): {}\
                                         Got fields ({}): {}",
                                         idx.name(),
-                                        expected_schema.fields().len(),
+                                        schema_before.fields().len(),
                                         exp,
                                         b.schema().fields().len(),
                                         got,
