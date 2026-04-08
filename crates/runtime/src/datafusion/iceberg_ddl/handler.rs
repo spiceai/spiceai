@@ -53,7 +53,6 @@ impl IcebergDdlHandler {
     }
 
     fn get_iceberg_catalog(
-        &self,
         catalog_name: &str,
         catalog_list: &Arc<dyn CatalogProviderList>,
     ) -> Option<Arc<dyn iceberg::Catalog>> {
@@ -75,8 +74,7 @@ impl CatalogDdlHandler for IcebergDdlHandler {
         catalog_name: &str,
         catalog_list: &Arc<dyn CatalogProviderList>,
     ) -> bool {
-        self.get_iceberg_catalog(catalog_name, catalog_list)
-            .is_some()
+        Self::get_iceberg_catalog(catalog_name, catalog_list).is_some()
     }
 
     fn create_table_exec(
@@ -85,8 +83,7 @@ impl CatalogDdlHandler for IcebergDdlHandler {
         catalog_list: Arc<dyn CatalogProviderList>,
         _session_state: &SessionState,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let iceberg_catalog = self
-            .get_iceberg_catalog(&params.catalog_name, &catalog_list)
+        let iceberg_catalog = Self::get_iceberg_catalog(&params.catalog_name, &catalog_list)
             .ok_or_else(|| {
                 DataFusionError::Plan(format!(
                     "Catalog '{}' is not an Iceberg catalog",
@@ -120,8 +117,7 @@ impl CatalogDdlHandler for IcebergDdlHandler {
         params: DropTableParams,
         catalog_list: Arc<dyn CatalogProviderList>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let iceberg_catalog = self
-            .get_iceberg_catalog(&params.catalog_name, &catalog_list)
+        let iceberg_catalog = Self::get_iceberg_catalog(&params.catalog_name, &catalog_list)
             .ok_or_else(|| {
                 DataFusionError::Plan(format!(
                     "Catalog '{}' is not an Iceberg catalog",
@@ -147,8 +143,7 @@ impl CatalogDdlHandler for IcebergDdlHandler {
         catalog_list: Arc<dyn CatalogProviderList>,
         _session_state: &SessionState,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let iceberg_catalog = self
-            .get_iceberg_catalog(&params.catalog_name, &catalog_list)
+        let iceberg_catalog = Self::get_iceberg_catalog(&params.catalog_name, &catalog_list)
             .ok_or_else(|| {
                 DataFusionError::Plan(format!(
                     "Catalog '{}' is not an Iceberg catalog",

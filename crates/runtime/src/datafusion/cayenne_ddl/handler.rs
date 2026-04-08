@@ -90,7 +90,7 @@ impl CatalogDdlHandler for DistributedCayenneDdlHandler {
                 ))),
             },
             catalog_list,
-            self.executor_registry.clone(),
+            Arc::clone(&self.executor_registry),
             Arc::clone(session_state.runtime_env()),
         )))
     }
@@ -106,7 +106,7 @@ impl CatalogDdlHandler for DistributedCayenneDdlHandler {
             params.catalog_name,
             params.schema_name,
             catalog_list,
-            self.executor_registry.clone(),
+            Arc::clone(&self.executor_registry),
         )))
     }
 

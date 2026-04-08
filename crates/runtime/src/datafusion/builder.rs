@@ -300,7 +300,7 @@ impl DataFusionBuilder {
             .with_default_features()
             .with_query_planner(Arc::new(
                 ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners(
-                    self.executor_registry.clone(),
+                    Arc::clone(&self.executor_registry),
                     self.io_runtime.clone(),
                 )),
             ))

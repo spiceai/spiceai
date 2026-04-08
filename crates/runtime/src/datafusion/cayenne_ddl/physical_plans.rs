@@ -25,7 +25,7 @@ limitations under the License.
 //!
 //! **DML (distributed)**: `DistributedCayenneDeleteExec`, `DistributedCayenneUpdateExec`,
 //! `DistributedCayenneInsertExec`, `DistributedCayenneMergeExec` forward DML SQL
-//! verbatim to all connected executor nodes via FlightSQL.
+//! verbatim to all connected executor nodes via `FlightSQL`.
 
 use std::any::Any;
 use std::fmt;
@@ -160,7 +160,7 @@ async fn forward_sql_to_executor(
 /// Broadcast physical plan for `CREATE TABLE` on a Cayenne catalog.
 ///
 /// 1. Checks that at least one executor is connected (distributed mode guard).
-/// 2. Calls [`create_table`] to register in metadata + DataFusion.
+/// 2. Calls [`create_table`] to register in metadata + `DataFusion`.
 /// 3. Initialises partition metadata on the scheduler.
 /// 4. Forwards the `CREATE TABLE` DDL SQL to all executor nodes.
 /// 5. Copies partition-to-executor assignments for `LIKE` tables.
@@ -256,7 +256,7 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
         let like_source_table = self.params.like_source_table.clone();
         let ctx_opt = self.params.ctx.clone();
         let catalog_list = Arc::clone(&self.catalog_list);
-        let executor_registry = self.executor_registry.clone();
+        let executor_registry = Arc::clone(&self.executor_registry);
         let arrow_schema_fwd = Arc::clone(&self.arrow_schema_for_fwd);
         let primary_key_fwd = self.primary_key_for_fwd.clone();
         let runtime_env = Arc::clone(&self.runtime_env);
@@ -306,7 +306,7 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
             );
 
             // 3. Initialise partition metadata so the scheduler can route queries.
-            if let Some(expr_sql) = partition_expr_sql.as_ref().cloned() {
+            if let Some(expr_sql) = partition_expr_sql.clone() {
                 let pm = executor_registry.federated_partition_manager();
                 if let Err(e) = pm.initialize_metadata(&table_ref, vec![expr_sql]).await {
                     tracing::warn!(
@@ -503,7 +503,7 @@ impl ExecutionPlan for DistributedCayenneDropTableExec {
         let catalog_name = self.df_catalog_name.clone();
         let schema_name = self.df_schema_name.clone();
         let catalog_list = Arc::clone(&self.catalog_list);
-        let executor_registry = self.executor_registry.clone();
+        let executor_registry = Arc::clone(&self.executor_registry);
         let result_schema = ddl_result_schema();
 
         let stream = futures::stream::once(async move {
@@ -627,7 +627,7 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
         })?;
         Ok(Arc::new(Self::new(
             self.table_name.clone(),
-            self.executor_registry.clone(),
+            Arc::clone(&self.executor_registry),
             self.filter_sql.clone(),
             input,
         )))
@@ -638,7 +638,7 @@ impl ExecutionPlan for DistributedCayenneDeleteExec {
         _context: Arc<TaskContext>,
     ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
         let table_name = self.table_name.clone();
-        let executor_registry = self.executor_registry.clone();
+        let executor_registry = Arc::clone(&self.executor_registry);
         let filter_sql = self.filter_sql.clone();
         let result_schema = dml_count_schema();
         let stream = futures::stream::once(async move {
@@ -728,7 +728,7 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
         })?;
         Ok(Arc::new(Self::new(
             self.table_name.clone(),
-            self.executor_registry.clone(),
+            Arc::clone(&self.executor_registry),
             self.filter_sql.clone(),
             self.assignments_sql.clone(),
             input,
@@ -740,7 +740,7 @@ impl ExecutionPlan for DistributedCayenneUpdateExec {
         _context: Arc<TaskContext>,
     ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
         let table_name = self.table_name.clone();
-        let executor_registry = self.executor_registry.clone();
+        let executor_registry = Arc::clone(&self.executor_registry);
         let filter_sql = self.filter_sql.clone();
         let assignments_sql = self.assignments_sql.clone();
         let result_schema = dml_count_schema();
@@ -841,7 +841,7 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
         })?;
         Ok(Arc::new(Self::new(
             self.table_name.clone(),
-            self.executor_registry.clone(),
+            Arc::clone(&self.executor_registry),
             Arc::clone(&self.ctx),
             self.io_runtime.clone(),
             input,
@@ -853,7 +853,7 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
         context: Arc<TaskContext>,
     ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
         let table_name = self.table_name.clone();
-        let executor_registry = self.executor_registry.clone();
+        let executor_registry = Arc::clone(&self.executor_registry);
         let ctx = Arc::clone(&self.ctx);
         let io_runtime = self.io_runtime.clone();
         let input = Arc::clone(&self.input);
@@ -1027,7 +1027,7 @@ impl ExecutionPlan for DistributedCayenneMergeExec {
         let source_table = self.source_table.clone();
         let on_keys = self.on_keys.clone();
         let original_sql = self.original_sql.clone();
-        let executor_registry = self.executor_registry.clone();
+        let executor_registry = Arc::clone(&self.executor_registry);
         let ctx = Arc::clone(&self.ctx);
         let result_schema = dml_count_schema();
         let stream = futures::stream::once(async move {
@@ -1052,6 +1052,7 @@ impl ExecutionPlan for DistributedCayenneMergeExec {
     }
 }
 
+#[expect(clippy::items_after_statements)]
 async fn validate_partition_compatibility(
     registry: &ExecutorRegistry,
     ctx: &datafusion::prelude::SessionContext,
@@ -1063,6 +1064,25 @@ async fn validate_partition_compatibility(
     use datafusion::sql::sqlparser::dialect::GenericDialect;
     use datafusion::sql::sqlparser::parser::Parser;
     use std::ops::ControlFlow;
+
+    struct ColumnCollector {
+        columns: Vec<String>,
+    }
+    impl Visitor for ColumnCollector {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<Self::Break> {
+            match expr {
+                SqlExpr::Identifier(ident) => self.columns.push(ident.value.clone()),
+                SqlExpr::CompoundIdentifier(idents) => {
+                    if let Some(last) = idents.last() {
+                        self.columns.push(last.value.clone());
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
 
     let target_partition = crate::datafusion::DataFusion::get_table_partition_expr_from_ctx(
         ctx,
@@ -1091,25 +1111,6 @@ async fn validate_partition_compatibility(
         return Err(DataFusionError::Plan(format!(
             "Distributed MERGE requires identical partition expressions. Target: '{target_part}', Source: '{source_part}'"
         )));
-    }
-
-    struct ColumnCollector {
-        columns: Vec<String>,
-    }
-    impl Visitor for ColumnCollector {
-        type Break = ();
-        fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<Self::Break> {
-            match expr {
-                SqlExpr::Identifier(ident) => self.columns.push(ident.value.clone()),
-                SqlExpr::CompoundIdentifier(idents) => {
-                    if let Some(last) = idents.last() {
-                        self.columns.push(last.value.clone());
-                    }
-                }
-                _ => {}
-            }
-            ControlFlow::Continue(())
-        }
     }
 
     let dialect = GenericDialect {};

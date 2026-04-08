@@ -2721,7 +2721,7 @@ impl DataFusion {
             },
             cluster_role: self.cluster_config.effective_role(),
             ddl_extension_store: Arc::clone(&self.ddl_extension_store),
-            executor_registry: self.executor_registry.clone(),
+            executor_registry: Arc::clone(&self.executor_registry),
             ddl_handler: self.cayenne_ddl_handler.clone(),
         };
 
