@@ -26,8 +26,8 @@ use crate::{
     datafusion::request_context_extension::get_current_datafusion,
     flight::{metrics, util::attach_cache_metadata},
 };
-use telemetry::timing::TimedStream;
 use runtime_request_context::{AsyncMarker, RequestContext};
+use telemetry::timing::TimedStream;
 
 use super::{Service, flightsql, to_tonic_err};
 

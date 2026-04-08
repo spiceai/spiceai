@@ -142,11 +142,14 @@ mod tests {
     #[tokio::test]
     async fn test_task_is_cancelled_gracefully() {
         let cancellation_token = CancellationToken::new();
-        let (task_future, handle) =
-            spawn_cancellable_task(Some(cancellation_token.clone()), async move {
+        let (task_future, handle) = spawn_cancellable_task(
+            Some(cancellation_token.clone()),
+            async move {
                 cancellation_token.cancelled().await;
                 Ok::<(), TestError>(())
-            }, map_join_error);
+            },
+            map_join_error,
+        );
 
         let cancel_future = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;

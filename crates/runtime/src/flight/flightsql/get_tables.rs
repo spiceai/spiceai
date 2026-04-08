@@ -21,7 +21,6 @@ use crate::{
         util::set_flightsql_protocol,
     },
 };
-use telemetry::timing::TimedStream;
 use arrow_flight::{
     FlightDescriptor, FlightEndpoint, FlightInfo, Ticket, flight_service_server::FlightService, sql,
 };
@@ -29,6 +28,7 @@ use arrow_schema::Schema;
 use arrow_tools::schema::to_source_native_type_name;
 use datafusion::datasource::TableType;
 use runtime_request_context::{AsyncMarker, RequestContext};
+use telemetry::timing::TimedStream;
 use tonic::{Request, Response, Status};
 
 pub(crate) async fn get_flight_info(
