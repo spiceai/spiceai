@@ -1,14 +1,18 @@
 ---
 source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
-expression: plan
+expression: __plan
+snapshot_kind: text
 ---
-+---------------+-----------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                          |
-+---------------+-----------------------------------------------------------------------------------------------+
-| logical_plan  | Aggregate: groupBy=[[]], aggr=[[sum(ncat.ns.metrics.value)]]                                  |
-|               |   TableScan: ncat.ns.metrics projection=[value]                                               |
-| physical_plan | AggregateExec: mode=Final, gby=[], aggr=[sum(ncat.ns.metrics.value)]                          |
-|               |   CoalescePartitionsExec                                                                      |
-|               |     PartialAggregationFlightSqlExec sql=SELECT SUM("value") AS "__agg_0" FROM ncat.ns.metrics |
-|               |                                                                                               |
-+---------------+-----------------------------------------------------------------------------------------------+
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                             |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                        |
+|               |  Projection: sum(ncat.ns.metrics.value)                                                                                                          |
+|               |   Aggregate: groupBy=[[]], aggr=[[sum(ncat.ns.metrics.value)]]                                                                                   |
+|               |     TableScan: ncat.ns.metrics projection=[value]                                                                                                |
+| physical_plan | SchemaCastScanExec                                                                                                                               |
+|               |   CooperativeExec                                                                                                                                |
+|               |     BytesProcessedExec                                                                                                                           |
+|               |       VirtualExecutionPlan name=flightsql compute_context=endpoint=[endpoint] base_sql=SELECT sum("metrics"."value") FROM ncat.ns."metrics" |
+|               |                                                                                                                                                  |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------+

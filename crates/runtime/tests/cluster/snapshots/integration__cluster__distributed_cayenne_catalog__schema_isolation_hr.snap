@@ -1,18 +1,19 @@
 ---
 source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
-expression: plan
+expression: __plan
+snapshot_kind: text
 ---
-+---------------+---------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                              |
-+---------------+---------------------------------------------------------------------------------------------------+
-| logical_plan  | Projection: scat.hr.records.id, CAST(scat.hr.records.employee AS LargeUtf8) AS employee           |
-|               |   Sort: scat.hr.records.id ASC NULLS LAST                                                         |
-|               |     TableScan: scat.hr.records projection=[id, employee]                                          |
-| physical_plan | ProjectionExec: expr=[id@0 as id, CAST(employee@1 AS LargeUtf8) as employee]                      |
-|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1, maintains_sort_order=true |
-|               |     SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                           |
-|               |       CooperativeExec                                                                             |
-|               |         BytesProcessedExec                                                                        |
-|               |           FlightSqlExec sql=SELECT id, employee FROM scat.hr.records                              |
-|               |                                                                                                   |
-+---------------+---------------------------------------------------------------------------------------------------+
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                                         |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                                                                                                    |
+|               |  Projection: scat.hr.records.id, CAST(scat.hr.records.employee AS LargeUtf8) AS employee                                                                                                                                     |
+|               |   Sort: scat.hr.records.id ASC NULLS LAST                                                                                                                                                                                    |
+|               |     Projection: scat.hr.records.id, scat.hr.records.employee                                                                                                                                                                 |
+|               |       TableScan: scat.hr.records projection=[id, employee]                                                                                                                                                                   |
+| physical_plan | SchemaCastScanExec                                                                                                                                                                                                           |
+|               |   CooperativeExec                                                                                                                                                                                                            |
+|               |     BytesProcessedExec                                                                                                                                                                                                       |
+|               |       VirtualExecutionPlan name=flightsql compute_context=endpoint=[endpoint] base_sql=SELECT id, CAST(records.employee AS TEXT) AS employee FROM (SELECT id, employee FROM scat.hr.records ORDER BY id ASC NULLS LAST) |
+|               |                                                                                                                                                                                                                              |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
