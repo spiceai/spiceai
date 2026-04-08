@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use snafu::{Snafu, prelude::*};
 use std::{
+    error::Error as StdError,
     fmt::{Display, Formatter},
     io::Cursor,
     pin::Pin,
@@ -58,7 +59,7 @@ pub enum Error {
     #[snafu(display("This Databricks SQL Warehouse operation is not implemented"))]
     NotImplemented,
 
-    #[snafu(display("HTTP client build failed: {source}"))]
+    #[snafu(display("HTTP client build failed: {}", format_reqwest_error_chain(source)))]
     ClientBuildFailed { source: reqwest::Error },
 
     #[snafu(display("Databricks datatype {ty} not supported"))]
@@ -96,10 +97,10 @@ pub enum Error {
     #[snafu(display("Long-running operations are not supported (state: 'RUNNING')."))]
     QueryStillRunning,
 
-    #[snafu(display("HTTP request failed: {source}"))]
+    #[snafu(display("HTTP request failed: {}", format_reqwest_error_chain(source)))]
     HttpRequestFailed { source: reqwest::Error },
 
-    #[snafu(display("JSON parsing failed: {source}"))]
+    #[snafu(display("JSON parsing failed: {}", format_reqwest_error_chain(source)))]
     JsonParsingFailed { source: reqwest::Error },
 
     #[snafu(display("Missing JSON field: {field}"))]
@@ -132,6 +133,24 @@ pub enum Error {
         "Failed to execute the query. {message} Verify the query is valid, or report a bug at: https://github.com/spiceai/spiceai/issues"
     ))]
     QueryFailure { message: String },
+}
+
+fn format_reqwest_error_chain(error: &reqwest::Error) -> String {
+    let mut message = error.to_string();
+    let mut current = StdError::source(error);
+
+    while let Some(source) = current {
+        let source_message = source.to_string();
+        if !source_message.is_empty() {
+            let _ = std::fmt::Write::write_fmt(
+                &mut message,
+                format_args!("; caused by: {source_message}"),
+            );
+        }
+        current = StdError::source(source);
+    }
+
+    message
 }
 
 /// Main struct for interacting with Databricks SQL Warehouse
@@ -1847,6 +1866,40 @@ mod tests {
             requests.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "expected the SQL statement request to be retried once"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_http_request_failed_displays_source_chain() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should reserve an unused port");
+        let port = listener
+            .local_addr()
+            .expect("listener should have an address")
+            .port();
+        drop(listener);
+
+        let source = Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(100))
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .expect("should build client")
+            .post(format!("http://127.0.0.1:{port}/api/2.0/sql/statements/"))
+            .send()
+            .await
+            .expect_err("request should fail for a closed local port");
+
+        let err = Error::HttpRequestFailed { source };
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("HTTP request failed: error sending request for url"),
+            "error should include the reqwest request message: {msg}"
+        );
+        assert!(
+            msg.contains("caused by:"),
+            "error should include the underlying source chain: {msg}"
         );
     }
 
