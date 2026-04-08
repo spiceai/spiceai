@@ -36,6 +36,7 @@ use crate::request::DatabricksAuthExtension;
 use runtime_request_context::RequestContext;
 
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
+const MIN_TOKEN_REFRESH_WAIT_SECS: u64 = 1;
 const MAX_TOKEN_REQUEST_RETRIES: usize = 6;
 const MAX_TOKEN_REQUEST_BACKOFF: Duration = Duration::from_secs(300);
 const RETRY_AFTER_MS_HEADER: &str = "retry-after-ms";
@@ -115,7 +116,7 @@ impl DatabricksM2MTokenProvider {
 
         let handle = tokio::spawn(async move {
             // Databricks M2M access token lifespan is one hour. Schedule a refresh five minutes before expiration
-            let mut next_wait = Duration::from_secs(expires_in - TOKEN_REFRESH_BUFFER_SECS);
+            let mut next_wait = next_token_refresh_wait(expires_in);
 
             let mut backoff = FibonacciBackoffBuilder::new()
                 .max_duration(Some(Duration::from_secs(300))) // Cap at 5 minutes
@@ -139,7 +140,7 @@ impl DatabricksM2MTokenProvider {
                         backoff.reset();
                         tracing::debug!("M2M token refreshed; expires in {}", expires_in);
                         let _ = cloned_tx.send(access_token.clone());
-                        next_wait = Duration::from_secs(expires_in - TOKEN_REFRESH_BUFFER_SECS);
+                        next_wait = next_token_refresh_wait(expires_in);
                     }
                     Err(e) => {
                         let backoff_duration =
@@ -270,6 +271,14 @@ fn databricks_token_endpoint_url(databricks_endpoint: &str) -> String {
     };
 
     format!("{base_url}/oidc/v1/token")
+}
+
+fn next_token_refresh_wait(expires_in: u64) -> Duration {
+    Duration::from_secs(
+        expires_in
+            .saturating_sub(TOKEN_REFRESH_BUFFER_SECS)
+            .max(MIN_TOKEN_REFRESH_WAIT_SECS),
+    )
 }
 
 async fn send_databricks_token_request_with_retry<F>(
@@ -815,6 +824,19 @@ mod tests {
         assert_eq!(
             databricks_token_endpoint_url("http://127.0.0.1:1234/"),
             "http://127.0.0.1:1234/oidc/v1/token"
+        );
+    }
+
+    #[test]
+    fn test_next_token_refresh_wait_clamps_short_lived_tokens() {
+        assert_eq!(next_token_refresh_wait(0), Duration::from_secs(1));
+        assert_eq!(
+            next_token_refresh_wait(TOKEN_REFRESH_BUFFER_SECS),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            next_token_refresh_wait(TOKEN_REFRESH_BUFFER_SECS + 15),
+            Duration::from_secs(15)
         );
     }
 
