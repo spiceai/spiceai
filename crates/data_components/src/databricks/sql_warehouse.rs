@@ -498,7 +498,8 @@ impl SqlWarehouseApi {
 
         let stream: Pin<Box<dyn Stream<Item = Result<RecordBatch, DataFusionError>> + Send>> =
             Box::pin(
-                Box::pin(run_once.chain(batch_stream))
+                run_once
+                    .chain(batch_stream)
                     .map_err(|e| DataFusionError::Execution(e.to_string())),
             );
 
@@ -1529,8 +1530,9 @@ mod tests {
                         response.status_line,
                         response.body.len()
                     );
+                    use std::fmt::Write as _;
                     for (header_name, header_value) in response.headers {
-                        http_response.push_str(&format!("{header_name}: {header_value}\r\n"));
+                        let _ = write!(http_response, "{header_name}: {header_value}\r\n");
                     }
                     http_response.push_str("\r\n");
                     http_response.push_str(&response.body);

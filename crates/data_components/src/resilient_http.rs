@@ -91,6 +91,8 @@ where
                         "Retrying HTTP request after retryable response"
                     );
 
+                    drain_response_body(response, service_name, operation_name, retries, status)
+                        .await;
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -135,6 +137,32 @@ where
 
 pub(crate) fn enable_supported_compression(builder: ClientBuilder) -> ClientBuilder {
     builder.gzip(true).brotli(true).zstd(true).deflate(true)
+}
+
+async fn drain_response_body(
+    mut response: Response,
+    service_name: &str,
+    operation_name: &str,
+    attempt: usize,
+    status: StatusCode,
+) {
+    loop {
+        match response.chunk().await {
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(error) => {
+                tracing::debug!(
+                    service = service_name,
+                    operation = operation_name,
+                    attempt,
+                    status = %status,
+                    error = %error,
+                    "Failed to drain retry response body before retry"
+                );
+                return;
+            }
+        }
+    }
 }
 
 fn add_supported_accept_encoding_header(request: RequestBuilder) -> RequestBuilder {
@@ -231,7 +259,7 @@ mod tests {
     }
 
     impl MockHttpResponse {
-        fn json(status_line: &'static str, body: serde_json::Value) -> Self {
+        fn json(status_line: &'static str, body: &serde_json::Value) -> Self {
             Self {
                 status_line,
                 headers: vec![("Content-Type".to_string(), "application/json".to_string())],
@@ -271,29 +299,29 @@ mod tests {
                 let queued_responses = Arc::clone(&queued_responses);
                 let captured_requests = Arc::clone(&captured_requests_for_server);
                 tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    use tokio::io::AsyncWriteExt;
 
-                    let mut buf = vec![0u8; 4096];
-                    let bytes_read = stream.read(&mut buf).await.unwrap_or_default();
+                    let captured_request = read_http_request(&mut stream).await;
                     requests.fetch_add(1, Ordering::SeqCst);
                     captured_requests
                         .lock()
                         .await
-                        .push(String::from_utf8_lossy(&buf[..bytes_read]).into_owned());
+                        .push(String::from_utf8_lossy(&captured_request).into_owned());
 
                     let response = queued_responses
                         .lock()
                         .await
                         .pop_front()
-                        .unwrap_or_else(|| MockHttpResponse::json("200 OK", json!({"ok": true})));
+                        .unwrap_or_else(|| MockHttpResponse::json("200 OK", &json!({"ok": true})));
 
                     let mut http_response = format!(
                         "HTTP/1.1 {}\r\nContent-Length: {}\r\n",
                         response.status_line,
                         response.body.len()
                     );
+                    use std::fmt::Write as _;
                     for (header_name, header_value) in response.headers {
-                        http_response.push_str(&format!("{header_name}: {header_value}\r\n"));
+                        let _ = write!(http_response, "{header_name}: {header_value}\r\n");
                     }
                     http_response.push_str("\r\n");
                     let _ = stream.write_all(http_response.as_bytes()).await;
@@ -303,6 +331,56 @@ mod tests {
         });
 
         (format!("http://{address}"), requests, captured_requests)
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+
+        let mut captured_request = Vec::with_capacity(4096);
+        let mut buf = [0u8; 1024];
+        let mut expected_total_len = None;
+
+        loop {
+            let bytes_read = match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(bytes_read) => bytes_read,
+            };
+
+            captured_request.extend_from_slice(&buf[..bytes_read]);
+
+            if expected_total_len.is_none() {
+                expected_total_len = expected_http_request_len(&captured_request);
+            }
+
+            if let Some(expected_total_len) = expected_total_len
+                && captured_request.len() >= expected_total_len
+            {
+                break;
+            }
+        }
+
+        captured_request
+    }
+
+    fn expected_http_request_len(request: &[u8]) -> Option<usize> {
+        let headers_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)?;
+
+        let content_length = String::from_utf8_lossy(&request[..headers_end])
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("Content-Length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        Some(headers_end.saturating_add(content_length))
     }
 
     fn encode_body(encoding: &str, body: &[u8]) -> Vec<u8> {
@@ -374,7 +452,7 @@ mod tests {
                 body: serde_json::to_vec(&json!({"error_code": "RATE_LIMITED"}))
                     .expect("rate-limit JSON should serialize"),
             },
-            MockHttpResponse::json("200 OK", json!({"ok": true})),
+            MockHttpResponse::json("200 OK", &json!({"ok": true})),
         ])
         .await;
 
@@ -399,8 +477,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_send_request_with_retry_retries_server_error() {
         let (base_url, requests, _) = start_mock_server(vec![
-            MockHttpResponse::json("503 Service Unavailable", json!({"error": "busy"})),
-            MockHttpResponse::json("200 OK", json!({"ok": true})),
+            MockHttpResponse::json("503 Service Unavailable", &json!({"error": "busy"})),
+            MockHttpResponse::json("200 OK", &json!({"ok": true})),
         ])
         .await;
 
