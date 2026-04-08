@@ -67,7 +67,7 @@ pub struct DdlExtensionStore {
 }
 
 impl DdlExtensionStore {
-    pub fn new(default_schema: String, default_catalog: String) -> Self {
+    pub fn new(default_catalog: String, default_schema: String) -> Self {
         Self {
             default_catalog,
             default_schema,
@@ -99,8 +99,8 @@ pub type SharedDdlExtensionStore = Arc<RwLock<DdlExtensionStore>>;
 /// Create a new shared store.
 #[must_use]
 pub fn new_shared_store(
-    default_schema: impl Into<String>,
     default_catalog: impl Into<String>,
+    default_schema: impl Into<String>,
 ) -> SharedDdlExtensionStore {
     Arc::new(RwLock::new(DdlExtensionStore::new(
         default_schema.into(),
