@@ -19,6 +19,8 @@ use crate::cluster::ExecutorRegistry;
 use crate::cluster::PartitionManager;
 use crate::cluster::ResolvedClusterConfig;
 use crate::cluster::partition;
+use crate::cluster::partition::scheduler_task::PartitionManagementConfig;
+use crate::cluster::partition::service::{AssignmentConfig, PartitionService};
 use crate::config::ClusterRole;
 use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
@@ -247,69 +249,72 @@ impl RuntimeBuilder {
             .and_then(ResolvedClusterConfig::effective_role)
         {
             Some(ClusterRole::Scheduler) => {
-                if let Some(scheduler_config) = self
+                let store: Arc<dyn object_store::ObjectStore> = if let Some(scheduler_config) = self
                     .app
                     .as_ref()
                     .and_then(|app| app.runtime.scheduler.clone())
                 {
-                    match partition::build_partition_metadata_store(
+                    partition::build_partition_metadata_store(
                         io_runtime.clone(),
                         Arc::clone(&secrets),
                         &scheduler_config,
                     )
                     .await
-                    {
-                        Ok(store) => {
-                            let partition_manager =
-                                Arc::new(PartitionManager::new(Arc::clone(&store)));
-
-                            Some(DistributedNode::Scheduler {
-                                peers: Arc::new(RwLock::new(HashMap::new())),
-                                // Initialized later when scheduler registry starts
-                                job_executor: Arc::new(RwLock::new(None)),
-                                executor_registry: Arc::new(ExecutorRegistry::new(
-                                    Arc::clone(&partition_manager),
-                                    Arc::new(
-                                        PartitionManager::new(Arc::clone(&store))
-                                            .with_prefix("catalog/partitions/"),
-                                    ),
-                                )),
-                                partition_manager,
-                            })
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to initialize partition metadata store for scheduler: {e}"
-                            );
-                            None
-                        }
-                    }
+                    .unwrap_or_else(|e| {
+                        tracing::error!(
+                            "Failed to initialize partition metadata store for scheduler: {e}"
+                        );
+                        Arc::new(object_store::memory::InMemory::new())
+                    })
                 } else {
                     tracing::warn!(
                         "'--role scheduler' was specified but no `runtime.scheduler` field was found in spicepod.yaml. Using in-memory partition store."
                     );
-                    let store: Arc<dyn object_store::ObjectStore> =
-                        Arc::new(object_store::memory::InMemory::new());
-                    let partition_manager = Arc::new(PartitionManager::new(Arc::clone(&store)));
-                    Some(DistributedNode::Scheduler {
-                        peers: Arc::new(RwLock::new(HashMap::new())),
-                        job_executor: Arc::new(RwLock::new(None)),
-                        executor_registry: Arc::new(ExecutorRegistry::new(
-                            Arc::clone(&partition_manager),
-                            Arc::new(
-                                PartitionManager::new(Arc::clone(&store))
-                                    .with_prefix("catalog/partitions/"),
-                            ),
-                        )),
-                        partition_manager,
-                    })
-                }
+                    Arc::new(object_store::memory::InMemory::new())
+                };
+
+                let partition_manager = Arc::new(PartitionManager::new(Arc::clone(&store)));
+                let executor_registry = Arc::new(ExecutorRegistry::new(
+                    Arc::clone(&partition_manager),
+                    Arc::new(
+                        PartitionManager::new(Arc::clone(&store))
+                            .with_prefix("catalog/partitions/"),
+                    ),
+                ));
+                let assignment_config = self
+                    .app
+                    .as_ref()
+                    .and_then(|app| app.runtime.scheduler.as_ref())
+                    .and_then(|scheduler| scheduler.partition_management.clone())
+                    .and_then(|pm| PartitionManagementConfig::try_from(pm).ok())
+                    .map_or_else(AssignmentConfig::default, |pm_config| AssignmentConfig {
+                        max_assignments_per_cycle: pm_config.max_assignments_per_cycle,
+                        max_partitions_per_executor: pm_config.max_partitions_per_executor,
+                        discovery_timeout: pm_config.discovery_timeout,
+                    });
+                let partition_service = Arc::new(PartitionService::new(
+                    Arc::clone(&partition_manager),
+                    Arc::clone(&executor_registry),
+                    assignment_config,
+                    Arc::new(RwLock::new(self.app.clone())),
+                ));
+
+                Some(DistributedNode::Scheduler {
+                    peers: Arc::new(RwLock::new(HashMap::new())),
+                    job_executor: Arc::new(RwLock::new(None)),
+                    executor_registry,
+                    partition_manager,
+                    partition_service,
+                })
             }
             Some(ClusterRole::Executor) => Some(DistributedNode::Executor {
                 partition_assignments: Arc::new(RwLock::new(HashMap::new())),
             }),
             None => None, // No cluster config means we're running in standalone mode
         };
+        // Create the shared app reference early so both DataFusion and Runtime can share it.
+        let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
+
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
@@ -325,10 +330,14 @@ impl RuntimeBuilder {
         .with_url_tables(url_tables_enabled);
 
         if let Some(DistributedNode::Scheduler {
-            executor_registry, ..
+            executor_registry,
+            partition_service,
+            ..
         }) = distributed.as_ref()
         {
-            df_builder = df_builder.with_executor_registry(Arc::clone(executor_registry));
+            df_builder = df_builder
+                .with_executor_registry(Arc::clone(executor_registry))
+                .with_partition_service(Arc::clone(partition_service));
         }
 
         if let Some(resolved_cluster_config) = self.resolved_cluster_config {
@@ -359,7 +368,7 @@ impl RuntimeBuilder {
         };
 
         let mut rt = Runtime {
-            app: Arc::new(RwLock::new(self.app)),
+            app: shared_app,
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
             completion_llms: Arc::new(RwLock::new(HashMap::new())),

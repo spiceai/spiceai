@@ -97,6 +97,9 @@ pub enum DistributedNode {
 
         /// Manager for accelerated table partition metadata (initialized when scheduler config is available)
         partition_manager: Arc<PartitionManager>,
+
+        /// Partition service for discovery, assignment, and executor notification.
+        partition_service: Arc<PartitionService>,
     },
     Executor {
         /// Partition assignments for this runtime (executor) for each table.
@@ -407,6 +410,7 @@ mod scheduler_registry;
 mod servers;
 mod service;
 
+use crate::cluster::partition::service::PartitionService;
 pub use control_stream_client::ControlStreamManager;
 pub use executor_registry::{ExecutorRegistry, FederatedPartitionProvider};
 pub use partition::{PartitionManager, PartitionMetadata, TablePartitionMetadata};
@@ -861,12 +865,9 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                 .update_component_status("partition_metadata", ComponentStatus::Initializing);
 
             let pm_task = PartitionManagementTask::new(
-                rt.app(),
                 rt.datafusion(),
-                Arc::clone(&partition_manager),
-                Arc::clone(&scheduler_executor_registry),
                 Arc::clone(&rt.status),
-                pm_config,
+                pm_config.interval,
                 pm_shutdown.clone(),
             );
 

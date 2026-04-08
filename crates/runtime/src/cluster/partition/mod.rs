@@ -21,6 +21,7 @@ mod manager;
 mod metadata;
 pub use manager::CopyAssignmentsResult;
 pub mod scheduler_task;
+pub(crate) mod service;
 mod startup;
 pub(crate) mod write_through;
 
