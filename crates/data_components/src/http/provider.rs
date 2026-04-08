@@ -1446,10 +1446,11 @@ impl ExecutionPlan for HttpExec {
                         })?;
 
                         if state.page >= config.max_pages {
-                            return Err(DataFusionError::Execution(format!(
-                                "HTTP pagination query was aborted after reaching the configured safety limit of {} pages. Increase `pagination_max_pages` to fetch additional pages.",
+                            tracing::warn!(
+                                "HTTP pagination reached the configured safety limit of {} pages. Increase `pagination_max_pages` to fetch additional pages.",
                                 config.max_pages
-                            )));
+                            );
+                            return Ok(None);
                         }
 
                         if let Some(limit) = state.limit
