@@ -399,7 +399,7 @@ impl ExtensionPlanner for DdlExtensionPlanner {
             DdlNodeOp::CreateTable(params) => {
                 ddl_node
                     .handler
-                    .create_table_exec(params.clone(), catalog_list, session_state)?
+                    .create_table_exec(*params.clone(), catalog_list, session_state)?
             }
             DdlNodeOp::DropTable(params) => ddl_node
                 .handler
