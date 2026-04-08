@@ -50,9 +50,9 @@ jobs:
       - name: Parse repository list
         id: parse
         run: |
-          # Convert comma-separated repositories into a JSON array for matrix strategy
+          # Convert comma-separated repositories into a compact JSON array for matrix strategy
           REPOS="${{ inputs.repositories }}"
-          JSON=$(echo "${REPOS}" | jq -R 'split(",") | map(ltrimstr(" ") | rtrimstr(" "))')
+          JSON=$(echo "${REPOS}" | jq -cR 'split(",") | map(ltrimstr(" ") | rtrimstr(" "))')
           echo "repositories=${JSON}" >> "$GITHUB_OUTPUT"
           echo "Repositories to publish: ${JSON}"
 
