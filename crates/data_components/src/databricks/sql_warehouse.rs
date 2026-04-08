@@ -1823,7 +1823,7 @@ mod tests {
     }
 
     /// Schema parsed from `full_data_type` column values matching a real
-    /// Databricks information_schema dump (bigint, string, timestamp,
+    /// Databricks `information_schema` dump (bigint, string, timestamp,
     /// boolean, double).
     #[test]
     fn test_schema_from_json_real_full_data_type_schema() {
@@ -1860,7 +1860,7 @@ mod tests {
     }
 
     /// Schema parsed from `data_type` column values matching a real
-    /// Databricks information_schema dump. The fallback path receives
+    /// Databricks `information_schema` dump. The fallback path receives
     /// LONG instead of bigint, and all types are uppercase.
     #[test]
     fn test_schema_from_json_real_data_type_fallback_schema() {
@@ -1892,8 +1892,8 @@ mod tests {
         assert_eq!(schema.field(7).data_type(), &DataType::Boolean);
     }
 
-    /// Full bridge table schema from real Databricks information_schema,
-    /// using full_data_type values (bigint, string, timestamp, boolean).
+    /// Full bridge table schema from real Databricks `information_schema`,
+    /// using `full_data_type` values (bigint, string, timestamp, boolean).
     #[test]
     fn test_schema_from_json_real_bridge_table_full_data_type() {
         let response = make_schema_response(&json!([
@@ -1926,7 +1926,7 @@ mod tests {
         assert_eq!(schema.field(13).data_type(), &DataType::Boolean);
     }
 
-    /// Same bridge table but using data_type column values (LONG instead of bigint).
+    /// Same bridge table but using `data_type` column values (LONG instead of bigint).
     #[test]
     fn test_schema_from_json_real_bridge_table_data_type_fallback() {
         let response = make_schema_response(&json!([
@@ -1959,7 +1959,7 @@ mod tests {
         assert_eq!(schema.field(13).data_type(), &DataType::Boolean);
     }
 
-    /// Cohorted spend view — full_data_type column: date, string, decimal(26,2), int.
+    /// Cohorted spend view — `full_data_type` column: date, string, decimal(26,2), int.
     #[test]
     fn test_schema_from_json_real_cohorted_spend_full_data_type() {
         let response = make_schema_response(&json!([
@@ -2018,7 +2018,7 @@ mod tests {
         assert_eq!(schema.field(16).data_type(), &DataType::Int32);
     }
 
-    /// Same cohorted spend view using data_type column (DATE, STRING, DECIMAL, INT).
+    /// Same cohorted spend view using `data_type` column (DATE, STRING, DECIMAL, INT).
     #[test]
     fn test_schema_from_json_real_cohorted_spend_data_type_fallback() {
         let response = make_schema_response(&json!([
