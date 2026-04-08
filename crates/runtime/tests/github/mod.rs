@@ -213,6 +213,15 @@ fn assert_all_string_values(result_batches: &[RecordBatch], column_index: usize,
     );
 }
 
+fn assert_no_string_values(result_batches: &[RecordBatch], column_index: usize, unexpected: &str) {
+    let values = collect_string_values(result_batches, column_index);
+    assert!(!values.is_empty(), "expected at least one string value");
+    assert!(
+        values.iter().all(|value| value != unexpected),
+        "expected all values in column {column_index} to differ from {unexpected:?}, got {values:?}"
+    );
+}
+
 fn assert_github_file_ref_results(result_batches: &[RecordBatch], expected_ref: &str) {
     for batch in result_batches {
         assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
@@ -440,6 +449,52 @@ async fn test_github_commits() -> Result<(), String> {
                     }
                     assert_eq!(row_count, 5, "num_rows: {row_count}");
                     assert_all_string_values(&result_batches, 0, "trunk");
+                })),
+            )
+            .await?;
+
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_commits_slash_ref_filter",
+                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref = 'release/1.11' LIMIT 5",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let row_count = result_batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                    for batch in &result_batches {
+                        assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
+                    }
+                    assert_eq!(row_count, 5, "num_rows: {row_count}");
+                    assert_all_string_values(&result_batches, 0, "release/1.11");
+
+                    let shas = collect_string_values(&result_batches, 1);
+                    assert_eq!(shas.len(), row_count, "shas: {shas:?}");
+                    assert!(
+                        shas.iter().all(|sha| !sha.is_empty()),
+                        "expected non-empty shas, got {shas:?}"
+                    );
+                })),
+            )
+            .await?;
+
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_commits_dynamic_ref_filter",
+                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref != 'trunk' LIMIT 5",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let row_count = result_batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                    for batch in &result_batches {
+                        assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
+                    }
+                    assert_eq!(row_count, 5, "num_rows: {row_count}");
+                    assert_no_string_values(&result_batches, 0, "trunk");
+
+                    let shas = collect_string_values(&result_batches, 1);
+                    assert_eq!(shas.len(), row_count, "shas: {shas:?}");
+                    assert!(
+                        shas.iter().all(|sha| !sha.is_empty()),
+                        "expected non-empty shas, got {shas:?}"
+                    );
                 })),
             )
             .await?;
@@ -1246,6 +1301,51 @@ async fn test_github_app_commits_ref_filter() -> Result<(), String> {
                     }
                     assert_eq!(row_count, 5, "num_rows: {row_count}");
                     assert_all_string_values(&result_batches, 0, "trunk");
+                })),
+            )
+            .await?;
+
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_app_commits_slash_ref_filter",
+                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref = 'release/1.11' LIMIT 5",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let row_count = result_batches
+                        .iter()
+                        .map(RecordBatch::num_rows)
+                        .sum::<usize>();
+                    for batch in &result_batches {
+                        assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
+                    }
+                    assert_eq!(row_count, 5, "num_rows: {row_count}");
+                    assert_all_string_values(&result_batches, 0, "release/1.11");
+
+                    let shas = collect_string_values(&result_batches, 1);
+                    assert_eq!(shas.len(), row_count, "shas: {shas:?}");
+                    assert!(
+                        shas.iter().all(|sha| !sha.is_empty()),
+                        "expected non-empty shas, got {shas:?}"
+                    );
+                })),
+            )
+            .await?;
+
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_app_commits_dynamic_ref_filter",
+                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref != 'trunk' LIMIT 5",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let row_count = result_batches
+                        .iter()
+                        .map(RecordBatch::num_rows)
+                        .sum::<usize>();
+                    for batch in &result_batches {
+                        assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
+                    }
+                    assert_eq!(row_count, 5, "num_rows: {row_count}");
+                    assert_no_string_values(&result_batches, 0, "trunk");
                 })),
             )
             .await?;

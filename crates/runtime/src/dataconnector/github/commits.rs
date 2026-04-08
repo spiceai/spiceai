@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use crate::{dataconnector::ConnectorComponent, datafusion::error::find_datafusion_root};
+use async_trait::async_trait;
 
 use super::{
     GitHubTableArgs, GitHubTableGraphQLParams, commits_inject_parameters, expr_to_match,
@@ -22,13 +23,24 @@ use super::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use data_components::{
-    github::error_checker,
+    github::{GithubRef, GithubRestClient, error_checker},
     graphql::{
         ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
-        client::{DuplicateBehavior, GraphQLQuery, UnnestBehavior, unnest_json_object_to_depth},
+        client::{
+            DuplicateBehavior, GraphQLClient, GraphQLQuery, UnnestBehavior,
+            unnest_json_object_to_depth,
+        },
     },
 };
-use datafusion::{logical_expr::Operator, prelude::Expr};
+use datafusion::{
+    catalog::Session,
+    datasource::{MemTable, TableProvider, TableType},
+    error::DataFusionError,
+    logical_expr::Operator,
+    physical_plan::ExecutionPlan,
+    prelude::Expr,
+};
+use futures::TryStreamExt;
 use graphql_parser::query::{Definition, InlineFragment, OperationDefinition, Query, Selection};
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -36,7 +48,7 @@ use std::sync::Arc;
 const COMMITS_JSON_POINTER: &str = "/data/repository";
 
 // https://docs.github.com/en/graphql/reference/objects#commit
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CommitsTableArgs {
     pub owner: String,
     pub repo: String,
@@ -57,8 +69,12 @@ impl GraphQLContext for CommitsTableArgs {
         filters: &[FilterPushdownResult],
         query: &mut GraphQLQuery,
     ) -> Result<(), datafusion::error::DataFusionError> {
-        let requested_ref =
-            requested_ref_from_filters(filters)?.or_else(|| self.requested_ref.clone());
+        let requested_ref = self.requested_ref.clone().or_else(|| {
+            match ref_fetch_mode_from_filter_results(filters) {
+                RefFetchMode::Exact(ref_name) => Some(ref_name),
+                RefFetchMode::None | RefFetchMode::Dynamic => None,
+            }
+        });
 
         if let Some(ref_name) = requested_ref.as_deref() {
             inject_commit_ref_parameter(query, ref_name)?;
@@ -126,6 +142,258 @@ impl GitHubTableArgs for CommitsTableArgs {
             UnnestBehavior::Custom(Box::new(custom_unnestter)),
             Some(gql_schema()),
         )
+    }
+}
+
+pub struct CommitsTableProvider {
+    delegate: Arc<dyn TableProvider>,
+    client: Arc<GraphQLClient>,
+    rest_client: GithubRestClient,
+    table_args: Arc<CommitsTableArgs>,
+    schema: SchemaRef,
+}
+
+impl std::fmt::Debug for CommitsTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommitsTableProvider")
+            .field("table_args", &self.table_args)
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CommitsTableProvider {
+    pub fn new(
+        delegate: Arc<dyn TableProvider>,
+        client: GraphQLClient,
+        rest_client: GithubRestClient,
+        table_args: Arc<CommitsTableArgs>,
+    ) -> Self {
+        Self {
+            schema: delegate.schema(),
+            delegate,
+            client: Arc::new(client),
+            rest_client,
+            table_args,
+        }
+    }
+
+    async fn fetch_commits_for_ref(
+        &self,
+        pushdown_filters: &[FilterPushdownResult],
+        ref_name: &str,
+        limit: Option<usize>,
+    ) -> std::result::Result<Vec<arrow::array::RecordBatch>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let mut ref_args = self.table_args.as_ref().clone();
+        ref_args.requested_ref = Some(ref_name.to_string());
+
+        let graphql_values = ref_args.get_graphql_values();
+        let mut query = GraphQLQuery::try_from(Arc::clone(&graphql_values.query))?;
+        ref_args.inject_parameters(pushdown_filters, &mut query)?;
+
+        Arc::clone(&self.client)
+            .execute_paginated(
+                query,
+                Arc::clone(&self.schema),
+                Arc::clone(&self.schema),
+                limit,
+                ref_args.error_checker(),
+                ref_args.query_cost(),
+            )
+            .try_collect()
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn fetch_commits_for_requested_ref(
+        &self,
+        pushdown_filters: &[FilterPushdownResult],
+        requested_ref: &str,
+        limit: Option<usize>,
+    ) -> std::result::Result<Vec<arrow::array::RecordBatch>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let candidate_refs = self.resolve_requested_ref_names(requested_ref).await?;
+        let mut last_not_found_error = None;
+
+        for candidate_ref in candidate_refs {
+            match self
+                .fetch_commits_for_ref(pushdown_filters, &candidate_ref, limit)
+                .await
+            {
+                Ok(batches) => return Ok(batches),
+                Err(err) if is_resource_not_found_error(err.as_ref()) => {
+                    last_not_found_error = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(last_not_found_error.unwrap_or_else(|| {
+            data_components::graphql::Error::ResourceNotFound {
+                message: format!(
+                    "GitHub commits ref {requested_ref:?} was not found or is not accessible. Verify the requested ref exists and is readable."
+                ),
+            }
+            .into()
+        }))
+    }
+
+    async fn fetch_repository_refs(
+        &self,
+    ) -> std::result::Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
+        self.rest_client
+            .fetch_qualified_refs(&self.table_args.owner, &self.table_args.repo)
+            .await
+    }
+
+    async fn resolve_requested_ref_names(
+        &self,
+        requested_ref: &str,
+    ) -> std::result::Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        if requested_ref.starts_with("refs/") {
+            return Ok(vec![requested_ref.to_string()]);
+        }
+
+        let refs = self.fetch_repository_refs().await?;
+        let mut candidate_refs = resolve_requested_ref_candidates(requested_ref, &refs);
+
+        if candidate_refs.is_empty() {
+            candidate_refs.push(requested_ref.to_string());
+        }
+
+        Ok(candidate_refs)
+    }
+
+    async fn resolve_dynamic_refs(
+        &self,
+        filters: &[Expr],
+    ) -> std::result::Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut refs = self.fetch_repository_refs().await?;
+
+        if filters
+            .iter()
+            .any(|expr| expr_references_ref(expr) && !expr_is_ref_only(expr))
+        {
+            return Ok(refs);
+        }
+
+        let ref_only_filters = filters
+            .iter()
+            .filter(|expr| expr_is_ref_only(expr))
+            .collect::<Vec<_>>();
+
+        if ref_only_filters.is_empty()
+            || !ref_only_filters
+                .iter()
+                .all(|expr| can_evaluate_ref_expr(expr))
+        {
+            return Ok(refs);
+        }
+
+        refs.retain(|git_ref| {
+            ref_only_filters
+                .iter()
+                .all(|expr| evaluate_ref_expr(expr, &git_ref.name).unwrap_or(true))
+        });
+
+        Ok(refs)
+    }
+}
+
+#[async_trait]
+impl TableProvider for CommitsTableProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> std::result::Result<
+        Vec<datafusion::logical_expr::TableProviderFilterPushDown>,
+        DataFusionError,
+    > {
+        self.delegate.supports_filters_pushdown(filters)
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let pushdown_filters = filters
+            .iter()
+            .map(|filter| self.table_args.filter_pushdown(filter))
+            .collect::<Result<Vec<_>, DataFusionError>>()?;
+
+        let requested_ref = self.table_args.requested_ref.clone().or_else(|| {
+            match ref_fetch_mode_from_exprs(filters) {
+                RefFetchMode::Exact(ref_name) => Some(ref_name),
+                RefFetchMode::None | RefFetchMode::Dynamic => None,
+            }
+        });
+
+        if let Some(requested_ref) = requested_ref.as_deref() {
+            let batches = self
+                .fetch_commits_for_requested_ref(&pushdown_filters, requested_ref, limit)
+                .await
+                .map_err(DataFusionError::External)?;
+            let table = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
+            return table.scan(state, projection, filters, limit).await;
+        }
+
+        if !matches!(ref_fetch_mode_from_exprs(filters), RefFetchMode::Dynamic) {
+            return self.delegate.scan(state, projection, filters, limit).await;
+        }
+
+        let refs = self
+            .resolve_dynamic_refs(filters)
+            .await
+            .map_err(DataFusionError::External)?;
+
+        let stop_early = limit.is_some() && filters.iter().all(|expr| expr_is_ref_only(expr));
+        let mut remaining = limit;
+        let mut batches = Vec::new();
+
+        for git_ref in refs {
+            let ref_limit = if stop_early { remaining } else { None };
+            let ref_batches = self
+                .fetch_commits_for_ref(&pushdown_filters, &git_ref.qualified_name, ref_limit)
+                .await
+                .map_err(DataFusionError::External)?;
+
+            let fetched_rows = ref_batches
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum::<usize>();
+
+            if fetched_rows == 0 {
+                continue;
+            }
+
+            batches.extend(ref_batches);
+
+            if stop_early && let Some(remaining_rows) = remaining.as_mut() {
+                *remaining_rows = remaining_rows.saturating_sub(fetched_rows);
+                if *remaining_rows == 0 {
+                    break;
+                }
+            }
+        }
+
+        let table = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
+        table.scan(state, projection, filters, limit).await
     }
 }
 
@@ -221,58 +489,142 @@ fn expr_references_ref(expr: &Expr) -> bool {
     expr.column_refs().iter().any(|column| column.name == "ref")
 }
 
-fn unsupported_ref_filter_error() -> datafusion::error::DataFusionError {
-    datafusion::error::DataFusionError::Execution(
-        "GitHub commits only support a single non-empty ref = '<value>' predicate. Queries using ref with OR, IN, inequality, or multiple values are not supported because they can return incorrect results.".to_string(),
-    )
+fn expr_is_ref_only(expr: &Expr) -> bool {
+    let columns = expr.column_refs();
+    !columns.is_empty() && columns.iter().all(|column| column.name == "ref")
 }
 
-fn merge_requested_refs(
-    current: Option<String>,
-    next: Option<String>,
-) -> Result<Option<String>, datafusion::error::DataFusionError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RefFetchMode {
+    None,
+    Exact(String),
+    Dynamic,
+}
+
+fn merge_ref_fetch_modes(current: RefFetchMode, next: RefFetchMode) -> RefFetchMode {
     match (current, next) {
-        (Some(current), Some(next)) if current != next => Err(unsupported_ref_filter_error()),
-        (Some(current), _) => Ok(Some(current)),
-        (None, Some(next)) => Ok(Some(next)),
-        (None, None) => Ok(None),
+        (RefFetchMode::Dynamic, _) | (_, RefFetchMode::Dynamic) => RefFetchMode::Dynamic,
+        (RefFetchMode::Exact(current), RefFetchMode::Exact(next)) if current == next => {
+            RefFetchMode::Exact(current)
+        }
+        (RefFetchMode::Exact(_), RefFetchMode::Exact(_)) => RefFetchMode::Dynamic,
+        (RefFetchMode::Exact(current), RefFetchMode::None)
+        | (RefFetchMode::None, RefFetchMode::Exact(current)) => RefFetchMode::Exact(current),
+        (RefFetchMode::None, RefFetchMode::None) => RefFetchMode::None,
     }
 }
 
-fn requested_ref_from_filter(
-    expr: &Expr,
-) -> Result<Option<String>, datafusion::error::DataFusionError> {
+fn resolve_requested_ref_candidates(requested_ref: &str, refs: &[GithubRef]) -> Vec<String> {
+    let mut candidate_refs = refs
+        .iter()
+        .filter(|git_ref| git_ref.name == requested_ref)
+        .map(|git_ref| git_ref.qualified_name.clone())
+        .collect::<Vec<_>>();
+
+    candidate_refs.sort_by_key(|qualified_name| {
+        if qualified_name.starts_with("refs/heads/") {
+            0
+        } else if qualified_name.starts_with("refs/tags/") {
+            1
+        } else {
+            2
+        }
+    });
+    candidate_refs.dedup();
+    candidate_refs
+}
+
+fn is_resource_not_found_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<data_components::graphql::Error>()
+        .is_some_and(|graphql_error| {
+            matches!(
+                graphql_error,
+                data_components::graphql::Error::ResourceNotFound { .. }
+            )
+        })
+}
+
+fn ref_fetch_mode_from_expr(expr: &Expr) -> RefFetchMode {
     match expr {
-        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => merge_requested_refs(
-            requested_ref_from_filter(binary_expr.left.as_ref())?,
-            requested_ref_from_filter(binary_expr.right.as_ref())?,
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => merge_ref_fetch_modes(
+            ref_fetch_mode_from_expr(binary_expr.left.as_ref()),
+            ref_fetch_mode_from_expr(binary_expr.right.as_ref()),
         ),
         _ => {
             if let Some((column, value, op)) = expr_to_match(expr)
                 && column.name == "ref"
+                && op == Operator::Eq
+                && let Some(ref_value) = scalar_utf8_value(&value).filter(|v| !v.is_empty())
             {
-                let ref_value = scalar_utf8_value(&value).filter(|v| !v.is_empty());
-                return match (op, ref_value) {
-                    (Operator::Eq, Some(v)) => Ok(Some(v.to_string())),
-                    _ => Err(unsupported_ref_filter_error()),
-                };
+                return RefFetchMode::Exact(ref_value.to_string());
             }
 
             if expr_references_ref(expr) {
-                return Err(unsupported_ref_filter_error());
+                RefFetchMode::Dynamic
+            } else {
+                RefFetchMode::None
             }
-
-            Ok(None)
         }
     }
 }
 
-fn requested_ref_from_filters(
-    filters: &[FilterPushdownResult],
-) -> Result<Option<String>, datafusion::error::DataFusionError> {
-    filters.iter().try_fold(None, |current, filter| {
-        merge_requested_refs(current, requested_ref_from_filter(&filter.expr)?)
+fn ref_fetch_mode_from_filter_results(filters: &[FilterPushdownResult]) -> RefFetchMode {
+    filters.iter().fold(RefFetchMode::None, |current, filter| {
+        merge_ref_fetch_modes(current, ref_fetch_mode_from_expr(&filter.expr))
     })
+}
+
+fn ref_fetch_mode_from_exprs(filters: &[Expr]) -> RefFetchMode {
+    filters.iter().fold(RefFetchMode::None, |current, filter| {
+        merge_ref_fetch_modes(current, ref_fetch_mode_from_expr(filter))
+    })
+}
+
+fn can_evaluate_ref_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryExpr(binary_expr) if matches!(binary_expr.op, Operator::And | Operator::Or) => {
+            can_evaluate_ref_expr(binary_expr.left.as_ref())
+                && can_evaluate_ref_expr(binary_expr.right.as_ref())
+        }
+        _ => {
+            if let Some((column, value, op)) = expr_to_match(expr) {
+                column.name == "ref"
+                    && matches!(op, Operator::Eq | Operator::NotEq)
+                    && scalar_utf8_value(&value)
+                        .filter(|value| !value.is_empty())
+                        .is_some()
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn evaluate_ref_expr(expr: &Expr, ref_name: &str) -> Option<bool> {
+    match expr {
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => Some(
+            evaluate_ref_expr(binary_expr.left.as_ref(), ref_name)?
+                && evaluate_ref_expr(binary_expr.right.as_ref(), ref_name)?,
+        ),
+        Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => Some(
+            evaluate_ref_expr(binary_expr.left.as_ref(), ref_name)?
+                || evaluate_ref_expr(binary_expr.right.as_ref(), ref_name)?,
+        ),
+        _ => {
+            let (column, value, op) = expr_to_match(expr)?;
+            let expected = scalar_utf8_value(&value)?;
+            if column.name != "ref" || expected.is_empty() {
+                return None;
+            }
+
+            match op {
+                Operator::Eq => Some(ref_name == expected),
+                Operator::NotEq => Some(ref_name != expected),
+                _ => None,
+            }
+        }
+    }
 }
 
 fn inject_commit_ref_parameter(
@@ -615,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn test_requested_ref_from_filters_supports_conjunctive_filter() {
+    fn test_ref_fetch_mode_from_filters_supports_conjunctive_filter() {
         let filters = vec![FilterPushdownResult {
             filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Unsupported,
             expr: datafusion::prelude::col("ref")
@@ -625,15 +977,13 @@ mod tests {
         }];
 
         assert_eq!(
-            requested_ref_from_filters(&filters)
-                .expect("conjunctive ref filter should be supported")
-                .as_deref(),
-            Some("trunk")
+            ref_fetch_mode_from_filter_results(&filters),
+            RefFetchMode::Exact("trunk".to_string())
         );
     }
 
     #[test]
-    fn test_requested_ref_from_filters_rejects_multiple_ref_values() {
+    fn test_ref_fetch_mode_from_filters_uses_dynamic_mode_for_multiple_ref_values() {
         let filters = vec![
             FilterPushdownResult {
                 filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Exact,
@@ -647,12 +997,14 @@ mod tests {
             },
         ];
 
-        let _ = requested_ref_from_filters(&filters)
-            .expect_err("multiple ref values should be rejected");
+        assert_eq!(
+            ref_fetch_mode_from_filter_results(&filters),
+            RefFetchMode::Dynamic
+        );
     }
 
     #[test]
-    fn test_requested_ref_from_filters_rejects_unsupported_ref_or_predicate() {
+    fn test_ref_fetch_mode_from_filters_uses_dynamic_mode_for_ref_or_predicate() {
         let filters = vec![FilterPushdownResult {
             filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Unsupported,
             expr: datafusion::prelude::col("ref")
@@ -661,7 +1013,59 @@ mod tests {
             context: None,
         }];
 
-        let _ = requested_ref_from_filters(&filters)
-            .expect_err("unsupported ref OR predicates should be rejected");
+        assert_eq!(
+            ref_fetch_mode_from_filter_results(&filters),
+            RefFetchMode::Dynamic
+        );
+    }
+
+    #[test]
+    fn test_evaluate_ref_expr_supports_not_eq() {
+        let expr = datafusion::prelude::col("ref").not_eq(datafusion::prelude::lit("main"));
+
+        assert!(can_evaluate_ref_expr(&expr));
+        assert_eq!(evaluate_ref_expr(&expr, "main"), Some(false));
+        assert_eq!(evaluate_ref_expr(&expr, "trunk"), Some(true));
+    }
+
+    #[test]
+    fn test_resolve_requested_ref_candidates_prefers_qualified_branch_names() {
+        let refs = vec![
+            GithubRef {
+                name: "ashtom/fullsessionids".to_string(),
+                qualified_name: "refs/heads/ashtom/fullsessionids".to_string(),
+            },
+            GithubRef {
+                name: "v1.0.0".to_string(),
+                qualified_name: "refs/tags/v1.0.0".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            resolve_requested_ref_candidates("ashtom/fullsessionids", &refs),
+            vec!["refs/heads/ashtom/fullsessionids".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_resolve_requested_ref_candidates_prefers_branches_before_tags() {
+        let refs = vec![
+            GithubRef {
+                name: "release".to_string(),
+                qualified_name: "refs/tags/release".to_string(),
+            },
+            GithubRef {
+                name: "release".to_string(),
+                qualified_name: "refs/heads/release".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            resolve_requested_ref_candidates("release", &refs),
+            vec![
+                "refs/heads/release".to_string(),
+                "refs/tags/release".to_string()
+            ]
+        );
     }
 }
