@@ -15,13 +15,14 @@ limitations under the License.
 */
 
 //! Conversion helpers between [`ComponentStatus`] and proto `i32` representations
-//! used in `ExecutorHeartbeat` and `DatasetStatusChange` messages.
+//! used in `ComponentStatusUpdate` and `ComponentStatusAck` messages.
 
 use crate::status::ComponentStatus;
 
 /// Converts a [`ComponentStatus`] to its proto `i32` representation.
 /// Uses the same discriminant values as [`ComponentStatus::discriminant`].
 #[must_use]
+#[expect(clippy::cast_possible_truncation)]
 pub fn component_status_to_proto(status: &ComponentStatus) -> i32 {
     status.discriminant() as i32
 }
@@ -32,7 +33,6 @@ pub fn component_status_to_proto(status: &ComponentStatus) -> i32 {
 #[must_use]
 pub fn component_status_from_proto(value: i32) -> ComponentStatus {
     match value {
-        0 => ComponentStatus::Initializing,
         1 => ComponentStatus::Ready,
         2 => ComponentStatus::Disabled,
         3 => ComponentStatus::Error(None),

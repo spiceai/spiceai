@@ -189,6 +189,7 @@ pub struct ClusterServiceImpl {
 impl ClusterServiceImpl {
     /// Creates a new cluster service implementation.
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         app: Arc<TokioRwLock<Option<Arc<App>>>>,
         secrets: Arc<TokioRwLock<Secrets>>,
@@ -476,7 +477,7 @@ impl ClusterService for ClusterServiceImpl {
         // Spawn a task to handle the bidirectional stream.
         let executor_registry = Arc::clone(&self.executor_registry);
         let datafusion = Arc::clone(&self.datafusion);
-        let runtime_status = self.runtime_status.clone();
+        let runtime_status = Arc::clone(&self.runtime_status);
         let outbound_tx_for_registry = outbound_tx.clone();
         let outbound_tx_for_task = outbound_tx.clone();
         let metrics_node_id = self.advertise_address.clone();

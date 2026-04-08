@@ -190,6 +190,10 @@ impl ExecutorRegistry {
         let mut connections = self.connections.write().await;
         if connections.contains_key(&executor_id) {
             tracing::debug!("Executor {executor_id} reconnected, replacing existing connection");
+            // Clear stale dataset statuses — the reconnecting executor will re-send
+            // its current statuses via ComponentStatusUpdate messages.
+            let mut statuses = self.executor_dataset_statuses.write().await;
+            statuses.remove(&executor_id);
         } else {
             tracing::debug!("Executor {executor_id} connected");
         }

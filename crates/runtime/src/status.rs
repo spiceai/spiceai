@@ -104,11 +104,13 @@ impl RuntimeStatus {
 
     /// Updates the status of a component and tracks if it has ever been ready.
     pub(crate) fn update_component_status(&self, component_name: &str, status: ComponentStatus) {
-        let mut statuses = match self.statuses.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        statuses.insert(component_name.to_string(), status.clone());
+        {
+            let mut statuses = match self.statuses.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            statuses.insert(component_name.to_string(), status.clone());
+        }
 
         if status == ComponentStatus::Ready {
             let mut ever_ready = match self.ever_ready_components.write() {
@@ -118,7 +120,7 @@ impl RuntimeStatus {
             ever_ready.insert(component_name.to_string());
         }
 
-        // Broadcast the change event to subscribers.
+        // Broadcast the change event to subscribers (lock already dropped).
         let _ = self
             .component_status_tx
             .send((component_name.to_string(), status.clone()));

@@ -114,7 +114,7 @@ fn spawn_control_stream(
             .build();
         // Channel for forwarding ComponentStatusAck update_ids to the status sender task.
         // Re-created each connection since the sender task is re-spawned.
-        let mut ack_rx: Option<mpsc::Receiver<String>> = None;
+        let mut component_ack_rx: Option<mpsc::Receiver<String>>;
 
         loop {
             if token.is_cancelled() {
@@ -186,7 +186,7 @@ fn spawn_control_stream(
             let (outbound_tx, outbound_rx) = mpsc::channel::<ExecutorControlMessage>(32);
             // Create channel for forwarding acks to the component status task
             let (ack_tx, ack_rx_new) = mpsc::channel::<String>(32);
-            ack_rx = Some(ack_rx_new);
+            component_ack_rx = Some(ack_rx_new);
             {
                 let mut outbound_guard = outbound_tx_state_for_task.write().await;
                 *outbound_guard = Some(outbound_tx.clone());
@@ -217,7 +217,7 @@ fn spawn_control_stream(
                 outbound_tx.clone(),
                 token.clone(),
                 Arc::clone(&runtime_status),
-                ack_rx.take(),
+                component_ack_rx.take(),
             ));
 
             // Send initial identification message
@@ -608,14 +608,15 @@ pub struct ControlStreamManager {
     partition_update_handler: Option<PartitionUpdateHandler>,
     /// Callback handler for dataset refresh commands.
     refresh_dataset_handler: Option<RefreshDatasetHandler>,
-    /// Executor's runtime status, used to send dataset statuses in heartbeats
-    /// and real-time `DatasetStatusChange` messages.
+    /// Executor's runtime status, used to send real-time
+    /// `ComponentStatusUpdate` messages for runtime components.
     runtime_status: Arc<RuntimeStatus>,
 }
 
 impl ControlStreamManager {
     /// Creates a new control stream manager.
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         executor_id: String,
         ballista_executor_id: String,
