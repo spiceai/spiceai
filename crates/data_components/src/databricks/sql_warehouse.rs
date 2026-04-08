@@ -259,13 +259,6 @@ impl SqlWarehouseApi {
                     "information_schema.columns has no metadata for this table, falling back to DESCRIBE TABLE. Column nullability will default to nullable."
                 );
             }
-            Err(Error::ParseError { ref reason }) => {
-                tracing::warn!(
-                    table = %table,
-                    reason,
-                    "information_schema.columns returned unparseable type names (likely source-native types from a federated table), falling back to DESCRIBE TABLE. Column nullability will default to nullable."
-                );
-            }
             Err(e) => return Err(e),
         }
 

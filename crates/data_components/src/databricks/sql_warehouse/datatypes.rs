@@ -114,6 +114,21 @@ impl<'input> Parser<'input> {
         }
     }
 
+    /// Expects the current token to be an `Identifier` matching `name`
+    /// (case-insensitive). Advances past it on success.
+    fn expect_identifier(&mut self, name: &str, context: &str) -> Result<(), String> {
+        match &self.current {
+            Some(Ok(Token::Identifier(id))) if id.eq_ignore_ascii_case(name) => {
+                self.advance();
+                Ok(())
+            }
+            _ => Err(format!(
+                "Expected '{name}' after {context}, found {:?}",
+                self.current
+            )),
+        }
+    }
+
     pub fn parse(&mut self) -> Result<ArrowDataType, String> {
         self.parse_data_type_with_depth(0)
     }
@@ -141,10 +156,22 @@ impl<'input> Parser<'input> {
             None
         };
         Ok(match params {
-            Some((p, s)) => ArrowDataType::Decimal128(
-                u8::try_from(p).map_err(|e| format!("truncated Decimal precision: {e}"))?,
-                i8::try_from(s).map_err(|e| format!("truncated Decimal scale: {e}"))?,
-            ),
+            Some((p, s)) => {
+                let precision =
+                    u8::try_from(p).map_err(|e| format!("truncated Decimal precision: {e}"))?;
+                let scale = i8::try_from(s).map_err(|e| format!("truncated Decimal scale: {e}"))?;
+                if precision > 38 {
+                    return Err(format!(
+                        "DECIMAL precision {precision} exceeds maximum of 38"
+                    ));
+                }
+                if u8::try_from(s).is_ok_and(|su| su > precision) {
+                    return Err(format!(
+                        "DECIMAL scale {scale} out of range for precision {precision}"
+                    ));
+                }
+                ArrowDataType::Decimal128(precision, scale)
+            }
             None => ArrowDataType::Decimal128(38, 10), // Default precision and scale
         })
     }
@@ -212,16 +239,16 @@ impl<'input> Parser<'input> {
                 {
                     // "timestamp without time zone" → TimestampNtz
                     self.advance(); // consume "without"
-                    self.advance(); // consume "time"
-                    self.advance(); // consume "zone"
+                    self.expect_identifier("time", "'timestamp without'")?;
+                    self.expect_identifier("zone", "'timestamp without time'")?;
                     return Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None));
                 }
                 if matches!(&self.current, Some(Ok(Token::Identifier(id))) if id.eq_ignore_ascii_case("with"))
                 {
                     // "timestamp with time zone" → Timestamp(UTC)
                     self.advance(); // consume "with"
-                    self.advance(); // consume "time"
-                    self.advance(); // consume "zone"
+                    self.expect_identifier("time", "'timestamp with'")?;
+                    self.expect_identifier("zone", "'timestamp with time'")?;
                     return Ok(ArrowDataType::Timestamp(
                         TimeUnit::Microsecond,
                         Some("UTC".into()),
@@ -305,11 +332,18 @@ impl<'input> Parser<'input> {
                         return Err("Expected number for NUMERIC scale".to_string());
                     };
                     self.expect(&Token::RParen)?;
-                    Ok(ArrowDataType::Decimal128(
-                        u8::try_from(precision)
-                            .map_err(|e| format!("truncated NUMERIC precision: {e}"))?,
-                        i8::try_from(scale).map_err(|e| format!("truncated NUMERIC scale: {e}"))?,
-                    ))
+                    let p = u8::try_from(precision)
+                        .map_err(|e| format!("truncated NUMERIC precision: {e}"))?;
+                    let s =
+                        i8::try_from(scale).map_err(|e| format!("truncated NUMERIC scale: {e}"))?;
+                    if p > 38 {
+                        return Err(format!("NUMERIC precision {p} exceeds maximum of 38"));
+                    }
+                    // scale (originally u32, now i8) must not exceed precision
+                    if u8::try_from(scale).is_ok_and(|su| su > p) {
+                        return Err(format!("NUMERIC scale {s} out of range for precision {p}"));
+                    }
+                    Ok(ArrowDataType::Decimal128(p, s))
                 } else {
                     Ok(ArrowDataType::Decimal128(38, 10))
                 }
@@ -330,6 +364,9 @@ impl<'input> Parser<'input> {
                 // Consume optional (length) from "varchar(255)"
                 if self.current == Some(Ok(Token::LParen)) {
                     self.advance(); // skip `(`
+                    if !matches!(self.current, Some(Ok(Token::Number(_)))) {
+                        return Err("Expected number for CHARACTER/VARCHAR length".to_string());
+                    }
                     self.advance(); // skip length
                     self.expect(&Token::RParen)?;
                 }
