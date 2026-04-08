@@ -500,6 +500,26 @@ impl HttpTableProvider {
                 message: "pagination_max_pages must be greater than 0".to_string()
             }
         );
+        if let Some(ref pointer) = config.next_pointer {
+            ensure!(
+                pointer.starts_with('/'),
+                ConfigurationSnafu {
+                    message: format!(
+                        "pagination_next_pointer must be a valid JSON Pointer starting with '/': got '{pointer}'"
+                    )
+                }
+            );
+        }
+        if let Some(ref pointer) = config.data_pointer {
+            ensure!(
+                pointer.starts_with('/'),
+                ConfigurationSnafu {
+                    message: format!(
+                        "pagination_data_pointer must be a valid JSON Pointer starting with '/': got '{pointer}'"
+                    )
+                }
+            );
+        }
         self.pagination = Some(config);
         Ok(self)
     }
@@ -1495,7 +1515,8 @@ impl ExecutionPlan for HttpExec {
                     .map_err(DataFusionError::from)?;
 
                     // Extract data rows using data_pointer if configured
-                    let content_rows = extract_page_data(&fetch_result.content, config, page_limit);
+                    let content_rows =
+                        extract_page_data(&fetch_result.content, config, page_limit)?;
 
                     // Update pagination state before deciding whether to yield a batch
                     state.page += 1;
@@ -1613,23 +1634,39 @@ fn extract_next_page_info(
 ) -> Result<Option<NextPageInfo>> {
     // Try response body JSON pointer first
     if let Some(ref pointer) = config.next_pointer {
-        let parsed = serde_json::from_str::<serde_json::Value>(content).ok();
-        if let Some(value) = parsed.as_ref().and_then(|json| json.pointer(pointer)) {
-            if let Some(next_str) = value.as_str()
-                && !next_str.is_empty()
-            {
-                if config.token_param.is_some() {
-                    return Ok(Some(NextPageInfo::Token(next_str.to_string())));
+        let parsed = serde_json::from_str::<serde_json::Value>(content)
+            .map_err(|source| Error::Pagination {
+                message: format!(
+                    "Failed to parse pagination response body as JSON for pointer '{pointer}': {source}"
+                ),
+            })?;
+
+        if let Some(value) = parsed.pointer(pointer) {
+            match value {
+                serde_json::Value::String(next_str) if !next_str.is_empty() => {
+                    if config.token_param.is_some() {
+                        return Ok(Some(NextPageInfo::Token(next_str.clone())));
+                    }
+                    let next_url = resolve_and_validate_url(
+                        next_str,
+                        base_url,
+                        &format!("JSON pointer '{pointer}'"),
+                    )?;
+                    return Ok(Some(NextPageInfo::Url(next_url)));
                 }
-                let next_url = resolve_and_validate_url(
-                    next_str,
-                    base_url,
-                    &format!("JSON pointer '{pointer}'"),
-                )?;
-                return Ok(Some(NextPageInfo::Url(next_url)));
+                serde_json::Value::Null | serde_json::Value::String(_) => {
+                    // Null or empty string is an explicit end of pagination.
+                    return Ok(None);
+                }
+                _ => {
+                    return PaginationSnafu {
+                        message: format!(
+                            "Failed to extract pagination value from JSON pointer '{pointer}': expected a string or null"
+                        ),
+                    }
+                    .fail();
+                }
             }
-            // Value is null, empty, or non-string — explicit end of pagination
-            return Ok(None);
         }
         // Pointer path not found in response — fall through to Link header
         // (the API may not include the field on the last page)
@@ -1672,27 +1709,33 @@ fn extract_page_data(
     content: &str,
     config: &PaginationConfig,
     limit: Option<usize>,
-) -> Vec<String> {
-    if let Some(ref pointer) = config.data_pointer
-        && let Ok(json) = serde_json::from_str::<serde_json::Value>(content)
-    {
-        if let Some(data) = json.pointer(pointer) {
-            if let Some(arr) = data.as_array() {
-                return arr
-                    .iter()
-                    .take(limit.unwrap_or(usize::MAX))
-                    .map(std::string::ToString::to_string)
-                    .collect();
-            }
-            // Not an array — return as a single row
-            return vec![data.to_string()];
+) -> DataFusionResult<Vec<String>> {
+    if let Some(ref pointer) = config.data_pointer {
+        let json = serde_json::from_str::<serde_json::Value>(content).map_err(|source| {
+            DataFusionError::Execution(format!(
+                "Failed to extract paginated HTTP response data: response is not valid JSON for configured data pointer '{pointer}': {source}"
+            ))
+        })?;
+
+        let data = json.pointer(pointer).ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "Failed to extract paginated HTTP response data: configured data pointer '{pointer}' was not found in the response"
+            ))
+        })?;
+
+        if let Some(arr) = data.as_array() {
+            return Ok(arr
+                .iter()
+                .take(limit.unwrap_or(usize::MAX))
+                .map(std::string::ToString::to_string)
+                .collect());
         }
-        tracing::warn!("Data pointer '{pointer}' not found in response");
-        return vec![];
+        // Not an array — return as a single row
+        return Ok(vec![data.to_string()]);
     }
 
     // No data_pointer — use normal parse_content logic
-    HttpExec::parse_content(content, limit)
+    Ok(HttpExec::parse_content(content, limit))
 }
 
 /// Build a query string by adding or replacing a token parameter.
@@ -3799,7 +3842,7 @@ mod tests {
             ..Default::default()
         };
         let content = r#"{"results": [{"id": 1}, {"id": 2}], "next": "url"}"#;
-        let rows = extract_page_data(content, &config, None);
+        let rows = extract_page_data(content, &config, None).expect("should extract page data");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], r#"{"id":1}"#);
         assert_eq!(rows[1], r#"{"id":2}"#);
@@ -3812,7 +3855,7 @@ mod tests {
             ..Default::default()
         };
         let content = r#"{"items": [{"id": 1}, {"id": 2}, {"id": 3}]}"#;
-        let rows = extract_page_data(content, &config, Some(2));
+        let rows = extract_page_data(content, &config, Some(2)).expect("should extract page data");
         assert_eq!(rows.len(), 2);
     }
 
@@ -3820,7 +3863,7 @@ mod tests {
     fn test_extract_page_data_without_data_pointer() {
         let config = PaginationConfig::default();
         let content = r#"[{"id": 1}, {"id": 2}]"#;
-        let rows = extract_page_data(content, &config, None);
+        let rows = extract_page_data(content, &config, None).expect("should extract page data");
         assert_eq!(rows.len(), 2);
     }
 
@@ -3831,8 +3874,8 @@ mod tests {
             ..Default::default()
         };
         let content = r#"{"results": [1, 2, 3]}"#;
-        let rows = extract_page_data(content, &config, None);
-        assert!(rows.is_empty(), "missing pointer should return empty");
+        let result = extract_page_data(content, &config, None);
+        assert!(result.is_err(), "missing pointer should return error");
     }
 
     #[test]
@@ -4024,6 +4067,93 @@ mod tests {
         assert!(
             !result.contains("&foo="),
             "special chars in token should be encoded, not treated as params: {result}"
+        );
+    }
+
+    #[test]
+    fn test_extract_next_page_info_json_parse_error() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/next".to_string()),
+            ..Default::default()
+        };
+        let content = "this is not json";
+        let headers = vec![];
+
+        let result = extract_next_page_info(content, &headers, &config, &base_url);
+        assert!(
+            result.is_err(),
+            "invalid JSON should return error when next_pointer is configured"
+        );
+    }
+
+    #[test]
+    fn test_extract_next_page_info_non_string_pointer_value_errors() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/next".to_string()),
+            ..Default::default()
+        };
+        let content = r#"{"next": 42}"#;
+        let headers = vec![];
+
+        let result = extract_next_page_info(content, &headers, &config, &base_url);
+        assert!(
+            result.is_err(),
+            "non-string pointer value should return error"
+        );
+    }
+
+    #[test]
+    fn test_extract_page_data_invalid_json() {
+        let config = PaginationConfig {
+            data_pointer: Some("/results".to_string()),
+            ..Default::default()
+        };
+        let content = "not valid json";
+        let result = extract_page_data(content, &config, None);
+        assert!(
+            result.is_err(),
+            "invalid JSON should return error when data_pointer is configured"
+        );
+    }
+
+    #[test]
+    fn test_with_pagination_invalid_next_pointer() {
+        let provider = HttpTableProvider::new(
+            Url::parse("https://example.com").expect("valid URL"),
+            Client::new(),
+            "json".to_string(),
+            false,
+        );
+        let result = provider.with_pagination(PaginationConfig {
+            next_pointer: Some("next".to_string()),
+            use_link_header: false,
+            ..Default::default()
+        });
+        assert!(
+            result.is_err(),
+            "next_pointer without leading '/' should fail"
+        );
+    }
+
+    #[test]
+    fn test_with_pagination_invalid_data_pointer() {
+        let provider = HttpTableProvider::new(
+            Url::parse("https://example.com").expect("valid URL"),
+            Client::new(),
+            "json".to_string(),
+            false,
+        );
+        let result = provider.with_pagination(PaginationConfig {
+            next_pointer: Some("/next".to_string()),
+            data_pointer: Some("results".to_string()),
+            use_link_header: false,
+            ..Default::default()
+        });
+        assert!(
+            result.is_err(),
+            "data_pointer without leading '/' should fail"
         );
     }
 }
