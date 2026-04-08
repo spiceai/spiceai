@@ -199,13 +199,13 @@ impl<'input> Parser<'input> {
             Some(Ok(Token::Timestamp)) => {
                 self.advance();
                 Ok(ArrowDataType::Timestamp(
-                    TimeUnit::Nanosecond,
+                    TimeUnit::Microsecond,
                     Some("UTC".into()),
                 ))
             }
             Some(Ok(Token::TimestampNtz)) => {
                 self.advance();
-                Ok(ArrowDataType::Timestamp(TimeUnit::Nanosecond, None))
+                Ok(ArrowDataType::Timestamp(TimeUnit::Microsecond, None))
             }
             Some(Ok(Token::TinyInt)) => {
                 self.advance();
@@ -213,11 +213,17 @@ impl<'input> Parser<'input> {
             }
             Some(Ok(Token::Array)) => {
                 self.advance();
-                self.expect(&Token::LAngle)?;
-                let inner_type = self.parse_data_type_with_depth(depth + 1)?;
-                self.expect(&Token::RAngle)?;
-                let field = ArrowField::new("item", inner_type, true);
-                Ok(ArrowDataType::List(Arc::new(field)))
+                if self.current == Some(Ok(Token::LAngle)) {
+                    self.advance();
+                    let inner_type = self.parse_data_type_with_depth(depth + 1)?;
+                    self.expect(&Token::RAngle)?;
+                    let field = ArrowField::new("item", inner_type, true);
+                    Ok(ArrowDataType::List(Arc::new(field)))
+                } else {
+                    // Fallback: no element type specified (e.g. from data_type column)
+                    let field = ArrowField::new("item", ArrowDataType::Utf8, true);
+                    Ok(ArrowDataType::List(Arc::new(field)))
+                }
             }
             Some(Ok(Token::Map)) => self.parse_map_with_depth(depth),
             Some(Ok(Token::Struct)) => self.parse_struct_with_depth(depth),
@@ -227,7 +233,18 @@ impl<'input> Parser<'input> {
 
     fn parse_map_with_depth(&mut self, depth: usize) -> Result<ArrowDataType, String> {
         self.advance();
-        self.expect(&Token::LAngle)?;
+        if self.current != Some(Ok(Token::LAngle)) {
+            // Fallback: no type parameters (e.g. from data_type column)
+            let key_field = Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false));
+            let value_field = Arc::new(ArrowField::new("value", ArrowDataType::Utf8, true));
+            let entry_struct = Arc::new(ArrowField::new_struct(
+                "entries",
+                vec![key_field, value_field],
+                true,
+            ));
+            return Ok(ArrowDataType::Map(entry_struct, false));
+        }
+        self.advance();
         let key_type = self.parse_data_type_with_depth(depth + 1)?;
         self.expect(&Token::Comma)?;
         let value_type = self.parse_data_type_with_depth(depth + 1)?;
@@ -244,6 +261,10 @@ impl<'input> Parser<'input> {
 
     fn parse_struct_with_depth(&mut self, depth: usize) -> Result<ArrowDataType, String> {
         self.advance();
+        if self.current != Some(Ok(Token::LAngle)) {
+            // Fallback: no field definitions (e.g. from data_type column)
+            return Ok(ArrowDataType::Utf8);
+        }
         self.expect(&Token::LAngle)?;
         let mut fields = Vec::new();
         if self.current != Some(Ok(Token::RAngle)) {
@@ -388,10 +409,10 @@ mod tests {
             ArrowDataType::Int16,
             ArrowDataType::Utf8,
             ArrowDataType::Utf8,
-            ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-            ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-            ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
-            ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
             ArrowDataType::Int8,
             ArrowDataType::Int8,
             ArrowDataType::Null,
@@ -498,5 +519,65 @@ mod tests {
         let mut parser = Parser::new(input);
         let result = parser.parse().expect("parse success");
         assert_eq!(result, expected, "Failed for input: {input}");
+    }
+
+    #[test]
+    fn test_parameterless_complex_types() {
+        // When using `data_type` column instead of `full_data_type`, complex types
+        // come without type parameters (e.g. just "ARRAY" instead of "ARRAY<STRING>").
+        let mut parser = Parser::new("ARRAY");
+        let result = parser.parse().expect("parse ARRAY without params");
+        let expected_array =
+            ArrowDataType::List(Arc::new(ArrowField::new("item", ArrowDataType::Utf8, true)));
+        assert_eq!(result, expected_array);
+
+        let mut parser = Parser::new("MAP");
+        let result = parser.parse().expect("parse MAP without params");
+        let key = Arc::new(ArrowField::new("key", ArrowDataType::Utf8, false));
+        let val = Arc::new(ArrowField::new("value", ArrowDataType::Utf8, true));
+        let entries = Arc::new(ArrowField::new_struct("entries", vec![key, val], true));
+        let expected_map = ArrowDataType::Map(entries, false);
+        assert_eq!(result, expected_map);
+
+        let mut parser = Parser::new("STRUCT");
+        let result = parser.parse().expect("parse STRUCT without params");
+        assert_eq!(result, ArrowDataType::Utf8);
+
+        let mut parser = Parser::new("DECIMAL");
+        let result = parser.parse().expect("parse DECIMAL without params");
+        assert_eq!(result, ArrowDataType::Decimal128(38, 10));
+    }
+
+    /// Databricks sends Arrow IPC data with `Timestamp(Microsecond, ...)` but
+    /// the schema parser previously declared `Timestamp(Nanosecond, ...)`,
+    /// causing arithmetic overflow when casting far-future sentinel values
+    /// (e.g. year 9999: 253402300799999000 µs × 1000 > i64::MAX).
+    ///
+    /// This test ensures the parser declares Microsecond to match the wire format.
+    #[test]
+    fn test_timestamp_uses_microsecond_to_prevent_overflow() {
+        let mut parser = Parser::new("TIMESTAMP");
+        let result = parser.parse().expect("parse TIMESTAMP");
+        assert_eq!(
+            result,
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            "TIMESTAMP must use Microsecond to match Databricks Arrow IPC format"
+        );
+
+        let mut parser = Parser::new("TIMESTAMP_NTZ");
+        let result = parser.parse().expect("parse TIMESTAMP_NTZ");
+        assert_eq!(
+            result,
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+            "TIMESTAMP_NTZ must use Microsecond to match Databricks Arrow IPC format"
+        );
+
+        // Verify the sentinel value 9999-12-31T23:59:59.999 fits in i64 microseconds
+        // but would overflow in nanoseconds (253402300799999000 * 1000 > i64::MAX).
+        let sentinel_us: i64 = 253_402_300_799_999_000;
+        assert!(
+            sentinel_us.checked_mul(1000).is_none(),
+            "year-9999 sentinel must overflow when converting µs→ns"
+        );
     }
 }
