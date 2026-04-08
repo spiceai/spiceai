@@ -1016,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ref_fetch_mode_from_filters_uses_dynamic_mode_for_multiple_ref_values() {
+    fn test_ref_fetch_mode_from_filters_prefers_exact_mode_for_multiple_ref_values() {
         let filters = vec![
             FilterPushdownResult {
                 filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Exact,
@@ -1032,7 +1032,7 @@ mod tests {
 
         assert_eq!(
             ref_fetch_mode_from_filter_results(&filters),
-            RefFetchMode::Dynamic
+            RefFetchMode::Exact("trunk".to_string())
         );
     }
 
