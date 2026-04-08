@@ -247,33 +247,50 @@ impl SqlWarehouseApi {
 
     async fn get_schema(&self, table: &TableReference) -> Result<SchemaRef, Error> {
         let token = self.token_provider.get_token();
-        let payload = self.create_schema_payload(table, "full_data_type")?;
+        let payload = self.create_schema_payload(table)?;
         let response = self.execute_sql_statement(&token, &payload).await?;
         let response = self.wait_for_statement_completion(&token, response).await?;
 
         match schema_from_json(&response, &table.to_string()) {
             Ok(schema) => Ok(schema),
-            Err(Error::QueryFailure { ref message })
-                if message.contains("UNRESOLVED_COLUMN") && message.contains("full_data_type") =>
-            {
+            Err(original_err) if Self::is_schema_query_fallback_eligible(&original_err) => {
                 tracing::warn!(
                     table = %table,
-                    "Databricks information_schema does not have 'full_data_type' column, falling back to 'data_type'. Complex types (ARRAY, MAP, STRUCT) may lose inner type details."
+                    error = %original_err,
+                    "Failed to get schema via information_schema, falling back to DESCRIBE TABLE. Nullability information will not be available."
                 );
-                let payload = self.create_schema_payload(table, "data_type")?;
-                let response = self.execute_sql_statement(&token, &payload).await?;
-                let response = self.wait_for_statement_completion(&token, response).await?;
-                schema_from_json(&response, &table.to_string())
+                self.get_schema_via_describe_table(&token, table).await
             }
             Err(e) => Err(e),
         }
     }
 
-    fn create_schema_payload(
+    fn is_schema_query_fallback_eligible(err: &Error) -> bool {
+        match err {
+            Error::QueryFailure { message } => {
+                // Foreign catalogs: information_schema exists but lacks full_data_type
+                let unresolved_column =
+                    message.contains("UNRESOLVED_COLUMN") && message.contains("full_data_type");
+                // HMS catalogs: information_schema.columns doesn't exist
+                let table_not_found = message.contains("TABLE_OR_VIEW_NOT_FOUND");
+                unresolved_column || table_not_found
+            }
+            _ => false,
+        }
+    }
+
+    async fn get_schema_via_describe_table(
         &self,
+        token: &str,
         table: &TableReference,
-        data_type_column: &str,
-    ) -> Result<Value, Error> {
+    ) -> Result<SchemaRef, Error> {
+        let payload = self.create_describe_table_payload(table)?;
+        let response = self.execute_sql_statement(token, &payload).await?;
+        let response = self.wait_for_statement_completion(token, response).await?;
+        schema_from_describe_json(&response, &table.to_string())
+    }
+
+    fn create_schema_payload(&self, table: &TableReference) -> Result<Value, Error> {
         let table_schema = table.schema().ok_or_else(|| Error::FullyQualifiedPath {
             reason: "missing schema".into(),
         })?;
@@ -285,7 +302,7 @@ impl SqlWarehouseApi {
         let escaped_schema = table_schema.replace('\'', "''");
         let escaped_catalog = table_catalog.replace('\'', "''");
         let sql = format!(
-            "SELECT column_name, {data_type_column}, is_nullable FROM information_schema.columns WHERE table_name = '{escaped_table}' AND table_schema = '{escaped_schema}' AND table_catalog = '{escaped_catalog}'"
+            "SELECT column_name, full_data_type, is_nullable FROM information_schema.columns WHERE table_name = '{escaped_table}' AND table_schema = '{escaped_schema}' AND table_catalog = '{escaped_catalog}'"
         );
         // Databricks SQL Statements API max wait_timeout is 50s.
         // https://docs.databricks.com/api/workspace/statementexecution/executestatement
@@ -293,6 +310,29 @@ impl SqlWarehouseApi {
             "warehouse_id": self.sql_warehouse_id,
             "catalog": table_catalog,
             "schema": table_schema,
+            "statement": sql,
+            "format": "JSON_ARRAY",
+            "disposition": "INLINE",
+            "wait_timeout": "50s",
+            "on_wait_timeout": "CONTINUE",
+        }))
+    }
+
+    fn create_describe_table_payload(&self, table: &TableReference) -> Result<Value, Error> {
+        let table_schema = table.schema().ok_or_else(|| Error::FullyQualifiedPath {
+            reason: "missing schema".into(),
+        })?;
+        let table_catalog = table.catalog().ok_or_else(|| Error::FullyQualifiedPath {
+            reason: "missing catalog".into(),
+        })?;
+        // Escape backticks by doubling them to prevent SQL injection in identifiers
+        let escaped_table = table.table().replace('`', "``");
+        let escaped_schema = table_schema.replace('`', "``");
+        let escaped_catalog = table_catalog.replace('`', "``");
+        let sql =
+            format!("DESCRIBE TABLE `{escaped_catalog}`.`{escaped_schema}`.`{escaped_table}`");
+        Ok(json!({
+            "warehouse_id": self.sql_warehouse_id,
             "statement": sql,
             "format": "JSON_ARRAY",
             "disposition": "INLINE",
@@ -669,6 +709,100 @@ fn schema_from_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef,
 
         let field: Field = Field::new(col_name, data_type, nullable);
 
+        fields.push(field);
+    }
+
+    if fields.is_empty() {
+        return Err(Error::NoColumnsInDataset {
+            dataset_name: dataset_name.to_string(),
+        });
+    }
+
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// Parses schema from a `DESCRIBE TABLE` response.
+///
+/// `DESCRIBE TABLE` returns rows of `[col_name, data_type, comment]` with
+/// Databricks-normalized type names. Since `DESCRIBE TABLE` does not provide
+/// nullability information, all columns are assumed nullable.
+fn schema_from_describe_json(json_value: &Value, dataset_name: &str) -> Result<SchemaRef, Error> {
+    tracing::trace!("Parsing schema from DESCRIBE TABLE response: {json_value}");
+
+    SqlWarehouseApi::verify_response_status(json_value)?;
+
+    let result = json_value
+        .get("result")
+        .ok_or_else(|| Error::UnexpectedSchemaResponse {
+            dataset_name: dataset_name.to_string(),
+            reason: "missing result object in response".to_string(),
+        })?;
+
+    let data_array_value = result.get("data_array");
+
+    let data_array = match data_array_value {
+        None | Some(serde_json::Value::Null) => {
+            return Err(Error::TableSchemaNotRegistered {
+                dataset_name: dataset_name.to_string(),
+            });
+        }
+        Some(v) => v
+            .as_array()
+            .ok_or_else(|| Error::UnexpectedSchemaResponse {
+                dataset_name: dataset_name.to_string(),
+                reason: "result.data_array is not an array".to_string(),
+            })?,
+    };
+
+    if data_array.is_empty() {
+        return Err(Error::NoColumnsInDataset {
+            dataset_name: dataset_name.to_string(),
+        });
+    }
+
+    let mut fields = Vec::new();
+
+    for (i, row) in data_array.iter().enumerate() {
+        let row_array = row
+            .as_array()
+            .ok_or_else(|| Error::UnexpectedSchemaResponse {
+                dataset_name: dataset_name.to_string(),
+                reason: format!("data_array[{i}] is not an array"),
+            })?;
+
+        if row_array.len() < 2 {
+            return Err(Error::UnexpectedSchemaResponse {
+                dataset_name: dataset_name.to_string(),
+                reason: format!("data_array[{i}] has fewer than 2 fields"),
+            });
+        }
+
+        let col_name = row_array[0]
+            .as_str()
+            .ok_or_else(|| Error::UnexpectedSchemaResponse {
+                dataset_name: dataset_name.to_string(),
+                reason: format!("data_array[{i}][0] (column name) is not a string"),
+            })?;
+
+        // DESCRIBE TABLE appends partition info and other metadata after columns
+        if col_name.is_empty() || col_name.starts_with('#') {
+            break;
+        }
+
+        let data_type_str =
+            row_array[1]
+                .as_str()
+                .ok_or_else(|| Error::UnexpectedSchemaResponse {
+                    dataset_name: dataset_name.to_string(),
+                    reason: format!("data_array[{i}][1] (data type) is not a string"),
+                })?;
+
+        let data_type = datatypes::Parser::new(data_type_str)
+            .parse()
+            .map_err(|reason| Error::ParseError { reason })?;
+
+        // DESCRIBE TABLE does not provide nullability — assume all columns are nullable
+        let field = Field::new(col_name, data_type, true);
         fields.push(field);
     }
 
@@ -2152,5 +2286,185 @@ mod tests {
             &DataType::Binary,
             "GEOMETRY should map to Binary"
         );
+    }
+
+    // --- DESCRIBE TABLE fallback tests ---
+
+    fn make_describe_response(data_array: &Value) -> Value {
+        json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "test-stmt-id",
+            "result": { "data_array": data_array }
+        })
+    }
+
+    #[test]
+    fn test_describe_table_basic() {
+        let response = make_describe_response(&json!([
+            ["id", "int", ""],
+            ["name", "string", "some comment"],
+            ["amount", "decimal(10,2)", ""]
+        ]));
+
+        let schema = schema_from_describe_json(&response, "test_table")
+            .expect("should parse describe schema");
+        assert_eq!(schema.fields().len(), 3);
+
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+        assert!(
+            schema.field(0).is_nullable(),
+            "all DESCRIBE TABLE fields should be nullable"
+        );
+
+        assert_eq!(schema.field(1).name(), "name");
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert!(schema.field(1).is_nullable());
+
+        assert_eq!(schema.field(2).name(), "amount");
+        assert_eq!(schema.field(2).data_type(), &DataType::Decimal128(10, 2));
+        assert!(schema.field(2).is_nullable());
+    }
+
+    #[test]
+    fn test_describe_table_stops_at_metadata() {
+        let response = make_describe_response(&json!([
+            ["id", "int", ""],
+            ["name", "string", ""],
+            ["", "", ""],
+            ["# Partition Information", "", ""],
+            ["# col_name", "data_type", "comment"]
+        ]));
+
+        let schema = schema_from_describe_json(&response, "test_table")
+            .expect("should stop at empty col_name or metadata marker");
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "name");
+    }
+
+    #[test]
+    fn test_describe_table_stops_at_hash_marker() {
+        let response = make_describe_response(&json!([
+            ["id", "int", ""],
+            ["# Clustering Information", "", ""]
+        ]));
+
+        let schema = schema_from_describe_json(&response, "test_table")
+            .expect("should stop at clustering marker");
+        assert_eq!(schema.fields().len(), 1);
+        assert_eq!(schema.field(0).name(), "id");
+    }
+
+    #[test]
+    fn test_describe_table_empty() {
+        let response = make_describe_response(&json!([]));
+
+        let err = schema_from_describe_json(&response, "test_table")
+            .expect_err("should fail on empty describe");
+        assert!(
+            matches!(&err, Error::NoColumnsInDataset { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_describe_table_many_types() {
+        let response = make_describe_response(&json!([
+            ["col_bigint", "bigint", ""],
+            ["col_smallint", "smallint", ""],
+            ["col_boolean", "boolean", ""],
+            ["col_float", "float", ""],
+            ["col_date", "date", ""],
+            ["col_timestamp", "timestamp", ""],
+            ["col_timestamp_ntz", "timestamp_ntz", ""],
+            ["col_binary", "binary", ""],
+            ["col_decimal", "decimal(26,2)", ""],
+            ["col_array", "array<string>", ""],
+            ["col_map", "map<string,int>", ""],
+            ["col_struct", "struct<name:string,age:int>", ""]
+        ]));
+
+        let schema = schema_from_describe_json(&response, "test_table")
+            .expect("should parse all DESCRIBE TABLE types");
+        assert_eq!(schema.fields().len(), 12);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(1).data_type(), &DataType::Int16);
+        assert_eq!(schema.field(2).data_type(), &DataType::Boolean);
+        assert_eq!(schema.field(3).data_type(), &DataType::Float32);
+        assert_eq!(schema.field(4).data_type(), &DataType::Date32);
+        assert_eq!(
+            schema.field(5).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        assert_eq!(
+            schema.field(6).data_type(),
+            &DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+        );
+        assert_eq!(schema.field(7).data_type(), &DataType::Binary);
+        assert_eq!(schema.field(8).data_type(), &DataType::Decimal128(26, 2));
+
+        // All fields from DESCRIBE TABLE should be nullable
+        for field in schema.fields() {
+            assert!(
+                field.is_nullable(),
+                "field {} should be nullable",
+                field.name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_describe_table_failed_status() {
+        let response = json!({
+            "status": {
+                "state": "FAILED",
+                "error": { "message": "Table not found" }
+            },
+            "statement_id": "test-stmt-id",
+            "result": {}
+        });
+
+        let err = schema_from_describe_json(&response, "test_table")
+            .expect_err("should fail on FAILED status");
+        assert!(
+            matches!(&err, Error::QueryFailure { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_is_schema_query_fallback_eligible_unresolved_column() {
+        let err = Error::QueryFailure {
+            message: "Query failed with state FAILED: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `full_data_type` cannot be resolved.".to_string(),
+        };
+        assert!(SqlWarehouseApi::is_schema_query_fallback_eligible(&err));
+    }
+
+    #[test]
+    fn test_is_schema_query_fallback_eligible_table_not_found() {
+        let err = Error::QueryFailure {
+            message: "Query failed with state FAILED: [TABLE_OR_VIEW_NOT_FOUND] The table or view `information_schema`.`columns` cannot be found.".to_string(),
+        };
+        assert!(SqlWarehouseApi::is_schema_query_fallback_eligible(&err));
+    }
+
+    #[test]
+    fn test_is_schema_query_fallback_eligible_other_error() {
+        let err = Error::QueryFailure {
+            message: "Query failed with state FAILED: some other error".to_string(),
+        };
+        assert!(!SqlWarehouseApi::is_schema_query_fallback_eligible(&err));
+    }
+
+    #[test]
+    fn test_is_schema_query_fallback_eligible_non_query_failure() {
+        let err = Error::HttpRequestFailed {
+            source: reqwest::Client::new()
+                .get("http://invalid")
+                .build()
+                .unwrap_err(),
+        };
+        assert!(!SqlWarehouseApi::is_schema_query_fallback_eligible(&err));
     }
 }
