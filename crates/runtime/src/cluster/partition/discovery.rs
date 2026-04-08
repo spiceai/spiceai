@@ -126,8 +126,8 @@ pub(crate) async fn query_source_partitions(
 /// not yet tracked in the partition manager's metadata.
 pub(crate) async fn discover_new_partitions(
     table: &TableReference,
-    partition_by: &[spicepod::partitioning::PartitionedBy],
-    partition_manager: &super::PartitionManager,
+    partition_by: &[PartitionedBy],
+    partition_store: &super::PartitionStore,
     df: &Arc<DataFusion>,
 ) -> Result<Vec<PartitionValue>> {
     use std::collections::HashSet;
@@ -142,7 +142,7 @@ pub(crate) async fn discover_new_partitions(
     }
 
     // Get existing metadata.
-    let current_metadata = match partition_manager.get_table_metadata(table).await {
+    let current_metadata = match partition_store.get_table_metadata(table).await {
         Ok(Some(m)) => m,
         Ok(None) => {
             tracing::debug!(

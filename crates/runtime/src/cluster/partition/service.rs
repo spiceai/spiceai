@@ -38,28 +38,26 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use crate::cluster::executor_registry::{self, ExecutorRegistry};
 use crate::cluster::partition::discovery::{discover_new_partitions, table_partition_values};
 use crate::cluster::partition::{
-    PartitionManager, PartitionMetadata, PartitionValue, partition_value_to_bytes,
+    PartitionMetadata, PartitionStore, PartitionValue, partition_value_to_bytes,
 };
 use crate::datafusion::DataFusion;
-
-// --- Error and config types ---
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to refresh partition manager: {source}"))]
     PartitionManagerRefresh {
-        source: crate::cluster::partition::manager::Error,
+        source: crate::cluster::partition::store::Error,
     },
 
     #[snafu(display("Failed to list tables: {source}"))]
     ListTables {
-        source: crate::cluster::partition::manager::Error,
+        source: crate::cluster::partition::store::Error,
     },
 
     #[snafu(display("Failed to get table metadata for {table}: {source}"))]
     GetTableMetadata {
         table: String,
-        source: crate::cluster::partition::manager::Error,
+        source: crate::cluster::partition::store::Error,
     },
 
     #[snafu(display("Table metadata not found for {table}"))]
@@ -68,7 +66,7 @@ pub enum Error {
     #[snafu(display("Failed to write metadata for {table}: {source}"))]
     WriteMetadata {
         table: String,
-        source: crate::cluster::partition::manager::Error,
+        source: crate::cluster::partition::store::Error,
     },
 
     #[snafu(display(
@@ -115,8 +113,6 @@ impl Default for AssignmentConfig {
     }
 }
 
-// --- Internal types ---
-
 struct CycleState {
     executor_ids: Vec<String>,
     tables: Vec<String>,
@@ -156,7 +152,7 @@ struct DiscoveryResult {
 /// Holds the partition manager, executor registry, app reference, and assignment configuration.
 /// Methods take `&Arc<DataFusion>` as a parameter to avoid circular references.
 pub struct PartitionService {
-    pub partition_manager: Arc<PartitionManager>,
+    pub partition_store: Arc<PartitionStore>,
     pub executor_registry: Arc<ExecutorRegistry>,
     pub config: AssignmentConfig,
     pub(crate) app: Arc<RwLock<Option<Arc<App>>>>,
@@ -165,13 +161,13 @@ pub struct PartitionService {
 impl PartitionService {
     #[must_use]
     pub fn new(
-        partition_manager: Arc<PartitionManager>,
+        partition_store: Arc<PartitionStore>,
         executor_registry: Arc<ExecutorRegistry>,
         config: AssignmentConfig,
         app: Arc<RwLock<Option<Arc<App>>>>,
     ) -> Self {
         Self {
-            partition_manager,
+            partition_store,
             executor_registry,
             config,
             app,
@@ -191,14 +187,14 @@ impl PartitionService {
             return Ok(());
         };
 
-        self.partition_manager
+        self.partition_store
             .refresh()
             .await
             .context(PartitionManagerRefreshSnafu)?;
 
         let new_partitions = match timeout(
             self.config.discovery_timeout,
-            discover_new_partitions(table, &partition_by, &self.partition_manager, df),
+            discover_new_partitions(table, &partition_by, &self.partition_store, df),
         )
         .await
         {
@@ -223,9 +219,9 @@ impl PartitionService {
             "Discovered new partitions before refresh"
         );
 
-        add_partitions_with_retry(&self.partition_manager, table, new_partitions).await?;
+        add_partitions_with_retry(&self.partition_store, table, new_partitions).await?;
 
-        self.partition_manager
+        self.partition_store
             .refresh()
             .await
             .context(PartitionManagerRefreshSnafu)?;
@@ -237,7 +233,7 @@ impl PartitionService {
         }
 
         let tables = self
-            .partition_manager
+            .partition_store
             .list_tables()
             .await
             .context(ListTablesSnafu)?;
@@ -246,16 +242,16 @@ impl PartitionService {
             tables,
         };
 
-        let unassigned = find_unassigned_partitions_for_table(&self.partition_manager, table);
+        let unassigned = find_unassigned_partitions_for_table(&self.partition_store, table);
         if !unassigned.is_empty() {
             let assignments = assign_unassigned_partitions(
                 unassigned,
                 &state,
-                &self.partition_manager,
+                &self.partition_store,
                 &self.config,
             );
             let CommitResult { committed, failed } =
-                commit_assignments(&self.partition_manager, assignments).await?;
+                commit_assignments(&self.partition_store, assignments).await?;
             if !failed.is_empty() {
                 tracing::warn!("Failed to commit {} partition assignments", failed.len());
             }
@@ -266,25 +262,26 @@ impl PartitionService {
     }
 
     /// Discover new/removed partitions for all tracked tables, assign, and notify executors.
-    pub async fn discover_and_assign_all(&self, df: &Arc<DataFusion>) -> Result<()> {
+    pub async fn discover_and_assign_all_tables(&self, df: &Arc<DataFusion>) -> Result<()> {
         let Some(app) = self.app.read().await.clone() else {
             tracing::warn!("App not initialized, skipping partition discovery");
             return Ok(());
         };
 
-        let state = refresh_state(&self.partition_manager, &self.executor_registry).await?;
+        let state = refresh_state(&self.partition_store, &self.executor_registry).await?;
 
         let discovery_result =
-            discover_and_sync_partitions(&app, df, &self.partition_manager, &state, &self.config)
+            discover_and_sync_partitions(&app, df, &self.partition_store, &state, &self.config)
                 .await?;
 
         if !discovery_result.new_partitions.is_empty() {
-            add_new_partitions(&self.partition_manager, discovery_result.new_partitions).await?;
+            add_new_partitions_to_store(&self.partition_store, discovery_result.new_partitions)
+                .await?;
         }
 
         if !discovery_result.removed_partitions.is_empty() {
-            remove_stale_partitions(
-                &self.partition_manager,
+            remove_stale_partitions_from_store(
+                &self.partition_store,
                 &self.executor_registry,
                 df,
                 discovery_result.removed_partitions,
@@ -292,16 +289,16 @@ impl PartitionService {
             .await?;
         }
 
-        let unassigned = find_unassigned_partitions(&self.partition_manager, &state);
+        let unassigned = find_unassigned_partitions(&self.partition_store, &state);
         if !unassigned.is_empty() {
             let assignments = assign_unassigned_partitions(
                 unassigned,
                 &state,
-                &self.partition_manager,
+                &self.partition_store,
                 &self.config,
             );
             let CommitResult { committed, failed } =
-                commit_assignments(&self.partition_manager, assignments).await?;
+                commit_assignments(&self.partition_store, assignments).await?;
             if !failed.is_empty() {
                 tracing::warn!("Failed to commit {} partition assignments", failed.len());
             }
@@ -340,16 +337,16 @@ pub(crate) fn get_partition_config(
 }
 
 async fn refresh_state(
-    partition_manager: &PartitionManager,
+    partition_store: &PartitionStore,
     executor_registry: &ExecutorRegistry,
 ) -> Result<CycleState> {
-    partition_manager
+    partition_store
         .refresh()
         .await
         .context(PartitionManagerRefreshSnafu)?;
 
     let executor_ids = executor_registry.connected_executors().await;
-    let tables = partition_manager
+    let tables = partition_store
         .list_tables()
         .await
         .context(ListTablesSnafu)?;
@@ -360,10 +357,14 @@ async fn refresh_state(
     })
 }
 
+/// For each tracked table, queries the source for current partition values and
+/// diffs against the stored metadata. Returns new partitions (in source but not
+/// in metadata) and removed partitions (in metadata but no longer in source).
+/// Does not assign or notify — the caller handles that.
 async fn discover_and_sync_partitions(
     app: &App,
     df: &Arc<DataFusion>,
-    partition_manager: &PartitionManager,
+    partition_store: &PartitionStore,
     state: &CycleState,
     config: &AssignmentConfig,
 ) -> Result<DiscoveryResult> {
@@ -377,7 +378,7 @@ async fn discover_and_sync_partitions(
             continue;
         };
 
-        let Some(metadata) = partition_manager.get_cached_table_metadata(&table_ref) else {
+        let Some(metadata) = partition_store.get_cached_table_metadata(&table_ref) else {
             continue;
         };
 
@@ -444,13 +445,12 @@ async fn discover_and_sync_partitions(
     })
 }
 
-async fn add_new_partitions(
-    partition_manager: &PartitionManager,
+async fn add_new_partitions_to_store(
+    partition_store: &PartitionStore,
     new_partitions: Vec<(TableReference, Vec<PartitionValue>)>,
 ) -> Result<()> {
     for (table, partition_values) in new_partitions {
-        if let Err(e) = add_partitions_with_retry(partition_manager, &table, partition_values).await
-        {
+        if let Err(e) = add_partitions_with_retry(partition_store, &table, partition_values).await {
             tracing::error!(table = %table, error = %e, "Failed to add new partitions to metadata");
         }
     }
@@ -458,14 +458,14 @@ async fn add_new_partitions(
 }
 
 async fn add_partitions_with_retry(
-    partition_manager: &PartitionManager,
+    partition_store: &PartitionStore,
     table: &TableReference,
     partition_values: Vec<PartitionValue>,
 ) -> Result<()> {
     let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(5)).build();
 
     loop {
-        let mut metadata = partition_manager
+        let mut metadata = partition_store
             .get_table_metadata(table)
             .await
             .context(GetTableMetadataSnafu {
@@ -494,7 +494,7 @@ async fn add_partitions_with_retry(
         }
 
         metadata.updated_at = now;
-        match partition_manager
+        match partition_store
             .write_metadata(&table.to_string(), metadata)
             .await
         {
@@ -502,7 +502,7 @@ async fn add_partitions_with_retry(
                 tracing::debug!(table = %table, count = partition_values.len(), "Added new partitions to metadata");
                 return Ok(());
             }
-            Err(crate::cluster::partition::manager::Error::ConcurrentModification { .. }) => {
+            Err(crate::cluster::partition::store::Error::ConcurrentModification { .. }) => {
                 match backoff.next_duration() {
                     Some(duration) => tokio::time::sleep(duration).await,
                     None => {
@@ -524,15 +524,15 @@ async fn add_partitions_with_retry(
     }
 }
 
-async fn remove_stale_partitions(
-    partition_manager: &PartitionManager,
+async fn remove_stale_partitions_from_store(
+    partition_store: &PartitionStore,
     executor_registry: &ExecutorRegistry,
     df: &Arc<DataFusion>,
     removed_partitions: Vec<(TableReference, Vec<PartitionValue>)>,
 ) -> Result<()> {
     for (table, partition_values) in removed_partitions {
         if let Err(e) = remove_partitions_with_cleanup(
-            partition_manager,
+            partition_store,
             executor_registry,
             df,
             &table,
@@ -547,7 +547,7 @@ async fn remove_stale_partitions(
 }
 
 async fn remove_partitions_with_cleanup(
-    partition_manager: &PartitionManager,
+    partition_store: &PartitionStore,
     executor_registry: &ExecutorRegistry,
     df: &Arc<DataFusion>,
     table: &TableReference,
@@ -557,7 +557,7 @@ async fn remove_partitions_with_cleanup(
     let mut executors_to_notify: HashMap<String, Vec<PartitionValue>> = HashMap::new();
 
     loop {
-        let mut metadata = partition_manager
+        let mut metadata = partition_store
             .get_table_metadata(table)
             .await
             .context(GetTableMetadataSnafu {
@@ -592,7 +592,7 @@ async fn remove_partitions_with_cleanup(
 
         metadata.updated_at = now_ms();
 
-        match partition_manager
+        match partition_store
             .write_metadata(&table.to_string(), metadata)
             .await
         {
@@ -600,7 +600,7 @@ async fn remove_partitions_with_cleanup(
                 tracing::debug!(table = %table, count = partition_values.len(), "Removed stale partitions");
                 break;
             }
-            Err(crate::cluster::partition::manager::Error::ConcurrentModification { .. }) => {
+            Err(crate::cluster::partition::store::Error::ConcurrentModification { .. }) => {
                 match backoff.next_duration() {
                     Some(duration) => tokio::time::sleep(duration).await,
                     None => {
@@ -679,14 +679,14 @@ async fn notify_executor_to_unload(
 }
 
 fn find_unassigned_partitions(
-    partition_manager: &PartitionManager,
+    partition_store: &PartitionStore,
     state: &CycleState,
 ) -> Vec<UnassignedPartition> {
     let mut unassigned = Vec::new();
 
     for table_name in &state.tables {
         let table_ref = TableReference::parse_str(table_name);
-        let Some(metadata) = partition_manager.get_cached_table_metadata(&table_ref) else {
+        let Some(metadata) = partition_store.get_cached_table_metadata(&table_ref) else {
             continue;
         };
 
@@ -709,10 +709,10 @@ fn find_unassigned_partitions(
 }
 
 fn find_unassigned_partitions_for_table(
-    partition_manager: &PartitionManager,
+    partition_store: &PartitionStore,
     table: &TableReference,
 ) -> Vec<UnassignedPartition> {
-    let Some(metadata) = partition_manager.get_cached_table_metadata(table) else {
+    let Some(metadata) = partition_store.get_cached_table_metadata(table) else {
         return Vec::new();
     };
 
@@ -729,7 +729,7 @@ fn find_unassigned_partitions_for_table(
 fn assign_unassigned_partitions(
     unassigned: Vec<UnassignedPartition>,
     state: &CycleState,
-    partition_manager: &PartitionManager,
+    partition_store: &PartitionStore,
     config: &AssignmentConfig,
 ) -> Vec<Assignment> {
     if unassigned.is_empty() {
@@ -738,7 +738,7 @@ fn assign_unassigned_partitions(
 
     let mut assignments = Vec::new();
     let mut assignments_this_cycle = 0;
-    let mut executor_loads = build_executor_loads(state, partition_manager);
+    let mut executor_loads = build_executor_loads(state, partition_store);
 
     for unassigned_partition in unassigned {
         if assignments_this_cycle >= config.max_assignments_per_cycle {
@@ -783,7 +783,7 @@ fn assign_unassigned_partitions(
 
 fn build_executor_loads(
     state: &CycleState,
-    partition_manager: &PartitionManager,
+    partition_store: &PartitionStore,
 ) -> HashMap<String, ExecutorLoad> {
     let mut loads = HashMap::new();
 
@@ -793,7 +793,7 @@ fn build_executor_loads(
 
     for table_name in &state.tables {
         let table_ref = TableReference::parse_str(table_name);
-        if let Some(metadata) = partition_manager.get_cached_table_metadata(&table_ref) {
+        if let Some(metadata) = partition_store.get_cached_table_metadata(&table_ref) {
             for partition in &metadata.partitions {
                 for executor_id in &partition.assigned_executors {
                     let load = loads.entry(executor_id.clone()).or_default();
@@ -872,7 +872,7 @@ fn score_executor_for_partition(
 }
 
 async fn commit_assignments(
-    partition_manager: &PartitionManager,
+    partition_store: &PartitionStore,
     assignments: Vec<Assignment>,
 ) -> Result<CommitResult> {
     let mut committed = Vec::new();
@@ -880,7 +880,7 @@ async fn commit_assignments(
 
     for assignment in assignments {
         match assign_partition_with_retry(
-            partition_manager,
+            partition_store,
             &assignment.table,
             &assignment.partition_value,
             &assignment.executor_id,
@@ -920,7 +920,7 @@ async fn commit_assignments(
 }
 
 async fn assign_partition_with_retry(
-    partition_manager: &PartitionManager,
+    partition_store: &PartitionStore,
     table: &TableReference,
     partition_value: &PartitionValue,
     executor_id: &str,
@@ -928,12 +928,12 @@ async fn assign_partition_with_retry(
     let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(3)).build();
 
     loop {
-        match partition_manager
+        match partition_store
             .assign_partition(table, partition_value, executor_id)
             .await
         {
             Ok(()) => return Ok(()),
-            Err(crate::cluster::partition::manager::Error::ConcurrentModification { .. }) => {
+            Err(crate::cluster::partition::store::Error::ConcurrentModification { .. }) => {
                 match backoff.next_duration() {
                     Some(duration) => {
                         tracing::debug!(
@@ -1065,4 +1065,303 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+
+    fn make_store() -> Arc<PartitionStore> {
+        Arc::new(PartitionStore::new(Arc::new(InMemory::new())))
+    }
+
+    fn pv(key: &str, val: &str) -> PartitionValue {
+        HashMap::from([(key.to_string(), val.to_string())])
+    }
+
+    async fn setup_table(store: &PartitionStore, table: &str, partitions: Vec<PartitionMetadata>) {
+        let table_ref = TableReference::parse_str(table);
+        store
+            .initialize_metadata(&table_ref, vec!["date".to_string()])
+            .await
+            .expect("init");
+        let metadata = super::super::metadata::TablePartitionMetadata {
+            table_name: table.to_string(),
+            partitions,
+            schema_version: 1,
+            updated_at: 1000,
+            partition_expressions: vec!["date".to_string()],
+        };
+        store.write_metadata(table, metadata).await.expect("write");
+        store.refresh().await.expect("refresh");
+    }
+
+    fn assigned_partition(key: &str, val: &str, executor: &str) -> PartitionMetadata {
+        let mut p = PartitionMetadata::new(pv(key, val));
+        p.assign_to(executor.to_string(), 1000);
+        p
+    }
+
+    fn unassigned_partition(key: &str, val: &str) -> PartitionMetadata {
+        PartitionMetadata::new(pv(key, val))
+    }
+
+    #[tokio::test]
+    async fn test_find_unassigned_partitions() {
+        let store = make_store();
+        setup_table(
+            &store,
+            "test_table",
+            vec![
+                assigned_partition("date", "2024-01-01", "exec1"),
+                unassigned_partition("date", "2024-01-02"),
+                unassigned_partition("date", "2024-01-03"),
+            ],
+        )
+        .await;
+
+        let state = CycleState {
+            executor_ids: vec!["exec1".to_string()],
+            tables: vec!["test_table".to_string()],
+        };
+
+        let unassigned = find_unassigned_partitions(&store, &state);
+        assert_eq!(unassigned.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_find_unassigned_for_single_table() {
+        let store = make_store();
+        setup_table(
+            &store,
+            "test_table",
+            vec![
+                assigned_partition("date", "2024-01-01", "exec1"),
+                unassigned_partition("date", "2024-01-02"),
+            ],
+        )
+        .await;
+
+        let table_ref = TableReference::parse_str("test_table");
+        let unassigned = find_unassigned_partitions_for_table(&store, &table_ref);
+        assert_eq!(unassigned.len(), 1);
+        assert_eq!(
+            unassigned[0].partition_value.get("date"),
+            Some(&"2024-01-02".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_executor_loads() {
+        let store = make_store();
+        setup_table(
+            &store,
+            "table_a",
+            vec![
+                assigned_partition("date", "2024-01-01", "exec1"),
+                assigned_partition("date", "2024-01-02", "exec1"),
+                assigned_partition("date", "2024-01-03", "exec2"),
+            ],
+        )
+        .await;
+
+        let state = CycleState {
+            executor_ids: vec!["exec1".to_string(), "exec2".to_string()],
+            tables: vec!["table_a".to_string()],
+        };
+
+        let loads = build_executor_loads(&state, &store);
+        assert_eq!(loads["exec1"].partition_count, 2);
+        assert_eq!(loads["exec2"].partition_count, 1);
+        assert!(loads["exec1"].tables.contains("table_a"));
+    }
+
+    #[tokio::test]
+    async fn test_select_executor_prefers_locality() {
+        let store = make_store();
+        setup_table(
+            &store,
+            "orders",
+            vec![assigned_partition("date", "2024-01-01", "exec1")],
+        )
+        .await;
+
+        let state = CycleState {
+            executor_ids: vec!["exec1".to_string(), "exec2".to_string()],
+            tables: vec!["orders".to_string()],
+        };
+        let config = AssignmentConfig::default();
+        let loads = build_executor_loads(&state, &store);
+
+        let partition = UnassignedPartition {
+            table: TableReference::parse_str("orders"),
+            partition_value: pv("date", "2024-01-02"),
+        };
+
+        // exec1 already has partitions for "orders" → locality bonus → preferred
+        let selected = select_executor_for_partition(&partition, &loads, &state, &config);
+        assert_eq!(selected, Some("exec1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_select_executor_balances_load() {
+        let store = make_store();
+        setup_table(
+            &store,
+            "table_a",
+            vec![
+                assigned_partition("date", "1", "exec1"),
+                assigned_partition("date", "2", "exec1"),
+                assigned_partition("date", "3", "exec1"),
+                assigned_partition("date", "4", "exec1"),
+                assigned_partition("date", "5", "exec1"),
+            ],
+        )
+        .await;
+
+        let state = CycleState {
+            executor_ids: vec!["exec1".to_string(), "exec2".to_string()],
+            tables: vec!["table_a".to_string()],
+        };
+        let config = AssignmentConfig {
+            max_partitions_per_executor: 10,
+            ..Default::default()
+        };
+        let loads = build_executor_loads(&state, &store);
+
+        // New partition for a different table — no locality bonus
+        let partition = UnassignedPartition {
+            table: TableReference::parse_str("table_b"),
+            partition_value: pv("date", "2024-01-01"),
+        };
+
+        // exec2 has lower load → preferred
+        let selected = select_executor_for_partition(&partition, &loads, &state, &config);
+        assert_eq!(selected, Some("exec2".to_string()));
+    }
+
+    #[test]
+    fn test_select_executor_respects_capacity() {
+        let mut loads = HashMap::new();
+        loads.insert(
+            "exec1".to_string(),
+            ExecutorLoad {
+                partition_count: 2,
+                tables: HashSet::new(),
+            },
+        );
+        loads.insert(
+            "exec2".to_string(),
+            ExecutorLoad {
+                partition_count: 1,
+                tables: HashSet::new(),
+            },
+        );
+
+        let state = CycleState {
+            executor_ids: vec!["exec1".to_string(), "exec2".to_string()],
+            tables: vec![],
+        };
+        let config = AssignmentConfig {
+            max_partitions_per_executor: 2,
+            ..Default::default()
+        };
+
+        let partition = UnassignedPartition {
+            table: TableReference::parse_str("table"),
+            partition_value: pv("date", "2024-01-01"),
+        };
+
+        // exec1 at capacity → only exec2 eligible
+        let selected = select_executor_for_partition(&partition, &loads, &state, &config);
+        assert_eq!(selected, Some("exec2".to_string()));
+    }
+
+    #[test]
+    fn test_select_executor_none_when_all_at_capacity() {
+        let mut loads = HashMap::new();
+        loads.insert(
+            "exec1".to_string(),
+            ExecutorLoad {
+                partition_count: 1,
+                tables: HashSet::new(),
+            },
+        );
+
+        let state = CycleState {
+            executor_ids: vec!["exec1".to_string()],
+            tables: vec![],
+        };
+        let config = AssignmentConfig {
+            max_partitions_per_executor: 1,
+            ..Default::default()
+        };
+
+        let partition = UnassignedPartition {
+            table: TableReference::parse_str("table"),
+            partition_value: pv("date", "2024-01-01"),
+        };
+
+        let selected = select_executor_for_partition(&partition, &loads, &state, &config);
+        assert!(selected.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_assign_respects_max_per_cycle() {
+        let store = make_store();
+        setup_table(
+            &store,
+            "test_table",
+            vec![
+                unassigned_partition("date", "2024-01-01"),
+                unassigned_partition("date", "2024-01-02"),
+                unassigned_partition("date", "2024-01-03"),
+            ],
+        )
+        .await;
+
+        let state = CycleState {
+            executor_ids: vec!["exec1".to_string()],
+            tables: vec!["test_table".to_string()],
+        };
+        let config = AssignmentConfig {
+            max_assignments_per_cycle: 2,
+            ..Default::default()
+        };
+
+        let unassigned = find_unassigned_partitions(&store, &state);
+        let assignments = assign_unassigned_partitions(unassigned, &state, &store, &config);
+        assert_eq!(assignments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_commit_assignments() {
+        let store = make_store();
+        setup_table(
+            &store,
+            "test_table",
+            vec![unassigned_partition("date", "2024-01-01")],
+        )
+        .await;
+
+        let assignments = vec![Assignment {
+            table: TableReference::parse_str("test_table"),
+            partition_value: pv("date", "2024-01-01"),
+            executor_id: "exec1".to_string(),
+        }];
+
+        let result = commit_assignments(&store, assignments)
+            .await
+            .expect("commit");
+        assert_eq!(result.committed.len(), 1);
+        assert!(result.failed.is_empty());
+
+        let metadata = store
+            .get_table_metadata(&TableReference::parse_str("test_table"))
+            .await
+            .expect("get")
+            .expect("exists");
+        assert!(metadata.partitions[0].is_assigned_to("exec1"));
+    }
 }
