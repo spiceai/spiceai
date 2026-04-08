@@ -272,7 +272,7 @@ pub(crate) fn strip_replicated_keyword(sql: &str) -> (String, bool) {
     }
 
     let before = sql[..token_start].trim_end();
-    let after = &sql[token_end..];
+    let after = sql[token_end..].trim_start();
     (format!("{before}{after}"), true)
 }
 
