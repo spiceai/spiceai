@@ -16,7 +16,7 @@ The workflow is triggered manually via `workflow_dispatch` with the following in
 - **tag**: Docker image tag to publish (e.g., `1.3.0-models`)
 
 ### Optional Inputs
-- **repository**: Target ECR repository (default: `spice-ai/spiceai-enterprise`)
+- **repositories**: Target ECR repositories (choice: `spice-ai/spiceai-enterprise-byol`, `spice-ai/spiceai-enterprise-plan`, or both)
 - **platforms**: Platforms to publish (default: `linux/amd64,linux/arm64`)
 - **publish_docker**: Whether to publish Docker images (default: `true`)
 - **publish_helm**: Whether to publish Helm chart (default: `true`)
@@ -50,7 +50,7 @@ To publish version `1.3.0-models`:
 3. Click "Run workflow"
 4. Fill in the inputs:
    - **tag**: `1.3.0-models`
-   - **repository**: `spice-ai/spiceai-enterprise` (or `spice-ai/spiceai-enterprise-hourly`)
+   - **repositories**: `spice-ai/spiceai-enterprise-byol,spice-ai/spiceai-enterprise-plan` (or a single repository)
    - **platforms**: `linux/amd64,linux/arm64` (or leave default)
    - **publish_docker**: `true` (or leave default)
    - **publish_helm**: `true` (or leave default)
@@ -63,5 +63,5 @@ The workflow uses these fixed configurations:
 - **AWS Region**: `us-east-1`
 
 The repository can be configured through the workflow inputs:
-- Default repository: `spice-ai/spiceai-enterprise`
-- Alternative repository: `spice-ai/spiceai-enterprise-hourly`
+- BYOL repository: `spice-ai/spiceai-enterprise-byol`
+- Enterprise Plan repository: `spice-ai/spiceai-enterprise-plan`

@@ -137,9 +137,9 @@ assignees: ''
     - https://spice.ai/spiceai/docs
     - https://spice.ai/spiceai/quickstart
     - https://spice.ai/spiceai/tailwindcss
-- [ ] Run [Publish to AWS Marketplace](https://github.com/spicehq/spiceai/actions/workflows/aws_marketplace_publish.yml) using the following configuration (BYOL):
+- [ ] Run [Publish to AWS Marketplace](https://github.com/spicehq/spiceai/actions/workflows/aws_marketplace_publish.yml) using the following configuration:
   - Docker image: `X.Y.Z-enterprise-models` (i.e. `1.10.0-rc.1-enterprise-models`)
-  - Target ECR repository: `spice-ai/spiceai-enterprise-byol`
+  - Target ECR repositories: `spice-ai/spiceai-enterprise-byol,spice-ai/spiceai-enterprise-plan` (both)
   - Platforms to publish: `linux/amd64,linux/arm64`
 - [ ] Mark the [release](https://github.com/spicehq/spiceai/releases) as official once all binaries and Docker images finish building.
 

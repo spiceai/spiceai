@@ -508,7 +508,7 @@ jobs:
         run: |
           gh workflow run aws_marketplace_publish.yml \
             -f tag="${{ inputs.release_version }}-enterprise-models" \
-            -f repository="spice-ai/spiceai-enterprise-byol" \
+            -f repositories="spice-ai/spiceai-enterprise-byol,spice-ai/spiceai-enterprise-plan" \
             -f platforms="linux/amd64,linux/arm64" \
             -f publish_docker=true \
             -f publish_helm=true
