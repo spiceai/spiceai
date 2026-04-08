@@ -845,14 +845,13 @@ fn make_named_scheduler_config_with_executors(
         params: Some(spicepod::param::Params::from_string_map(
             std::collections::HashMap::from([
                 ("s3_region".to_string(), "us-east-1".to_string()),
-                ("s3_key".to_string(), "${env:AWS_ACCESS_KEY_ID}".to_string()),
                 (
-                    "s3_secret".to_string(),
-                    "${env:AWS_SECRET_ACCESS_KEY}".to_string(),
+                    "s3_key".to_string(),
+                    "${env:AWS_S3_VECTORS_KEY}".to_string(),
                 ),
                 (
-                    "s3_session_token".to_string(),
-                    "${env:AWS_SESSION_TOKEN}".to_string(),
+                    "s3_secret".to_string(),
+                    "${env:AWS_S3_VECTORS_SECRET}".to_string(),
                 ),
                 ("s3_auth".to_string(), "key".to_string()),
             ]),
