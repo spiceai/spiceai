@@ -293,7 +293,7 @@ impl Https {
                 .map(std::string::ToString::to_string);
 
             let link_header_param = self.params.get("pagination_link_header").expose().ok();
-            let use_link_header = link_header_param.as_deref().is_none_or(util::parse_enabled);
+            let use_link_header = link_header_param.is_none_or(util::parse_enabled);
 
             let token_param = self
                 .params
