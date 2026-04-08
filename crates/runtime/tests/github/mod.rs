@@ -45,6 +45,10 @@ enum GithubDatasetType {
     },
 }
 
+// GitHub commits queries request 100 history rows per page, so use a larger limit
+// in the pagination-sensitive tests to ensure they cross the page boundary.
+const GITHUB_COMMITS_PAGINATION_LIMIT: usize = 125;
+
 fn uses_public_github_rest_api(kind: &GithubDatasetType) -> bool {
     match kind {
         GithubDatasetType::RepoSpecific { query_type, .. } => {
@@ -437,33 +441,41 @@ async fn test_github_commits() -> Result<(), String> {
             )
             .await?;
 
+            let commits_ref_filter_query = format!(
+                "SELECT ref, sha, committer_name, changed_files, associated_pull_request_number, status FROM spiceai_commits_auto WHERE ref = 'trunk' LIMIT {GITHUB_COMMITS_PAGINATION_LIMIT}"
+            );
+
             run_query_and_check_results(
                 &mut rt,
                 "test_github_commits_ref_filter",
-                "SELECT ref, sha, committer_name, changed_files, associated_pull_request_number, status FROM spiceai_commits_auto WHERE ref = 'trunk' LIMIT 5",
+                &commits_ref_filter_query,
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let row_count = result_batches.iter().map(RecordBatch::num_rows).sum::<usize>();
                     for batch in &result_batches {
                         assert_eq!(batch.num_columns(), 6, "num_cols: {}", batch.num_columns());
                     }
-                    assert_eq!(row_count, 5, "num_rows: {row_count}");
+                    assert_eq!(row_count, GITHUB_COMMITS_PAGINATION_LIMIT, "num_rows: {row_count}");
                     assert_all_string_values(&result_batches, 0, "trunk");
                 })),
             )
             .await?;
 
+            let commits_slash_ref_filter_query = format!(
+                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref = 'release/1.11' LIMIT {GITHUB_COMMITS_PAGINATION_LIMIT}"
+            );
+
             run_query_and_check_results(
                 &mut rt,
                 "test_github_commits_slash_ref_filter",
-                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref = 'release/1.11' LIMIT 5",
+                &commits_slash_ref_filter_query,
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let row_count = result_batches.iter().map(RecordBatch::num_rows).sum::<usize>();
                     for batch in &result_batches {
                         assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
                     }
-                    assert_eq!(row_count, 5, "num_rows: {row_count}");
+                    assert_eq!(row_count, GITHUB_COMMITS_PAGINATION_LIMIT, "num_rows: {row_count}");
                     assert_all_string_values(&result_batches, 0, "release/1.11");
 
                     let shas = collect_string_values(&result_batches, 1);
@@ -476,17 +488,21 @@ async fn test_github_commits() -> Result<(), String> {
             )
             .await?;
 
+            let commits_dynamic_ref_filter_query = format!(
+                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref != 'trunk' LIMIT {GITHUB_COMMITS_PAGINATION_LIMIT}"
+            );
+
             run_query_and_check_results(
                 &mut rt,
                 "test_github_commits_dynamic_ref_filter",
-                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref != 'trunk' LIMIT 5",
+                &commits_dynamic_ref_filter_query,
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let row_count = result_batches.iter().map(RecordBatch::num_rows).sum::<usize>();
                     for batch in &result_batches {
                         assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
                     }
-                    assert_eq!(row_count, 5, "num_rows: {row_count}");
+                    assert_eq!(row_count, GITHUB_COMMITS_PAGINATION_LIMIT, "num_rows: {row_count}");
                     assert_no_string_values(&result_batches, 0, "trunk");
 
                     let shas = collect_string_values(&result_batches, 1);
@@ -499,17 +515,21 @@ async fn test_github_commits() -> Result<(), String> {
             )
             .await?;
 
+            let commits_ref_path_query = format!(
+                "SELECT ref, sha FROM spiceai_commits_trunk_auto LIMIT {GITHUB_COMMITS_PAGINATION_LIMIT}"
+            );
+
             run_query_and_check_results(
                 &mut rt,
                 "test_github_commits_ref_path",
-                "SELECT ref, sha FROM spiceai_commits_trunk_auto LIMIT 5",
+                &commits_ref_path_query,
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let row_count = result_batches.iter().map(RecordBatch::num_rows).sum::<usize>();
                     for batch in &result_batches {
                         assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
                     }
-                    assert_eq!(row_count, 5, "num_rows: {row_count}");
+                    assert_eq!(row_count, GITHUB_COMMITS_PAGINATION_LIMIT, "num_rows: {row_count}");
                     assert_all_string_values(&result_batches, 0, "trunk");
 
                     let shas = collect_string_values(&result_batches, 1);
@@ -1286,10 +1306,14 @@ async fn test_github_app_commits_ref_filter() -> Result<(), String> {
 
             runtime_ready_check(&rt).await;
 
+            let github_app_commits_ref_filter_query = format!(
+                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref = 'trunk' LIMIT {GITHUB_COMMITS_PAGINATION_LIMIT}"
+            );
+
             run_query_and_check_results(
                 &mut rt,
                 "test_github_app_commits_ref_filter",
-                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref = 'trunk' LIMIT 5",
+                &github_app_commits_ref_filter_query,
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let row_count = result_batches
@@ -1299,16 +1323,20 @@ async fn test_github_app_commits_ref_filter() -> Result<(), String> {
                     for batch in &result_batches {
                         assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
                     }
-                    assert_eq!(row_count, 5, "num_rows: {row_count}");
+                    assert_eq!(row_count, GITHUB_COMMITS_PAGINATION_LIMIT, "num_rows: {row_count}");
                     assert_all_string_values(&result_batches, 0, "trunk");
                 })),
             )
             .await?;
 
+            let github_app_commits_slash_ref_filter_query = format!(
+                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref = 'release/1.11' LIMIT {GITHUB_COMMITS_PAGINATION_LIMIT}"
+            );
+
             run_query_and_check_results(
                 &mut rt,
                 "test_github_app_commits_slash_ref_filter",
-                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref = 'release/1.11' LIMIT 5",
+                &github_app_commits_slash_ref_filter_query,
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let row_count = result_batches
@@ -1318,7 +1346,7 @@ async fn test_github_app_commits_ref_filter() -> Result<(), String> {
                     for batch in &result_batches {
                         assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
                     }
-                    assert_eq!(row_count, 5, "num_rows: {row_count}");
+                    assert_eq!(row_count, GITHUB_COMMITS_PAGINATION_LIMIT, "num_rows: {row_count}");
                     assert_all_string_values(&result_batches, 0, "release/1.11");
 
                     let shas = collect_string_values(&result_batches, 1);
@@ -1331,10 +1359,14 @@ async fn test_github_app_commits_ref_filter() -> Result<(), String> {
             )
             .await?;
 
+            let github_app_commits_dynamic_ref_filter_query = format!(
+                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref != 'trunk' LIMIT {GITHUB_COMMITS_PAGINATION_LIMIT}"
+            );
+
             run_query_and_check_results(
                 &mut rt,
                 "test_github_app_commits_dynamic_ref_filter",
-                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref != 'trunk' LIMIT 5",
+                &github_app_commits_dynamic_ref_filter_query,
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     let row_count = result_batches
@@ -1344,7 +1376,7 @@ async fn test_github_app_commits_ref_filter() -> Result<(), String> {
                     for batch in &result_batches {
                         assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
                     }
-                    assert_eq!(row_count, 5, "num_rows: {row_count}");
+                    assert_eq!(row_count, GITHUB_COMMITS_PAGINATION_LIMIT, "num_rows: {row_count}");
                     assert_no_string_values(&result_batches, 0, "trunk");
                 })),
             )
