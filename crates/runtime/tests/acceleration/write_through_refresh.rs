@@ -197,6 +197,74 @@ async fn test_write_through_acceleration_does_not_refresh_from_federated() {
     drop(table);
 }
 
+/// Regression test: inserting data through a write-through AcceleratedTable must not
+/// produce duplicate rows in the local accelerator.
+///
+/// Exercises the full pipeline: SQL INSERT → AcceleratedTable::insert_into() →
+/// WriteThroughDataSink::write_all() → Cayenne staged append + federated insert.
+/// Then queries through AcceleratedTable::scan() to verify no duplication.
+#[tokio::test]
+#[cfg(not(target_os = "windows"))]
+async fn test_write_through_insert_no_duplicate_rows_in_accelerator() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let schema = test_schema();
+
+    // Create a Cayenne table as the federated source (simulates shared Iceberg).
+    let federated_cayenne =
+        create_cayenne_table(Arc::clone(&schema), temp_dir.path(), "federated_src").await;
+    let federated_provider: Arc<dyn TableProvider> = Arc::new(federated_cayenne);
+    let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&federated_provider)));
+
+    // Create a Cayenne accelerator (the local acceleration).
+    let accel_cayenne =
+        create_cayenne_table(Arc::clone(&schema), temp_dir.path(), "local_accel").await;
+    let accelerator: Arc<dyn TableProvider> = Arc::new(accel_cayenne);
+
+    let table = build_write_through_table(
+        Arc::clone(&accelerator),
+        federated,
+        "wt_insert_test",
+    )
+    .await;
+
+    // Register in a SessionContext and insert 3 rows via SQL.
+    let table = Arc::new(table);
+    let ctx = SessionContext::new();
+    ctx.register_table("wt_insert_test", Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register table");
+
+    ctx.sql("INSERT INTO wt_insert_test (id, value) VALUES (1, 10), (2, 20), (3, 30)")
+        .await
+        .expect("plan insert")
+        .collect()
+        .await
+        .expect("insert should succeed");
+
+    // Check the raw accelerator: must have exactly 3 rows.
+    let accel_rows = count_rows(&accelerator).await;
+    assert_eq!(
+        accel_rows, 3,
+        "Accelerator should contain exactly 3 rows after inserting 3. \
+         Found {accel_rows} — write-through is duplicating rows in the accelerator."
+    );
+
+    // Check the federated source: must also have exactly 3 rows.
+    let fed_rows = count_rows(&federated_provider).await;
+    assert_eq!(
+        fed_rows, 3,
+        "Federated source should contain exactly 3 rows after inserting 3. Found {fed_rows}."
+    );
+
+    // Check querying THROUGH the AcceleratedTable: must return exactly 3 rows.
+    let query_rows = count_rows(&(table as Arc<dyn TableProvider>)).await;
+    assert_eq!(
+        query_rows, 3,
+        "Querying through AcceleratedTable should return exactly 3 rows. \
+         Found {query_rows} — either the accelerator has duplicates or the scan \
+         is falling back to the federated source incorrectly."
+    );
+}
+
 /// End-to-end regression test: simulates the distributed scenario where two executors
 /// each have a write-through accelerated table sharing the same federated source.
 ///

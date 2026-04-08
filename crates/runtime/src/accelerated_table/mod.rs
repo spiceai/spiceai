@@ -1190,6 +1190,14 @@ impl TableProvider for AcceleratedTable {
         // Check if we're in caching mode
         let is_caching_mode = self.refresh_params.read().await.mode == RefreshMode::Caching;
 
+        tracing::debug!(
+            dataset = %self.dataset_name,
+            cluster_role = ?self.cluster_role,
+            initial_load_completed = self.refresher().initial_load_completed(),
+            is_write_through = self.write_mode.is_write_through(),
+            "AcceleratedTable::scan called"
+        );
+
         if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
             // Accelerated tables aren't accelerated on scheduler. Just scan the federated source.
             let federated_provider = self.federated.table_provider().await;
@@ -1313,6 +1321,12 @@ impl TableProvider for AcceleratedTable {
         overwrite: InsertOp,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         self.update_last_updated_at();
+
+        tracing::debug!(
+            dataset = %self.dataset_name,
+            write_mode = ?self.write_mode,
+            "AcceleratedTable::insert_into called"
+        );
 
         match &self.write_mode {
             WriteMode::AcceleratorOnly => {

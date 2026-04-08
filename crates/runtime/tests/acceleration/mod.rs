@@ -45,6 +45,7 @@ mod partition_by_arrow;
 mod partition_by_cayenne;
 #[cfg(not(target_os = "windows"))]
 mod write_through_refresh;
+mod write_through_query_duplication;
 mod query_push_down;
 mod refresh;
 #[cfg(feature = "duckdb")]

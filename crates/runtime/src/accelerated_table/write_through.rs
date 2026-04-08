@@ -134,6 +134,9 @@ pub(crate) fn insert_write_through(
     refresher: &Arc<refresh::Refresher>,
     schema: SchemaRef,
 ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+    tracing::debug!(
+        "insert_write_through: creating DataSinkExec for write-through insert"
+    );
     match overwrite {
         InsertOp::Append => Ok(Arc::new(DataSinkExec::new(
             input,
@@ -207,6 +210,7 @@ impl DataSink for WriteThroughDataSink {
         mut data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> datafusion::common::Result<u64> {
+        tracing::debug!("WriteThroughDataSink::write_all called");
         if let CayenneWriteTarget::Partitioned(accelerator) = &self.accelerator {
             return write_all_with_partitioned_cayenne(
                 Arc::clone(&self.refresher),
@@ -306,6 +310,7 @@ async fn write_all_with_partitioned_cayenne(
     federated: Arc<dyn TableProvider>,
     mut data: SendableRecordBatchStream,
 ) -> datafusion::common::Result<u64> {
+    tracing::debug!("write_all_with_partitioned_cayenne: starting partitioned write-through");
     let partitioned = accelerator
         .as_any()
         .downcast_ref::<PartitionTableProvider>()
@@ -408,6 +413,10 @@ async fn write_all_with_partitioned_cayenne(
     match (staged_result, source_result, upstream_error) {
         (Ok(staged), Ok(()), None) => {
             let row_count = staged.commit().await?;
+            tracing::info!(
+                row_count,
+                "write_all_with_partitioned_cayenne: committed {row_count} rows to accelerator and federated source"
+            );
             refresher.set_initial_load_completed(true);
             Ok(row_count)
         }
