@@ -120,7 +120,7 @@ mod tests {
         manager
     }
 
-    /// Helper: build executor statuses map from a list of (executor_id, [(dataset, status)]).
+    /// Helper: build executor statuses map from a list of (`executor_id`, [(dataset, status)]).
     fn executor_statuses(
         entries: Vec<(&str, Vec<(&str, ComponentStatus)>)>,
     ) -> HashMap<String, HashMap<String, ComponentStatus>> {
