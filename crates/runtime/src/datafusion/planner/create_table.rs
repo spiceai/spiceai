@@ -38,7 +38,7 @@ use datafusion_ddl::{
     CreateTableStatementExtension, SharedDdlExtensionStore, parse_ddl_table_options,
 };
 
-/// Returns `true` if the `CREATE TABLE` has extensions we need to intercept:
+// Returns `true` if the `CREATE TABLE` has extensions we need to intercept:
 // `has_ddl_extensions` is re-exported from `datafusion_ddl` via the `use` above.
 
 /// Plan a `CREATE TABLE` with DDL extensions.
@@ -386,25 +386,28 @@ pub(super) async fn plan_create_table_like(
         arrow_schema,
         primary_key: vec![], // LIKE never copies primary keys
         extension: {
-            let mut ext = datafusion_ddl::CreateTableStatementExtension::default();
             // Encode the partition SQL back into the extension's partition_by field
             // as a bare identifier — the handler will call .to_string() on it.
-            ext.partition_by = partition_expr_sql.map(|sql| {
-                use datafusion::sql::sqlparser::dialect::GenericDialect;
-                use datafusion::sql::sqlparser::parser::Parser;
-                // Parse back into a real AST expression so that function calls
-                // like `bucket(4, region)` are not mangled into an identifier.
-                Parser::new(&GenericDialect {})
-                    .try_with_sql(&sql)
-                    .and_then(|mut p| p.parse_expr())
-                    .map(Box::new)
-                    .unwrap_or_else(|_| {
-                        Box::new(datafusion::sql::sqlparser::ast::Expr::Identifier(
-                            datafusion::sql::sqlparser::ast::Ident::new(sql),
-                        ))
-                    })
-            });
-            ext
+            datafusion_ddl::CreateTableStatementExtension {
+                partition_by: partition_expr_sql.map(|sql| {
+                    use datafusion::sql::sqlparser::dialect::GenericDialect;
+                    use datafusion::sql::sqlparser::parser::Parser;
+                    // Parse back into a real AST expression so that function calls
+                    // like `bucket(4, region)` are not mangled into an identifier.
+                    Parser::new(&GenericDialect {})
+                        .try_with_sql(&sql)
+                        .and_then(|mut p| p.parse_expr())
+                        .map_or_else(
+                            |_| {
+                                Box::new(datafusion::sql::sqlparser::ast::Expr::Identifier(
+                                    datafusion::sql::sqlparser::ast::Ident::new(sql),
+                                ))
+                            },
+                            Box::new,
+                        )
+                }),
+                ..Default::default()
+            }
         },
         if_not_exists: create_table.if_not_exists,
         or_replace: false,
@@ -583,6 +586,7 @@ mod tests {
     use super::*;
     use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
     use datafusion::sql::sqlparser::parser::Parser;
+    use datafusion_ddl::has_ddl_extensions;
     use datafusion_ddl::new_shared_store;
 
     /// Parse SQL into a `CreateTable` AST node for testing.

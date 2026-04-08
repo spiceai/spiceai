@@ -141,7 +141,7 @@ impl ExtensionPlanner for DistributedCayenneDmlExtensionPlanner {
             })?;
             return Ok(Some(Arc::new(DistributedCayenneDeleteExec::new(
                 delete.table_name.clone(),
-                self.executor_registry.clone(),
+                Arc::clone(&self.executor_registry),
                 delete.filter_sql.clone(),
                 Arc::clone(input),
             ))));
@@ -155,7 +155,7 @@ impl ExtensionPlanner for DistributedCayenneDmlExtensionPlanner {
             })?;
             return Ok(Some(Arc::new(DistributedCayenneUpdateExec::new(
                 update.table_name.clone(),
-                self.executor_registry.clone(),
+                Arc::clone(&self.executor_registry),
                 update.filter_sql.clone(),
                 update.assignments_sql.clone(),
                 Arc::clone(input),
@@ -178,7 +178,7 @@ impl ExtensionPlanner for DistributedCayenneDmlExtensionPlanner {
             ));
             return Ok(Some(Arc::new(DistributedCayenneInsertExec::new(
                 insert.table_name.clone(),
-                self.executor_registry.clone(),
+                Arc::clone(&self.executor_registry),
                 ctx,
                 io_runtime,
                 Arc::clone(input),
@@ -194,7 +194,7 @@ impl ExtensionPlanner for DistributedCayenneDmlExtensionPlanner {
                 merge.source_table.clone(),
                 merge.on_keys.clone(),
                 merge.original_sql.clone(),
-                self.executor_registry.clone(),
+                Arc::clone(&self.executor_registry),
                 ctx,
             ))));
         }

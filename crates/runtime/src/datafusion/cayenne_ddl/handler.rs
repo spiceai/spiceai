@@ -66,8 +66,7 @@ impl CatalogDdlHandler for DistributedCayenneDdlHandler {
     ) -> bool {
         catalog_list
             .catalog(catalog_name)
-            .map(|c| get_cayenne_provider(c.as_ref()).is_some())
-            .unwrap_or(false)
+            .is_some_and(|c| get_cayenne_provider(c.as_ref()).is_some())
     }
 
     fn create_table_exec(

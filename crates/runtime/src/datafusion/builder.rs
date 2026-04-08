@@ -481,7 +481,7 @@ impl DataFusionBuilder {
                 ctx.state().catalog_list(),
                 &ddl_enabled_catalogs,
                 Arc::clone(&ddl_extension_store),
-                Arc::clone(&cayenne_ddl_handler),
+                Arc::clone(cayenne_ddl_handler),
                 SPICE_DEFAULT_SCHEMA,
                 SPICE_DEFAULT_CATALOG,
             )));
