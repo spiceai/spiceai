@@ -16,6 +16,7 @@ limitations under the License.
 
 pub(crate) mod discovery;
 pub mod scheduler_task;
+pub(crate) mod service;
 mod startup;
 
 use std::collections::HashMap;
