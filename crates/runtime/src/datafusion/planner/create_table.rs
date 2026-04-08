@@ -239,7 +239,7 @@ pub(super) async fn plan_create_table_like(
     if !is_cayenne_catalog(source_catalog.as_ref()) {
         return Err(DataFusionError::Plan(format!(
             "CREATE TABLE ... (LIKE ...) is only supported for Cayenne catalog tables. \
-             Source table '{source_name}' is not in a Cayenne catalog."
+             Table '{source_name}' is not in a Cayenne catalog."
         )));
     }
 
@@ -258,9 +258,7 @@ pub(super) async fn plan_create_table_like(
                 "Failed to resolve source table '{source_name}': {e}"
             ))
         })?
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!("Source table '{source_name}' not found for LIKE"))
-        })?;
+        .ok_or_else(|| DataFusionError::Plan(format!("Table '{source_name}' not found")))?;
 
     let arrow_schema = source_provider.schema();
 
@@ -361,8 +359,17 @@ pub(super) async fn plan_create_table_like(
 
     if !is_cayenne_catalog(target_catalog.as_ref()) {
         return Err(DataFusionError::Plan(format!(
-            "CREATE TABLE ... LIKE is only supported for Cayenne catalog tables. \
-             Target catalog '{target_catalog_name}' is not a Cayenne catalog."
+            "CREATE TABLE ... (LIKE ...) is only supported for Cayenne catalog tables. \
+             Table '{target_name}' is not in a Cayenne catalog."
+        )));
+    }
+
+    // Validate source and target are in the same catalog.
+    if source_catalog_name != target_catalog_name {
+        return Err(DataFusionError::Plan(format!(
+            "CREATE TABLE ... (LIKE ...) requires the source and target tables to be \
+             in the same catalog. Source '{source_name}' is in catalog \
+             '{source_catalog_name}', but target is in '{target_catalog_name}'."
         )));
     }
 

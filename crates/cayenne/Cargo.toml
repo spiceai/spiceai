@@ -69,6 +69,7 @@ partition-table-provider = ["dep:runtime-table-partition"]
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
 datafusion-federation.workspace = true
+datafusion-functions = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 paste.workspace = true
 rstest = "0.26.1"
