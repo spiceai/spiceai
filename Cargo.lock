@@ -770,6 +770,7 @@ dependencies = [
  "insta",
  "serde_json",
  "snafu",
+ "tracing",
 ]
 
 [[package]]
