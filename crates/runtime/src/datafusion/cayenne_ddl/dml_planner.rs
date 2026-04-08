@@ -17,11 +17,9 @@ limitations under the License.
 //! Extension planners for Cayenne DML nodes.
 //!
 //! DDL nodes are handled by `datafusion_ddl::DdlExtensionPlanner`.
+//! Local MERGE is handled by `cayenne::ddl::CayenneDmlExtensionPlanner`.
 //!
-//! This module provides two planners:
-//!
-//! - [`CayenneDmlExtensionPlanner`] — stateless, handles local (single-node)
-//!   [`CayenneMergeNode`] → [`CayenneMergeExec`]. Always registered.
+//! This module provides:
 //!
 //! - [`DistributedCayenneDmlExtensionPlanner`] — handles the four distributed
 //!   DML nodes (DELETE, UPDATE, INSERT, MERGE) that forward operations to
@@ -30,7 +28,6 @@ limitations under the License.
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use cayenne::ddl::physical_plans::CayenneMergeExec;
 use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
@@ -45,8 +42,6 @@ use super::physical_plans::{
     DistributedCayenneUpdateExec,
 };
 use crate::cluster::executor_registry::ExecutorRegistry;
-use crate::datafusion::planner::logical_nodes::CayenneMergeNode;
-
 // ── DML SQL extraction helpers ────────────────────────────────────────────────
 
 /// Walk the input plan to find the topmost `Filter` and convert its predicate to SQL text.
@@ -101,32 +96,6 @@ pub fn extract_update_assignments(
         assignments.push((col_name.clone(), ast.to_string()));
     }
     Ok(assignments)
-}
-
-// ── CayenneDmlExtensionPlanner ────────────────────────────────────────────────
-
-/// Stateless extension planner for local (single-node) Cayenne DML.
-///
-/// Handles only [`CayenneMergeNode`] → [`CayenneMergeExec`].
-/// Always registered; does not require a distributed [`ExecutorRegistry`].
-#[derive(Debug, Default)]
-pub struct CayenneDmlExtensionPlanner;
-
-#[async_trait]
-impl ExtensionPlanner for CayenneDmlExtensionPlanner {
-    async fn plan_extension(
-        &self,
-        _planner: &dyn PhysicalPlanner,
-        node: &dyn UserDefinedLogicalNode,
-        _logical_inputs: &[&LogicalPlan],
-        _physical_inputs: &[Arc<dyn ExecutionPlan>],
-        session_state: &datafusion::execution::SessionState,
-    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-        if let Some(merge) = node.as_any().downcast_ref::<CayenneMergeNode>() {
-            return plan_local_merge(merge, session_state).await;
-        }
-        Ok(None)
-    }
 }
 
 // ── DistributedCayenneDmlExtensionPlanner ─────────────────────────────────────
@@ -232,133 +201,4 @@ impl ExtensionPlanner for DistributedCayenneDmlExtensionPlanner {
 
         Ok(None)
     }
-}
-
-// ── Local merge ───────────────────────────────────────────────────────────────
-
-use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
-
-/// Build the physical plan for a local (single-node) `CayenneMergeNode`.
-async fn plan_local_merge(
-    merge: &CayenneMergeNode,
-    session_state: &datafusion::execution::SessionState,
-) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-    use std::collections::HashMap;
-
-    use datafusion::datasource::provider_as_source;
-    use datafusion::logical_expr::LogicalPlanBuilder;
-    use datafusion::prelude::{Column, Expr, JoinType, col};
-
-    async fn resolve_table(
-        session_state: &datafusion::execution::SessionState,
-        table_ref: &datafusion::sql::TableReference,
-    ) -> DFResult<Arc<dyn datafusion::datasource::TableProvider>> {
-        let catalog_name = table_ref.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
-        let schema_name = table_ref.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
-        let table_name = table_ref.table();
-        let catalog = session_state
-            .catalog_list()
-            .catalog(catalog_name)
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Plan(format!(
-                    "Catalog '{catalog_name}' not found"
-                ))
-            })?;
-        let schema = catalog.schema(schema_name).ok_or_else(|| {
-            datafusion::error::DataFusionError::Plan(format!("Schema '{schema_name}' not found"))
-        })?;
-        schema
-            .table(table_name)
-            .await
-            .map_err(|e| {
-                datafusion::error::DataFusionError::Plan(format!(
-                    "Failed to resolve table '{table_ref}': {e}"
-                ))
-            })?
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Plan(format!("Table '{table_ref}' not found"))
-            })
-    }
-
-    let target_provider = resolve_table(session_state, &merge.target_table).await?;
-    let source_provider = resolve_table(session_state, &merge.source_table).await?;
-
-    let target_qualifier = merge.target_qualifier.as_str();
-    let source_qualifier = merge.source_qualifier.as_str();
-
-    let target_scan = LogicalPlanBuilder::scan(
-        target_qualifier,
-        provider_as_source(Arc::clone(&target_provider)),
-        None,
-    )?
-    .build()?;
-    let source_scan = LogicalPlanBuilder::scan(
-        source_qualifier,
-        provider_as_source(Arc::clone(&source_provider)),
-        None,
-    )?
-    .build()?;
-
-    let (left_keys, right_keys): (Vec<Column>, Vec<Column>) = merge
-        .on_keys
-        .iter()
-        .map(|(t, s)| {
-            (
-                Column::new(Some(target_qualifier.to_string()), t),
-                Column::new(Some(source_qualifier.to_string()), s),
-            )
-        })
-        .unzip();
-    let target_key_columns: Vec<String> = merge.on_keys.iter().map(|(t, _)| t.clone()).collect();
-
-    let joined = LogicalPlanBuilder::from(target_scan)
-        .join(source_scan, JoinType::Inner, (left_keys, right_keys), None)?
-        .build()?;
-
-    let assign_map: HashMap<&str, &str> = merge
-        .assignments
-        .iter()
-        .map(|(c, e)| (c.as_str(), e.as_str()))
-        .collect();
-    let target_schema = target_provider.schema();
-    let target_field_names: std::collections::HashSet<&str> = target_schema
-        .fields()
-        .iter()
-        .map(|f| f.name().as_str())
-        .collect();
-
-    for (col_name, _) in &merge.assignments {
-        if !target_field_names.contains(col_name.as_str()) {
-            return Err(datafusion::error::DataFusionError::Plan(format!(
-                "MERGE SET column '{col_name}' does not exist in target table"
-            )));
-        }
-    }
-
-    let joined_schema = joined.schema();
-    let project_exprs: Vec<Expr> = target_schema
-        .fields()
-        .iter()
-        .map(|field| {
-            let col_name = field.name();
-            let expr = if let Some(value_sql) = assign_map.get(col_name.as_str()) {
-                session_state.create_logical_expr(value_sql, joined_schema)?
-            } else {
-                col(Column::new(Some(target_qualifier.to_string()), col_name))
-            };
-            Ok(expr.alias(col_name))
-        })
-        .collect::<DFResult<Vec<_>>>()?;
-
-    let projected = LogicalPlanBuilder::from(joined)
-        .project(project_exprs)?
-        .build()?;
-    let join_physical = session_state.create_physical_plan(&projected).await?;
-
-    Ok(Some(Arc::new(CayenneMergeExec::new(
-        join_physical,
-        target_provider,
-        session_state.clone(),
-        target_key_columns,
-    ))))
 }

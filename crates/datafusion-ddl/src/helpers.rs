@@ -52,7 +52,7 @@ pub fn parse_qualified_schema_name(name: &str, default_catalog: &str) -> (String
     }
 }
 
-/// Extract primary key column names from DataFusion [`Constraints`] using the Arrow schema
+/// Extract primary key column names from `DataFusion` [`Constraints`] using the Arrow schema
 /// to resolve column indices to names.
 #[must_use]
 pub fn extract_primary_key_columns(
@@ -82,8 +82,8 @@ pub fn extract_primary_key_columns(
 ///
 /// Gracefully returns `false` if the `Weak` reference has been dropped.
 #[must_use]
-pub fn is_ddl_enabled(
-    ddl_enabled_catalogs: &Weak<RwLock<HashSet<String>>>,
+pub fn is_ddl_enabled<S: ::std::hash::BuildHasher>(
+    ddl_enabled_catalogs: &Weak<RwLock<HashSet<String, S>>>,
     catalog_name: &str,
 ) -> bool {
     ddl_enabled_catalogs
@@ -93,7 +93,7 @@ pub fn is_ddl_enabled(
 }
 
 /// Returns `true` if the `CREATE TABLE` AST node contains extensions that Spice
-/// intercepts before handing to DataFusion:
+/// intercepts before handing to `DataFusion`:
 /// - A `PARTITION BY` clause, or
 /// - `WITH (...)` options whose keys start with `acceleration.` or `dataset.`
 #[must_use]

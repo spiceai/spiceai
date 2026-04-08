@@ -661,7 +661,10 @@ pub(crate) fn default_extension_planners(
             ),
         ));
     } else {
-        planners.push(Arc::new(super::cayenne_ddl::CayenneDmlExtensionPlanner));
+        planners.push(Arc::new(cayenne::ddl::CayenneDmlExtensionPlanner::new(
+            super::SPICE_DEFAULT_CATALOG,
+            super::SPICE_DEFAULT_SCHEMA,
+        )));
     };
     planners
 }

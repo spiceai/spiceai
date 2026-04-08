@@ -29,8 +29,7 @@ pub mod logical_nodes;
 pub mod physical_plans;
 
 pub use dml_planner::{
-    CayenneDmlExtensionPlanner, DistributedCayenneDmlExtensionPlanner, extract_filter_sql,
-    extract_update_assignments,
+    DistributedCayenneDmlExtensionPlanner, extract_filter_sql, extract_update_assignments,
 };
 pub use handler::DistributedCayenneDdlHandler;
 

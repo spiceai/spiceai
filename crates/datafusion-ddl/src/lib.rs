@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Shared DataFusion DDL infrastructure for Spice catalog integrations.
+//! Shared `DataFusion` DDL infrastructure for Spice catalog integrations.
 //!
 //! ## Core abstractions
 //!

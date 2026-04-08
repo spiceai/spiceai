@@ -83,7 +83,7 @@ impl fmt::Debug for DdlExtensionNode {
         f.debug_struct("DdlExtensionNode")
             .field("op", &self.op)
             .field("handler", &self.handler.name())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
