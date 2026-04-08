@@ -32,6 +32,7 @@ use spicepod::{
     partitioning::PartitionedBy,
 };
 use std::time::Duration;
+use tokio::time::sleep;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
@@ -128,6 +129,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
                 .start()
                 .await?;
 
+            tokio::time::sleep(Duration::from_secs(2)).await;
             harness.wait_for_executors(Duration::from_secs(15)).await?;
 
             // Wait for executors to load and accelerate their assigned partitions.
@@ -140,7 +142,14 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                 .expect("format explain")
                 .to_string();
-            insta::assert_snapshot!("bucket_partitioning_plan", plan_fmt);
+
+            insta::with_settings!({
+                filters => vec![
+                    (r"127\.0\.0\.1:\d+", "[endpoint]")
+                ]
+            }, {
+                insta::assert_snapshot!("bucket_partitioning_plan", plan_fmt);
+            });
 
             let rows = harness.query(select_all_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
@@ -154,7 +163,13 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             let agg_plan_fmt = arrow::util::pretty::pretty_format_batches(&agg_plan)
                 .expect("format explain agg")
                 .to_string();
-            insta::assert_snapshot!("bucket_partitioning_agg_plan", agg_plan_fmt);
+            insta::with_settings!({
+                filters => vec![
+                    (r"127\.0\.0\.1:\d+", "[endpoint]")
+                ]
+            }, {
+                insta::assert_snapshot!("bucket_partitioning_agg_plan", agg_plan_fmt);
+            });
 
             let agg = harness.query(aggregation_sql).await?;
             let agg_fmt = arrow::util::pretty::pretty_format_batches(&agg).expect("format agg");
@@ -196,14 +211,15 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
             configure_test_datafusion();
             let app = AppBuilder::new("test_multi_executor_accel")
                 .with_dataset(make_memory_accelerated_dataset(
-                    format!("file:{}", csv_path.display()),
+                    format!("file://{}", csv_path.display()),
                     "test_data",
                     4,
                     "id",
                 ))
                 .with_runtime(SpicepodRuntime {
-                    scheduler: Some(make_named_scheduler_config(
+                    scheduler: Some(make_named_scheduler_config_with_executors(
                         "test_distributed_acceleration_multi_executor",
+                        2,
                     )),
                     ..SpicepodRuntime::default()
                 })
@@ -215,6 +231,7 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
                 .start()
                 .await?;
 
+            sleep(Duration::from_secs(2)).await; // Ensure we get an initial partition assignment.
             harness.wait_for_executors(Duration::from_secs(15)).await?;
             wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
 
@@ -232,14 +249,15 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
                 "plan should contain Sort operator"
             );
             assert!(
-                plan_fmt.contains("FlightSqlExec"),
-                "plan should use FlightSqlExec for distributed execution"
+                plan_fmt.contains("VirtualExecutionPlan name=flightsql"),
+                "plan should use FlightSqlExec for distributed execution \n {plan_fmt}"
             );
             // All 4 bucket values should appear in partition filters
             for bucket in &["'0'", "'1'", "'2'", "'3'"] {
+                let expected_filter = format!("bucket(4, test_data.id) = {bucket}");
                 assert!(
-                    plan_fmt.contains(&format!("bucket(4, \"id\") = {bucket}")),
-                    "bucket {bucket} should appear in partition filters"
+                    plan_fmt.contains(&expected_filter),
+                    "'{expected_filter}' should appear in partition filters \n {plan_fmt}"
                 );
             }
 
@@ -261,11 +279,11 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
         .await
 }
 
-/// Test that user predicates are pushed down into the `FlightSqlExec` queries sent to
+/// Test that user predicates are pushed down into the `VirtualExecutionPlan` queries sent to
 /// executors, rather than being applied as a post-fetch filter on the scheduler.
 ///
 /// Verifies:
-/// - `WHERE score > 85` appears in the `FlightSqlExec` sql string in the EXPLAIN plan
+/// - `WHERE score > 85` appears in the `VirtualExecutionPlan name=flightsql` sql string in the EXPLAIN plan
 /// - Only rows matching the predicate are returned (5 rows: ids 2,4,6,8,10)
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
@@ -292,7 +310,7 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
             configure_test_datafusion();
             let app = AppBuilder::new("test_predicate_pushdown_accel")
                 .with_dataset(make_memory_accelerated_dataset(
-                    format!("file:{}", csv_path.display()),
+                    format!("file://{}", csv_path.display()),
                     "test_data",
                     3,
                     "id",
@@ -311,10 +329,11 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
                 .start()
                 .await?;
 
+            tokio::time::sleep(Duration::from_secs(2)).await;
             harness.wait_for_executors(Duration::from_secs(15)).await?;
             wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
 
-            // The user predicate `score > 85` must be visible inside the FlightSqlExec
+            // The user predicate `score > 85` must be visible inside the VirtualExecutionPlan
             // sql string — confirming it was pushed to the executor, not applied above.
             let filtered_sql = "SELECT id, name, score FROM test_data WHERE score > 85 ORDER BY id";
 
@@ -322,7 +341,13 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                 .expect("format explain")
                 .to_string();
-            insta::assert_snapshot!("predicate_pushdown_plan", plan_fmt);
+            insta::with_settings!({
+                filters => vec![
+                    (r"127\.0\.0\.1:\d+", "[endpoint]")
+                ]
+            }, {
+                insta::assert_snapshot!("predicate_pushdown_plan", plan_fmt);
+            });
 
             let rows = harness.query(filtered_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
@@ -370,7 +395,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
             configure_test_datafusion();
             let app = AppBuilder::new("test_rebalance_accel")
                 .with_dataset(make_memory_accelerated_dataset(
-                    format!("file:{}", csv_path.display()),
+                    format!("file://{}", csv_path.display()),
                     "test_data",
                     4,
                     "id",
@@ -389,6 +414,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
                 .start()
                 .await?;
 
+            tokio::time::sleep(Duration::from_secs(2)).await;
             harness.wait_for_executors(Duration::from_secs(15)).await?;
             wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
 
@@ -467,13 +493,13 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
             configure_test_datafusion();
             let app = AppBuilder::new("test_join_partitioned")
                 .with_dataset(make_memory_accelerated_dataset(
-                    format!("file:{}", data_path.display()),
+                    format!("file://{}", data_path.display()),
                     "test_data",
                     4,
                     "id",
                 ))
                 .with_dataset(make_memory_accelerated_dataset(
-                    format!("file:{}", cat_path.display()),
+                    format!("file://{}", cat_path.display()),
                     "categories",
                     4,
                     "id",
@@ -510,7 +536,7 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
 
             // Wait for partition metadata to be fully initialized and assigned
             // to executors. Poll until the EXPLAIN shows a distributed plan
-            // (FlightSqlExec with bucket filters) rather than an EmptyRelation.
+            // (VirtualExecutionPlan name=flightsql with bucket filters) rather than an EmptyRelation.
             let join_sql = "SELECT t.id, t.name, c.category, c.rating \
                             FROM test_data t JOIN categories c ON t.id = c.id \
                             ORDER BY t.id";
@@ -521,7 +547,9 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                 let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                     .expect("format explain")
                     .to_string();
-                if plan_fmt.contains("FlightSqlExec") && plan_fmt.contains("bucket") {
+                if plan_fmt.contains("VirtualExecutionPlan name=flightsql")
+                    && plan_fmt.contains("bucket")
+                {
                     break plan;
                 }
                 assert!(
@@ -568,8 +596,8 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
             }
             // Verify distributed execution operators
             assert!(
-                plan_fmt.contains("FlightSqlExec"),
-                "plan should use FlightSqlExec"
+                plan_fmt.contains("VirtualExecutionPlan name=flightsql"),
+                "plan should use FlightSqlExec for distributed execution \n {plan_fmt}"
             );
             assert!(
                 plan_fmt.contains("HashJoinExec"),
@@ -623,7 +651,7 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
             configure_test_datafusion();
             let app = AppBuilder::new("test_refresh_forwarding")
                 .with_dataset(make_memory_accelerated_dataset(
-                    format!("file:{}", csv_path.display()),
+                    format!("file://{}", csv_path.display()),
                     "test_data",
                     3,
                     "id",
@@ -642,6 +670,8 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
                 .start()
                 .await?;
 
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
             harness.wait_for_executors(Duration::from_secs(15)).await?;
             wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
 
@@ -657,7 +687,7 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
                 .expect("refresh_table on scheduler should forward to executors");
 
             // Allow time for the executor to process the refresh command.
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
 
             // Verify data is still correct after refresh.
             wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(30)).await?;
@@ -800,6 +830,13 @@ fn make_memory_accelerated_dataset(
 /// A UUID suffix ensures each test run starts with clean state, avoiding stale
 /// partition assignments from previous runs routing queries to dead executors.
 fn make_named_scheduler_config(test_name: &str) -> SchedulerConfig {
+    make_named_scheduler_config_with_executors(test_name, 10)
+}
+
+fn make_named_scheduler_config_with_executors(
+    test_name: &str,
+    max_partitions_per_executor: usize,
+) -> SchedulerConfig {
     let run_id = uuid::Uuid::new_v4();
     SchedulerConfig {
         state_location: format!(
@@ -808,18 +845,20 @@ fn make_named_scheduler_config(test_name: &str) -> SchedulerConfig {
         params: Some(spicepod::param::Params::from_string_map(
             std::collections::HashMap::from([
                 ("s3_region".to_string(), "us-east-1".to_string()),
-                (
-                    "s3_key".to_string(),
-                    "${env:AWS_S3_VECTORS_KEY}".to_string(),
-                ),
+                ("s3_key".to_string(), "${env:AWS_ACCESS_KEY_ID}".to_string()),
                 (
                     "s3_secret".to_string(),
-                    "${env:AWS_S3_VECTORS_SECRET}".to_string(),
+                    "${env:AWS_SECRET_ACCESS_KEY}".to_string(),
+                ),
+                (
+                    "s3_session_token".to_string(),
+                    "${env:AWS_SESSION_TOKEN}".to_string(),
                 ),
                 ("s3_auth".to_string(), "key".to_string()),
             ]),
         )),
         partition_management: Some(PartitionManagement {
+            max_partitions_per_executor,
             interval: "1s".to_string(),
             ..Default::default()
         }),
