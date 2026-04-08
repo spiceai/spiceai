@@ -1957,4 +1957,123 @@ mod tests {
         );
         assert_eq!(schema.field(13).data_type(), &DataType::Boolean);
     }
+
+    /// Cohorted spend view — full_data_type column: date, string, decimal(26,2), int.
+    #[test]
+    fn test_schema_from_json_real_cohorted_spend_full_data_type() {
+        let response = make_schema_response(&json!([
+            ["spend_dt", "date", "YES"],
+            ["source_nm", "string", "YES"],
+            ["channel_id", "string", "YES"],
+            ["campaign_nm", "string", "YES"],
+            ["brand_campaign_nm", "string", "YES"],
+            ["state_cd", "string", "YES"],
+            ["county_cd", "string", "YES"],
+            ["designated_market_area", "string", "YES"],
+            ["zip_code_cd", "string", "YES"],
+            ["region_cd", "string", "YES"],
+            ["lead_tier_id", "string", "YES"],
+            ["sub_id", "string", "YES"],
+            ["publisher_nm", "string", "YES"],
+            ["non_experiment__decimal_amt", "decimal(26,2)", "YES"],
+            ["mrktng_spnd_amt", "decimal(26,2)", "YES"],
+            ["mrktng_spnd_exprmnt_amt", "decimal(26,2)", "YES"],
+            ["lead_cnt", "int", "YES"],
+            ["new_lead_cnt", "int", "YES"],
+            ["returning_lead_cnt", "int", "YES"],
+            ["leads_with_assgnmnts_cnt", "int", "YES"],
+            ["leads_with_any_rep_assgnmnts_cnt", "int", "YES"],
+            ["bind_cnt", "int", "YES"],
+            ["cohort_binds_0_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_binds_1_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_binds_3_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_binds_7_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_binds_14_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_binds_30_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_binds_45_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_binds_60_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_binds_90_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_0_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_1_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_3_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_7_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_14_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_30_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_45_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_60_days_amt", "decimal(26,2)", "YES"],
+            ["cohort_bound_premium_90_days_amt", "decimal(26,2)", "YES"],
+            ["bound_premium_amt", "decimal(26,2)", "YES"]
+        ]));
+
+        let schema = schema_from_json(
+            &response,
+            "catalog.ext_dbt_dwh_v.mart_mrktng_cohorted_spend_v",
+        )
+        .expect("should parse cohorted spend schema");
+        assert_eq!(schema.fields().len(), 41);
+        assert_eq!(schema.field(0).data_type(), &DataType::Date32);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(13).data_type(), &DataType::Decimal128(26, 2));
+        assert_eq!(schema.field(16).data_type(), &DataType::Int32);
+    }
+
+    /// Same cohorted spend view using data_type column (DATE, STRING, DECIMAL, INT).
+    #[test]
+    fn test_schema_from_json_real_cohorted_spend_data_type_fallback() {
+        let response = make_schema_response(&json!([
+            ["spend_dt", "DATE", "YES"],
+            ["source_nm", "STRING", "YES"],
+            ["channel_id", "STRING", "YES"],
+            ["campaign_nm", "STRING", "YES"],
+            ["brand_campaign_nm", "STRING", "YES"],
+            ["state_cd", "STRING", "YES"],
+            ["county_cd", "STRING", "YES"],
+            ["designated_market_area", "STRING", "YES"],
+            ["zip_code_cd", "STRING", "YES"],
+            ["region_cd", "STRING", "YES"],
+            ["lead_tier_id", "STRING", "YES"],
+            ["sub_id", "STRING", "YES"],
+            ["publisher_nm", "STRING", "YES"],
+            ["non_experiment__decimal_amt", "DECIMAL", "YES"],
+            ["mrktng_spnd_amt", "DECIMAL", "YES"],
+            ["mrktng_spnd_exprmnt_amt", "DECIMAL", "YES"],
+            ["lead_cnt", "INT", "YES"],
+            ["new_lead_cnt", "INT", "YES"],
+            ["returning_lead_cnt", "INT", "YES"],
+            ["leads_with_assgnmnts_cnt", "INT", "YES"],
+            ["leads_with_any_rep_assgnmnts_cnt", "INT", "YES"],
+            ["bind_cnt", "INT", "YES"],
+            ["cohort_binds_0_days_amt", "DECIMAL", "YES"],
+            ["cohort_binds_1_days_amt", "DECIMAL", "YES"],
+            ["cohort_binds_3_days_amt", "DECIMAL", "YES"],
+            ["cohort_binds_7_days_amt", "DECIMAL", "YES"],
+            ["cohort_binds_14_days_amt", "DECIMAL", "YES"],
+            ["cohort_binds_30_days_amt", "DECIMAL", "YES"],
+            ["cohort_binds_45_days_amt", "DECIMAL", "YES"],
+            ["cohort_binds_60_days_amt", "DECIMAL", "YES"],
+            ["cohort_binds_90_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_0_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_1_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_3_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_7_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_14_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_30_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_45_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_60_days_amt", "DECIMAL", "YES"],
+            ["cohort_bound_premium_90_days_amt", "DECIMAL", "YES"],
+            ["bound_premium_amt", "DECIMAL", "YES"]
+        ]));
+
+        let schema = schema_from_json(
+            &response,
+            "catalog.ext_dbt_dwh_v.mart_mrktng_cohorted_spend_v",
+        )
+        .expect("should parse cohorted spend with data_type fallback");
+        assert_eq!(schema.fields().len(), 41);
+        assert_eq!(schema.field(0).data_type(), &DataType::Date32);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        // DECIMAL without params falls back to Decimal128(38,10)
+        assert_eq!(schema.field(13).data_type(), &DataType::Decimal128(38, 10));
+        assert_eq!(schema.field(16).data_type(), &DataType::Int32);
+    }
 }
