@@ -323,7 +323,8 @@ where
                     let retry_after = retry_after_duration(response.headers());
                     let backoff =
                         next_backoff(reason, &mut transient_backoff, &mut rate_limit_backoff);
-                    let delay = retry_after.map_or(backoff, |retry_after| retry_after.max(backoff));
+                    let delay =
+                        bounded_retry_delay(retry_after, backoff, MAX_TOKEN_REQUEST_BACKOFF);
 
                     tracing::warn!(
                         operation = operation_name,
@@ -442,6 +443,16 @@ fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| retry_after_duration_from_value(value, SystemTime::now()))
     })
+}
+
+fn bounded_retry_delay(
+    retry_after: Option<Duration>,
+    backoff: Duration,
+    max_delay: Duration,
+) -> Duration {
+    retry_after
+        .map_or(backoff, |retry_after| retry_after.max(backoff))
+        .min(max_delay)
 }
 
 fn retry_after_millis_duration(headers: &HeaderMap) -> Option<Duration> {
@@ -838,6 +849,17 @@ mod tests {
             next_token_refresh_wait(TOKEN_REFRESH_BUFFER_SECS + 15),
             Duration::from_secs(15)
         );
+    }
+
+    #[test]
+    fn test_bounded_retry_delay_clamps_large_retry_after() {
+        let delay = bounded_retry_delay(
+            Some(Duration::from_secs(3600)),
+            Duration::from_secs(5),
+            MAX_TOKEN_REQUEST_BACKOFF,
+        );
+
+        assert_eq!(delay, MAX_TOKEN_REQUEST_BACKOFF);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
