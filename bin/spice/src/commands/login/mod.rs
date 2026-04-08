@@ -190,6 +190,8 @@ async fn login_spiceai(
             std::env::consts::OS,
             std::env::consts::ARCH
         ))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_default();
     let exchange_url = format!("{base_url}/auth/token/exchange");
@@ -365,6 +367,8 @@ async fn get_spice_auth_context(
             std::env::consts::OS,
             std::env::consts::ARCH
         ))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_default();
     let response = client
