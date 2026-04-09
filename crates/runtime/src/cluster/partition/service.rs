@@ -231,6 +231,19 @@ impl PartitionService {
             "Discovered new partitions before refresh"
         );
 
+        // Ensure partition metadata is initialized for this table. This handles
+        // the case where refresh is triggered before the periodic metadata seeding
+        // has run (e.g., immediately after startup).
+        let partition_expressions: Vec<String> =
+            partition_by.iter().map(|p| p.expression.clone()).collect();
+        if let Err(e) = self
+            .partition_store
+            .initialize_metadata(table, partition_expressions)
+            .await
+        {
+            tracing::warn!(table = %table, error = %e, "Failed to initialize partition metadata");
+        }
+
         add_partitions_with_retry(&self.partition_store, table, new_partitions).await?;
 
         self.partition_store

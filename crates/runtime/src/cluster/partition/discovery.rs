@@ -121,7 +121,7 @@ pub async fn table_partition_values(
 /// and diffing against existing metadata.
 ///
 /// Returns the list of new partition values that exist in the source but are
-/// not yet tracked in the partition manager's metadata.
+/// not yet tracked in the partition store's metadata.
 pub(crate) async fn discover_new_partitions(
     table: &TableReference,
     partition_by: &[PartitionedBy],

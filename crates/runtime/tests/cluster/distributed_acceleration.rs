@@ -734,28 +734,30 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
             harness.wait_for_executors(Duration::from_secs(15)).await?;
             wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
 
-            // Verify initial partition state: 10 unique cities = 10 partitions.
+            // Wait for partition management cycle to discover and assign all partitions.
+            // The cycle runs every 1s (configured in make_named_scheduler_config).
             let partition_store = harness
                 .scheduler
                 .partition_store()
                 .expect("scheduler should have partition store");
-            partition_store.refresh().await.expect("refresh store");
-
             let table_ref = datafusion::sql::TableReference::parse_str("test_data");
-            let initial_metadata = partition_store
-                .get_table_metadata(&table_ref)
-                .await
-                .expect("get metadata")
-                .expect("metadata should exist");
-            assert_eq!(
-                initial_metadata.partitions.len(),
-                10,
-                "Initial data has 10 unique cities = 10 partitions"
-            );
-            // All should be assigned.
+
+            let partitions_assigned =
+                crate::utils::wait_until_true(Duration::from_secs(30), || async {
+                    partition_store.refresh().await.ok();
+                    partition_store
+                        .get_table_metadata(&table_ref)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map_or(false, |m| {
+                            m.partitions.len() == 10 && m.partitions.iter().all(|p| p.is_assigned())
+                        })
+                })
+                .await;
             assert!(
-                initial_metadata.partitions.iter().all(|p| p.is_assigned()),
-                "All initial partitions should be assigned to an executor"
+                partitions_assigned,
+                "All 10 initial partitions should be discovered and assigned"
             );
 
             // Append a row with a NEW city that doesn't exist in the initial data.
@@ -779,31 +781,33 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
                 .await
                 .expect("refresh_table should succeed");
 
-            // Verify partition store: should now have 11 partitions, all assigned.
-            partition_store.refresh().await.expect("refresh store");
-            let final_metadata = partition_store
-                .get_table_metadata(&table_ref)
-                .await
-                .expect("get metadata")
-                .expect("metadata should exist");
-            assert_eq!(
-                final_metadata.partitions.len(),
-                11,
-                "After refresh, partition store should have 11 partitions (10 original + Seattle)"
-            );
+            // Verify partition store: should now have 11 partitions with Seattle present
+            // and assigned. Use polling because S3 writes may not be immediately visible.
+            let seattle_assigned =
+                crate::utils::wait_until_true(Duration::from_secs(30), || async {
+                    partition_store.refresh().await.ok();
+                    partition_store
+                        .get_table_metadata(&table_ref)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map_or(false, |m| {
+                            m.partitions.len() == 11
+                                && m.partitions.iter().any(|p| {
+                                    p.partition_value.values().any(|v| v == "Seattle")
+                                        && p.is_assigned()
+                                })
+                        })
+                })
+                .await;
             assert!(
-                final_metadata.partitions.iter().all(|p| p.is_assigned()),
-                "All partitions (including new Seattle) should be assigned"
+                seattle_assigned,
+                "Seattle partition should be discovered, added to store, and assigned"
             );
 
-            // Verify the new partition value is present.
-            let has_seattle = final_metadata
-                .partitions
-                .iter()
-                .any(|p| p.partition_value.values().any(|v| v == "Seattle"));
-            assert!(has_seattle, "Seattle partition should exist in metadata");
-
-            // Wait for the data to appear and verify all 11 rows are queryable.
+            // Wait for the executor to pick up the new partition and load the data.
+            // The executor needs to receive the UpdatePartitions message, update its
+            // partition filter, and then the next refresh will include Seattle.
             wait_for_row_count(&harness, "test_data", 11, Duration::from_secs(60)).await?;
 
             harness.shutdown().await;
