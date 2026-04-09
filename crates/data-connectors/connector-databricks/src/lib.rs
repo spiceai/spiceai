@@ -968,14 +968,16 @@ impl MetricsProvider for DatabricksMetricsProvider {
                     );
                 })))
             }
-            "inflight_operations" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
-                instrument.observe(
-                    metrics
-                        .inflight_operations
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    &attributes,
-                );
-            }))),
+            "inflight_operations" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .inflight_operations
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
             "statements_executed_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(
