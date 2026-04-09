@@ -18,7 +18,7 @@ use crate::{dataconnector::ConnectorComponent, datafusion::error::find_datafusio
 
 use super::{
     GitHubTableArgs, GitHubTableGraphQLParams, commits_inject_parameters, expr_to_match,
-    filter_pushdown, inject_parameters,
+    filter_pushdown, inject_parameters, scalar_utf8_value,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use data_components::{
@@ -28,7 +28,7 @@ use data_components::{
         client::{DuplicateBehavior, GraphQLQuery, UnnestBehavior, unnest_json_object_to_depth},
     },
 };
-use datafusion::{logical_expr::Operator, prelude::Expr, scalar::ScalarValue};
+use datafusion::{logical_expr::Operator, prelude::Expr};
 use graphql_parser::query::{Definition, InlineFragment, OperationDefinition, Query, Selection};
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -199,14 +199,13 @@ fn commits_filter_pushdown(expr: &Expr) -> FilterPushdownResult {
     if let Some((column, value, op)) = expr_to_match(expr)
         && column.name == "ref"
     {
-        return match (op, value) {
-            (Operator::Eq, ScalarValue::Utf8(Some(value))) if !value.is_empty() => {
-                FilterPushdownResult {
-                    filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Exact,
-                    expr: expr.clone(),
-                    context: Some(format!("ref:{value}")),
-                }
-            }
+        let ref_value = scalar_utf8_value(&value).filter(|v| !v.is_empty());
+        return match (op, ref_value) {
+            (Operator::Eq, Some(ref_value)) => FilterPushdownResult {
+                filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Exact,
+                expr: expr.clone(),
+                context: Some(format!("ref:{ref_value}")),
+            },
             _ => FilterPushdownResult {
                 filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Unsupported,
                 expr: expr.clone(),
@@ -252,10 +251,9 @@ fn requested_ref_from_filter(
             if let Some((column, value, op)) = expr_to_match(expr)
                 && column.name == "ref"
             {
-                return match (op, value) {
-                    (Operator::Eq, ScalarValue::Utf8(Some(value))) if !value.is_empty() => {
-                        Ok(Some(value))
-                    }
+                let ref_value = scalar_utf8_value(&value).filter(|v| !v.is_empty());
+                return match (op, ref_value) {
+                    (Operator::Eq, Some(v)) => Ok(Some(v.to_string())),
                     _ => Err(unsupported_ref_filter_error()),
                 };
             }
@@ -590,6 +588,23 @@ mod tests {
     #[test]
     fn test_ref_filter_pushdown_is_supported() {
         let expr = datafusion::prelude::col("ref").eq(datafusion::prelude::lit("trunk"));
+        let result = commits_filter_pushdown(&expr);
+
+        assert_eq!(
+            result.filter_pushdown,
+            datafusion::logical_expr::TableProviderFilterPushDown::Exact
+        );
+        assert_eq!(result.context.as_deref(), Some("ref:trunk"));
+    }
+
+    #[test]
+    fn test_ref_filter_pushdown_supports_utf8view() {
+        use datafusion::logical_expr::Expr;
+        use datafusion::scalar::ScalarValue;
+        let expr = datafusion::prelude::col("ref").eq(Expr::Literal(
+            ScalarValue::Utf8View(Some("trunk".to_string())),
+            None,
+        ));
         let result = commits_filter_pushdown(&expr);
 
         assert_eq!(
