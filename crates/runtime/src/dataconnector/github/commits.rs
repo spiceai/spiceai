@@ -511,8 +511,17 @@ fn commits_filter_pushdown(expr: &Expr) -> FilterPushdownResult {
         && op == Operator::Eq
         && let Some(ref_value) = scalar_utf8_value(&value).filter(|v| !v.is_empty())
     {
+        // Qualified refs (e.g. "refs/heads/trunk") are resolved by scan() but the
+        // ref column projects the short name ("trunk").  Mark as Inexact so
+        // DataFusion re-applies the filter — this correctly returns 0 rows when the
+        // user filters on a qualified name that differs from the projected short name.
+        let pushdown = if ref_value.starts_with("refs/") {
+            datafusion::logical_expr::TableProviderFilterPushDown::Inexact
+        } else {
+            datafusion::logical_expr::TableProviderFilterPushDown::Exact
+        };
         return FilterPushdownResult {
-            filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Exact,
+            filter_pushdown: pushdown,
             expr: expr.clone(),
             context: Some(format!("ref:{ref_value}")),
         };
@@ -1065,6 +1074,23 @@ mod tests {
             datafusion::logical_expr::TableProviderFilterPushDown::Inexact
         );
         assert_eq!(result.context.as_deref(), Some("ref-dynamic"));
+    }
+
+    #[test]
+    fn test_ref_filter_pushdown_qualified_ref_uses_inexact() {
+        let expr = datafusion::prelude::col("ref")
+            .eq(datafusion::prelude::lit("refs/heads/release/1.11"));
+        let result = commits_filter_pushdown(&expr);
+
+        assert_eq!(
+            result.filter_pushdown,
+            datafusion::logical_expr::TableProviderFilterPushDown::Inexact,
+            "qualified refs must use Inexact since the ref column projects the short name"
+        );
+        assert_eq!(
+            result.context.as_deref(),
+            Some("ref:refs/heads/release/1.11")
+        );
     }
 
     #[test]
