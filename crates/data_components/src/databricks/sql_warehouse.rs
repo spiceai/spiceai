@@ -279,9 +279,7 @@ impl SqlWarehouseApi {
 
         match self.get_schema_from_information_schema(&token, table).await {
             Ok(schema) => return Ok(schema),
-            Err(
-                Error::TableSchemaNotRegistered { .. } | Error::NoColumnsInDataset { .. },
-            ) => {
+            Err(Error::TableSchemaNotRegistered { .. } | Error::NoColumnsInDataset { .. }) => {
                 tracing::warn!(
                     table = %table,
                     "information_schema.columns has no metadata for this table, falling back to DESCRIBE TABLE. Column nullability will default to nullable."
