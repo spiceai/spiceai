@@ -284,13 +284,10 @@ impl CayenneDataSink {
             };
 
             // Step 3: Write staging WAL (records intent before the non-atomic move)
-            self.table.write_staging_wal().await?;
-
-            // Step 4: Move files from staging into current snapshot (atomic on local FS)
-            self.table.move_files_to_current_snapshot().await?;
-
-            // Step 5: Remove staging WAL (signals successful move)
-            self.table.remove_staging_wal().await?;
+            // Step 4-6: Execute WAL finalize sequence: write WAL, move files,
+            // remove WAL, and refresh listing table.
+            let staged_append = self.table.staged_append_for_existing_staging();
+            staged_append.finalize_staged_write().await?;
 
             tracing::debug!(
                 "Insert completed, wrote {} rows to Vortex in {} writer operation(s)",
@@ -306,9 +303,11 @@ impl CayenneDataSink {
             rows
         };
 
-        // Refresh the listing table before retention/sort so newly written files are visible.
-        // Without this, sort rewrite can read stale data and drop fresh append rows.
-        self.table.refresh_listing_table()?;
+        // Listing table refresh is already part of the staged WAL finalize flow.
+        // For snapshot-creation paths, we still need this explicit refresh.
+        if needs_new_snapshot {
+            self.table.refresh_listing_table()?;
+        }
 
         // Apply retention filters, sort, and refresh listing table.
         self.apply_retention_if_configured().await?;
