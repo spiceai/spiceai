@@ -204,24 +204,37 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
 }
 
 /// Converts a [`PartitionValue`] (e.g. `{"bucket(3, org_id)": "42"}`) into a filter [`Expr`]
-/// (e.g. `bucket(3, org_id) = '42'`). Multiple keys are `AND`ed together.
+/// (e.g. `bucket(3, org_id) = 42`). Multiple keys are `AND`ed together.
+///
+/// Partition values are stored as strings by [`scalar_to_sql_literal`], which produces
+/// valid SQL literals: numbers as `"42"`, strings as `"'hello'"`, NULL as `"NULL"`.
+/// We parse each value as a SQL expression so DataFusion infers the correct type
+/// (e.g. `42` becomes an `Int64` literal, not a `Utf8` string). This prevents
+/// type-mismatch errors in downstream engines (e.g. Vortex pruning predicates)
+/// that lack cast kernels for `i64 → utf8`.
 fn partition_value_to_expr(
     pv: &PartitionValue,
     df_schema: &datafusion::common::DFSchema,
     state: &Weak<RwLock<SessionState>>,
 ) -> Result<Option<Expr>, DataFusionError> {
     let mut expr: Option<Expr> = None;
+    let session_state = state.upgrade().ok_or_else(|| {
+        DataFusionError::Plan(
+            "SessionState has been dropped, cannot parse partition expression".to_string(),
+        )
+    })?;
+    let session_state = session_state.read();
+
     for (partition_expr_str, val) in pv {
-        let new_expr = state
-            .upgrade()
-            .ok_or_else(|| {
-                DataFusionError::Plan(
-                    "SessionState has been dropped, cannot parse partition expression".to_string(),
-                )
-            })?
-            .read()
-            .create_logical_expr(partition_expr_str, df_schema)?
-            .eq(lit(val.clone()));
+        let partition_expr = session_state.create_logical_expr(partition_expr_str, df_schema)?;
+
+        // Parse the value as a SQL expression to preserve type information.
+        // For example, "15" parses to Int64(15), "'hello'" parses to Utf8("hello").
+        let value_expr = session_state
+            .create_logical_expr(val, df_schema)
+            .unwrap_or_else(|_| lit(val.clone()));
+
+        let new_expr = partition_expr.eq(value_expr);
         expr = match expr {
             Some(existing) => Some(existing.and(new_expr)),
             None => Some(new_expr),
