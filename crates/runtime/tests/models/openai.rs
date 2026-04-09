@@ -153,7 +153,7 @@ mod search {
 
     use crate::models::{
         get_mega_science_dataset, get_small_clickbench_dataset,
-        search::{SearchTestCase, SearchTestType, run_search_w_explain},
+        search::{SearchTestCase, SearchTestType, run_search},
     };
 
     use super::*;
@@ -163,7 +163,7 @@ mod search {
         verify_env_secret_exists("SPICE_OPENAI_API_KEY")
             .await
             .map_err(anyhow::Error::msg)?;
-        run_search_w_explain(
+        run_search(
             AppBuilder::new("search_app")
                 .with_embedding(get_openai_embeddings(
                     Some("text-embedding-3-small"),
@@ -214,8 +214,6 @@ mod search {
                     })),
                 ),
             ],
-            false,
-            false,
         )
         .await
     }
@@ -268,7 +266,7 @@ mod search {
                 "openai_embeddings",
             ))
             .build();
-        run_search_w_explain(
+        run_search(
             app,
             vec![
                 SearchTestCase::new(
@@ -288,8 +286,6 @@ mod search {
                     })),
                 ),
             ],
-            false,
-            false,
         )
         .await
     }
