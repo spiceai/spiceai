@@ -784,11 +784,7 @@ impl DataConnectorFactory for DatabricksFactory {
                             .and_then(|v| v.parse::<usize>().ok())
 .filter(|&n| n > 0)
                             .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS);
-                        Some(self.get_or_create_semaphore(
-                            endpoint,
-                            warehouse_id,
-                            max_concurrent,
-                        ))
+                        Some(self.get_or_create_semaphore(endpoint, warehouse_id, max_concurrent))
                     } else {
                         None
                     }
@@ -920,8 +916,11 @@ const DATABRICKS_METRICS: &[MetricSpec] = &[
     MetricSpec::new("pool_active_connections", MetricType::ObservableGaugeU64)
         .description("Current number of active connection handles"),
     // -- Concurrency metrics --
-    MetricSpec::new("semaphore_available_permits", MetricType::ObservableGaugeU64)
-        .description("Current number of available concurrency permits in the request semaphore"),
+    MetricSpec::new(
+        "semaphore_available_permits",
+        MetricType::ObservableGaugeU64,
+    )
+    .description("Current number of available concurrency permits in the request semaphore"),
     // -- Data transfer metrics --
     MetricSpec::new("chunks_fetched_total", MetricType::ObservableCounterU64)
         .description("Total Arrow result chunks fetched from external links"),
@@ -1053,16 +1052,14 @@ impl MetricsProvider for DatabricksMetricsProvider {
                     );
                 })))
             }
-            "connector_disabled" => {
-                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
-                    let disabled = u64::from(
-                        metrics
-                            .permanently_disabled
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                    );
-                    instrument.observe(disabled, &attributes);
-                })))
-            }
+            "connector_disabled" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                let disabled = u64::from(
+                    metrics
+                        .permanently_disabled
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+                instrument.observe(disabled, &attributes);
+            }))),
             _ => None,
         }
     }
