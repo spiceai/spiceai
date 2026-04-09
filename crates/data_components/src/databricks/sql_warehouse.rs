@@ -70,7 +70,7 @@ const SQL_WAREHOUSE_DEFAULT_STATEMENT_MAX_RETRIES: usize = 14;
 ///
 /// Controls concurrency, retry limits, and permanent error handling to
 /// prevent thundering herd issues.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct SqlWarehouseConfig {
     /// Maximum number of concurrent HTTP requests to the SQL Warehouse API.
     pub max_concurrent_requests: usize,
@@ -130,7 +130,7 @@ pub struct DatabricksMetrics {
     pub statements_failed_total: AtomicU64,
 
     // -- Connection pool metrics --
-    /// Total virtual pool connect() calls (each returns a lightweight handle).
+    /// Total virtual pool `connect()` calls (each returns a lightweight handle).
     pub pool_connections_total: AtomicU64,
     /// Current number of active connections (handles not yet dropped).
     pub pool_active_connections: AtomicU64,
@@ -350,7 +350,7 @@ impl DbConnectionPool<Arc<SqlWarehouseApi>, &'static dyn Sync> for SqlWarehouseC
             .fetch_add(1, Ordering::Relaxed);
         Ok(Box::new(SqlWarehouseConnection {
             api: Arc::clone(&self.api),
-            _metrics: Arc::clone(&self.metrics),
+            metrics: Arc::clone(&self.metrics),
         }))
     }
 
@@ -603,7 +603,7 @@ impl SqlWarehouseApi {
             )
             .await
             .context(HttpRequestFailedSnafu)?;
-            self.check_permanent_http_error(response)?
+            self.check_permanent_http_error(response)
                 .error_for_status()
                 .context(HttpRequestFailedSnafu)?
                 .json()
@@ -649,7 +649,7 @@ impl SqlWarehouseApi {
             )
             .await
             .context(HttpRequestFailedSnafu)?;
-            self.check_permanent_http_error(response)?
+            self.check_permanent_http_error(response)
                 .error_for_status()
                 .context(HttpRequestFailedSnafu)?
                 .json()
@@ -736,7 +736,8 @@ impl SqlWarehouseApi {
 
                         let result = match api
                             .check_permanent_http_error(resp)
-                            .and_then(|r| r.error_for_status().context(HttpRequestFailedSnafu))
+                            .error_for_status()
+                            .context(HttpRequestFailedSnafu)
                         {
                             Ok(response) => match response
                                 .json()
@@ -848,7 +849,7 @@ impl SqlWarehouseApi {
             )
             .await
             .context(HttpRequestFailedSnafu)?;
-            self.check_permanent_http_error(response)?
+            self.check_permanent_http_error(response)
                 .error_for_status()
                 .context(HttpRequestFailedSnafu)?
                 .bytes()
@@ -996,10 +997,7 @@ impl SqlWarehouseApi {
     /// disabled so that future requests fail fast without issuing HTTP calls.
     ///
     /// Returns the response unchanged on success so it can be chained.
-    fn check_permanent_http_error(
-        &self,
-        response: reqwest::Response,
-    ) -> Result<reqwest::Response, Error> {
+    fn check_permanent_http_error(&self, response: reqwest::Response) -> reqwest::Response {
         let status = response.status();
         if self.disable_on_permanent_error && is_permanent_http_status(status) {
             tracing::error!(
@@ -1012,7 +1010,7 @@ impl SqlWarehouseApi {
                 .permanent_errors_total
                 .fetch_add(1, Ordering::Relaxed);
         }
-        Ok(response)
+        response
     }
 }
 
@@ -1216,12 +1214,12 @@ fn schema_from_describe_json(json_value: &Value, dataset_name: &str) -> Result<S
 
 struct SqlWarehouseConnection {
     api: Arc<SqlWarehouseApi>,
-    _metrics: Arc<DatabricksMetrics>,
+    metrics: Arc<DatabricksMetrics>,
 }
 
 impl Drop for SqlWarehouseConnection {
     fn drop(&mut self) {
-        self._metrics
+        self.metrics
             .pool_active_connections
             .fetch_sub(1, Ordering::Relaxed);
     }
@@ -1245,10 +1243,7 @@ impl<'a> DbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseConnec
 impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseConnection {
     fn new(api: Arc<SqlWarehouseApi>) -> Self {
         let metrics = Arc::clone(&api.metrics);
-        Self {
-            api,
-            _metrics: metrics,
-        }
+        Self { api, metrics }
     }
 
     async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {
@@ -1349,7 +1344,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
             .await?;
 
         if let Err(e) = SqlWarehouseApi::verify_response_status(&response) {
-            self._metrics
+            self.metrics
                 .statements_failed_total
                 .fetch_add(1, Ordering::Relaxed);
             return Err(e.into());

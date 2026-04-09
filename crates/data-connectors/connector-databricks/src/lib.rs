@@ -267,13 +267,13 @@ impl Databricks {
                 .ok()
                 .map(Arc::new);
 
-let sql_warehouse_config = Self::build_sql_warehouse_config(&params);
+                let sql_warehouse_config = Self::build_sql_warehouse_config(&params);
 
                 let read_provider = DatabricksSqlWarehouse::with_config_and_semaphore(
                     endpoint,
                     sql_warehouse_id,
                     token_provider,
-sql_warehouse_config,
+                    sql_warehouse_config,
                     shared_semaphore,
                 )
                 .context(UnableToConstructDatabricksSqlWarehouseSnafu)?;
@@ -682,7 +682,7 @@ sql_warehouse_config,
                     error = %e,
                     "Failed to check Unity Catalog permissions; proceeding without validation"
                 );
-return Err(DataConnectorError::UnableToGetReadProvider {
+                return Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "databricks".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     source: Box::new(e),
@@ -782,7 +782,7 @@ impl DataConnectorFactory for DatabricksFactory {
                             .expose()
                             .ok()
                             .and_then(|v| v.parse::<usize>().ok())
-.filter(|&n| n > 0)
+                            .filter(|&n| n > 0)
                             .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS);
                         Some(self.get_or_create_semaphore(endpoint, warehouse_id, max_concurrent))
                     } else {
