@@ -283,7 +283,7 @@ impl DataFusionBuilder {
         self
     }
 
-    /// Sets the partition manager for on-demand partition discovery before refresh (scheduler mode only).
+    /// Sets the partition service for discovery and assignment of partitions (scheduler mode only).
     #[must_use]
     pub fn with_partition_service(mut self, service: Arc<PartitionService>) -> Self {
         self.partition_service = Some(service);

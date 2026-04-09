@@ -243,16 +243,21 @@ impl RuntimeBuilder {
         let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
         let secrets = Arc::new(RwLock::new(Self::load_secrets(self.app.as_ref()).await));
 
+        // Create the shared app reference early so DataFusion, Runtime, and PartitionService share it.
+        let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
+
         let distributed: Option<DistributedNode> = match self
             .resolved_cluster_config
             .as_ref()
             .and_then(ResolvedClusterConfig::effective_role)
         {
             Some(ClusterRole::Scheduler) => {
-                let store: Arc<dyn object_store::ObjectStore> = if let Some(scheduler_config) = self
-                    .app
-                    .as_ref()
-                    .and_then(|app| app.runtime.scheduler.clone())
+                let store: Arc<dyn object_store::ObjectStore> = if let Some(scheduler_config) =
+                    shared_app
+                        .read()
+                        .await
+                        .as_ref()
+                        .and_then(|app| app.runtime.scheduler.clone())
                 {
                     partition::build_partition_metadata_store(
                         io_runtime.clone(),
@@ -280,8 +285,9 @@ impl RuntimeBuilder {
                         PartitionStore::new(Arc::clone(&store)).with_prefix("catalog/partitions/"),
                     ),
                 ));
-                let assignment_config = self
-                    .app
+                let assignment_config = shared_app
+                    .read()
+                    .await
                     .as_ref()
                     .and_then(|app| app.runtime.scheduler.as_ref())
                     .and_then(|scheduler| scheduler.partition_management.clone())
@@ -295,7 +301,7 @@ impl RuntimeBuilder {
                     Arc::clone(&partition_store),
                     Arc::clone(&executor_registry),
                     assignment_config,
-                    Arc::new(RwLock::new(self.app.clone())),
+                    Arc::clone(&shared_app),
                 ));
 
                 Some(DistributedNode::Scheduler {
@@ -311,8 +317,6 @@ impl RuntimeBuilder {
             }),
             None => None, // No cluster config means we're running in standalone mode
         };
-        // Create the shared app reference early so both DataFusion and Runtime can share it.
-        let shared_app: Arc<RwLock<Option<Arc<App>>>> = Arc::new(RwLock::new(self.app));
 
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),

@@ -2119,16 +2119,13 @@ impl DataFusion {
         // refresh command. Without this, the periodic partition management task (which
         // runs on a 30-second interval) might not have discovered new partitions yet,
         // causing executors to drop data from unassigned partitions. (fixes #10075)
-        if let Err(e) = partition_service
+        partition_service
             .discover_and_assign_for_table(dataset_name, self)
             .await
-        {
-            tracing::warn!(
-                table = %dataset_name,
-                error = %e,
-                "Pre-refresh partition discovery failed"
-            );
-        }
+            .map_err(|e| Error::PreRefreshPartitionDiscoveryFailed {
+                table_name: dataset_name.to_string(),
+                reason: e.to_string(),
+            })?;
 
         let executor_registry = &partition_service.executor_registry;
 

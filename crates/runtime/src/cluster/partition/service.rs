@@ -88,6 +88,15 @@ pub enum Error {
     PartitionValueConversion {
         source: datafusion::error::DataFusionError,
     },
+
+    #[snafu(display("Partition discovery failed for table {table}: {source}"))]
+    DiscoveryFailed {
+        table: String,
+        source: crate::cluster::partition::Error,
+    },
+
+    #[snafu(display("Partition discovery timed out for table {table}"))]
+    DiscoveryTimeout { table: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -200,12 +209,15 @@ impl PartitionService {
         {
             Ok(Ok(new)) => new,
             Ok(Err(e)) => {
-                tracing::warn!(table = %table, error = %e, "Failed to discover partitions");
-                return Ok(());
+                return Err(Error::DiscoveryFailed {
+                    table: table.to_string(),
+                    source: e,
+                });
             }
             Err(_) => {
-                tracing::warn!(table = %table, "Partition discovery timed out");
-                return Ok(());
+                return Err(Error::DiscoveryTimeout {
+                    table: table.to_string(),
+                });
             }
         };
 
@@ -980,7 +992,6 @@ async fn notify_executors(
             .into_iter()
             .map(|(executor_id, assignments)| {
                 let registry = executor_registry;
-                let df = df;
                 async move {
                     notify_executor_of_assignments(registry, df, &executor_id, assignments).await
                 }

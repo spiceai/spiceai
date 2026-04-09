@@ -252,5 +252,4 @@ impl PartitionManagementTask {
     }
 }
 
-// Everything below has been moved to `assignment.rs`.
-// Keep this line to prevent accidental code below.
+// Partition management logic lives in `super::service::PartitionService`.
