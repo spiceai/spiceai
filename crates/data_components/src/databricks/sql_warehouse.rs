@@ -110,13 +110,16 @@ impl Default for SqlWarehouseConfig {
 #[derive(Debug, Default)]
 pub struct DatabricksMetrics {
     // -- Request metrics --
-    /// Total HTTP requests issued (including retries).
+    /// Total logical operations initiated (each `execute_sql_statement`,
+    /// `get_sql_statement_status`, or `fetch_chunk_data` call counts as one).
+    /// Retries within an operation are tracked separately by `retries_total`.
     pub requests_total: AtomicU64,
-    /// Total HTTP retries performed.
+    /// Total HTTP retries performed across all operations.
     pub retries_total: AtomicU64,
     /// Total non-retryable (permanent) errors detected.
     pub permanent_errors_total: AtomicU64,
-    /// Current number of in-flight HTTP requests (gauge, can go up and down).
+    /// Current number of in-progress operations (gauge, can go up and down).
+    /// Includes time spent waiting for a concurrency permit.
     pub inflight_requests: AtomicU64,
 
     // -- Statement metrics --

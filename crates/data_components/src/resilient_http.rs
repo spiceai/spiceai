@@ -180,6 +180,9 @@ where
             }
             Err(error) => {
                 let Some(reason) = retry_reason_from_error(&error) else {
+                    if permit.is_some() {
+                        telemetry::dec_connector_inflight_requests(&dimensions);
+                    }
                     return Err(error);
                 };
 

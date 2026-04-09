@@ -411,31 +411,38 @@ async fn create_token_provider_for_catalog(
     }
 }
 
-fn build_sql_warehouse_config(params: &Parameters) -> SqlWarehouseConfig {
+pub fn build_sql_warehouse_config(params: &Parameters) -> SqlWarehouseConfig {
     let mut config = SqlWarehouseConfig::default();
 
     if let Some(v) = params.get("max_concurrent_requests").expose().ok() {
-        if let Ok(n) = v.parse::<usize>() {
-            config.max_concurrent_requests = n;
+        match v.parse::<usize>() {
+            Ok(n) => config.max_concurrent_requests = n,
+            Err(e) => tracing::warn!(parameter = "max_concurrent_requests", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default"),
         }
     }
     if let Some(v) = params.get("http_max_retries").expose().ok() {
-        if let Ok(n) = v.parse::<usize>() {
-            config.http_max_retries = n;
+        match v.parse::<usize>() {
+            Ok(n) => config.http_max_retries = n,
+            Err(e) => tracing::warn!(parameter = "http_max_retries", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default"),
         }
     }
     if let Some(v) = params.get("backoff_method").expose().ok() {
-        if let Ok(m) = v.parse::<util::retry_strategy::BackoffMethod>() {
-            config.backoff_method = m;
+        match v.parse::<util::retry_strategy::BackoffMethod>() {
+            Ok(m) => config.backoff_method = m,
+            Err(e) => tracing::warn!(parameter = "backoff_method", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default"),
         }
     }
     if let Some(v) = params.get("statement_max_retries").expose().ok() {
-        if let Ok(n) = v.parse::<usize>() {
-            config.statement_max_retries = n;
+        match v.parse::<usize>() {
+            Ok(n) => config.statement_max_retries = n,
+            Err(e) => tracing::warn!(parameter = "statement_max_retries", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default"),
         }
     }
     if let Some(v) = params.get("disable_on_permanent_error").expose().ok() {
-        config.disable_on_permanent_error = v != "false";
+        match v.parse::<bool>() {
+            Ok(b) => config.disable_on_permanent_error = b,
+            Err(e) => tracing::warn!(parameter = "disable_on_permanent_error", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default"),
+        }
     }
 
     config

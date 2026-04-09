@@ -39,6 +39,7 @@ use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
 use runtime::Runtime;
 use runtime::catalogconnector::{CatalogConnector, Error as CatalogError, Result as CatalogResult};
+use runtime::catalogconnector::databricks::build_sql_warehouse_config;
 use runtime::component::ComponentInitialization;
 use runtime::component::ComponentType;
 use runtime::component::catalog::Catalog;
@@ -267,11 +268,13 @@ impl Databricks {
                 .ok()
                 .map(Arc::new);
 
+                let config = build_sql_warehouse_config(&params);
+
                 let read_provider = DatabricksSqlWarehouse::with_config_and_semaphore(
                     endpoint,
                     sql_warehouse_id,
                     token_provider,
-                    sql_warehouse::SqlWarehouseConfig::default(),
+                    config,
                     shared_semaphore,
                 )
                 .context(UnableToConstructDatabricksSqlWarehouseSnafu)?;
@@ -634,18 +637,11 @@ impl Databricks {
                 );
             }
             Err(e) => {
-                tracing::error!(
+                tracing::warn!(
                     table = %full_name,
                     error = %e,
-                    "Failed to check Unity Catalog permissions"
+                    "Failed to check Unity Catalog permissions; proceeding without validation"
                 );
-                return Err(DataConnectorError::InsufficientPermissions {
-                    dataconnector: "databricks".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: Box::new(Error::InsufficientPermissions {
-                        table_name: full_name,
-                    }),
-                });
             }
         }
 
@@ -735,10 +731,17 @@ impl DataConnectorFactory for DatabricksFactory {
                         .ok()
                         .unwrap_or_default();
                     if !endpoint.is_empty() && !warehouse_id.is_empty() {
+                        let max_concurrent = params
+                            .parameters
+                            .get("max_concurrent_requests")
+                            .expose()
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS);
                         Some(self.get_or_create_semaphore(
                             endpoint,
                             warehouse_id,
-                            DEFAULT_MAX_CONCURRENT_REQUESTS,
+                            max_concurrent,
                         ))
                     } else {
                         None
