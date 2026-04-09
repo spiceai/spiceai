@@ -280,13 +280,19 @@ impl SqlWarehouseApi {
         match self.get_schema_from_information_schema(&token, table).await {
             Ok(schema) => return Ok(schema),
             Err(
-                Error::TableSchemaNotRegistered { .. }
-                | Error::NoColumnsInDataset { .. }
-                | Error::QueryFailure { .. },
+                Error::TableSchemaNotRegistered { .. } | Error::NoColumnsInDataset { .. },
             ) => {
                 tracing::warn!(
                     table = %table,
                     "information_schema.columns has no metadata for this table, falling back to DESCRIBE TABLE. Column nullability will default to nullable."
+                );
+            }
+            Err(Error::QueryFailure { ref message })
+                if message.contains("UNSUPPORTED_DATA_SOURCE") =>
+            {
+                tracing::warn!(
+                    table = %table,
+                    "information_schema query returned UNSUPPORTED_DATA_SOURCE, falling back to DESCRIBE TABLE. Column nullability will default to nullable."
                 );
             }
             Err(e) => return Err(e),
@@ -2319,6 +2325,47 @@ mod tests {
             matches!(&err, Error::QueryFailure { message } if message.contains("UNRESOLVED_COLUMN")),
             "unexpected error: {err}"
         );
+    }
+
+    /// Regression test: tables backed by unsupported data sources (e.g.
+    /// Lakehouse Federation foreign tables) cause `information_schema`
+    /// queries to fail with `UNSUPPORTED_DATA_SOURCE`. The schema fetch
+    /// must fall back to `DESCRIBE TABLE` instead of surfacing the error.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_get_schema_falls_back_to_describe_on_unsupported_data_source() {
+        let unsupported_response = json!({
+            "status": {
+                "state": "FAILED",
+                "error": {
+                    "message": "[UNSUPPORTED_DATA_SOURCE] The input query contains unsupported data source(s). Only csv, json, avro, delta, kafka, parquet, orc, text, unity_catalog, binaryFile, xml, excel, simplescan, iceberg data sources are supported on Databricks SQL, and only csv, json, avro, delta, kafka, parquet, orc, text, unity_catalog, binaryFile, xml, excel, simplescan, iceberg data sources are allowed to run DML on Databricks SQL. SQLSTATE: 0A000"
+                }
+            },
+            "statement_id": "stmt-1"
+        });
+        // DESCRIBE TABLE succeeds as fallback.
+        let describe_response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "stmt-2",
+            "result": {
+                "data_array": [
+                    ["id", "int", ""],
+                    ["name", "string", ""]
+                ]
+            }
+        });
+
+        let port =
+            start_mock_server(vec![unsupported_response, describe_response], json!({})).await;
+        let api = create_test_api(port);
+        let table = TableReference::full("catalog", "schema", "foreign_table");
+
+        let schema = api
+            .get_schema(&table)
+            .await
+            .expect("should fall back to DESCRIBE TABLE on UNSUPPORTED_DATA_SOURCE");
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "name");
     }
 
     /// Schema parsed from `full_data_type` column values matching a real
