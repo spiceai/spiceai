@@ -941,12 +941,31 @@ async fn initialize_partition_metadata(
             schema_name.to_string(),
             table_name.to_string(),
         );
+
+        // Initialize partition metadata in BOTH partition managers:
+        //
+        // - `federated_partition_manager`: used by `forward_partitioned_batches` to route
+        //   DoPut INSERT data to the correct executor during writes.
+        //
+        // - `accelerations_partition_manager`: used by `ExecutorRegistry`'s
+        //   `PartitionedTableScanRewrite` analyzer rule to produce partition-filtered
+        //   executor scans during queries. Without this, the rule falls back to a single
+        //   unfiltered executor scan, and the `FederatedPartitionProvider` rule (which
+        //   checks `federated_partition_manager`) also fires and produces N unfiltered
+        //   scans — resulting in N× data duplication on query.
         if let Err(error) = registry
             .federated_partition_manager()
             .initialize_metadata(&table_ref, vec![expr_sql.clone()])
             .await
         {
-            tracing::warn!(table = %table_ref, error = %error, "Failed to initialize partition metadata for table");
+            tracing::warn!(table = %table_ref, error = %error, "Failed to initialize federated partition metadata for table");
+        }
+        if let Err(error) = registry
+            .accelerations_partition_manager()
+            .initialize_metadata(&table_ref, vec![expr_sql.clone()])
+            .await
+        {
+            tracing::warn!(table = %table_ref, error = %error, "Failed to initialize accelerations partition metadata for table");
         }
     }
 }

@@ -2869,9 +2869,17 @@ async fn resolve_table_partition_expr(
 
     let Some(expr_string) = expr_string.or(provider_expr_string).or_else(|| {
         executor_registry.and_then(|registry| {
+            // Check both partition managers — write-through accelerated tables store
+            // metadata in accelerations_partition_manager, while non-accelerated
+            // federated tables use federated_partition_manager.
             registry
-                .federated_partition_manager()
+                .accelerations_partition_manager()
                 .get_cached_table_metadata(table_reference)
+                .or_else(|| {
+                    registry
+                        .federated_partition_manager()
+                        .get_cached_table_metadata(table_reference)
+                })
                 .and_then(|metadata| metadata.partition_expressions.first().cloned())
         })
     }) else {
@@ -2881,15 +2889,29 @@ async fn resolve_table_partition_expr(
     // Resolve auto-generated labels (e.g. "expr0") from partition manager metadata.
     if let Some(Ok(idx)) = expr_string.strip_prefix("expr").map(str::parse::<usize>)
         && let Some(executor_registry) = executor_registry
-        && let Some(metadata) = executor_registry
-            .federated_partition_manager()
+    {
+        // Check accelerations_partition_manager first (for write-through accelerated tables),
+        // then fall back to federated_partition_manager.
+        let metadata = executor_registry
+            .accelerations_partition_manager()
             .get_table_metadata(table_reference)
             .await
             .boxed()
-            .map_err(DataFusionError::External)?
-        && let Some(original) = metadata.partition_expressions.get(idx)
-    {
-        return Ok(Some(original.clone()));
+            .map_err(DataFusionError::External)?;
+        let metadata = match metadata {
+            Some(m) => Some(m),
+            None => executor_registry
+                .federated_partition_manager()
+                .get_table_metadata(table_reference)
+                .await
+                .boxed()
+                .map_err(DataFusionError::External)?,
+        };
+        if let Some(metadata) = metadata
+            && let Some(original) = metadata.partition_expressions.get(idx)
+        {
+            return Ok(Some(original.clone()));
+        }
     }
 
     Ok(Some(expr_string))

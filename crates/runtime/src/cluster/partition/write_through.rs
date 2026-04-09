@@ -335,6 +335,10 @@ pub(crate) async fn forward_partitioned_batches(
     .await?;
 
     let partition_manager = executor_registry.federated_partition_manager();
+    // Also sync partition assignments to the accelerations partition manager so that
+    // query-time PartitionedTableScanRewrite (which uses accelerations_partition_manager)
+    // can produce partition-filtered executor scans for accelerated tables.
+    let accel_partition_manager = executor_registry.accelerations_partition_manager();
 
     // Route each batch through partition filters to the appropriate executor.
     let mut routing_error: Option<Error> = None;
@@ -354,6 +358,7 @@ pub(crate) async fn forward_partitioned_batches(
             raw_partition_by,
             &mut partitions_by_executor,
             &partition_manager,
+            Some(&accel_partition_manager),
             path,
         )
         .await
@@ -412,6 +417,10 @@ async fn route_batch_and_assign_unseen(
     // For each executor, the PartitionValue boolean expressions it currently has.
     partitions_by_executor: &mut HashMap<String, Vec<Expr>>,
     partition_manager: &Arc<PartitionManager>,
+    // Optional second partition manager to sync assignments to. Used for write-through
+    // accelerated tables where partition assignments must be visible to both the write
+    // path (federated_partition_manager) and the query path (accelerations_partition_manager).
+    sync_partition_manager: Option<&Arc<PartitionManager>>,
     path: &TableReference,
 ) -> Result<()> {
     // Partition rows by executor filter, collecting (executor_id, batch) pairs
@@ -487,6 +496,19 @@ async fn route_batch_and_assign_unseen(
         .map_err(|source| Error::PersistAssignment {
             source: Box::new(source),
         })?;
+
+    // Sync to the accelerations partition manager so the query-time
+    // PartitionedTableScanRewrite (which uses accelerations_partition_manager)
+    // can produce partition-filtered executor scans.
+    if let Some(sync_pm) = sync_partition_manager {
+        if let Err(error) = sync_pm.add_and_assign_partitions(path, &assignments).await {
+            tracing::warn!(
+                table = %path,
+                error = %error,
+                "Failed to sync partition assignments to accelerations partition manager"
+            );
+        }
+    }
 
     // Update in-memory filters and forward rows for each partition.
     for ((scalar_values, _partition_value, sub_batch), executor_id) in
