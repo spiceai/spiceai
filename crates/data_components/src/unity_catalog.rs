@@ -23,7 +23,7 @@ use url::Url;
 
 use token_provider::TokenProvider;
 
-use crate::resilient_http::{enable_supported_compression, send_request_with_retry};
+use crate::resilient_http::{configure_client_builder, send_request_with_retry};
 
 pub mod provider;
 
@@ -116,10 +116,8 @@ impl UnityCatalog {
             };
         }
 
-        let client = enable_supported_compression(reqwest::Client::builder())
+        let client = configure_client_builder(reqwest::Client::builder())
             .user_agent(util::spiceai_user_agent())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
             .build()
             .context(UnableToCreateHttpClientSnafu)?;
 

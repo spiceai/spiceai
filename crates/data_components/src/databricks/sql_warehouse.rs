@@ -45,14 +45,17 @@ use std::{
     sync::Arc,
 };
 use token_provider::TokenProvider;
+use tokio::sync::Semaphore;
 use util::{
     fibonacci_backoff::{Backoff, FibonacciBackoffBuilder},
     format_datafusion_error,
 };
 
-use crate::resilient_http::{enable_supported_compression, send_request_with_retry};
+use crate::resilient_http::{configure_client_builder, send_request_with_retry};
 
 mod datatypes;
+
+const SQL_WAREHOUSE_MAX_IN_FLIGHT_REQUESTS: usize = 8;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -102,6 +105,11 @@ pub enum Error {
 
     #[snafu(display("JSON parsing failed: {}", format_reqwest_error_chain(source)))]
     JsonParsingFailed { source: reqwest::Error },
+
+    #[snafu(display(
+        "Internal error: failed to acquire a Databricks SQL Warehouse request permit: {source}"
+    ))]
+    RequestPermitFailed { source: tokio::sync::AcquireError },
 
     #[snafu(display("Missing JSON field: {field}"))]
     MissingJsonField { field: String },
@@ -243,6 +251,7 @@ impl FromStr for ResponseStatus {
 struct SqlWarehouseApi {
     client: Client,
     base_url: String,
+    request_semaphore: Arc<Semaphore>,
     sql_warehouse_id: String,
     token_provider: Arc<dyn TokenProvider>,
 }
@@ -253,19 +262,25 @@ impl SqlWarehouseApi {
         sql_warehouse_id: &str,
         token_provider: Arc<dyn TokenProvider>,
     ) -> Result<Self, Error> {
-        let client = enable_supported_compression(ClientBuilder::new())
+        let client = configure_client_builder(ClientBuilder::new())
             .user_agent(super::user_agent())
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(30))
             .build()
             .context(ClientBuildFailedSnafu)?;
 
         Ok(Self {
             client,
             base_url: format!("https://{host}"),
+            request_semaphore: Arc::new(Semaphore::new(SQL_WAREHOUSE_MAX_IN_FLIGHT_REQUESTS)),
             sql_warehouse_id: sql_warehouse_id.to_string(),
             token_provider,
         })
+    }
+
+    async fn acquire_request_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Error> {
+        Arc::clone(&self.request_semaphore)
+            .acquire_owned()
+            .await
+            .context(RequestPermitFailedSnafu)
     }
 
     async fn get_schema(&self, table: &TableReference) -> Result<SchemaRef, Error> {
@@ -383,6 +398,7 @@ impl SqlWarehouseApi {
 
     async fn execute_sql_statement(&self, token: &str, payload: &Value) -> Result<Value, Error> {
         let url = format!("{}/api/2.0/sql/statements/", self.base_url);
+        let _permit = self.acquire_request_permit().await?;
         send_request_with_retry("Databricks SQL Warehouse", "execute SQL statement", || {
             self.client.post(&url).bearer_auth(token).json(payload)
         })
@@ -401,6 +417,7 @@ impl SqlWarehouseApi {
         statement_id: &str,
     ) -> Result<Value, Error> {
         let url = format!("{}/api/2.0/sql/statements/{statement_id}", self.base_url);
+        let _permit = self.acquire_request_permit().await?;
         send_request_with_retry(
             "Databricks SQL Warehouse",
             "poll SQL statement status",
@@ -460,6 +477,11 @@ impl SqlWarehouseApi {
                 let next_link = match link.next_chunk_internal_link {
                     Some(path) => {
                         let url = format!("{}{path}", api.base_url);
+                        let permit = match api.acquire_request_permit().await {
+                            Ok(permit) => permit,
+                            Err(error) => return Some((Err(error), None)),
+                        };
+
                         match send_request_with_retry(
                             "Databricks SQL Warehouse",
                             "fetch next external chunk link",
@@ -475,7 +497,10 @@ impl SqlWarehouseApi {
                                 .context(JsonParsingFailedSnafu)
                                 .and_then(Self::extract_external_links)
                             {
-                                Ok(next) => next,
+                                Ok(next) => {
+                                    drop(permit);
+                                    next
+                                }
                                 Err(e) => return Some((Err(e), None)),
                             },
                             Err(e) => return Some((Err(e), None)),
@@ -548,6 +573,7 @@ impl SqlWarehouseApi {
     }
 
     async fn fetch_chunk_data(&self, url: &str) -> Result<bytes::Bytes, Error> {
+        let _permit = self.acquire_request_permit().await?;
         send_request_with_retry(
             "Databricks SQL Warehouse",
             "fetch statement result chunk",
@@ -1567,15 +1593,95 @@ mod tests {
     }
 
     fn create_test_api(port: u16) -> SqlWarehouseApi {
-        let client = enable_supported_compression(ClientBuilder::new())
+        create_test_api_with_request_limit(port, SQL_WAREHOUSE_MAX_IN_FLIGHT_REQUESTS)
+    }
+
+    fn create_test_api_with_request_limit(
+        port: u16,
+        max_in_flight_requests: usize,
+    ) -> SqlWarehouseApi {
+        let client = configure_client_builder(ClientBuilder::new())
             .build()
             .expect("should build client");
         SqlWarehouseApi {
             client,
             base_url: format!("http://127.0.0.1:{port}"),
+            request_semaphore: Arc::new(Semaphore::new(max_in_flight_requests)),
             sql_warehouse_id: "test-warehouse".to_string(),
             token_provider: Arc::new(StaticTokenProvider("test-token".to_string())),
         }
+    }
+
+    async fn start_blocking_mock_http_server(
+        response: MockHttpResponse,
+    ) -> (
+        u16,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        Arc<Semaphore>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind to a port");
+        let port = listener
+            .local_addr()
+            .expect("should have an address")
+            .port();
+        let response = Arc::new(response);
+        let max_active_requests = Arc::new(AtomicUsize::new(0));
+        let active_requests = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(Semaphore::new(0));
+
+        let max_active_requests_for_server = Arc::clone(&max_active_requests);
+        let active_requests_for_server = Arc::clone(&active_requests);
+        let gate_for_server = Arc::clone(&gate);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let response = Arc::clone(&response);
+                let started_tx = started_tx.clone();
+                let max_active_requests = Arc::clone(&max_active_requests_for_server);
+                let active_requests = Arc::clone(&active_requests_for_server);
+                let gate = Arc::clone(&gate_for_server);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+
+                    let active = active_requests.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active_requests.fetch_max(active, Ordering::SeqCst);
+                    let _ = started_tx.send(());
+
+                    let permit = gate.acquire().await.expect("gate should remain open");
+                    drop(permit);
+
+                    let mut http_response = format!(
+                        "HTTP/1.1 {}\r\nContent-Length: {}\r\n",
+                        response.status_line,
+                        response.body.len()
+                    );
+                    for (header_name, header_value) in &response.headers {
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut http_response,
+                            format_args!("{header_name}: {header_value}\r\n"),
+                        );
+                    }
+                    http_response.push_str("\r\n");
+                    http_response.push_str(&response.body);
+
+                    let _ = stream.write_all(http_response.as_bytes()).await;
+                    active_requests.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+
+        (port, max_active_requests, started_rx, gate)
     }
 
     fn pending_response() -> Value {
@@ -1867,6 +1973,83 @@ mod tests {
             2,
             "expected the SQL statement request to be retried once"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_execute_sql_statement_limits_concurrent_requests() {
+        use std::sync::atomic::Ordering;
+
+        let (port, max_active_requests, mut started_rx, gate) =
+            start_blocking_mock_http_server(MockHttpResponse {
+                status_line: "200 OK",
+                headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                body: json!({
+                    "status": { "state": "SUCCEEDED" },
+                    "statement_id": "stmt-1",
+                    "result": { "data_array": [] }
+                })
+                .to_string(),
+            })
+            .await;
+
+        let api = Arc::new(create_test_api_with_request_limit(port, 1));
+
+        let first_payload = json!({"statement": "SELECT 1"});
+        let first_api = Arc::clone(&api);
+        let first = tokio::spawn(async move {
+            first_api
+                .execute_sql_statement("token", &first_payload)
+                .await
+        });
+
+        started_rx
+            .recv()
+            .await
+            .expect("the first request should reach the server");
+
+        let second_payload = json!({"statement": "SELECT 2"});
+        let second_api = Arc::clone(&api);
+        let second = tokio::spawn(async move {
+            second_api
+                .execute_sql_statement("token", &second_payload)
+                .await
+        });
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            max_active_requests.load(Ordering::SeqCst),
+            1,
+            "only one Databricks HTTP request should be in flight at a time"
+        );
+        assert!(
+            started_rx.try_recv().is_err(),
+            "the second request should wait for a permit before reaching the server"
+        );
+
+        gate.add_permits(1);
+
+        started_rx
+            .recv()
+            .await
+            .expect("the second request should start after the first finishes");
+
+        gate.add_permits(1);
+
+        let first_response = first
+            .await
+            .expect("the first task should join")
+            .expect("the first request should succeed");
+        let second_response = second
+            .await
+            .expect("the second task should join")
+            .expect("the second request should succeed");
+
+        assert_eq!(first_response["status"]["state"], "SUCCEEDED");
+        assert_eq!(second_response["status"]["state"], "SUCCEEDED");
+        assert_eq!(max_active_requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

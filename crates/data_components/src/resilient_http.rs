@@ -21,6 +21,11 @@ use reqwest::{
 use std::time::{Duration, SystemTime};
 use util::retry_strategy::{Backoff, BackoffMethod, RetryBackoffBuilder};
 
+const DEFAULT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_HTTP_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+const DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 16;
 const MAX_HTTP_RETRIES: usize = 6;
 const MAX_HTTP_BACKOFF: Duration = Duration::from_secs(300);
 const RETRY_AFTER_MS_HEADER: &str = "retry-after-ms";
@@ -137,6 +142,15 @@ where
 
 pub fn enable_supported_compression(builder: ClientBuilder) -> ClientBuilder {
     builder.gzip(true).brotli(true).zstd(true).deflate(true)
+}
+
+pub fn configure_client_builder(builder: ClientBuilder) -> ClientBuilder {
+    enable_supported_compression(builder)
+        .connect_timeout(DEFAULT_HTTP_CONNECT_TIMEOUT)
+        .timeout(DEFAULT_HTTP_REQUEST_TIMEOUT)
+        .pool_idle_timeout(DEFAULT_HTTP_POOL_IDLE_TIMEOUT)
+        .pool_max_idle_per_host(DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST)
+        .tcp_keepalive(DEFAULT_HTTP_TCP_KEEPALIVE)
 }
 
 async fn drain_response_body(

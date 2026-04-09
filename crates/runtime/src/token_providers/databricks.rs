@@ -15,7 +15,7 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use data_components::resilient_http::{enable_supported_compression, send_request_with_retry};
+use data_components::resilient_http::{configure_client_builder, send_request_with_retry};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use snafu::prelude::*;
@@ -77,12 +77,16 @@ impl DatabricksM2MTokenProvider {
         client_id: String,
         client_secret: SecretString,
     ) -> Result<Self, Error> {
+        let client = build_m2m_token_client().map_err(|e| Error::UnableToGetToken {
+            source: Box::new(e),
+        })?;
+
         // initial fetch
         let TokenResponse {
             access_token,
             expires_in,
             ..
-        } = get_m2m_access_token(endpoint.clone(), client_id.clone(), client_secret.clone())
+        } = get_m2m_access_token(&client, &endpoint, &client_id, &client_secret)
             .await
             .map_err(|e| Error::UnableToGetToken { source: e })?;
 
@@ -93,6 +97,7 @@ impl DatabricksM2MTokenProvider {
         let cloned_client_id = client_id.clone();
         let cloned_endpoint = endpoint.clone();
         let cloned_tx = tx;
+        let refresh_client = client.clone();
 
         let secret = client_secret.clone();
 
@@ -108,9 +113,10 @@ impl DatabricksM2MTokenProvider {
                 sleep(next_wait).await;
 
                 match get_m2m_access_token(
-                    cloned_endpoint.clone(),
-                    cloned_client_id.clone(),
-                    secret.clone(),
+                    &refresh_client,
+                    &cloned_endpoint,
+                    &cloned_client_id,
+                    &secret,
                 )
                 .await
                 {
@@ -203,22 +209,17 @@ impl fmt::Debug for TokenResponse {
 }
 
 async fn get_m2m_access_token(
-    databricks_endpoint: String,
-    client_id: String,
-    client_secret: SecretString,
+    client: &reqwest::Client,
+    databricks_endpoint: &str,
+    client_id: &str,
+    client_secret: &SecretString,
 ) -> Result<TokenResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let token_endpoint_url = databricks_token_endpoint_url(&databricks_endpoint);
-
-    let client = enable_supported_compression(reqwest::Client::builder())
-        .user_agent(util::spiceai_user_agent())
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .build()?;
+    let token_endpoint_url = databricks_token_endpoint_url(databricks_endpoint);
 
     let response = send_request_with_retry("Databricks", "request M2M access token", || {
         client
             .post(&token_endpoint_url)
-            .basic_auth(client_id.as_str(), Some(client_secret.expose_secret()))
+            .basic_auth(client_id, Some(client_secret.expose_secret()))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .form(&[("grant_type", "client_credentials"), ("scope", "all-apis")])
     })
@@ -238,6 +239,12 @@ async fn get_m2m_access_token(
     );
 
     Ok(token_response)
+}
+
+fn build_m2m_token_client() -> Result<reqwest::Client, reqwest::Error> {
+    configure_client_builder(reqwest::Client::builder())
+        .user_agent(util::spiceai_user_agent())
+        .build()
 }
 
 fn databricks_token_endpoint_url(databricks_endpoint: &str) -> String {
@@ -641,10 +648,13 @@ mod tests {
         ])
         .await;
 
+        let client = build_m2m_token_client().expect("should build token client");
+
         let response = get_m2m_access_token(
-            endpoint,
-            "client-id".to_string(),
-            SecretString::from("client-secret"),
+            &client,
+            &endpoint,
+            "client-id",
+            &SecretString::from("client-secret"),
         )
         .await
         .expect("token request should succeed after retrying the rate-limited response");
@@ -661,10 +671,13 @@ mod tests {
         ])
         .await;
 
+        let client = build_m2m_token_client().expect("should build token client");
+
         let response = get_m2m_access_token(
-            endpoint,
-            "client-id".to_string(),
-            SecretString::from("client-secret"),
+            &client,
+            &endpoint,
+            "client-id",
+            &SecretString::from("client-secret"),
         )
         .await
         .expect("token request should succeed after retrying the transient server error");
@@ -682,10 +695,13 @@ mod tests {
             )])
             .await;
 
+        let client = build_m2m_token_client().expect("should build token client");
+
         let response = get_m2m_access_token(
-            endpoint,
-            "client-id".to_string(),
-            SecretString::from("client-secret"),
+            &client,
+            &endpoint,
+            "client-id",
+            &SecretString::from("client-secret"),
         )
         .await
         .expect("token request should succeed");
