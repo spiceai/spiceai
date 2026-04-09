@@ -412,6 +412,7 @@ impl UCTable {
 pub enum UCTableType {
     Managed,
     External,
+    Foreign,
     View,
     MaterializedView,
     StreamingTable,
@@ -425,7 +426,7 @@ impl UCTableType {
     pub const fn is_queryable(self) -> bool {
         matches!(
             self,
-            Self::Managed | Self::External | Self::MaterializedView
+            Self::Managed | Self::External | Self::Foreign | Self::MaterializedView
         )
     }
 }
@@ -435,6 +436,7 @@ impl From<&str> for UCTableType {
         match s {
             "MANAGED" => Self::Managed,
             "EXTERNAL" => Self::External,
+            "FOREIGN" => Self::Foreign,
             "VIEW" => Self::View,
             "MATERIALIZED_VIEW" => Self::MaterializedView,
             "STREAMING_TABLE" => Self::StreamingTable,
