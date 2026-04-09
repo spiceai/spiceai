@@ -664,7 +664,8 @@ impl Databricks {
 /// Default maximum concurrent requests to the SQL Warehouse API.
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
 
-type SemaphoreRegistry = Arc<parking_lot::Mutex<HashMap<(String, String), (Arc<Semaphore>, usize)>>>;
+type SemaphoreRegistry =
+    Arc<parking_lot::Mutex<HashMap<(String, String), (Arc<Semaphore>, usize)>>>;
 
 #[derive(Default, Clone)]
 pub struct DatabricksFactory {
