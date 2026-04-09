@@ -63,6 +63,7 @@ The connector checks each table's type against Unity Catalog metadata before att
 | ------------------- | --------- | -------------------------------------- |
 | `MANAGED`           | Yes       | Standard Delta tables                  |
 | `EXTERNAL`          | Yes       | Tables with external storage locations |
+| `FOREIGN`           | Yes       | Lakehouse Federation foreign tables    |
 | `MATERIALIZED_VIEW` | Yes       | Materialized views                     |
 | `VIEW`              | No        | Skipped with a debug log               |
 | `STREAMING_TABLE`   | No        | Skipped with a debug log               |

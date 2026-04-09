@@ -191,7 +191,8 @@ impl UnityCatalog {
 
     pub async fn get_table(&self, table_reference: &TableReference) -> Result<Option<UCTable>> {
         let table_name = table_reference.to_string();
-        let path = format!("/api/2.1/unity-catalog/tables/{table_name}");
+        let encoded = Self::encode_uc_name(&table_name);
+        let path = format!("/api/2.1/unity-catalog/tables/{encoded}");
         async {
             let response = self.send_get_with_retry("get table", &path).await?;
 
@@ -312,7 +313,8 @@ impl UnityCatalog {
         &self,
         full_name: &str,
     ) -> Result<Option<UCPermissionsEnvelope>> {
-        let path = format!("/api/2.1/unity-catalog/effective-permissions/table/{full_name}");
+        let encoded = Self::encode_uc_name(full_name);
+        let path = format!("/api/2.1/unity-catalog/effective-permissions/table/{encoded}");
         async {
             let response = self
                 .send_get_with_retry("get effective permissions", &path)
@@ -359,6 +361,24 @@ impl UnityCatalog {
         send_request_with_retry("Unity Catalog", operation, || self.get_req(path))
             .await
             .context(ConnectionSnafu)
+    }
+
+    /// Percent-encodes each dot-separated segment of a UC name individually.
+    ///
+    /// UC table names are `catalog.schema.table` where dots are separators.
+    /// Each segment is encoded but dots are preserved so the API receives
+    /// the correct path structure.
+    fn encode_uc_name(name: &str) -> String {
+        name.split('.')
+            .map(|segment| {
+                percent_encoding::utf8_percent_encode(
+                    segment,
+                    percent_encoding::NON_ALPHANUMERIC,
+                )
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(".")
     }
 }
 

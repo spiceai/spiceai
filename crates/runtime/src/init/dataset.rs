@@ -42,7 +42,7 @@ use crate::{
         AccelerationSource, validate_cayenne_snapshot_consistency, validate_snapshot_paths,
     },
     dataconnector::{
-        self, ConnectorComponent, DataConnector, DataConnectorError, ODBC_DATACONNECTOR,
+        self, ConnectorComponent, DataConnector, ODBC_DATACONNECTOR,
         deferred::DeferredConnector,
         localpod::{LOCALPOD_DATACONNECTOR, LocalPodConnector},
         parameters::ConnectorParamsBuilder,
@@ -452,11 +452,7 @@ impl Runtime {
                         }
                         .fail();
                     }
-                    if let DataConnectorError::UnsupportedDataType { .. } = err {
-                        error_spaced!(spaced_tracer, "{}{err}", "");
-                    } else {
-                        warn_spaced!(spaced_tracer, "{}{err}", "");
-                    }
+                    warn_spaced!(spaced_tracer, "{}{err}", "");
                     return UnableToLoadDatasetConnectorSnafu {
                         dataset: ds.name.clone(),
                     }

@@ -711,6 +711,9 @@ impl SqlWarehouseApi {
                     Some(path) => {
                         let url = format!("{}{path}", api.base_url);
 
+                        if let Err(e) = api.check_permanently_disabled() {
+                            return Some((Err(e), None));
+                        }
                         api.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
                         api.metrics
                             .inflight_operations
