@@ -44,8 +44,8 @@ use crate::datafusion::DataFusion;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to refresh partition manager: {source}"))]
-    PartitionManagerRefresh {
+    #[snafu(display("Failed to refresh partition store: {source}"))]
+    PartitionStoreRefresh {
         source: crate::cluster::partition::store::Error,
     },
 
@@ -199,7 +199,7 @@ impl PartitionService {
         self.partition_store
             .refresh()
             .await
-            .context(PartitionManagerRefreshSnafu)?;
+            .context(PartitionStoreRefreshSnafu)?;
 
         let new_partitions = match timeout(
             self.config.discovery_timeout,
@@ -236,7 +236,7 @@ impl PartitionService {
         self.partition_store
             .refresh()
             .await
-            .context(PartitionManagerRefreshSnafu)?;
+            .context(PartitionStoreRefreshSnafu)?;
 
         let executor_ids = self.executor_registry.connected_executors().await;
         if executor_ids.is_empty() {
@@ -355,7 +355,7 @@ async fn refresh_state(
     partition_store
         .refresh()
         .await
-        .context(PartitionManagerRefreshSnafu)?;
+        .context(PartitionStoreRefreshSnafu)?;
 
     let executor_ids = executor_registry.connected_executors().await;
     let tables = partition_store
@@ -1373,6 +1373,157 @@ mod tests {
             .await
             .expect("get")
             .expect("exists");
+        assert!(metadata.partitions[0].is_assigned_to("exec1"));
+    }
+
+    /// Simulates the post-discovery partition assignment flow:
+    /// new partition values are added to the store, then assigned to executors.
+    /// Verifies that after the flow completes, partitions are present and assigned in the store.
+    #[tokio::test]
+    async fn test_new_partitions_discovered_and_assigned() {
+        let store = make_store();
+
+        // Initialize table with 2 existing assigned partitions.
+        setup_table(
+            &store,
+            "orders",
+            vec![
+                assigned_partition("date", "2024-01-01", "exec1"),
+                assigned_partition("date", "2024-01-02", "exec2"),
+            ],
+        )
+        .await;
+
+        // Simulate discovery finding 2 new partition values.
+        let new_partition_values = vec![
+            pv("date", "2024-01-03"),
+            pv("date", "2024-01-04"),
+        ];
+        let table = TableReference::parse_str("orders");
+
+        // Step 1: Add new partitions to the store (as unassigned).
+        add_partitions_with_retry(&store, &table, new_partition_values)
+            .await
+            .expect("add partitions");
+        store.refresh().await.expect("refresh");
+
+        // Verify: 4 partitions total, 2 new ones unassigned.
+        let metadata = store
+            .get_table_metadata(&table)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(metadata.partitions.len(), 4);
+        let unassigned_count = metadata.partitions.iter().filter(|p| !p.is_assigned()).count();
+        assert_eq!(unassigned_count, 2, "New partitions should be unassigned");
+
+        // Step 2: Assign unassigned partitions using the assignment algorithm.
+        let state = CycleState {
+            executor_ids: vec!["exec1".to_string(), "exec2".to_string()],
+            tables: vec!["orders".to_string()],
+        };
+        let config = AssignmentConfig::default();
+
+        let unassigned = find_unassigned_partitions_for_table(&store, &table);
+        assert_eq!(unassigned.len(), 2);
+
+        let assignments = assign_unassigned_partitions(unassigned, &state, &store, &config);
+        assert_eq!(assignments.len(), 2, "Both new partitions should be assigned");
+
+        // Step 3: Commit assignments to the store.
+        let result = commit_assignments(&store, assignments).await.expect("commit");
+        assert_eq!(result.committed.len(), 2);
+        assert!(result.failed.is_empty());
+
+        // Verify: all 4 partitions are now assigned in the store.
+        let metadata = store
+            .get_table_metadata(&table)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(metadata.partitions.len(), 4);
+        for p in &metadata.partitions {
+            assert!(
+                p.is_assigned(),
+                "Partition {:?} should be assigned",
+                p.partition_value
+            );
+        }
+    }
+
+    /// Verifies that new partitions are assigned with load balancing:
+    /// if exec1 already has 2 partitions and exec2 has 0, new partitions
+    /// should prefer exec2.
+    #[tokio::test]
+    async fn test_new_partitions_assigned_with_load_balancing() {
+        let store = make_store();
+
+        // exec1 has 2 partitions, exec2 has none.
+        setup_table(
+            &store,
+            "orders",
+            vec![
+                assigned_partition("date", "2024-01-01", "exec1"),
+                assigned_partition("date", "2024-01-02", "exec1"),
+            ],
+        )
+        .await;
+
+        // Add 1 new partition.
+        let table = TableReference::parse_str("orders");
+        add_partitions_with_retry(&store, &table, vec![pv("date", "2024-01-03")])
+            .await
+            .expect("add");
+        store.refresh().await.expect("refresh");
+
+        let state = CycleState {
+            executor_ids: vec!["exec1".to_string(), "exec2".to_string()],
+            tables: vec!["orders".to_string()],
+        };
+        let config = AssignmentConfig {
+            max_partitions_per_executor: 10,
+            ..Default::default()
+        };
+
+        let unassigned = find_unassigned_partitions_for_table(&store, &table);
+        let assignments = assign_unassigned_partitions(unassigned, &state, &store, &config);
+        assert_eq!(assignments.len(), 1);
+
+        // exec2 has lower load → should be preferred.
+        assert_eq!(
+            assignments[0].executor_id, "exec2",
+            "New partition should be assigned to the less-loaded executor"
+        );
+    }
+
+    /// Verifies that adding partitions that already exist is a no-op (idempotent).
+    #[tokio::test]
+    async fn test_add_partitions_idempotent() {
+        let store = make_store();
+        setup_table(
+            &store,
+            "orders",
+            vec![assigned_partition("date", "2024-01-01", "exec1")],
+        )
+        .await;
+
+        let table = TableReference::parse_str("orders");
+
+        // Try to add the same partition again.
+        add_partitions_with_retry(&store, &table, vec![pv("date", "2024-01-01")])
+            .await
+            .expect("should succeed (idempotent)");
+
+        let metadata = store
+            .get_table_metadata(&table)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(
+            metadata.partitions.len(),
+            1,
+            "Duplicate partition should not be added"
+        );
         assert!(metadata.partitions[0].is_assigned_to("exec1"));
     }
 }

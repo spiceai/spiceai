@@ -767,7 +767,7 @@ impl Runtime {
         Ok(())
     }
 
-    /// Returns the partition manager for accelerated table partition metadata (scheduler only).
+    /// Returns the partition store for accelerated table partition metadata (scheduler only).
     #[must_use]
     pub fn partition_store(&self) -> Option<Arc<PartitionStore>> {
         match self.distributed.as_ref() {

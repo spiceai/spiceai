@@ -219,7 +219,7 @@ impl PartitionManagementTask {
     }
 
     /// Underlying logic for a single management cycle.
-    /// Delegates to [`super::assignment::discover_and_assign_all_tables`].
+    /// Delegates to [`super::service::PartitionService::discover_and_assign_all`].
     async fn run_management_cycle(&self) -> Result<()> {
         let Some(service) = &self.df.partition_service else {
             tracing::warn!("Partition service not initialized, skipping management cycle");
