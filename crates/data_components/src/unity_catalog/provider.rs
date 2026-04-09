@@ -157,10 +157,9 @@ impl UnityCatalogSchemaProvider {
                 catalog_id: schema.catalog_name.clone(),
             })?;
 
-        let mut tables_map = HashMap::new();
+        // First pass: filter to queryable, included tables with valid references.
+        let mut candidates: Vec<(UCTable, TableReference)> = Vec::new();
         for table in tables {
-            let table_name = table.name.clone();
-
             if !table.is_queryable() {
                 tracing::debug!(
                     table = %table.full_name(),
@@ -170,13 +169,11 @@ impl UnityCatalogSchemaProvider {
                 continue;
             }
 
-            let table_reference = table_reference_creator(&table);
-
-            let Some(table_reference) = table_reference else {
+            let Some(table_reference) = table_reference_creator(&table) else {
                 continue;
             };
 
-            let schema_with_table = format!("{}.{}", schema.name, table_name);
+            let schema_with_table = format!("{}.{}", schema.name, table.name);
             tracing::debug!("Checking if table {} should be included", schema_with_table);
             if let Some(include) = &include
                 && !include.is_match(&schema_with_table)
@@ -185,31 +182,53 @@ impl UnityCatalogSchemaProvider {
                 continue;
             }
 
-            // Check permissions before attempting to create the table provider.
-            match client.get_effective_permissions(&table.full_name()).await {
-                Ok(Some(perms)) if !perms.has_read_permission() => {
-                    tracing::error!(
-                        table = %table.full_name(),
-                        "Skipping table: no SELECT privilege"
-                    );
-                    continue;
+            candidates.push((table, table_reference));
+        }
+
+        // Second pass: check permissions concurrently (bounded).
+        let max_concurrent_permission_checks = 5;
+        let permission_results: Vec<(UCTable, TableReference, bool)> =
+            futures::stream::iter(candidates.into_iter().map(|(table, table_ref)| {
+                let client = Arc::clone(&client);
+                async move {
+                    let has_permission =
+                        match client.get_effective_permissions(&table.full_name()).await {
+                            Ok(Some(perms)) if !perms.has_read_permission() => {
+                                tracing::error!(
+                                    table = %table.full_name(),
+                                    "Skipping table: no SELECT privilege"
+                                );
+                                false
+                            }
+                            Ok(None) => {
+                                tracing::error!(
+                                    table = %table.full_name(),
+                                    "Skipping table: table not found when checking permissions"
+                                );
+                                false
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    table = %table.full_name(),
+                                    error = %e,
+                                    "Failed to check permissions; skipping table"
+                                );
+                                false
+                            }
+                            Ok(Some(_)) => true,
+                        };
+                    (table, table_ref, has_permission)
                 }
-                Ok(None) => {
-                    tracing::error!(
-                        table = %table.full_name(),
-                        "Skipping table: table not found when checking permissions"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        table = %table.full_name(),
-                        error = %e,
-                        "Failed to check permissions; skipping table"
-                    );
-                    continue;
-                }
-                Ok(Some(_)) => {} // Has read permission, proceed.
+            }))
+            .buffer_unordered(max_concurrent_permission_checks)
+            .collect()
+            .await;
+
+        // Third pass: create table providers for permitted tables.
+        let mut tables_map = HashMap::new();
+        for (table, table_reference, has_permission) in permission_results {
+            if !has_permission {
+                continue;
             }
 
             let table_provider = match table_creator.table_provider(table_reference.clone()).await {
@@ -219,7 +238,7 @@ impl UnityCatalogSchemaProvider {
                     continue;
                 }
             };
-            tables_map.insert(table_name, table_provider);
+            tables_map.insert(table.name.clone(), table_provider);
         }
 
         Ok(Self {

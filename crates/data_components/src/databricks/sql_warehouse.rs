@@ -55,8 +55,7 @@ use util::{
 };
 
 use crate::resilient_http::{
-    configure_client_builder,
-    send_request_with_retry_and_concurrency_limit_with_counter,
+    configure_client_builder, send_request_with_retry_and_concurrency_limit_with_counter,
 };
 use tracing::Instrument;
 use util::retry_strategy::BackoffMethod;
@@ -1968,9 +1967,9 @@ mod tests {
         port: u16,
         max_in_flight_requests: usize,
     ) -> SqlWarehouseApi {
-        let client = configure_client_builder(ClientBuilder::new())
-            .build()
-            .expect("should build client");
+        // Build without connect/request timeouts so that `start_paused = true`
+        // tests don't race with tokio's auto-advance clock.
+        let client = ClientBuilder::new().build().expect("should build client");
         SqlWarehouseApi {
             client,
             base_url: format!("http://127.0.0.1:{port}"),

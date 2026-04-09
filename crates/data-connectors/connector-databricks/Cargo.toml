@@ -39,6 +39,7 @@ snafu.workspace = true
 token_provider = { path = "../../token_provider" }
 tokio.workspace = true
 tracing.workspace = true
+util = { path = "../../util" }
 
 [features]
 default = []

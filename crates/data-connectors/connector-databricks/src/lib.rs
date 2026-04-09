@@ -39,7 +39,6 @@ use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
 use runtime::Runtime;
 use runtime::catalogconnector::{CatalogConnector, Error as CatalogError, Result as CatalogResult};
-use runtime::catalogconnector::databricks::build_sql_warehouse_config;
 use runtime::component::ComponentInitialization;
 use runtime::component::ComponentType;
 use runtime::component::catalog::Catalog;
@@ -268,13 +267,13 @@ impl Databricks {
                 .ok()
                 .map(Arc::new);
 
-                let config = build_sql_warehouse_config(&params);
+let sql_warehouse_config = Self::build_sql_warehouse_config(&params);
 
                 let read_provider = DatabricksSqlWarehouse::with_config_and_semaphore(
                     endpoint,
                     sql_warehouse_id,
                     token_provider,
-                    config,
+sql_warehouse_config,
                     shared_semaphore,
                 )
                 .context(UnableToConstructDatabricksSqlWarehouseSnafu)?;
@@ -559,6 +558,47 @@ impl Databricks {
         Arc::clone(&self.read_provider)
     }
 
+    /// Builds a [`SqlWarehouseConfig`] from the connector parameters.
+    fn build_sql_warehouse_config(params: &Parameters) -> sql_warehouse::SqlWarehouseConfig {
+        let mut config = sql_warehouse::SqlWarehouseConfig::default();
+
+        if let Some(v) = params.get("max_concurrent_requests").expose().ok() {
+            if let Ok(n) = v.parse::<usize>() {
+                config.max_concurrent_requests = n;
+            }
+        }
+        if let Some(v) = params.get("http_max_retries").expose().ok() {
+            if let Ok(n) = v.parse::<usize>() {
+                config.http_max_retries = n;
+            }
+        }
+        if let Some(v) = params.get("backoff_method").expose().ok() {
+            if let Ok(m) = v.parse::<util::retry_strategy::BackoffMethod>() {
+                config.backoff_method = m;
+            }
+        }
+        if let Some(v) = params.get("statement_max_retries").expose().ok() {
+            if let Ok(n) = v.parse::<usize>() {
+                config.statement_max_retries = n;
+            }
+        }
+        if let Some(v) = params.get("disable_on_permanent_error").expose().ok() {
+            match v.parse::<bool>() {
+                Ok(b) => config.disable_on_permanent_error = b,
+                Err(source) => {
+                    tracing::error!(
+                        parameter = "disable_on_permanent_error",
+                        value = &v,
+                        %source,
+                        "Failed to parse Databricks SQL warehouse config parameter as a boolean"
+                    );
+                }
+            }
+        }
+
+        config
+    }
+
     /// Validates that a Unity Catalog table is of a supported type and that the
     /// current principal has read permissions on it.
     ///
@@ -642,6 +682,11 @@ impl Databricks {
                     error = %e,
                     "Failed to check Unity Catalog permissions; proceeding without validation"
                 );
+return Err(DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "databricks".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: Box::new(e),
+                });
             }
         }
 
@@ -737,6 +782,7 @@ impl DataConnectorFactory for DatabricksFactory {
                             .expose()
                             .ok()
                             .and_then(|v| v.parse::<usize>().ok())
+.filter(|&n| n > 0)
                             .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS);
                         Some(self.get_or_create_semaphore(
                             endpoint,

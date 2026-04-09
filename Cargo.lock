@@ -4033,6 +4033,7 @@ dependencies = [
  "token_provider",
  "tokio",
  "tracing",
+ "util",
 ]
 
 [[package]]
