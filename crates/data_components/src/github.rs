@@ -1040,10 +1040,10 @@ impl GithubRestClient {
         repo: &str,
     ) -> Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
         let mut refs = self
-            .fetch_refs_for_resource(owner, repo, "branches", "refs/heads/", None)
+            .fetch_refs_for_resource(owner, repo, "branches", "refs/heads/", None, None)
             .await?;
         refs.extend(
-            self.fetch_refs_for_resource(owner, repo, "tags", "refs/tags/", None)
+            self.fetch_refs_for_resource(owner, repo, "tags", "refs/tags/", None, None)
                 .await?,
         );
         refs.sort_unstable_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
@@ -1058,7 +1058,14 @@ impl GithubRestClient {
         max_refs: usize,
     ) -> Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
         let mut refs = self
-            .fetch_refs_for_resource(owner, repo, "branches", "refs/heads/", Some(max_refs))
+            .fetch_refs_for_resource(
+                owner,
+                repo,
+                "branches",
+                "refs/heads/",
+                Some(max_refs),
+                Some(max_refs),
+            )
             .await?;
         let remaining_refs = max_refs.saturating_sub(refs.len());
         if remaining_refs == 0 {
@@ -1068,8 +1075,15 @@ impl GithubRestClient {
         }
 
         refs.extend(
-            self.fetch_refs_for_resource(owner, repo, "tags", "refs/tags/", Some(remaining_refs))
-                .await?,
+            self.fetch_refs_for_resource(
+                owner,
+                repo,
+                "tags",
+                "refs/tags/",
+                Some(remaining_refs),
+                Some(max_refs),
+            )
+            .await?,
         );
         refs.sort_unstable_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
         refs.dedup_by(|left, right| left.qualified_name == right.qualified_name);
@@ -1157,6 +1171,7 @@ impl GithubRestClient {
         resource: &str,
         qualified_name_prefix: &str,
         max_refs: Option<usize>,
+        overall_limit: Option<usize>,
     ) -> Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
         if max_refs == Some(0) {
             return Ok(Vec::new());
@@ -1231,8 +1246,9 @@ impl GithubRestClient {
             if let Some(max_refs) = max_refs
                 && refs.len() + page_len > max_refs
             {
+                let reported_limit = overall_limit.unwrap_or(max_refs);
                 return Err(std::io::Error::other(format!(
-                    "Failed to retrieve GitHub refs for {owner}/{repo}: dynamic ref scans are limited to {max_refs} refs. Add a more selective ref predicate or use an exact ref = '<value>' filter."
+                    "Failed to retrieve GitHub refs for {owner}/{repo}: dynamic ref scans are limited to {reported_limit} refs. Add a more selective ref predicate or use an exact ref = '<value>' filter."
                 ))
                 .into());
             }
