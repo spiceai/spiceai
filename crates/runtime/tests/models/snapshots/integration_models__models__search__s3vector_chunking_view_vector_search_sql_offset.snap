@@ -9,7 +9,7 @@ expression: resp?
       48,
       50
     ],
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(2))": 0.796
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.796
   },
   {
     "id": 349,
@@ -17,7 +17,7 @@ expression: resp?
       103,
       109
     ],
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(2))": 0.785
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.785
   },
   {
     "id": 948,
@@ -25,7 +25,7 @@ expression: resp?
       61,
       94
     ],
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(2))": 0.556
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.556
   },
   {
     "id": 1277,
@@ -33,6 +33,6 @@ expression: resp?
       62,
       95
     ],
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(2))": 0.556
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.556
   }
 ]
