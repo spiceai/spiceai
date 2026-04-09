@@ -138,6 +138,25 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("sql_warehouse_id")
         .secret()
         .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'"),
+
+    // Connection / resilience tuning (sql_warehouse mode)
+    ParameterSpec::runtime("max_concurrent_requests")
+        .description("Maximum number of concurrent HTTP requests to the SQL Warehouse API.")
+        .default("8"),
+    ParameterSpec::runtime("http_max_retries")
+        .description("Maximum number of HTTP-level retries for transient failures (429, 5xx).")
+        .default("3"),
+    ParameterSpec::runtime("backoff_method")
+        .description("Backoff strategy for transient HTTP retries.")
+        .one_of(&["fibonacci", "exponential"])
+        .default("fibonacci"),
+    ParameterSpec::runtime("statement_max_retries")
+        .description("Maximum number of poll retries when waiting for async statement completion.")
+        .default("14"),
+    ParameterSpec::runtime("disable_on_permanent_error")
+        .description("When true, non-retryable errors (401, 403, 404) permanently disable the connector to prevent a thundering herd of failed requests.")
+        .default("true"),
+
     ParameterSpec::component("token")
         .secret()
         .description("The personal access token used to authenticate against the DataBricks API."),
