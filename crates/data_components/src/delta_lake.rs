@@ -20,7 +20,9 @@ use aws_sdk_credential_bridge;
 use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
+use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{DFSchema, exec_err};
+use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{
     DefaultParquetFileReaderFactory, ParquetAccessPlan, RowGroupAccess,
@@ -35,7 +37,9 @@ use datafusion::logical_expr::utils::conjunction;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, lit};
 use datafusion::parquet::arrow::arrow_reader::RowSelection;
 use datafusion::parquet::file::metadata::RowGroupMetaData;
+use datafusion::physical_plan::expressions::{CastExpr, Column};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
@@ -47,6 +51,7 @@ use delta_kernel::scan::ScanBuilder;
 use delta_kernel::scan::state::{DvInfo, Stats};
 use delta_kernel::schema::{DecimalType, PrimitiveType};
 use delta_kernel::snapshot::Snapshot;
+use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::{ExpressionRef, Predicate, SnapshotRef};
 use indexmap::IndexMap;
 use object_store::ObjectMeta;
@@ -99,6 +104,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct DeltaTableFactory {
     params: HashMap<String, SecretString>,
     io_runtime: Handle,
+    table_parquet_options: TableParquetOptions,
 }
 
 impl std::fmt::Debug for DeltaTableFactory {
@@ -112,7 +118,17 @@ impl std::fmt::Debug for DeltaTableFactory {
 impl DeltaTableFactory {
     #[must_use]
     pub fn new(params: HashMap<String, SecretString>, io_runtime: Handle) -> Self {
-        Self { params, io_runtime }
+        Self {
+            params,
+            io_runtime,
+            table_parquet_options: TableParquetOptions::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_table_parquet_options(mut self, opts: TableParquetOptions) -> Self {
+        self.table_parquet_options = opts;
+        self
     }
 }
 
@@ -123,8 +139,9 @@ impl Read for DeltaTableFactory {
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let delta_path = table_reference.table().to_string();
-        let delta: DeltaTable =
-            DeltaTable::from(delta_path, self.params.clone(), &self.io_runtime).boxed()?;
+        let delta: DeltaTable = DeltaTable::from(delta_path, self.params.clone(), &self.io_runtime)
+            .boxed()?
+            .with_table_parquet_options(self.table_parquet_options.clone());
         Ok(Arc::new(delta))
     }
 }
@@ -133,9 +150,16 @@ impl Read for DeltaTableFactory {
 pub struct DeltaTable {
     table_url: Url,
     engine: Arc<DefaultEngine<TokioBackgroundExecutor>>,
+    /// User-facing Arrow schema with logical column names. When the Delta table
+    /// uses column mapping (`Name` or `Id` mode), parquet files store data under
+    /// physical column names that differ from these logical names.
     arrow_schema: SchemaRef,
     delta_schema: delta_kernel::schema::SchemaRef,
     snapshot: RwLock<SnapshotRef>,
+    /// Pre-computed physical schema mapping for column mapping modes (`Name`/`Id`).
+    /// `None` when the table uses no column mapping (physical names == logical names).
+    physical_schema_mapping: Option<PhysicalSchemaMapping>,
+    table_parquet_options: TableParquetOptions,
 }
 
 impl DeltaTable {
@@ -208,8 +232,25 @@ impl DeltaTable {
             .build(engine.as_ref())
             .map_err(handle_delta_error)?;
 
-        let arrow_schema = Self::get_schema(&snapshot);
         let delta_schema = snapshot.schema();
+        let column_mapping_mode = snapshot.table_configuration().column_mapping_mode();
+
+        tracing::debug!(
+            version = snapshot.version(),
+            column_mapping = ?column_mapping_mode,
+            "Initializing Delta Lake table at '{table_url}'",
+        );
+
+        let arrow_schema = Self::get_logical_schema(&snapshot);
+
+        let physical_schema_mapping = if column_mapping_mode == ColumnMappingMode::None {
+            None
+        } else {
+            Some(build_physical_schema_mapping(
+                &delta_schema,
+                column_mapping_mode,
+            ))
+        };
 
         Ok(Self {
             table_url,
@@ -217,7 +258,15 @@ impl DeltaTable {
             arrow_schema: Arc::new(arrow_schema),
             delta_schema,
             snapshot: RwLock::new(snapshot),
+            physical_schema_mapping,
+            table_parquet_options: TableParquetOptions::default(),
         })
+    }
+
+    #[must_use]
+    pub fn with_table_parquet_options(mut self, opts: TableParquetOptions) -> Self {
+        self.table_parquet_options = opts;
+        self
     }
 
     /// Gets the latest snapshot by paginating object storage. It uses version hints from the currently
@@ -244,14 +293,16 @@ impl DeltaTable {
         Ok(Arc::clone(&*current_snapshot))
     }
 
-    fn get_schema(snapshot: &Snapshot) -> Schema {
+    /// Builds the logical (user-facing) Arrow schema from the snapshot's delta schema.
+    fn get_logical_schema(snapshot: &Snapshot) -> Schema {
         let schema = snapshot.schema();
 
         let mut fields: Vec<Field> = vec![];
         for field in schema.fields() {
             fields.push(Field::new(
                 field.name(),
-                map_delta_data_type_to_arrow_data_type(&field.data_type),
+                // `ColumnMappingMode::None` to always return logical names
+                map_delta_data_type_to_arrow_data_type(&field.data_type, ColumnMappingMode::None),
                 field.nullable,
             ));
         }
@@ -269,6 +320,7 @@ impl DeltaTable {
         parquet_file_reader_factory: &Arc<dyn ParquetFileReaderFactory>,
         partitioned_files: &[PartitionedFile],
         physical_expr: &Arc<dyn PhysicalExpr>,
+        logical_to_physical: &HashMap<String, String>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // this is needed to pass the plan_extension
         let projection = Some(
@@ -282,8 +334,11 @@ impl DeltaTable {
                 .iter()
                 .map(|&x| {
                     let field = self.arrow_schema.field(x);
+                    let name_in_schema = logical_to_physical
+                        .get(field.name())
+                        .unwrap_or(field.name());
 
-                    if let Ok(i) = schema.index_of(field.name()) {
+                    if let Ok(i) = schema.index_of(name_in_schema) {
                         return i;
                     }
 
@@ -299,7 +354,12 @@ impl DeltaTable {
             Arc::clone(schema),
             partition_cols.iter().map(|f| Arc::new(f.clone())).collect(),
         );
+        tracing::trace!(
+            table_parquet_options = ?self.table_parquet_options,
+            "Creating Delta Lake ParquetSource"
+        );
         let parquet_source = ParquetSource::new(table_schema)
+            .with_table_parquet_options(self.table_parquet_options.clone())
             .with_parquet_file_reader_factory(Arc::clone(parquet_file_reader_factory))
             .with_predicate(Arc::clone(physical_expr));
 
@@ -333,9 +393,115 @@ fn ensure_folder_location(table_location: String) -> String {
     }
 }
 
+/// Builds a [`PhysicalSchemaMapping`] for the given Delta schema and column mapping mode.
+///
+/// The result contains the physical Arrow schema (with physical column names used in parquet
+/// files) and bidirectional name mappings between physical and logical column names.
+fn build_physical_schema_mapping(
+    delta_schema: &delta_kernel::schema::Schema,
+    column_mapping_mode: ColumnMappingMode,
+) -> PhysicalSchemaMapping {
+    let mut fields = vec![];
+    let mut physical_to_logical = HashMap::new();
+    let mut logical_to_physical = HashMap::new();
+
+    for field in delta_schema.fields() {
+        let physical_name = field.physical_name(column_mapping_mode).to_string();
+        let logical_name = field.name().clone();
+        physical_to_logical.insert(physical_name.clone(), logical_name.clone());
+        logical_to_physical.insert(logical_name, physical_name.clone());
+        fields.push(Field::new(
+            physical_name,
+            map_delta_data_type_to_arrow_data_type(field.data_type(), column_mapping_mode),
+            field.nullable,
+        ));
+    }
+
+    PhysicalSchemaMapping {
+        schema: Schema::new(fields),
+        physical_to_logical,
+        logical_to_physical,
+    }
+}
+
+/// Result of [`build_physical_schema_mapping`]: contains the physical Arrow schema and
+/// bidirectional name mappings between physical and logical column names.
+#[derive(Debug)]
+struct PhysicalSchemaMapping {
+    schema: Schema,
+    physical_to_logical: HashMap<String, String>,
+    logical_to_physical: HashMap<String, String>,
+}
+
+/// Rewrites column references in a `DataFusion` [`Expr`] from logical to physical names.
+///
+/// This is needed so that predicates pushed down to [`ParquetExec`] reference the physical
+/// column names actually present in the parquet files.
+fn rewrite_column_names(
+    expr: Expr,
+    logical_to_physical: &HashMap<String, String>,
+) -> Result<Expr, DataFusionError> {
+    Ok(expr
+        .transform(|e| {
+            if let Expr::Column(col) = &e
+                && let Some(physical_name) = logical_to_physical.get(col.name())
+            {
+                return Ok(datafusion::common::tree_node::Transformed::yes(
+                    Expr::Column(datafusion::common::Column::new(
+                        col.relation.clone(),
+                        physical_name,
+                    )),
+                ));
+            }
+            Ok(datafusion::common::tree_node::Transformed::no(e))
+        })?
+        .data)
+}
+
+/// Builds a [`ProjectionExec`] that renames columns from physical names back to logical names.
+///
+/// For columns with nested types (Struct, List, Map) where the physical and logical data types
+/// differ (because nested field names are also physical), wraps the column in a [`CastExpr`]
+/// to trigger Arrow's recursive struct/list/map field renaming.
+fn build_column_mapping_projection(
+    exec: Arc<dyn ExecutionPlan>,
+    physical_to_logical: &HashMap<String, String>,
+    logical_schema: &SchemaRef,
+) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    let exec_schema = exec.schema();
+    let projection_expr: Vec<(Arc<dyn PhysicalExpr>, String)> = exec_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            let logical_name = physical_to_logical
+                .get(field.name())
+                .cloned()
+                .unwrap_or_else(|| field.name().clone());
+
+            // If the logical field has a different data type (nested field names differ),
+            // wrap in CastExpr to recursively rename nested struct/list/map fields.
+            let expr: Arc<dyn PhysicalExpr> = match logical_schema.field_with_name(&logical_name) {
+                Ok(logical_field) if field.data_type() != logical_field.data_type() => {
+                    Arc::new(CastExpr::new(
+                        Arc::new(Column::new(field.name(), i)),
+                        logical_field.data_type().clone(),
+                        None,
+                    ))
+                }
+                _ => Arc::new(Column::new(field.name(), i)),
+            };
+
+            (expr, logical_name)
+        })
+        .collect();
+
+    Ok(Arc::new(ProjectionExec::try_new(projection_expr, exec)?))
+}
 #[expect(clippy::cast_possible_wrap)]
 fn map_delta_data_type_to_arrow_data_type(
     delta_data_type: &delta_kernel::schema::DataType,
+    column_mapping_mode: ColumnMappingMode,
 ) -> DataType {
     match delta_data_type {
         delta_kernel::schema::DataType::Primitive(primitive_type) => match primitive_type {
@@ -361,7 +527,7 @@ fn map_delta_data_type_to_arrow_data_type(
         },
         delta_kernel::schema::DataType::Array(array_type) => DataType::List(Arc::new(Field::new(
             "item",
-            map_delta_data_type_to_arrow_data_type(array_type.element_type()),
+            map_delta_data_type_to_arrow_data_type(array_type.element_type(), column_mapping_mode),
             array_type.contains_null(),
         ))),
         delta_kernel::schema::DataType::Struct(struct_type)
@@ -369,16 +535,18 @@ fn map_delta_data_type_to_arrow_data_type(
             let mut fields: Vec<Field> = vec![];
             for field in struct_type.fields() {
                 fields.push(Field::new(
-                    field.name(),
-                    map_delta_data_type_to_arrow_data_type(field.data_type()),
+                    field.physical_name(column_mapping_mode),
+                    map_delta_data_type_to_arrow_data_type(field.data_type(), column_mapping_mode),
                     field.nullable,
                 ));
             }
             DataType::Struct(fields.into())
         }
         delta_kernel::schema::DataType::Map(map_type) => {
-            let key_type = map_delta_data_type_to_arrow_data_type(map_type.key_type());
-            let value_type = map_delta_data_type_to_arrow_data_type(map_type.value_type());
+            let key_type =
+                map_delta_data_type_to_arrow_data_type(map_type.key_type(), column_mapping_mode);
+            let value_type =
+                map_delta_data_type_to_arrow_data_type(map_type.value_type(), column_mapping_mode);
             DataType::Map(
                 Arc::new(Field::new_struct(
                     map_type.type_name.clone(),
@@ -520,13 +688,22 @@ impl TableProvider for DeltaTable {
         // We handle this by keeping track of all the partition columns we find in the `all_partition_columns` variable and if one
         // doesn't have a value, we add a NULL value for that field to the `partition_values` field of the `PartitionedFile` object.
         let mut partitioned_files: Vec<PartitionedFile> = vec![];
+        let physical_to_logical = self
+            .physical_schema_mapping
+            .as_ref()
+            .map(|m| &m.physical_to_logical);
         let all_partition_columns = scan_context
             .files
             .iter()
             .flat_map(|file| {
                 file.partition_values.iter().filter_map(|(k, _)| {
                     let schema = self.schema();
-                    schema.field_with_name(k).ok().cloned()
+                    // With column mapping, partition value keys use physical names.
+                    // Translate to logical name for schema lookup.
+                    let logical_key = physical_to_logical
+                        .and_then(|m| m.get(k))
+                        .map_or(k.as_str(), String::as_str);
+                    schema.field_with_name(logical_key).ok().cloned()
                 })
             })
             // Use an IndexMap to preserve insertion order
@@ -539,11 +716,13 @@ impl TableProvider for DeltaTable {
             partitioned_file.partition_values = all_partition_columns
                 .iter()
                 .map(|(field, ())| {
-                    if let Some((_, value)) = file
-                        .partition_values
-                        .iter()
-                        .find(|(k, _)| *k == field.name())
-                    {
+                    if let Some((_, value)) = file.partition_values.iter().find(|(k, _)| {
+                        // With column mapping, k is a physical name; translate before comparing.
+                        let logical_key = physical_to_logical
+                            .and_then(|m| m.get(k.as_str()))
+                            .map_or(k.as_str(), String::as_str);
+                        logical_key == field.name()
+                    }) {
                         ScalarValue::try_from_string(value.clone(), field.data_type())
                     } else {
                         // This will create a null value typed for the field
@@ -594,29 +773,56 @@ impl TableProvider for DeltaTable {
         );
 
         let filter = conjunction(filters).unwrap_or_else(|| lit(true));
-        let physical_expr = state.create_physical_expr(filter, &df_schema)?;
 
-        let schema = self.arrow_schema.project(
-            &self
-                .arrow_schema
-                .fields
-                .iter()
-                .enumerate()
-                .filter_map(|(i, f)| (!partition_cols.contains(f)).then_some(i))
-                .collect::<Vec<_>>(),
-        )?;
+        let non_partition_indices = self
+            .arrow_schema
+            .fields
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| (!partition_cols.contains(f)).then_some(i))
+            .collect::<Vec<_>>();
 
-        Ok(self
-            .create_parquet_exec(
-                projection,
-                limit,
-                &Arc::new(schema),
-                &partition_cols,
-                &parquet_file_reader_factory,
-                &filtered_partitioned_files,
-                &physical_expr,
-            )
-            .map_err(|e| DataFusionError::External(Box::new(e)))?)
+        if let Some(mapping) = &self.physical_schema_mapping {
+            // Rewrite filter column references from logical to physical names
+            // so ParquetExec can match them against the physical parquet schema.
+            let physical_filter = rewrite_column_names(filter, &mapping.logical_to_physical)?;
+            let physical_df_schema = DFSchema::try_from(Arc::new(mapping.schema.clone()))?;
+            let physical_expr = state.create_physical_expr(physical_filter, &physical_df_schema)?;
+
+            let physical_non_partition_schema =
+                Arc::new(mapping.schema.project(&non_partition_indices)?);
+
+            let exec = self
+                .create_parquet_exec(
+                    projection,
+                    limit,
+                    &physical_non_partition_schema,
+                    &partition_cols,
+                    &parquet_file_reader_factory,
+                    &filtered_partitioned_files,
+                    &physical_expr,
+                    &mapping.logical_to_physical,
+                )
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            build_column_mapping_projection(exec, &mapping.physical_to_logical, &self.arrow_schema)
+        } else {
+            let physical_expr = state.create_physical_expr(filter, &df_schema)?;
+            let schema = self.arrow_schema.project(&non_partition_indices)?;
+
+            Ok(self
+                .create_parquet_exec(
+                    projection,
+                    limit,
+                    &Arc::new(schema),
+                    &partition_cols,
+                    &parquet_file_reader_factory,
+                    &filtered_partitioned_files,
+                    &physical_expr,
+                    &HashMap::new(),
+                )
+                .map_err(|e| DataFusionError::External(Box::new(e)))?)
+        }
     }
 }
 
@@ -639,14 +845,14 @@ impl ScanContext {
 }
 
 fn project_delta_schema(
-    arrow_schema: &SchemaRef,
+    arrow_logical_schema: &SchemaRef,
     schema: delta_kernel::schema::SchemaRef,
     projections: Option<&Vec<usize>>,
 ) -> Result<delta_kernel::schema::SchemaRef, DataFusionError> {
     if let Some(projections) = projections {
         let projected_fields = projections
             .iter()
-            .filter_map(|i| schema.field(arrow_schema.field(*i).name()))
+            .filter_map(|i| schema.field(arrow_logical_schema.field(*i).name()))
             .cloned()
             .collect::<Vec<_>>();
         Ok(Arc::new(
