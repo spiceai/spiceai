@@ -127,7 +127,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Insufficient permissions to read table '{table_name}'. The current principal does not have SELECT privilege on this table. Grant SELECT on the table, and try again."
+        "Insufficient permissions to read table '{table_name}'. The current principal does not have a read-compatible privilege on this table. Grant SELECT or ALL PRIVILEGES on the table, and try again."
     ))]
     InsufficientPermissions { table_name: String },
 }
@@ -563,8 +563,16 @@ impl Databricks {
         let mut config = sql_warehouse::SqlWarehouseConfig::default();
 
         if let Some(v) = params.get("max_concurrent_requests").expose().ok() {
-            if let Ok(n) = v.parse::<usize>() {
-                config.max_concurrent_requests = n;
+            match v.parse::<usize>() {
+                Ok(0) => {
+                    tracing::warn!(
+                        parameter = "max_concurrent_requests",
+                        value = v,
+                        "Invalid Databricks SQL Warehouse config value; must be >= 1; using default"
+                    );
+                }
+                Ok(n) => config.max_concurrent_requests = n,
+                Err(_) => {}
             }
         }
         if let Some(v) = params.get("http_max_retries").expose().ok() {

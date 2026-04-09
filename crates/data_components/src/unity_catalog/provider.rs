@@ -201,19 +201,19 @@ impl UnityCatalogSchemaProvider {
                                 false
                             }
                             Ok(None) => {
-                                tracing::error!(
+                                tracing::warn!(
                                     table = %table.full_name(),
-                                    "Skipping table: table not found when checking permissions"
+                                    "Permission check returned no table; proceeding without permission validation"
                                 );
-                                false
+                                true
                             }
                             Err(e) => {
-                                tracing::error!(
+                                tracing::warn!(
                                     table = %table.full_name(),
                                     error = %e,
-                                    "Failed to check permissions; skipping table"
+                                    "Failed to check permissions; proceeding without permission validation"
                                 );
-                                false
+                                true
                             }
                             Ok(Some(_)) => true,
                         };
@@ -371,19 +371,17 @@ impl UnityCatalogSchemaProvider {
                 return None;
             }
             Ok(None) => {
-                tracing::error!(
+                tracing::warn!(
                     table = %table.full_name(),
-                    "Skipping table: table not found when checking permissions"
+                    "Permission check returned no table; proceeding without permission validation"
                 );
-                return None;
             }
             Err(e) => {
-                tracing::error!(
+                tracing::warn!(
                     table = %table.full_name(),
                     error = %e,
-                    "Failed to check permissions; skipping table"
+                    "Failed to check permissions; proceeding without permission validation"
                 );
-                return None;
             }
             Ok(Some(_)) => {}
         }

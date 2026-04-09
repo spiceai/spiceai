@@ -118,9 +118,7 @@ where
     loop {
         let permit =
             acquire_concurrency_permit(concurrency_limit, service_name, operation_name).await;
-        if permit.is_some() {
-            telemetry::inc_connector_inflight_requests(&dimensions);
-        }
+        telemetry::inc_connector_inflight_requests(&dimensions);
         match add_supported_accept_encoding_header(build_request())
             .send()
             .await
@@ -137,9 +135,7 @@ where
                             max_retries,
                             "HTTP retries exhausted after retryable response"
                         );
-                        if permit.is_some() {
-                            telemetry::dec_connector_inflight_requests(&dimensions);
-                        }
+                        telemetry::dec_connector_inflight_requests(&dimensions);
                         return Ok(response);
                     }
 
@@ -165,24 +161,18 @@ where
 
                     drain_response_body(response, service_name, operation_name, retries, status)
                         .await;
-                    if permit.is_some() {
-                        telemetry::dec_connector_inflight_requests(&dimensions);
-                    }
+                    telemetry::dec_connector_inflight_requests(&dimensions);
                     drop(permit);
                     tokio::time::sleep(delay).await;
                     continue;
                 }
 
-                if permit.is_some() {
-                    telemetry::dec_connector_inflight_requests(&dimensions);
-                }
+                telemetry::dec_connector_inflight_requests(&dimensions);
                 return Ok(response);
             }
             Err(error) => {
                 let Some(reason) = retry_reason_from_error(&error) else {
-                    if permit.is_some() {
-                        telemetry::dec_connector_inflight_requests(&dimensions);
-                    }
+                    telemetry::dec_connector_inflight_requests(&dimensions);
                     return Err(error);
                 };
 
@@ -195,9 +185,7 @@ where
                         error = %error,
                         "HTTP retries exhausted after transient request failure"
                     );
-                    if permit.is_some() {
-                        telemetry::dec_connector_inflight_requests(&dimensions);
-                    }
+                    telemetry::dec_connector_inflight_requests(&dimensions);
                     return Err(error);
                 }
 
@@ -217,9 +205,7 @@ where
                     "Retrying HTTP request after transient request failure"
                 );
 
-                if permit.is_some() {
-                    telemetry::dec_connector_inflight_requests(&dimensions);
-                }
+                telemetry::dec_connector_inflight_requests(&dimensions);
                 drop(permit);
                 tokio::time::sleep(delay).await;
             }

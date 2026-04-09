@@ -78,7 +78,7 @@ Before creating a table provider, the connector calls the UC Effective Permissio
 
 - **Catalog connector path**: Tables without read permissions are skipped during discovery with an error-level log.
 - **Data connector path**: Returns an `InsufficientPermissions` error when a fully-qualified table reference is used.
-- **Graceful degradation**: If the UC API is unreachable or the table is not found in UC, the connector proceeds without validation (the table may not be a UC-managed table).
+- **Graceful degradation**: If the UC API is unreachable or the table is not found in UC, the connector logs a warning and proceeds without validation (the table may not be a UC-managed table).
 
 ## Task History Instrumentation
 
