@@ -74,7 +74,7 @@ where
     let mut retries = 0usize;
 
     loop {
-        let _permit =
+        let permit =
             acquire_concurrency_permit(concurrency_limit, service_name, operation_name).await;
         match add_supported_accept_encoding_header(build_request())
             .send()
@@ -114,7 +114,7 @@ where
 
                     drain_response_body(response, service_name, operation_name, retries, status)
                         .await;
-                    drop(_permit);
+                    drop(permit);
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -151,7 +151,7 @@ where
                     "Retrying HTTP request after transient request failure"
                 );
 
-                drop(_permit);
+                drop(permit);
                 tokio::time::sleep(delay).await;
             }
         }
@@ -177,16 +177,15 @@ async fn acquire_concurrency_permit<'a>(
     operation_name: &str,
 ) -> Option<tokio::sync::SemaphorePermit<'a>> {
     let sem = semaphore?;
-    match sem.acquire().await {
-        Ok(permit) => Some(permit),
-        Err(_) => {
-            tracing::warn!(
-                service = service_name,
-                operation = operation_name,
-                "Request concurrency limiter closed; proceeding without limit"
-            );
-            None
-        }
+    if let Ok(permit) = sem.acquire().await {
+        Some(permit)
+    } else {
+        tracing::warn!(
+            service = service_name,
+            operation = operation_name,
+            "Request concurrency limiter closed; proceeding without limit"
+        );
+        None
     }
 }
 
