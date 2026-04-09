@@ -119,14 +119,6 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Unsupported Unity Catalog table type '{table_type}' for table '{table_name}'. Only MANAGED, EXTERNAL, and MATERIALIZED_VIEW tables can be queried."
-    ))]
-    UnsupportedTableType {
-        table_name: String,
-        table_type: String,
-    },
-
-    #[snafu(display(
         "Insufficient permissions to read table '{table_name}'. The current principal does not have a read-compatible privilege on this table. Grant SELECT or ALL PRIVILEGES on the table, and try again."
     ))]
     InsufficientPermissions { table_name: String },
@@ -627,13 +619,13 @@ impl Databricks {
         match uc_client.get_table(table_reference).await {
             Ok(Some(uc_table)) => {
                 if !uc_table.is_queryable() {
-                    return Err(DataConnectorError::UnableToGetReadProvider {
+                    return Err(DataConnectorError::InvalidConfigurationNoSource {
                         dataconnector: "databricks".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
-                        source: Box::new(Error::UnsupportedTableType {
-                            table_name: full_name.clone(),
-                            table_type: uc_table.table_type.clone(),
-                        }),
+                        message: format!(
+                            "Unsupported Unity Catalog table type '{}' for table '{}'. Only MANAGED, EXTERNAL, and MATERIALIZED_VIEW tables can be queried.",
+                            uc_table.table_type, full_name
+                        ),
                     });
                 }
                 tracing::debug!(
@@ -690,11 +682,6 @@ impl Databricks {
                     error = %e,
                     "Failed to check Unity Catalog permissions; proceeding without validation"
                 );
-                return Err(DataConnectorError::UnableToGetReadProvider {
-                    dataconnector: "databricks".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: Box::new(e),
-                });
             }
         }
 
