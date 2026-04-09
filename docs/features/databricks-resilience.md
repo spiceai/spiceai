@@ -117,7 +117,7 @@ The SQL Warehouse connector exposes per-dataset operational metrics via the `Met
 | `requests_total`              | Counter | Requests        | Total HTTP requests issued to the SQL Warehouse API (excl. retries) |
 | `retries_total`               | Counter | Requests        | Total HTTP retries performed for transient failures                 |
 | `permanent_errors_total`      | Counter | Requests        | Total non-retryable errors (401, 403, 404) detected                 |
-| `inflight_requests`           | Gauge   | Requests        | Current number of in-flight HTTP requests                           |
+| `inflight_operations`         | Gauge   | Requests        | Current number of in-flight SQL Warehouse operations                |
 | `statements_executed_total`   | Counter | Statements      | Total SQL statements submitted for execution                        |
 | `statement_polls_total`       | Counter | Statements      | Total polls made when waiting for async statement completion        |
 | `statements_failed_total`     | Counter | Statements      | Total SQL statements that completed with FAILED status              |
@@ -145,7 +145,7 @@ datasets:
       - name: requests_total
       - name: retries_total
       - name: permanent_errors_total
-      - name: inflight_requests
+      - name: inflight_operations
       - name: statements_executed_total
       - name: statement_polls_total
       - name: statements_failed_total
@@ -161,7 +161,7 @@ Individual metrics can be disabled by setting `enabled: false`:
 ```yaml
     metrics:
       - name: requests_total
-      - name: inflight_requests
+      - name: inflight_operations
       - name: pool_active_connections
       - name: semaphore_available_permits
       - name: statement_polls_total

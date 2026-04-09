@@ -119,7 +119,7 @@ pub struct DatabricksMetrics {
     pub permanent_errors_total: AtomicU64,
     /// Current number of in-progress operations (gauge, can go up and down).
     /// Includes time spent waiting for a concurrency permit.
-    pub inflight_requests: AtomicU64,
+    pub inflight_operations: AtomicU64,
 
     // -- Statement metrics --
     /// Total SQL statements that entered execution.
@@ -583,12 +583,9 @@ impl SqlWarehouseApi {
             .get("statement")
             .and_then(|v| v.as_str())
             .unwrap_or("<unknown>");
-        self.metrics
-            .statements_executed_total
-            .fetch_add(1, Ordering::Relaxed);
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         self.metrics
-            .inflight_requests
+            .inflight_operations
             .fetch_add(1, Ordering::Relaxed);
         let url = format!("{}/api/2.0/sql/statements/", self.base_url);
         let result = async {
@@ -603,12 +600,17 @@ impl SqlWarehouseApi {
             )
             .await
             .context(HttpRequestFailedSnafu)?;
-            self.check_permanent_http_error(response)
+            let value: Value = self
+                .check_permanent_http_error(response)
                 .error_for_status()
                 .context(HttpRequestFailedSnafu)?
                 .json()
                 .await
-                .context(JsonParsingFailedSnafu)
+                .context(JsonParsingFailedSnafu)?;
+            self.metrics
+                .statements_executed_total
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(value)
         }
         .instrument(tracing::info_span!(
             target: "task_history",
@@ -618,7 +620,7 @@ impl SqlWarehouseApi {
         ))
         .await;
         self.metrics
-            .inflight_requests
+            .inflight_operations
             .fetch_sub(1, Ordering::Relaxed);
         result
     }
@@ -634,7 +636,7 @@ impl SqlWarehouseApi {
             .fetch_add(1, Ordering::Relaxed);
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         self.metrics
-            .inflight_requests
+            .inflight_operations
             .fetch_add(1, Ordering::Relaxed);
         let url = format!("{}/api/2.0/sql/statements/{statement_id}", self.base_url);
         let result = async {
@@ -658,7 +660,7 @@ impl SqlWarehouseApi {
         }
         .await;
         self.metrics
-            .inflight_requests
+            .inflight_operations
             .fetch_sub(1, Ordering::Relaxed);
         result
     }
@@ -711,7 +713,7 @@ impl SqlWarehouseApi {
 
                         api.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
                         api.metrics
-                            .inflight_requests
+                            .inflight_operations
                             .fetch_add(1, Ordering::Relaxed);
                         let resp = match send_request_with_retry_and_concurrency_limit_with_counter(
                             "Databricks SQL Warehouse",
@@ -728,7 +730,7 @@ impl SqlWarehouseApi {
                             Ok(resp) => resp,
                             Err(e) => {
                                 api.metrics
-                                    .inflight_requests
+                                    .inflight_operations
                                     .fetch_sub(1, Ordering::Relaxed);
                                 return Some((Err(e), None));
                             }
@@ -748,20 +750,20 @@ impl SqlWarehouseApi {
                                 Ok(next) => next,
                                 Err(e) => {
                                     api.metrics
-                                        .inflight_requests
+                                        .inflight_operations
                                         .fetch_sub(1, Ordering::Relaxed);
                                     return Some((Err(e), None));
                                 }
                             },
                             Err(e) => {
                                 api.metrics
-                                    .inflight_requests
+                                    .inflight_operations
                                     .fetch_sub(1, Ordering::Relaxed);
                                 return Some((Err(e), None));
                             }
                         };
                         api.metrics
-                            .inflight_requests
+                            .inflight_operations
                             .fetch_sub(1, Ordering::Relaxed);
                         result
                     }
@@ -835,7 +837,7 @@ impl SqlWarehouseApi {
         self.check_permanently_disabled()?;
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         self.metrics
-            .inflight_requests
+            .inflight_operations
             .fetch_add(1, Ordering::Relaxed);
         let result = async {
             let response = send_request_with_retry_and_concurrency_limit_with_counter(
@@ -861,7 +863,7 @@ impl SqlWarehouseApi {
         }
         .await;
         self.metrics
-            .inflight_requests
+            .inflight_operations
             .fetch_sub(1, Ordering::Relaxed);
         if result.is_ok() {
             self.metrics

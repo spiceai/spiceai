@@ -503,8 +503,11 @@ pub struct UCPrivilege {
 const READ_PRIVILEGES: &[&str] = &["SELECT", "ALL_PRIVILEGES", "ALL PRIVILEGES"];
 
 impl UCPermissionsEnvelope {
-    /// Returns `true` if any principal in this response has a read-compatible
-    /// privilege (`SELECT` or `ALL_PRIVILEGES`).
+    /// Returns `true` if the current caller has a read-compatible privilege
+    /// (`SELECT` or `ALL_PRIVILEGES`).
+    ///
+    /// This checks the response from the UC **effective-permissions** endpoint,
+    /// which already scopes results to the authenticated principal.
     #[must_use]
     pub fn has_read_permission(&self) -> bool {
         self.privilege_assignments.iter().any(|pa| {

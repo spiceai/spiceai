@@ -891,8 +891,8 @@ const DATABRICKS_METRICS: &[MetricSpec] = &[
     MetricSpec::new("permanent_errors_total", MetricType::ObservableCounterU64).description(
         "Total non-retryable errors (401, 403, 404) that permanently disabled the connector",
     ),
-    MetricSpec::new("inflight_requests", MetricType::ObservableGaugeU64)
-        .description("Current number of in-flight HTTP requests to the SQL Warehouse API"),
+    MetricSpec::new("inflight_operations", MetricType::ObservableGaugeU64)
+        .description("Current number of in-flight SQL Warehouse operations (includes semaphore wait and retries)"),
     // -- Statement metrics --
     MetricSpec::new(
         "statements_executed_total",
@@ -968,10 +968,10 @@ impl MetricsProvider for DatabricksMetricsProvider {
                     );
                 })))
             }
-            "inflight_requests" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+            "inflight_operations" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                 instrument.observe(
                     metrics
-                        .inflight_requests
+                        .inflight_operations
                         .load(std::sync::atomic::Ordering::Relaxed),
                     &attributes,
                 );
