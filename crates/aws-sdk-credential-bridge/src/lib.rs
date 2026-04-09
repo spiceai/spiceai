@@ -43,10 +43,13 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 /// application in the user-agent header of AWS API requests.
 ///
 /// The `AppName::new` call is infallible for this input: the name contains only alphanumeric
-/// characters plus `.` and `-`, all of which are permitted.
+/// characters plus `.` and `-`, all of which are permitted. The name is truncated to 50
+/// characters to stay within the AWS SDK's recommended limit.
 static APN_APP_NAME: LazyLock<AppName> = LazyLock::new(|| {
     let version = env!("CARGO_PKG_VERSION");
-    match AppName::new(format!("Spice-{version}")) {
+    let mut name = format!("Spice-{version}");
+    name.truncate(50);
+    match AppName::new(name) {
         Ok(name) => name,
         Err(_) => unreachable!("Spice version string should always be a valid AppName"),
     }
@@ -961,6 +964,11 @@ mod tests {
         assert!(
             name_str.starts_with("Spice-"),
             "APN app name should start with 'Spice-', got: {name_str}"
+        );
+        assert!(
+            name_str.len() <= 50,
+            "APN app name must be at most 50 characters, got {} ({name_str})",
+            name_str.len()
         );
     }
 
