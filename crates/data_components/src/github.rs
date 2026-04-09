@@ -1058,13 +1058,7 @@ impl GithubRestClient {
         max_refs: usize,
     ) -> Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
         let mut refs = self
-            .fetch_refs_for_resource(
-                owner,
-                repo,
-                "branches",
-                "refs/heads/",
-                Some(max_refs),
-            )
+            .fetch_refs_for_resource(owner, repo, "branches", "refs/heads/", Some(max_refs))
             .await?;
         let remaining_refs = max_refs.saturating_sub(refs.len());
         if remaining_refs == 0 {
@@ -1074,14 +1068,8 @@ impl GithubRestClient {
         }
 
         refs.extend(
-            self.fetch_refs_for_resource(
-                owner,
-                repo,
-                "tags",
-                "refs/tags/",
-                Some(remaining_refs),
-            )
-            .await?,
+            self.fetch_refs_for_resource(owner, repo, "tags", "refs/tags/", Some(remaining_refs))
+                .await?,
         );
         refs.sort_unstable_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
         refs.dedup_by(|left, right| left.qualified_name == right.qualified_name);
