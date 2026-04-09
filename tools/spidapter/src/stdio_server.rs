@@ -729,8 +729,6 @@ async fn provision_spice_cloud_app(
             .update_app(
                 app_id,
                 &UpdateAppRequest {
-                    registry: args.image_registry.clone(),
-                    image: args.image_name.clone(),
                     image_tag: args.image_tag.clone(),
                     update_channel: args.channel.clone(),
                     ..UpdateAppRequest::default()
@@ -1688,8 +1686,6 @@ mod tests {
             spice_cloud_api_url: "https://api.spice.ai".to_string(),
             ready_wait: 600,
             channel: None,
-            image_registry: None,
-            image_name: None,
             image_tag: None,
             api_key: None,
             backend: BackendMode::Scp,
