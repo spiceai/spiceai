@@ -371,11 +371,8 @@ impl UnityCatalog {
     fn encode_uc_name(name: &str) -> String {
         name.split('.')
             .map(|segment| {
-                percent_encoding::utf8_percent_encode(
-                    segment,
-                    percent_encoding::NON_ALPHANUMERIC,
-                )
-                .to_string()
+                percent_encoding::utf8_percent_encode(segment, percent_encoding::NON_ALPHANUMERIC)
+                    .to_string()
             })
             .collect::<Vec<_>>()
             .join(".")
