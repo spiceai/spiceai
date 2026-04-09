@@ -509,14 +509,13 @@ fn commits_filter_pushdown(expr: &Expr) -> FilterPushdownResult {
     if let Some((column, value, op)) = expr_to_match(expr)
         && column.name == "ref"
         && op == Operator::Eq
+        && let Some(ref_value) = scalar_utf8_value(&value).filter(|v| !v.is_empty())
     {
-        if let Some(ref_value) = scalar_utf8_value(&value).filter(|v| !v.is_empty()) {
-            return FilterPushdownResult {
-                filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Exact,
-                expr: expr.clone(),
-                context: Some(format!("ref:{ref_value}")),
-            };
-        }
+        return FilterPushdownResult {
+            filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Exact,
+            expr: expr.clone(),
+            context: Some(format!("ref:{ref_value}")),
+        };
     }
 
     if expr_references_ref(expr) && expr_is_ref_only(expr) {

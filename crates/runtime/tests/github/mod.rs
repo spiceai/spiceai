@@ -558,10 +558,92 @@ async fn test_github_commits() -> Result<(), String> {
             )
             .await?;
 
+            // Tag ref filter: verifies tag resolution path and tag target traversal
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_commits_tag_ref_filter",
+                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref = 'v1.0.0' LIMIT 10",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let row_count = result_batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                    for batch in &result_batches {
+                        assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
+                    }
+                    assert!(row_count > 0 && row_count <= 10, "expected 0 < num_rows <= 10, got {row_count}");
+                    assert_all_string_values(&result_batches, 0, "v1.0.0");
+                })),
+            )
+            .await?;
+
+            // LIMIT 0 returns empty results without making API calls
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_commits_limit_zero",
+                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref = 'trunk' LIMIT 0",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let row_count: usize = result_batches.iter().map(RecordBatch::num_rows).sum();
+                    assert_eq!(row_count, 0, "LIMIT 0 should return 0 rows, got {row_count}");
+                })),
+            )
+            .await?;
+
+            // Projection pushdown: select only specific metadata columns with ref filter
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_commits_projection_pushdown",
+                "SELECT sha, author_name, message_head_line FROM spiceai_commits_auto WHERE ref = 'trunk' LIMIT 5",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let row_count: usize = result_batches.iter().map(RecordBatch::num_rows).sum();
+                    for batch in &result_batches {
+                        assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
+                    }
+                    assert_eq!(row_count, 5, "expected 5 rows, got {row_count}");
+
+                    let shas = collect_string_values(&result_batches, 0);
+                    assert!(
+                        shas.iter().all(|sha| !sha.is_empty()),
+                        "expected non-empty shas, got {shas:?}"
+                    );
+                })),
+            )
+            .await?;
+
+            // Ref-in-path dataset combined with additional non-ref filter
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_commits_ref_path_with_projection",
+                "SELECT sha, additions, deletions FROM spiceai_commits_trunk_auto LIMIT 5",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let row_count: usize = result_batches.iter().map(RecordBatch::num_rows).sum();
+                    for batch in &result_batches {
+                        assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
+                    }
+                    assert_eq!(row_count, 5, "expected 5 rows, got {row_count}");
+                })),
+            )
+            .await?;
+
+            // Verify the schema of the commits table via DESCRIBE
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_commits_schema",
+                "DESCRIBE spiceai_commits_auto",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let total_rows: usize = result_batches.iter().map(RecordBatch::num_rows).sum();
+                    assert_eq!(total_rows, 17, "expected 17 columns in schema, got {total_rows}");
+                })),
+            )
+            .await?;
+
             let elapsed = now.elapsed().as_secs();
 
-            // LIMIT should stop this query from retrieving every commit, so it shouldn't take that long
-            assert!(elapsed < 15, "elapsed: {elapsed}");
+            // LIMIT should stop this query from retrieving every commit, so it shouldn't take that long.
+            // Budget is higher because the test now includes tag-ref, LIMIT 0, projection, and schema queries.
+            assert!(elapsed < 60, "elapsed: {elapsed}");
 
             Ok(())
         })
@@ -631,6 +713,90 @@ async fn test_github_files_ref_resolution() -> Result<(), String> {
                 false,
                 Some(Box::new(|result_batches: Vec<RecordBatch>| {
                     assert_github_file_ref_results(&result_batches, "trunk");
+                })),
+            )
+            .await?;
+
+            // Tag ref for files: verifies tag resolution works for the files provider
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_files_tag_ref_filter",
+                "SELECT ref, path, download_url FROM spiceai_files_auto WHERE ref = 'v1.0.0' AND path = 'README.md' LIMIT 1",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    assert_github_file_ref_results(&result_batches, "v1.0.0");
+                })),
+            )
+            .await?;
+
+            // Multiple files listing with just a ref filter (no path restriction)
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_files_ref_only",
+                "SELECT ref, path FROM spiceai_files_auto WHERE ref = 'trunk' LIMIT 20",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let row_count: usize = result_batches.iter().map(RecordBatch::num_rows).sum();
+                    for batch in &result_batches {
+                        assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
+                    }
+                    assert!(row_count > 1, "expected multiple files, got {row_count}");
+                    assert_all_string_values(&result_batches, 0, "trunk");
+                })),
+            )
+            .await?;
+
+            // Ref-in-path dataset listing multiple files
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_files_ref_path_multiple",
+                "SELECT ref, path FROM spiceai_files_trunk_auto LIMIT 20",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let row_count: usize = result_batches.iter().map(RecordBatch::num_rows).sum();
+                    for batch in &result_batches {
+                        assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
+                    }
+                    assert!(row_count > 1, "expected multiple files, got {row_count}");
+                    assert_all_string_values(&result_batches, 0, "trunk");
+                })),
+            )
+            .await?;
+
+            // Default branch resolution: no ref filter relies on fetching the default branch
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_files_default_branch",
+                "SELECT ref, path FROM spiceai_files_auto WHERE path = 'README.md' LIMIT 1",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let row_count: usize = result_batches.iter().map(RecordBatch::num_rows).sum();
+                    assert_eq!(row_count, 1, "expected 1 row, got {row_count}");
+                    for batch in &result_batches {
+                        assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
+                    }
+                    // Verify the ref column is populated (should be the default branch)
+                    let refs = collect_string_values(&result_batches, 0);
+                    assert_eq!(refs.len(), 1, "expected 1 ref value");
+                    assert!(!refs[0].is_empty(), "default branch ref should not be empty");
+                })),
+            )
+            .await?;
+
+            // Projection pushdown: select only specific columns with ref filter
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_files_projection",
+                "SELECT name, size, sha FROM spiceai_files_auto WHERE ref = 'trunk' AND path = 'README.md' LIMIT 1",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let row_count: usize = result_batches.iter().map(RecordBatch::num_rows).sum();
+                    assert_eq!(row_count, 1, "expected 1 row, got {row_count}");
+                    for batch in &result_batches {
+                        assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
+                    }
+                    let names = collect_string_values(&result_batches, 0);
+                    assert_eq!(names, vec!["README.md"]);
                 })),
             )
             .await?;
