@@ -160,6 +160,16 @@ impl UnityCatalogSchemaProvider {
         let mut tables_map = HashMap::new();
         for table in tables {
             let table_name = table.name.clone();
+
+            if !table.is_queryable() {
+                tracing::debug!(
+                    table = %table.full_name(),
+                    table_type = %table.table_type,
+                    "Skipping unsupported Unity Catalog table type"
+                );
+                continue;
+            }
+
             let table_reference = table_reference_creator(&table);
 
             let Some(table_reference) = table_reference else {
@@ -173,6 +183,33 @@ impl UnityCatalogSchemaProvider {
             {
                 tracing::debug!("Table {} is not included", schema_with_table);
                 continue;
+            }
+
+            // Check permissions before attempting to create the table provider.
+            match client.get_effective_permissions(&table.full_name()).await {
+                Ok(Some(perms)) if !perms.has_read_permission() => {
+                    tracing::error!(
+                        table = %table.full_name(),
+                        "Skipping table: no SELECT privilege"
+                    );
+                    continue;
+                }
+                Ok(None) => {
+                    tracing::error!(
+                        table = %table.full_name(),
+                        "Skipping table: table not found when checking permissions"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        table = %table.full_name(),
+                        error = %e,
+                        "Failed to check permissions; skipping table"
+                    );
+                    continue;
+                }
+                Ok(Some(_)) => {} // Has read permission, proceed.
             }
 
             let table_provider = match table_creator.table_provider(table_reference.clone()).await {
@@ -229,6 +266,7 @@ impl UnityCatalogSchemaProvider {
                 Arc::clone(&self.table_creator),
                 self.table_reference_creator,
                 self.include.clone(),
+                Arc::clone(&self.client),
             )
             .await
             else {
@@ -282,7 +320,17 @@ impl UnityCatalogSchemaProvider {
         table_creator: Arc<dyn Read>,
         table_reference_creator: fn(&UCTable) -> Option<TableReference>,
         include: Option<Arc<GlobSet>>,
+        client: Arc<UnityCatalog>,
     ) -> Option<Arc<dyn TableProvider>> {
+        if !table.is_queryable() {
+            tracing::debug!(
+                table = %table.full_name(),
+                table_type = %table.table_type,
+                "Skipping unsupported Unity Catalog table type"
+            );
+            return None;
+        }
+
         let table_name = table.name.clone();
         let table_reference = table_reference_creator(table)?;
 
@@ -293,6 +341,32 @@ impl UnityCatalogSchemaProvider {
         {
             tracing::debug!("Table {} is not included", schema_with_table);
             return None;
+        }
+
+        match client.get_effective_permissions(&table.full_name()).await {
+            Ok(Some(perms)) if !perms.has_read_permission() => {
+                tracing::error!(
+                    table = %table.full_name(),
+                    "Skipping table: no SELECT privilege"
+                );
+                return None;
+            }
+            Ok(None) => {
+                tracing::error!(
+                    table = %table.full_name(),
+                    "Skipping table: table not found when checking permissions"
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::error!(
+                    table = %table.full_name(),
+                    error = %e,
+                    "Failed to check permissions; skipping table"
+                );
+                return None;
+            }
+            Ok(Some(_)) => {}
         }
 
         let table_provider = match table_creator.table_provider(table_reference.clone()).await {

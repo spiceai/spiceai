@@ -24,10 +24,11 @@ use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
 use crate::{
     AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error,
-    FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu, Result, Runtime,
-    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
-    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
-    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
+    FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu,
+    PermanentDatasetFailureSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
+    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
+    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
+    UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
     component::{
         access::AccessMode,
@@ -361,7 +362,9 @@ impl Runtime {
                 .await
             {
                 if runtime.status.is_shutdown() {
-                    // should not retry if runtime is shutting down
+                    return Err(RetryError::permanent(err));
+                }
+                if matches!(err, Error::PermanentDatasetFailure { .. }) {
                     return Err(RetryError::permanent(err));
                 }
                 return Err(RetryError::transient(err));
@@ -441,6 +444,14 @@ impl Runtime {
                         status::ComponentStatus::error_with_message(err.to_string()),
                     );
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
+                    if !err.is_retriable() {
+                        error_spaced!(spaced_tracer, "{}{err}", "");
+                        return PermanentDatasetFailureSnafu {
+                            dataset: ds.name.clone(),
+                            reason: err.to_string(),
+                        }
+                        .fail();
+                    }
                     if let DataConnectorError::UnsupportedDataType { .. } = err {
                         error_spaced!(spaced_tracer, "{}{err}", "");
                     } else {

@@ -22,6 +22,7 @@ use snafu::prelude::*;
 use url::Url;
 
 use token_provider::TokenProvider;
+use tracing::Instrument;
 
 use crate::resilient_http::{configure_client_builder, send_request_with_retry};
 
@@ -191,57 +192,82 @@ impl UnityCatalog {
     pub async fn get_table(&self, table_reference: &TableReference) -> Result<Option<UCTable>> {
         let table_name = table_reference.to_string();
         let path = format!("/api/2.1/unity-catalog/tables/{table_name}");
-        let response = self.send_get_with_retry("get table", &path).await?;
+        async {
+            let response = self.send_get_with_retry("get table", &path).await?;
 
-        if response.status().is_success() {
-            let api_response: UCTable = response.json().await.context(ConnectionSnafu)?;
-            Ok(Some(api_response))
-        } else if response.status().as_u16() == 404 {
-            Ok(None)
-        } else {
-            UnexpectedStatusCodeSnafu {
-                status: response.status(),
+            if response.status().is_success() {
+                let api_response: UCTable = response.json().await.context(ConnectionSnafu)?;
+                Ok(Some(api_response))
+            } else if response.status().as_u16() == 404 {
+                Ok(None)
+            } else {
+                UnexpectedStatusCodeSnafu {
+                    status: response.status(),
+                }
+                .fail()
             }
-            .fail()
         }
+        .instrument(tracing::info_span!(
+            target: "task_history",
+            "uc_get_table",
+            input = %table_name,
+        ))
+        .await
     }
 
     pub async fn get_catalog(&self, catalog_id: &str) -> Result<Option<UCCatalog>> {
         let path = format!("/api/2.1/unity-catalog/catalogs/{catalog_id}");
-        let response = self.send_get_with_retry("get catalog", &path).await?;
+        async {
+            let response = self.send_get_with_retry("get catalog", &path).await?;
 
-        tracing::debug!("get_catalog: Response status: {}", response.status());
+            tracing::debug!("get_catalog: Response status: {}", response.status());
 
-        if response.status().is_success() {
-            let api_response: UCCatalog = response.json().await.context(ConnectionSnafu)?;
-            Ok(Some(api_response))
-        } else if response.status().as_u16() == 404 {
-            Ok(None)
-        } else {
-            UnexpectedStatusCodeSnafu {
-                status: response.status(),
+            if response.status().is_success() {
+                let api_response: UCCatalog = response.json().await.context(ConnectionSnafu)?;
+                Ok(Some(api_response))
+            } else if response.status().as_u16() == 404 {
+                Ok(None)
+            } else {
+                UnexpectedStatusCodeSnafu {
+                    status: response.status(),
+                }
+                .fail()
             }
-            .fail()
         }
+        .instrument(tracing::info_span!(
+            target: "task_history",
+            "uc_get_catalog",
+            input = catalog_id,
+        ))
+        .await
     }
 
     pub async fn list_schemas(&self, catalog_id: &str) -> Result<Option<Vec<UCSchema>>> {
         let path = format!("/api/2.1/unity-catalog/schemas?catalog_name={catalog_id}");
-        let response = self.send_get_with_retry("list schemas", &path).await?;
+        async {
+            let response = self.send_get_with_retry("list schemas", &path).await?;
 
-        tracing::debug!("list_schemas: Response status: {}", response.status());
+            tracing::debug!("list_schemas: Response status: {}", response.status());
 
-        if response.status().is_success() {
-            let api_response: UCSchemaEnvelope = response.json().await.context(ConnectionSnafu)?;
-            Ok(Some(api_response.schemas))
-        } else if response.status().as_u16() == 404 {
-            Ok(None)
-        } else {
-            UnexpectedStatusCodeSnafu {
-                status: response.status(),
+            if response.status().is_success() {
+                let api_response: UCSchemaEnvelope =
+                    response.json().await.context(ConnectionSnafu)?;
+                Ok(Some(api_response.schemas))
+            } else if response.status().as_u16() == 404 {
+                Ok(None)
+            } else {
+                UnexpectedStatusCodeSnafu {
+                    status: response.status(),
+                }
+                .fail()
             }
-            .fail()
         }
+        .instrument(tracing::info_span!(
+            target: "task_history",
+            "uc_list_schemas",
+            input = catalog_id,
+        ))
+        .await
     }
 
     pub async fn list_tables(
@@ -252,21 +278,65 @@ impl UnityCatalog {
         let path = format!(
             "/api/2.1/unity-catalog/tables?catalog_name={catalog_id}&schema_name={schema_name}"
         );
-        let response = self.send_get_with_retry("list tables", &path).await?;
+        async {
+            let response = self.send_get_with_retry("list tables", &path).await?;
 
-        tracing::debug!("list_tables: Response status: {}", response.status());
+            tracing::debug!("list_tables: Response status: {}", response.status());
 
-        if response.status().is_success() {
-            let api_response: UCTableEnvelope = response.json().await.context(ConnectionSnafu)?;
-            Ok(Some(api_response.tables))
-        } else if response.status().as_u16() == 404 {
-            Ok(None)
-        } else {
-            UnexpectedStatusCodeSnafu {
-                status: response.status(),
+            if response.status().is_success() {
+                let api_response: UCTableEnvelope =
+                    response.json().await.context(ConnectionSnafu)?;
+                Ok(Some(api_response.tables))
+            } else if response.status().as_u16() == 404 {
+                Ok(None)
+            } else {
+                UnexpectedStatusCodeSnafu {
+                    status: response.status(),
+                }
+                .fail()
             }
-            .fail()
         }
+        .instrument(tracing::info_span!(
+            target: "task_history",
+            "uc_list_tables",
+            input = %format!("{catalog_id}.{schema_name}"),
+        ))
+        .await
+    }
+
+    /// Fetches the effective permissions for a table from the UC API.
+    ///
+    /// Returns `Ok(None)` if the table is not found (404).
+    /// The `full_name` should be in `catalog.schema.table` format.
+    pub async fn get_effective_permissions(
+        &self,
+        full_name: &str,
+    ) -> Result<Option<UCPermissionsEnvelope>> {
+        let path = format!("/api/2.1/unity-catalog/effective-permissions/table/{full_name}");
+        async {
+            let response = self
+                .send_get_with_retry("get effective permissions", &path)
+                .await?;
+
+            if response.status().is_success() {
+                let envelope: UCPermissionsEnvelope =
+                    response.json().await.context(ConnectionSnafu)?;
+                Ok(Some(envelope))
+            } else if response.status().as_u16() == 404 {
+                Ok(None)
+            } else {
+                UnexpectedStatusCodeSnafu {
+                    status: response.status(),
+                }
+                .fail()
+            }
+        }
+        .instrument(tracing::info_span!(
+            target: "task_history",
+            "uc_get_effective_permissions",
+            input = full_name,
+        ))
+        .await
     }
 
     fn get_req(&self, path: &str) -> reqwest::RequestBuilder {
@@ -314,6 +384,65 @@ pub struct UCTable {
     pub storage_location: Option<String>,
 }
 
+impl UCTable {
+    /// Returns the fully qualified name of the table: `catalog.schema.table`.
+    #[must_use]
+    pub fn full_name(&self) -> String {
+        format!("{}.{}.{}", self.catalog_name, self.schema_name, self.name)
+    }
+
+    /// Returns the parsed [`UCTableType`] for this table.
+    #[must_use]
+    pub fn parsed_table_type(&self) -> UCTableType {
+        UCTableType::from(self.table_type.as_str())
+    }
+
+    /// Returns `true` if the table type is supported for direct querying
+    /// through the SQL Warehouse or Spark Connect connectors.
+    ///
+    /// `VIEW` and `STREAMING_TABLE` types are not supported.
+    #[must_use]
+    pub fn is_queryable(&self) -> bool {
+        self.parsed_table_type().is_queryable()
+    }
+}
+
+/// Databricks Unity Catalog table types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UCTableType {
+    Managed,
+    External,
+    View,
+    MaterializedView,
+    StreamingTable,
+    /// An unrecognised value from the API.
+    Unknown,
+}
+
+impl UCTableType {
+    /// Returns `true` if tables of this type can be queried directly.
+    #[must_use]
+    pub const fn is_queryable(self) -> bool {
+        matches!(
+            self,
+            Self::Managed | Self::External | Self::MaterializedView
+        )
+    }
+}
+
+impl From<&str> for UCTableType {
+    fn from(s: &str) -> Self {
+        match s {
+            "MANAGED" => Self::Managed,
+            "EXTERNAL" => Self::External,
+            "VIEW" => Self::View,
+            "MATERIALIZED_VIEW" => Self::MaterializedView,
+            "STREAMING_TABLE" => Self::StreamingTable,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct UCColumn {
     pub name: String,
@@ -341,4 +470,45 @@ pub struct UCSchemaEnvelope {
 pub struct UCSchema {
     pub name: String,
     pub catalog_name: String,
+}
+
+// ============================================================================
+// Permissions
+// ============================================================================
+
+/// Response from `/api/2.1/unity-catalog/permissions/{securable_type}/{full_name}`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UCPermissionsEnvelope {
+    #[serde(default)]
+    pub privilege_assignments: Vec<UCPrivilegeAssignment>,
+}
+
+/// A single privilege assignment returned by the UC permissions endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UCPrivilegeAssignment {
+    pub principal: String,
+    #[serde(default)]
+    pub privileges: Vec<UCPrivilege>,
+}
+
+/// A single privilege entry.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UCPrivilege {
+    pub privilege: String,
+}
+
+/// The subset of UC privileges relevant to read operations.
+const READ_PRIVILEGES: &[&str] = &["SELECT", "ALL_PRIVILEGES", "ALL PRIVILEGES"];
+
+impl UCPermissionsEnvelope {
+    /// Returns `true` if any principal in this response has a read-compatible
+    /// privilege (`SELECT` or `ALL_PRIVILEGES`).
+    #[must_use]
+    pub fn has_read_permission(&self) -> bool {
+        self.privilege_assignments.iter().any(|pa| {
+            pa.privileges
+                .iter()
+                .any(|p| READ_PRIVILEGES.contains(&p.privilege.as_str()))
+        })
+    }
 }

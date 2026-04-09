@@ -18,16 +18,19 @@ use reqwest::{
     ClientBuilder, RequestBuilder, Response, StatusCode,
     header::{ACCEPT_ENCODING, HeaderMap, RETRY_AFTER},
 };
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Semaphore;
 use util::retry_strategy::{Backoff, BackoffMethod, RetryBackoffBuilder};
+
+use telemetry::KeyValue;
 
 const DEFAULT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_HTTP_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 const DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 16;
-const MAX_HTTP_RETRIES: usize = 6;
+const MAX_HTTP_RETRIES: usize = 3;
 const MAX_HTTP_BACKOFF: Duration = Duration::from_secs(300);
 const RETRY_AFTER_MS_HEADER: &str = "retry-after-ms";
 const X_RETRY_AFTER_MS_HEADER: &str = "x-retry-after-ms";
@@ -48,8 +51,15 @@ pub async fn send_request_with_retry<F>(
 where
     F: Fn() -> RequestBuilder,
 {
-    send_request_with_retry_and_concurrency_limit(service_name, operation_name, build_request, None)
-        .await
+    send_request_with_retry_and_concurrency_limit(
+        service_name,
+        operation_name,
+        build_request,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 pub async fn send_request_with_retry_and_concurrency_limit<F>(
@@ -57,12 +67,40 @@ pub async fn send_request_with_retry_and_concurrency_limit<F>(
     operation_name: &str,
     build_request: F,
     concurrency_limit: Option<&Semaphore>,
+    max_retries: Option<usize>,
+    backoff_method: Option<BackoffMethod>,
 ) -> Result<Response, reqwest::Error>
 where
     F: Fn() -> RequestBuilder,
 {
+    send_request_with_retry_and_concurrency_limit_with_counter(
+        service_name,
+        operation_name,
+        build_request,
+        concurrency_limit,
+        max_retries,
+        backoff_method,
+        None,
+    )
+    .await
+}
+
+pub async fn send_request_with_retry_and_concurrency_limit_with_counter<F>(
+    service_name: &str,
+    operation_name: &str,
+    build_request: F,
+    concurrency_limit: Option<&Semaphore>,
+    max_retries: Option<usize>,
+    backoff_method: Option<BackoffMethod>,
+    retry_counter: Option<&AtomicU64>,
+) -> Result<Response, reqwest::Error>
+where
+    F: Fn() -> RequestBuilder,
+{
+    let max_retries = max_retries.unwrap_or(MAX_HTTP_RETRIES);
+    let transient_method = backoff_method.unwrap_or(BackoffMethod::Fibonacci);
     let mut transient_backoff = RetryBackoffBuilder::new()
-        .method(BackoffMethod::Fibonacci)
+        .method(transient_method)
         .max_duration(Some(MAX_HTTP_BACKOFF))
         .build();
     let mut rate_limit_backoff = RetryBackoffBuilder::new()
@@ -72,10 +110,17 @@ where
         .build();
 
     let mut retries = 0usize;
+    let dimensions = [
+        KeyValue::new("service", service_name.to_string()),
+        KeyValue::new("operation", operation_name.to_string()),
+    ];
 
     loop {
         let permit =
             acquire_concurrency_permit(concurrency_limit, service_name, operation_name).await;
+        if permit.is_some() {
+            telemetry::inc_connector_inflight_requests(&dimensions);
+        }
         match add_supported_accept_encoding_header(build_request())
             .send()
             .await
@@ -83,19 +128,25 @@ where
             Ok(response) => {
                 let status = response.status();
                 if let Some(reason) = retry_reason_from_status(status) {
-                    if retries >= MAX_HTTP_RETRIES {
+                    if retries >= max_retries {
                         tracing::warn!(
                             service = service_name,
                             operation = operation_name,
                             status = %status,
                             retries,
-                            max_retries = MAX_HTTP_RETRIES,
+                            max_retries,
                             "HTTP retries exhausted after retryable response"
                         );
+                        if permit.is_some() {
+                            telemetry::dec_connector_inflight_requests(&dimensions);
+                        }
                         return Ok(response);
                     }
 
                     retries += 1;
+                    if let Some(counter) = retry_counter {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let retry_after = retry_after_duration(response.headers());
                     let backoff =
                         next_backoff(reason, &mut transient_backoff, &mut rate_limit_backoff);
@@ -105,7 +156,7 @@ where
                         service = service_name,
                         operation = operation_name,
                         attempt = retries,
-                        max_retries = MAX_HTTP_RETRIES,
+                        max_retries,
                         status = %status,
                         retry_after = ?retry_after,
                         delay = ?delay,
@@ -114,11 +165,17 @@ where
 
                     drain_response_body(response, service_name, operation_name, retries, status)
                         .await;
+                    if permit.is_some() {
+                        telemetry::dec_connector_inflight_requests(&dimensions);
+                    }
                     drop(permit);
                     tokio::time::sleep(delay).await;
                     continue;
                 }
 
+                if permit.is_some() {
+                    telemetry::dec_connector_inflight_requests(&dimensions);
+                }
                 return Ok(response);
             }
             Err(error) => {
@@ -126,31 +183,40 @@ where
                     return Err(error);
                 };
 
-                if retries >= MAX_HTTP_RETRIES {
+                if retries >= max_retries {
                     tracing::warn!(
                         service = service_name,
                         operation = operation_name,
                         retries,
-                        max_retries = MAX_HTTP_RETRIES,
+                        max_retries,
                         error = %error,
                         "HTTP retries exhausted after transient request failure"
                     );
+                    if permit.is_some() {
+                        telemetry::dec_connector_inflight_requests(&dimensions);
+                    }
                     return Err(error);
                 }
 
                 retries += 1;
+                if let Some(counter) = retry_counter {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 let delay = next_backoff(reason, &mut transient_backoff, &mut rate_limit_backoff);
 
                 tracing::warn!(
                     service = service_name,
                     operation = operation_name,
                     attempt = retries,
-                    max_retries = MAX_HTTP_RETRIES,
+                    max_retries,
                     delay = ?delay,
                     error = %error,
                     "Retrying HTTP request after transient request failure"
                 );
 
+                if permit.is_some() {
+                    telemetry::dec_connector_inflight_requests(&dimensions);
+                }
                 drop(permit);
                 tokio::time::sleep(delay).await;
             }

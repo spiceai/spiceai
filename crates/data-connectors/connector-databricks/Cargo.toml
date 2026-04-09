@@ -29,6 +29,8 @@ data_components = { path = "../../data_components", features = ["databricks"] }
 datafusion.workspace = true
 futures.workspace = true
 linkme.workspace = true
+opentelemetry.workspace = true
+parking_lot.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime", features = ["databricks"] }
 runtime-secrets = { path = "../../runtime-secrets", default-features = false }

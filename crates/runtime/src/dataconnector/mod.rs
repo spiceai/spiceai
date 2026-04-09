@@ -371,6 +371,38 @@ pub enum DataConnectorError {
         dataconnector: String,
         keyword: String,
     },
+
+    #[snafu(display(
+        "Insufficient permissions to access the {connector_component} ({dataconnector}). {source}"
+    ))]
+    InsufficientPermissions {
+        dataconnector: String,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+impl DataConnectorError {
+    /// Returns `true` if this error is transient and the operation may succeed
+    /// on retry. Configuration errors, permission errors, and unsupported
+    /// type/table errors are permanent and should not be retried.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        !matches!(
+            self,
+            Self::InvalidConfiguration { .. }
+                | Self::InvalidConfigurationSourceOnly { .. }
+                | Self::InvalidConfigurationNoSource { .. }
+                | Self::InvalidConnectorType { .. }
+                | Self::InvalidGlobPattern { .. }
+                | Self::InvalidTableName { .. }
+                | Self::UnsupportedTypeAction { .. }
+                | Self::UnsupportedDataType { .. }
+                | Self::OdbcNotInstalled { .. }
+                | Self::UseOfProtectedKeyword { .. }
+                | Self::InsufficientPermissions { .. }
+        )
+    }
 }
 
 pub type Result<T, E = DataConnectorError> = std::result::Result<T, E>;

@@ -28,6 +28,7 @@ use crate::token_providers::databricks::{
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::RefreshableCatalogProvider;
+use data_components::databricks::sql_warehouse::SqlWarehouseConfig;
 use data_components::databricks::{DatabricksSparkConnect, DatabricksSqlWarehouse};
 use data_components::delta_lake::DeltaTableFactory;
 use data_components::unity_catalog::CatalogId;
@@ -83,6 +84,24 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("sql_warehouse_id")
         .secret()
         .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'"),
+
+    // Connection / resilience tuning (sql_warehouse mode)
+    ParameterSpec::runtime("max_concurrent_requests")
+        .description("Maximum number of concurrent HTTP requests to the SQL Warehouse API.")
+        .default("8"),
+    ParameterSpec::runtime("http_max_retries")
+        .description("Maximum number of HTTP-level retries for transient failures (429, 5xx).")
+        .default("3"),
+    ParameterSpec::runtime("backoff_method")
+        .description("Backoff strategy for transient HTTP retries.")
+        .one_of(&["fibonacci", "exponential"])
+        .default("fibonacci"),
+    ParameterSpec::runtime("statement_max_retries")
+        .description("Maximum number of poll retries when waiting for async statement completion.")
+        .default("14"),
+    ParameterSpec::runtime("disable_on_permanent_error")
+        .description("When true, non-retryable errors (401, 403, 404) permanently disable the connector to prevent a thundering herd of failed requests.")
+        .default("true"),
 
     // Databricks M2M Service Principal credentials
     ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
@@ -248,14 +267,19 @@ impl CatalogConnector for Databricks {
             )
             .await?;
 
-            let read_provider =
-                DatabricksSqlWarehouse::new(endpoint, sql_warehouse_id, token_provider).map_err(
-                    |source| super::Error::UnableToGetCatalogProvider {
-                        connector: "databricks".to_string(),
-                        source: source.into(),
-                        connector_component: ConnectorComponent::from(catalog),
-                    },
-                )?;
+            let config = build_sql_warehouse_config(&params);
+
+            let read_provider = DatabricksSqlWarehouse::with_config(
+                endpoint,
+                sql_warehouse_id,
+                token_provider,
+                config,
+            )
+            .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                connector: "databricks".to_string(),
+                source: source.into(),
+                connector_component: ConnectorComponent::from(catalog),
+            })?;
 
             (
                 Arc::new(read_provider) as Arc<dyn Read>,
@@ -385,6 +409,36 @@ async fn create_token_provider_for_catalog(
                 })
         }
     }
+}
+
+fn build_sql_warehouse_config(params: &Parameters) -> SqlWarehouseConfig {
+    let mut config = SqlWarehouseConfig::default();
+
+    if let Some(v) = params.get("max_concurrent_requests").expose().ok() {
+        if let Ok(n) = v.parse::<usize>() {
+            config.max_concurrent_requests = n;
+        }
+    }
+    if let Some(v) = params.get("http_max_retries").expose().ok() {
+        if let Ok(n) = v.parse::<usize>() {
+            config.http_max_retries = n;
+        }
+    }
+    if let Some(v) = params.get("backoff_method").expose().ok() {
+        if let Ok(m) = v.parse::<util::retry_strategy::BackoffMethod>() {
+            config.backoff_method = m;
+        }
+    }
+    if let Some(v) = params.get("statement_max_retries").expose().ok() {
+        if let Ok(n) = v.parse::<usize>() {
+            config.statement_max_retries = n;
+        }
+    }
+    if let Some(v) = params.get("disable_on_permanent_error").expose().ok() {
+        config.disable_on_permanent_error = v != "false";
+    }
+
+    config
 }
 
 #[cfg(test)]
