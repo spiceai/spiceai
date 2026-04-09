@@ -20,6 +20,7 @@ The workflow is triggered manually via `workflow_dispatch` with the following in
 - **platforms**: Platforms to publish (default: `linux/amd64,linux/arm64`)
 - **publish_docker**: Whether to publish Docker images (default: `true`)
 - **publish_helm**: Whether to publish Helm chart (default: `true`)
+- **allowed_account_ids**: Comma-separated AWS account IDs to grant read-only pull access (defaults to a pre-configured allowlist; set to empty to skip)
 
 ## What the Workflow Does
 
@@ -40,6 +41,9 @@ The workflow is triggered manually via `workflow_dispatch` with the following in
    - Changes description to "Spice.ai Enterprise"
 2. Packages the modified chart
 3. Pushes to ECR OCI registry: `oci://709825985650.dkr.ecr.us-east-1.amazonaws.com/spice-ai/`
+
+### ECR Pull Access Policy
+The workflow sets an ECR repository policy granting read-only pull access (`ecr:GetDownloadUrlForLayer`, `ecr:BatchGetImage`, `ecr:BatchCheckLayerAvailability`, `ecr:DescribeImages`) to each AWS account in `allowed_account_ids`. A pre-configured allowlist is applied by default. To skip setting the policy, clear the `allowed_account_ids` input. The policy is merged with any existing repository policy (preserving statements with different Sids). Account IDs must be 12-digit numbers, comma-separated (e.g., `123456789012,987654321098`). See [AWS Marketplace ECR: Controlling Access and Permissions](https://aws.amazon.com/blogs/awsmarketplace/aws-marketplace-ecr-controlling-access-and-permissions/) for background.
 
 ## Example Usage
 
