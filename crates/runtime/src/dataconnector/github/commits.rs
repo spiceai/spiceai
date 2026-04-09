@@ -230,16 +230,15 @@ impl CommitsTableProvider {
             }
         }
 
-        if !requested_ref.starts_with("refs/") {
-            if let Some(candidate_ref) = resolve_requested_ref_candidates(
+        if !requested_ref.starts_with("refs/")
+            && let Some(candidate_ref) = resolve_requested_ref_candidates(
                 requested_ref,
                 &self.fetch_repository_refs().await?,
             )
             .into_iter()
             .next()
-            {
-                return Ok(candidate_ref);
-            }
+        {
+            return Ok(candidate_ref);
         }
 
         Ok(requested_ref.to_string())
@@ -587,17 +586,6 @@ fn resolve_requested_ref_candidates(requested_ref: &str, refs: &[GithubRef]) -> 
     });
     candidate_refs.dedup();
     candidate_refs
-}
-
-fn is_resource_not_found_error(error: &(dyn std::error::Error + 'static)) -> bool {
-    error
-        .downcast_ref::<data_components::graphql::Error>()
-        .is_some_and(|graphql_error| {
-            matches!(
-                graphql_error,
-                data_components::graphql::Error::ResourceNotFound { .. }
-            )
-        })
 }
 
 fn validate_dynamic_ref_scan(
