@@ -6,7 +6,7 @@ description: "SELECT id, answer, trunc(_score, 3) as _score FROM text_search(qs,
 | plan_type     | plan                                                                                                                                                                 |
 +---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | logical_plan  | Sort: _score DESC NULLS FIRST, fetch=4                                                                                                                               |
-|               |   Projection: text_search(qs, Utf8("secondary")).id, text_search(qs, Utf8("secondary")).answer, trunc(text_search(qs, Utf8("secondary"))._score, Int64(3)) AS _score |
+|               |   Projection: text_search(qs, Utf8("secondary")).id, text_search(qs, Utf8("secondary")).answer, trunc(text_search(qs, Utf8("secondary"))._score, Int64(2)) AS _score |
 |               |     TableScan: text_search(qs, Utf8("secondary")) projection=[_score, answer, id], full_filters=[text_search(qs, Utf8("secondary")).subject != Utf8("math")]         |
 | physical_plan | SortPreservingMergeExec: [_score@2 DESC], fetch=4                                                                                                                    |
 |               |   SortExec: TopK(fetch=4), expr=[_score@2 DESC], preserve_partitioning=[true]                                                                                        |
