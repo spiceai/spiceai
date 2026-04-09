@@ -31,17 +31,21 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use arrow_ipc::writer::StreamWriter;
 use data_components::flightsql::FlightSqlClient;
 
-use datafusion::sql::{
-    TableReference,
-    sqlparser::{
-        ast::{Ident, ObjectNamePart, visit_relations_mut},
-        dialect::PostgreSqlDialect,
-        parser::Parser,
+use datafusion::{
+    prelude::Expr,
+    sql::{
+        TableReference,
+        sqlparser::{
+            ast::{Ident, ObjectNamePart, visit_relations_mut},
+            dialect::PostgreSqlDialect,
+            parser::Parser,
+        },
     },
 };
 
 use ballista_core::serde::protobuf::{ExecutorStoppedParams, scheduler_grpc_server::SchedulerGrpc};
 
+use datafusion_proto::bytes::Serializeable;
 use flight_client::cookie::{CookieService, CookieStore};
 use flight_client::{MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -57,7 +61,8 @@ use runtime_proto::{
 };
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
-use std::collections::HashMap;
+use spicepod::component::runtime;
+use std::collections::{HashMap, HashSet};
 use std::task::{Context, Poll};
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::mpsc;
@@ -69,13 +74,12 @@ use tonic::{
     transport::{ClientTlsConfig, Endpoint},
 };
 
+use crate::cluster::partition::dataset_status::evaluate_dataset_readiness;
 use crate::cluster::{
-    SchedulerPeers, executor_registry::ExecutorRegistry, partition::allocate_initial_partitions,
+    executor_registry::{ExecutorRegistry, TablePartitions},
+    {SchedulerPeers, partition::partition_value_to_bytes},
 };
-use crate::datafusion::{
-    DataFusion, SPICE_RUNTIME_SCHEMA,
-    cayenne_ddl::{create_table_if_not_exists, physical_plans::forward_sql_to_executor},
-};
+use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::metrics_reader::MetricsReader;
 use crate::task_history::{DEFAULT_TASK_HISTORY_TABLE, LOCAL_TASK_HISTORY_TABLE};
 
@@ -181,11 +185,14 @@ pub struct ClusterServiceImpl {
     metrics_reader: Option<MetricsReader>,
     /// Registry of connected executor streams for [`PollNow`] broadcasts.
     executor_streams: ExecutorControlStreamRegistry,
+    /// Runtime status for updating dataset statuses on the scheduler.
+    runtime_status: Arc<crate::status::RuntimeStatus>,
 }
 
 impl ClusterServiceImpl {
     /// Creates a new cluster service implementation.
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         app: Arc<TokioRwLock<Option<Arc<App>>>>,
         secrets: Arc<TokioRwLock<Secrets>>,
@@ -194,6 +201,7 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
+        runtime_status: Arc<crate::status::RuntimeStatus>,
     ) -> Self {
         Self {
             app,
@@ -204,6 +212,7 @@ impl ClusterServiceImpl {
             executor_registry,
             metrics_reader,
             executor_streams: ExecutorControlStreamRegistry::new(),
+            runtime_status,
         }
     }
 
@@ -222,6 +231,7 @@ impl ClusterServiceImpl {
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
         executor_streams: ExecutorControlStreamRegistry,
+        runtime_status: Arc<crate::status::RuntimeStatus>,
     ) -> Self {
         Self {
             app,
@@ -231,8 +241,8 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
-
             executor_streams,
+            runtime_status,
         }
     }
 
@@ -470,9 +480,12 @@ impl ClusterService for ClusterServiceImpl {
         // Spawn a task to handle the bidirectional stream.
         let executor_registry = Arc::clone(&self.executor_registry);
         let datafusion = Arc::clone(&self.datafusion);
+        let runtime_status = Arc::clone(&self.runtime_status);
         let outbound_tx_for_registry = outbound_tx.clone();
+        let outbound_tx_for_task = outbound_tx.clone();
         let metrics_node_id = self.advertise_address.clone();
         let inbound_task = tokio::spawn(async move {
+            let outbound_tx = outbound_tx_for_task;
             let executor_id = match inbound.next().await {
                 Some(Ok(msg)) => {
                     let executor_id = msg.executor_id.clone();
@@ -484,7 +497,15 @@ impl ClusterService for ClusterServiceImpl {
 
                     // Handle the first message if it contains data.
                     if let Some(message) = msg.message {
-                        handle_executor_message(&executor_id, &message, &datafusion).await;
+                        handle_executor_message(
+                            &executor_id,
+                            &message,
+                            &datafusion,
+                            &executor_registry,
+                            &runtime_status,
+                            &outbound_tx,
+                        )
+                        .await;
                     }
                     executor_id
                 }
@@ -536,6 +557,9 @@ impl ClusterService for ClusterServiceImpl {
                                             &executor_id,
                                             &message,
                                             &datafusion,
+                                            &executor_registry,
+                                            &runtime_status,
+                                            &outbound_tx,
                                         )
                                         .await;
                                     }
@@ -591,89 +615,120 @@ impl ClusterService for ClusterServiceImpl {
         };
 
         let tls_config_opt = self.datafusion.cluster_config.client_tls_config().cloned();
-        let client = create_executor_flight_client(&executor_url, tls_config_opt)
-            .inspect_err(|e| {
+        match create_executor_flight_client(&executor_url, tls_config_opt) {
+            Ok(client) => {
+                let mut flight_client_registry =
+                    self.executor_registry.flight_sql_clients.write().await;
+                flight_client_registry.insert(executor_id.to_string(), client);
+            }
+            Err(e) => {
                 tracing::warn!(
                     "Failed to create Flight SQL client for executor {executor_id}: {e}"
                 );
-            })
-            .map_err(|e| Status::internal(format!("Failed to create Flight SQL client: {e}")))?;
-        {
-            let mut flight_client_registry =
-                self.executor_registry.flight_sql_clients.write().await;
-            flight_client_registry.insert(executor_id.to_string(), client.clone());
+            }
         }
 
-        // Forward `CREATE TABLE IF NOT EXISTS` DDL to executor, including PARTITION BY
-        // when the table has a partition expression in the Cayenne metadata catalog.
-        #[cfg(not(windows))]
-        for table_ref in discover_cayenne_tables(&self.datafusion).await {
-            if let Some(table) = self.datafusion.get_table(&table_ref).await {
-                let resolved = table_ref.clone().resolve(
-                    crate::datafusion::SPICE_DEFAULT_CATALOG,
-                    crate::datafusion::SPICE_DEFAULT_SCHEMA,
-                );
-                let partition_expr_str = match self.datafusion.ctx.catalog(&resolved.catalog) {
-                    Some(cat) => {
-                        if let Some(pa) =
-                            crate::datafusion::cayenne_ddl::as_partition_aware(cat.as_ref())
-                        {
-                            match pa
-                                .table_partition_expr(&resolved.schema, &resolved.table)
-                                .await
+        let mut table_partitions: HashMap<String, BytesArray> = HashMap::new();
+
+        let partition_manager = self.executor_registry().accelerations_partition_manager();
+        let app_guard = self.app.read().await;
+        let mut total_assigned: usize = 0;
+        if let Some(app) = app_guard.as_ref() {
+            let max_partitions_per_executor = app.runtime.scheduler.as_ref().map_or(
+                runtime::PartitionManagement::default().max_partitions_per_executor,
+                runtime::Scheduler::max_partitions_per_executor,
+            );
+
+            // Find accelerated datasets with partitioning
+            for table_ref in super::partition::accelerated_tables(app).keys() {
+                if total_assigned >= max_partitions_per_executor {
+                    tracing::debug!(
+                        "Executor {executor_id} reached max_partitions_per_executor ({max_partitions_per_executor}) during initial allocation, skipping remaining tables"
+                    );
+                    break;
+                }
+                let remaining = max_partitions_per_executor.saturating_sub(total_assigned);
+
+                if partition_manager
+                    .get_cached_table_metadata(table_ref)
+                    .is_none()
+                {
+                    tracing::info!(
+                        "No cached partition metadata for table {table_ref}. Scheduler likely has not finished discovering partitions for the table. Will not assign in initial allocation, but will get assigned on future assignments"
+                    );
+                    continue;
+                }
+                match partition_manager
+                    .allocate_partitions(table_ref, executor_id, remaining)
+                    .await
+                {
+                    Ok(result) => {
+                        let newly_assigned = result.newly_assigned.len();
+                        let partitions = result.all_assigned();
+                        if partitions.is_empty() {
+                            continue;
+                        }
+                        let mut items = Vec::with_capacity(partitions.len());
+                        for partition in &partitions {
+                            match partition_value_to_bytes(
+                                partition.clone(),
+                                table_ref,
+                                &self.datafusion,
+                            )
+                            .await
                             {
-                                Ok(expr) => expr,
+                                Ok(bytes) => items.push(bytes.to_vec()),
                                 Err(e) => {
-                                    tracing::warn!(
-                                        "Failed to read partition expression for {table_ref}: {e}"
+                                    tracing::error!(
+                                        "Failed to serialize partition expression for table {table_ref}: {e}"
                                     );
-                                    None
                                 }
                             }
-                        } else {
-                            None
                         }
+                        total_assigned += newly_assigned;
+                        table_partitions.insert(table_ref.to_string(), BytesArray { items });
                     }
-                    None => None,
-                };
-
-                let ddl_sql = match create_table_if_not_exists(
-                    &table_ref,
-                    &table,
-                    partition_expr_str.as_deref(),
-                ) {
-                    Ok(sql) => sql,
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to generate DDL for table {table_ref}, skipping: {e}"
+                        tracing::error!(
+                            "Failed to allocate partitions for table {table_ref} to executor {executor_id}: {e}",
                         );
-                        continue;
                     }
-                };
-                if let Err(e) = forward_sql_to_executor(client.clone(), &ddl_sql).await {
-                    tracing::warn!(
-                        "Failed to apply DDL for table {table_ref} to executor {executor_id}, skipping: {e}"
-                    );
                 }
             }
         }
 
-        let app_guard = self.app.read().await;
-        let mut table_partitions: HashMap<String, BytesArray> = HashMap::new();
-        if let Some(app) = app_guard.as_ref() {
-            match allocate_initial_partitions(
-                executor_id,
-                &self.executor_registry().accelerations_partition_manager(),
-                app,
-                &self.datafusion,
-            )
-            .await
-            {
-                Ok(p) => table_partitions = p,
-                Err(e) => {
-                    tracing::warn!("Failed to allocate partitions to executor {executor_id}: {e}");
-                }
+        // Register the allocated partitions in the executor registry so the scheduler knows where they are
+        {
+            let registry = self.datafusion.ctx.as_ref();
+            let mut partition_map: TablePartitions = table_partitions
+                .iter()
+                .map(|(tbl, sa)| {
+                    let exprs = sa
+                        .items
+                        .iter()
+                        .filter_map(
+                            |bytes| match Expr::from_bytes_with_registry(bytes, registry) {
+                                Ok(expr) => Some(expr),
+                                Err(e) => {
+                                    tracing::error!("Failed to deserialize expr: {e}");
+                                    None
+                                }
+                            },
+                        )
+                        .collect();
+                    (TableReference::parse_str(tbl), exprs)
+                })
+                .collect();
+
+            // Register Cayenne tables as single unpartitioned entries (empty filter expressions).
+            // This tells the scheduler that queries targeting these tables should be forwarded to this executor.
+            #[cfg(not(windows))]
+            for table_ref in discover_cayenne_tables(&self.datafusion).await {
+                partition_map.entry(table_ref).or_default();
             }
+
+            let mut executor_partitions = self.executor_registry.partitions.write().await;
+            executor_partitions.insert(executor_id.to_string(), partition_map);
         }
 
         Ok(Response::new(AllocateInitialPartitionsResponse {
@@ -707,11 +762,14 @@ fn create_executor_flight_client(
     ))
 }
 
-/// Handles an executor control message (heartbeat, shutdown, etc.)
+/// Handles an executor control message (heartbeat, shutdown, component status update, etc.)
 async fn handle_executor_message(
     executor_id: &str,
     message: &ExecutorMessage,
     datafusion: &DataFusion,
+    executor_registry: &ExecutorRegistry,
+    runtime_status: &Arc<crate::status::RuntimeStatus>,
+    outbound_tx: &mpsc::Sender<SchedulerControlMessage>,
 ) {
     match message {
         ExecutorMessage::Heartbeat(heartbeat) => {
@@ -719,6 +777,42 @@ async fn handle_executor_message(
                 "Received heartbeat from executor {executor_id}: timestamp_ms={}",
                 heartbeat.timestamp_ms
             );
+        }
+        ExecutorMessage::ComponentStatus(update) => {
+            tracing::debug!(
+                "Received ComponentStatusUpdate from executor {executor_id}: component={}, status={}, update_id={}",
+                update.component_name,
+                update.status,
+                update.update_id
+            );
+            let status = crate::cluster::proto_conv::component_status_from_proto(update.status);
+
+            // Extract dataset name from "dataset:xxx" component_name
+            if let Some(dataset_name) = update.component_name.strip_prefix("dataset:") {
+                executor_registry
+                    .update_executor_dataset_status(executor_id, dataset_name, status)
+                    .await;
+                evaluate_dataset_readiness(
+                    dataset_name,
+                    &executor_registry.accelerations_partition_manager(),
+                    runtime_status,
+                    &executor_registry.get_executor_dataset_statuses().await,
+                );
+            }
+
+            // Send ack
+            let ack = SchedulerControlMessage {
+                message: Some(
+                    runtime_proto::scheduler_control_message::Message::ComponentStatusAck(
+                        runtime_proto::ComponentStatusAck {
+                            update_id: update.update_id.clone(),
+                        },
+                    ),
+                ),
+            };
+            if let Err(e) = outbound_tx.send(ack).await {
+                tracing::debug!("Failed to send ComponentStatusAck to executor {executor_id}: {e}");
+            }
         }
         ExecutorMessage::Metrics(_) => {
             // Metrics responses are handled separately in the stream handler
@@ -779,71 +873,69 @@ async fn notify_scheduler_executor_shutdown(
 }
 /// Discovers all Cayenne table references registered in the `DataFusion` catalog.
 ///
-/// Iterates through all catalogs, identifies Cayenne-backed catalogs, and queries
-/// the underlying metadata catalog to discover all tables — including those not yet
-/// loaded into the in-memory schema cache.
+/// Iterates through all catalogs, identifies Cayenne-backed catalogs, and returns
+/// fully qualified [`TableReference`]s for each table found. These are used to
+/// register unpartitioned entries in the executor's partition map so that queries
+/// for Cayenne tables are forwarded to the executor.
 #[cfg(not(windows))]
 async fn discover_cayenne_tables(datafusion: &DataFusion) -> Vec<TableReference> {
+    use crate::datafusion::cayenne_ddl::is_cayenne_catalog;
     use cayenne::CayenneSchemaProvider;
 
     let mut tables = Vec::new();
-
-    for c_name in &datafusion.ctx.catalog_names() {
-        let Some(catalog) = datafusion.ctx.catalog(c_name) else {
+    let mut seen = HashSet::new();
+    for catalog_name in datafusion.ctx.catalog_names() {
+        let Some(catalog) = datafusion.ctx.catalog(&catalog_name) else {
             continue;
         };
-        if !crate::datafusion::cayenne_ddl::is_cayenne_catalog(catalog.as_ref()) {
+        if !is_cayenne_catalog(catalog.as_ref()) {
             continue;
         }
-
-        for s_name in &catalog.schema_names() {
-            let Some(schema) = catalog.schema(s_name) else {
+        for schema_name in catalog.schema_names() {
+            let Some(schema) = catalog.schema(&schema_name) else {
                 continue;
             };
 
-            // Attempt to downcast to CayenneSchemaProvider to query the metadata catalog
-            // for all table names, including those not yet loaded into the in-memory cache.
+            // Prefer metadata-catalog discovery to avoid relying on in-memory schema cache.
             if let Some(cayenne_schema) = schema.as_any().downcast_ref::<CayenneSchemaProvider>() {
-                let ns_prefix = format!("{}/", cayenne_schema.namespace());
+                let namespace_prefix = format!("{}/", cayenne_schema.namespace());
                 match cayenne_schema.metadata_catalog().list_table_names().await {
-                    Ok(full_names) => {
-                        for full_name in &full_names {
-                            if let Some(short_name) = full_name.strip_prefix(&ns_prefix) {
-                                tables.push(TableReference::full(
-                                    c_name.as_str(),
-                                    s_name.as_str(),
-                                    short_name,
-                                ));
+                    Ok(all_table_names) => {
+                        for full_name in all_table_names {
+                            let Some(short_name) = full_name.strip_prefix(&namespace_prefix) else {
+                                continue;
+                            };
+                            let key = (
+                                catalog_name.clone(),
+                                schema_name.clone(),
+                                short_name.to_string(),
+                            );
+                            if seen.insert(key.clone()) {
+                                tables.push(TableReference::full(key.0, key.1, key.2));
                             }
                         }
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "Failed to list Cayenne tables for schema {c_name}.{s_name}: {e}"
+                            "Failed to list Cayenne metadata tables for {catalog_name}.{schema_name}: {e}"
                         );
-                        // Fall back to in-memory cache
-                        for t in &schema.table_names() {
-                            tables.push(TableReference::full(
-                                c_name.as_str(),
-                                s_name.as_str(),
-                                t.as_str(),
-                            ));
-                        }
                     }
                 }
-            } else {
-                // Not a CayenneSchemaProvider; use the default table_names()
-                for t in &schema.table_names() {
-                    tables.push(TableReference::full(
-                        c_name.as_str(),
-                        s_name.as_str(),
-                        t.as_str(),
-                    ));
+                continue;
+            }
+
+            for table_name in schema.table_names() {
+                let key = (
+                    catalog_name.clone(),
+                    schema_name.clone(),
+                    table_name.clone(),
+                );
+                if seen.insert(key.clone()) {
+                    tables.push(TableReference::full(key.0, key.1, key.2));
                 }
             }
         }
     }
-
     tables
 }
 

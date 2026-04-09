@@ -68,6 +68,9 @@ pub(crate) mod sink;
 mod snapshots;
 mod synchronized_table;
 mod timestamp_metrics_utils;
+pub mod write_through;
+
+pub(crate) use write_through::WriteMode;
 
 pub use refresh_task_runner::RefreshTaskRunner;
 pub use snapshots::SnapshotCreationConfig;
@@ -239,9 +242,8 @@ pub struct AcceleratedTable {
     refresh_mode: RefreshMode,
     refresher: Arc<refresh::Refresher>,
     disable_federation: bool,
-    /// If true, writes only go to the accelerator table (not replicated to source).
-    /// This is set when `on_conflict` is configured - the accelerator handles writes locally.
-    write_to_accelerator_only: bool,
+    /// Controls where writes (INSERT INTO) are directed.
+    write_mode: WriteMode,
     synchronized_with: Option<SynchronizedTable>,
     /// Child accelerators that should receive cached data when this parent stores new cache entries (caching mode only)
     synchronized_children: Arc<RwLock<Vec<Arc<dyn TableProvider>>>>,
@@ -272,6 +274,7 @@ impl std::fmt::Debug for AcceleratedTable {
             .field("ready_state", &self.ready_state)
             .field("refresh_params", &self.refresh_params)
             .field("disable_federation", &self.disable_federation)
+            .field("write_mode", &self.write_mode)
             .field("synchronized_with", &self.synchronized_with)
             .finish_non_exhaustive()
     }
@@ -321,6 +324,7 @@ pub struct Builder {
     append_stream: Option<ChangesStream>,
     disable_federation: bool,
     write_to_accelerator_only: bool,
+    write_through: bool,
     refresh_semaphore: Option<Arc<Semaphore>>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
@@ -369,6 +373,7 @@ impl Builder {
             synchronize_with: None,
             disable_federation: false,
             write_to_accelerator_only: false,
+            write_through: false,
             initial_load_complete: false,
             refresh_semaphore: None,
             snapshot_creation_config: None,
@@ -434,6 +439,13 @@ impl Builder {
     /// This is used when `on_conflict` is configured - writes go only to the accelerator.
     pub fn write_to_accelerator_only(&mut self) -> &mut Self {
         self.write_to_accelerator_only = true;
+        self
+    }
+
+    /// Enable write-through mode: writes go simultaneously to both the federated source
+    /// and the local Cayenne accelerator using staged append/commit/rollback semantics.
+    pub fn write_through(&mut self) -> &mut Self {
+        self.write_through = true;
         self
     }
 
@@ -763,11 +775,16 @@ impl Builder {
 
         let (refresh_handle, refresh_trigger) =
             if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
-                // Accelerated tables aren't accelerated on scheduler. Immediately ready.
+                // Accelerated tables aren't accelerated on the scheduler. Don't mark
+                // the dataset as Ready yet. Register it as Initializing so it is
+                // tracked by the runtime status system and blocks /v1/ready until
+                // executors report their status back to the scheduler and
+                // evaluate_dataset_readiness promotes the distributed dataset to
+                // Ready.
+                self.runtime_status
+                    .update_dataset(&self.dataset_name, status::ComponentStatus::Initializing);
                 // Set refresh_trigger to None because the receiver will be dropped
                 // (refresher.start() is not called), making the channel dead.
-                self.runtime_status
-                    .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
                 // Notify immediately so schedule creation doesn't block waiting for
                 // a refresh that will never happen locally on the scheduler.
                 on_complete_notification.notify_waiters();
@@ -882,6 +899,14 @@ impl Builder {
             }
         }
 
+        let write_mode = if self.write_through {
+            WriteMode::resolve_write_through(&self.accelerator, &self.federated)?
+        } else if self.write_to_accelerator_only {
+            WriteMode::AcceleratorOnly
+        } else {
+            WriteMode::FederatedOnly
+        };
+
         Ok(AcceleratedTable {
             dataset_name: self.dataset_name,
             accelerator: self.accelerator,
@@ -894,7 +919,7 @@ impl Builder {
             refresh_mode,
             refresher,
             disable_federation: self.disable_federation,
-            write_to_accelerator_only: self.write_to_accelerator_only,
+            write_mode,
             synchronized_with: self.synchronize_with,
             synchronized_children: Arc::new(RwLock::new(Vec::new())),
             cache_ttl: self.caching_ttl,
@@ -991,6 +1016,11 @@ impl AcceleratedTable {
     #[must_use]
     pub fn get_federated_table_ref(&self) -> &Arc<FederatedTable> {
         &self.federated
+    }
+
+    #[must_use]
+    pub fn is_write_through(&self) -> bool {
+        self.write_mode.is_write_through()
     }
 
     #[must_use]
@@ -1279,21 +1309,35 @@ impl TableProvider for AcceleratedTable {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         self.update_last_updated_at();
 
-        // When on_conflict is configured, writes go only to the accelerator
-        // (the federated source may not support writes, e.g., file connector).
-        if self.write_to_accelerator_only {
-            let accelerated_insert_plan = self
-                .accelerator
-                .insert_into(state, input, overwrite)
-                .await?;
-            self.refresher().set_initial_load_completed(true);
-            return Ok(accelerated_insert_plan);
+        match &self.write_mode {
+            WriteMode::AcceleratorOnly => {
+                // When on_conflict is configured, writes go only to the accelerator
+                // (the federated source may not support writes, e.g., file connector).
+                let accelerated_insert_plan = self
+                    .accelerator
+                    .insert_into(state, input, overwrite)
+                    .await?;
+                self.refresher().set_initial_load_completed(true);
+                Ok(accelerated_insert_plan)
+            }
+            WriteMode::FederatedOnly => {
+                // Writes go to the federated source. The acceleration refresh
+                // mechanism will pick up the new data on its next cycle.
+                let federated_table = self.federated.table_provider().await;
+                federated_table.insert_into(state, input, overwrite).await
+            }
+            WriteMode::WriteThrough {
+                cayenne_target,
+                federated_provider,
+            } => write_through::insert_write_through(
+                input,
+                overwrite,
+                cayenne_target.as_ref(),
+                Arc::clone(federated_provider),
+                &self.refresher,
+                self.schema(),
+            ),
         }
-
-        // Writes go to the federated source. The acceleration refresh
-        // mechanism will pick up the new data on its next cycle.
-        let federated_table = self.federated.table_provider().await;
-        federated_table.insert_into(state, input, overwrite).await
     }
 }
 

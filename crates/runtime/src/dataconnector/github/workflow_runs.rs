@@ -157,7 +157,9 @@ fn extract_filter_column_value_op(expr: &Expr) -> Option<(Column, ScalarValue, O
 
 fn scalar_to_string(scalar: &ScalarValue) -> Option<String> {
     match scalar {
-        ScalarValue::Utf8(Some(s)) => Some(s.clone()),
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => Some(s.clone()),
         _ => None,
     }
 }
