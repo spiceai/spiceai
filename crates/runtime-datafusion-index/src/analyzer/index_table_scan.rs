@@ -497,8 +497,8 @@ impl ExecutionPlan for IndexerExec {
                                     let exp = schema_signature(schema_before.as_ref());
                                     let got = schema_signature(b.schema().as_ref());
                                     return Err(DataFusionError::Execution(format!(
-                                        "Index {} changed schema.\
-                                        Expected fields ({}): {}\
+                                        "Index {} changed schema. \
+                                        Expected fields ({}): {} \
                                         Got fields ({}): {}",
                                         idx.name(),
                                         schema_before.fields().len(),
