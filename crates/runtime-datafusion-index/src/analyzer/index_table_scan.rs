@@ -472,14 +472,32 @@ impl ExecutionPlan for IndexerExec {
         context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
         let schema = self.input_exec.schema();
+        let advertised_schema = Arc::clone(&schema);
         let indexes = self.indexes.clone();
         let stream = self
             .input_exec
             .execute(partition, Arc::clone(&context))?
             .and_then(move |batch| {
                 let indexes = indexes.clone();
+                let advertised_schema = Arc::clone(&advertised_schema);
                 async move {
                     let mut b = batch;
+
+                    // Verify the incoming batch fields match the advertised schema.
+                    // Uses fields-only comparison to tolerate metadata differences.
+                    if b.schema().fields() != advertised_schema.fields() {
+                        let exp = schema_signature(advertised_schema.as_ref());
+                        let got = schema_signature(b.schema().as_ref());
+                        return Err(DataFusionError::Execution(format!(
+                            "Input stream produced batch with unexpected schema. \
+                            Expected fields ({}): {} \
+                            Got fields ({}): {}",
+                            advertised_schema.fields().len(),
+                            exp,
+                            b.schema().fields().len(),
+                            got,
+                        )));
+                    }
 
                     // Each index consumes the record batch and produces a new record batch with
                     // the same schema. The indexes are executed in order, with the output of the
