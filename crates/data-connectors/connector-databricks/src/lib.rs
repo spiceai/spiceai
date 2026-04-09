@@ -267,7 +267,8 @@ impl Databricks {
                     }
                 };
 
-                let sql_warehouse_config = Self::build_sql_warehouse_config(&params);
+                let sql_warehouse_config =
+                    runtime::catalogconnector::databricks::build_sql_warehouse_config(&params);
 
                 let read_provider = DatabricksSqlWarehouse::with_config_and_semaphore(
                     endpoint,
@@ -566,86 +567,6 @@ impl Databricks {
         Arc::clone(&self.read_provider)
     }
 
-    /// Builds a [`SqlWarehouseConfig`] from the connector parameters.
-    fn build_sql_warehouse_config(params: &Parameters) -> sql_warehouse::SqlWarehouseConfig {
-        let mut config = sql_warehouse::SqlWarehouseConfig::default();
-
-        if let Some(v) = params.get("max_concurrent_requests").expose().ok() {
-            match v.parse::<usize>() {
-                Ok(0) => {
-                    tracing::warn!(
-                        parameter = "max_concurrent_requests",
-                        value = v,
-                        "Invalid Databricks SQL Warehouse config value; must be >= 1; using default"
-                    );
-                }
-                Ok(n) => config.max_concurrent_requests = n,
-                Err(source) => {
-                    tracing::warn!(
-                        parameter = "max_concurrent_requests",
-                        value = &v,
-                        %source,
-                        "Failed to parse Databricks SQL Warehouse config parameter; using default"
-                    );
-                }
-            }
-        }
-        if let Some(v) = params.get("http_max_retries").expose().ok() {
-            match v.parse::<usize>() {
-                Ok(n) => config.http_max_retries = n,
-                Err(source) => {
-                    tracing::warn!(
-                        parameter = "http_max_retries",
-                        value = &v,
-                        %source,
-                        "Failed to parse Databricks SQL Warehouse config parameter; using default"
-                    );
-                }
-            }
-        }
-        if let Some(v) = params.get("backoff_method").expose().ok() {
-            match v.parse::<util::retry_strategy::BackoffMethod>() {
-                Ok(m) => config.backoff_method = m,
-                Err(source) => {
-                    tracing::warn!(
-                        parameter = "backoff_method",
-                        value = &v,
-                        %source,
-                        "Failed to parse Databricks SQL Warehouse config parameter; using default"
-                    );
-                }
-            }
-        }
-        if let Some(v) = params.get("statement_max_retries").expose().ok() {
-            match v.parse::<usize>() {
-                Ok(n) => config.statement_max_retries = n,
-                Err(source) => {
-                    tracing::warn!(
-                        parameter = "statement_max_retries",
-                        value = &v,
-                        %source,
-                        "Failed to parse Databricks SQL Warehouse config parameter; using default"
-                    );
-                }
-            }
-        }
-        if let Some(v) = params.get("disable_on_permanent_error").expose().ok() {
-            match v.parse::<bool>() {
-                Ok(b) => config.disable_on_permanent_error = b,
-                Err(source) => {
-                    tracing::error!(
-                        parameter = "disable_on_permanent_error",
-                        value = &v,
-                        %source,
-                        "Failed to parse Databricks SQL warehouse config parameter as a boolean"
-                    );
-                }
-            }
-        }
-
-        config
-    }
-
     /// Validates that a Unity Catalog table is of a supported type and that the
     /// current principal has read permissions on it.
     ///
@@ -743,7 +664,7 @@ impl Databricks {
 /// Default maximum concurrent requests to the SQL Warehouse API.
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
 
-type SemaphoreRegistry = Arc<parking_lot::Mutex<HashMap<(String, String), Arc<Semaphore>>>>;
+type SemaphoreRegistry = Arc<parking_lot::Mutex<HashMap<(String, String), (Arc<Semaphore>, usize)>>>;
 
 #[derive(Default, Clone)]
 pub struct DatabricksFactory {
@@ -778,21 +699,19 @@ impl DatabricksFactory {
     ) -> Arc<Semaphore> {
         let key = (endpoint.to_string(), warehouse_id.to_string());
         let mut registry = self.semaphore_registry.lock();
-        let sem = Arc::clone(
-            registry
-                .entry(key)
-                .or_insert_with(|| Arc::new(Semaphore::new(max_concurrent))),
-        );
-        if sem.available_permits() != max_concurrent {
+        let (sem, configured_limit) = registry
+            .entry(key)
+            .or_insert_with(|| (Arc::new(Semaphore::new(max_concurrent)), max_concurrent));
+        if *configured_limit != max_concurrent {
             tracing::warn!(
                 endpoint = endpoint,
                 warehouse_id = warehouse_id,
                 requested = max_concurrent,
-                existing = sem.available_permits(),
+                existing = *configured_limit,
                 "Databricks concurrency semaphore already exists with a different limit; using existing semaphore"
             );
         }
-        sem
+        Arc::clone(sem)
     }
 }
 
