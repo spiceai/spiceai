@@ -1126,11 +1126,11 @@ mod test {
                 let b = batches.into_iter().next().expect("one batch");
                 let mut metadata = b.schema().metadata().clone();
                 metadata.insert("extra_key".to_string(), "extra_value".to_string());
-                let new_schema = Arc::new(
-                    Schema::new(b.schema().fields().to_vec()).with_metadata(metadata),
-                );
-                let columns: Vec<ArrayRef> =
-                    (0..b.num_columns()).map(|i| Arc::clone(b.column(i))).collect();
+                let new_schema =
+                    Arc::new(Schema::new(b.schema().fields().to_vec()).with_metadata(metadata));
+                let columns: Vec<ArrayRef> = (0..b.num_columns())
+                    .map(|i| Arc::clone(b.column(i)))
+                    .collect();
                 let out = RecordBatch::try_new(new_schema, columns)
                     .map_err(|e| DataFusionError::Execution(e.to_string()))?;
                 Ok(vec![out])
@@ -1149,7 +1149,10 @@ mod test {
 
         let df = ctx.table("metadata_diff_table").await.expect("valid");
         // Must succeed — metadata-only differences are benign.
-        let results = df.collect().await.expect("metadata-only difference should not error");
+        let results = df
+            .collect()
+            .await
+            .expect("metadata-only difference should not error");
         assert_eq!(results.len(), 1);
         assert_eq!(1, idx.compute_index_calls());
     }
