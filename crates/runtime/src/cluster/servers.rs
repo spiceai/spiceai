@@ -120,7 +120,6 @@ pub async fn start_internal_cluster_server(
             Arc::clone(&executor_registry),
             rt.metrics_reader().cloned(),
             executor_streams,
-            rt.status(),
         )
     } else {
         ClusterServiceImpl::new(
@@ -131,7 +130,6 @@ pub async fn start_internal_cluster_server(
             Arc::clone(&rt.df),
             Arc::clone(&executor_registry),
             rt.metrics_reader().cloned(),
-            rt.status(),
         )
     };
     let cluster_service_server = ClusterServiceServer::new(cluster_service);
