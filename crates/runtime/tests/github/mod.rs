@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use app::AppBuilder;
 
-use arrow::array::{Array, RecordBatch, StringArray};
+use arrow::array::{Array, Int64Array, ListArray, RecordBatch, StringArray};
 
 use datafusion::common::test_util::batches_to_string;
 use runtime::Runtime;
@@ -1315,6 +1315,182 @@ async fn test_github_pull_requests_schema_all_comments() -> Result<(), String> {
                         .map(arrow::array::RecordBatch::num_rows)
                         .sum::<usize>();
                     assert_eq!(total_rows, 22);
+                })),
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+/// Validates that `number`, `commits_count`, and `hashes` columns return correct data.
+/// `commits_count` should reflect the true total (not capped at the GraphQL page size of 25),
+/// and `hashes` should be a non-empty list for PRs with commits.
+#[tokio::test]
+async fn test_github_pull_requests_commits_and_number_columns() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    if !repo_github_secret_available("test_github_pull_requests_commits_and_number_columns").await {
+        return Ok(());
+    }
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("github_integration_test")
+                .with_dataset(make_github_dataset(
+                    &GithubDatasetType::RepoSpecific {
+                        owner: "spiceai".to_string(),
+                        repo: "cookbook".to_string(),
+                        query_type: "pulls".to_string(),
+                    },
+                    "auto",
+                    None,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Validate number, commits_count, and hashes columns
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_pull_requests_commits_and_number",
+                "SELECT number, commits_count, hashes FROM cookbook_pulls_auto LIMIT 5",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let mut total_rows = 0;
+                    for batch in &result_batches {
+                        total_rows += batch.num_rows();
+
+                        // number column (index 0) — Int64, should be non-null positive
+                        let numbers = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("number column should be Int64Array");
+                        for i in 0..numbers.len() {
+                            assert!(!numbers.is_null(i), "number should not be null");
+                            assert!(numbers.value(i) > 0, "PR number should be positive");
+                        }
+
+                        // commits_count column (index 1) — Int64, should be >= 1
+                        let commits_counts = batch
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("commits_count column should be Int64Array");
+                        for i in 0..commits_counts.len() {
+                            assert!(
+                                !commits_counts.is_null(i),
+                                "commits_count should not be null"
+                            );
+                            assert!(
+                                commits_counts.value(i) >= 1,
+                                "commits_count should be at least 1, got {}",
+                                commits_counts.value(i)
+                            );
+                        }
+
+                        // hashes column (index 2) — List of structs, should be non-null and non-empty
+                        let hashes = batch
+                            .column(2)
+                            .as_any()
+                            .downcast_ref::<ListArray>()
+                            .expect("hashes column should be ListArray");
+                        for i in 0..hashes.len() {
+                            assert!(!hashes.is_null(i), "hashes should not be null");
+                            assert!(
+                                !hashes.value(i).is_empty(),
+                                "hashes list should have at least one entry"
+                            );
+                        }
+                    }
+                    assert_eq!(total_rows, 5, "expected 5 rows from LIMIT 5");
+                })),
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+/// Validates that `commits_count` reports the true total count even when the query only
+/// fetches up to 25 commit hashes per PR. Uses spiceai/spiceai which has PRs with >25 commits.
+#[tokio::test]
+async fn test_github_pull_requests_commits_count_not_capped() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    if !repo_github_secret_available("test_github_pull_requests_commits_count_not_capped").await {
+        return Ok(());
+    }
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("github_integration_test")
+                .with_dataset(make_github_dataset(
+                    &GithubDatasetType::RepoSpecific {
+                        owner: "spiceai".to_string(),
+                        repo: "spiceai".to_string(),
+                        query_type: "pulls".to_string(),
+                    },
+                    "auto",
+                    None,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Find if any PR has commits_count > 25 (the GraphQL first: limit)
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_pull_requests_commits_count_not_capped",
+                "SELECT number, commits_count FROM spiceai_pulls_auto WHERE commits_count > 25 LIMIT 1",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let total_rows: usize = result_batches
+                        .iter()
+                        .map(arrow::array::RecordBatch::num_rows)
+                        .sum();
+                    assert!(
+                        total_rows >= 1,
+                        "expected at least one PR with commits_count > 25 in spiceai/spiceai"
+                    );
+
+                    let commits_counts = result_batches[0]
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("commits_count column should be Int64Array");
+                    assert!(
+                        commits_counts.value(0) > 25,
+                        "commits_count should be > 25, got {}",
+                        commits_counts.value(0)
+                    );
                 })),
             )
             .await?;
