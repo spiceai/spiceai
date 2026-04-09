@@ -429,7 +429,7 @@ pub fn build_sql_warehouse_config(params: &Parameters) -> SqlWarehouseConfig {
         match v.parse::<usize>() {
             Ok(n) => config.http_max_retries = n,
             Err(e) => {
-                tracing::warn!(parameter = "http_max_retries", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default")
+                tracing::warn!(parameter = "http_max_retries", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default");
             }
         }
     }
@@ -437,7 +437,7 @@ pub fn build_sql_warehouse_config(params: &Parameters) -> SqlWarehouseConfig {
         match v.parse::<util::retry_strategy::BackoffMethod>() {
             Ok(m) => config.backoff_method = m,
             Err(e) => {
-                tracing::warn!(parameter = "backoff_method", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default")
+                tracing::warn!(parameter = "backoff_method", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default");
             }
         }
     }
@@ -445,7 +445,7 @@ pub fn build_sql_warehouse_config(params: &Parameters) -> SqlWarehouseConfig {
         match v.parse::<usize>() {
             Ok(n) => config.statement_max_retries = n,
             Err(e) => {
-                tracing::warn!(parameter = "statement_max_retries", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default")
+                tracing::warn!(parameter = "statement_max_retries", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default");
             }
         }
     }
@@ -453,7 +453,7 @@ pub fn build_sql_warehouse_config(params: &Parameters) -> SqlWarehouseConfig {
         match v.parse::<bool>() {
             Ok(b) => config.disable_on_permanent_error = b,
             Err(e) => {
-                tracing::warn!(parameter = "disable_on_permanent_error", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default")
+                tracing::warn!(parameter = "disable_on_permanent_error", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default");
             }
         }
     }
