@@ -98,7 +98,7 @@ impl GraphQLContext for CommitsTableArgs {
                 filter
                     .context
                     .as_deref()
-                    .is_none_or(|context| !context.starts_with("ref:"))
+                    .is_none_or(|context| !context.starts_with("ref"))
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -240,26 +240,7 @@ impl CommitsTableProvider {
             }
         }
 
-        if !requested_ref.starts_with("refs/")
-            && let Some(candidate_ref) = resolve_requested_ref_candidates(
-                requested_ref,
-                &self.fetch_repository_refs().await?,
-            )
-            .into_iter()
-            .next()
-        {
-            return Ok(candidate_ref);
-        }
-
         Ok(requested_ref.to_string())
-    }
-
-    async fn fetch_repository_refs(
-        &self,
-    ) -> std::result::Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
-        self.rest_client
-            .fetch_qualified_refs(&self.table_args.owner, &self.table_args.repo)
-            .await
     }
 
     async fn fetch_repository_refs_bounded(
@@ -279,28 +260,8 @@ impl CommitsTableProvider {
             .fetch_repository_refs_bounded(MAX_DYNAMIC_REF_SCAN_REFS)
             .await?;
 
-        if filters
-            .iter()
-            .any(|expr| expr_references_ref(expr) && !expr_is_ref_only(expr))
-        {
-            return Ok(refs);
-        }
-
-        let ref_only_filters = filters
-            .iter()
-            .filter(|expr| expr_is_ref_only(expr))
-            .collect::<Vec<_>>();
-
-        if ref_only_filters.is_empty()
-            || !ref_only_filters
-                .iter()
-                .all(|expr| can_evaluate_ref_expr(expr))
-        {
-            return Ok(refs);
-        }
-
         refs.retain(|git_ref| {
-            ref_only_filters
+            filters
                 .iter()
                 .all(|expr| evaluate_ref_expr(expr, &git_ref.name).unwrap_or(true))
         });
@@ -411,6 +372,10 @@ impl TableProvider for CommitsTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        if limit == Some(0) {
+            return self.empty_scan_plan(projection);
+        }
+
         let pushdown_filters = filters
             .iter()
             .map(|filter| self.table_args.filter_pushdown(filter))
@@ -424,7 +389,6 @@ impl TableProvider for CommitsTableProvider {
         match ref_fetch_mode {
             RefFetchMode::Unsatisfiable => return self.empty_scan_plan(projection),
             RefFetchMode::Exact(requested_ref) => {
-                let _ = state;
                 return self
                     .scan_for_requested_ref(projection, filters, limit, &requested_ref)
                     .await;
@@ -544,19 +508,22 @@ fn history_query() -> &'static str {
 fn commits_filter_pushdown(expr: &Expr) -> FilterPushdownResult {
     if let Some((column, value, op)) = expr_to_match(expr)
         && column.name == "ref"
+        && op == Operator::Eq
     {
-        let ref_value = scalar_utf8_value(&value).filter(|v| !v.is_empty());
-        return match (op, ref_value) {
-            (Operator::Eq, Some(ref_value)) => FilterPushdownResult {
+        if let Some(ref_value) = scalar_utf8_value(&value).filter(|v| !v.is_empty()) {
+            return FilterPushdownResult {
                 filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Exact,
                 expr: expr.clone(),
                 context: Some(format!("ref:{ref_value}")),
-            },
-            _ => FilterPushdownResult {
-                filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Unsupported,
-                expr: expr.clone(),
-                context: None,
-            },
+            };
+        }
+    }
+
+    if expr_references_ref(expr) && expr_is_ref_only(expr) {
+        return FilterPushdownResult {
+            filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Inexact,
+            expr: expr.clone(),
+            context: Some("ref-dynamic".to_string()),
         };
     }
 
@@ -643,26 +610,6 @@ fn requested_ref_candidates(requested_ref: &str) -> Vec<String> {
     candidate_refs
 }
 
-fn resolve_requested_ref_candidates(requested_ref: &str, refs: &[GithubRef]) -> Vec<String> {
-    let mut candidate_refs = refs
-        .iter()
-        .filter(|git_ref| git_ref.name == requested_ref)
-        .map(|git_ref| git_ref.qualified_name.clone())
-        .collect::<Vec<_>>();
-
-    candidate_refs.sort_by_key(|qualified_name| {
-        if qualified_name.starts_with("refs/heads/") {
-            0
-        } else if qualified_name.starts_with("refs/tags/") {
-            1
-        } else {
-            2
-        }
-    });
-    candidate_refs.dedup();
-    candidate_refs
-}
-
 fn validate_dynamic_ref_scan(
     filters: &[Expr],
     limit: Option<usize>,
@@ -676,6 +623,12 @@ fn validate_dynamic_ref_scan(
     if !filters.iter().all(expr_is_ref_only) {
         return Err(DataFusionError::Execution(
             "GitHub commits dynamic ref scans only support predicates on ref. Add an exact ref = '<value>' predicate or remove additional filters.".to_string(),
+        ));
+    }
+
+    if !filters.iter().all(can_evaluate_ref_expr) {
+        return Err(DataFusionError::Execution(
+            "GitHub commits dynamic ref scans only support ref predicates built from = and != with AND/OR. Use an exact ref = '<value>' predicate for other expressions.".to_string(),
         ));
     }
 
@@ -1104,6 +1057,18 @@ mod tests {
     }
 
     #[test]
+    fn test_ref_filter_pushdown_uses_inexact_for_dynamic_ref_predicate() {
+        let expr = datafusion::prelude::col("ref").not_eq(datafusion::prelude::lit("trunk"));
+        let result = commits_filter_pushdown(&expr);
+
+        assert_eq!(
+            result.filter_pushdown,
+            datafusion::logical_expr::TableProviderFilterPushDown::Inexact
+        );
+        assert_eq!(result.context.as_deref(), Some("ref-dynamic"));
+    }
+
+    #[test]
     fn test_ref_fetch_mode_from_filters_supports_conjunctive_filter() {
         let filters = vec![FilterPushdownResult {
             filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Unsupported,
@@ -1204,47 +1169,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_requested_ref_candidates_prefers_qualified_branch_names() {
-        let refs = vec![
-            GithubRef {
-                name: "ashtom/fullsessionids".to_string(),
-                qualified_name: "refs/heads/ashtom/fullsessionids".to_string(),
-            },
-            GithubRef {
-                name: "v1.0.0".to_string(),
-                qualified_name: "refs/tags/v1.0.0".to_string(),
-            },
-        ];
-
-        assert_eq!(
-            resolve_requested_ref_candidates("ashtom/fullsessionids", &refs),
-            vec!["refs/heads/ashtom/fullsessionids".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_resolve_requested_ref_candidates_prefers_branches_before_tags() {
-        let refs = vec![
-            GithubRef {
-                name: "release".to_string(),
-                qualified_name: "refs/tags/release".to_string(),
-            },
-            GithubRef {
-                name: "release".to_string(),
-                qualified_name: "refs/heads/release".to_string(),
-            },
-        ];
-
-        assert_eq!(
-            resolve_requested_ref_candidates("release", &refs),
-            vec![
-                "refs/heads/release".to_string(),
-                "refs/tags/release".to_string()
-            ]
-        );
-    }
-
-    #[test]
     fn test_requested_ref_candidates_try_common_qualified_refs_first() {
         assert_eq!(
             requested_ref_candidates("release/1.11"),
@@ -1295,5 +1219,18 @@ mod tests {
             .expect_err("dynamic ref scans with non-ref filters should fail");
 
         assert!(err.to_string().contains("only support predicates on ref"));
+    }
+
+    #[test]
+    fn test_validate_dynamic_ref_scan_requires_evaluable_ref_filters() {
+        let filters = vec![datafusion::prelude::col("ref").is_not_null()];
+
+        let err = validate_dynamic_ref_scan(&filters, Some(125))
+            .expect_err("dynamic ref scans with unevaluable ref filters should fail");
+
+        assert!(
+            err.to_string()
+                .contains("only support ref predicates built from = and !=")
+        );
     }
 }
