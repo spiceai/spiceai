@@ -103,9 +103,7 @@ impl GraphQLContext for CommitsTableArgs {
                 filter
                     .context
                     .as_deref()
-                    .is_none_or(|context| {
-                        context != "ref-dynamic" && !context.starts_with("ref:")
-                    })
+                    .is_none_or(|context| context != "ref-dynamic" && !context.starts_with("ref:"))
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -1242,9 +1240,8 @@ mod tests {
 
     #[test]
     fn test_validate_dynamic_ref_scan_requires_limit() {
-        let filters = vec![
-            datafusion::prelude::col("ref").not_eq(datafusion::prelude::lit("trunk")),
-        ];
+        let filters =
+            vec![datafusion::prelude::col("ref").not_eq(datafusion::prelude::lit("trunk"))];
 
         let err = validate_dynamic_ref_scan(&filters, None)
             .expect_err("dynamic ref scans without LIMIT should fail");
