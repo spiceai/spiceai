@@ -229,9 +229,9 @@ pub(crate) enum TestCases {
     VectorSearchSqlRandom,
     VectorSearchSqlVectors,
     VectorSearchSqlIndexOnly,
-    /// Regression test for https://github.com/spiceai/spiceai/issues/10149
-    /// Tests the index-only path with a WHERE filter and pre_limit. The fix
-    /// places filters below the pre_limit so DataFusion can push them down
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/10149>
+    /// Tests the index-only path with a WHERE filter and `pre_limit`. The fix
+    /// places filters below the `pre_limit` so `DataFusion` can push them down
     /// into the search index scan.
     VectorSearchSqlFilteredIndexOnly,
 }
