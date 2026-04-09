@@ -568,18 +568,42 @@ impl Databricks {
             }
         }
         if let Some(v) = params.get("http_max_retries").expose().ok() {
-            if let Ok(n) = v.parse::<usize>() {
-                config.http_max_retries = n;
+            match v.parse::<usize>() {
+                Ok(n) => config.http_max_retries = n,
+                Err(e) => {
+                    tracing::warn!(
+                        parameter = "http_max_retries",
+                        value = v,
+                        error = %e,
+                        "Invalid Databricks SQL Warehouse config value; using default"
+                    );
+                }
             }
         }
         if let Some(v) = params.get("backoff_method").expose().ok() {
-            if let Ok(m) = v.parse::<util::retry_strategy::BackoffMethod>() {
-                config.backoff_method = m;
+            match v.parse::<util::retry_strategy::BackoffMethod>() {
+                Ok(m) => config.backoff_method = m,
+                Err(e) => {
+                    tracing::warn!(
+                        parameter = "backoff_method",
+                        value = v,
+                        error = %e,
+                        "Invalid Databricks SQL Warehouse config value; using default"
+                    );
+                }
             }
         }
         if let Some(v) = params.get("statement_max_retries").expose().ok() {
-            if let Ok(n) = v.parse::<usize>() {
-                config.statement_max_retries = n;
+            match v.parse::<usize>() {
+                Ok(n) => config.statement_max_retries = n,
+                Err(e) => {
+                    tracing::warn!(
+                        parameter = "statement_max_retries",
+                        value = v,
+                        error = %e,
+                        "Invalid Databricks SQL Warehouse config value; using default"
+                    );
+                }
             }
         }
         if let Some(v) = params.get("disable_on_permanent_error").expose().ok() {
@@ -729,11 +753,21 @@ impl DatabricksFactory {
     ) -> Arc<Semaphore> {
         let key = (endpoint.to_string(), warehouse_id.to_string());
         let mut registry = self.semaphore_registry.lock();
-        Arc::clone(
+        let sem = Arc::clone(
             registry
                 .entry(key)
                 .or_insert_with(|| Arc::new(Semaphore::new(max_concurrent))),
-        )
+        );
+        if sem.available_permits() != max_concurrent {
+            tracing::warn!(
+                endpoint = endpoint,
+                warehouse_id = warehouse_id,
+                requested = max_concurrent,
+                existing = sem.available_permits(),
+                "Databricks concurrency semaphore already exists with a different limit; using existing semaphore"
+            );
+        }
+        sem
     }
 }
 

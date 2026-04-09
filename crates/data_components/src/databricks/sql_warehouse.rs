@@ -849,7 +849,10 @@ impl SqlWarehouseApi {
             )
             .await
             .context(HttpRequestFailedSnafu)?;
-            self.check_permanent_http_error(response)
+            // Skip permanent-error detection for external chunk URLs (pre-signed
+            // storage links). A 403/404 here typically means an expired link,
+            // not broken credentials/warehouse configuration.
+            response
                 .error_for_status()
                 .context(HttpRequestFailedSnafu)?
                 .bytes()
