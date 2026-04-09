@@ -754,42 +754,6 @@ async fn handle_executor_message(
                 heartbeat.timestamp_ms
             );
         }
-        ExecutorMessage::ComponentStatus(update) => {
-            tracing::debug!(
-                "Received ComponentStatusUpdate from executor {executor_id}: component={}, status={}, update_id={}",
-                update.component_name,
-                update.status,
-                update.update_id
-            );
-            let status = crate::cluster::proto_conv::component_status_from_proto(update.status);
-
-            // Extract dataset name from "dataset:xxx" component_name
-            if let Some(dataset_name) = update.component_name.strip_prefix("dataset:") {
-                executor_registry
-                    .update_executor_dataset_status(executor_id, dataset_name, status)
-                    .await;
-                evaluate_dataset_readiness(
-                    dataset_name,
-                    &executor_registry.accelerations_partition_store(),
-                    runtime_status,
-                    &executor_registry.get_executor_dataset_statuses().await,
-                );
-            }
-
-            // Send ack
-            let ack = SchedulerControlMessage {
-                message: Some(
-                    runtime_proto::scheduler_control_message::Message::ComponentStatusAck(
-                        runtime_proto::ComponentStatusAck {
-                            update_id: update.update_id.clone(),
-                        },
-                    ),
-                ),
-            };
-            if let Err(e) = outbound_tx.send(ack).await {
-                tracing::debug!("Failed to send ComponentStatusAck to executor {executor_id}: {e}");
-            }
-        }
         ExecutorMessage::Metrics(_) => {
             // Metrics responses are handled separately in the stream handler
             // This shouldn't be reached, but log if it is
