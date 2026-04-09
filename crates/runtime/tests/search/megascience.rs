@@ -229,6 +229,11 @@ pub(crate) enum TestCases {
     VectorSearchSqlRandom,
     VectorSearchSqlVectors,
     VectorSearchSqlIndexOnly,
+    /// Regression test for https://github.com/spiceai/spiceai/issues/10149
+    /// Tests the index-only path with a WHERE filter and pre_limit. The fix
+    /// places filters below the pre_limit so DataFusion can push them down
+    /// into the search index scan.
+    VectorSearchSqlFilteredIndexOnly,
 }
 
 impl fmt::Display for TestCases {
@@ -245,6 +250,7 @@ impl fmt::Display for TestCases {
             TestCases::VectorSearchSqlRandom => "vector_search_sql_random",
             TestCases::VectorSearchSqlVectors => "vector_search_sql_vectors",
             TestCases::VectorSearchSqlIndexOnly => "vector_search_sql_index_only",
+            TestCases::VectorSearchSqlFilteredIndexOnly => "vector_search_sql_filtered_index_only",
         };
         write!(f, "{s}")
     }
@@ -264,6 +270,7 @@ impl TestCases {
             TestCases::VectorSearchSqlRandom,
             TestCases::VectorSearchSqlVectors,
             TestCases::VectorSearchSqlIndexOnly,
+            TestCases::VectorSearchSqlFilteredIndexOnly,
         ]
     }
 
@@ -308,6 +315,9 @@ impl TestCases {
             ),
             Self::VectorSearchSqlIndexOnly => SearchTestType::Sql(
                 "SELECT id, trunc(_score, 3) as _score  FROM vector_search(qs, 'second', answer) order by _score desc, id desc LIMIT 4;".to_string()
+            ),
+            Self::VectorSearchSqlFilteredIndexOnly => SearchTestType::Sql(
+                "SELECT id, trunc(_score, 3) as _score FROM vector_search(qs, 'secondary', answer, 4) WHERE subject != 'math' ORDER BY _score DESC, id".to_string()
             ),
        }
     }

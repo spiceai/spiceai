@@ -472,21 +472,38 @@ impl ExecutionPlan for IndexerExec {
         context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
         let schema = self.input_exec.schema();
-        let expected_schema = Arc::clone(&schema);
+        let advertised_schema = Arc::clone(&schema);
         let indexes = self.indexes.clone();
         let stream = self
             .input_exec
             .execute(partition, Arc::clone(&context))?
             .and_then(move |batch| {
                 let indexes = indexes.clone();
-                let expected_schema = Arc::clone(&expected_schema);
+                let advertised_schema = Arc::clone(&advertised_schema);
                 async move {
                     let mut b = batch;
+
+                    // Verify the incoming batch fields match the advertised schema.
+                    // Uses fields-only comparison to tolerate metadata differences.
+                    if b.schema().fields() != advertised_schema.fields() {
+                        let exp = schema_signature(advertised_schema.as_ref());
+                        let got = schema_signature(b.schema().as_ref());
+                        return Err(DataFusionError::Execution(format!(
+                            "Input stream produced batch with unexpected schema. \
+                            Expected fields ({}): {} \
+                            Got fields ({}): {}",
+                            advertised_schema.fields().len(),
+                            exp,
+                            b.schema().fields().len(),
+                            got,
+                        )));
+                    }
 
                     // Each index consumes the record batch and produces a new record batch with
                     // the same schema. The indexes are executed in order, with the output of the
                     // first index becoming the input of the second, etc.
                     for idx in &indexes {
+                        let schema_before = b.schema();
                         let mut out = idx.compute_index(vec![b]).await?;
 
                         match out.len() {
@@ -494,15 +511,15 @@ impl ExecutionPlan for IndexerExec {
                                 b = out
                                     .pop()
                                     .unwrap_or_else(|| unreachable!("length is checked"));
-                                if b.schema().as_ref() != expected_schema.as_ref() {
-                                    let exp = schema_signature(expected_schema.as_ref());
+                                if b.schema().fields() != schema_before.fields() {
+                                    let exp = schema_signature(schema_before.as_ref());
                                     let got = schema_signature(b.schema().as_ref());
                                     return Err(DataFusionError::Execution(format!(
-                                        "Index {} changed schema.\
-                                        Expected fields ({}): {}\
+                                        "Index {} changed schema. \
+                                        Expected fields ({}): {} \
                                         Got fields ({}): {}",
                                         idx.name(),
-                                        expected_schema.fields().len(),
+                                        schema_before.fields().len(),
                                         exp,
                                         b.schema().fields().len(),
                                         got,
@@ -1110,5 +1127,52 @@ mod test {
         assert!(msg.contains("extra: Int64"));
 
         assert_eq!(1, idx_add.compute_index_calls());
+    }
+
+    /// Regression test for #10223: a metadata-only schema difference introduced
+    /// by the index must not trigger a false "changed schema" error.
+    /// This test rebuilds the output `RecordBatch` with identical fields and
+    /// columns but additional schema-level metadata.
+    #[tokio::test]
+    async fn pipeline_tolerates_metadata_only_schema_difference() {
+        let ctx = get_ctx();
+
+        // Index callback that rebuilds the batch with extra schema-level metadata.
+        // The fields and column data are identical; only schema metadata differs.
+        let idx = Arc::new(TestIndex::new(
+            vec!["id".to_string()],
+            Some(|batches| {
+                let b = batches.into_iter().next().expect("one batch");
+                let mut metadata = b.schema().metadata().clone();
+                metadata.insert("extra_key".to_string(), "extra_value".to_string());
+                let new_schema =
+                    Arc::new(Schema::new(b.schema().fields().to_vec()).with_metadata(metadata));
+                let columns: Vec<ArrayRef> = (0..b.num_columns())
+                    .map(|i| Arc::clone(b.column(i)))
+                    .collect();
+                let out = RecordBatch::try_new(new_schema, columns)
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                Ok(vec![out])
+            }),
+        ));
+
+        let table = mem_table_from_batches(vec![one_row_batch()]);
+        let provider = IndexedTableProvider::new(table)
+            .add_index(Arc::clone(&idx) as Arc<dyn Index + Send + Sync>);
+
+        ctx.register_table(
+            "metadata_diff_table",
+            Arc::new(provider) as Arc<dyn TableProvider>,
+        )
+        .expect("valid");
+
+        let df = ctx.table("metadata_diff_table").await.expect("valid");
+        // Must succeed — metadata-only differences are benign.
+        let results = df
+            .collect()
+            .await
+            .expect("metadata-only difference should not error");
+        assert_eq!(results.len(), 1);
+        assert_eq!(1, idx.compute_index_calls());
     }
 }

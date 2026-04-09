@@ -773,7 +773,10 @@ async fn get_and_display_nql_records(
     let start_time = Instant::now();
 
     let resp = send_nsql_request(
-        &Client::new(),
+        &Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?,
         endpoint,
         query,
         LlmRuntime::Openai,
