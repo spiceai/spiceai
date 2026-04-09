@@ -1040,11 +1040,35 @@ impl GithubRestClient {
         repo: &str,
     ) -> Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
         let mut refs = self
-            .fetch_refs_for_resource(owner, repo, "branches", "refs/heads/")
+            .fetch_refs_for_resource(owner, repo, "branches", "refs/heads/", None)
             .await?;
         refs.extend(
-            self.fetch_refs_for_resource(owner, repo, "tags", "refs/tags/")
+            self.fetch_refs_for_resource(owner, repo, "tags", "refs/tags/", None)
                 .await?,
+        );
+        refs.sort_unstable_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
+        refs.dedup_by(|left, right| left.qualified_name == right.qualified_name);
+        Ok(refs)
+    }
+
+    pub async fn fetch_qualified_refs_bounded(
+        &self,
+        owner: &str,
+        repo: &str,
+        max_refs: usize,
+    ) -> Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut refs = self
+            .fetch_refs_for_resource(owner, repo, "branches", "refs/heads/", Some(max_refs))
+            .await?;
+        refs.extend(
+            self.fetch_refs_for_resource(
+                owner,
+                repo,
+                "tags",
+                "refs/tags/",
+                Some(max_refs.saturating_sub(refs.len())),
+            )
+            .await?,
         );
         refs.sort_unstable_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
         refs.dedup_by(|left, right| left.qualified_name == right.qualified_name);
@@ -1132,6 +1156,7 @@ impl GithubRestClient {
         repo: &str,
         resource: &str,
         qualified_name_prefix: &str,
+        max_refs: Option<usize>,
     ) -> Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
         self.rate_limiter.check_rate_limit().await?;
 
@@ -1199,6 +1224,15 @@ impl GithubRestClient {
             }
 
             let page_len = page_refs.len();
+            if let Some(max_refs) = max_refs
+                && refs.len() + page_len > max_refs
+            {
+                return Err(std::io::Error::other(format!(
+                    "Failed to retrieve GitHub refs for {owner}/{repo}: dynamic ref scans are limited to {max_refs} refs. Add a more selective ref predicate or use an exact ref = '<value>' filter."
+                ))
+                .into());
+            }
+
             refs.extend(page_refs.into_iter().map(|git_ref| GithubRef {
                 qualified_name: format!("{qualified_name_prefix}{}", git_ref.name),
                 name: git_ref.name,

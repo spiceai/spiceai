@@ -39,7 +39,9 @@ use datafusion::{
     error::DataFusionError,
     logical_expr::Operator,
     physical_expr::PhysicalExpr,
-    physical_plan::{ExecutionPlan, expressions::Column, projection::ProjectionExec},
+    physical_plan::{
+        ExecutionPlan, empty::EmptyExec, expressions::Column, projection::ProjectionExec,
+    },
     prelude::Expr,
 };
 use futures::TryStreamExt;
@@ -48,6 +50,7 @@ use serde_json::{Map, Value};
 use std::sync::Arc;
 
 const COMMITS_JSON_POINTER: &str = "/data/repository";
+const MAX_DYNAMIC_REF_SCAN_REFS: usize = 1_000;
 
 // https://docs.github.com/en/graphql/reference/objects#commit
 #[derive(Debug, Clone)]
@@ -71,12 +74,19 @@ impl GraphQLContext for CommitsTableArgs {
         filters: &[FilterPushdownResult],
         query: &mut GraphQLQuery,
     ) -> Result<(), datafusion::error::DataFusionError> {
-        let requested_ref = self.requested_ref.clone().or_else(|| {
-            match ref_fetch_mode_from_filter_results(filters) {
-                RefFetchMode::Exact(ref_name) => Some(ref_name),
-                RefFetchMode::None | RefFetchMode::Dynamic => None,
+        let requested_ref = match merge_requested_ref_mode(
+            self.requested_ref.as_deref(),
+            ref_fetch_mode_from_filter_results(filters),
+        ) {
+            RefFetchMode::Exact(ref_name) => Some(ref_name),
+            RefFetchMode::None | RefFetchMode::Dynamic => None,
+            RefFetchMode::Unsatisfiable => {
+                return Err(DataFusionError::Execution(
+                    "GitHub commits ref predicates are contradictory and cannot match any rows."
+                        .to_string(),
+                ));
             }
-        });
+        };
 
         if let Some(ref_name) = requested_ref.as_deref() {
             inject_commit_ref_parameter(query, ref_name)?;
@@ -252,11 +262,22 @@ impl CommitsTableProvider {
             .await
     }
 
+    async fn fetch_repository_refs_bounded(
+        &self,
+        max_refs: usize,
+    ) -> std::result::Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
+        self.rest_client
+            .fetch_qualified_refs_bounded(&self.table_args.owner, &self.table_args.repo, max_refs)
+            .await
+    }
+
     async fn resolve_dynamic_refs(
         &self,
         filters: &[Expr],
     ) -> std::result::Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut refs = self.fetch_repository_refs().await?;
+        let mut refs = self
+            .fetch_repository_refs_bounded(MAX_DYNAMIC_REF_SCAN_REFS)
+            .await?;
 
         if filters
             .iter()
@@ -344,6 +365,19 @@ impl CommitsTableProvider {
 
         Ok(graphql_exec as Arc<dyn ExecutionPlan>)
     }
+
+    fn empty_scan_plan(
+        &self,
+        projection: Option<&Vec<usize>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let schema = if let Some(projection) = projection {
+            Arc::new(self.schema.project(projection)?)
+        } else {
+            Arc::clone(&self.schema)
+        };
+
+        Ok(Arc::new(EmptyExec::new(schema)) as Arc<dyn ExecutionPlan>)
+    }
 }
 
 #[async_trait]
@@ -382,22 +416,23 @@ impl TableProvider for CommitsTableProvider {
             .map(|filter| self.table_args.filter_pushdown(filter))
             .collect::<Result<Vec<_>, DataFusionError>>()?;
 
-        let requested_ref = self.table_args.requested_ref.clone().or_else(|| {
-            match ref_fetch_mode_from_exprs(filters) {
-                RefFetchMode::Exact(ref_name) => Some(ref_name),
-                RefFetchMode::None | RefFetchMode::Dynamic => None,
+        let ref_fetch_mode = merge_requested_ref_mode(
+            self.table_args.requested_ref.as_deref(),
+            ref_fetch_mode_from_exprs(filters),
+        );
+
+        match ref_fetch_mode {
+            RefFetchMode::Unsatisfiable => return self.empty_scan_plan(projection),
+            RefFetchMode::Exact(requested_ref) => {
+                let _ = state;
+                return self
+                    .scan_for_requested_ref(projection, filters, limit, &requested_ref)
+                    .await;
             }
-        });
-
-        if let Some(requested_ref) = requested_ref.as_deref() {
-            let _ = state;
-            return self
-                .scan_for_requested_ref(projection, filters, limit, requested_ref)
-                .await;
-        }
-
-        if !matches!(ref_fetch_mode_from_exprs(filters), RefFetchMode::Dynamic) {
-            return self.delegate.scan(state, projection, filters, limit).await;
+            RefFetchMode::None => {
+                return self.delegate.scan(state, projection, filters, limit).await;
+            }
+            RefFetchMode::Dynamic => {}
         }
 
         validate_dynamic_ref_scan(filters, limit)?;
@@ -542,15 +577,55 @@ enum RefFetchMode {
     None,
     Exact(String),
     Dynamic,
+    Unsatisfiable,
 }
 
 fn merge_ref_fetch_modes(current: RefFetchMode, next: RefFetchMode) -> RefFetchMode {
     match (current, next) {
+        (RefFetchMode::Unsatisfiable, _) | (_, RefFetchMode::Unsatisfiable) => {
+            RefFetchMode::Unsatisfiable
+        }
+        (RefFetchMode::Exact(current), RefFetchMode::Exact(next)) => {
+            merge_exact_refs(current, next)
+        }
         (RefFetchMode::Exact(current), _) | (_, RefFetchMode::Exact(current)) => {
             RefFetchMode::Exact(current)
         }
         (RefFetchMode::Dynamic, _) | (_, RefFetchMode::Dynamic) => RefFetchMode::Dynamic,
         (RefFetchMode::None, RefFetchMode::None) => RefFetchMode::None,
+    }
+}
+
+fn merge_exact_refs(current: String, next: String) -> RefFetchMode {
+    if !exact_refs_are_compatible(&current, &next) {
+        return RefFetchMode::Unsatisfiable;
+    }
+
+    if !current.starts_with("refs/") && next.starts_with("refs/") {
+        RefFetchMode::Exact(next)
+    } else {
+        RefFetchMode::Exact(current)
+    }
+}
+
+fn exact_refs_are_compatible(current: &str, next: &str) -> bool {
+    let current_candidates = requested_ref_candidates(current);
+    let next_candidates = requested_ref_candidates(next);
+
+    current_candidates
+        .iter()
+        .any(|candidate| next_candidates.iter().any(|other| other == candidate))
+}
+
+fn merge_requested_ref_mode(
+    requested_ref: Option<&str>,
+    filter_mode: RefFetchMode,
+) -> RefFetchMode {
+    match requested_ref {
+        Some(requested_ref) => {
+            merge_ref_fetch_modes(RefFetchMode::Exact(requested_ref.to_string()), filter_mode)
+        }
+        None => filter_mode,
     }
 }
 
@@ -1045,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ref_fetch_mode_from_filters_prefers_exact_mode_for_multiple_ref_values() {
+    fn test_ref_fetch_mode_from_filters_returns_unsatisfiable_for_conflicting_ref_values() {
         let filters = vec![
             FilterPushdownResult {
                 filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Exact,
@@ -1061,7 +1136,29 @@ mod tests {
 
         assert_eq!(
             ref_fetch_mode_from_filter_results(&filters),
-            RefFetchMode::Exact("trunk".to_string())
+            RefFetchMode::Unsatisfiable
+        );
+    }
+
+    #[test]
+    fn test_ref_fetch_mode_from_filters_prefers_qualified_exact_ref_when_compatible() {
+        let filters = vec![
+            FilterPushdownResult {
+                filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Exact,
+                expr: datafusion::prelude::col("ref").eq(datafusion::prelude::lit("release")),
+                context: Some("ref:release".to_string()),
+            },
+            FilterPushdownResult {
+                filter_pushdown: datafusion::logical_expr::TableProviderFilterPushDown::Exact,
+                expr: datafusion::prelude::col("ref")
+                    .eq(datafusion::prelude::lit("refs/heads/release")),
+                context: Some("ref:refs/heads/release".to_string()),
+            },
+        ];
+
+        assert_eq!(
+            ref_fetch_mode_from_filter_results(&filters),
+            RefFetchMode::Exact("refs/heads/release".to_string())
         );
     }
 
@@ -1164,6 +1261,14 @@ mod tests {
         assert_eq!(
             requested_ref_candidates("refs/heads/release/1.11"),
             vec!["refs/heads/release/1.11".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_merge_requested_ref_mode_detects_conflicting_requested_ref_and_filter() {
+        assert_eq!(
+            merge_requested_ref_mode(Some("trunk"), RefFetchMode::Exact("main".to_string())),
+            RefFetchMode::Unsatisfiable
         );
     }
 
