@@ -254,16 +254,9 @@ fn databricks_token_endpoint_url(
     let base_url = if endpoint.starts_with("https://") {
         endpoint.to_string()
     } else if endpoint.starts_with("http://") {
-        let host = endpoint
-            .strip_prefix("http://")
-            .unwrap_or(endpoint)
-            .split('/')
-            .next()
-            .unwrap_or("")
-            .split(':')
-            .next()
-            .unwrap_or("");
-        if host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]" {
+        let parsed = url::Url::parse(endpoint)?;
+        let host = parsed.host_str().unwrap_or("");
+        if host == "127.0.0.1" || host == "localhost" || host == "::1" {
             endpoint.to_string()
         } else {
             return Err(format!(
@@ -643,6 +636,11 @@ mod tests {
         assert!(
             databricks_token_endpoint_url("http://dbc.example.databricks.com").is_err(),
             "http:// to non-localhost should be rejected"
+        );
+        assert_eq!(
+            databricks_token_endpoint_url("http://[::1]:1234/")
+                .expect("http://[::1] should be allowed"),
+            "http://[::1]:1234/oidc/v1/token"
         );
     }
 
