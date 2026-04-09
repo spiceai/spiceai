@@ -1976,7 +1976,7 @@ fn git_ref_endpoint(
     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
     {
-        let mut path_segments = endpoint.path_segments_mut().map_err(|_| {
+        let mut path_segments = endpoint.path_segments_mut().map_err(|()| {
             Box::new(std::io::Error::other(format!(
                 "Failed to construct GitHub ref URL for {owner}/{repo}: {git_ref_path}"
             ))) as Box<dyn std::error::Error + Send + Sync>
