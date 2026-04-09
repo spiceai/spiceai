@@ -1129,15 +1129,16 @@ mod test {
         assert_eq!(1, idx_add.compute_index_calls());
     }
 
-    /// Regression test for #10223: batches whose schema metadata differs from
-    /// the plan's advertised schema must not trigger a false "changed schema"
-    /// error when the index returns the batch unchanged.
+    /// Regression test for #10223: a metadata-only schema difference introduced
+    /// by the index must not trigger a false "changed schema" error.
+    /// This test rebuilds the output `RecordBatch` with identical fields and
+    /// columns but additional schema-level metadata.
     #[tokio::test]
     async fn pipeline_tolerates_metadata_only_schema_difference() {
         let ctx = get_ctx();
 
-        // Pass-through index that returns the batch with extra schema-level metadata.
-        // The fields are identical but the schema metadata differs.
+        // Index callback that rebuilds the batch with extra schema-level metadata.
+        // The fields and column data are identical; only schema metadata differs.
         let idx = Arc::new(TestIndex::new(
             vec!["id".to_string()],
             Some(|batches| {
