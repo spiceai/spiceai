@@ -420,10 +420,9 @@ impl TableProvider for CommitsTableProvider {
         let mut batches = Vec::new();
 
         for git_ref in refs {
-            let per_ref_limit = remaining.map_or(
-                DYNAMIC_SCAN_PER_REF_COMMIT_LIMIT,
-                |r| r.min(DYNAMIC_SCAN_PER_REF_COMMIT_LIMIT),
-            );
+            let per_ref_limit = remaining.map_or(DYNAMIC_SCAN_PER_REF_COMMIT_LIMIT, |r| {
+                r.min(DYNAMIC_SCAN_PER_REF_COMMIT_LIMIT)
+            });
             let ref_batches = self
                 .fetch_commits_for_ref(
                     &pushdown_filters,
