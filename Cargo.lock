@@ -5259,6 +5259,7 @@ dependencies = [
  "bb8",
  "bb8-oracle",
  "bigdecimal",
+ "brotli",
  "bytes",
  "charset",
  "chrono",
@@ -5275,6 +5276,7 @@ dependencies = [
  "document_parse",
  "duckdb",
  "dynamodb-streams",
+ "flate2",
  "flight_client",
  "futures",
  "git2",
@@ -5332,6 +5334,7 @@ dependencies = [
  "util",
  "uuid 1.21.0",
  "zip 7.4.0",
+ "zstd",
 ]
 
 [[package]]
