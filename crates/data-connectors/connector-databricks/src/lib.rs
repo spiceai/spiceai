@@ -845,6 +845,7 @@ struct DatabricksMetricsProvider {
 }
 
 const DATABRICKS_METRICS: &[MetricSpec] = &[
+    // -- Request metrics --
     MetricSpec::new("requests_total", MetricType::ObservableCounterU64)
         .description("Total HTTP requests issued to the SQL Warehouse API"),
     MetricSpec::new("retries_total", MetricType::ObservableCounterU64)
@@ -854,6 +855,7 @@ const DATABRICKS_METRICS: &[MetricSpec] = &[
     ),
     MetricSpec::new("inflight_requests", MetricType::ObservableGaugeU64)
         .description("Current number of in-flight HTTP requests to the SQL Warehouse API"),
+    // -- Statement metrics --
     MetricSpec::new(
         "statements_executed_total",
         MetricType::ObservableCounterU64,
@@ -861,6 +863,22 @@ const DATABRICKS_METRICS: &[MetricSpec] = &[
     .description("Total SQL statements submitted for execution"),
     MetricSpec::new("statement_polls_total", MetricType::ObservableCounterU64)
         .description("Total polls made when waiting for async statement completion"),
+    MetricSpec::new("statements_failed_total", MetricType::ObservableCounterU64)
+        .description("Total SQL statements that completed with FAILED status"),
+    // -- Connection pool metrics --
+    MetricSpec::new("pool_connections_total", MetricType::ObservableCounterU64)
+        .description("Total virtual pool connect() calls"),
+    MetricSpec::new("pool_active_connections", MetricType::ObservableGaugeU64)
+        .description("Current number of active connection handles"),
+    // -- Concurrency metrics --
+    MetricSpec::new("semaphore_available_permits", MetricType::ObservableGaugeU64)
+        .description("Current number of available concurrency permits in the request semaphore"),
+    // -- Data transfer metrics --
+    MetricSpec::new("chunks_fetched_total", MetricType::ObservableCounterU64)
+        .description("Total Arrow result chunks fetched from external links"),
+    // -- Connector state --
+    MetricSpec::new("connector_disabled", MetricType::ObservableGaugeU64)
+        .description("Whether the connector is permanently disabled (1 = disabled, 0 = active)"),
 ];
 
 impl MetricsProvider for DatabricksMetricsProvider {
@@ -935,6 +953,65 @@ impl MetricsProvider for DatabricksMetricsProvider {
                             .load(std::sync::atomic::Ordering::Relaxed),
                         &attributes,
                     );
+                })))
+            }
+            "statements_failed_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .statements_failed_total
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "pool_connections_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .pool_connections_total
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "pool_active_connections" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .pool_active_connections
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "semaphore_available_permits" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    let permits = metrics
+                        .semaphore
+                        .as_ref()
+                        .map_or(0, |s| s.available_permits() as u64);
+                    instrument.observe(permits, &attributes);
+                })))
+            }
+            "chunks_fetched_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .chunks_fetched_total
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "connector_disabled" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    let disabled = u64::from(
+                        metrics
+                            .permanently_disabled
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                    instrument.observe(disabled, &attributes);
                 })))
             }
             _ => None,

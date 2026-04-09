@@ -109,6 +109,7 @@ impl Default for SqlWarehouseConfig {
 /// [`MetricsProvider`] without holding any lock.
 #[derive(Debug, Default)]
 pub struct DatabricksMetrics {
+    // -- Request metrics --
     /// Total HTTP requests issued (including retries).
     pub requests_total: AtomicU64,
     /// Total HTTP retries performed.
@@ -117,10 +118,33 @@ pub struct DatabricksMetrics {
     pub permanent_errors_total: AtomicU64,
     /// Current number of in-flight HTTP requests (gauge, can go up and down).
     pub inflight_requests: AtomicU64,
+
+    // -- Statement metrics --
     /// Total SQL statements that entered execution.
     pub statements_executed_total: AtomicU64,
     /// Total polls made when waiting for async statement completion.
     pub statement_polls_total: AtomicU64,
+    /// Total SQL statements that completed with FAILED status.
+    pub statements_failed_total: AtomicU64,
+
+    // -- Connection pool metrics --
+    /// Total virtual pool connect() calls (each returns a lightweight handle).
+    pub pool_connections_total: AtomicU64,
+    /// Current number of active connections (handles not yet dropped).
+    pub pool_active_connections: AtomicU64,
+
+    // -- Concurrency metrics --
+    /// Reference to the concurrency semaphore for observing available permits.
+    /// Set once during construction; if `None`, concurrency metrics are unavailable.
+    pub semaphore: Option<Arc<Semaphore>>,
+
+    // -- Data transfer metrics --
+    /// Total Arrow result chunks fetched from external links.
+    pub chunks_fetched_total: AtomicU64,
+
+    // -- Connector state --
+    /// Whether the connector has been permanently disabled (1 = disabled, 0 = active).
+    pub permanently_disabled: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Snafu)]
@@ -271,16 +295,28 @@ impl DatabricksSqlWarehouse {
         config: SqlWarehouseConfig,
         shared_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<Self, Error> {
-        let metrics = Arc::new(DatabricksMetrics::default());
+        let permanently_disabled = Arc::new(AtomicBool::new(false));
+        let request_semaphore = shared_semaphore
+            .unwrap_or_else(|| Arc::new(Semaphore::new(config.max_concurrent_requests)));
+
+        let metrics = Arc::new(DatabricksMetrics {
+            semaphore: Some(Arc::clone(&request_semaphore)),
+            permanently_disabled: Arc::clone(&permanently_disabled),
+            ..DatabricksMetrics::default()
+        });
         let api = Arc::new(SqlWarehouseApi::new(
             endpoint,
             sql_warehouse_id,
             token_provider,
             &config,
             Arc::clone(&metrics),
-            shared_semaphore,
+            permanently_disabled,
+            request_semaphore,
         )?);
-        let pool = Arc::new(SqlWarehouseConnectionPool { api });
+        let pool = Arc::new(SqlWarehouseConnectionPool {
+            api,
+            metrics: Arc::clone(&metrics),
+        });
         Ok(Self { pool, metrics })
     }
 
@@ -293,6 +329,7 @@ impl DatabricksSqlWarehouse {
 
 struct SqlWarehouseConnectionPool {
     api: Arc<SqlWarehouseApi>,
+    metrics: Arc<DatabricksMetrics>,
 }
 
 #[async_trait]
@@ -303,8 +340,15 @@ impl DbConnectionPool<Arc<SqlWarehouseApi>, &'static dyn Sync> for SqlWarehouseC
         Box<dyn DbConnection<Arc<SqlWarehouseApi>, &'static dyn Sync>>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
+        self.metrics
+            .pool_connections_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .pool_active_connections
+            .fetch_add(1, Ordering::Relaxed);
         Ok(Box::new(SqlWarehouseConnection {
             api: Arc::clone(&self.api),
+            _metrics: Arc::clone(&self.metrics),
         }))
     }
 
@@ -377,15 +421,13 @@ impl SqlWarehouseApi {
         token_provider: Arc<dyn TokenProvider>,
         config: &SqlWarehouseConfig,
         metrics: Arc<DatabricksMetrics>,
-        shared_semaphore: Option<Arc<Semaphore>>,
+        permanently_disabled: Arc<AtomicBool>,
+        request_semaphore: Arc<Semaphore>,
     ) -> Result<Self, Error> {
         let client = configure_client_builder(ClientBuilder::new())
             .user_agent(super::user_agent())
             .build()
             .context(ClientBuildFailedSnafu)?;
-
-        let request_semaphore = shared_semaphore
-            .unwrap_or_else(|| Arc::new(Semaphore::new(config.max_concurrent_requests)));
 
         Ok(Self {
             client,
@@ -395,7 +437,7 @@ impl SqlWarehouseApi {
             backoff_method: config.backoff_method,
             statement_max_retries: config.statement_max_retries,
             disable_on_permanent_error: config.disable_on_permanent_error,
-            permanently_disabled: Arc::new(AtomicBool::new(false)),
+            permanently_disabled,
             sql_warehouse_id: sql_warehouse_id.to_string(),
             token_provider,
             metrics,
@@ -815,6 +857,11 @@ impl SqlWarehouseApi {
         self.metrics
             .inflight_requests
             .fetch_sub(1, Ordering::Relaxed);
+        if result.is_ok() {
+            self.metrics
+                .chunks_fetched_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         result
     }
 
@@ -1167,6 +1214,15 @@ fn schema_from_describe_json(json_value: &Value, dataset_name: &str) -> Result<S
 
 struct SqlWarehouseConnection {
     api: Arc<SqlWarehouseApi>,
+    _metrics: Arc<DatabricksMetrics>,
+}
+
+impl Drop for SqlWarehouseConnection {
+    fn drop(&mut self) {
+        self._metrics
+            .pool_active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl<'a> DbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseConnection {
@@ -1186,7 +1242,11 @@ impl<'a> DbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseConnec
 #[async_trait]
 impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseConnection {
     fn new(api: Arc<SqlWarehouseApi>) -> Self {
-        Self { api }
+        let metrics = Arc::clone(&api.metrics);
+        Self {
+            api,
+            _metrics: metrics,
+        }
     }
 
     async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {
@@ -1286,7 +1346,12 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
             .wait_for_statement_completion(&token, response)
             .await?;
 
-        SqlWarehouseApi::verify_response_status(&response)?;
+        if let Err(e) = SqlWarehouseApi::verify_response_status(&response) {
+            self._metrics
+                .statements_failed_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(e.into());
+        }
 
         let result_object = response.get_mut("result").map(Value::take).ok_or_else(|| {
             MissingJsonFieldSnafu {
@@ -1659,7 +1724,8 @@ mod tests {
             Arc::new(StaticTokenProvider("token".to_string())),
             &SqlWarehouseConfig::default(),
             Arc::new(DatabricksMetrics::default()),
-            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Semaphore::new(8)),
         )
         .expect("should create api");
         let table = TableReference::full("my_catalog", "my_schema", "my_table");
@@ -1690,7 +1756,8 @@ mod tests {
             Arc::new(StaticTokenProvider("t".to_string())),
             &SqlWarehouseConfig::default(),
             Arc::new(DatabricksMetrics::default()),
-            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Semaphore::new(8)),
         )
         .expect("should create api");
         let table = TableReference::bare("just_table");
@@ -1712,7 +1779,8 @@ mod tests {
             Arc::new(StaticTokenProvider("t".to_string())),
             &SqlWarehouseConfig::default(),
             Arc::new(DatabricksMetrics::default()),
-            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Semaphore::new(8)),
         )
         .expect("should create api");
         let table = TableReference::partial("my_schema", "my_table");
@@ -1734,7 +1802,8 @@ mod tests {
             Arc::new(StaticTokenProvider("t".to_string())),
             &SqlWarehouseConfig::default(),
             Arc::new(DatabricksMetrics::default()),
-            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Semaphore::new(8)),
         )
         .expect("should create api");
         let table = TableReference::full("cat'alog", "sch'ema", "tab'le");
@@ -2198,7 +2267,8 @@ mod tests {
             Arc::new(StaticTokenProvider("t".to_string())),
             &SqlWarehouseConfig::default(),
             Arc::new(DatabricksMetrics::default()),
-            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Semaphore::new(8)),
         )
         .expect("should create api");
         let table = TableReference::full("my_catalog", "my_schema", "my_table");
