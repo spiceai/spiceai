@@ -476,7 +476,7 @@ pub struct UCSchema {
 // Permissions
 // ============================================================================
 
-/// Response from `/api/2.1/unity-catalog/permissions/{securable_type}/{full_name}`.
+/// Response from `/api/2.1/unity-catalog/effective-permissions/table/{full_name}`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UCPermissionsEnvelope {
     #[serde(default)]

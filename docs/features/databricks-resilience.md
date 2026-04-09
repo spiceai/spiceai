@@ -70,7 +70,7 @@ The connector checks each table's type against Unity Catalog metadata before att
 Unsupported table types are:
 
 - **Catalog connector path**: Silently skipped during catalog discovery with a debug-level log message.
-- **Data connector path**: Rejected with an `UnsupportedTableType` error when a fully-qualified table reference (`catalog.schema.table`) is used and the table exists in Unity Catalog.
+- **Data connector path**: Rejected with a `DataConnectorError::InvalidConfigurationNoSource` error (message: "Unsupported Unity Catalog table type ...") when a fully-qualified table reference (`catalog.schema.table`) is used and the table exists in Unity Catalog.
 
 ### Permission Checking
 
@@ -114,7 +114,7 @@ The SQL Warehouse connector exposes per-dataset operational metrics via the `Met
 
 | Metric Name                    | Type    | Category        | Description                                                         |
 | ------------------------------ | ------- | --------------- | ------------------------------------------------------------------- |
-| `requests_total`               | Counter | Requests        | Total HTTP requests issued to the SQL Warehouse API (incl. retries) |
+| `requests_total`               | Counter | Requests        | Total HTTP requests issued to the SQL Warehouse API (excl. retries) |
 | `retries_total`                | Counter | Requests        | Total HTTP retries performed for transient failures                 |
 | `permanent_errors_total`       | Counter | Requests        | Total non-retryable errors (401, 403, 404) detected                 |
 | `inflight_requests`            | Gauge   | Requests        | Current number of in-flight HTTP requests                           |

@@ -252,12 +252,20 @@ impl Databricks {
                     Self::get_token_provider(endpoint, auth_credentials, token_provider_registry)
                         .await?;
 
-                let uc_client = UnityCatalogClient::new(
+                let uc_client = match UnityCatalogClient::new(
                     Endpoint(endpoint.to_string()),
                     Some(Arc::clone(&token_provider)),
-                )
-                .ok()
-                .map(Arc::new);
+                ) {
+                    Ok(client) => Some(Arc::new(client)),
+                    Err(error) => {
+                        tracing::warn!(
+                            endpoint,
+                            %error,
+                            "Failed to initialize Unity Catalog client; UC table-type and permission validation is disabled"
+                        );
+                        None
+                    }
+                };
 
                 let sql_warehouse_config = Self::build_sql_warehouse_config(&params);
 
@@ -299,12 +307,20 @@ impl Databricks {
                     }
                 };
 
-                let uc_client = UnityCatalogClient::new(
+                let uc_client = match UnityCatalogClient::new(
                     Endpoint(endpoint.to_string()),
                     Some(Arc::clone(&token_provider)),
-                )
-                .ok()
-                .map(Arc::new);
+                ) {
+                    Ok(client) => Some(Arc::new(client)),
+                    Err(error) => {
+                        tracing::warn!(
+                            endpoint,
+                            %error,
+                            "Failed to initialize Unity Catalog client; UC table-type and permission validation is disabled"
+                        );
+                        None
+                    }
+                };
 
                 let read_provider = DatabricksDelta::new(
                     Endpoint(endpoint.to_string()),
@@ -564,23 +580,54 @@ impl Databricks {
                     );
                 }
                 Ok(n) => config.max_concurrent_requests = n,
-                Err(_) => {}
+                Err(source) => {
+                    tracing::warn!(
+                        parameter = "max_concurrent_requests",
+                        value = &v,
+                        %source,
+                        "Failed to parse Databricks SQL Warehouse config parameter; using default"
+                    );
+                }
             }
         }
-        if let Some(v) = params.get("http_max_retries").expose().ok()
-            && let Ok(n) = v.parse::<usize>()
-        {
-            config.http_max_retries = n;
+        if let Some(v) = params.get("http_max_retries").expose().ok() {
+            match v.parse::<usize>() {
+                Ok(n) => config.http_max_retries = n,
+                Err(source) => {
+                    tracing::warn!(
+                        parameter = "http_max_retries",
+                        value = &v,
+                        %source,
+                        "Failed to parse Databricks SQL Warehouse config parameter; using default"
+                    );
+                }
+            }
         }
-        if let Some(v) = params.get("backoff_method").expose().ok()
-            && let Ok(m) = v.parse::<util::retry_strategy::BackoffMethod>()
-        {
-            config.backoff_method = m;
+        if let Some(v) = params.get("backoff_method").expose().ok() {
+            match v.parse::<util::retry_strategy::BackoffMethod>() {
+                Ok(m) => config.backoff_method = m,
+                Err(source) => {
+                    tracing::warn!(
+                        parameter = "backoff_method",
+                        value = &v,
+                        %source,
+                        "Failed to parse Databricks SQL Warehouse config parameter; using default"
+                    );
+                }
+            }
         }
-        if let Some(v) = params.get("statement_max_retries").expose().ok()
-            && let Ok(n) = v.parse::<usize>()
-        {
-            config.statement_max_retries = n;
+        if let Some(v) = params.get("statement_max_retries").expose().ok() {
+            match v.parse::<usize>() {
+                Ok(n) => config.statement_max_retries = n,
+                Err(source) => {
+                    tracing::warn!(
+                        parameter = "statement_max_retries",
+                        value = &v,
+                        %source,
+                        "Failed to parse Databricks SQL Warehouse config parameter; using default"
+                    );
+                }
+            }
         }
         if let Some(v) = params.get("disable_on_permanent_error").expose().ok() {
             match v.parse::<bool>() {
