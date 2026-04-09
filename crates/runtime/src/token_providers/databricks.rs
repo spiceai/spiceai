@@ -214,7 +214,7 @@ async fn get_m2m_access_token(
     client_id: &str,
     client_secret: &SecretString,
 ) -> Result<TokenResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let token_endpoint_url = databricks_token_endpoint_url(databricks_endpoint);
+    let token_endpoint_url = databricks_token_endpoint_url(databricks_endpoint)?;
 
     let response = send_request_with_retry("Databricks", "request M2M access token", || {
         client
@@ -247,15 +247,35 @@ fn build_m2m_token_client() -> Result<reqwest::Client, reqwest::Error> {
         .build()
 }
 
-fn databricks_token_endpoint_url(databricks_endpoint: &str) -> String {
+fn databricks_token_endpoint_url(
+    databricks_endpoint: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let endpoint = databricks_endpoint.trim_end_matches('/');
-    let base_url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+    let base_url = if endpoint.starts_with("https://") {
         endpoint.to_string()
+    } else if endpoint.starts_with("http://") {
+        let host = endpoint
+            .strip_prefix("http://")
+            .unwrap_or(endpoint)
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("");
+        if host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]" {
+            endpoint.to_string()
+        } else {
+            return Err(format!(
+                "Databricks token endpoint must use HTTPS for non-localhost hosts, got: {endpoint}"
+            )
+            .into());
+        }
     } else {
         format!("https://{endpoint}")
     };
 
-    format!("{base_url}/oidc/v1/token")
+    Ok(format!("{base_url}/oidc/v1/token"))
 }
 
 fn next_token_refresh_wait(expires_in: u64) -> Duration {
@@ -611,12 +631,19 @@ mod tests {
     #[test]
     fn test_databricks_token_endpoint_url_normalizes_host() {
         assert_eq!(
-            databricks_token_endpoint_url("dbc.example.databricks.com"),
+            databricks_token_endpoint_url("dbc.example.databricks.com")
+                .expect("plain hostname should be accepted"),
             "https://dbc.example.databricks.com/oidc/v1/token"
         );
         assert_eq!(
-            databricks_token_endpoint_url("http://127.0.0.1:1234/"),
+            databricks_token_endpoint_url("http://127.0.0.1:1234/")
+                .expect("http://localhost should be allowed"),
             "http://127.0.0.1:1234/oidc/v1/token"
+        );
+        assert!(
+            databricks_token_endpoint_url("http://dbc.example.databricks.com")
+                .is_err(),
+            "http:// to non-localhost should be rejected"
         );
     }
 

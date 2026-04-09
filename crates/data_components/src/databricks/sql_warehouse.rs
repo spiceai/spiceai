@@ -51,7 +51,9 @@ use util::{
     format_datafusion_error,
 };
 
-use crate::resilient_http::{configure_client_builder, send_request_with_retry};
+use crate::resilient_http::{
+    configure_client_builder, send_request_with_retry_and_concurrency_limit,
+};
 
 mod datatypes;
 
@@ -105,11 +107,6 @@ pub enum Error {
 
     #[snafu(display("JSON parsing failed: {}", format_reqwest_error_chain(source)))]
     JsonParsingFailed { source: reqwest::Error },
-
-    #[snafu(display(
-        "Internal error: failed to acquire a Databricks SQL Warehouse request permit: {source}"
-    ))]
-    RequestPermitFailed { source: tokio::sync::AcquireError },
 
     #[snafu(display("Missing JSON field: {field}"))]
     MissingJsonField { field: String },
@@ -276,13 +273,6 @@ impl SqlWarehouseApi {
         })
     }
 
-    async fn acquire_request_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Error> {
-        Arc::clone(&self.request_semaphore)
-            .acquire_owned()
-            .await
-            .context(RequestPermitFailedSnafu)
-    }
-
     async fn get_schema(&self, table: &TableReference) -> Result<SchemaRef, Error> {
         let token = self.token_provider.get_token();
         let table_name = table.to_string();
@@ -398,10 +388,12 @@ impl SqlWarehouseApi {
 
     async fn execute_sql_statement(&self, token: &str, payload: &Value) -> Result<Value, Error> {
         let url = format!("{}/api/2.0/sql/statements/", self.base_url);
-        let _permit = self.acquire_request_permit().await?;
-        send_request_with_retry("Databricks SQL Warehouse", "execute SQL statement", || {
-            self.client.post(&url).bearer_auth(token).json(payload)
-        })
+        send_request_with_retry_and_concurrency_limit(
+            "Databricks SQL Warehouse",
+            "execute SQL statement",
+            || self.client.post(&url).bearer_auth(token).json(payload),
+            Some(&self.request_semaphore),
+        )
         .await
         .context(HttpRequestFailedSnafu)?
         .error_for_status()
@@ -417,11 +409,11 @@ impl SqlWarehouseApi {
         statement_id: &str,
     ) -> Result<Value, Error> {
         let url = format!("{}/api/2.0/sql/statements/{statement_id}", self.base_url);
-        let _permit = self.acquire_request_permit().await?;
-        send_request_with_retry(
+        send_request_with_retry_and_concurrency_limit(
             "Databricks SQL Warehouse",
             "poll SQL statement status",
             || self.client.get(&url).bearer_auth(token),
+            Some(&self.request_semaphore),
         )
         .await
         .context(HttpRequestFailedSnafu)?
@@ -477,15 +469,12 @@ impl SqlWarehouseApi {
                 let next_link = match link.next_chunk_internal_link {
                     Some(path) => {
                         let url = format!("{}{path}", api.base_url);
-                        let permit = match api.acquire_request_permit().await {
-                            Ok(permit) => permit,
-                            Err(error) => return Some((Err(error), None)),
-                        };
 
-                        match send_request_with_retry(
+                        match send_request_with_retry_and_concurrency_limit(
                             "Databricks SQL Warehouse",
                             "fetch next external chunk link",
                             || api.client.get(&url).bearer_auth(&token),
+                            Some(&api.request_semaphore),
                         )
                         .await
                         .context(HttpRequestFailedSnafu)
@@ -497,10 +486,7 @@ impl SqlWarehouseApi {
                                 .context(JsonParsingFailedSnafu)
                                 .and_then(Self::extract_external_links)
                             {
-                                Ok(next) => {
-                                    drop(permit);
-                                    next
-                                }
+                                Ok(next) => next,
                                 Err(e) => return Some((Err(e), None)),
                             },
                             Err(e) => return Some((Err(e), None)),
@@ -573,11 +559,11 @@ impl SqlWarehouseApi {
     }
 
     async fn fetch_chunk_data(&self, url: &str) -> Result<bytes::Bytes, Error> {
-        let _permit = self.acquire_request_permit().await?;
-        send_request_with_retry(
+        send_request_with_retry_and_concurrency_limit(
             "Databricks SQL Warehouse",
             "fetch statement result chunk",
             || self.client.get(url),
+            Some(&self.request_semaphore),
         )
         .await
         .context(HttpRequestFailedSnafu)?

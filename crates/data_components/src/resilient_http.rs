@@ -19,6 +19,7 @@ use reqwest::{
     header::{ACCEPT_ENCODING, HeaderMap, RETRY_AFTER},
 };
 use std::time::{Duration, SystemTime};
+use tokio::sync::Semaphore;
 use util::retry_strategy::{Backoff, BackoffMethod, RetryBackoffBuilder};
 
 const DEFAULT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -47,6 +48,19 @@ pub async fn send_request_with_retry<F>(
 where
     F: Fn() -> RequestBuilder,
 {
+    send_request_with_retry_and_concurrency_limit(service_name, operation_name, build_request, None)
+        .await
+}
+
+pub async fn send_request_with_retry_and_concurrency_limit<F>(
+    service_name: &str,
+    operation_name: &str,
+    build_request: F,
+    concurrency_limit: Option<&Semaphore>,
+) -> Result<Response, reqwest::Error>
+where
+    F: Fn() -> RequestBuilder,
+{
     let mut transient_backoff = RetryBackoffBuilder::new()
         .method(BackoffMethod::Fibonacci)
         .max_duration(Some(MAX_HTTP_BACKOFF))
@@ -60,6 +74,12 @@ where
     let mut retries = 0usize;
 
     loop {
+        let _permit = acquire_concurrency_permit(
+            concurrency_limit,
+            service_name,
+            operation_name,
+        )
+        .await;
         match add_supported_accept_encoding_header(build_request())
             .send()
             .await
@@ -98,6 +118,7 @@ where
 
                     drain_response_body(response, service_name, operation_name, retries, status)
                         .await;
+                    drop(_permit);
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -134,6 +155,7 @@ where
                     "Retrying HTTP request after transient request failure"
                 );
 
+                drop(_permit);
                 tokio::time::sleep(delay).await;
             }
         }
@@ -151,6 +173,25 @@ pub fn configure_client_builder(builder: ClientBuilder) -> ClientBuilder {
         .pool_idle_timeout(DEFAULT_HTTP_POOL_IDLE_TIMEOUT)
         .pool_max_idle_per_host(DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST)
         .tcp_keepalive(DEFAULT_HTTP_TCP_KEEPALIVE)
+}
+
+async fn acquire_concurrency_permit<'a>(
+    semaphore: Option<&'a Semaphore>,
+    service_name: &str,
+    operation_name: &str,
+) -> Option<tokio::sync::SemaphorePermit<'a>> {
+    let sem = semaphore?;
+    match sem.acquire().await {
+        Ok(permit) => Some(permit),
+        Err(_) => {
+            tracing::warn!(
+                service = service_name,
+                operation = operation_name,
+                "Request concurrency limiter closed; proceeding without limit"
+            );
+            None
+        }
+    }
 }
 
 async fn drain_response_body(
