@@ -417,7 +417,11 @@ pub fn build_sql_warehouse_config(params: &Parameters) -> SqlWarehouseConfig {
     if let Some(v) = params.get("max_concurrent_requests").expose().ok() {
         match v.parse::<usize>() {
             Ok(0) => {
-                tracing::warn!(parameter = "max_concurrent_requests", value = v, "Invalid Databricks SQL Warehouse config value; must be >= 1; using default");
+                tracing::warn!(
+                    parameter = "max_concurrent_requests",
+                    value = v,
+                    "Invalid Databricks SQL Warehouse config value; must be >= 1; using default"
+                );
             }
             Ok(n) => config.max_concurrent_requests = n,
             Err(e) => {

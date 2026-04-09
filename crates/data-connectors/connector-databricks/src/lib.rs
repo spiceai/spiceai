@@ -567,44 +567,20 @@ impl Databricks {
                 Err(_) => {}
             }
         }
-        if let Some(v) = params.get("http_max_retries").expose().ok() {
-            match v.parse::<usize>() {
-                Ok(n) => config.http_max_retries = n,
-                Err(e) => {
-                    tracing::warn!(
-                        parameter = "http_max_retries",
-                        value = v,
-                        error = %e,
-                        "Invalid Databricks SQL Warehouse config value; using default"
-                    );
-                }
-            }
+        if let Some(v) = params.get("http_max_retries").expose().ok()
+            && let Ok(n) = v.parse::<usize>()
+        {
+            config.http_max_retries = n;
         }
-        if let Some(v) = params.get("backoff_method").expose().ok() {
-            match v.parse::<util::retry_strategy::BackoffMethod>() {
-                Ok(m) => config.backoff_method = m,
-                Err(e) => {
-                    tracing::warn!(
-                        parameter = "backoff_method",
-                        value = v,
-                        error = %e,
-                        "Invalid Databricks SQL Warehouse config value; using default"
-                    );
-                }
-            }
+        if let Some(v) = params.get("backoff_method").expose().ok()
+            && let Ok(m) = v.parse::<util::retry_strategy::BackoffMethod>()
+        {
+            config.backoff_method = m;
         }
-        if let Some(v) = params.get("statement_max_retries").expose().ok() {
-            match v.parse::<usize>() {
-                Ok(n) => config.statement_max_retries = n,
-                Err(e) => {
-                    tracing::warn!(
-                        parameter = "statement_max_retries",
-                        value = v,
-                        error = %e,
-                        "Invalid Databricks SQL Warehouse config value; using default"
-                    );
-                }
-            }
+        if let Some(v) = params.get("statement_max_retries").expose().ok()
+            && let Ok(n) = v.parse::<usize>()
+        {
+            config.statement_max_retries = n;
         }
         if let Some(v) = params.get("disable_on_permanent_error").expose().ok() {
             match v.parse::<bool>() {
@@ -720,6 +696,8 @@ impl Databricks {
 /// Default maximum concurrent requests to the SQL Warehouse API.
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
 
+type SemaphoreRegistry = Arc<parking_lot::Mutex<HashMap<(String, String), Arc<Semaphore>>>>;
+
 #[derive(Default, Clone)]
 pub struct DatabricksFactory {
     /// Shared concurrency semaphores keyed by `(endpoint, warehouse_id)`.
@@ -727,7 +705,7 @@ pub struct DatabricksFactory {
     /// When multiple datasets use the same SQL Warehouse, they share a single
     /// semaphore so the concurrency limit is enforced globally across all
     /// datasets, not per-dataset.
-    semaphore_registry: Arc<parking_lot::Mutex<HashMap<(String, String), Arc<Semaphore>>>>,
+    semaphore_registry: SemaphoreRegistry,
 }
 
 impl DatabricksFactory {
