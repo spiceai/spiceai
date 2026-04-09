@@ -30,6 +30,7 @@ use data_components::{
             DuplicateBehavior, GraphQLClient, GraphQLQuery, UnnestBehavior,
             unnest_json_object_to_depth,
         },
+        provider::GraphQLTableProviderExec,
     },
 };
 use datafusion::{
@@ -37,7 +38,8 @@ use datafusion::{
     datasource::{MemTable, TableProvider, TableType},
     error::DataFusionError,
     logical_expr::Operator,
-    physical_plan::ExecutionPlan,
+    physical_expr::PhysicalExpr,
+    physical_plan::{ExecutionPlan, expressions::Column, projection::ProjectionExec},
     prelude::Expr,
 };
 use futures::TryStreamExt;
@@ -206,58 +208,41 @@ impl CommitsTableProvider {
             .map_err(Into::into)
     }
 
-    async fn fetch_commits_for_requested_ref(
+    async fn resolve_requested_ref_name(
         &self,
-        pushdown_filters: &[FilterPushdownResult],
         requested_ref: &str,
-        limit: Option<usize>,
-    ) -> std::result::Result<Vec<arrow::array::RecordBatch>, Box<dyn std::error::Error + Send + Sync>>
-    {
-        let mut attempted_refs = Vec::new();
-        let mut last_not_found_error = None;
-
+    ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
         for candidate_ref in requested_ref_candidates(requested_ref) {
-            attempted_refs.push(candidate_ref.clone());
-            match self
-                .fetch_commits_for_ref(pushdown_filters, &candidate_ref, limit)
-                .await
+            if !candidate_ref.starts_with("refs/") {
+                continue;
+            }
+
+            if let Some(git_ref) = self
+                .rest_client
+                .fetch_qualified_ref(
+                    &self.table_args.owner,
+                    &self.table_args.repo,
+                    &candidate_ref,
+                )
+                .await?
             {
-                Ok(batches) => return Ok(batches),
-                Err(err) if is_resource_not_found_error(err.as_ref()) => {
-                    last_not_found_error = Some(err);
-                }
-                Err(err) => return Err(err),
+                return Ok(git_ref.qualified_name);
             }
         }
 
         if !requested_ref.starts_with("refs/") {
-            let fallback_refs = self.fetch_repository_refs().await?;
-            for candidate_ref in resolve_requested_ref_candidates(requested_ref, &fallback_refs) {
-                if attempted_refs.contains(&candidate_ref) {
-                    continue;
-                }
-
-                match self
-                    .fetch_commits_for_ref(pushdown_filters, &candidate_ref, limit)
-                    .await
-                {
-                    Ok(batches) => return Ok(batches),
-                    Err(err) if is_resource_not_found_error(err.as_ref()) => {
-                        last_not_found_error = Some(err);
-                    }
-                    Err(err) => return Err(err),
-                }
+            if let Some(candidate_ref) = resolve_requested_ref_candidates(
+                requested_ref,
+                &self.fetch_repository_refs().await?,
+            )
+            .into_iter()
+            .next()
+            {
+                return Ok(candidate_ref);
             }
         }
 
-        Err(last_not_found_error.unwrap_or_else(|| {
-            data_components::graphql::Error::ResourceNotFound {
-                message: format!(
-                    "GitHub commits ref {requested_ref:?} was not found or is not accessible. Verify the requested ref exists and is readable."
-                ),
-            }
-            .into()
-        }))
+        Ok(requested_ref.to_string())
     }
 
     async fn fetch_repository_refs(
@@ -301,6 +286,64 @@ impl CommitsTableProvider {
         });
 
         Ok(refs)
+    }
+
+    async fn scan_for_requested_ref(
+        &self,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        requested_ref: &str,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let resolved_ref = self
+            .resolve_requested_ref_name(requested_ref)
+            .await
+            .map_err(DataFusionError::External)?;
+
+        let mut ref_args = self.table_args.as_ref().clone();
+        ref_args.requested_ref = Some(resolved_ref);
+
+        let graphql_values = ref_args.get_graphql_values();
+        let mut query = GraphQLQuery::try_from(Arc::clone(&graphql_values.query))
+            .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
+
+        if let Some(json_pointer) = graphql_values.json_pointer {
+            query = query.with_json_pointer(Arc::from(json_pointer));
+        }
+
+        let pushdown_filters = filters
+            .iter()
+            .map(|filter| ref_args.filter_pushdown(filter))
+            .collect::<Result<Vec<_>, DataFusionError>>()?;
+        ref_args.inject_parameters(&pushdown_filters, &mut query)?;
+
+        let graphql_exec = Arc::new(
+            GraphQLTableProviderExec::new(
+                Arc::clone(&self.client),
+                query,
+                Arc::clone(&self.schema),
+                Arc::clone(&self.schema),
+            )
+            .with_limit(limit)
+            .with_error_checker(ref_args.error_checker())
+            .with_query_cost(ref_args.query_cost()),
+        );
+
+        if let Some(projection) = projection {
+            let mut projection_expr = Vec::with_capacity(projection.len());
+            for idx in projection {
+                let col_name = self.schema.field(*idx).name();
+                projection_expr.push((
+                    Arc::new(Column::new(col_name, *idx)) as Arc<dyn PhysicalExpr>,
+                    col_name.clone(),
+                ));
+            }
+
+            let projection_exec = ProjectionExec::try_new(projection_expr, graphql_exec)?;
+            return Ok(Arc::new(projection_exec) as Arc<dyn ExecutionPlan>);
+        }
+
+        Ok(graphql_exec as Arc<dyn ExecutionPlan>)
     }
 }
 
@@ -348,12 +391,10 @@ impl TableProvider for CommitsTableProvider {
         });
 
         if let Some(requested_ref) = requested_ref.as_deref() {
-            let batches = self
-                .fetch_commits_for_requested_ref(&pushdown_filters, requested_ref, limit)
-                .await
-                .map_err(DataFusionError::External)?;
-            let table = MemTable::try_new(Arc::clone(&self.schema), vec![batches])?;
-            return table.scan(state, projection, filters, limit).await;
+            let _ = state;
+            return self
+                .scan_for_requested_ref(projection, filters, limit, requested_ref)
+                .await;
         }
 
         if !matches!(ref_fetch_mode_from_exprs(filters), RefFetchMode::Dynamic) {
@@ -1127,6 +1168,14 @@ mod tests {
                 "refs/tags/release/1.11".to_string(),
                 "release/1.11".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn test_requested_ref_candidates_preserve_qualified_refs() {
+        assert_eq!(
+            requested_ref_candidates("refs/heads/release/1.11"),
+            vec!["refs/heads/release/1.11".to_string()]
         );
     }
 

@@ -1051,6 +1051,81 @@ impl GithubRestClient {
         Ok(refs)
     }
 
+    pub async fn fetch_qualified_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        qualified_name: &str,
+    ) -> Result<Option<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
+        self.rate_limiter.check_rate_limit().await?;
+
+        let Some(git_ref_path) = qualified_name.strip_prefix("refs/") else {
+            return Ok(None);
+        };
+
+        let action = format!("retrieve GitHub ref {qualified_name}");
+        let endpoint =
+            format!("https://api.github.com/repos/{owner}/{repo}/git/ref/{git_ref_path}");
+
+        let client = &self.client;
+        let token = &self.token;
+        let rate_limiter = &self.rate_limiter;
+
+        let response = retry_with_adaptive_backoff(&action, 3, rate_limiter, || async {
+            let mut headers = HeaderMap::new();
+            headers.insert(USER_AGENT, HeaderValue::from_static(SPICE_USER_AGENT));
+            headers.insert(
+                ACCEPT,
+                HeaderValue::from_static("application/vnd.github.v3+json"),
+            );
+
+            add_optional_github_auth(&mut headers, token.as_ref());
+
+            tracing::debug!(owner, repo, qualified_name, endpoint = %endpoint, "Requesting GitHub ref");
+
+            client.get(&endpoint).headers(headers).send().await
+        })
+        .await
+        .map_err(|e: reqwest::Error| -> Box<dyn std::error::Error + Send + Sync> {
+            boxed_github_request_error(&action, owner, repo, &e)
+        })?;
+
+        rate_limiter.update_from_headers(response.headers()).await;
+
+        if response.status().is_success() {
+            let git_ref = response.json::<GitQualifiedRef>().await?;
+            return Ok(Some(GithubRef {
+                name: short_ref_name(&git_ref.qualified_name),
+                qualified_name: git_ref.qualified_name,
+            }));
+        }
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        let (response_headers, response_status, response_json, detail) =
+            read_github_error_response(response).await;
+
+        if let Some(response_json) = response_json.as_ref() {
+            error_checker(&response_headers, response_json).map_err(|e| {
+                if let graphql::Error::RateLimited { message } = e {
+                    Error::RateLimited { message }
+                } else {
+                    Error::GithubApiError { source: e.into() }
+                }
+            })?;
+        }
+
+        Err(boxed_github_status_error(
+            &action,
+            owner,
+            repo,
+            response_status,
+            detail.as_deref(),
+        ))
+    }
+
     async fn fetch_refs_for_resource(
         &self,
         owner: &str,
@@ -1835,6 +1910,21 @@ struct GitHubRepository {
 #[derive(Debug, Deserialize)]
 struct GitRefName {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitQualifiedRef {
+    #[serde(rename = "ref")]
+    qualified_name: String,
+}
+
+fn short_ref_name(qualified_name: &str) -> String {
+    qualified_name
+        .strip_prefix("refs/heads/")
+        .or_else(|| qualified_name.strip_prefix("refs/tags/"))
+        .or_else(|| qualified_name.strip_prefix("refs/"))
+        .unwrap_or(qualified_name)
+        .to_string()
 }
 
 #[derive(Debug, Deserialize)]
