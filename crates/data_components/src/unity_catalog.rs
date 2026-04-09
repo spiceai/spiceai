@@ -500,7 +500,13 @@ pub struct UCPrivilege {
 }
 
 /// The subset of UC privileges relevant to read operations.
-const READ_PRIVILEGES: &[&str] = &["SELECT", "ALL_PRIVILEGES", "ALL PRIVILEGES"];
+const READ_PRIVILEGES: &[&str] = &[
+    "SELECT",
+    "ALL_PRIVILEGES",
+    "ALL PRIVILEGES",
+    "OWNER",
+    "OWNERSHIP",
+];
 
 impl UCPermissionsEnvelope {
     /// Returns `true` if the current caller has a read-compatible privilege
@@ -523,6 +529,15 @@ impl UCPermissionsEnvelope {
         self.privilege_assignments
             .iter()
             .map(|pa| pa.principal.as_str())
+            .collect()
+    }
+
+    /// Returns all privilege names across all principal assignments.
+    #[must_use]
+    pub fn all_privileges(&self) -> Vec<&str> {
+        self.privilege_assignments
+            .iter()
+            .flat_map(|pa| pa.privileges.iter().map(|p| p.privilege.as_str()))
             .collect()
     }
 }
