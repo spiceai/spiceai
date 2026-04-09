@@ -1040,10 +1040,10 @@ impl GithubRestClient {
         repo: &str,
     ) -> Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
         let mut refs = self
-            .fetch_refs_for_resource(owner, repo, "branches", "refs/heads/", None, None)
+            .fetch_refs_for_resource(owner, repo, "branches", "refs/heads/", None)
             .await?;
         refs.extend(
-            self.fetch_refs_for_resource(owner, repo, "tags", "refs/tags/", None, None)
+            self.fetch_refs_for_resource(owner, repo, "tags", "refs/tags/", None)
                 .await?,
         );
         refs.sort_unstable_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
@@ -1064,7 +1064,6 @@ impl GithubRestClient {
                 "branches",
                 "refs/heads/",
                 Some(max_refs),
-                Some(max_refs),
             )
             .await?;
         let remaining_refs = max_refs.saturating_sub(refs.len());
@@ -1081,7 +1080,6 @@ impl GithubRestClient {
                 "tags",
                 "refs/tags/",
                 Some(remaining_refs),
-                Some(max_refs),
             )
             .await?,
         );
@@ -1171,7 +1169,6 @@ impl GithubRestClient {
         resource: &str,
         qualified_name_prefix: &str,
         max_refs: Option<usize>,
-        overall_limit: Option<usize>,
     ) -> Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
         if max_refs == Some(0) {
             return Ok(Vec::new());
@@ -1246,11 +1243,15 @@ impl GithubRestClient {
             if let Some(max_refs) = max_refs
                 && refs.len() + page_len > max_refs
             {
-                let reported_limit = overall_limit.unwrap_or(max_refs);
-                return Err(std::io::Error::other(format!(
-                    "Failed to retrieve GitHub refs for {owner}/{repo}: dynamic ref scans are limited to {reported_limit} refs. Add a more selective ref predicate or use an exact ref = '<value>' filter."
-                ))
-                .into());
+                // Truncate to max_refs instead of erroring so dynamic scans
+                // work on repos with more refs than the limit. Only the first
+                // max_refs refs (alphabetical) are included.
+                let take = max_refs.saturating_sub(refs.len());
+                refs.extend(page_refs.into_iter().take(take).map(|git_ref| GithubRef {
+                    qualified_name: format!("{qualified_name_prefix}{}", git_ref.name),
+                    name: git_ref.name,
+                }));
+                break;
             }
 
             refs.extend(page_refs.into_iter().map(|git_ref| GithubRef {

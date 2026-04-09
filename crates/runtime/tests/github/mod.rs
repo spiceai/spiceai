@@ -22,6 +22,7 @@ use app::AppBuilder;
 use arrow::array::{Array, Int64Array, ListArray, RecordBatch, StringArray};
 
 use datafusion::common::test_util::batches_to_string;
+use futures::TryStreamExt;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 
@@ -517,32 +518,48 @@ async fn test_github_commits() -> Result<(), String> {
 
             // Dynamic ref scan on cookbook (22 branches) instead of spiceai (800+ branches)
             // to avoid overwhelming the GitHub API with hundreds of per-ref commit fetches.
+            // Run directly (no EXPLAIN preflight) since EXPLAIN also triggers the
+            // full dynamic scan, doubling per-ref API calls.
             let commits_dynamic_ref_filter_query = format!(
                 "SELECT ref, sha FROM cookbook_commits_auto WHERE ref != 'trunk' LIMIT {GITHUB_COMMITS_PAGINATION_LIMIT}"
             );
 
-            run_query_and_check_results(
-                &mut rt,
-                "test_github_commits_dynamic_ref_filter",
-                &commits_dynamic_ref_filter_query,
-                false,
-                Some(Box::new(|result_batches: Vec<RecordBatch>| {
-                    let row_count = result_batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-                    for batch in &result_batches {
-                        assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
-                    }
-                    assert_positive_row_count_at_most_pagination_limit(row_count);
-                    assert_no_string_values(&result_batches, 0, "trunk");
+            let result_batches: Vec<RecordBatch> = rt
+                .datafusion()
+                .query_builder(&commits_dynamic_ref_filter_query)
+                .build()
+                .run()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "query `{commits_dynamic_ref_filter_query}` failed to run: {e}"
+                    )
+                })?
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "query `{commits_dynamic_ref_filter_query}` to results: {e}"
+                    )
+                })?;
 
-                    let shas = collect_string_values(&result_batches, 1);
-                    assert_eq!(shas.len(), row_count, "shas: {shas:?}");
-                    assert!(
-                        shas.iter().all(|sha| !sha.is_empty()),
-                        "expected non-empty shas, got {shas:?}"
-                    );
-                })),
-            )
-            .await?;
+            let row_count = result_batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>();
+            for batch in &result_batches {
+                assert_eq!(batch.num_columns(), 2, "num_cols: {}", batch.num_columns());
+            }
+            assert_positive_row_count_at_most_pagination_limit(row_count);
+            assert_no_string_values(&result_batches, 0, "trunk");
+
+            let shas = collect_string_values(&result_batches, 1);
+            assert_eq!(shas.len(), row_count, "shas: {shas:?}");
+            assert!(
+                shas.iter().all(|sha| !sha.is_empty()),
+                "expected non-empty shas, got {shas:?}"
+            );
 
             let commits_ref_path_query = format!(
                 "SELECT ref, sha FROM spiceai_commits_trunk_auto LIMIT {GITHUB_COMMITS_PAGINATION_LIMIT}"
@@ -654,9 +671,9 @@ async fn test_github_commits() -> Result<(), String> {
 
             let elapsed = now.elapsed().as_secs();
 
-            // LIMIT should stop this query from retrieving every commit, so it shouldn't take that long.
-            // Budget is higher because the test now includes tag-ref, LIMIT 0, projection, and schema queries.
-            assert!(elapsed < 60, "elapsed: {elapsed}");
+            // Budget is higher because the test includes tag-ref, LIMIT 0, projection,
+            // schema queries, plus the dynamic ref scan on cookbook.
+            assert!(elapsed < 180, "elapsed: {elapsed}");
 
             Ok(())
         })

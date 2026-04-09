@@ -50,7 +50,12 @@ use serde_json::{Map, Value};
 use std::sync::Arc;
 
 const COMMITS_JSON_POINTER: &str = "/data/repository";
-const MAX_DYNAMIC_REF_SCAN_REFS: usize = 25;
+const MAX_DYNAMIC_REF_SCAN_REFS: usize = 5;
+
+/// Per-ref commit limit during dynamic scans to avoid overwhelming the GitHub
+/// GraphQL API with unbounded pagination across many refs. Matches the
+/// `history(first: 100)` page size so each ref costs at most one API call.
+const DYNAMIC_SCAN_PER_REF_COMMIT_LIMIT: usize = 100;
 
 // https://docs.github.com/en/graphql/reference/objects#commit
 #[derive(Debug, Clone)]
@@ -202,6 +207,11 @@ impl CommitsTableProvider {
 
         let graphql_values = ref_args.get_graphql_values();
         let mut query = GraphQLQuery::try_from(Arc::clone(&graphql_values.query))?;
+        // Clear the auto-inferred json_pointer so the client's pointer
+        // ("/data/repository") is used instead. The inferred pointer points
+        // directly to the nodes array, but the custom_unnestter expects the
+        // full repository object to extract selected_ref → target → history.
+        query.json_pointer = None;
         ref_args.inject_parameters(pushdown_filters, &mut query)?;
 
         Arc::clone(&self.client)
@@ -410,8 +420,15 @@ impl TableProvider for CommitsTableProvider {
         let mut batches = Vec::new();
 
         for git_ref in refs {
+            let per_ref_limit = remaining
+                .map(|r| r.min(DYNAMIC_SCAN_PER_REF_COMMIT_LIMIT))
+                .unwrap_or(DYNAMIC_SCAN_PER_REF_COMMIT_LIMIT);
             let ref_batches = self
-                .fetch_commits_for_ref(&pushdown_filters, &git_ref.qualified_name, remaining)
+                .fetch_commits_for_ref(
+                    &pushdown_filters,
+                    &git_ref.qualified_name,
+                    Some(per_ref_limit),
+                )
                 .await
                 .map_err(DataFusionError::External)?;
 
