@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "ansi_colors"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 
 [[package]]
 name = "anstream"
@@ -407,7 +407,7 @@ checksum = "fca387cdc0a1f9c7a7c26556d584aa2d07fc529843082e4861003cde4ab914ed"
 
 [[package]]
 name = "app"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "serde",
  "snafu",
@@ -746,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_sql_gen"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "bigdecimal",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "arrow_tools"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-cast",
@@ -1565,7 +1565,7 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-credential-bridge"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3112,7 +3112,7 @@ dependencies = [
 
 [[package]]
 name = "cache"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -3471,7 +3471,7 @@ dependencies = [
 
 [[package]]
 name = "cayenne"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "aegis",
  "arrow",
@@ -3703,7 +3703,7 @@ dependencies = [
 
 [[package]]
 name = "chunking"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "criterion 0.7.0",
  "snafu",
@@ -3996,7 +3996,7 @@ checksum = "510ca239cf13b7f8d16a2b48f263de7b4f8c566f0af58d901031473c76afb1e3"
 
 [[package]]
 name = "connector-clickhouse"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "clickhouse-rs",
@@ -4015,7 +4015,7 @@ dependencies = [
 
 [[package]]
 name = "connector-databricks"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
@@ -4035,7 +4035,7 @@ dependencies = [
 
 [[package]]
 name = "connector-delta-lake"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
@@ -4051,7 +4051,7 @@ dependencies = [
 
 [[package]]
 name = "connector-dremio"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4069,7 +4069,7 @@ dependencies = [
 
 [[package]]
 name = "connector-duckdb"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4084,7 +4084,7 @@ dependencies = [
 
 [[package]]
 name = "connector-flightsql"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -4100,7 +4100,7 @@ dependencies = [
 
 [[package]]
 name = "connector-ftp"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "linkme",
  "paste",
@@ -4112,7 +4112,7 @@ dependencies = [
 
 [[package]]
 name = "connector-graphql"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4128,7 +4128,7 @@ dependencies = [
 
 [[package]]
 name = "connector-imap"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4144,7 +4144,7 @@ dependencies = [
 
 [[package]]
 name = "connector-mongodb"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4160,7 +4160,7 @@ dependencies = [
 
 [[package]]
 name = "connector-mssql"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4174,7 +4174,7 @@ dependencies = [
 
 [[package]]
 name = "connector-mysql"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4204,7 +4204,7 @@ dependencies = [
 
 [[package]]
 name = "connector-odbc"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4219,7 +4219,7 @@ dependencies = [
 
 [[package]]
 name = "connector-oracle"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4235,7 +4235,7 @@ dependencies = [
 
 [[package]]
 name = "connector-postgres"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -4249,7 +4249,7 @@ dependencies = [
 
 [[package]]
 name = "connector-scylladb"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4267,7 +4267,7 @@ dependencies = [
 
 [[package]]
 name = "connector-sftp"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "linkme",
  "paste",
@@ -4279,7 +4279,7 @@ dependencies = [
 
 [[package]]
 name = "connector-sharepoint"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4295,7 +4295,7 @@ dependencies = [
 
 [[package]]
 name = "connector-smb"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "linkme",
  "paste",
@@ -4307,7 +4307,7 @@ dependencies = [
 
 [[package]]
 name = "connector-snowflake"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "data_components",
@@ -4324,7 +4324,7 @@ dependencies = [
 
 [[package]]
 name = "connector-spark"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "data_components",
@@ -5238,7 +5238,7 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
 name = "data_components"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -5339,7 +5339,7 @@ dependencies = [
 
 [[package]]
 name = "dataformat-json"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5860,7 +5860,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-optimizer-rules"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6178,7 +6178,7 @@ dependencies = [
 
 [[package]]
 name = "db_connection_pool"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-odbc",
@@ -6642,7 +6642,7 @@ checksum = "aac81fa3e28d21450aa4d2ac065992ba96a1d7303efbce51a95f4fd175b67562"
 
 [[package]]
 name = "document_parse"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "bytes",
  "docx-rs",
@@ -6757,7 +6757,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "duration-parse"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "snafu",
 ]
@@ -6802,7 +6802,7 @@ checksum = "e1d926b4d407d372f141f93bb444696142c29d32962ccbd3531117cf3aa0bfa9"
 
 [[package]]
 name = "dynamodb-streams"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "aws-config",
  "aws-sdk-dynamodb",
@@ -7205,7 +7205,7 @@ dependencies = [
 
 [[package]]
 name = "event_stream"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "futures",
  "snafu",
@@ -7528,7 +7528,7 @@ dependencies = [
 
 [[package]]
 name = "flight-cookie-server"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow-array",
  "arrow-flight",
@@ -7546,7 +7546,7 @@ dependencies = [
 
 [[package]]
 name = "flight_client"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -7567,7 +7567,7 @@ dependencies = [
 
 [[package]]
 name = "flightpublisher"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -7580,7 +7580,7 @@ dependencies = [
 
 [[package]]
 name = "flightsubscriber"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow-flight",
  "clap",
@@ -8473,7 +8473,7 @@ dependencies = [
 
 [[package]]
 name = "google-genai"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "bytes",
  "futures",
@@ -8762,7 +8762,7 @@ dependencies = [
 
 [[package]]
 name = "hash-index"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -10748,7 +10748,7 @@ dependencies = [
 
 [[package]]
 name = "llms"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -11620,7 +11620,7 @@ dependencies = [
 
 [[package]]
 name = "model_components"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -12165,7 +12165,7 @@ dependencies = [
 
 [[package]]
 name = "ns_lookup"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "hickory-resolver",
  "snafu",
@@ -13174,7 +13174,7 @@ dependencies = [
 
 [[package]]
 name = "otel-arrow"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-buffer",
@@ -13186,7 +13186,7 @@ dependencies = [
 
 [[package]]
 name = "otelpublisher"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "clap",
  "opentelemetry-proto",
@@ -13333,7 +13333,7 @@ dependencies = [
 
 [[package]]
 name = "package"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "bytes",
  "futures",
@@ -13456,7 +13456,7 @@ dependencies = [
 
 [[package]]
 name = "parsley"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "bytes",
  "chunking",
@@ -14238,7 +14238,7 @@ dependencies = [
 
 [[package]]
 name = "pr-builds"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -15453,7 +15453,7 @@ dependencies = [
 
 [[package]]
 name = "repl"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "ansi_colors",
  "arrow",
@@ -15919,7 +15919,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -16131,7 +16131,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-acceleration"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -16168,7 +16168,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-api-types"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -16177,7 +16177,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-async"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "futures",
  "libc",
@@ -16189,7 +16189,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-auth"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "app",
  "axum",
@@ -16204,7 +16204,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow_tools",
@@ -16236,7 +16236,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-index"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -16249,7 +16249,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-datafusion-udfs"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -16274,7 +16274,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-object-store"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -16304,7 +16304,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-parameters"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "itertools 0.14.0",
  "runtime-secrets",
@@ -16316,7 +16316,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-proto"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "datafusion",
  "datafusion-common",
@@ -16331,7 +16331,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-rate-control"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "futures",
  "governor",
@@ -16343,7 +16343,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-request-context"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "app",
  "async-trait",
@@ -16364,7 +16364,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-secrets"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -16391,7 +16391,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-table-partition"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -16765,7 +16765,7 @@ checksum = "a50f4cf475b65d88e057964e0e9bb1f0aa9bbb2036dc65c64596b42932536984"
 
 [[package]]
 name = "s3_vectors"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -16777,7 +16777,7 @@ dependencies = [
 
 [[package]]
 name = "s3_vectors_metadata_filter"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "aws-smithy-types",
  "datafusion",
@@ -16901,7 +16901,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -17113,7 +17113,7 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "search"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -18118,7 +18118,7 @@ dependencies = [
 
 [[package]]
 name = "spice"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "ansi_colors",
  "arrow",
@@ -18172,7 +18172,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -18187,7 +18187,7 @@ dependencies = [
 
 [[package]]
 name = "spice-cloud-client"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "reqwest 0.12.24",
  "serde",
@@ -18227,7 +18227,7 @@ dependencies = [
 
 [[package]]
 name = "spiced"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "app",
  "clap",
@@ -18285,7 +18285,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "aws-sdk-credential-bridge",
@@ -18308,7 +18308,7 @@ dependencies = [
 
 [[package]]
 name = "spicepod-validator"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "app",
  "clap",
@@ -18318,7 +18318,7 @@ dependencies = [
 
 [[package]]
 name = "spicepodschema"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "connector-clickhouse",
  "connector-delta-lake",
@@ -18350,7 +18350,7 @@ dependencies = [
 
 [[package]]
 name = "spiceschema"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "clap",
  "runtime",
@@ -18360,7 +18360,7 @@ dependencies = [
 
 [[package]]
 name = "spidapter"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -19253,7 +19253,7 @@ checksum = "b1dd07eb858a2067e2f3c7155d54e929265c264e6f37efe3ee7a8d1b5a1dd0ba"
 
 [[package]]
 name = "telemetry"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -19353,7 +19353,7 @@ checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "test-framework"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "anyhow",
  "app",
@@ -19427,7 +19427,7 @@ dependencies = [
 
 [[package]]
 name = "testoperator"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -19783,7 +19783,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "token_provider"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "secrecy",
  "snafu",
@@ -20146,7 +20146,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "rmcp",
@@ -20223,7 +20223,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "tpc-extension"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-trait",
  "duckdb",
@@ -20557,7 +20557,7 @@ dependencies = [
 
 [[package]]
 name = "turso-shared"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 
 [[package]]
 name = "turso_core"
@@ -21237,7 +21237,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "util"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -23126,7 +23126,7 @@ dependencies = [
 
 [[package]]
 name = "workers"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "async-openai",
  "async-trait",
@@ -23268,7 +23268,7 @@ checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
 
 [[package]]
 name = "yaml"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2"
 dependencies = [
  "indexmap 2.13.0",
  "serde",
