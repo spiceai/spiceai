@@ -68,6 +68,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Debezium {
     kafka_config: KafkaConfig,
     batching: (usize, Duration),
+    schema_evolution: bool,
 }
 
 impl Debezium {
@@ -165,9 +166,19 @@ impl Debezium {
             .and_then(|v| fundu::parse_duration(v).ok())
             .unwrap_or(Duration::from_secs(1));
 
+        let schema_evolution = params
+            .get("schema_evolution")
+            .expose()
+            .ok()
+            .unwrap_or("false")
+            .to_string()
+            .parse()
+            .unwrap_or(false);
+
         Ok(Self {
             kafka_config,
             batching: (batch_max_size, batch_max_duration),
+            schema_evolution,
         })
     }
 }
@@ -230,6 +241,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("batch_max_duration")
         .description("Maximum time to wait for a batch to fill before processing")
         .default("1s"),
+    ParameterSpec::runtime("schema_evolution")
+        .default("false")
+        .description("Enable automatic schema evolution detection on reload. When true, the connector peeks at the latest Kafka message to detect schema changes. Default: false."),
 ];
 
 impl DataConnectorFactory for DebeziumFactory {
@@ -349,9 +363,20 @@ impl DataConnector for Debezium {
                     }
                 );
 
-                // Check for schema evolution by peeking at the latest Kafka message
-                let (metadata, schema) =
-                    refresh_schema_if_evolved(metadata, dataset, topic, &self.kafka_config).await?;
+                let (metadata, schema) = if self.schema_evolution {
+                    // Check for schema evolution by peeking at the latest Kafka message
+                    refresh_schema_if_evolved(metadata, dataset, topic, &self.kafka_config).await?
+                } else {
+                    let schema = debezium::arrow::convert_fields_to_arrow_schema(
+                        metadata.schema_fields.iter().collect(),
+                    )
+                    .boxed()
+                    .context(super::UnableToGetReadProviderSnafu {
+                        dataconnector: "debezium",
+                        connector_component: ConnectorComponent::from(dataset),
+                    })?;
+                    (metadata, Arc::new(schema))
+                };
 
                 kafka_consumer.subscribe(topic).boxed().context(
                     super::UnableToGetReadProviderSnafu {
