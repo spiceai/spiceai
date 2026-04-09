@@ -231,17 +231,14 @@ fn assert_no_string_values(result_batches: &[RecordBatch], column_index: usize, 
 fn assert_positive_row_count_at_most_pagination_limit(row_count: usize) {
     assert!(
         row_count > 0 && row_count <= GITHUB_COMMITS_PAGINATION_LIMIT,
-        "expected 0 < num_rows <= {}, got {row_count}",
-        GITHUB_COMMITS_PAGINATION_LIMIT
+        "expected 0 < num_rows <= {GITHUB_COMMITS_PAGINATION_LIMIT}, got {row_count}"
     );
 }
 
 fn assert_crosses_commits_pagination_boundary(row_count: usize) {
     assert!(
         row_count > GITHUB_COMMITS_PAGE_SIZE && row_count <= GITHUB_COMMITS_PAGINATION_LIMIT,
-        "expected {} < num_rows <= {}, got {row_count}",
-        GITHUB_COMMITS_PAGE_SIZE,
-        GITHUB_COMMITS_PAGINATION_LIMIT
+        "expected {GITHUB_COMMITS_PAGE_SIZE} < num_rows <= {GITHUB_COMMITS_PAGINATION_LIMIT}, got {row_count}"
     );
 }
 
