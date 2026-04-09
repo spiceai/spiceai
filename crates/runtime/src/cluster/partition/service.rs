@@ -1395,10 +1395,7 @@ mod tests {
         .await;
 
         // Simulate discovery finding 2 new partition values.
-        let new_partition_values = vec![
-            pv("date", "2024-01-03"),
-            pv("date", "2024-01-04"),
-        ];
+        let new_partition_values = vec![pv("date", "2024-01-03"), pv("date", "2024-01-04")];
         let table = TableReference::parse_str("orders");
 
         // Step 1: Add new partitions to the store (as unassigned).
@@ -1414,7 +1411,11 @@ mod tests {
             .expect("get")
             .expect("exists");
         assert_eq!(metadata.partitions.len(), 4);
-        let unassigned_count = metadata.partitions.iter().filter(|p| !p.is_assigned()).count();
+        let unassigned_count = metadata
+            .partitions
+            .iter()
+            .filter(|p| !p.is_assigned())
+            .count();
         assert_eq!(unassigned_count, 2, "New partitions should be unassigned");
 
         // Step 2: Assign unassigned partitions using the assignment algorithm.
@@ -1428,10 +1429,16 @@ mod tests {
         assert_eq!(unassigned.len(), 2);
 
         let assignments = assign_unassigned_partitions(unassigned, &state, &store, &config);
-        assert_eq!(assignments.len(), 2, "Both new partitions should be assigned");
+        assert_eq!(
+            assignments.len(),
+            2,
+            "Both new partitions should be assigned"
+        );
 
         // Step 3: Commit assignments to the store.
-        let result = commit_assignments(&store, assignments).await.expect("commit");
+        let result = commit_assignments(&store, assignments)
+            .await
+            .expect("commit");
         assert_eq!(result.committed.len(), 2);
         assert!(result.failed.is_empty());
 

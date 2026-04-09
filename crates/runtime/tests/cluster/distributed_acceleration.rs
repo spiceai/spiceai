@@ -797,11 +797,10 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
             );
 
             // Verify the new partition value is present.
-            let has_seattle = final_metadata.partitions.iter().any(|p| {
-                p.partition_value
-                    .values()
-                    .any(|v| v == "Seattle")
-            });
+            let has_seattle = final_metadata
+                .partitions
+                .iter()
+                .any(|p| p.partition_value.values().any(|v| v == "Seattle"));
             assert!(has_seattle, "Seattle partition should exist in metadata");
 
             // Wait for the data to appear and verify all 11 rows are queryable.
