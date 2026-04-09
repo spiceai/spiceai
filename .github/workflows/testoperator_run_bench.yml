@@ -462,6 +462,8 @@ jobs:
       - name: Upload benchmark snapshots to branch
         if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
         run: |
+          git fetch --unshallow || true
+
           # if the spiced commit is set, use that as the branch ID
           if [ -n "${{ github.event.inputs.spiced_commit || '' }}" ]; then
             BRANCH_ID=${{ github.event.inputs.spiced_commit }}
@@ -497,7 +499,7 @@ jobs:
           **Profile:** \`${{ github.event.inputs.profile_option || 'release' }}\`
           EOF
           )
-              gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base develop --head ${BRANCH_NAME} --label kind/bug
+              gh pr create --title "fix: Update ${{ github.event.inputs.query_set }} benchmark snapshots for ${{ github.event.inputs.spicepod_path }}" --body "${BODY}" --base trunk --head ${BRANCH_NAME} --label kind/bug
               gh pr merge --squash --auto ${BRANCH_NAME}
             fi
           fi

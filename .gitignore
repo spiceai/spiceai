@@ -81,5 +81,8 @@ data/
 # Cluster logs
 cluster_logs/
 
+# Insta snapshot artifacts
+*.pending-snap
+
 # Claude worktrees
 .claude/worktrees/
