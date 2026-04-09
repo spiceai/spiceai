@@ -32,6 +32,7 @@ use spicepod::{
     partitioning::PartitionedBy,
 };
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
@@ -667,6 +668,128 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
                 .await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
             insta::assert_snapshot!("refresh_forwarding_count", rows_fmt);
+
+            harness.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// Test that on-demand refresh discovers new partitions and assigns them before
+/// forwarding the refresh command to executors.
+///
+/// Scenario:
+/// 1. Start cluster with a partitioned dataset (initial data: 10 rows)
+/// 2. Wait for initial acceleration to complete
+/// 3. Add new rows to the source CSV that fall into a new partition bucket
+/// 4. Trigger `refresh_table()` on the scheduler
+/// 5. Verify that the new partition data is queryable (refresh discovered + assigned + loaded it)
+///
+/// Without the pre-refresh partition discovery (PartitionService.discover_and_assign_for_table),
+/// the new partition data would be silently dropped because executors wouldn't have assignments
+/// for it.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow::Error> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("runtime=debug,info"))
+        .with_ansi(true)
+        .try_init();
+
+    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
+        verify_env_secret_exists(env_var)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let csv_path = csv_tempdir.path().join("test_data.csv");
+    // Initial data: 10 rows with IDs 1-10. With bucket(3, id), these map to buckets 0, 1, 2.
+    tokio::fs::write(&csv_path, TEST_DATA_CSV)
+        .await
+        .expect("write test data");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+            let app = AppBuilder::new("test_refresh_discovers_partitions")
+                .with_dataset(make_memory_accelerated_dataset(
+                    format!("file:{}", csv_path.display()),
+                    "test_data",
+                    3,
+                    "id",
+                ))
+                .with_runtime(SpicepodRuntime {
+                    scheduler: Some(make_named_scheduler_config(
+                        "test_on_demand_refresh_discovers_new_partitions",
+                    )),
+                    ..SpicepodRuntime::default()
+                })
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(app)
+                .executors(1)
+                .start()
+                .await?;
+
+            harness.wait_for_executors(Duration::from_secs(15)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+
+            // Verify initial state: 10 rows across 3 buckets.
+            let initial_count = harness
+                .query("SELECT COUNT(*) AS cnt FROM test_data")
+                .await?;
+            let cnt = initial_count[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("count column")
+                .value(0);
+            assert_eq!(cnt, 10, "Initial data should have 10 rows");
+
+            // Append new rows to the source CSV. These rows have new IDs that may
+            // fall into partition buckets that already exist — the important thing
+            // is that after refresh, all data is present.
+            let additional_rows = "\n11,Alice New,25,Chicago,88\n12,Bob New,30,Houston,91\n";
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&csv_path)
+                .await
+                .expect("open csv for append")
+                .write_all(additional_rows.as_bytes())
+                .await
+                .expect("append new rows");
+
+            // Trigger on-demand refresh. This calls PartitionService.discover_and_assign_for_table()
+            // before forwarding the refresh command to executors.
+            harness
+                .scheduler
+                .datafusion()
+                .refresh_table(
+                    &datafusion::sql::TableReference::parse_str("test_data"),
+                    None,
+                )
+                .await
+                .expect("refresh_table should succeed");
+
+            // Wait for the new data to appear.
+            wait_for_row_count(&harness, "test_data", 12, Duration::from_secs(60)).await?;
+
+            // Verify all 12 rows are queryable.
+            let final_count = harness
+                .query("SELECT COUNT(*) AS cnt FROM test_data")
+                .await?;
+            let cnt = final_count[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("count column")
+                .value(0);
+            assert_eq!(
+                cnt, 12,
+                "After refresh, all 12 rows (original + new) should be queryable"
+            );
 
             harness.shutdown().await;
             Ok(())
