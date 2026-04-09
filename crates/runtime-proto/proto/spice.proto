@@ -104,7 +104,6 @@ message ExecutorControlMessage {
         ExecutorHeartbeat heartbeat = 2;
         MetricsResponse metrics = 3;
         ExecutorShutdown shutdown = 4;
-        ComponentStatusUpdate component_status = 5;
     }
 }
 
@@ -116,7 +115,6 @@ message SchedulerControlMessage {
         UpdatePartitions update_partitions = 3;
         CancelTasksCommand cancel_tasks = 4;
         RefreshDatasetCommand refresh_dataset = 5;
-        ComponentStatusAck component_status_ack = 6;
     }
 }
 
@@ -176,23 +174,6 @@ message RefreshDatasetCommand {
 // Heartbeat message sent by executor to scheduler.
 message ExecutorHeartbeat {
     int64 timestamp_ms = 1;
-}
-
-// Component status update sent by executor to scheduler.
-// The executor retries sending until it receives a ComponentStatusAck.
-message ComponentStatusUpdate {
-    // Auto-generated unique ID for this update.
-    string update_id = 1;
-    // Component name (e.g. "dataset:my_table").
-    string component_name = 2;
-    // ComponentStatus discriminant (0=Initializing, 1=Ready, 2=Disabled, 3=Error, 4=Refreshing, 5=ShuttingDown).
-    int32 status = 3;
-}
-
-// Acknowledgement from scheduler for a ComponentStatusUpdate.
-message ComponentStatusAck {
-    // Echoed update_id from the corresponding ComponentStatusUpdate.
-    string update_id = 1;
 }
 
 // Executor shutdown notification sent by executor to scheduler.
