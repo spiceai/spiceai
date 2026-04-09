@@ -610,7 +610,7 @@ impl Databricks {
                         dataconnector: "databricks".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
                         message: format!(
-                            "Unsupported Unity Catalog table type '{}' for table '{}'. Only MANAGED, EXTERNAL, and MATERIALIZED_VIEW tables can be queried.",
+                            "Unsupported Unity Catalog table type '{}' for table '{}'. Only MANAGED, EXTERNAL, FOREIGN, and MATERIALIZED_VIEW tables can be queried.",
                             uc_table.table_type, full_name
                         ),
                     });
