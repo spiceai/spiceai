@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-pub(crate) mod dataset_status;
 mod discovery;
 pub mod executor_selection;
 mod metadata;

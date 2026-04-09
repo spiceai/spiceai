@@ -405,7 +405,6 @@ pub mod datafusion;
 pub(crate) mod executor_registry;
 pub mod metrics_collector;
 pub mod partition;
-pub(crate) mod proto_conv;
 mod scheduler_registry;
 mod servers;
 mod service;
@@ -1221,7 +1220,6 @@ pub async fn initialize_cluster_executor(
     let control_stream_tls_config = client_tls_config.clone();
     let control_stream_initial_schedulers = initial_scheduler_addresses.clone();
     let control_stream_metrics_reader = rt.metrics_reader().cloned();
-    let control_stream_runtime_status = rt.status();
     let shutdown_token_for_manager = shutdown_token.clone();
 
     let partition_update_handler_rt = Arc::clone(&rt);
@@ -1281,7 +1279,6 @@ pub async fn initialize_cluster_executor(
             partition_update_handler,
             Some(Arc::clone(&executor_for_manager)),
             refresh_dataset_handler,
-            control_stream_runtime_status,
         );
 
         // Get the shared poll_now notify handle from the control stream manager.
