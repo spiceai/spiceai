@@ -255,8 +255,13 @@ fn databricks_token_endpoint_url(
         endpoint.to_string()
     } else if endpoint.starts_with("http://") {
         let parsed = url::Url::parse(endpoint)?;
-        let host = parsed.host_str().unwrap_or("");
-        if host == "127.0.0.1" || host == "localhost" || host == "::1" {
+        let is_localhost = match parsed.host() {
+            Some(url::Host::Domain("localhost")) => true,
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        };
+        if is_localhost {
             endpoint.to_string()
         } else {
             return Err(format!(
@@ -657,7 +662,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_get_m2m_access_token_retries_rate_limited_response() {
         let (endpoint, requests, _) = start_mock_server(vec![
             MockHttpResponse {
@@ -687,7 +692,7 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_get_m2m_access_token_retries_server_error_response() {
         let (endpoint, requests, _) = start_mock_server(vec![
             MockHttpResponse::json("503 Service Unavailable", &json!({"error": "busy"})),
