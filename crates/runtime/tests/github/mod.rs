@@ -409,6 +409,16 @@ async fn test_github_commits() -> Result<(), String> {
             );
             commits_ref_dataset.name = "spiceai_commits_trunk_auto".to_string();
 
+            let cookbook_commits_dataset = make_github_dataset(
+                &GithubDatasetType::RepoSpecific {
+                    owner: "spiceai".to_string(),
+                    repo: "cookbook".to_string(),
+                    query_type: "commits".to_string(),
+                },
+                "auto",
+                None,
+            );
+
             let app = AppBuilder::new("github_integration_test")
                 .with_dataset(make_github_dataset(
                     &GithubDatasetType::RepoSpecific {
@@ -420,6 +430,7 @@ async fn test_github_commits() -> Result<(), String> {
                     None,
                 ))
                 .with_dataset(commits_ref_dataset)
+                .with_dataset(cookbook_commits_dataset)
                 .build();
 
             configure_test_datafusion();
@@ -504,8 +515,10 @@ async fn test_github_commits() -> Result<(), String> {
             )
             .await?;
 
+            // Dynamic ref scan on cookbook (22 branches) instead of spiceai (800+ branches)
+            // to avoid overwhelming the GitHub API with hundreds of per-ref commit fetches.
             let commits_dynamic_ref_filter_query = format!(
-                "SELECT ref, sha FROM spiceai_commits_auto WHERE ref != 'trunk' LIMIT {GITHUB_COMMITS_PAGINATION_LIMIT}"
+                "SELECT ref, sha FROM cookbook_commits_auto WHERE ref != 'trunk' LIMIT {GITHUB_COMMITS_PAGINATION_LIMIT}"
             );
 
             run_query_and_check_results(
@@ -1418,6 +1431,88 @@ async fn test_github_pull_requests_commits_and_number_columns() -> Result<(), St
                         }
                     }
                     assert_eq!(total_rows, 5, "expected 5 rows from LIMIT 5");
+                })),
+            )
+            .await?;
+
+            Ok(())
+        })
+        .await
+}
+
+/// Validates that `commits_count` reports the true total count (from `totalCount`) and is not
+/// capped at the GraphQL fetch limit (`commits(first: 25)`). Uses a limit exceeding PR pagination
+/// boundary (100 PRs per page) to stress test multi-page fetching.
+#[tokio::test]
+async fn test_github_pull_requests_commits_count_not_capped() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    if !repo_github_secret_available("test_github_pull_requests_commits_count_not_capped").await {
+        return Ok(());
+    }
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("github_integration_test")
+                .with_dataset(make_github_dataset(
+                    &GithubDatasetType::RepoSpecific {
+                        owner: "spiceai".to_string(),
+                        repo: "cookbook".to_string(),
+                        query_type: "pulls".to_string(),
+                    },
+                    "auto",
+                    None,
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            // Fetch PRs with commits_count >= 1, limit exceeds PR pagination boundary (100)
+            run_query_and_check_results(
+                &mut rt,
+                "test_github_pull_requests_commits_count_not_capped",
+                "SELECT number, commits_count FROM cookbook_pulls_auto WHERE commits_count >= 1 LIMIT 125",
+                false,
+                Some(Box::new(|result_batches: Vec<RecordBatch>| {
+                    let total_rows: usize = result_batches
+                        .iter()
+                        .map(arrow::array::RecordBatch::num_rows)
+                        .sum();
+                    assert!(
+                        total_rows >= 1,
+                        "expected at least one PR with commits_count >= 1"
+                    );
+
+                    for batch in &result_batches {
+                        let commits_counts = batch
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("commits_count column should be Int64Array");
+                        for i in 0..commits_counts.len() {
+                            assert!(
+                                !commits_counts.is_null(i),
+                                "commits_count should not be null"
+                            );
+                            assert!(
+                                commits_counts.value(i) >= 1,
+                                "commits_count should be >= 1, got {}",
+                                commits_counts.value(i)
+                            );
+                        }
+                    }
                 })),
             )
             .await?;

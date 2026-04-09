@@ -50,7 +50,7 @@ use serde_json::{Map, Value};
 use std::sync::Arc;
 
 const COMMITS_JSON_POINTER: &str = "/data/repository";
-const MAX_DYNAMIC_REF_SCAN_REFS: usize = 1_000;
+const MAX_DYNAMIC_REF_SCAN_REFS: usize = 25;
 
 // https://docs.github.com/en/graphql/reference/objects#commit
 #[derive(Debug, Clone)]
