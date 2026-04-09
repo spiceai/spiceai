@@ -103,7 +103,9 @@ impl GraphQLContext for CommitsTableArgs {
                 filter
                     .context
                     .as_deref()
-                    .is_none_or(|context| !context.starts_with("ref"))
+                    .is_none_or(|context| {
+                        context != "ref-dynamic" && !context.starts_with("ref:")
+                    })
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -409,7 +411,7 @@ impl TableProvider for CommitsTableProvider {
             RefFetchMode::Dynamic => {}
         }
 
-        validate_dynamic_ref_scan(filters)?;
+        validate_dynamic_ref_scan(filters, limit)?;
 
         let refs = self
             .resolve_dynamic_refs(filters)
@@ -635,7 +637,16 @@ fn requested_ref_candidates(requested_ref: &str) -> Vec<String> {
     candidate_refs
 }
 
-fn validate_dynamic_ref_scan(filters: &[Expr]) -> datafusion::error::Result<()> {
+fn validate_dynamic_ref_scan(
+    filters: &[Expr],
+    limit: Option<usize>,
+) -> datafusion::error::Result<()> {
+    if limit.is_none() {
+        return Err(DataFusionError::Execution(
+            "GitHub commits dynamic ref scans require a LIMIT clause to bound API usage. Add a LIMIT to your query or use an exact ref = '<value>' predicate.".to_string(),
+        ));
+    }
+
     if !filters.iter().all(expr_is_ref_only) {
         return Err(DataFusionError::Execution(
             "GitHub commits dynamic ref scans only support predicates on ref. Add an exact ref = '<value>' predicate or remove additional filters.".to_string(),
@@ -1230,6 +1241,18 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_dynamic_ref_scan_requires_limit() {
+        let filters = vec![
+            datafusion::prelude::col("ref").not_eq(datafusion::prelude::lit("trunk")),
+        ];
+
+        let err = validate_dynamic_ref_scan(&filters, None)
+            .expect_err("dynamic ref scans without LIMIT should fail");
+
+        assert!(err.to_string().contains("require a LIMIT clause"));
+    }
+
+    #[test]
     fn test_validate_dynamic_ref_scan_requires_ref_only_filters() {
         let filters = vec![
             datafusion::prelude::col("ref")
@@ -1237,7 +1260,7 @@ mod tests {
                 .and(datafusion::prelude::col("sha").eq(datafusion::prelude::lit("abc123"))),
         ];
 
-        let err = validate_dynamic_ref_scan(&filters)
+        let err = validate_dynamic_ref_scan(&filters, Some(100))
             .expect_err("dynamic ref scans with non-ref filters should fail");
 
         assert!(err.to_string().contains("only support predicates on ref"));
@@ -1247,7 +1270,7 @@ mod tests {
     fn test_validate_dynamic_ref_scan_requires_evaluable_ref_filters() {
         let filters = vec![datafusion::prelude::col("ref").is_not_null()];
 
-        let err = validate_dynamic_ref_scan(&filters)
+        let err = validate_dynamic_ref_scan(&filters, Some(100))
             .expect_err("dynamic ref scans with unevaluable ref filters should fail");
 
         assert!(

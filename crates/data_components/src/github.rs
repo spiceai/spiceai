@@ -1231,15 +1231,9 @@ impl GithubRestClient {
             if let Some(max_refs) = max_refs
                 && refs.len() + page_len > max_refs
             {
-                // Truncate to max_refs instead of erroring so dynamic scans
-                // work on repos with more refs than the limit. Only the first
-                // max_refs refs (alphabetical) are included.
-                let take = max_refs.saturating_sub(refs.len());
-                refs.extend(page_refs.into_iter().take(take).map(|git_ref| GithubRef {
-                    qualified_name: format!("{qualified_name_prefix}{}", git_ref.name),
-                    name: git_ref.name,
-                }));
-                break;
+                return Err(Box::new(std::io::Error::other(format!(
+                    "Failed to fetch GitHub refs for repository {owner}/{repo}: {resource} refs exceed the configured limit of {max_refs}. Use an exact ref = '<value>' predicate to avoid enumerating all refs."
+                ))));
             }
 
             refs.extend(page_refs.into_iter().map(|git_ref| GithubRef {
