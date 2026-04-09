@@ -477,6 +477,11 @@ pub struct FederatedPartitionProvider {
     connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
     flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
     partition_manager: Arc<PartitionManager>,
+    /// The accelerations partition manager, used to detect tables that are already
+    /// handled by the `ExecutorRegistry`'s `PartitionedTableScanRewrite` rule.
+    /// Tables present in this manager should NOT be repartitioned by this provider,
+    /// as that would cause duplicate scans (N× data duplication).
+    accelerations_partition_manager: Arc<PartitionManager>,
 }
 
 impl FederatedPartitionProvider {
@@ -487,12 +492,27 @@ impl FederatedPartitionProvider {
             connections: Arc::clone(&registry.connections),
             flight_sql_clients: Arc::clone(&registry.flight_sql_clients),
             partition_manager: Arc::clone(&registry.federated_partition_manager),
+            accelerations_partition_manager: Arc::clone(&registry.accelerations_partition_manager),
         }
     }
 }
 
 impl TablePartitionProvider for FederatedPartitionProvider {
     fn should_partition(&self, tbl: &TableScan) -> bool {
+        // Skip tables that are already handled by the ExecutorRegistry's
+        // PartitionedTableScanRewrite rule (which uses accelerations_partition_manager).
+        // Without this check, both rules would fire for the same table: Rule 1
+        // (ExecutorRegistry) produces partition-filtered executor scans, then Rule 2
+        // (this provider) would replace each of those scans with N unfiltered executor
+        // scans — causing N× data duplication.
+        if self
+            .accelerations_partition_manager
+            .get_cached_table_metadata(&tbl.table_name)
+            .is_some()
+        {
+            return false;
+        }
+
         self.partition_manager
             .get_cached_table_metadata(&tbl.table_name)
             .is_some()

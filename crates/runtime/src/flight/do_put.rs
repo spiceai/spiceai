@@ -218,7 +218,6 @@ pub(crate) async fn handle(
             ));
         }
 
-        tracing::info!(dataset = %path, "DoPut: scheduler forwarding write-through to executors");
         let response = partition::write_through::forward_federated_partitioned_write(
             executor_registry,
             Arc::clone(&datafusion.ctx),
@@ -385,7 +384,6 @@ fn create_response_stream(
         let write_stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), Box::new(ReceiverStream::new(batch_rx))));
         let streaming_update = StreamingDataUpdate::new(write_stream, UpdateType::Append);
         let path = path.clone();
-        tracing::info!(dataset = %path, "DoPut: starting write_streaming_data for local table");
         let mut write_future = Box::pin(df.write_streaming_data(&path, streaming_update));
 
         if let Some(first_batch) = first_batch {
