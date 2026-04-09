@@ -196,6 +196,7 @@ impl UnityCatalogSchemaProvider {
                             Ok(Some(perms)) if !perms.has_read_permission() => {
                                 tracing::error!(
                                     table = %table.full_name(),
+                                    principals = ?perms.principals(),
                                     "Skipping table: no SELECT privilege"
                                 );
                                 false
@@ -366,6 +367,7 @@ impl UnityCatalogSchemaProvider {
             Ok(Some(perms)) if !perms.has_read_permission() => {
                 tracing::error!(
                     table = %table.full_name(),
+                    principals = ?perms.principals(),
                     "Skipping table: no SELECT privilege"
                 );
                 return None;

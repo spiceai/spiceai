@@ -654,6 +654,7 @@ impl Databricks {
                 }
                 tracing::debug!(
                     table = %full_name,
+                    principals = ?perms.principals(),
                     "Unity Catalog permission check passed"
                 );
             }

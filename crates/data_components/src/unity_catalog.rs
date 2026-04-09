@@ -516,4 +516,13 @@ impl UCPermissionsEnvelope {
                 .any(|p| READ_PRIVILEGES.contains(&p.privilege.as_str()))
         })
     }
+
+    /// Returns the principal identifiers from the privilege assignments.
+    #[must_use]
+    pub fn principals(&self) -> Vec<&str> {
+        self.privilege_assignments
+            .iter()
+            .map(|pa| pa.principal.as_str())
+            .collect()
+    }
 }
