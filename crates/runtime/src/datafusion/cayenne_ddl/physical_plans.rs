@@ -16,12 +16,11 @@ limitations under the License.
 
 //! Physical execution plans for broadcast Cayenne DDL and distributed DML.
 //!
-//! **DDL (broadcast)**: `DistributedCayenneCreateTableExec` and `DistributedCayenneDropTableExec`
-//! call the single-node `cayenne::ddl::operations::*` functions, then add distributed
-//! steps (executor connectivity check, partition metadata init, DDL forwarding,
-//! LIKE assignment copy). `CayenneCreateSchemaExec` and `CayenneMergeExec` are
-//! re-exported directly from `cayenne::ddl::physical_plans` — schema creation
-//! and local merge need no broadcast step.
+//! **DDL (broadcast)**: `DistributedCayenneCreateTableExec`, `DistributedCayenneDropTableExec`,
+//! and `DistributedCayenneCreateSchemaExec` call the single-node
+//! `cayenne::ddl::operations::*` functions, then forward the DDL to all connected
+//! executor nodes. `CayenneMergeExec` is re-exported directly from
+//! `cayenne::ddl::physical_plans` — local merge needs no broadcast step.
 //!
 //! **DML (distributed)**: `DistributedCayenneDeleteExec`, `DistributedCayenneUpdateExec`,
 //! `DistributedCayenneInsertExec`, `DistributedCayenneMergeExec` forward DML SQL
@@ -34,7 +33,7 @@ use std::sync::Arc;
 
 use arrow::array::{RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use cayenne::ddl::operations::{self, create_table, drop_table};
+use cayenne::ddl::operations::{self, create_schema, create_table, drop_table};
 use datafusion::catalog::CatalogProviderList;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
@@ -47,8 +46,8 @@ use datafusion_ddl::arrow_datatype_to_sql;
 use super::get_cayenne_provider;
 use crate::cluster::executor_registry::ExecutorRegistry;
 
-// Re-export single-node schema/merge execs (no broadcast needed for those).
-pub use cayenne::ddl::physical_plans::{CayenneCreateSchemaExec, CayenneMergeExec};
+// Re-export single-node merge exec (no broadcast needed for local merge).
+pub use cayenne::ddl::physical_plans::CayenneMergeExec;
 
 fn ddl_result_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new(
@@ -547,6 +546,134 @@ impl ExecutionPlan for DistributedCayenneDropTableExec {
             RecordBatch::try_new(
                 result_schema,
                 vec![Arc::new(StringArray::from(vec![outcome.message]))],
+            )
+            .map_err(Into::into)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            ddl_result_schema(),
+            stream,
+        )))
+    }
+}
+
+// ── DistributedCayenneCreateSchemaExec ───────────────────────────────────────
+
+/// Broadcast physical plan for `CREATE SCHEMA` on a Cayenne catalog.
+///
+/// 1. Calls [`create_schema`] to register the schema in metadata + `DataFusion`.
+/// 2. Forwards the `CREATE SCHEMA IF NOT EXISTS` DDL SQL to all executor nodes.
+pub struct DistributedCayenneCreateSchemaExec {
+    schema_name: String,
+    if_not_exists: bool,
+    catalog_name: String,
+    catalog_list: Arc<dyn CatalogProviderList>,
+    executor_registry: Arc<ExecutorRegistry>,
+    properties: PlanProperties,
+}
+
+impl fmt::Debug for DistributedCayenneCreateSchemaExec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DistributedCayenneCreateSchemaExec")
+            .field("schema_name", &self.schema_name)
+            .field("catalog_name", &self.catalog_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DistributedCayenneCreateSchemaExec {
+    #[must_use]
+    pub fn new(
+        schema_name: String,
+        if_not_exists: bool,
+        catalog_name: String,
+        catalog_list: Arc<dyn CatalogProviderList>,
+        executor_registry: Arc<ExecutorRegistry>,
+    ) -> Self {
+        let schema = ddl_result_schema();
+        Self {
+            schema_name,
+            if_not_exists,
+            catalog_name,
+            catalog_list,
+            executor_registry,
+            properties: ddl_plan_properties(schema),
+        }
+    }
+}
+
+impl DisplayAs for DistributedCayenneCreateSchemaExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "DistributedCayenneCreateSchemaExec: {}.{}",
+            self.catalog_name, self.schema_name
+        )
+    }
+}
+
+impl ExecutionPlan for DistributedCayenneCreateSchemaExec {
+    fn name(&self) -> &'static str {
+        "DistributedCayenneCreateSchemaExec"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
+        let schema_name = self.schema_name.clone();
+        let if_not_exists = self.if_not_exists;
+        let catalog_name = self.catalog_name.clone();
+        let catalog_list = Arc::clone(&self.catalog_list);
+        let executor_registry = Arc::clone(&self.executor_registry);
+        let result_schema = ddl_result_schema();
+        let runtime_env = context.runtime_env();
+
+        let stream = futures::stream::once(async move {
+            let df_catalog = catalog_list.catalog(&catalog_name).ok_or_else(|| {
+                DataFusionError::Execution(format!("Catalog '{catalog_name}' not found"))
+            })?;
+            let cayenne_provider = get_cayenne_provider(df_catalog.as_ref()).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Catalog '{catalog_name}' is not a Cayenne catalog"
+                ))
+            })?;
+
+            // 1. Core create — metadata catalog + DataFusion registration.
+            let message = create_schema(
+                &schema_name,
+                &catalog_name,
+                if_not_exists,
+                cayenne_provider,
+                runtime_env,
+            )?;
+
+            // 2. Forward to executors only when the schema was actually created.
+            if message.contains("created") {
+                let ddl_sql =
+                    format!("CREATE SCHEMA IF NOT EXISTS \"{catalog_name}\".\"{schema_name}\"");
+                forward_ddl_to_executors(&executor_registry, &ddl_sql).await?;
+            }
+
+            RecordBatch::try_new(
+                result_schema,
+                vec![Arc::new(StringArray::from(vec![message]))],
             )
             .map_err(Into::into)
         });

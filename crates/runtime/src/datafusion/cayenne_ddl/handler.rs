@@ -23,7 +23,6 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use cayenne::ddl::physical_plans::CayenneCreateSchemaExec;
 use datafusion::catalog::CatalogProviderList;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::SessionState;
@@ -32,7 +31,10 @@ use datafusion::prelude::SessionContext;
 use datafusion_ddl::{CatalogDdlHandler, CreateSchemaParams, CreateTableParams, DropTableParams};
 
 use super::get_cayenne_provider;
-use super::physical_plans::{DistributedCayenneCreateTableExec, DistributedCayenneDropTableExec};
+use super::physical_plans::{
+    DistributedCayenneCreateSchemaExec, DistributedCayenneCreateTableExec,
+    DistributedCayenneDropTableExec,
+};
 use crate::cluster::executor_registry::ExecutorRegistry;
 use cayenne::ddl::operations;
 
@@ -116,12 +118,12 @@ impl CatalogDdlHandler for DistributedCayenneDdlHandler {
         catalog_list: Arc<dyn CatalogProviderList>,
         _session_state: &SessionState,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Schema creation is identical in single-node and broadcast mode.
-        Ok(Arc::new(CayenneCreateSchemaExec::new(
+        Ok(Arc::new(DistributedCayenneCreateSchemaExec::new(
             params.schema_name,
             params.if_not_exists,
             params.catalog_name,
             catalog_list,
+            Arc::clone(&self.executor_registry),
         )))
     }
 }
