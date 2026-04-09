@@ -1078,8 +1078,8 @@ mod tests {
 
     #[test]
     fn test_ref_filter_pushdown_qualified_ref_uses_inexact() {
-        let expr = datafusion::prelude::col("ref")
-            .eq(datafusion::prelude::lit("refs/heads/release/1.11"));
+        let expr =
+            datafusion::prelude::col("ref").eq(datafusion::prelude::lit("refs/heads/release/1.11"));
         let result = commits_filter_pushdown(&expr);
 
         assert_eq!(
