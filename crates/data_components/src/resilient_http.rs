@@ -74,12 +74,8 @@ where
     let mut retries = 0usize;
 
     loop {
-        let _permit = acquire_concurrency_permit(
-            concurrency_limit,
-            service_name,
-            operation_name,
-        )
-        .await;
+        let _permit =
+            acquire_concurrency_permit(concurrency_limit, service_name, operation_name).await;
         match add_supported_accept_encoding_header(build_request())
             .send()
             .await

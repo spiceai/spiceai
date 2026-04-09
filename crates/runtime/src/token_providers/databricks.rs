@@ -641,8 +641,7 @@ mod tests {
             "http://127.0.0.1:1234/oidc/v1/token"
         );
         assert!(
-            databricks_token_endpoint_url("http://dbc.example.databricks.com")
-                .is_err(),
+            databricks_token_endpoint_url("http://dbc.example.databricks.com").is_err(),
             "http:// to non-localhost should be rejected"
         );
     }
