@@ -116,20 +116,20 @@ The SQL Warehouse connector exposes per-dataset operational metrics via the `Met
 
 #### Available Metrics
 
-| Metric Name                   | Type    | Category        | Description                                                                       |
-| ----------------------------- | ------- | --------------- | --------------------------------------------------------------------------------- |
-| `requests_total`              | Counter | Requests        | Total HTTP requests issued to the SQL Warehouse API (excl. retries)               |
-| `retries_total`               | Counter | Requests        | Total HTTP retries performed for transient failures                               |
-| `permanent_errors_total`      | Counter | Requests        | Total non-retryable errors (401, 403, 404) detected                               |
+| Metric Name                   | Type    | Category        | Description                                                                                                                                   |
+| ----------------------------- | ------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `requests_total`              | Counter | Requests        | Total HTTP requests issued to the SQL Warehouse API (excl. retries)                                                                           |
+| `retries_total`               | Counter | Requests        | Total HTTP retries performed for transient failures                                                                                           |
+| `permanent_errors_total`      | Counter | Requests        | Total non-retryable errors (401, 403, 404) detected                                                                                           |
 | `inflight_operations`         | Gauge   | Requests        | Current number of in-flight SQL Warehouse operations holding a concurrency permit. Bounded by `max_concurrent_requests`. **Auto-registered.** |
-| `statements_executed_total`   | Counter | Statements      | Total SQL statements submitted for execution                                      |
-| `statement_polls_total`       | Counter | Statements      | Total polls made when waiting for async statement completion                      |
-| `statements_failed_total`     | Counter | Statements      | Total SQL statements that completed with FAILED status                            |
-| `pool_connections_total`      | Counter | Connection Pool | Total virtual pool `connect()` calls                                              |
-| `pool_active_connections`     | Gauge   | Connection Pool | Current number of active connection handles                                       |
-| `semaphore_available_permits` | Gauge   | Concurrency     | Current available permits in the request concurrency semaphore                    |
-| `chunks_fetched_total`        | Counter | Data Transfer   | Total Arrow result chunks fetched from external links                             |
-| `connector_disabled`          | Gauge   | Connector State | Whether the connector is permanently disabled (1 = yes, 0 = no)                   |
+| `statements_executed_total`   | Counter | Statements      | Total SQL statements submitted for execution                                                                                                  |
+| `statement_polls_total`       | Counter | Statements      | Total polls made when waiting for async statement completion                                                                                  |
+| `statements_failed_total`     | Counter | Statements      | Total SQL statements that completed with FAILED status                                                                                        |
+| `pool_connections_total`      | Counter | Connection Pool | Total virtual pool `connect()` calls                                                                                                          |
+| `pool_active_connections`     | Gauge   | Connection Pool | Current number of active connection handles                                                                                                   |
+| `semaphore_available_permits` | Gauge   | Concurrency     | Current available permits in the request concurrency semaphore                                                                                |
+| `chunks_fetched_total`        | Counter | Data Transfer   | Total Arrow result chunks fetched from external links                                                                                         |
+| `connector_disabled`          | Gauge   | Connector State | Whether the connector is permanently disabled (1 = yes, 0 = no)                                                                               |
 
 #### Enabling Metrics
 

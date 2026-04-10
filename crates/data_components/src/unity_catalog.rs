@@ -450,7 +450,8 @@ impl UCTable {
     /// not report a read-compatible privilege.
     #[must_use]
     pub fn requires_read_permission_validation(&self) -> bool {
-        self.parsed_table_type().requires_read_permission_validation()
+        self.parsed_table_type()
+            .requires_read_permission_validation()
     }
 }
 

@@ -652,35 +652,35 @@ impl Databricks {
         // 2) Check permissions via UC effective-permissions endpoint.
         if should_validate_permissions {
             match uc_client.get_effective_permissions(&full_name).await {
-            Ok(Some(perms)) => {
-                if !perms.has_read_permission() {
-                    tracing::warn!(
-                        table = %full_name,
-                        principals = ?perms.principals(),
-                        privileges = ?perms.all_privileges(),
-                        "Unity Catalog effective-permissions did not include a read-compatible privilege; proceeding anyway (access may still work via workspace admin or inherited grants)"
-                    );
-                } else {
+                Ok(Some(perms)) => {
+                    if !perms.has_read_permission() {
+                        return Err(DataConnectorError::InsufficientPermissions {
+                            dataconnector: "databricks".to_string(),
+                            connector_component: ConnectorComponent::from(dataset),
+                            source: Box::new(Error::InsufficientPermissions {
+                                table_name: full_name,
+                            }),
+                        });
+                    }
                     tracing::debug!(
                         table = %full_name,
                         principals = ?perms.principals(),
                         "Unity Catalog permission check passed"
                     );
                 }
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    table = %full_name,
-                    "Table not found when checking permissions; proceeding"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    table = %full_name,
-                    error = %e,
-                    "Failed to check Unity Catalog permissions; proceeding without validation"
-                );
-            }
+                Ok(None) => {
+                    tracing::debug!(
+                        table = %full_name,
+                        "Table not found when checking permissions; proceeding"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        table = %full_name,
+                        error = %e,
+                        "Failed to check Unity Catalog permissions; proceeding without validation"
+                    );
+                }
             }
         }
 
