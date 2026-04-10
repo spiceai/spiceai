@@ -750,8 +750,8 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
                         .await
                         .ok()
                         .flatten()
-                        .map_or(false, |m| {
-                            m.partitions.len() == 10 && m.partitions.iter().all(|p| p.is_assigned())
+                        .is_some_and(|m| {
+                            m.partitions.len() == 10 && m.partitions.iter().all(runtime::cluster::PartitionMetadata::is_assigned)
                         })
                 })
                 .await;
@@ -791,7 +791,7 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
                         .await
                         .ok()
                         .flatten()
-                        .map_or(false, |m| {
+                        .is_some_and(|m| {
                             m.partitions.len() == 11
                                 && m.partitions.iter().any(|p| {
                                     p.partition_value.values().any(|v| v == "Seattle")

@@ -1489,27 +1489,30 @@ mod tests {
         )
         .await;
 
-        // Add 1 new partition.
-        let table = TableReference::parse_str("orders");
-        add_partitions_with_retry(&store, &table, vec![pv("date", "2024-01-03")])
-            .await
-            .expect("add");
-        store.refresh().await.expect("refresh");
+        // Add 1 new partition to a DIFFERENT table so exec1's locality bonus
+        // for "orders" doesn't apply — pure load balancing.
+        let other_table = TableReference::parse_str("inventory");
+        setup_table(
+            &store,
+            "inventory",
+            vec![unassigned_partition("date", "2024-01-03")],
+        )
+        .await;
 
         let state = CycleState {
             executor_ids: vec!["exec1".to_string(), "exec2".to_string()],
-            tables: vec!["orders".to_string()],
+            tables: vec!["orders".to_string(), "inventory".to_string()],
         };
         let config = AssignmentConfig {
             max_partitions_per_executor: 10,
             ..Default::default()
         };
 
-        let unassigned = find_unassigned_partitions_for_table(&store, &table);
+        let unassigned = find_unassigned_partitions_for_table(&store, &other_table);
         let assignments = assign_unassigned_partitions(unassigned, &state, &store, &config);
         assert_eq!(assignments.len(), 1);
 
-        // exec2 has lower load → should be preferred.
+        // exec2 has lower load and no locality bonus for "inventory" → preferred.
         assert_eq!(
             assignments[0].executor_id, "exec2",
             "New partition should be assigned to the less-loaded executor"
