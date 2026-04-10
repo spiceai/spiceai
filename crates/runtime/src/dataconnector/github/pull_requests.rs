@@ -107,11 +107,11 @@ impl GraphQLContext for PullRequestTableArgs {
         // if discussion comments are enabled, each PR also retrieves discussion comments
         // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
         match self.include_comments {
-            PullRequestCommentType::None => Some(301),
-            PullRequestCommentType::Review => Some(301 + (20 * self.max_comments_fetched)), // 1 + 100 (labels) + 100 (commits) + 100 (assignees) + (20 review threads * comments_to_fetch) = n
-            PullRequestCommentType::Discussion => Some(301 + self.max_comments_fetched), // 1 + 100 (labels) + 100 (commits) + 100 (assignees) + comments_to_fetch (discussion comments) = n
+            PullRequestCommentType::None => Some(226), // 1 + 100 (labels) + 25 (commits) + 100 (assignees) = 226
+            PullRequestCommentType::Review => Some(226 + (20 * self.max_comments_fetched)), // 226 + (20 review threads * comments_to_fetch)
+            PullRequestCommentType::Discussion => Some(226 + self.max_comments_fetched), // 226 + comments_to_fetch (discussion comments)
             PullRequestCommentType::All => {
-                Some(301 + (20 * self.max_comments_fetched) + self.max_comments_fetched)
+                Some(226 + (20 * self.max_comments_fetched) + self.max_comments_fetched)
             }
         }
     }
@@ -130,14 +130,13 @@ impl PullRequestTableArgs {
             updated_at: updatedAt
             merged_at: mergedAt
             closed_at: closedAt
-            number
             reviews { reviews_count: totalCount }
             author: author { author: login }
             additions
             deletions
             changed_files: changedFiles
             labels(first: 100) { labels: nodes { name } }
-            commits(first: 100) { commits_count: totalCount, hashes: nodes { id } }
+            commits(first: 25) { commits_count: totalCount, hashes: nodes { id } }
             assignees(first: 100) { assignees: nodes { login } }
             comments_count_wrapper: comments { comments_count: totalCount }
         "
