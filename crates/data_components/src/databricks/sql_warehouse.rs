@@ -70,7 +70,8 @@ const SQL_WAREHOUSE_DEFAULT_STATEMENT_MAX_RETRIES: usize = 14;
 type SharedSqlWarehouseKey = (String, String);
 type SharedSqlWarehouseEntry = (Arc<Semaphore>, usize);
 type SharedSqlWarehouseRegistry = Mutex<HashMap<SharedSqlWarehouseKey, SharedSqlWarehouseEntry>>;
-type SharedSqlWarehouseMetricsRegistry = Mutex<HashMap<SharedSqlWarehouseKey, Arc<DatabricksMetrics>>>;
+type SharedSqlWarehouseMetricsRegistry =
+    Mutex<HashMap<SharedSqlWarehouseKey, Arc<DatabricksMetrics>>>;
 
 static SHARED_SQL_WAREHOUSE_SEMAPHORES: LazyLock<SharedSqlWarehouseRegistry> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -336,14 +337,12 @@ impl DatabricksSqlWarehouse {
             let mut registry = SHARED_SQL_WAREHOUSE_METRICS
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let metrics = Arc::clone(
-                registry.entry(key).or_insert_with(|| {
-                    Arc::new(DatabricksMetrics {
-                        semaphore: Some(Arc::clone(&sem)),
-                        ..DatabricksMetrics::default()
-                    })
-                }),
-            );
+            let metrics = Arc::clone(registry.entry(key).or_insert_with(|| {
+                Arc::new(DatabricksMetrics {
+                    semaphore: Some(Arc::clone(&sem)),
+                    ..DatabricksMetrics::default()
+                })
+            }));
             (sem, metrics)
         } else {
             let sem = Arc::new(Semaphore::new(config.max_concurrent_requests));
