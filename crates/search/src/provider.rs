@@ -535,29 +535,37 @@ impl TableProvider for SearchQueryProvider {
             proj2
         });
 
-        let mut search_lp = LogicalPlanBuilder::new_from_arc(Arc::clone(&self.search_index_query))
-            .alias("search_index")?
-            .limit(0, self.pre_limit)?;
+        // Build search index base plan WITHOUT pre_limit so that filters can be added
+        // below the limit. DataFusion cannot push filters past a Limit node, so adding
+        // filters after the limit prevents them from reaching the underlying search index
+        // (e.g. S3VectorsQueryExec), causing both worse performance and incorrect results
+        // (top-K-then-filter vs top-K-of-filtered).
+        let search_base = LogicalPlanBuilder::new_from_arc(Arc::clone(&self.search_index_query))
+            .alias("search_index")?;
 
         let just_use_index = self.search_index_table_is_sufficient(
             &Arc::clone(self.search_index_query.schema()),
             inner_proj.as_ref(),
             filters,
         )?;
-        search_lp = match (just_use_index, filters.iter().cloned().reduce(Expr::and)) {
-            (true, None) => search_lp.limit(0, limit)?,
-            (true, Some(filter)) => search_lp.filter(filter)?.limit(0, limit)?,
+        let search_lp = match (just_use_index, filters.iter().cloned().reduce(Expr::and)) {
+            (true, None) => search_base.limit(0, self.pre_limit)?.limit(0, limit)?,
+            (true, Some(filter)) => search_base
+                .filter(filter)?
+                .limit(0, self.pre_limit)?
+                .limit(0, limit)?,
             (false, _) => {
-                // Pushdown indexes to search index
+                // Add supported filters BEFORE the pre_limit so they can be pushed down
+                // into the search index scan by DataFusion's PushDownFilter optimizer.
                 let search_index = if let Some(filter) =
-                    exprs_supported(filters, search_lp.schema())
+                    exprs_supported(filters, search_base.schema())
                         .iter()
                         .cloned()
                         .reduce(Expr::and)
                 {
-                    search_lp.filter(filter)?
+                    search_base.filter(filter)?.limit(0, self.pre_limit)?
                 } else {
-                    search_lp
+                    search_base.limit(0, self.pre_limit)?
                 };
 
                 self.join_with_base(inner_proj.as_ref(), search_index, filters)?
