@@ -274,6 +274,7 @@ impl Databricks {
                 let uc_client = match UnityCatalogClient::new(
                     Endpoint(endpoint.to_string()),
                     Some(Arc::clone(&token_provider)),
+                    shared_semaphore.clone(),
                 ) {
                     Ok(client) => Some(Arc::new(client)),
                     Err(error) => {
@@ -330,6 +331,7 @@ impl Databricks {
                 let uc_client = match UnityCatalogClient::new(
                     Endpoint(endpoint.to_string()),
                     Some(Arc::clone(&token_provider)),
+                    None,
                 ) {
                     Ok(client) => Some(Arc::new(client)),
                     Err(error) => {
@@ -838,7 +840,9 @@ const DATABRICKS_METRICS: &[MetricSpec] = &[
         "Total non-retryable errors (401, 403, 404) that permanently disabled the connector",
     ),
     MetricSpec::new("inflight_operations", MetricType::ObservableGaugeU64)
-        .description("Current number of in-flight SQL Warehouse operations holding a concurrency permit")
+        .description(
+            "Current number of in-flight SQL Warehouse operations holding a concurrency permit",
+        )
         .auto_register(),
     // -- Statement metrics --
     MetricSpec::new(
@@ -1172,13 +1176,12 @@ impl CatalogConnector for DatabricksCatalog {
         };
 
         let unity_catalog =
-            UnityCatalogClient::new(Endpoint(endpoint.to_string()), Some(token_provider)).map_err(
-                |source| CatalogError::UnableToGetCatalogProvider {
+            UnityCatalogClient::new(Endpoint(endpoint.to_string()), Some(token_provider), None)
+                .map_err(|source| CatalogError::UnableToGetCatalogProvider {
                     connector: "databricks".to_string(),
                     source: Box::new(source),
                     connector_component: ConnectorComponent::from(catalog),
-                },
-            )?;
+                })?;
         let client = Arc::new(unity_catalog);
 
         // Copy the catalog params into the dataset params, and allow user to override
@@ -1222,17 +1225,22 @@ impl CatalogConnector for DatabricksCatalog {
                     params.get("sql_warehouse_id").expose().ok(),
                 ) {
                     (Some(endpoint), Some(warehouse_id)) => {
-                        let config = runtime::catalogconnector::databricks::build_sql_warehouse_config(&params);
+                        let config =
+                            runtime::catalogconnector::databricks::build_sql_warehouse_config(
+                                &params,
+                            );
                         Some(
                             sql_warehouse::shared_request_semaphore(
                                 endpoint,
                                 warehouse_id,
                                 config.max_concurrent_requests,
                             )
-                            .map_err(|source| CatalogError::UnableToGetCatalogProvider {
-                                connector: "databricks".to_string(),
-                                source: source.into(),
-                                connector_component: ConnectorComponent::from(catalog),
+                            .map_err(|source| {
+                                CatalogError::UnableToGetCatalogProvider {
+                                    connector: "databricks".to_string(),
+                                    source: source.into(),
+                                    connector_component: ConnectorComponent::from(catalog),
+                                }
                             })?,
                         )
                     }

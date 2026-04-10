@@ -19,12 +19,15 @@ use std::{fmt::Write, sync::Arc};
 use datafusion::sql::TableReference;
 use serde::Deserialize;
 use snafu::prelude::*;
+use tokio::sync::Semaphore;
 use url::Url;
 
 use token_provider::TokenProvider;
 use tracing::Instrument;
 
-use crate::resilient_http::{configure_client_builder, send_request_with_retry};
+use crate::resilient_http::{
+    RetryConfig, configure_client_builder, send_request_with_retry_and_concurrency_limit,
+};
 
 pub mod provider;
 
@@ -86,6 +89,7 @@ pub struct UnityCatalog {
     token_provider: Option<Arc<dyn TokenProvider>>,
     client: reqwest::Client,
     user_agent: Option<String>,
+    request_semaphore: Option<Arc<Semaphore>>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,7 +100,11 @@ pub struct CatalogId(pub String);
 
 impl UnityCatalog {
     #[expect(clippy::needless_pass_by_value)]
-    pub fn new(endpoint: Endpoint, token_provider: Option<Arc<dyn TokenProvider>>) -> Result<Self> {
+    pub fn new(
+        endpoint: Endpoint,
+        token_provider: Option<Arc<dyn TokenProvider>>,
+        request_semaphore: Option<Arc<Semaphore>>,
+    ) -> Result<Self> {
         let mut endpoint_str = endpoint.0.trim_end_matches('/').to_string();
         if !endpoint_str.starts_with("http") {
             endpoint_str = format!("https://{endpoint_str}");
@@ -127,6 +135,7 @@ impl UnityCatalog {
             token_provider,
             client,
             user_agent,
+            request_semaphore,
         })
     }
 
@@ -364,9 +373,17 @@ impl UnityCatalog {
     }
 
     async fn send_get_with_retry(&self, operation: &str, path: &str) -> Result<reqwest::Response> {
-        send_request_with_retry("Unity Catalog", operation, || self.get_req(path))
-            .await
-            .context(ConnectionSnafu)
+        send_request_with_retry_and_concurrency_limit(
+            "Unity Catalog",
+            operation,
+            || self.get_req(path),
+            &RetryConfig {
+                concurrency_limit: self.request_semaphore.as_deref(),
+                ..RetryConfig::default()
+            },
+        )
+        .await
+        .context(ConnectionSnafu)
     }
 
     /// Percent-encodes each dot-separated segment of a UC name individually.

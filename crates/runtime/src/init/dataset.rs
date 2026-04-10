@@ -272,11 +272,9 @@ impl Runtime {
             let instance_name = ds.name.to_string();
 
             for metric in metrics_provider.available_metrics() {
-                let explicitly_disabled = ds
-                    .metrics
-                    .metrics
-                    .iter()
-                    .any(|configured_metric| configured_metric.name == metric.name && !configured_metric.enabled);
+                let explicitly_disabled = ds.metrics.metrics.iter().any(|configured_metric| {
+                    configured_metric.name == metric.name && !configured_metric.enabled
+                });
                 let user_enabled = enabled_metrics.iter().any(|m| m == metric.name);
                 if explicitly_disabled || (!metric.auto_register && !user_enabled) {
                     continue;
