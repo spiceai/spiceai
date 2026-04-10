@@ -545,18 +545,14 @@ impl Shard {
         table.insert(hash, location)
     }
 
-    fn insert_or_replace(&self, hash: u64, location: RowLocation) {
+    fn insert_or_replace(&self, hash: u64, location: RowLocation) -> bool {
         let mut table = self.table.write();
-        table.insert_or_replace(hash, location);
+        table.insert_or_replace(hash, location)
     }
 
     fn remove(&self, hash: u64) -> Option<RowLocation> {
         let mut table = self.table.write();
         table.remove(hash)
-    }
-
-    fn len(&self) -> usize {
-        self.table.read().len
     }
 
     fn clear(&self) {
@@ -634,7 +630,9 @@ impl ShardTable {
         }
     }
 
-    fn insert_or_replace(&mut self, hash: u64, location: RowLocation) {
+    /// Inserts or replaces an entry. Returns `true` if a new entry was inserted,
+    /// `false` if an existing entry was replaced.
+    fn insert_or_replace(&mut self, hash: u64, location: RowLocation) -> bool {
         if self.len * 4 >= self.slots.len() * 3 {
             self.grow();
         }
@@ -648,12 +646,12 @@ impl ShardTable {
                 slot.hash = hash;
                 slot.location = location;
                 self.len += 1;
-                return;
+                return true;
             }
 
             if slot.hash == hash {
                 slot.location = location;
-                return;
+                return false;
             }
 
             idx = (idx + 1) & self.mask;
@@ -884,10 +882,8 @@ impl HashIndex {
     pub fn insert_or_replace(&self, hash: u64, location: RowLocation) {
         let hash = normalize_hash(hash);
         let shard = self.shard(hash);
-        let old_len = shard.len();
-        shard.insert_or_replace(hash, location);
-        let new_len = shard.len();
-        if new_len > old_len {
+        let was_new = shard.insert_or_replace(hash, location);
+        if was_new {
             self.len.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(bloom) = &self.bloom {
