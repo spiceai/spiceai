@@ -244,10 +244,8 @@ impl UnityCatalog {
     }
 
     pub async fn list_schemas(&self, catalog_id: &str) -> Result<Option<Vec<UCSchema>>> {
-        let encoded_catalog = percent_encoding::utf8_percent_encode(
-            catalog_id,
-            percent_encoding::NON_ALPHANUMERIC,
-        );
+        let encoded_catalog =
+            percent_encoding::utf8_percent_encode(catalog_id, percent_encoding::NON_ALPHANUMERIC);
         let path = format!("/api/2.1/unity-catalog/schemas?catalog_name={encoded_catalog}");
         async {
             let response = self.send_get_with_retry("list schemas", &path).await?;
@@ -280,14 +278,10 @@ impl UnityCatalog {
         catalog_id: &str,
         schema_name: &str,
     ) -> Result<Option<Vec<UCTable>>> {
-        let encoded_catalog = percent_encoding::utf8_percent_encode(
-            catalog_id,
-            percent_encoding::NON_ALPHANUMERIC,
-        );
-        let encoded_schema = percent_encoding::utf8_percent_encode(
-            schema_name,
-            percent_encoding::NON_ALPHANUMERIC,
-        );
+        let encoded_catalog =
+            percent_encoding::utf8_percent_encode(catalog_id, percent_encoding::NON_ALPHANUMERIC);
+        let encoded_schema =
+            percent_encoding::utf8_percent_encode(schema_name, percent_encoding::NON_ALPHANUMERIC);
         let path = format!(
             "/api/2.1/unity-catalog/tables?catalog_name={encoded_catalog}&schema_name={encoded_schema}"
         );

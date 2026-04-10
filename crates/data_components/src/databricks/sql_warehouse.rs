@@ -739,10 +739,7 @@ impl SqlWarehouseApi {
                             }
                         };
 
-                        let result = match resp
-                            .error_for_status()
-                            .context(HttpRequestFailedSnafu)
-                        {
+                        let result = match resp.error_for_status().context(HttpRequestFailedSnafu) {
                             Ok(response) => match response
                                 .json()
                                 .await
