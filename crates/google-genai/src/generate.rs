@@ -223,7 +223,20 @@ fn parse_sse_stream(
                             (stream, buffer),
                         ));
                     }
-                    None => return None,
+                    None => {
+                        if buffer.is_empty() {
+                            return None;
+                        }
+
+                        return Some((
+                            StreamSnafu {
+                                message: "Unexpected end of stream while parsing SSE event"
+                                    .to_string(),
+                            }
+                            .fail(),
+                            (stream, buffer),
+                        ));
+                    }
                 }
 
                 if let Some(pos) = buffer.find("\n\n") {
