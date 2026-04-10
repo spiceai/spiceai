@@ -92,6 +92,7 @@ impl DatabricksDelta {
         let uc_client = UnityCatalog::new(
             self.endpoint.clone(),
             Some(Arc::clone(&self.token_provider)),
+            None,
         )
         .boxed()?;
 

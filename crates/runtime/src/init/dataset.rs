@@ -24,10 +24,11 @@ use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
 use crate::{
     AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error,
-    FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu, Result, Runtime,
-    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
-    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
-    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
+    FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu,
+    PermanentDatasetFailureSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
+    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
+    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
+    UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
     component::{
         access::AccessMode,
@@ -41,7 +42,7 @@ use crate::{
         AccelerationSource, validate_cayenne_snapshot_consistency, validate_snapshot_paths,
     },
     dataconnector::{
-        self, ConnectorComponent, DataConnector, DataConnectorError, ODBC_DATACONNECTOR,
+        self, ConnectorComponent, DataConnector, ODBC_DATACONNECTOR,
         deferred::DeferredConnector,
         localpod::{LOCALPOD_DATACONNECTOR, LocalPodConnector},
         parameters::ConnectorParamsBuilder,
@@ -265,32 +266,39 @@ impl Runtime {
             }
         };
 
-        // Register any component metrics that the user has enabled for this dataset.
-        if ds.metrics.has_enabled_metrics() {
+        // Register component metrics for this dataset.
+        if let Some(metrics_provider) = data_connector.metrics_provider() {
             let enabled_metrics = ds.metrics.enabled_metrics();
-            let Some(metrics_provider) = data_connector.metrics_provider() else {
-                tracing::warn!(
-                    "Dataset {} does not support metrics. Skipping metric registration for {}.",
-                    ds.name,
-                    enabled_metrics.join(", ")
-                );
-                return Ok(data_connector);
-            };
-            for metric in enabled_metrics {
-                if let Some(metric) = metrics_provider.get_metric(&metric) {
-                    if let Err(e) =
-                        register_component_metric(&metrics_provider, *metric, &ds.name.to_string())
-                    {
-                        tracing::error!(
-                            "Unable to register component metric {}: {}",
-                            metric.name,
-                            e
-                        );
-                    }
-                } else {
-                    tracing::warn!("Metric {metric} not available in {source}");
+            let instance_name = ds.name.to_string();
+
+            for metric in metrics_provider.available_metrics() {
+                let explicitly_disabled = ds.metrics.metrics.iter().any(|configured_metric| {
+                    configured_metric.name == metric.name && !configured_metric.enabled
+                });
+                let user_enabled = enabled_metrics.iter().any(|m| m == metric.name);
+                if explicitly_disabled || (!metric.auto_register && !user_enabled) {
+                    continue;
+                }
+                if let Err(e) =
+                    register_component_metric(&metrics_provider, *metric, &instance_name)
+                {
+                    tracing::error!("Unable to register component metric {}: {}", metric.name, e);
                 }
             }
+
+            // Warn about user-enabled metrics that don't exist on this connector.
+            for name in &enabled_metrics {
+                if metrics_provider.get_metric(name).is_none() {
+                    tracing::warn!("Metric {name} not available in {source}");
+                }
+            }
+        } else if ds.metrics.has_enabled_metrics() {
+            let enabled_metrics = ds.metrics.enabled_metrics();
+            tracing::warn!(
+                "Dataset {} does not support metrics. Skipping metric registration for {}.",
+                ds.name,
+                enabled_metrics.join(", ")
+            );
         }
 
         Ok(data_connector)
@@ -361,7 +369,9 @@ impl Runtime {
                 .await
             {
                 if runtime.status.is_shutdown() {
-                    // should not retry if runtime is shutting down
+                    return Err(RetryError::permanent(err));
+                }
+                if matches!(err, Error::PermanentDatasetFailure { .. }) {
                     return Err(RetryError::permanent(err));
                 }
                 return Err(RetryError::transient(err));
@@ -441,11 +451,15 @@ impl Runtime {
                         status::ComponentStatus::error_with_message(err.to_string()),
                     );
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    if let DataConnectorError::UnsupportedDataType { .. } = err {
+                    if !err.is_retriable() {
                         error_spaced!(spaced_tracer, "{}{err}", "");
-                    } else {
-                        warn_spaced!(spaced_tracer, "{}{err}", "");
+                        return PermanentDatasetFailureSnafu {
+                            dataset: ds.name.clone(),
+                            reason: err.to_string(),
+                        }
+                        .fail();
                     }
+                    warn_spaced!(spaced_tracer, "{}{err}", "");
                     return UnableToLoadDatasetConnectorSnafu {
                         dataset: ds.name.clone(),
                     }
