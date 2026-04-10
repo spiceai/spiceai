@@ -71,8 +71,6 @@ pub fn register_query_counter(dimensions: &[KeyValue]) {
 
 static QUERY_ACTIVE_COUNT: OnceLock<UpDownCounter<i64>> = OnceLock::new();
 
-static CONNECTOR_INFLIGHT_REQUESTS: OnceLock<UpDownCounter<i64>> = OnceLock::new();
-
 pub fn inc_query_active_count(dimensions: &[KeyValue]) {
     let Some(m) = meter::METER.get() else { return };
     QUERY_ACTIVE_COUNT
@@ -101,33 +99,7 @@ pub fn dec_query_active_count(dimensions: &[KeyValue]) {
         .add(-1, dimensions);
 }
 
-pub fn inc_connector_inflight_requests(dimensions: &[KeyValue]) {
-    let Some(m) = meter::METER.get() else { return };
-    CONNECTOR_INFLIGHT_REQUESTS
-        .get_or_init(|| {
-            m.i64_up_down_counter("connector_inflight_requests")
-                .with_description(
-                    "Number of in-flight connector requests currently being executed.",
-                )
-                .with_unit("requests")
-                .build()
-        })
-        .add(1, dimensions);
-}
 
-pub fn dec_connector_inflight_requests(dimensions: &[KeyValue]) {
-    let Some(m) = meter::METER.get() else { return };
-    CONNECTOR_INFLIGHT_REQUESTS
-        .get_or_init(|| {
-            m.i64_up_down_counter("connector_inflight_requests")
-                .with_description(
-                    "Number of in-flight connector requests currently being executed.",
-                )
-                .with_unit("requests")
-                .build()
-        })
-        .add(-1, dimensions);
-}
 
 static BYTES_PROCESSED: OnceLock<Counter<u64>> = OnceLock::new();
 

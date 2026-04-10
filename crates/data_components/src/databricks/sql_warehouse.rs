@@ -48,7 +48,6 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
-use telemetry::KeyValue;
 use token_provider::TokenProvider;
 use tokio::sync::Semaphore;
 use util::{
@@ -71,13 +70,6 @@ const SQL_WAREHOUSE_DEFAULT_STATEMENT_MAX_RETRIES: usize = 14;
 static SHARED_SQL_WAREHOUSE_SEMAPHORES: LazyLock<
     Mutex<HashMap<(String, String), (Arc<Semaphore>, usize)>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn build_connection_metric_dimensions(endpoint: &str, sql_warehouse_id: &str) -> Vec<KeyValue> {
-    vec![
-        KeyValue::new("endpoint", endpoint.to_string()),
-        KeyValue::new("warehouse_id", sql_warehouse_id.to_string()),
-    ]
-}
 
 /// Configuration for Databricks SQL Warehouse connection behavior.
 ///
@@ -479,7 +471,6 @@ impl FromStr for ResponseStatus {
 struct SqlWarehouseApi {
     client: Client,
     base_url: String,
-    connection_metric_dimensions: Vec<KeyValue>,
     request_semaphore: Arc<Semaphore>,
     http_max_retries: usize,
     backoff_method: BackoffMethod,
@@ -509,10 +500,6 @@ impl SqlWarehouseApi {
         Ok(Self {
             client,
             base_url: format!("https://{host}"),
-            connection_metric_dimensions: build_connection_metric_dimensions(
-                host,
-                sql_warehouse_id,
-            ),
             request_semaphore,
             http_max_retries: config.http_max_retries,
             backoff_method: config.backoff_method,
@@ -532,7 +519,6 @@ impl SqlWarehouseApi {
             backoff_method: Some(self.backoff_method),
             retry_counter: Some(&self.metrics.retries_total),
             inflight_counter: Some(&self.metrics.inflight_operations),
-            extra_dimensions: Some(&self.connection_metric_dimensions),
         }
     }
 
@@ -2007,10 +1993,6 @@ mod tests {
         SqlWarehouseApi {
             client,
             base_url: format!("http://127.0.0.1:{port}"),
-            connection_metric_dimensions: build_connection_metric_dimensions(
-                &format!("127.0.0.1:{port}"),
-                "test-warehouse",
-            ),
             request_semaphore: Arc::new(Semaphore::new(max_in_flight_requests)),
             http_max_retries: SQL_WAREHOUSE_DEFAULT_HTTP_MAX_RETRIES,
             backoff_method: BackoffMethod::Fibonacci,
@@ -3641,10 +3623,6 @@ mod tests {
         let api_a = Arc::new(SqlWarehouseApi {
             client: client.clone(),
             base_url: format!("http://127.0.0.1:{port}"),
-            connection_metric_dimensions: build_connection_metric_dimensions(
-                &format!("127.0.0.1:{port}"),
-                "warehouse-a",
-            ),
             request_semaphore: Arc::clone(&shared_semaphore),
             http_max_retries: SQL_WAREHOUSE_DEFAULT_HTTP_MAX_RETRIES,
             backoff_method: BackoffMethod::Fibonacci,
@@ -3658,10 +3636,6 @@ mod tests {
         let api_b = Arc::new(SqlWarehouseApi {
             client,
             base_url: format!("http://127.0.0.1:{port}"),
-            connection_metric_dimensions: build_connection_metric_dimensions(
-                &format!("127.0.0.1:{port}"),
-                "warehouse-b",
-            ),
             request_semaphore: Arc::clone(&shared_semaphore),
             http_max_retries: SQL_WAREHOUSE_DEFAULT_HTTP_MAX_RETRIES,
             backoff_method: BackoffMethod::Fibonacci,
