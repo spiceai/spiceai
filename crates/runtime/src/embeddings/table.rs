@@ -56,6 +56,15 @@ pub enum Error {
         "The dataset is configured with an embedding model '{model}' to embed column '{column}', but the model '{model}' is not defined in Spicepod (as an 'embeddings') or failed to load.\nFor details, visit: https://spiceai.org/docs/components/embeddings"
     ))]
     EmbeddingModelNotFound { column: String, model: String },
+
+    #[snafu(display(
+        "Embedding row_id column '{row_id_column}' for column '{column}' was not found in the dataset schema. Valid columns: {valid_columns}. Verify the row_id configuration and try again.\nFor details, visit: https://spiceai.org/docs/components/embeddings"
+    ))]
+    RowIdColumnNotFound {
+        column: String,
+        row_id_column: String,
+        valid_columns: String,
+    },
 }
 
 /// An [`EmbeddingTable`] is a [`TableProvider`] where some columns are augmented with associated embedding columns
@@ -118,6 +127,28 @@ impl EmbeddingTable {
             .iter()
             .map(|e| (e.column.clone(), e.clone()))
             .collect::<HashMap<_, _>>();
+
+        // Validate that all row_id columns exist in the dataset schema.
+        let base_schema = base_table.schema();
+        for (column, config) in &embed_columns {
+            if let Some(primary_keys) = &config.primary_keys {
+                for pk in primary_keys {
+                    if base_schema.column_with_name(pk).is_none() {
+                        let valid_columns: String = base_schema
+                            .fields()
+                            .iter()
+                            .map(|f| f.name().as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(Error::RowIdColumnNotFound {
+                            column: column.clone(),
+                            row_id_column: pk.clone(),
+                            valid_columns,
+                        });
+                    }
+                }
+            }
+        }
 
         // Early check if embedding models are available.
         for (column, config) in &embed_columns {
@@ -817,5 +848,139 @@ mod tests {
             ])),
             "c"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_row_id_column_rejected() {
+        let schema = Arc::new(Schema::new(vec![
+            field("id", DataType::Int64),
+            field("r_name", DataType::Utf8),
+            field("r_comment", DataType::Utf8),
+        ]));
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(schema, vec![vec![]]).expect("create MemTable"),
+        );
+        let embedding_models = Arc::new(RwLock::new(HashMap::new()));
+
+        let embeddings = vec![ColumnEmbeddingConfig {
+            column: "r_name".to_string(),
+            model: "test_model".to_string(),
+            primary_keys: Some(vec!["n_regionkey".to_string()]),
+            chunking: None,
+            vector_size: None,
+        }];
+
+        let result =
+            EmbeddingTable::from_spicepod_columns(base_table, embeddings, &embedding_models, None)
+                .await;
+
+        assert!(result.is_err());
+        let err = result.expect_err("expected row_id validation error");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("n_regionkey"),
+            "Error should mention the invalid column name, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("r_name"),
+            "Error should mention the embedding column, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_valid_row_id_column_accepted() {
+        let schema = Arc::new(Schema::new(vec![
+            field("id", DataType::Int64),
+            field("r_name", DataType::Utf8),
+        ]));
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(schema, vec![vec![]]).expect("create MemTable"),
+        );
+        let embedding_models = Arc::new(RwLock::new(HashMap::new()));
+
+        // Valid row_id but model doesn't exist — should fail on model check, NOT row_id check
+        let embeddings = vec![ColumnEmbeddingConfig {
+            column: "r_name".to_string(),
+            model: "test_model".to_string(),
+            primary_keys: Some(vec!["id".to_string()]),
+            chunking: None,
+            vector_size: None,
+        }];
+
+        let result =
+            EmbeddingTable::from_spicepod_columns(base_table, embeddings, &embedding_models, None)
+                .await;
+
+        assert!(result.is_err());
+        let err = result.expect_err("expected model-not-found error");
+        // Should fail on model not found, not row_id validation
+        assert!(
+            matches!(err, Error::EmbeddingModelNotFound { .. }),
+            "Expected EmbeddingModelNotFound error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_row_id_columns_accepted() {
+        let schema = Arc::new(Schema::new(vec![
+            field("id", DataType::Int64),
+            field("r_name", DataType::Utf8),
+        ]));
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(schema, vec![vec![]]).expect("create MemTable"),
+        );
+        let embedding_models = Arc::new(RwLock::new(HashMap::new()));
+
+        // No primary_keys specified — should pass row_id validation and fail on model check
+        let embeddings = vec![ColumnEmbeddingConfig {
+            column: "r_name".to_string(),
+            model: "test_model".to_string(),
+            primary_keys: None,
+            chunking: None,
+            vector_size: None,
+        }];
+
+        let result =
+            EmbeddingTable::from_spicepod_columns(base_table, embeddings, &embedding_models, None)
+                .await;
+
+        assert!(result.is_err());
+        let err = result.expect_err("expected model-not-found error");
+        assert!(
+            matches!(err, Error::EmbeddingModelNotFound { .. }),
+            "Expected EmbeddingModelNotFound error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiple_row_id_columns_one_invalid() {
+        let schema = Arc::new(Schema::new(vec![
+            field("id", DataType::Int64),
+            field("r_name", DataType::Utf8),
+        ]));
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(schema, vec![vec![]]).expect("create MemTable"),
+        );
+        let embedding_models = Arc::new(RwLock::new(HashMap::new()));
+
+        let embeddings = vec![ColumnEmbeddingConfig {
+            column: "r_name".to_string(),
+            model: "test_model".to_string(),
+            primary_keys: Some(vec!["id".to_string(), "nonexistent".to_string()]),
+            chunking: None,
+            vector_size: None,
+        }];
+
+        let result =
+            EmbeddingTable::from_spicepod_columns(base_table, embeddings, &embedding_models, None)
+                .await;
+
+        assert!(result.is_err());
+        let err = result.expect_err("expected row_id validation error");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("nonexistent"),
+            "Error should mention the invalid column, got: {err_msg}"
+        );
     }
 }
