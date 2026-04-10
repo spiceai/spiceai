@@ -2350,9 +2350,15 @@ mod tests {
             .as_any()
             .downcast_ref::<arrow::array::TimestampSecondArray>()
             .expect("should be TimestampSecondArray");
-        assert!(!arr.is_null(0), "Second-precision timestamp should not be NULL for year 2300");
+        assert!(
+            !arr.is_null(0),
+            "Second-precision timestamp should not be NULL for year 2300"
+        );
         // 2300-01-01T00:00:00Z in seconds since epoch
-        assert!(arr.value(0) > 10_000_000_000, "timestamp should be far in the future, not epoch 0");
+        assert!(
+            arr.value(0) > 10_000_000_000,
+            "timestamp should be far in the future, not epoch 0"
+        );
 
         // Millisecond unit should also work
         let schema_millis = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
@@ -2367,8 +2373,14 @@ mod tests {
             .as_any()
             .downcast_ref::<arrow::array::TimestampMillisecondArray>()
             .expect("should be TimestampMillisecondArray");
-        assert!(!arr.is_null(0), "Millisecond-precision timestamp should not be NULL for year 2300");
-        assert!(arr.value(0) > 10_000_000_000_000, "timestamp should be far in the future, not epoch 0");
+        assert!(
+            !arr.is_null(0),
+            "Millisecond-precision timestamp should not be NULL for year 2300"
+        );
+        assert!(
+            arr.value(0) > 10_000_000_000_000,
+            "timestamp should be far in the future, not epoch 0"
+        );
 
         // Microsecond unit should also work
         let schema_micros = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
@@ -2383,8 +2395,14 @@ mod tests {
             .as_any()
             .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
             .expect("should be TimestampMicrosecondArray");
-        assert!(!arr.is_null(0), "Microsecond-precision timestamp should not be NULL for year 2300");
-        assert!(arr.value(0) > 10_000_000_000_000_000, "timestamp should be far in the future, not epoch 0");
+        assert!(
+            !arr.is_null(0),
+            "Microsecond-precision timestamp should not be NULL for year 2300"
+        );
+        assert!(
+            arr.value(0) > 10_000_000_000_000_000,
+            "timestamp should be far in the future, not epoch 0"
+        );
 
         // Nanosecond unit should return NULL (overflow) instead of epoch 0
         let schema_nanos = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
@@ -2400,6 +2418,9 @@ mod tests {
             .downcast_ref::<arrow::array::TimestampNanosecondArray>()
             .expect("should be TimestampNanosecondArray");
         // Nanosecond cannot represent year 2300 — should be NULL, not epoch 0
-        assert!(arr.is_null(0), "Nanosecond-precision timestamp should be NULL for year 2300 (overflow)");
+        assert!(
+            arr.is_null(0),
+            "Nanosecond-precision timestamp should be NULL for year 2300 (overflow)"
+        );
     }
 }
