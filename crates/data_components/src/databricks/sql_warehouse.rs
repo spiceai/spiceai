@@ -74,6 +74,10 @@ type SharedSqlWarehouseRegistry = Mutex<HashMap<SharedSqlWarehouseKey, SharedSql
 static SHARED_SQL_WAREHOUSE_SEMAPHORES: LazyLock<SharedSqlWarehouseRegistry> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+static SHARED_SQL_WAREHOUSE_METRICS: LazyLock<
+    Mutex<HashMap<(String, String), Arc<DatabricksMetrics>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Configuration for Databricks SQL Warehouse connection behavior.
 ///
 /// Controls concurrency, retry limits, and permanent error handling to
@@ -327,13 +331,29 @@ impl DatabricksSqlWarehouse {
             }
         );
 
-        let request_semaphore = shared_semaphore
-            .unwrap_or_else(|| Arc::new(Semaphore::new(config.max_concurrent_requests)));
-
-        let metrics = Arc::new(DatabricksMetrics {
-            semaphore: Some(Arc::clone(&request_semaphore)),
-            ..DatabricksMetrics::default()
-        });
+        let (request_semaphore, metrics) = if let Some(sem) = shared_semaphore {
+            let key = (endpoint.to_string(), sql_warehouse_id.to_string());
+            let mut registry = SHARED_SQL_WAREHOUSE_METRICS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let metrics = registry
+                .entry(key)
+                .or_insert_with(|| {
+                    Arc::new(DatabricksMetrics {
+                        semaphore: Some(Arc::clone(&sem)),
+                        ..DatabricksMetrics::default()
+                    })
+                })
+                .clone();
+            (sem, metrics)
+        } else {
+            let sem = Arc::new(Semaphore::new(config.max_concurrent_requests));
+            let metrics = Arc::new(DatabricksMetrics {
+                semaphore: Some(Arc::clone(&sem)),
+                ..DatabricksMetrics::default()
+            });
+            (sem, metrics)
+        };
         let api = Arc::new(SqlWarehouseApi::new(
             endpoint,
             sql_warehouse_id,
