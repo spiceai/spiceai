@@ -95,7 +95,7 @@ Connectors must implement safeguards to prevent thundering herd issues and ensur
 - [ ] **Retry limiting**: HTTP or RPC retries for transient failures (e.g. 429, 5xx, timeouts) are bounded with a configurable maximum (e.g. `http_max_retries`). Retries must use backoff (exponential or fibonacci) and respect upstream `Retry-After` headers when present.
 - [ ] **Permanent error detection**: Non-retryable errors (e.g. 401 Unauthorized, 403 Forbidden, 404 Not Found) are detected and the connector enters a permanent error state to prevent further requests from being issued. This must be configurable via a spicepod parameter (e.g. `disable_on_permanent_error`).
 - [ ] **Connection pooling or request budgeting**: For connectors that maintain persistent connections or sessions, the pool size or maximum concurrent sessions must be configurable. For HTTP-based connectors, the request concurrency semaphore fulfills this requirement.
-- [ ] **In-flight request observability**: The connector emits a component-level metric (e.g. `inflight_operations` gauge) that tracks the number of concurrent in-flight requests holding a concurrency permit. This metric must be bounded by `max_concurrent_requests`, auto-registered, and observable via the `/v1/metrics` endpoint.
+- [ ] **In-flight request observability**: The connector emits an in-flight requests metric (e.g. `connector_inflight_requests`) that tracks the number of concurrent in-flight requests, with `service` and `operation` dimensions. This metric must be observable via the runtime metrics endpoint.
 
 #### Documentation
 

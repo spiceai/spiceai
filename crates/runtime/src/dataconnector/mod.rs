@@ -396,6 +396,9 @@ impl DataConnectorError {
                 | Self::InvalidConnectorType { .. }
                 | Self::InvalidGlobPattern { .. }
                 | Self::InvalidTableName { .. }
+                | Self::UnableToConnectInvalidHostOrPort { .. }
+                | Self::UnableToConnectInvalidUsernameOrPassword { .. }
+                | Self::UnableToConnectTlsError { .. }
                 | Self::UnsupportedTypeAction { .. }
                 | Self::UnsupportedDataType { .. }
                 | Self::OdbcNotInstalled { .. }

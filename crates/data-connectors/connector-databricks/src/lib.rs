@@ -680,22 +680,8 @@ impl Databricks {
 // ============================================================================
 // Data Connector Factory
 // ============================================================================
-
-/// Default maximum concurrent requests to the SQL Warehouse API.
-const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
-
-type SemaphoreRegistry =
-    Arc<parking_lot::Mutex<HashMap<(String, String), (Arc<Semaphore>, usize)>>>;
-
 #[derive(Default, Clone)]
-pub struct DatabricksFactory {
-    /// Shared concurrency semaphores keyed by `(endpoint, warehouse_id)`.
-    ///
-    /// When multiple datasets use the same SQL Warehouse, they share a single
-    /// semaphore so the concurrency limit is enforced globally across all
-    /// datasets, not per-dataset.
-    semaphore_registry: SemaphoreRegistry,
-}
+pub struct DatabricksFactory;
 
 impl DatabricksFactory {
     #[must_use]
@@ -706,33 +692,6 @@ impl DatabricksFactory {
     #[must_use]
     pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
         Arc::new(Self::default()) as Arc<dyn DataConnectorFactory>
-    }
-
-    /// Returns a shared semaphore for the given endpoint and warehouse.
-    ///
-    /// The first call for a given key creates the semaphore; subsequent calls
-    /// return the same one.
-    fn get_or_create_semaphore(
-        &self,
-        endpoint: &str,
-        warehouse_id: &str,
-        max_concurrent: usize,
-    ) -> Arc<Semaphore> {
-        let key = (endpoint.to_string(), warehouse_id.to_string());
-        let mut registry = self.semaphore_registry.lock();
-        let (sem, configured_limit) = registry
-            .entry(key)
-            .or_insert_with(|| (Arc::new(Semaphore::new(max_concurrent)), max_concurrent));
-        if *configured_limit != max_concurrent {
-            tracing::warn!(
-                endpoint = endpoint,
-                warehouse_id = warehouse_id,
-                requested = max_concurrent,
-                existing = *configured_limit,
-                "Databricks concurrency semaphore already exists with a different limit; using existing semaphore"
-            );
-        }
-        Arc::clone(sem)
     }
 }
 
@@ -748,45 +707,6 @@ impl DataConnectorFactory for DatabricksFactory {
         if let Some(runtime) = params.runtime {
             let param_map = params.parameters.to_secret_map();
 
-            // Resolve a shared semaphore if this is a sql_warehouse connector.
-            let shared_semaphore = {
-                let mode = params
-                    .parameters
-                    .get("mode")
-                    .expose()
-                    .ok()
-                    .unwrap_or_default();
-                if mode == "sql_warehouse" {
-                    let endpoint = params
-                        .parameters
-                        .get("endpoint")
-                        .expose()
-                        .ok()
-                        .unwrap_or_default();
-                    let warehouse_id = params
-                        .parameters
-                        .get("sql_warehouse_id")
-                        .expose()
-                        .ok()
-                        .unwrap_or_default();
-                    if !endpoint.is_empty() && !warehouse_id.is_empty() {
-                        let max_concurrent = params
-                            .parameters
-                            .get("max_concurrent_requests")
-                            .expose()
-                            .ok()
-                            .and_then(|v| v.parse::<usize>().ok())
-                            .filter(|&n| n > 0)
-                            .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS);
-                        Some(self.get_or_create_semaphore(endpoint, warehouse_id, max_concurrent))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            };
-
             Box::pin(async move {
                 // Initialize AWS SDK credentials if not using explicit credentials
                 if !aws_sdk_credential_bridge::has_explicit_credentials(
@@ -799,6 +719,31 @@ impl DataConnectorFactory for DatabricksFactory {
                         "Unable to initialize AWS credentials for Databricks connector: {err}"
                     );
                 }
+
+                let shared_semaphore = if matches!(
+                    params.parameters.get("mode").expose().ok(),
+                    Some("sql_warehouse")
+                ) {
+                    match (
+                        params.parameters.get("endpoint").expose().ok(),
+                        params.parameters.get("sql_warehouse_id").expose().ok(),
+                    ) {
+                        (Some(endpoint), Some(warehouse_id)) => {
+                            let config =
+                                runtime::catalogconnector::databricks::build_sql_warehouse_config(
+                                    &params.parameters,
+                                );
+                            Some(sql_warehouse::shared_request_semaphore(
+                                endpoint,
+                                warehouse_id,
+                                config.max_concurrent_requests,
+                            )?)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
 
                 let databricks = Databricks::new(
                     params.parameters,
@@ -893,8 +838,7 @@ const DATABRICKS_METRICS: &[MetricSpec] = &[
         "Total non-retryable errors (401, 403, 404) that permanently disabled the connector",
     ),
     MetricSpec::new("inflight_operations", MetricType::ObservableGaugeU64)
-        .description("Current number of in-flight SQL Warehouse operations (includes semaphore wait and retries)")
-        .auto_register(),
+        .description("Current number of in-flight SQL Warehouse operations holding a concurrency permit"),
     // -- Statement metrics --
     MetricSpec::new(
         "statements_executed_total",
@@ -1271,11 +1215,37 @@ impl CatalogConnector for DatabricksCatalog {
                 table_reference_creator_delta_lake as fn(&UCTable) -> Option<TableReference>,
             )
         } else {
+            let shared_semaphore = if mode == Some("sql_warehouse") {
+                match (
+                    params.get("endpoint").expose().ok(),
+                    params.get("sql_warehouse_id").expose().ok(),
+                ) {
+                    (Some(endpoint), Some(warehouse_id)) => {
+                        let config = runtime::catalogconnector::databricks::build_sql_warehouse_config(&params);
+                        Some(
+                            sql_warehouse::shared_request_semaphore(
+                                endpoint,
+                                warehouse_id,
+                                config.max_concurrent_requests,
+                            )
+                            .map_err(|source| CatalogError::UnableToGetCatalogProvider {
+                                connector: "databricks".to_string(),
+                                source: source.into(),
+                                connector_component: ConnectorComponent::from(catalog),
+                            })?,
+                        )
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
             let dataset_databricks = Databricks::new(
                 params,
                 runtime.tokio_io_runtime(),
                 runtime.token_provider_registry(),
-                None,
+                shared_semaphore,
             )
             .await
             .map_err(|source| CatalogError::UnableToGetCatalogProvider {

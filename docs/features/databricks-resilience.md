@@ -37,9 +37,9 @@ catalogs:
 
 ### Shared Concurrency Semaphore
 
-When multiple datasets target the same SQL Warehouse (same `endpoint` + `sql_warehouse_id`), the connector factory automatically shares a single concurrency semaphore across all of them. This ensures the `max_concurrent_requests` limit is enforced **globally** rather than per-dataset, preventing overloading the warehouse when many datasets are configured.
+When multiple datasets or catalog-discovery paths target the same SQL Warehouse (same `endpoint` + `sql_warehouse_id`), the connector shares a single concurrency semaphore across all of them. This ensures the `max_concurrent_requests` limit is enforced **globally** for that warehouse connection rather than per-dataset or per-catalog refresh.
 
-This applies to the **data connector path** (individual datasets in the spicepod). The **catalog connector path** creates its own semaphore per catalog — all tables discovered within a single catalog share that semaphore, but it is not shared with datasets from the data connector factory or other catalogs.
+All Databricks components that share the same warehouse must use the same `max_concurrent_requests` value. Conflicting values are treated as a configuration error so the effective global limit stays deterministic.
 
 ### Permanent-Disable Fuse
 
@@ -79,9 +79,9 @@ Unsupported table types are:
 
 Before creating a table provider, the connector calls the UC Effective Permissions API (`GET /api/2.1/unity-catalog/effective-permissions/table/{full_name}`) to verify the current principal has a read-compatible privilege on the table. The following privileges are treated as granting read access: `SELECT`, `ALL_PRIVILEGES`, `ALL PRIVILEGES`, `OWNER`, and `OWNERSHIP`.
 
-- **Catalog connector path**: Tables without read permissions are skipped during discovery with a warning-level log.
+- **Catalog connector path**: Tables without read permissions are skipped during discovery with a debug-level log.
 - **Data connector path**: Returns an `InsufficientPermissions` error when a fully-qualified table reference is used.
-- **Graceful degradation**: If the UC API is unreachable or the table is not found in UC, the connector logs a warning and proceeds without validation (the table may not be a UC-managed table).
+- **Graceful degradation**: If the UC API is unreachable, the connector logs a warning and proceeds without validation. If the table is not found in UC, the connector proceeds without validation with a debug-level log (the table may not be a UC-managed table).
 
 ## Task History Instrumentation
 
@@ -111,28 +111,28 @@ All spans include a `warehouse_id` field (SQL Warehouse spans) or the table/cata
 
 ### Component-Level Metrics
 
-The SQL Warehouse connector exposes per-dataset operational metrics via the `MetricsProvider` interface. Most metrics must be **explicitly enabled** in the dataset's `metrics` section in the spicepod to be registered. The `inflight_operations` metric is **auto-registered** and always appears in `/v1/metrics` without opt-in.
+The SQL Warehouse connector exposes per-dataset operational metrics via the `MetricsProvider` interface. These metrics must be **explicitly enabled** in the dataset's `metrics` section in the spicepod to be registered.
 
 #### Available Metrics
 
-| Metric Name                   | Type    | Category        | Description                                                         |
-| ----------------------------- | ------- | --------------- | ------------------------------------------------------------------- |
-| `requests_total`              | Counter | Requests        | Total HTTP requests issued to the SQL Warehouse API (excl. retries) |
-| `retries_total`               | Counter | Requests        | Total HTTP retries performed for transient failures                 |
-| `permanent_errors_total`      | Counter | Requests        | Total non-retryable errors (401, 403, 404) detected                 |
-| `inflight_operations`         | Gauge   | Requests        | Current number of HTTP requests holding a concurrency permit. Bounded by `max_concurrent_requests`. **Auto-registered.** |
-| `statements_executed_total`   | Counter | Statements      | Total SQL statements submitted for execution                        |
-| `statement_polls_total`       | Counter | Statements      | Total polls made when waiting for async statement completion        |
-| `statements_failed_total`     | Counter | Statements      | Total SQL statements that completed with FAILED status              |
-| `pool_connections_total`      | Counter | Connection Pool | Total virtual pool `connect()` calls                                |
-| `pool_active_connections`     | Gauge   | Connection Pool | Current number of active connection handles                         |
-| `semaphore_available_permits` | Gauge   | Concurrency     | Current available permits in the request concurrency semaphore      |
-| `chunks_fetched_total`        | Counter | Data Transfer   | Total Arrow result chunks fetched from external links               |
-| `connector_disabled`          | Gauge   | Connector State | Whether the connector is permanently disabled (1 = yes, 0 = no)     |
+| Metric Name                   | Type    | Category        | Description                                                                       |
+| ----------------------------- | ------- | --------------- | --------------------------------------------------------------------------------- |
+| `requests_total`              | Counter | Requests        | Total HTTP requests issued to the SQL Warehouse API (excl. retries)               |
+| `retries_total`               | Counter | Requests        | Total HTTP retries performed for transient failures                               |
+| `permanent_errors_total`      | Counter | Requests        | Total non-retryable errors (401, 403, 404) detected                               |
+| `inflight_operations`         | Gauge   | Requests        | Current number of in-flight SQL Warehouse operations holding a concurrency permit |
+| `statements_executed_total`   | Counter | Statements      | Total SQL statements submitted for execution                                      |
+| `statement_polls_total`       | Counter | Statements      | Total polls made when waiting for async statement completion                      |
+| `statements_failed_total`     | Counter | Statements      | Total SQL statements that completed with FAILED status                            |
+| `pool_connections_total`      | Counter | Connection Pool | Total virtual pool `connect()` calls                                              |
+| `pool_active_connections`     | Gauge   | Connection Pool | Current number of active connection handles                                       |
+| `semaphore_available_permits` | Gauge   | Concurrency     | Current available permits in the request concurrency semaphore                    |
+| `chunks_fetched_total`        | Counter | Data Transfer   | Total Arrow result chunks fetched from external links                             |
+| `connector_disabled`          | Gauge   | Connector State | Whether the connector is permanently disabled (1 = yes, 0 = no)                   |
 
 #### Enabling Metrics
 
-Add a `metrics` list to the dataset definition in your spicepod. Each entry names a metric from the table above. Auto-registered metrics (like `inflight_operations`) do not need to be listed.
+Add a `metrics` list to the dataset definition in your spicepod. Each entry names a metric from the table above.
 
 ```yaml
 datasets:
@@ -173,13 +173,22 @@ Individual metrics can be disabled by setting `enabled: false`:
 
 Once registered, each metric is exposed as an OpenTelemetry instrument with the naming convention:
 
-```
+```text
 dataset_databricks_{metric_name}
 ```
 
 For example, `requests_total` becomes `dataset_databricks_requests_total`.
 
 Each instrument carries a `name` attribute set to the dataset instance name (e.g., `my_table`), so metrics from multiple datasets sharing the same SQL Warehouse can be distinguished.
+
+#### Dataset Metrics vs Connection Metrics
+
+Databricks SQL Warehouse observability has two scopes:
+
+- **Dataset metrics** — `dataset_databricks_*` metrics registered from a dataset's `metrics` block. These answer questions like "what is this dataset doing?"
+- **Connection metrics** — telemetry keyed by the shared SQL Warehouse connection identity, currently `(endpoint, sql_warehouse_id)`. These answer questions like "what is this shared warehouse connection doing across all datasets and catalog refreshes that use it?"
+
+This distinction matters when multiple datasets share the same warehouse. Per-dataset metrics are useful for attribution, but they are not the authoritative view of shared warehouse load.
 
 #### Accessing Metrics
 
@@ -188,6 +197,12 @@ Registered component metrics are available through:
 - **Prometheus endpoint** — Scraped from the `/metrics` HTTP endpoint when the metrics server is enabled.
 - **`runtime.metrics` SQL table** — Queryable via SQL: `SELECT * FROM runtime.metrics WHERE name LIKE 'dataset_databricks_%'`.
 - **OTLP push exporter** — Pushed to any configured OpenTelemetry collector.
+
+### Connection-Level Metrics
+
+The shared `resilient_http` module emits a global `connector_inflight_requests` OpenTelemetry UpDownCounter for cross-connector observability. For Databricks SQL Warehouse requests, it includes `service`, `operation`, `endpoint`, and `warehouse_id` dimensions, so requests from datasets and catalog refreshes that share the same warehouse surface under the same connection identity.
+
+This metric is always active (no opt-in required) and tracks active HTTP attempts across connectors that use the shared retry/concurrency infrastructure.
 
 ## Architecture Notes
 

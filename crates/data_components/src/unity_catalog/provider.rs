@@ -194,10 +194,8 @@ impl UnityCatalogSchemaProvider {
                     let has_permission =
                         match client.get_effective_permissions(&table.full_name()).await {
                             Ok(Some(perms)) if !perms.has_read_permission() => {
-                                tracing::warn!(
+                                tracing::debug!(
                                     table = %table.full_name(),
-                                    principals = ?perms.principals(),
-                                    privileges = ?perms.all_privileges(),
                                     "Skipping table during catalog discovery: no read-compatible privilege found in effective-permissions response"
                                 );
                                 false
@@ -366,10 +364,8 @@ impl UnityCatalogSchemaProvider {
 
         match client.get_effective_permissions(&table.full_name()).await {
             Ok(Some(perms)) if !perms.has_read_permission() => {
-                tracing::warn!(
+                tracing::debug!(
                     table = %table.full_name(),
-                    principals = ?perms.principals(),
-                    privileges = ?perms.all_privileges(),
                     "Skipping table during catalog discovery: no read-compatible privilege found in effective-permissions response"
                 );
                 return None;

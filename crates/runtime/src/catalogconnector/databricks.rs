@@ -28,7 +28,7 @@ use crate::token_providers::databricks::{
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::RefreshableCatalogProvider;
-use data_components::databricks::sql_warehouse::SqlWarehouseConfig;
+use data_components::databricks::sql_warehouse::{SqlWarehouseConfig, shared_request_semaphore};
 use data_components::databricks::{DatabricksSparkConnect, DatabricksSqlWarehouse};
 use data_components::delta_lake::DeltaTableFactory;
 use data_components::unity_catalog::CatalogId;
@@ -268,12 +268,23 @@ impl CatalogConnector for Databricks {
             .await?;
 
             let config = build_sql_warehouse_config(&params);
+            let shared_semaphore = shared_request_semaphore(
+                endpoint,
+                sql_warehouse_id,
+                config.max_concurrent_requests,
+            )
+            .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                connector: "databricks".to_string(),
+                source: source.into(),
+                connector_component: ConnectorComponent::from(catalog),
+            })?;
 
-            let read_provider = DatabricksSqlWarehouse::with_config(
+            let read_provider = DatabricksSqlWarehouse::with_config_and_semaphore(
                 endpoint,
                 sql_warehouse_id,
                 token_provider,
                 config,
+                Some(shared_semaphore),
             )
             .map_err(|source| super::Error::UnableToGetCatalogProvider {
                 connector: "databricks".to_string(),
@@ -469,6 +480,17 @@ pub fn build_sql_warehouse_config(params: &Parameters) -> SqlWarehouseConfig {
 mod tests {
     use super::*;
 
+    fn make_parameters(entries: &[(&str, &str)]) -> Parameters {
+        Parameters::new(
+            entries
+                .iter()
+                .map(|(key, value)| (key.to_string(), SecretString::from(*value)))
+                .collect(),
+            "databricks",
+            PARAMETERS,
+        )
+    }
+
     fn make_uc_table(storage_location: Option<&str>) -> UCTable {
         UCTable {
             name: "my_table".to_string(),
@@ -640,5 +662,47 @@ mod tests {
             }
             _ => unreachable!("already asserted to be Bare table reference"),
         }
+    }
+
+    #[test]
+    fn test_build_sql_warehouse_config_parses_valid_overrides() {
+        let params = make_parameters(&[
+            ("max_concurrent_requests", "4"),
+            ("http_max_retries", "6"),
+            ("backoff_method", "exponential"),
+            ("statement_max_retries", "21"),
+            ("disable_on_permanent_error", "false"),
+        ]);
+
+        let config = build_sql_warehouse_config(&params);
+
+        assert_eq!(config.max_concurrent_requests, 4);
+        assert_eq!(config.http_max_retries, 6);
+        assert_eq!(config.backoff_method, util::retry_strategy::BackoffMethod::Exponential);
+        assert_eq!(config.statement_max_retries, 21);
+        assert!(!config.disable_on_permanent_error);
+    }
+
+    #[test]
+    fn test_build_sql_warehouse_config_uses_defaults_for_invalid_values() {
+        let params = make_parameters(&[
+            ("max_concurrent_requests", "0"),
+            ("http_max_retries", "NaN"),
+            ("backoff_method", "quadratic"),
+            ("statement_max_retries", "bad"),
+            ("disable_on_permanent_error", "maybe"),
+        ]);
+
+        let config = build_sql_warehouse_config(&params);
+        let defaults = SqlWarehouseConfig::default();
+
+        assert_eq!(config.max_concurrent_requests, defaults.max_concurrent_requests);
+        assert_eq!(config.http_max_retries, defaults.http_max_retries);
+        assert_eq!(config.backoff_method, defaults.backoff_method);
+        assert_eq!(config.statement_max_retries, defaults.statement_max_retries);
+        assert_eq!(
+            config.disable_on_permanent_error,
+            defaults.disable_on_permanent_error
+        );
     }
 }
