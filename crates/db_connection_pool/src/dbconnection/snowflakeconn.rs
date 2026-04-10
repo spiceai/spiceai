@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::any::Any;
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use arrow::array::{
     Array, ArrayRef, AsArray, Decimal128Array, Int32Array, Int64Array, PrimitiveArray, RecordBatch,
@@ -97,9 +98,11 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
     }
 
     async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        let start = Instant::now();
         // Quote the identifier to prevent SQL injection and handle special characters
         let escaped_schema = schema.replace('"', "\"\"");
         let query = format!("SHOW TABLES IN SCHEMA \"{escaped_schema}\"");
+        tracing::debug!(query = %query, "Snowflake: listing tables");
         let res =
             self.api
                 .exec(&query)
@@ -108,7 +111,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
                     source: e.to_string().into(),
                 })?;
 
-        match res {
+        let result = match res {
             snowflake_api::QueryResult::Arrow(batches) => {
                 names_from_arrow_batches(batches, tables_error)
             }
@@ -116,11 +119,15 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
                 names_from_json_rows(&resp.value, tables_error)
             }
             snowflake_api::QueryResult::Empty => Ok(Vec::new()),
-        }
+        };
+        tracing::debug!(duration_ms = %start.elapsed().as_millis(), schema = %schema, count = result.as_ref().map_or(0, Vec::len), "Snowflake: listed tables");
+        result
     }
 
     async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
+        let start = Instant::now();
         let query = "SHOW SCHEMAS";
+        tracing::debug!(query = %query, "Snowflake: listing schemas");
         let res =
             self.api
                 .exec(query)
@@ -129,7 +136,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
                     source: e.to_string().into(),
                 })?;
 
-        match res {
+        let result = match res {
             snowflake_api::QueryResult::Arrow(batches) => {
                 names_from_arrow_batches(batches, schemas_error)
             }
@@ -137,15 +144,19 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
                 names_from_json_rows(&resp.value, schemas_error)
             }
             snowflake_api::QueryResult::Empty => Ok(Vec::new()),
-        }
+        };
+        tracing::debug!(duration_ms = %start.elapsed().as_millis(), count = result.as_ref().map_or(0, Vec::len), "Snowflake: listed schemas");
+        result
     }
 
     async fn get_schema(
         &self,
         table_reference: &TableReference,
     ) -> Result<SchemaRef, dbconnection::Error> {
+        let start = Instant::now();
         let table = table_reference.to_quoted_string();
         let query = format!("SHOW COLUMNS IN {table}");
+        tracing::debug!(query = %query, "Snowflake: fetching schema");
 
         let res =
             self.api
@@ -155,7 +166,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
                     source: e.to_string().into(),
                 })?;
 
-        match res {
+        let result = match res {
             snowflake_api::QueryResult::Json(resp) => {
                 parse_schema_from_json(&resp.value).map_err(|e| {
                     dbconnection::Error::UnableToGetSchema {
@@ -169,7 +180,9 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
             snowflake_api::QueryResult::Empty => Err(dbconnection::Error::UnableToGetSchema {
                 source: "Empty response".to_string().into(),
             }),
-        }
+        };
+        tracing::debug!(duration_ms = %start.elapsed().as_millis(), table = %table, "Snowflake: fetched schema");
+        result
     }
 
     async fn query_arrow(
@@ -178,13 +191,17 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
         _: &[&'a dyn Sync],
         _projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
+        let start = Instant::now();
         let sql = sql.to_string();
+        tracing::debug!(sql = %sql, "Snowflake: executing query");
 
         let stream = self
             .api
             .exec_streamed(&sql)
             .await
             .context(SnowflakeQuerySnafu)?;
+
+        tracing::debug!(duration_ms = %start.elapsed().as_millis(), "Snowflake: query stream initiated");
 
         let mut transformed_stream = stream.map(|batch| {
             batch.and_then(|batch| {

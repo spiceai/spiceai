@@ -36,11 +36,13 @@ use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
+use futures::stream::{self, StreamExt};
 use globset::GlobSet;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 pub const PREFIX: &str = "adbc";
 
@@ -187,6 +189,9 @@ impl CatalogConnector for AdbcCatalog {
     }
 }
 
+/// Maximum number of concurrent ADBC table provider creation tasks during catalog discovery.
+const CATALOG_DISCOVERY_CONCURRENCY: usize = 10;
+
 /// Creates an ADBC connection pool from connector parameters.
 async fn create_pool(params: &ConnectorParams) -> Result<(String, Arc<ADBCPool<ManagedDatabase>>)> {
     let driver_name = params
@@ -318,10 +323,12 @@ impl AdbcCatalogProvider {
     }
 
     async fn refresh_schemas(&self) -> Result<()> {
+        let refresh_start = Instant::now();
         // Phase 1: Discover schemas and tables via ADBC metadata API.
         // These are synchronous FFI calls — offload to a blocking thread
         // to avoid stalling the async runtime.
         let pool = Arc::clone(&self.pool);
+        let discovery_start = Instant::now();
         let schema_tables =
             tokio::task::spawn_blocking(move || -> Result<Vec<(String, Vec<String>)>> {
                 let conn = pool
@@ -357,7 +364,11 @@ impl AdbcCatalogProvider {
                 source: Box::new(e),
             })??;
 
-        // Phase 2: Create table providers (async).
+        let schema_count = schema_tables.len();
+        let table_count: usize = schema_tables.iter().map(|(_, t)| t.len()).sum();
+        tracing::info!(duration_ms = %discovery_start.elapsed().as_millis(), schemas = schema_count, tables = table_count, "ADBC: metadata discovery complete");
+
+        // Phase 2: Create table providers concurrently.
         let mut schemas = HashMap::new();
         for (schema_name, table_names) in schema_tables {
             let tables = self.create_table_providers(&schema_name, table_names).await;
@@ -378,6 +389,8 @@ impl AdbcCatalogProvider {
             *guard = schemas;
         }
 
+        tracing::info!(duration_ms = %refresh_start.elapsed().as_millis(), "ADBC: catalog refresh complete");
+
         Ok(())
     }
 
@@ -386,26 +399,41 @@ impl AdbcCatalogProvider {
         schema_name: &str,
         table_names: Vec<String>,
     ) -> HashMap<String, Arc<dyn TableProvider>> {
-        let mut tables = HashMap::new();
-
+        let start = Instant::now();
         let dialect = dialect_for_driver(&self.driver_name);
+        let include = self.include.clone();
+        let schema_name_owned = schema_name.to_owned();
 
-        for table_name in table_names {
-            let schema_with_table = format!("{schema_name}.{table_name}");
-            if let Some(include) = &self.include
-                && !include.is_match(&schema_with_table)
-            {
-                tracing::debug!("Table {schema_with_table} is not included, skipping");
-                continue;
-            }
+        type ProviderResult =
+            std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
-            let table_ref = TableReference::partial(schema_name.to_owned(), table_name.clone());
+        let results: Vec<(String, ProviderResult)> =
+            stream::iter(table_names.into_iter().filter_map(|table_name| {
+                let schema_with_table = format!("{schema_name_owned}.{table_name}");
+                if let Some(include) = &include
+                    && !include.is_match(&schema_with_table)
+                {
+                    tracing::debug!("Table {schema_with_table} is not included, skipping");
+                    return None;
+                }
+                Some(table_name)
+            }).map(|table_name| {
+                let table_factory = &self.table_factory;
+                let schema_ref = &schema_name_owned;
+                let dialect = dialect.clone();
+                async move {
+                    let table_ref = TableReference::partial(schema_ref.to_owned(), table_name.clone());
+                    let result = table_factory.table_provider(table_ref, dialect).await;
+                    (table_name, result)
+                }
+            }))
+            .buffer_unordered(CATALOG_DISCOVERY_CONCURRENCY)
+            .collect()
+            .await;
 
-            match self
-                .table_factory
-                .table_provider(table_ref, dialect.clone())
-                .await
-            {
+        let mut tables = HashMap::new();
+        for (table_name, result) in results {
+            match result {
                 Ok(provider) => {
                     tables.insert(table_name, provider);
                 }
@@ -414,12 +442,13 @@ impl AdbcCatalogProvider {
                         schema = %schema_name,
                         table = %table_name,
                         error = %e,
-                        "Failed to create table provider for ADBC table {schema_with_table}, skipping"
+                        "Failed to create table provider for ADBC table, skipping"
                     );
                 }
             }
         }
 
+        tracing::debug!(duration_ms = %start.elapsed().as_millis(), schema = %schema_name, tables = tables.len(), "ADBC: schema table providers created");
         tables
     }
 }

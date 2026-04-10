@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use crate::cluster::partition::get_partition_filter_exprs;
 use crate::component::dataset::acceleration::Mode;
@@ -136,8 +136,9 @@ impl Runtime {
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
             let ds_clone = Arc::clone(ds);
             let cloned_self = Arc::clone(&self);
+            let load_semaphore = Arc::clone(&semaphore);
             let future: Pin<Box<dyn Future<Output = ()> + Send>> =
-                Box::pin(async move { cloned_self.load_dataset(ds_clone, bootstrap_status).await })
+                Box::pin(async move { cloned_self.load_dataset(ds_clone, bootstrap_status, load_semaphore).await })
                     as Pin<Box<dyn Future<Output = ()> + Send>>;
             dataset_futures.insert(ds.name.clone(), future);
         }
@@ -155,10 +156,11 @@ impl Runtime {
             if let Some(parent_future) = dataset_futures.remove(&path_table_ref) {
                 let ds_clone = Arc::clone(&ds);
                 let cloned_self = Arc::clone(&self);
+                let load_semaphore = Arc::clone(&semaphore);
                 // Chain the localpod dataset load after its parent
                 let chained_future = Box::pin(async move {
                     parent_future.await;
-                    cloned_self.load_dataset(ds_clone, bootstrap_status).await;
+                    cloned_self.load_dataset(ds_clone, bootstrap_status, load_semaphore).await;
                 }) as Pin<Box<dyn Future<Output = ()> + Send>>;
 
                 // Replace parent future with the chained future
@@ -184,11 +186,7 @@ impl Runtime {
         let mut spawned_tasks = vec![];
 
         for (ds, dataset_load_future) in dataset_futures {
-            let semaphore = Arc::clone(&semaphore);
             let handle = tokio::spawn(async move {
-                let Ok(_guard) = semaphore.acquire().await else {
-                    unreachable!("Semaphore is never closed.");
-                };
                 tracing::info!("Dataset {ds} initializing...");
                 dataset_load_future.await;
             });
@@ -305,7 +303,16 @@ impl Runtime {
     }
 
     /// Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.
-    async fn load_dataset(self: Arc<Self>, ds: Arc<Dataset>, bootstrap_status: BootstrapStatus) {
+    ///
+    /// The `load_semaphore` gates the data-intensive parts (schema inference via
+    /// `read_provider` and initial data load/refresh) while allowing connector
+    /// creation and validation to proceed without the permit.
+    async fn load_dataset(
+        self: Arc<Self>,
+        ds: Arc<Dataset>,
+        bootstrap_status: BootstrapStatus,
+        load_semaphore: Arc<Semaphore>,
+    ) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         if let Err(err) = validate_dataset(&ds) {
@@ -333,11 +340,15 @@ impl Runtime {
                 ));
             }
 
+            let connector_start = Instant::now();
             let connector = match Arc::clone(&runtime)
                 .load_dataset_connector(Arc::clone(&ds))
                 .await
             {
-                Ok(connector) => connector,
+                Ok(connector) => {
+                    tracing::debug!(dataset = %ds.name, duration_ms = %connector_start.elapsed().as_millis(), "Dataset connector created");
+                    connector
+                }
                 Err(err) => {
                     if runtime.status.is_shutdown() {
                         // should not retry or trace error if runtime is shutting down
@@ -365,7 +376,13 @@ impl Runtime {
             }
 
             if let Err(err) = Arc::clone(&runtime)
-                .register_loaded_dataset(Arc::clone(&ds), connector, None, bootstrap_status.clone())
+                .register_loaded_dataset(
+                    Arc::clone(&ds),
+                    connector,
+                    None,
+                    bootstrap_status.clone(),
+                    Arc::clone(&load_semaphore),
+                )
                 .await
             {
                 if runtime.status.is_shutdown() {
@@ -394,6 +411,7 @@ impl Runtime {
         data_connector: Arc<dyn DataConnector>,
         accelerated_table: Option<Arc<AcceleratedTable>>,
         bootstrap_status: BootstrapStatus,
+        load_semaphore: Arc<Semaphore>,
     ) -> Result<()> {
         let source = ds.source();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
@@ -417,7 +435,15 @@ impl Runtime {
             .as_ref()
             .is_some_and(|a| a.mode == Mode::FileUpdate);
 
+        // Acquire the load semaphore before schema inference and data loading.
+        // This limits the concurrent load on the source (e.g., Snowflake) while
+        // allowing connector creation and validation to proceed freely.
+        let Ok(_load_guard) = load_semaphore.acquire().await else {
+            unreachable!("Semaphore is never closed.");
+        };
+
         // Test dataset connectivity by attempting to get a read provider.
+        let schema_start = Instant::now();
         let federated_table = match data_connector.read_provider(&ds).await {
             Ok(provider) => {
                 FederatedTable::new(
@@ -468,6 +494,9 @@ impl Runtime {
             }
         };
 
+        tracing::debug!(dataset = %ds.name, duration_ms = %schema_start.elapsed().as_millis(), "Dataset schema inference complete");
+
+        let register_start = Instant::now();
         match Arc::clone(&self)
             .register_dataset(
                 Arc::clone(&ds),
@@ -494,6 +523,7 @@ impl Runtime {
                     );
                 }
                 tracing::info!(
+                    duration_ms = %register_start.elapsed().as_millis(),
                     "{}",
                     dataset_registered_trace(
                         data_connector.as_ref(),
@@ -631,6 +661,7 @@ impl Runtime {
                         Arc::clone(&connector),
                         None,
                         BootstrapStatus::None,
+                        Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
                     )
                     .await
                 {
@@ -745,6 +776,7 @@ impl Runtime {
             Arc::clone(&connector),
             Some(accelerated_table),
             BootstrapStatus::None,
+            Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
         )
         .await?;
 
@@ -974,7 +1006,11 @@ impl Runtime {
                 self.status
                     .update_dataset(&ds.name, status::ComponentStatus::Initializing);
                 Arc::clone(&self)
-                    .load_dataset(Arc::clone(ds), bootstrap_status)
+                    .load_dataset(
+                        Arc::clone(ds),
+                        bootstrap_status,
+                        Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
+                    )
                     .await;
             }
         }
