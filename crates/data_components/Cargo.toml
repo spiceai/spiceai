@@ -77,6 +77,7 @@ regex.workspace = true
 reqwest.workspace = true
 runtime-rate-control = { path = "../runtime-rate-control" }
 rusqlite = { workspace = true, optional = true }
+elasticsearch = { path = "../elasticsearch", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }
 scylla = { workspace = true, optional = true }
@@ -122,6 +123,7 @@ databricks = [
 debezium = ["dep:rdkafka"]
 default = []
 delta_lake = ["dep:delta_kernel"]
+elasticsearch = ["dep:elasticsearch"]
 duckdb = [
     "dep:duckdb",
     "db_connection_pool/duckdb",

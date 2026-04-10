@@ -1,0 +1,402 @@
+/*
+Copyright 2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! [`TableProvider`] implementations for Elasticsearch kNN vector search
+//! and full-text search, used by the search index layer.
+
+use std::any::Any;
+use std::sync::Arc;
+
+use arrow::array::{ArrayRef, Float64Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use async_trait::async_trait;
+use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::project_schema;
+use datafusion::datasource::TableType;
+use datafusion::error::DataFusionError;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+};
+use datafusion::prelude::Expr;
+use elasticsearch::{Elasticsearch, KnnQuery, SearchRequest};
+
+use super::query_table::hits_to_record_batch;
+
+/// The column name for the search relevance score.
+pub static ES_SCORE_COLUMN_NAME: &str = "_score";
+
+/// The column name for the document `_id`.
+pub static ES_ID_COLUMN_NAME: &str = "_id";
+
+// ── kNN Vector Search Table ────────────────────────────────────────────────
+
+/// A [`TableProvider`] that executes an Elasticsearch kNN vector search.
+///
+/// Returns the primary key fields, embedding vector, and `_score` column.
+#[derive(Debug)]
+pub struct ElasticsearchKnnTable {
+    pub client: Arc<dyn Elasticsearch>,
+    pub index: String,
+    pub vector_field: String,
+    pub query_vector: Vec<f32>,
+    pub k: usize,
+    /// Schema of the kNN result (primary keys + embedding + _score).
+    pub schema: SchemaRef,
+    /// Schema of the full source document (for extracting fields from _source).
+    pub source_schema: SchemaRef,
+}
+
+#[async_trait]
+impl TableProvider for ElasticsearchKnnTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let projected_schema = project_schema(&self.schema, projection)?;
+        Ok(Arc::new(ElasticsearchKnnExec {
+            client: Arc::clone(&self.client),
+            index: self.index.clone(),
+            vector_field: self.vector_field.clone(),
+            query_vector: self.query_vector.clone(),
+            k: self.k,
+            schema: Arc::clone(&self.schema),
+            source_schema: Arc::clone(&self.source_schema),
+            projected_schema,
+            projection: projection.cloned(),
+            properties: PlanProperties::new(
+                EquivalenceProperties::new(project_schema(&self.schema, projection)?),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            ),
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct ElasticsearchKnnExec {
+    client: Arc<dyn Elasticsearch>,
+    index: String,
+    vector_field: String,
+    query_vector: Vec<f32>,
+    k: usize,
+    schema: SchemaRef,
+    source_schema: SchemaRef,
+    projected_schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    properties: PlanProperties,
+}
+
+impl DisplayAs for ElasticsearchKnnExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "ElasticsearchKnnExec: index={}, field={}, k={}",
+            self.index, self.vector_field, self.k
+        )
+    }
+}
+
+impl ExecutionPlan for ElasticsearchKnnExec {
+    fn name(&self) -> &'static str {
+        "ElasticsearchKnnExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> datafusion::error::Result<SendableRecordBatchStream> {
+        let client = Arc::clone(&self.client);
+        let index = self.index.clone();
+        let vector_field = self.vector_field.clone();
+        let query_vector = self.query_vector.clone();
+        let k = self.k;
+        let schema = Arc::clone(&self.schema);
+        let source_schema = Arc::clone(&self.source_schema);
+        let projected_schema = Arc::clone(&self.projected_schema);
+        let projection = self.projection.clone();
+
+        let stream = futures::stream::once(async move {
+            let req = SearchRequest {
+                knn: Some(KnnQuery {
+                    field: vector_field,
+                    query_vector,
+                    k,
+                    num_candidates: k * 2,
+                }),
+                size: Some(k),
+                ..Default::default()
+            };
+
+            let response = client
+                .search(&index, &req)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            let batch = knn_hits_to_batch(&response.hits.hits, &schema, &source_schema)?;
+
+            if let Some(proj) = &projection {
+                Ok(batch.project(proj)?)
+            } else {
+                Ok(batch)
+            }
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            projected_schema,
+            stream,
+        )))
+    }
+}
+
+/// Convert kNN search hits to a [`RecordBatch`] with primary key fields and `_score`.
+fn knn_hits_to_batch(
+    hits: &[elasticsearch::Hit],
+    output_schema: &SchemaRef,
+    source_schema: &SchemaRef,
+) -> Result<RecordBatch, DataFusionError> {
+    // Build columns from _source for non-score fields, and from hit metadata for _score/_id.
+    let num_rows = hits.len();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+
+    for field in output_schema.fields() {
+        if field.name() == ES_SCORE_COLUMN_NAME {
+            let scores: Vec<Option<f64>> = hits.iter().map(|h| h.score).collect();
+            columns.push(Arc::new(Float64Array::from(scores)) as ArrayRef);
+        } else if field.name() == ES_ID_COLUMN_NAME {
+            let ids: Vec<Option<&str>> = hits.iter().map(|h| Some(h.id.as_str())).collect();
+            columns.push(Arc::new(StringArray::from(ids)) as ArrayRef);
+        } else {
+            // Extract from _source using the source_schema field definition.
+            let source_batch = hits_to_record_batch(hits, source_schema)?;
+            if let Ok(col_idx) = source_batch.schema().index_of(field.name()) {
+                columns.push(Arc::clone(source_batch.column(col_idx)));
+            } else {
+                // Field not in source; fill with nulls.
+                columns.push(arrow::array::new_null_array(field.data_type(), num_rows));
+            }
+        }
+    }
+
+    RecordBatch::try_new(Arc::clone(output_schema), columns)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+// ── Full-Text Search Table ─────────────────────────────────────────────────
+
+/// A [`TableProvider`] that executes an Elasticsearch full-text search query.
+///
+/// Returns primary key fields and a `_score` column with BM25 relevance scores.
+#[derive(Debug)]
+pub struct ElasticsearchTextSearchTable {
+    pub client: Arc<dyn Elasticsearch>,
+    pub index: String,
+    pub search_fields: Vec<String>,
+    pub query_text: String,
+    pub limit: usize,
+    /// Schema of the result (primary keys + `_score`).
+    pub schema: SchemaRef,
+    /// Schema of the full source document.
+    pub source_schema: SchemaRef,
+}
+
+#[async_trait]
+impl TableProvider for ElasticsearchTextSearchTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let projected_schema = project_schema(&self.schema, projection)?;
+        Ok(Arc::new(ElasticsearchTextSearchExec {
+            client: Arc::clone(&self.client),
+            index: self.index.clone(),
+            search_fields: self.search_fields.clone(),
+            query_text: self.query_text.clone(),
+            limit: self.limit,
+            schema: Arc::clone(&self.schema),
+            source_schema: Arc::clone(&self.source_schema),
+            projected_schema,
+            projection: projection.cloned(),
+            properties: PlanProperties::new(
+                EquivalenceProperties::new(project_schema(&self.schema, projection)?),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            ),
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct ElasticsearchTextSearchExec {
+    client: Arc<dyn Elasticsearch>,
+    index: String,
+    search_fields: Vec<String>,
+    query_text: String,
+    limit: usize,
+    schema: SchemaRef,
+    source_schema: SchemaRef,
+    projected_schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    properties: PlanProperties,
+}
+
+impl DisplayAs for ElasticsearchTextSearchExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "ElasticsearchTextSearchExec: index={}, fields={:?}, limit={}",
+            self.index, self.search_fields, self.limit
+        )
+    }
+}
+
+impl ExecutionPlan for ElasticsearchTextSearchExec {
+    fn name(&self) -> &'static str {
+        "ElasticsearchTextSearchExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> datafusion::error::Result<SendableRecordBatchStream> {
+        let client = Arc::clone(&self.client);
+        let index = self.index.clone();
+        let search_fields = self.search_fields.clone();
+        let query_text = self.query_text.clone();
+        let limit = self.limit;
+        let schema = Arc::clone(&self.schema);
+        let source_schema = Arc::clone(&self.source_schema);
+        let projected_schema = Arc::clone(&self.projected_schema);
+        let projection = self.projection.clone();
+
+        let stream = futures::stream::once(async move {
+            let query = if search_fields.len() == 1 {
+                elasticsearch::match_query(&search_fields[0], &query_text)
+            } else {
+                let fields: Vec<&str> = search_fields.iter().map(String::as_str).collect();
+                elasticsearch::multi_match_query(&fields, &query_text)
+            };
+
+            let req = SearchRequest {
+                query: Some(query),
+                size: Some(limit),
+                ..Default::default()
+            };
+
+            let response = client
+                .search(&index, &req)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            let batch = knn_hits_to_batch(&response.hits.hits, &schema, &source_schema)?;
+
+            if let Some(proj) = &projection {
+                Ok(batch.project(proj)?)
+            } else {
+                Ok(batch)
+            }
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            projected_schema,
+            stream,
+        )))
+    }
+}
+
+/// Build a search result schema from primary key fields plus a `_score` column.
+#[must_use]
+pub fn search_result_schema(primary_fields: &[Field], extra_fields: &[Field]) -> SchemaRef {
+    let mut fields: Vec<Field> = primary_fields.to_vec();
+    fields.extend_from_slice(extra_fields);
+    fields.push(Field::new(ES_SCORE_COLUMN_NAME, DataType::Float64, true));
+    Arc::new(Schema::new(fields))
+}
