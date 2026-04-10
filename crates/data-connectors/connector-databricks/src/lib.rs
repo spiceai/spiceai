@@ -646,19 +646,19 @@ impl Databricks {
         match uc_client.get_effective_permissions(&full_name).await {
             Ok(Some(perms)) => {
                 if !perms.has_read_permission() {
-                    return Err(DataConnectorError::InsufficientPermissions {
-                        dataconnector: "databricks".to_string(),
-                        connector_component: ConnectorComponent::from(dataset),
-                        source: Box::new(Error::InsufficientPermissions {
-                            table_name: full_name,
-                        }),
-                    });
+                    tracing::warn!(
+                        table = %full_name,
+                        principals = ?perms.principals(),
+                        privileges = ?perms.all_privileges(),
+                        "Unity Catalog effective-permissions did not include a read-compatible privilege; proceeding anyway (access may still work via workspace admin or inherited grants)"
+                    );
+                } else {
+                    tracing::debug!(
+                        table = %full_name,
+                        principals = ?perms.principals(),
+                        "Unity Catalog permission check passed"
+                    );
                 }
-                tracing::debug!(
-                    table = %full_name,
-                    principals = ?perms.principals(),
-                    "Unity Catalog permission check passed"
-                );
             }
             Ok(None) => {
                 tracing::debug!(
