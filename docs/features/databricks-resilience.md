@@ -39,7 +39,7 @@ catalogs:
 
 When multiple datasets target the same SQL Warehouse (same `endpoint` + `sql_warehouse_id`), the connector factory automatically shares a single concurrency semaphore across all of them. This ensures the `max_concurrent_requests` limit is enforced **globally** rather than per-dataset, preventing overloading the warehouse when many datasets are configured.
 
-This applies to both the data connector and catalog connector paths.
+This applies to the **data connector path** (individual datasets in the spicepod). The **catalog connector path** creates its own semaphore per catalog — all tables discovered within a single catalog share that semaphore, but it is not shared with datasets from the data connector factory or other catalogs.
 
 ### Permanent-Disable Fuse
 
@@ -111,7 +111,7 @@ All spans include a `warehouse_id` field (SQL Warehouse spans) or the table/cata
 
 ### Component-Level Metrics
 
-The SQL Warehouse connector exposes per-dataset operational metrics via the `MetricsProvider` interface. These metrics must be **explicitly enabled** in the dataset's `metrics` section in the spicepod to be registered.
+The SQL Warehouse connector exposes per-dataset operational metrics via the `MetricsProvider` interface. Most metrics must be **explicitly enabled** in the dataset's `metrics` section in the spicepod to be registered. The `inflight_operations` metric is **auto-registered** and always appears in `/v1/metrics` without opt-in.
 
 #### Available Metrics
 
@@ -120,7 +120,7 @@ The SQL Warehouse connector exposes per-dataset operational metrics via the `Met
 | `requests_total`              | Counter | Requests        | Total HTTP requests issued to the SQL Warehouse API (excl. retries) |
 | `retries_total`               | Counter | Requests        | Total HTTP retries performed for transient failures                 |
 | `permanent_errors_total`      | Counter | Requests        | Total non-retryable errors (401, 403, 404) detected                 |
-| `inflight_operations`         | Gauge   | Requests        | Current number of in-flight SQL Warehouse operations                |
+| `inflight_operations`         | Gauge   | Requests        | Current number of HTTP requests holding a concurrency permit. Bounded by `max_concurrent_requests`. **Auto-registered.** |
 | `statements_executed_total`   | Counter | Statements      | Total SQL statements submitted for execution                        |
 | `statement_polls_total`       | Counter | Statements      | Total polls made when waiting for async statement completion        |
 | `statements_failed_total`     | Counter | Statements      | Total SQL statements that completed with FAILED status              |
@@ -132,7 +132,7 @@ The SQL Warehouse connector exposes per-dataset operational metrics via the `Met
 
 #### Enabling Metrics
 
-Add a `metrics` list to the dataset definition in your spicepod. Each entry names a metric from the table above.
+Add a `metrics` list to the dataset definition in your spicepod. Each entry names a metric from the table above. Auto-registered metrics (like `inflight_operations`) do not need to be listed.
 
 ```yaml
 datasets:
@@ -148,9 +148,7 @@ datasets:
       - name: requests_total
       - name: retries_total
       - name: permanent_errors_total
-      - name: inflight_operations
       - name: statements_executed_total
-
       - name: statement_polls_total
       - name: statements_failed_total
       - name: pool_connections_total
@@ -165,7 +163,6 @@ Individual metrics can be disabled by setting `enabled: false`:
 ```yaml
     metrics:
       - name: requests_total
-      - name: inflight_operations
       - name: pool_active_connections
       - name: semaphore_available_permits
       - name: statement_polls_total
@@ -191,10 +188,6 @@ Registered component metrics are available through:
 - **Prometheus endpoint** — Scraped from the `/metrics` HTTP endpoint when the metrics server is enabled.
 - **`runtime.metrics` SQL table** — Queryable via SQL: `SELECT * FROM runtime.metrics WHERE name LIKE 'dataset_databricks_%'`.
 - **OTLP push exporter** — Pushed to any configured OpenTelemetry collector.
-
-### Global Inflight Requests Metric
-
-Additionally, the shared `resilient_http` module emits a global `connector_inflight_requests` OpenTelemetry UpDownCounter with `service` and `operation` dimensions for cross-connector observability. This metric is always active (no opt-in required) and tracks in-flight HTTP requests across all connectors that use the shared retry/concurrency infrastructure.
 
 ## Architecture Notes
 
