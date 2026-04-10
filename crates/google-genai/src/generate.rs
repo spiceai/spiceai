@@ -233,8 +233,12 @@ fn parse_sse_stream_response(
 
                     for line in event.lines() {
                         if let Some(data) = line.strip_prefix("data: ") {
-                            if data.trim().is_empty() || data == "[DONE]" {
+                            if data == "[DONE]" {
                                 return None;
+                            }
+
+                            if data.trim().is_empty() {
+                                continue;
                             }
 
                             let result = serde_json::from_str(data).context(JsonSnafu);
