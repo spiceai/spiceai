@@ -436,33 +436,3 @@ pub fn record_snapshot_skipped(dimensions: &[KeyValue]) {
         })
         .add(1, dimensions);
 }
-
-static CONNECTOR_INFLIGHT_REQUESTS: OnceLock<UpDownCounter<i64>> = OnceLock::new();
-
-pub fn inc_connector_inflight_requests(dimensions: &[KeyValue]) {
-    let Some(m) = meter::METER.get() else { return };
-    CONNECTOR_INFLIGHT_REQUESTS
-        .get_or_init(|| {
-            m.i64_up_down_counter("connector_inflight_requests")
-                .with_description(
-                    "Number of concurrent in-flight HTTP requests to an upstream data connector.",
-                )
-                .with_unit("requests")
-                .build()
-        })
-        .add(1, dimensions);
-}
-
-pub fn dec_connector_inflight_requests(dimensions: &[KeyValue]) {
-    let Some(m) = meter::METER.get() else { return };
-    CONNECTOR_INFLIGHT_REQUESTS
-        .get_or_init(|| {
-            m.i64_up_down_counter("connector_inflight_requests")
-                .with_description(
-                    "Number of concurrent in-flight HTTP requests to an upstream data connector.",
-                )
-                .with_unit("requests")
-                .build()
-        })
-        .add(-1, dimensions);
-}

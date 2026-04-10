@@ -23,7 +23,6 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::Semaphore;
 use util::retry_strategy::{Backoff, BackoffMethod, RetryBackoffBuilder};
 
-use telemetry::KeyValue;
 
 const DEFAULT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -139,10 +138,6 @@ where
         .build();
 
     let mut retries = 0usize;
-    let dimensions = [
-        KeyValue::new("service", service_name.to_string()),
-        KeyValue::new("operation", operation_name.to_string()),
-    ];
 
     let inc_inflight = || {
         if let Some(c) = inflight_counter {
@@ -158,7 +153,6 @@ where
     loop {
         let permit =
             acquire_concurrency_permit(concurrency_limit, service_name, operation_name).await;
-        telemetry::inc_connector_inflight_requests(&dimensions);
         inc_inflight();
         match add_supported_accept_encoding_header(build_request())
             .send()
@@ -177,7 +171,6 @@ where
                             "HTTP retries exhausted after retryable response"
                         );
                         dec_inflight();
-                        telemetry::dec_connector_inflight_requests(&dimensions);
                         return Ok(response);
                     }
 
@@ -204,20 +197,17 @@ where
                     drain_response_body(response, service_name, operation_name, retries, status)
                         .await;
                     dec_inflight();
-                    telemetry::dec_connector_inflight_requests(&dimensions);
                     drop(permit);
                     tokio::time::sleep(delay).await;
                     continue;
                 }
 
                 dec_inflight();
-                telemetry::dec_connector_inflight_requests(&dimensions);
                 return Ok(response);
             }
             Err(error) => {
                 let Some(reason) = retry_reason_from_error(&error) else {
                     dec_inflight();
-                    telemetry::dec_connector_inflight_requests(&dimensions);
                     return Err(error);
                 };
 
@@ -231,7 +221,6 @@ where
                         "HTTP retries exhausted after transient request failure"
                     );
                     dec_inflight();
-                    telemetry::dec_connector_inflight_requests(&dimensions);
                     return Err(error);
                 }
 
@@ -252,7 +241,6 @@ where
                 );
 
                 dec_inflight();
-                telemetry::dec_connector_inflight_requests(&dimensions);
                 drop(permit);
                 tokio::time::sleep(delay).await;
             }
