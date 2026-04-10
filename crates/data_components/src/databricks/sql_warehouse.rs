@@ -2451,7 +2451,7 @@ mod tests {
 
     #[test]
     fn test_with_config_rejects_zero_max_concurrent_requests() {
-        let err = DatabricksSqlWarehouse::with_config(
+        let result = DatabricksSqlWarehouse::with_config(
             "host.example.com",
             "warehouse-123",
             Arc::new(StaticTokenProvider("test-token".to_string())),
@@ -2459,13 +2459,13 @@ mod tests {
                 max_concurrent_requests: 0,
                 ..SqlWarehouseConfig::default()
             },
-        )
-        .expect_err("zero max_concurrent_requests should be rejected");
-
-        assert!(
-            matches!(err, Error::InvalidConcurrencyLimit { limit: 0 }),
-            "unexpected error: {err}"
         );
+
+        match result {
+            Err(Error::InvalidConcurrencyLimit { limit: 0 }) => {}
+            Err(err) => panic!("unexpected error: {err}"),
+            Ok(_) => panic!("zero max_concurrent_requests should be rejected"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

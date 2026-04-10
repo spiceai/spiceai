@@ -27,7 +27,7 @@ const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_HTTP_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 const DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 16;
-const DEFAULT_HTTP_RETRIES: usize = 10;
+const DEFAULT_HTTP_RETRIES: usize = 3;
 const MAX_HTTP_BACKOFF: Duration = Duration::from_secs(300);
 const RETRY_AFTER_MS_HEADER: &str = "retry-after-ms";
 const X_RETRY_AFTER_MS_HEADER: &str = "x-retry-after-ms";
@@ -90,6 +90,7 @@ where
         .build();
 
     let mut retries = 0usize;
+
     let inc_inflight = || {
         if let Some(c) = config.inflight_counter {
             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -124,7 +125,6 @@ where
                             "HTTP retries exhausted after retryable response"
                         );
                         dec_inflight();
-    
                         return Ok(response);
                     }
 
@@ -151,7 +151,6 @@ where
                     drain_response_body(response, service_name, operation_name, retries, status)
                         .await;
                     dec_inflight();
-
                     drop(permit);
                     tokio::time::sleep(delay).await;
                     continue;
@@ -163,7 +162,6 @@ where
             Err(error) => {
                 let Some(reason) = retry_reason_from_error(&error) else {
                     dec_inflight();
-
                     return Err(error);
                 };
 
@@ -177,7 +175,6 @@ where
                         "HTTP retries exhausted after transient request failure"
                     );
                     dec_inflight();
-
                     return Err(error);
                 }
 

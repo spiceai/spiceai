@@ -99,8 +99,6 @@ pub fn dec_query_active_count(dimensions: &[KeyValue]) {
         .add(-1, dimensions);
 }
 
-
-
 static BYTES_PROCESSED: OnceLock<Counter<u64>> = OnceLock::new();
 
 pub fn track_bytes_processed(bytes: u64, dimensions: &[KeyValue]) {

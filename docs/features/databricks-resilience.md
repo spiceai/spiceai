@@ -181,14 +181,11 @@ For example, `requests_total` becomes `dataset_databricks_requests_total`.
 
 Each instrument carries a `name` attribute set to the dataset instance name (e.g., `my_table`), so metrics from multiple datasets sharing the same SQL Warehouse can be distinguished.
 
-#### Dataset Metrics vs Connection Metrics
+#### Shared Warehouse Attribution
 
-Databricks SQL Warehouse observability has two scopes:
+Databricks SQL Warehouse metrics are emitted per dataset. When multiple datasets share the same SQL Warehouse, compare the `dataset_databricks_*` metrics by their `name` attribute to understand which dataset is generating load.
 
-- **Dataset metrics** — `dataset_databricks_*` metrics registered from a dataset's `metrics` block. These answer questions like "what is this dataset doing?"
-- **Connection metrics** — telemetry keyed by the shared SQL Warehouse connection identity, currently `(endpoint, sql_warehouse_id)`. These answer questions like "what is this shared warehouse connection doing across all datasets and catalog refreshes that use it?"
-
-This distinction matters when multiple datasets share the same warehouse. Per-dataset metrics are useful for attribution, but they are not the authoritative view of shared warehouse load.
+Shared concurrency is still enforced at the warehouse level via the shared semaphore. The `semaphore_available_permits` metric is backed by that shared semaphore, so datasets pointed at the same warehouse observe the same underlying concurrency budget even though the metric is registered per dataset.
 
 #### Accessing Metrics
 
@@ -197,12 +194,6 @@ Registered component metrics are available through:
 - **Prometheus endpoint** — Scraped from the `/metrics` HTTP endpoint when the metrics server is enabled.
 - **`runtime.metrics` SQL table** — Queryable via SQL: `SELECT * FROM runtime.metrics WHERE name LIKE 'dataset_databricks_%'`.
 - **OTLP push exporter** — Pushed to any configured OpenTelemetry collector.
-
-### Connection-Level Metrics
-
-The shared `resilient_http` module emits a global `connector_inflight_requests` OpenTelemetry UpDownCounter for cross-connector observability. For Databricks SQL Warehouse requests, it includes `service`, `operation`, `endpoint`, and `warehouse_id` dimensions, so requests from datasets and catalog refreshes that share the same warehouse surface under the same connection identity.
-
-This metric is always active (no opt-in required) and tracks active HTTP attempts across connectors that use the shared retry/concurrency infrastructure.
 
 ## Architecture Notes
 
