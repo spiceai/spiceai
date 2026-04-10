@@ -67,9 +67,12 @@ const SQL_WAREHOUSE_MAX_IN_FLIGHT_REQUESTS: usize = 8;
 const SQL_WAREHOUSE_DEFAULT_HTTP_MAX_RETRIES: usize = 3;
 const SQL_WAREHOUSE_DEFAULT_STATEMENT_MAX_RETRIES: usize = 14;
 
-static SHARED_SQL_WAREHOUSE_SEMAPHORES: LazyLock<
-    Mutex<HashMap<(String, String), (Arc<Semaphore>, usize)>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
+type SharedSqlWarehouseKey = (String, String);
+type SharedSqlWarehouseEntry = (Arc<Semaphore>, usize);
+type SharedSqlWarehouseRegistry = Mutex<HashMap<SharedSqlWarehouseKey, SharedSqlWarehouseEntry>>;
+
+static SHARED_SQL_WAREHOUSE_SEMAPHORES: LazyLock<SharedSqlWarehouseRegistry> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Configuration for Databricks SQL Warehouse connection behavior.
 ///
@@ -367,7 +370,7 @@ pub fn shared_request_semaphore(
 
     let mut registry = SHARED_SQL_WAREHOUSE_SEMAPHORES
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let key = (endpoint.to_string(), sql_warehouse_id.to_string());
 
     match registry.entry(key) {
