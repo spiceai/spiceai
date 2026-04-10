@@ -30,7 +30,6 @@ datafusion.workspace = true
 futures.workspace = true
 linkme.workspace = true
 opentelemetry.workspace = true
-parking_lot.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime", features = ["databricks"] }
 runtime-secrets = { path = "../../runtime-secrets", default-features = false }
@@ -39,7 +38,6 @@ snafu.workspace = true
 token_provider = { path = "../../token_provider" }
 tokio.workspace = true
 tracing.workspace = true
-util = { path = "../../util" }
 
 [features]
 default = []

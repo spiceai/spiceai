@@ -4024,7 +4024,6 @@ dependencies = [
  "futures",
  "linkme",
  "opentelemetry",
- "parking_lot 0.12.5",
  "paste",
  "runtime",
  "runtime-secrets",
@@ -4033,7 +4032,6 @@ dependencies = [
  "token_provider",
  "tokio",
  "tracing",
- "util",
 ]
 
 [[package]]

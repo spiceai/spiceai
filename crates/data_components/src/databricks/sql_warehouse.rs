@@ -324,13 +324,11 @@ impl DatabricksSqlWarehouse {
             }
         );
 
-        let permanently_disabled = Arc::new(AtomicBool::new(false));
         let request_semaphore = shared_semaphore
             .unwrap_or_else(|| Arc::new(Semaphore::new(config.max_concurrent_requests)));
 
         let metrics = Arc::new(DatabricksMetrics {
             semaphore: Some(Arc::clone(&request_semaphore)),
-            permanently_disabled: Arc::clone(&permanently_disabled),
             ..DatabricksMetrics::default()
         });
         let api = Arc::new(SqlWarehouseApi::new(
@@ -339,7 +337,6 @@ impl DatabricksSqlWarehouse {
             token_provider,
             &config,
             Arc::clone(&metrics),
-            permanently_disabled,
             request_semaphore,
         )?);
         let pool = Arc::new(SqlWarehouseConnectionPool {
@@ -476,7 +473,6 @@ struct SqlWarehouseApi {
     backoff_method: BackoffMethod,
     statement_max_retries: usize,
     disable_on_permanent_error: bool,
-    permanently_disabled: Arc<AtomicBool>,
     sql_warehouse_id: String,
     token_provider: Arc<dyn TokenProvider>,
     metrics: Arc<DatabricksMetrics>,
@@ -489,7 +485,6 @@ impl SqlWarehouseApi {
         token_provider: Arc<dyn TokenProvider>,
         config: &SqlWarehouseConfig,
         metrics: Arc<DatabricksMetrics>,
-        permanently_disabled: Arc<AtomicBool>,
         request_semaphore: Arc<Semaphore>,
     ) -> Result<Self, Error> {
         let client = configure_client_builder(ClientBuilder::new())
@@ -505,7 +500,6 @@ impl SqlWarehouseApi {
             backoff_method: config.backoff_method,
             statement_max_retries: config.statement_max_retries,
             disable_on_permanent_error: config.disable_on_permanent_error,
-            permanently_disabled,
             sql_warehouse_id: sql_warehouse_id.to_string(),
             token_provider,
             metrics,
@@ -1011,7 +1005,7 @@ impl SqlWarehouseApi {
 
     /// Returns `Err(PermanentlyDisabled)` if the connector has been marked disabled.
     fn check_permanently_disabled(&self) -> Result<(), Error> {
-        if self.permanently_disabled.load(Ordering::Relaxed) {
+        if self.metrics.permanently_disabled.load(Ordering::Relaxed) {
             return Err(Error::PermanentlyDisabled);
         }
         Ok(())
@@ -1030,7 +1024,9 @@ impl SqlWarehouseApi {
                 warehouse_id = %self.sql_warehouse_id,
                 "Databricks SQL Warehouse returned a non-retryable HTTP status; disabling connector to prevent further requests"
             );
-            self.permanently_disabled.store(true, Ordering::Relaxed);
+            self.metrics
+                .permanently_disabled
+                .store(true, Ordering::Relaxed);
             self.metrics
                 .permanent_errors_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -1746,7 +1742,6 @@ mod tests {
             Arc::new(StaticTokenProvider("token".to_string())),
             &SqlWarehouseConfig::default(),
             Arc::new(DatabricksMetrics::default()),
-            Arc::new(AtomicBool::new(false)),
             Arc::new(Semaphore::new(8)),
         )
         .expect("should create api");
@@ -1778,7 +1773,6 @@ mod tests {
             Arc::new(StaticTokenProvider("t".to_string())),
             &SqlWarehouseConfig::default(),
             Arc::new(DatabricksMetrics::default()),
-            Arc::new(AtomicBool::new(false)),
             Arc::new(Semaphore::new(8)),
         )
         .expect("should create api");
@@ -1801,7 +1795,6 @@ mod tests {
             Arc::new(StaticTokenProvider("t".to_string())),
             &SqlWarehouseConfig::default(),
             Arc::new(DatabricksMetrics::default()),
-            Arc::new(AtomicBool::new(false)),
             Arc::new(Semaphore::new(8)),
         )
         .expect("should create api");
@@ -1824,7 +1817,6 @@ mod tests {
             Arc::new(StaticTokenProvider("t".to_string())),
             &SqlWarehouseConfig::default(),
             Arc::new(DatabricksMetrics::default()),
-            Arc::new(AtomicBool::new(false)),
             Arc::new(Semaphore::new(8)),
         )
         .expect("should create api");
@@ -1998,7 +1990,6 @@ mod tests {
             backoff_method: BackoffMethod::Fibonacci,
             statement_max_retries: SQL_WAREHOUSE_DEFAULT_STATEMENT_MAX_RETRIES,
             disable_on_permanent_error: true,
-            permanently_disabled: Arc::new(AtomicBool::new(false)),
             sql_warehouse_id: "test-warehouse".to_string(),
             token_provider: Arc::new(StaticTokenProvider("test-token".to_string())),
             metrics: Arc::new(DatabricksMetrics::default()),
@@ -2289,7 +2280,6 @@ mod tests {
             Arc::new(StaticTokenProvider("t".to_string())),
             &SqlWarehouseConfig::default(),
             Arc::new(DatabricksMetrics::default()),
-            Arc::new(AtomicBool::new(false)),
             Arc::new(Semaphore::new(8)),
         )
         .expect("should create api");
@@ -2498,7 +2488,7 @@ mod tests {
                 "unexpected error: {err}"
             );
             assert!(
-                api.permanently_disabled.load(Ordering::Relaxed),
+                api.metrics.permanently_disabled.load(Ordering::Relaxed),
                 "connector should be disabled after {status_line}"
             );
             assert_eq!(
@@ -2565,7 +2555,7 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(
-            !api.permanently_disabled.load(Ordering::Relaxed),
+            !api.metrics.permanently_disabled.load(Ordering::Relaxed),
             "connector should remain enabled when disable_on_permanent_error is false"
         );
         assert_eq!(
@@ -3628,7 +3618,6 @@ mod tests {
             backoff_method: BackoffMethod::Fibonacci,
             statement_max_retries: SQL_WAREHOUSE_DEFAULT_STATEMENT_MAX_RETRIES,
             disable_on_permanent_error: true,
-            permanently_disabled: Arc::new(AtomicBool::new(false)),
             sql_warehouse_id: "warehouse-a".to_string(),
             token_provider: Arc::new(StaticTokenProvider("token-a".to_string())),
             metrics: Arc::new(DatabricksMetrics::default()),
@@ -3641,7 +3630,6 @@ mod tests {
             backoff_method: BackoffMethod::Fibonacci,
             statement_max_retries: SQL_WAREHOUSE_DEFAULT_STATEMENT_MAX_RETRIES,
             disable_on_permanent_error: true,
-            permanently_disabled: Arc::new(AtomicBool::new(false)),
             sql_warehouse_id: "warehouse-b".to_string(),
             token_provider: Arc::new(StaticTokenProvider("token-b".to_string())),
             metrics: Arc::new(DatabricksMetrics::default()),
