@@ -37,12 +37,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use snafu::{Snafu, prelude::*};
 use std::{
+    collections::{HashMap, hash_map::Entry},
     error::Error as StdError,
     fmt::{Display, Formatter},
     io::Cursor,
     pin::Pin,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 use token_provider::TokenProvider;
 use tokio::sync::Semaphore;
@@ -52,12 +56,111 @@ use util::{
 };
 
 use crate::resilient_http::{
-    configure_client_builder, send_request_with_retry_and_concurrency_limit,
+    RetryConfig, configure_client_builder, send_request_with_retry_and_concurrency_limit,
 };
+use tracing::Instrument;
+use util::retry_strategy::BackoffMethod;
 
 mod datatypes;
 
 const SQL_WAREHOUSE_MAX_IN_FLIGHT_REQUESTS: usize = 8;
+const SQL_WAREHOUSE_DEFAULT_HTTP_MAX_RETRIES: usize = 3;
+const SQL_WAREHOUSE_DEFAULT_STATEMENT_MAX_RETRIES: usize = 14;
+
+type SharedSqlWarehouseKey = (String, String);
+type SharedSqlWarehouseEntry = (Arc<Semaphore>, usize);
+type SharedSqlWarehouseRegistry = Mutex<HashMap<SharedSqlWarehouseKey, SharedSqlWarehouseEntry>>;
+type SharedSqlWarehouseMetricsRegistry =
+    Mutex<HashMap<SharedSqlWarehouseKey, Arc<DatabricksMetrics>>>;
+
+static SHARED_SQL_WAREHOUSE_SEMAPHORES: LazyLock<SharedSqlWarehouseRegistry> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static SHARED_SQL_WAREHOUSE_METRICS: LazyLock<SharedSqlWarehouseMetricsRegistry> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Configuration for Databricks SQL Warehouse connection behavior.
+///
+/// Controls concurrency, retry limits, and permanent error handling to
+/// prevent thundering herd issues.
+#[derive(Debug, Clone, Copy)]
+pub struct SqlWarehouseConfig {
+    /// Maximum number of concurrent HTTP requests to the SQL Warehouse API.
+    pub max_concurrent_requests: usize,
+
+    /// Maximum number of HTTP-level retries for transient failures (e.g. 429, 5xx).
+    pub http_max_retries: usize,
+
+    /// Backoff strategy for transient HTTP retries (fibonacci or exponential).
+    pub backoff_method: BackoffMethod,
+
+    /// Maximum number of poll retries when waiting for async statement completion.
+    pub statement_max_retries: usize,
+
+    /// When true, non-retryable errors (401, 403, 404) permanently disable
+    /// the connector so subsequent queries fail immediately without issuing
+    /// further HTTP requests.
+    pub disable_on_permanent_error: bool,
+}
+
+impl Default for SqlWarehouseConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: SQL_WAREHOUSE_MAX_IN_FLIGHT_REQUESTS,
+            http_max_retries: SQL_WAREHOUSE_DEFAULT_HTTP_MAX_RETRIES,
+            backoff_method: BackoffMethod::Fibonacci,
+            statement_max_retries: SQL_WAREHOUSE_DEFAULT_STATEMENT_MAX_RETRIES,
+            disable_on_permanent_error: true,
+        }
+    }
+}
+
+/// Shared observable metrics for the Databricks SQL Warehouse connector.
+///
+/// All fields are atomics so they can be read by an external
+/// [`MetricsProvider`] without holding any lock.
+#[derive(Debug, Default)]
+pub struct DatabricksMetrics {
+    // -- Request metrics --
+    /// Total logical operations initiated (each `execute_sql_statement`,
+    /// `get_sql_statement_status`, or `fetch_chunk_data` call counts as one).
+    /// Retries within an operation are tracked separately by `retries_total`.
+    pub requests_total: AtomicU64,
+    /// Total HTTP retries performed across all operations.
+    pub retries_total: AtomicU64,
+    /// Total non-retryable (permanent) errors detected.
+    pub permanent_errors_total: AtomicU64,
+    /// Current number of HTTP requests holding a concurrency permit (gauge).
+    /// Bounded by `max_concurrent_requests`.
+    pub inflight_operations: AtomicU64,
+
+    // -- Statement metrics --
+    /// Total SQL statements that entered execution.
+    pub statements_executed_total: AtomicU64,
+    /// Total polls made when waiting for async statement completion.
+    pub statement_polls_total: AtomicU64,
+    /// Total SQL statements that completed with FAILED status.
+    pub statements_failed_total: AtomicU64,
+
+    // -- Connection pool metrics --
+    /// Total virtual pool `connect()` calls (each returns a lightweight handle).
+    pub pool_connections_total: AtomicU64,
+    /// Current number of active connections (handles not yet dropped).
+    pub pool_active_connections: AtomicU64,
+
+    // -- Concurrency metrics --
+    /// Reference to the concurrency semaphore for observing available permits.
+    /// Set once during construction; if `None`, concurrency metrics are unavailable.
+    pub semaphore: Option<Arc<Semaphore>>,
+
+    // -- Data transfer metrics --
+    /// Total Arrow result chunks fetched from external links.
+    pub chunks_fetched_total: AtomicU64,
+
+    // -- Connector state --
+    /// Whether the connector has been permanently disabled (1 = disabled, 0 = active).
+    pub permanently_disabled: Arc<AtomicBool>,
+}
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -101,6 +204,26 @@ pub enum Error {
 
     #[snafu(display("Long-running operations are not supported (state: 'RUNNING')."))]
     QueryStillRunning,
+
+    #[snafu(display(
+        "Connector is permanently disabled due to a previous non-retryable error. Verify credentials and warehouse configuration, then restart."
+    ))]
+    PermanentlyDisabled,
+
+    #[snafu(display(
+        "Invalid Databricks SQL Warehouse configuration: max_concurrent_requests must be >= 1, got {limit}"
+    ))]
+    InvalidConcurrencyLimit { limit: usize },
+
+    #[snafu(display(
+        "Conflicting Databricks SQL Warehouse concurrency limits for endpoint '{endpoint}' and warehouse '{warehouse_id}': requested {requested}, existing {existing}. Use the same max_concurrent_requests value for all datasets and catalogs that share this warehouse."
+    ))]
+    ConflictingConcurrencyLimit {
+        endpoint: String,
+        warehouse_id: String,
+        requested: usize,
+        existing: usize,
+    },
 
     #[snafu(display("HTTP request failed: {}", format_reqwest_error_chain(source)))]
     HttpRequestFailed { source: reqwest::Error },
@@ -161,27 +284,138 @@ fn format_reqwest_error_chain(error: &reqwest::Error) -> String {
 /// Main struct for interacting with Databricks SQL Warehouse
 pub struct DatabricksSqlWarehouse {
     pool: Arc<dyn DbConnectionPool<Arc<SqlWarehouseApi>, &'static dyn Sync> + Send + Sync>,
+    metrics: Arc<DatabricksMetrics>,
 }
 
 impl DatabricksSqlWarehouse {
-    /// Creates a new Databricks SQL Warehouse instance
+    /// Creates a new Databricks SQL Warehouse instance with default configuration.
     pub fn new(
         endpoint: &str,
         sql_warehouse_id: &str,
         token_provider: Arc<dyn TokenProvider>,
     ) -> Result<Self, Error> {
+        Self::with_config(
+            endpoint,
+            sql_warehouse_id,
+            token_provider,
+            SqlWarehouseConfig::default(),
+        )
+    }
+
+    /// Creates a new Databricks SQL Warehouse instance with explicit configuration.
+    pub fn with_config(
+        endpoint: &str,
+        sql_warehouse_id: &str,
+        token_provider: Arc<dyn TokenProvider>,
+        config: SqlWarehouseConfig,
+    ) -> Result<Self, Error> {
+        Self::with_config_and_semaphore(endpoint, sql_warehouse_id, token_provider, config, None)
+    }
+
+    /// Creates a new Databricks SQL Warehouse instance with explicit configuration
+    /// and a shared concurrency semaphore.
+    ///
+    /// When `shared_semaphore` is `Some`, the instance uses the provided semaphore
+    /// for concurrency limiting instead of creating its own. This ensures a global
+    /// concurrency limit across all datasets that share the same semaphore.
+    pub fn with_config_and_semaphore(
+        endpoint: &str,
+        sql_warehouse_id: &str,
+        token_provider: Arc<dyn TokenProvider>,
+        config: SqlWarehouseConfig,
+        shared_semaphore: Option<Arc<Semaphore>>,
+    ) -> Result<Self, Error> {
+        ensure!(
+            config.max_concurrent_requests > 0,
+            InvalidConcurrencyLimitSnafu {
+                limit: config.max_concurrent_requests,
+            }
+        );
+
+        let (request_semaphore, metrics) = if let Some(sem) = shared_semaphore {
+            let key = (endpoint.to_string(), sql_warehouse_id.to_string());
+            let mut registry = SHARED_SQL_WAREHOUSE_METRICS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let metrics = Arc::clone(registry.entry(key).or_insert_with(|| {
+                Arc::new(DatabricksMetrics {
+                    semaphore: Some(Arc::clone(&sem)),
+                    ..DatabricksMetrics::default()
+                })
+            }));
+            (sem, metrics)
+        } else {
+            let sem = Arc::new(Semaphore::new(config.max_concurrent_requests));
+            let metrics = Arc::new(DatabricksMetrics {
+                semaphore: Some(Arc::clone(&sem)),
+                ..DatabricksMetrics::default()
+            });
+            (sem, metrics)
+        };
         let api = Arc::new(SqlWarehouseApi::new(
             endpoint,
             sql_warehouse_id,
             token_provider,
+            &config,
+            Arc::clone(&metrics),
+            request_semaphore,
         )?);
-        let pool = Arc::new(SqlWarehouseConnectionPool { api });
-        Ok(Self { pool })
+        let pool = Arc::new(SqlWarehouseConnectionPool {
+            api,
+            metrics: Arc::clone(&metrics),
+        });
+        Ok(Self { pool, metrics })
+    }
+
+    /// Returns the shared metrics for this SQL Warehouse instance.
+    #[must_use]
+    pub fn metrics(&self) -> &Arc<DatabricksMetrics> {
+        &self.metrics
+    }
+}
+
+pub fn shared_request_semaphore(
+    endpoint: &str,
+    sql_warehouse_id: &str,
+    max_concurrent_requests: usize,
+) -> Result<Arc<Semaphore>, Error> {
+    ensure!(
+        max_concurrent_requests > 0,
+        InvalidConcurrencyLimitSnafu {
+            limit: max_concurrent_requests,
+        }
+    );
+
+    let mut registry = SHARED_SQL_WAREHOUSE_SEMAPHORES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = (endpoint.to_string(), sql_warehouse_id.to_string());
+
+    match registry.entry(key) {
+        Entry::Occupied(entry) => {
+            let (semaphore, existing) = entry.get();
+            ensure!(
+                *existing == max_concurrent_requests,
+                ConflictingConcurrencyLimitSnafu {
+                    endpoint: endpoint.to_string(),
+                    warehouse_id: sql_warehouse_id.to_string(),
+                    requested: max_concurrent_requests,
+                    existing: *existing,
+                }
+            );
+            Ok(Arc::clone(semaphore))
+        }
+        Entry::Vacant(entry) => {
+            let semaphore = Arc::new(Semaphore::new(max_concurrent_requests));
+            entry.insert((Arc::clone(&semaphore), max_concurrent_requests));
+            Ok(semaphore)
+        }
     }
 }
 
 struct SqlWarehouseConnectionPool {
     api: Arc<SqlWarehouseApi>,
+    metrics: Arc<DatabricksMetrics>,
 }
 
 #[async_trait]
@@ -192,8 +426,15 @@ impl DbConnectionPool<Arc<SqlWarehouseApi>, &'static dyn Sync> for SqlWarehouseC
         Box<dyn DbConnection<Arc<SqlWarehouseApi>, &'static dyn Sync>>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
+        self.metrics
+            .pool_connections_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .pool_active_connections
+            .fetch_add(1, Ordering::Relaxed);
         Ok(Box::new(SqlWarehouseConnection {
             api: Arc::clone(&self.api),
+            metrics: Arc::clone(&self.metrics),
         }))
     }
 
@@ -249,8 +490,13 @@ struct SqlWarehouseApi {
     client: Client,
     base_url: String,
     request_semaphore: Arc<Semaphore>,
+    http_max_retries: usize,
+    backoff_method: BackoffMethod,
+    statement_max_retries: usize,
+    disable_on_permanent_error: bool,
     sql_warehouse_id: String,
     token_provider: Arc<dyn TokenProvider>,
+    metrics: Arc<DatabricksMetrics>,
 }
 
 impl SqlWarehouseApi {
@@ -258,6 +504,9 @@ impl SqlWarehouseApi {
         host: &str,
         sql_warehouse_id: &str,
         token_provider: Arc<dyn TokenProvider>,
+        config: &SqlWarehouseConfig,
+        metrics: Arc<DatabricksMetrics>,
+        request_semaphore: Arc<Semaphore>,
     ) -> Result<Self, Error> {
         let client = configure_client_builder(ClientBuilder::new())
             .user_agent(super::user_agent())
@@ -267,39 +516,64 @@ impl SqlWarehouseApi {
         Ok(Self {
             client,
             base_url: format!("https://{host}"),
-            request_semaphore: Arc::new(Semaphore::new(SQL_WAREHOUSE_MAX_IN_FLIGHT_REQUESTS)),
+            request_semaphore,
+            http_max_retries: config.http_max_retries,
+            backoff_method: config.backoff_method,
+            statement_max_retries: config.statement_max_retries,
+            disable_on_permanent_error: config.disable_on_permanent_error,
             sql_warehouse_id: sql_warehouse_id.to_string(),
             token_provider,
+            metrics,
         })
     }
 
+    fn retry_config(&self) -> RetryConfig<'_> {
+        RetryConfig {
+            concurrency_limit: Some(&self.request_semaphore),
+            max_retries: Some(self.http_max_retries),
+            backoff_method: Some(self.backoff_method),
+            retry_counter: Some(&self.metrics.retries_total),
+            inflight_counter: Some(&self.metrics.inflight_operations),
+        }
+    }
+
     async fn get_schema(&self, table: &TableReference) -> Result<SchemaRef, Error> {
-        let token = self.token_provider.get_token();
         let table_name = table.to_string();
 
-        match self.get_schema_from_information_schema(&token, table).await {
-            Ok(schema) => return Ok(schema),
-            Err(Error::TableSchemaNotRegistered { .. } | Error::NoColumnsInDataset { .. }) => {
-                tracing::warn!(
-                    table = %table,
-                    "information_schema.columns has no metadata for this table, falling back to DESCRIBE TABLE. Column nullability will default to nullable."
-                );
-            }
-            Err(Error::QueryFailure { ref message })
-                if message.contains("UNSUPPORTED_DATA_SOURCE") =>
-            {
-                tracing::warn!(
-                    table = %table,
-                    "information_schema query returned UNSUPPORTED_DATA_SOURCE, falling back to DESCRIBE TABLE. Column nullability will default to nullable."
-                );
-            }
-            Err(e) => return Err(e),
-        }
+        async {
+            let token = self.token_provider.get_token();
 
-        let payload = self.create_describe_payload(table)?;
-        let response = self.execute_sql_statement(&token, &payload).await?;
-        let response = self.wait_for_statement_completion(&token, response).await?;
-        schema_from_describe_json(&response, &table_name)
+            match self.get_schema_from_information_schema(&token, table).await {
+                Ok(schema) => return Ok(schema),
+                Err(Error::TableSchemaNotRegistered { .. } | Error::NoColumnsInDataset { .. }) => {
+                    tracing::warn!(
+                        table = %table,
+                        "information_schema.columns has no metadata for this table, falling back to DESCRIBE TABLE. Column nullability will default to nullable."
+                    );
+                }
+                Err(Error::QueryFailure { ref message })
+                    if message.contains("UNSUPPORTED_DATA_SOURCE") =>
+                {
+                    tracing::warn!(
+                        table = %table,
+                        "information_schema query returned UNSUPPORTED_DATA_SOURCE, falling back to DESCRIBE TABLE. Column nullability will default to nullable."
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+
+            let payload = self.create_describe_payload(table)?;
+            let response = self.execute_sql_statement(&token, &payload).await?;
+            let response = self.wait_for_statement_completion(&token, response).await?;
+            schema_from_describe_json(&response, &table_name)
+        }
+        .instrument(tracing::info_span!(
+            target: "task_history",
+            "databricks_get_schema",
+            input = %table_name,
+            warehouse_id = %self.sql_warehouse_id,
+        ))
+        .await
     }
 
     /// Attempts to read the schema from `information_schema.columns`,
@@ -395,20 +669,41 @@ impl SqlWarehouseApi {
     }
 
     async fn execute_sql_statement(&self, token: &str, payload: &Value) -> Result<Value, Error> {
+        self.check_permanently_disabled()?;
+        let sql_text = payload
+            .get("statement")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>");
+        self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let url = format!("{}/api/2.0/sql/statements/", self.base_url);
-        send_request_with_retry_and_concurrency_limit(
-            "Databricks SQL Warehouse",
-            "execute SQL statement",
-            || self.client.post(&url).bearer_auth(token).json(payload),
-            Some(&self.request_semaphore),
-        )
+        async {
+            let response = send_request_with_retry_and_concurrency_limit(
+                "Databricks SQL Warehouse",
+                "execute SQL statement",
+                || self.client.post(&url).bearer_auth(token).json(payload),
+                &self.retry_config(),
+            )
+            .await
+            .context(HttpRequestFailedSnafu)?;
+            let value: Value = self
+                .check_permanent_http_error(response)
+                .error_for_status()
+                .context(HttpRequestFailedSnafu)?
+                .json()
+                .await
+                .context(JsonParsingFailedSnafu)?;
+            self.metrics
+                .statements_executed_total
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(value)
+        }
+        .instrument(tracing::info_span!(
+            target: "task_history",
+            "databricks_execute_statement",
+            input = sql_text,
+            warehouse_id = %self.sql_warehouse_id,
+        ))
         .await
-        .context(HttpRequestFailedSnafu)?
-        .error_for_status()
-        .context(HttpRequestFailedSnafu)?
-        .json()
-        .await
-        .context(JsonParsingFailedSnafu)
     }
 
     async fn get_sql_statement_status(
@@ -416,20 +711,26 @@ impl SqlWarehouseApi {
         token: &str,
         statement_id: &str,
     ) -> Result<Value, Error> {
+        self.check_permanently_disabled()?;
+        self.metrics
+            .statement_polls_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let url = format!("{}/api/2.0/sql/statements/{statement_id}", self.base_url);
-        send_request_with_retry_and_concurrency_limit(
+        let response = send_request_with_retry_and_concurrency_limit(
             "Databricks SQL Warehouse",
             "poll SQL statement status",
             || self.client.get(&url).bearer_auth(token),
-            Some(&self.request_semaphore),
+            &self.retry_config(),
         )
         .await
-        .context(HttpRequestFailedSnafu)?
-        .error_for_status()
-        .context(HttpRequestFailedSnafu)?
-        .json()
-        .await
-        .context(JsonParsingFailedSnafu)
+        .context(HttpRequestFailedSnafu)?;
+        response
+            .error_for_status()
+            .context(HttpRequestFailedSnafu)?
+            .json()
+            .await
+            .context(JsonParsingFailedSnafu)
     }
 
     // Fetch the arrow data at the external links, repeating for each chunk
@@ -478,16 +779,26 @@ impl SqlWarehouseApi {
                     Some(path) => {
                         let url = format!("{}{path}", api.base_url);
 
-                        match send_request_with_retry_and_concurrency_limit(
+                        if let Err(e) = api.check_permanently_disabled() {
+                            return Some((Err(e), None));
+                        }
+                        api.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+                        let resp = match send_request_with_retry_and_concurrency_limit(
                             "Databricks SQL Warehouse",
                             "fetch next external chunk link",
                             || api.client.get(&url).bearer_auth(&token),
-                            Some(&api.request_semaphore),
+                            &api.retry_config(),
                         )
                         .await
                         .context(HttpRequestFailedSnafu)
-                        .and_then(|resp| resp.error_for_status().context(HttpRequestFailedSnafu))
                         {
+                            Ok(resp) => resp,
+                            Err(e) => {
+                                return Some((Err(e), None));
+                            }
+                        };
+
+                        match resp.error_for_status().context(HttpRequestFailedSnafu) {
                             Ok(response) => match response
                                 .json()
                                 .await
@@ -495,9 +806,13 @@ impl SqlWarehouseApi {
                                 .and_then(Self::extract_external_links)
                             {
                                 Ok(next) => next,
-                                Err(e) => return Some((Err(e), None)),
+                                Err(e) => {
+                                    return Some((Err(e), None));
+                                }
                             },
-                            Err(e) => return Some((Err(e), None)),
+                            Err(e) => {
+                                return Some((Err(e), None));
+                            }
                         }
                     }
                     None => None,
@@ -567,19 +882,30 @@ impl SqlWarehouseApi {
     }
 
     async fn fetch_chunk_data(&self, url: &str) -> Result<bytes::Bytes, Error> {
-        send_request_with_retry_and_concurrency_limit(
+        self.check_permanently_disabled()?;
+        self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+        let result = send_request_with_retry_and_concurrency_limit(
             "Databricks SQL Warehouse",
             "fetch statement result chunk",
             || self.client.get(url),
-            Some(&self.request_semaphore),
+            &self.retry_config(),
         )
         .await
         .context(HttpRequestFailedSnafu)?
+        // Skip permanent-error detection for external chunk URLs (pre-signed
+        // storage links). A 403/404 here typically means an expired link,
+        // not broken credentials/warehouse configuration.
         .error_for_status()
         .context(HttpRequestFailedSnafu)?
         .bytes()
         .await
-        .context(HttpRequestFailedSnafu)
+        .context(HttpRequestFailedSnafu);
+        if result.is_ok() {
+            self.metrics
+                .chunks_fetched_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     fn read_arrow_batches(
@@ -655,23 +981,38 @@ impl SqlWarehouseApi {
         let mut state = Self::extract_response_status(&response)?;
         let statement_id = Self::extract_statement_id(&response)?;
 
-        let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(14)).build();
-        while Self::is_async_query(state) {
-            let Some(backoff_duration) = backoff.next_backoff() else {
-                break;
-            };
-            tokio::time::sleep(backoff_duration).await;
-            response = self.get_sql_statement_status(token, &statement_id).await?;
-            state = Self::extract_response_status(&response)?;
-        }
+        let max_retries = self.statement_max_retries;
+        let mut backoff = FibonacciBackoffBuilder::new()
+            .max_retries(Some(max_retries))
+            .build();
 
-        match state {
-            ResponseStatus::Pending => Err(Error::InvalidWarehouseState {
-                state: state.to_string(),
-            }),
-            ResponseStatus::Running => Err(Error::QueryStillRunning),
-            _ => Ok(response),
+        let span = tracing::info_span!(
+            target: "task_history",
+            "databricks_poll_statement",
+            input = %statement_id,
+            warehouse_id = %self.sql_warehouse_id,
+        );
+
+        async {
+            while Self::is_async_query(state) {
+                let Some(backoff_duration) = backoff.next_backoff() else {
+                    break;
+                };
+                tokio::time::sleep(backoff_duration).await;
+                response = self.get_sql_statement_status(token, &statement_id).await?;
+                state = Self::extract_response_status(&response)?;
+            }
+
+            match state {
+                ResponseStatus::Pending => Err(Error::InvalidWarehouseState {
+                    state: state.to_string(),
+                }),
+                ResponseStatus::Running => Err(Error::QueryStillRunning),
+                _ => Ok(response),
+            }
         }
+        .instrument(span)
+        .await
     }
 
     fn extract_error_message(response: &Value) -> Option<String> {
@@ -682,6 +1023,44 @@ impl SqlWarehouseApi {
             .and_then(|m| m.as_str())
             .map(ToString::to_string)
     }
+
+    /// Returns `Err(PermanentlyDisabled)` if the connector has been marked disabled.
+    fn check_permanently_disabled(&self) -> Result<(), Error> {
+        if self.metrics.permanently_disabled.load(Ordering::Relaxed) {
+            return Err(Error::PermanentlyDisabled);
+        }
+        Ok(())
+    }
+
+    /// Inspects the HTTP response status for non-retryable errors (401, 403, 404).
+    /// If `disable_on_permanent_error` is enabled, marks the connector as permanently
+    /// disabled so that future requests fail fast without issuing HTTP calls.
+    ///
+    /// Returns the response unchanged on success so it can be chained.
+    fn check_permanent_http_error(&self, response: reqwest::Response) -> reqwest::Response {
+        let status = response.status();
+        if self.disable_on_permanent_error && is_permanent_http_status(status) {
+            tracing::error!(
+                status = %status,
+                warehouse_id = %self.sql_warehouse_id,
+                "Databricks SQL Warehouse returned a non-retryable HTTP status; disabling connector to prevent further requests"
+            );
+            self.metrics
+                .permanently_disabled
+                .store(true, Ordering::Relaxed);
+            self.metrics
+                .permanent_errors_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        response
+    }
+}
+
+/// HTTP status codes that indicate a non-retryable configuration or
+/// authentication problem.  These should not be retried because
+/// repeating the same request will produce the same failure.
+fn is_permanent_http_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 403 | 404)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -877,6 +1256,15 @@ fn schema_from_describe_json(json_value: &Value, dataset_name: &str) -> Result<S
 
 struct SqlWarehouseConnection {
     api: Arc<SqlWarehouseApi>,
+    metrics: Arc<DatabricksMetrics>,
+}
+
+impl Drop for SqlWarehouseConnection {
+    fn drop(&mut self) {
+        self.metrics
+            .pool_active_connections
+            .fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl<'a> DbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseConnection {
@@ -896,7 +1284,8 @@ impl<'a> DbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseConnec
 #[async_trait]
 impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseConnection {
     fn new(api: Arc<SqlWarehouseApi>) -> Self {
-        Self { api }
+        let metrics = Arc::clone(&api.metrics);
+        Self { api, metrics }
     }
 
     async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {
@@ -996,7 +1385,12 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
             .wait_for_statement_completion(&token, response)
             .await?;
 
-        SqlWarehouseApi::verify_response_status(&response)?;
+        if let Err(e) = SqlWarehouseApi::verify_response_status(&response) {
+            self.metrics
+                .statements_failed_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(e.into());
+        }
 
         let result_object = response.get_mut("result").map(Value::take).ok_or_else(|| {
             MissingJsonFieldSnafu {
@@ -1367,6 +1761,9 @@ mod tests {
             "host.example.com",
             "warehouse-123",
             Arc::new(StaticTokenProvider("token".to_string())),
+            &SqlWarehouseConfig::default(),
+            Arc::new(DatabricksMetrics::default()),
+            Arc::new(Semaphore::new(8)),
         )
         .expect("should create api");
         let table = TableReference::full("my_catalog", "my_schema", "my_table");
@@ -1395,6 +1792,9 @@ mod tests {
             "host.example.com",
             "wh-1",
             Arc::new(StaticTokenProvider("t".to_string())),
+            &SqlWarehouseConfig::default(),
+            Arc::new(DatabricksMetrics::default()),
+            Arc::new(Semaphore::new(8)),
         )
         .expect("should create api");
         let table = TableReference::bare("just_table");
@@ -1414,6 +1814,9 @@ mod tests {
             "host.example.com",
             "wh-1",
             Arc::new(StaticTokenProvider("t".to_string())),
+            &SqlWarehouseConfig::default(),
+            Arc::new(DatabricksMetrics::default()),
+            Arc::new(Semaphore::new(8)),
         )
         .expect("should create api");
         let table = TableReference::partial("my_schema", "my_table");
@@ -1433,6 +1836,9 @@ mod tests {
             "host.example.com",
             "wh-1",
             Arc::new(StaticTokenProvider("t".to_string())),
+            &SqlWarehouseConfig::default(),
+            Arc::new(DatabricksMetrics::default()),
+            Arc::new(Semaphore::new(8)),
         )
         .expect("should create api");
         let table = TableReference::full("cat'alog", "sch'ema", "tab'le");
@@ -1594,15 +2000,20 @@ mod tests {
         port: u16,
         max_in_flight_requests: usize,
     ) -> SqlWarehouseApi {
-        let client = configure_client_builder(ClientBuilder::new())
-            .build()
-            .expect("should build client");
+        // Build without connect/request timeouts so that `start_paused = true`
+        // tests don't race with tokio's auto-advance clock.
+        let client = ClientBuilder::new().build().expect("should build client");
         SqlWarehouseApi {
             client,
             base_url: format!("http://127.0.0.1:{port}"),
             request_semaphore: Arc::new(Semaphore::new(max_in_flight_requests)),
+            http_max_retries: SQL_WAREHOUSE_DEFAULT_HTTP_MAX_RETRIES,
+            backoff_method: BackoffMethod::Fibonacci,
+            statement_max_retries: SQL_WAREHOUSE_DEFAULT_STATEMENT_MAX_RETRIES,
+            disable_on_permanent_error: true,
             sql_warehouse_id: "test-warehouse".to_string(),
             token_provider: Arc::new(StaticTokenProvider("test-token".to_string())),
+            metrics: Arc::new(DatabricksMetrics::default()),
         }
     }
 
@@ -1888,6 +2299,9 @@ mod tests {
             "host.example.com",
             "wh-1",
             Arc::new(StaticTokenProvider("t".to_string())),
+            &SqlWarehouseConfig::default(),
+            Arc::new(DatabricksMetrics::default()),
+            Arc::new(Semaphore::new(8)),
         )
         .expect("should create api");
         let table = TableReference::full("my_catalog", "my_schema", "my_table");
@@ -2044,6 +2458,143 @@ mod tests {
         assert_eq!(first_response["status"]["state"], "SUCCEEDED");
         assert_eq!(second_response["status"]["state"], "SUCCEEDED");
         assert_eq!(max_active_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_with_config_rejects_zero_max_concurrent_requests() {
+        let result = DatabricksSqlWarehouse::with_config(
+            "host.example.com",
+            "warehouse-123",
+            Arc::new(StaticTokenProvider("test-token".to_string())),
+            SqlWarehouseConfig {
+                max_concurrent_requests: 0,
+                ..SqlWarehouseConfig::default()
+            },
+        );
+
+        match result {
+            Err(Error::InvalidConcurrencyLimit { limit: 0 }) => {}
+            Err(err) => panic!("unexpected error: {err}"),
+            Ok(_) => panic!("zero max_concurrent_requests should be rejected"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_execute_sql_statement_disables_on_permanent_http_errors() {
+        use std::sync::atomic::Ordering;
+
+        for status_line in ["401 Unauthorized", "403 Forbidden", "404 Not Found"] {
+            let (port, requests) = start_mock_http_server(
+                vec![MockHttpResponse {
+                    status_line,
+                    headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                    body: json!({"error": "permanent failure"}).to_string(),
+                }],
+                MockHttpResponse {
+                    status_line: "200 OK",
+                    headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                    body: json!({"ok": true}).to_string(),
+                },
+            )
+            .await;
+
+            let api = create_test_api(port);
+
+            let err = api
+                .execute_sql_statement("token", &json!({"statement": "SELECT 1"}))
+                .await
+                .expect_err("permanent HTTP status should fail the request");
+            assert!(
+                matches!(err, Error::HttpRequestFailed { .. }),
+                "unexpected error: {err}"
+            );
+            assert!(
+                api.metrics.permanently_disabled.load(Ordering::Relaxed),
+                "connector should be disabled after {status_line}"
+            );
+            assert_eq!(
+                api.metrics.permanent_errors_total.load(Ordering::Relaxed),
+                1,
+                "permanent error counter should increment after {status_line}"
+            );
+
+            let second_err = api
+                .execute_sql_statement("token", &json!({"statement": "SELECT 2"}))
+                .await
+                .expect_err("subsequent requests should fail fast after disable");
+            assert!(
+                matches!(second_err, Error::PermanentlyDisabled),
+                "unexpected error: {second_err}"
+            );
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                1,
+                "disabled connector should not issue additional HTTP requests after {status_line}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_execute_sql_statement_does_not_disable_when_opted_out() {
+        use std::sync::atomic::Ordering;
+
+        let (port, requests) = start_mock_http_server(
+            vec![
+                MockHttpResponse {
+                    status_line: "401 Unauthorized",
+                    headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                    body: json!({"error": "permanent failure"}).to_string(),
+                },
+                MockHttpResponse {
+                    status_line: "200 OK",
+                    headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                    body: json!({
+                        "status": { "state": "SUCCEEDED" },
+                        "statement_id": "stmt-1",
+                        "result": { "data_array": [] }
+                    })
+                    .to_string(),
+                },
+            ],
+            MockHttpResponse {
+                status_line: "200 OK",
+                headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                body: json!({"ok": true}).to_string(),
+            },
+        )
+        .await;
+
+        let mut api = create_test_api(port);
+        api.disable_on_permanent_error = false;
+
+        let err = api
+            .execute_sql_statement("token", &json!({"statement": "SELECT 1"}))
+            .await
+            .expect_err("401 should still fail the current request");
+        assert!(
+            matches!(err, Error::HttpRequestFailed { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !api.metrics.permanently_disabled.load(Ordering::Relaxed),
+            "connector should remain enabled when disable_on_permanent_error is false"
+        );
+        assert_eq!(
+            api.metrics.permanent_errors_total.load(Ordering::Relaxed),
+            0,
+            "permanent error counter should remain unchanged when opt-out is enabled"
+        );
+
+        let response = api
+            .execute_sql_statement("token", &json!({"statement": "SELECT 2"}))
+            .await
+            .expect("subsequent requests should still succeed");
+        assert_eq!(response["status"]["state"], "SUCCEEDED");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "connector should continue issuing requests when permanent disable is disabled"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3050,5 +3601,155 @@ mod tests {
             "timestamp without time zone maps to Timestamp(Microsecond, None)"
         );
         assert_eq!(schema.field(4).data_type(), &DataType::Boolean);
+    }
+
+    /// Two `SqlWarehouseApi` instances sharing the same semaphore must enforce
+    /// a single global concurrency limit. A request from either instance
+    /// consumes a permit from the shared pool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_shared_semaphore_limits_across_instances() {
+        use std::sync::atomic::Ordering;
+
+        let (port, max_active_requests, mut started_rx, gate) =
+            start_blocking_mock_http_server(MockHttpResponse {
+                status_line: "200 OK",
+                headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                body: json!({
+                    "status": { "state": "SUCCEEDED" },
+                    "statement_id": "stmt-1",
+                    "result": { "data_array": [] }
+                })
+                .to_string(),
+            })
+            .await;
+
+        // A shared semaphore with capacity 1, simulating a global limit.
+        let shared_semaphore = Arc::new(Semaphore::new(1));
+
+        let client = configure_client_builder(ClientBuilder::new())
+            .build()
+            .expect("should build client");
+
+        // Create two independent API instances that share the same semaphore.
+        let api_a = Arc::new(SqlWarehouseApi {
+            client: client.clone(),
+            base_url: format!("http://127.0.0.1:{port}"),
+            request_semaphore: Arc::clone(&shared_semaphore),
+            http_max_retries: SQL_WAREHOUSE_DEFAULT_HTTP_MAX_RETRIES,
+            backoff_method: BackoffMethod::Fibonacci,
+            statement_max_retries: SQL_WAREHOUSE_DEFAULT_STATEMENT_MAX_RETRIES,
+            disable_on_permanent_error: true,
+            sql_warehouse_id: "warehouse-a".to_string(),
+            token_provider: Arc::new(StaticTokenProvider("token-a".to_string())),
+            metrics: Arc::new(DatabricksMetrics::default()),
+        });
+        let api_b = Arc::new(SqlWarehouseApi {
+            client,
+            base_url: format!("http://127.0.0.1:{port}"),
+            request_semaphore: Arc::clone(&shared_semaphore),
+            http_max_retries: SQL_WAREHOUSE_DEFAULT_HTTP_MAX_RETRIES,
+            backoff_method: BackoffMethod::Fibonacci,
+            statement_max_retries: SQL_WAREHOUSE_DEFAULT_STATEMENT_MAX_RETRIES,
+            disable_on_permanent_error: true,
+            sql_warehouse_id: "warehouse-b".to_string(),
+            token_provider: Arc::new(StaticTokenProvider("token-b".to_string())),
+            metrics: Arc::new(DatabricksMetrics::default()),
+        });
+
+        // The first request (from api_a) should consume the single permit.
+        let first_payload = json!({"statement": "SELECT 1"});
+        let first = tokio::spawn({
+            let api = Arc::clone(&api_a);
+            async move { api.execute_sql_statement("token", &first_payload).await }
+        });
+
+        started_rx
+            .recv()
+            .await
+            .expect("the first request should reach the server");
+
+        // The second request (from api_b, a different instance) must wait
+        // because the shared semaphore has no remaining permits.
+        let second_payload = json!({"statement": "SELECT 2"});
+        let second = tokio::spawn({
+            let api = Arc::clone(&api_b);
+            async move { api.execute_sql_statement("token", &second_payload).await }
+        });
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            max_active_requests.load(Ordering::SeqCst),
+            1,
+            "only one HTTP request should be in flight even though two different API instances issued requests"
+        );
+        assert!(
+            started_rx.try_recv().is_err(),
+            "the second request (from another API instance) should wait for a permit"
+        );
+
+        // Verify inflight_operations metrics: only api_a holds a permit, so only
+        // it reports 1 in-flight. api_b is blocked waiting for the semaphore.
+        assert_eq!(
+            api_a.metrics.inflight_operations.load(Ordering::Relaxed),
+            1,
+            "api_a should report 1 in-flight operation (holding permit)"
+        );
+        assert_eq!(
+            api_b.metrics.inflight_operations.load(Ordering::Relaxed),
+            0,
+            "api_b should report 0 in-flight operations (waiting for permit)"
+        );
+        assert_eq!(
+            shared_semaphore.available_permits(),
+            0,
+            "shared semaphore should have no available permits"
+        );
+
+        // Release the first request so the second can proceed.
+        gate.add_permits(1);
+
+        started_rx
+            .recv()
+            .await
+            .expect("the second request should start after the first finishes");
+
+        gate.add_permits(1);
+
+        let first_response = first
+            .await
+            .expect("first task should join")
+            .expect("first request should succeed");
+        let second_response = second
+            .await
+            .expect("second task should join")
+            .expect("second request should succeed");
+
+        assert_eq!(first_response["status"]["state"], "SUCCEEDED");
+        assert_eq!(second_response["status"]["state"], "SUCCEEDED");
+        assert_eq!(
+            max_active_requests.load(Ordering::SeqCst),
+            1,
+            "max concurrent requests must stay at 1 across both instances"
+        );
+
+        // Verify inflight_operations return to zero after both operations complete.
+        assert_eq!(
+            api_a.metrics.inflight_operations.load(Ordering::Relaxed),
+            0,
+            "api_a inflight should be 0 after completion"
+        );
+        assert_eq!(
+            api_b.metrics.inflight_operations.load(Ordering::Relaxed),
+            0,
+            "api_b inflight should be 0 after completion"
+        );
+        assert_eq!(
+            shared_semaphore.available_permits(),
+            1,
+            "all semaphore permits should be returned after both operations complete"
+        );
     }
 }

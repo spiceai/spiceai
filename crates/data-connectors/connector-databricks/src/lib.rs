@@ -26,6 +26,7 @@ limitations under the License.
 use async_trait::async_trait;
 #[cfg(feature = "spark")]
 use data_components::databricks::DatabricksSparkConnect;
+use data_components::databricks::sql_warehouse::DatabricksMetrics;
 use data_components::databricks::{DatabricksDelta, DatabricksSqlWarehouse, sql_warehouse};
 use data_components::delta_lake::DeltaTableFactory;
 use data_components::unity_catalog::provider::UnityCatalogProvider;
@@ -35,11 +36,14 @@ use data_components::unity_catalog::{
 use data_components::{Read, RefreshableCatalogProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
+use opentelemetry::KeyValue;
 use runtime::Runtime;
 use runtime::catalogconnector::{CatalogConnector, Error as CatalogError, Result as CatalogResult};
 use runtime::component::ComponentInitialization;
+use runtime::component::ComponentType;
 use runtime::component::catalog::Catalog;
 use runtime::component::dataset::Dataset;
+use runtime::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -61,6 +65,7 @@ use std::sync::Arc;
 use token_provider::registry::TokenProviderRegistry;
 use token_provider::{StaticTokenProvider, TokenProvider};
 use tokio::runtime::Handle;
+use tokio::sync::Semaphore;
 
 // ============================================================================
 // Data Connector Error Types
@@ -112,6 +117,11 @@ pub enum Error {
     UnableToGetToken {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Insufficient permissions to read table '{table_name}'. The current principal does not have a read-compatible privilege on this table. Grant SELECT or ALL PRIVILEGES on the table, and try again."
+    ))]
+    InsufficientPermissions { table_name: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -128,6 +138,25 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("sql_warehouse_id")
         .secret()
         .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'"),
+
+    // Connection / resilience tuning (sql_warehouse mode)
+    ParameterSpec::runtime("max_concurrent_requests")
+        .description("Maximum number of concurrent HTTP requests to the SQL Warehouse API.")
+        .default("8"),
+    ParameterSpec::runtime("http_max_retries")
+        .description("Maximum number of HTTP-level retries for transient failures (429, 5xx).")
+        .default("3"),
+    ParameterSpec::runtime("backoff_method")
+        .description("Backoff strategy for transient HTTP retries.")
+        .one_of(&["fibonacci", "exponential"])
+        .default("fibonacci"),
+    ParameterSpec::runtime("statement_max_retries")
+        .description("Maximum number of poll retries when waiting for async statement completion.")
+        .default("14"),
+    ParameterSpec::runtime("disable_on_permanent_error")
+        .description("When true, non-retryable errors (401, 403, 404) permanently disable the connector to prevent a thundering herd of failed requests.")
+        .default("true"),
+
     ParameterSpec::component("token")
         .secret()
         .description("The personal access token used to authenticate against the DataBricks API."),
@@ -194,6 +223,10 @@ pub const PARAMETERS: &[ParameterSpec] = &[
 pub struct Databricks {
     read_provider: Arc<dyn Read>,
     initialization: ComponentInitialization,
+    metrics: Option<Arc<DatabricksMetrics>>,
+    /// Unity Catalog client for table type detection and permission checking.
+    /// Present when the connector was created with enough information to call UC APIs.
+    uc_client: Option<Arc<UnityCatalogClient>>,
 }
 
 impl std::fmt::Debug for Databricks {
@@ -213,6 +246,7 @@ impl Databricks {
         params: Parameters,
         io_runtime: Handle,
         token_provider_registry: Arc<TokenProviderRegistry>,
+        shared_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<Self> {
         let mode = params.get("mode").expose().ok().unwrap_or_default();
         let endpoint = params
@@ -237,13 +271,40 @@ impl Databricks {
                     Self::get_token_provider(endpoint, auth_credentials, token_provider_registry)
                         .await?;
 
-                let read_provider =
-                    DatabricksSqlWarehouse::new(endpoint, sql_warehouse_id, token_provider)
-                        .context(UnableToConstructDatabricksSqlWarehouseSnafu)?;
+                let uc_client = match UnityCatalogClient::new(
+                    Endpoint(endpoint.to_string()),
+                    Some(Arc::clone(&token_provider)),
+                    shared_semaphore.clone(),
+                ) {
+                    Ok(client) => Some(Arc::new(client)),
+                    Err(error) => {
+                        tracing::warn!(
+                            endpoint,
+                            %error,
+                            "Failed to initialize Unity Catalog client; UC table-type and permission validation is disabled"
+                        );
+                        None
+                    }
+                };
+
+                let sql_warehouse_config =
+                    runtime::catalogconnector::databricks::build_sql_warehouse_config(&params);
+
+                let read_provider = DatabricksSqlWarehouse::with_config_and_semaphore(
+                    endpoint,
+                    sql_warehouse_id,
+                    token_provider,
+                    sql_warehouse_config,
+                    shared_semaphore,
+                )
+                .context(UnableToConstructDatabricksSqlWarehouseSnafu)?;
+                let metrics = Some(Arc::clone(read_provider.metrics()));
 
                 Ok(Self {
                     read_provider: Arc::new(read_provider),
                     initialization,
+                    metrics,
+                    uc_client,
                 })
             }
             "delta_lake" => {
@@ -267,6 +328,22 @@ impl Databricks {
                     }
                 };
 
+                let uc_client = match UnityCatalogClient::new(
+                    Endpoint(endpoint.to_string()),
+                    Some(Arc::clone(&token_provider)),
+                    None,
+                ) {
+                    Ok(client) => Some(Arc::new(client)),
+                    Err(error) => {
+                        tracing::warn!(
+                            endpoint,
+                            %error,
+                            "Failed to initialize Unity Catalog client; UC table-type and permission validation is disabled"
+                        );
+                        None
+                    }
+                };
+
                 let read_provider = DatabricksDelta::new(
                     Endpoint(endpoint.to_string()),
                     storage_options,
@@ -277,6 +354,8 @@ impl Databricks {
                 Ok(Self {
                     read_provider: Arc::new(read_provider),
                     initialization,
+                    metrics: None,
+                    uc_client,
                 })
             }
             #[cfg(feature = "spark")]
@@ -448,6 +527,8 @@ impl Databricks {
 
             // Databricks spark connect doesn't support U2M, so no deferred loading
             initialization: ComponentInitialization::default(),
+            metrics: None,
+            uc_client: None,
         })
     }
 
@@ -506,24 +587,122 @@ impl Databricks {
     pub(crate) fn read_provider(&self) -> Arc<dyn Read> {
         Arc::clone(&self.read_provider)
     }
+
+    /// Validates that a Unity Catalog table is of a supported type and that the
+    /// current principal has read permissions on it.
+    ///
+    /// Returns `Ok(())` if validation passes or if it cannot be performed
+    /// (e.g., table not found in UC — the table may not be a UC table at all).
+    ///
+    /// Returns an error only when the UC API definitively reports an unsupported
+    /// table type or missing permissions.
+    async fn validate_uc_table(
+        &self,
+        uc_client: &UnityCatalogClient,
+        table_reference: &TableReference,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<()> {
+        let full_name = table_reference.to_string();
+        let should_validate_permissions = match uc_client.get_table(table_reference).await {
+            Ok(Some(uc_table)) => {
+                if !uc_table.is_queryable() {
+                    return Err(DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "databricks".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message: format!(
+                            "Unsupported Unity Catalog table type '{}' for table '{}'. Only MANAGED, EXTERNAL, FOREIGN, and MATERIALIZED_VIEW tables can be queried.",
+                            uc_table.table_type, full_name
+                        ),
+                    });
+                }
+                tracing::debug!(
+                    table = %full_name,
+                    table_type = %uc_table.table_type,
+                    "Unity Catalog table type is supported"
+                );
+
+                if !uc_table.requires_read_permission_validation() {
+                    tracing::debug!(
+                        table = %full_name,
+                        table_type = %uc_table.table_type,
+                        "Skipping strict Unity Catalog permission precheck for foreign table; Databricks validates access at query time"
+                    );
+                    return Ok(());
+                }
+
+                true
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    table = %full_name,
+                    "Table not found in Unity Catalog; skipping UC validation"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    table = %full_name,
+                    error = %e,
+                    "Failed to check Unity Catalog table metadata; proceeding without validation"
+                );
+                return Ok(());
+            }
+        };
+
+        // 2) Check permissions via UC effective-permissions endpoint.
+        if should_validate_permissions {
+            match uc_client.get_effective_permissions(&full_name).await {
+                Ok(Some(perms)) => {
+                    if !perms.has_read_permission() {
+                        return Err(DataConnectorError::InsufficientPermissions {
+                            dataconnector: "databricks".to_string(),
+                            connector_component: ConnectorComponent::from(dataset),
+                            source: Box::new(Error::InsufficientPermissions {
+                                table_name: full_name,
+                            }),
+                        });
+                    }
+                    tracing::debug!(
+                        table = %full_name,
+                        principals = ?perms.principals(),
+                        "Unity Catalog permission check passed"
+                    );
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        table = %full_name,
+                        "Table not found when checking permissions; proceeding"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        table = %full_name,
+                        error = %e,
+                        "Failed to check Unity Catalog permissions; proceeding without validation"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // ============================================================================
 // Data Connector Factory
 // ============================================================================
-
-#[derive(Default, Clone, Copy)]
-pub struct DatabricksFactory {}
+#[derive(Default, Clone)]
+pub struct DatabricksFactory;
 
 impl DatabricksFactory {
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        Self
     }
 
     #[must_use]
     pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
-        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+        Arc::new(Self) as Arc<dyn DataConnectorFactory>
     }
 }
 
@@ -538,6 +717,7 @@ impl DataConnectorFactory for DatabricksFactory {
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         if let Some(runtime) = params.runtime {
             let param_map = params.parameters.to_secret_map();
+
             Box::pin(async move {
                 // Initialize AWS SDK credentials if not using explicit credentials
                 if !aws_sdk_credential_bridge::has_explicit_credentials(
@@ -551,10 +731,36 @@ impl DataConnectorFactory for DatabricksFactory {
                     );
                 }
 
+                let shared_semaphore = if matches!(
+                    params.parameters.get("mode").expose().ok(),
+                    Some("sql_warehouse")
+                ) {
+                    match (
+                        params.parameters.get("endpoint").expose().ok(),
+                        params.parameters.get("sql_warehouse_id").expose().ok(),
+                    ) {
+                        (Some(endpoint), Some(warehouse_id)) => {
+                            let config =
+                                runtime::catalogconnector::databricks::build_sql_warehouse_config(
+                                    &params.parameters,
+                                );
+                            Some(sql_warehouse::shared_request_semaphore(
+                                endpoint,
+                                warehouse_id,
+                                config.max_concurrent_requests,
+                            )?)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
                 let databricks = Databricks::new(
                     params.parameters,
                     params.io_runtime,
                     runtime.token_provider_registry(),
+                    shared_semaphore,
                 )
                 .await?;
                 Ok(Arc::new(databricks) as Arc<dyn DataConnector>)
@@ -589,6 +795,18 @@ impl DataConnector for Databricks {
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let table_reference = TableReference::from(dataset.path());
+
+        // If we have a UC client and the table reference is fully qualified
+        // (catalog.schema.table), validate the table type and permissions
+        // upfront before attempting to create the table provider.
+        if let Some(uc_client) = &self.uc_client
+            && table_reference.catalog().is_some()
+            && table_reference.schema().is_some()
+        {
+            self.validate_uc_table(uc_client, &table_reference, dataset)
+                .await?;
+        }
+
         self.read_provider
             .table_provider(table_reference)
             .await
@@ -601,6 +819,204 @@ impl DataConnector for Databricks {
 
     fn initialization(&self) -> ComponentInitialization {
         self.initialization
+    }
+
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        self.metrics.as_ref().map(|m| {
+            Arc::new(DatabricksMetricsProvider {
+                metrics: Arc::clone(m),
+            }) as Arc<dyn MetricsProvider>
+        })
+    }
+}
+
+// ============================================================================
+// Databricks Metrics Provider
+// ============================================================================
+
+#[derive(Debug, Clone)]
+struct DatabricksMetricsProvider {
+    metrics: Arc<DatabricksMetrics>,
+}
+
+const DATABRICKS_METRICS: &[MetricSpec] = &[
+    // -- Request metrics --
+    MetricSpec::new("requests_total", MetricType::ObservableCounterU64)
+        .description("Total HTTP requests issued to the SQL Warehouse API"),
+    MetricSpec::new("retries_total", MetricType::ObservableCounterU64)
+        .description("Total HTTP retries performed for transient failures"),
+    MetricSpec::new("permanent_errors_total", MetricType::ObservableCounterU64).description(
+        "Total non-retryable errors (401, 403, 404) that permanently disabled the connector",
+    ),
+    MetricSpec::new("inflight_operations", MetricType::ObservableGaugeU64)
+        .description(
+            "Current number of in-flight SQL Warehouse operations holding a concurrency permit",
+        )
+        .auto_register(),
+    // -- Statement metrics --
+    MetricSpec::new(
+        "statements_executed_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description("Total SQL statements submitted for execution"),
+    MetricSpec::new("statement_polls_total", MetricType::ObservableCounterU64)
+        .description("Total polls made when waiting for async statement completion"),
+    MetricSpec::new("statements_failed_total", MetricType::ObservableCounterU64)
+        .description("Total SQL statements that completed with FAILED status"),
+    // -- Connection pool metrics --
+    MetricSpec::new("pool_connections_total", MetricType::ObservableCounterU64)
+        .description("Total virtual pool connect() calls"),
+    MetricSpec::new("pool_active_connections", MetricType::ObservableGaugeU64)
+        .description("Current number of active connection handles"),
+    // -- Concurrency metrics --
+    MetricSpec::new(
+        "semaphore_available_permits",
+        MetricType::ObservableGaugeU64,
+    )
+    .description("Current number of available concurrency permits in the request semaphore"),
+    // -- Data transfer metrics --
+    MetricSpec::new("chunks_fetched_total", MetricType::ObservableCounterU64)
+        .description("Total Arrow result chunks fetched from external links"),
+    // -- Connector state --
+    MetricSpec::new("connector_disabled", MetricType::ObservableGaugeU64)
+        .description("Whether the connector is permanently disabled (1 = disabled, 0 = active)"),
+];
+
+impl MetricsProvider for DatabricksMetricsProvider {
+    fn component_type(&self) -> ComponentType {
+        ComponentType::Dataset
+    }
+
+    fn component_name(&self) -> &'static str {
+        "databricks"
+    }
+
+    fn available_metrics(&self) -> &'static [MetricSpec] {
+        DATABRICKS_METRICS
+    }
+
+    fn callback_to_observe_metric(
+        &self,
+        metric: &MetricSpec,
+        attributes: Vec<KeyValue>,
+    ) -> Option<ObserveMetricCallback> {
+        let metrics = Arc::clone(&self.metrics);
+        match metric.name {
+            "requests_total" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                instrument.observe(
+                    metrics
+                        .requests_total
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    &attributes,
+                );
+            }))),
+            "retries_total" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                instrument.observe(
+                    metrics
+                        .retries_total
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    &attributes,
+                );
+            }))),
+            "permanent_errors_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .permanent_errors_total
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "inflight_operations" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .inflight_operations
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "statements_executed_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .statements_executed_total
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "statement_polls_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .statement_polls_total
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "statements_failed_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .statements_failed_total
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "pool_connections_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .pool_connections_total
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "pool_active_connections" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .pool_active_connections
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "semaphore_available_permits" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    let permits = metrics
+                        .semaphore
+                        .as_ref()
+                        .map_or(0, |s| s.available_permits() as u64);
+                    instrument.observe(permits, &attributes);
+                })))
+            }
+            "chunks_fetched_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(
+                        metrics
+                            .chunks_fetched_total
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            "connector_disabled" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                let disabled = u64::from(
+                    metrics
+                        .permanently_disabled
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+                instrument.observe(disabled, &attributes);
+            }))),
+            _ => None,
+        }
     }
 }
 
@@ -769,13 +1185,12 @@ impl CatalogConnector for DatabricksCatalog {
         };
 
         let unity_catalog =
-            UnityCatalogClient::new(Endpoint(endpoint.to_string()), Some(token_provider)).map_err(
-                |source| CatalogError::UnableToGetCatalogProvider {
+            UnityCatalogClient::new(Endpoint(endpoint.to_string()), Some(token_provider), None)
+                .map_err(|source| CatalogError::UnableToGetCatalogProvider {
                     connector: "databricks".to_string(),
                     source: Box::new(source),
                     connector_component: ConnectorComponent::from(catalog),
-                },
-            )?;
+                })?;
         let client = Arc::new(unity_catalog);
 
         // Copy the catalog params into the dataset params, and allow user to override
@@ -813,10 +1228,42 @@ impl CatalogConnector for DatabricksCatalog {
                 table_reference_creator_delta_lake as fn(&UCTable) -> Option<TableReference>,
             )
         } else {
+            let shared_semaphore = if mode == Some("sql_warehouse") {
+                match (
+                    params.get("endpoint").expose().ok(),
+                    params.get("sql_warehouse_id").expose().ok(),
+                ) {
+                    (Some(endpoint), Some(warehouse_id)) => {
+                        let config =
+                            runtime::catalogconnector::databricks::build_sql_warehouse_config(
+                                &params,
+                            );
+                        Some(
+                            sql_warehouse::shared_request_semaphore(
+                                endpoint,
+                                warehouse_id,
+                                config.max_concurrent_requests,
+                            )
+                            .map_err(|source| {
+                                CatalogError::UnableToGetCatalogProvider {
+                                    connector: "databricks".to_string(),
+                                    source: source.into(),
+                                    connector_component: ConnectorComponent::from(catalog),
+                                }
+                            })?,
+                        )
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
             let dataset_databricks = Databricks::new(
                 params,
                 runtime.tokio_io_runtime(),
                 runtime.token_provider_registry(),
+                shared_semaphore,
             )
             .await
             .map_err(|source| CatalogError::UnableToGetCatalogProvider {
