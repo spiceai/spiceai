@@ -103,7 +103,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         for part in &candidate.content.parts {
             match part {
-                Part::FunctionCall { function_call } => {
+                Part::FunctionCall {
+                    function_call,
+                    thought_signature,
+                } => {
                     println!("Model requested function call:");
                     println!("  Function: {}", function_call.name);
                     println!("  Arguments: {:?}\n", function_call.args);
@@ -128,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             name: function_call.name.clone(),
                             response: response_map,
                         },
+                        thought_signature: thought_signature.clone(),
                     };
 
                     conversation_history.push(Content {

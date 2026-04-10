@@ -59,10 +59,14 @@ pub enum Part {
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: FunctionCall,
+        #[serde(rename = "thoughtSignature")]
+        thought_signature: Option<String>,
     },
     FunctionResponse {
         #[serde(rename = "functionResponse")]
         function_response: FunctionResponse,
+        #[serde(rename = "thoughtSignature")]
+        thought_signature: Option<String>,
     },
 }
 
