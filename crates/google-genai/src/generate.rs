@@ -201,6 +201,28 @@ fn parse_sse_stream(
         (stream, String::new()),
         |(mut stream, mut buffer)| async move {
             loop {
+                if let Some(pos) = buffer.find("\n\n") {
+                    let event = buffer[..pos].to_string();
+
+                    buffer = buffer[pos + 2..].to_string();
+
+                    for line in event.lines() {
+                        if let Some(data) = line.strip_prefix("data: ") {
+                            if data == "[DONE]" {
+                                return None;
+                            }
+
+                            if data.trim().is_empty() {
+                                continue;
+                            }
+
+                            let result = serde_json::from_str(data).context(JsonSnafu);
+
+                            return Some((result, (stream, buffer)));
+                        }
+                    }
+                }
+
                 match stream.next().await {
                     Some(Ok(bytes)) => {
                         let text = std::str::from_utf8(&bytes).map_err(|e| {
@@ -236,28 +258,6 @@ fn parse_sse_stream(
                             .fail(),
                             (stream, buffer),
                         ));
-                    }
-                }
-
-                if let Some(pos) = buffer.find("\n\n") {
-                    let event = buffer[..pos].to_string();
-
-                    buffer = buffer[pos + 2..].to_string();
-
-                    for line in event.lines() {
-                        if let Some(data) = line.strip_prefix("data: ") {
-                            if data == "[DONE]" {
-                                return None;
-                            }
-
-                            if data.trim().is_empty() {
-                                continue;
-                            }
-
-                            let result = serde_json::from_str(data).context(JsonSnafu);
-
-                            return Some((result, (stream, buffer)));
-                        }
                     }
                 }
             }
