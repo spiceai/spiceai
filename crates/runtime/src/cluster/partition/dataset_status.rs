@@ -103,15 +103,11 @@ mod tests {
                 .await
                 .expect("should initialize metadata");
 
-            let metadata = TablePartitionMetadata {
-                table_name: table_name.to_string(),
-                partitions,
-                schema_version: 1,
-                updated_at: 1000,
-                partition_expressions: vec!["date".to_string()],
-            };
+            let mut metadata =
+                TablePartitionMetadata::new(&table_ref, 1000, vec!["date".to_string()]);
+            metadata.partitions = partitions;
             manager
-                .write_metadata(table_name, metadata)
+                .write_metadata(&table_ref, metadata)
                 .await
                 .expect("should write metadata");
         }
@@ -409,17 +405,12 @@ mod tests {
         assert!(!status.is_ready());
 
         // Simulate: partitions get assigned
-        let metadata = TablePartitionMetadata {
-            table_name: "test_table".to_string(),
-            partitions: vec![
-                make_assigned_partition("date", "2024-01-01", "executor1"),
-                make_assigned_partition("date", "2024-01-02", "executor2"),
-            ],
-            schema_version: 1,
-            updated_at: 2000,
-            partition_expressions: vec!["date".to_string()],
-        };
-        pm.write_metadata("test_table", metadata)
+        let mut metadata = TablePartitionMetadata::new(&table_ref, 2000, vec!["date".to_string()]);
+        metadata.partitions = vec![
+            make_assigned_partition("date", "2024-01-01", "executor1"),
+            make_assigned_partition("date", "2024-01-02", "executor2"),
+        ];
+        pm.write_metadata(&table_ref, metadata)
             .await
             .expect("should write");
         pm.refresh().await.expect("should refresh");
