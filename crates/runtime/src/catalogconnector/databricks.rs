@@ -678,7 +678,10 @@ mod tests {
 
         assert_eq!(config.max_concurrent_requests, 4);
         assert_eq!(config.http_max_retries, 6);
-        assert_eq!(config.backoff_method, util::retry_strategy::BackoffMethod::Exponential);
+        assert_eq!(
+            config.backoff_method,
+            util::retry_strategy::BackoffMethod::Exponential
+        );
         assert_eq!(config.statement_max_retries, 21);
         assert!(!config.disable_on_permanent_error);
     }
@@ -696,7 +699,10 @@ mod tests {
         let config = build_sql_warehouse_config(&params);
         let defaults = SqlWarehouseConfig::default();
 
-        assert_eq!(config.max_concurrent_requests, defaults.max_concurrent_requests);
+        assert_eq!(
+            config.max_concurrent_requests,
+            defaults.max_concurrent_requests
+        );
         assert_eq!(config.http_max_retries, defaults.http_max_retries);
         assert_eq!(config.backoff_method, defaults.backoff_method);
         assert_eq!(config.statement_max_retries, defaults.statement_max_retries);

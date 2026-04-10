@@ -509,7 +509,10 @@ impl SqlWarehouseApi {
         Ok(Self {
             client,
             base_url: format!("https://{host}"),
-            connection_metric_dimensions: build_connection_metric_dimensions(host, sql_warehouse_id),
+            connection_metric_dimensions: build_connection_metric_dimensions(
+                host,
+                sql_warehouse_id,
+            ),
             request_semaphore,
             http_max_retries: config.http_max_retries,
             backoff_method: config.backoff_method,
@@ -2508,7 +2511,10 @@ mod tests {
                 .execute_sql_statement("token", &json!({"statement": "SELECT 1"}))
                 .await
                 .expect_err("permanent HTTP status should fail the request");
-            assert!(matches!(err, Error::HttpRequestFailed { .. }), "unexpected error: {err}");
+            assert!(
+                matches!(err, Error::HttpRequestFailed { .. }),
+                "unexpected error: {err}"
+            );
             assert!(
                 api.permanently_disabled.load(Ordering::Relaxed),
                 "connector should be disabled after {status_line}"
@@ -2572,7 +2578,10 @@ mod tests {
             .execute_sql_statement("token", &json!({"statement": "SELECT 1"}))
             .await
             .expect_err("401 should still fail the current request");
-        assert!(matches!(err, Error::HttpRequestFailed { .. }), "unexpected error: {err}");
+        assert!(
+            matches!(err, Error::HttpRequestFailed { .. }),
+            "unexpected error: {err}"
+        );
         assert!(
             !api.permanently_disabled.load(Ordering::Relaxed),
             "connector should remain enabled when disable_on_permanent_error is false"
