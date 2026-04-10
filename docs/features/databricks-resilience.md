@@ -77,7 +77,7 @@ Unsupported table types are:
 
 Before creating a table provider, the connector calls the UC Effective Permissions API (`GET /api/2.1/unity-catalog/effective-permissions/table/{full_name}`) to verify the current principal has `SELECT` or `ALL_PRIVILEGES` on the table.
 
-- **Catalog connector path**: Tables without read permissions are skipped during discovery with an error-level log.
+- **Catalog connector path**: Tables without read permissions are skipped during discovery with a warning-level log.
 - **Data connector path**: Returns an `InsufficientPermissions` error when a fully-qualified table reference is used.
 - **Graceful degradation**: If the UC API is unreachable or the table is not found in UC, the connector logs a warning and proceeds without validation (the table may not be a UC-managed table).
 
@@ -148,6 +148,7 @@ datasets:
       - name: permanent_errors_total
       - name: inflight_operations
       - name: statements_executed_total
+
       - name: statement_polls_total
       - name: statements_failed_total
       - name: pool_connections_total

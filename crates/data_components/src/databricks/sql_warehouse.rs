@@ -651,7 +651,7 @@ impl SqlWarehouseApi {
             )
             .await
             .context(HttpRequestFailedSnafu)?;
-            self.check_permanent_http_error(response)
+            response
                 .error_for_status()
                 .context(HttpRequestFailedSnafu)?
                 .json()
@@ -739,8 +739,7 @@ impl SqlWarehouseApi {
                             }
                         };
 
-                        let result = match api
-                            .check_permanent_http_error(resp)
+                        let result = match resp
                             .error_for_status()
                             .context(HttpRequestFailedSnafu)
                         {

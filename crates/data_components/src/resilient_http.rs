@@ -30,7 +30,7 @@ const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_HTTP_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 const DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 16;
-const MAX_HTTP_RETRIES: usize = 10;
+const DEFAULT_HTTP_RETRIES: usize = 10;
 const MAX_HTTP_BACKOFF: Duration = Duration::from_secs(300);
 const RETRY_AFTER_MS_HEADER: &str = "retry-after-ms";
 const X_RETRY_AFTER_MS_HEADER: &str = "x-retry-after-ms";
@@ -97,7 +97,7 @@ pub async fn send_request_with_retry_and_concurrency_limit_with_counter<F>(
 where
     F: Fn() -> RequestBuilder,
 {
-    let max_retries = max_retries.unwrap_or(MAX_HTTP_RETRIES);
+    let max_retries = max_retries.unwrap_or(DEFAULT_HTTP_RETRIES);
     let transient_method = backoff_method.unwrap_or(BackoffMethod::Fibonacci);
     let mut transient_backoff = RetryBackoffBuilder::new()
         .method(transient_method)
