@@ -139,8 +139,7 @@ fn should_include_otel_location(is_release_build: bool, verbosity: &LogVerbosity
     }
 
     match verbosity {
-        LogVerbosity::Default => false,
-        LogVerbosity::Verbose => false,
+        LogVerbosity::Default | LogVerbosity::Verbose => false,
         LogVerbosity::VeryVerbose => true,
         LogVerbosity::Specific(filter) => specific_filter_enables_trace_logging(filter),
     }

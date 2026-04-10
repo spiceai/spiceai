@@ -41,9 +41,7 @@ pub(crate) struct CatalogFilter {
     from: Option<String>,
 }
 
-// Re-export shared type for backwards compatibility
-pub use runtime_api_types::v1::CatalogInfo;
-pub use runtime_api_types::v1::CatalogInfo as CatalogResponseItem;
+type CatalogResponseItem = runtime_api_types::v1::CatalogInfo;
 
 const APPLICATION_JSON: MediaType = MediaType::from_parts(APPLICATION, JSON, None, &[]);
 const TEXT_CSV: MediaType = MediaType::from_parts(TEXT, CSV, None, &[]);
@@ -60,7 +58,7 @@ const ACCEPT_LIST: &[MediaType; 2] = &[APPLICATION_JSON, TEXT_CSV];
     params(CatalogFilter),
     responses(
         (status = 200, description = "List of catalogs", content((
-            CatalogInfo = "application/json",
+            runtime_api_types::v1::CatalogInfo = "application/json",
             example = json!([
                 {
                     "from": "spiceai",
