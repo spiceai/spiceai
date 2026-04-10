@@ -908,18 +908,6 @@ mod tests {
         );
     }
 
-    /// Creates a large `ChangeBatch` with `n` rows, all upserts with NO primary keys
-    /// (like Kafka's `wrap_data_as_change_batch` produces).
-    fn create_large_change_batch_no_pks(n: usize) -> ChangeBatch {
-        let ops: Vec<&str> = vec!["c"; n];
-        let primary_keys: Vec<Vec<&str>> = vec![vec![]; n]; // empty PK lists
-        let ids: Vec<i32> = (0..n as i32).collect();
-        let names: Vec<Option<&str>> = (0..n)
-            .map(|i| Some(if i % 2 == 0 { "Alice" } else { "Bob" }))
-            .collect();
-        create_test_change_batch(ops, &primary_keys, ids, names)
-    }
-
     #[test]
     fn test_group_into_sub_batches_no_pks_single_batch() {
         let batch = create_test_change_batch(
