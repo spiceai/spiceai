@@ -324,7 +324,9 @@ url = { version = "2.5", features = ["serde"] }
 util = { path = "crates/util", default-features = false }
 uuid = "1"
 
-# We can't use patches for vortex, because their tagged release version .tomls have a version of 0.1.0 not the actual release version
+# Vortex tagged releases publish version 0.1.0 in their Cargo.toml, not the actual release version,
+# so we specify git deps here directly. The [patch.crates-io] entries below exist to override
+# transitive vortex dependencies pulled in by other patched crates.
 vortex = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
 vortex-array = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
 vortex-datafusion = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
