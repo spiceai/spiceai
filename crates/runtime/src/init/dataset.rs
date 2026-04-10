@@ -266,32 +266,40 @@ impl Runtime {
             }
         };
 
-        // Register any component metrics that the user has enabled for this dataset.
-        if ds.metrics.has_enabled_metrics() {
+        // Register component metrics for this dataset.
+        if let Some(metrics_provider) = data_connector.metrics_provider() {
             let enabled_metrics = ds.metrics.enabled_metrics();
-            let Some(metrics_provider) = data_connector.metrics_provider() else {
-                tracing::warn!(
-                    "Dataset {} does not support metrics. Skipping metric registration for {}.",
-                    ds.name,
-                    enabled_metrics.join(", ")
-                );
-                return Ok(data_connector);
-            };
-            for metric in enabled_metrics {
-                if let Some(metric) = metrics_provider.get_metric(&metric) {
-                    if let Err(e) =
-                        register_component_metric(&metrics_provider, *metric, &ds.name.to_string())
-                    {
-                        tracing::error!(
-                            "Unable to register component metric {}: {}",
-                            metric.name,
-                            e
-                        );
-                    }
-                } else {
-                    tracing::warn!("Metric {metric} not available in {source}");
+            let instance_name = ds.name.to_string();
+
+            for metric in metrics_provider.available_metrics() {
+                let user_enabled = enabled_metrics.iter().any(|m| m == metric.name);
+                if !metric.auto_register && !user_enabled {
+                    continue;
+                }
+                if let Err(e) =
+                    register_component_metric(&metrics_provider, *metric, &instance_name)
+                {
+                    tracing::error!(
+                        "Unable to register component metric {}: {}",
+                        metric.name,
+                        e
+                    );
                 }
             }
+
+            // Warn about user-enabled metrics that don't exist on this connector.
+            for name in &enabled_metrics {
+                if metrics_provider.get_metric(name).is_none() {
+                    tracing::warn!("Metric {name} not available in {source}");
+                }
+            }
+        } else if ds.metrics.has_enabled_metrics() {
+            let enabled_metrics = ds.metrics.enabled_metrics();
+            tracing::warn!(
+                "Dataset {} does not support metrics. Skipping metric registration for {}.",
+                ds.name,
+                enabled_metrics.join(", ")
+            );
         }
 
         Ok(data_connector)

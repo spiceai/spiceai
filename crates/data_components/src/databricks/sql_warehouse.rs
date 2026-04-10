@@ -3523,6 +3523,25 @@ mod tests {
             "the second request (from another API instance) should wait for a permit"
         );
 
+        // Verify inflight_operations metrics: both operations are counted as
+        // in-flight (api_a is executing on the server, api_b is waiting for the
+        // concurrency semaphore permit).
+        assert_eq!(
+            api_a.metrics.inflight_operations.load(Ordering::Relaxed),
+            1,
+            "api_a should report 1 in-flight operation"
+        );
+        assert_eq!(
+            api_b.metrics.inflight_operations.load(Ordering::Relaxed),
+            1,
+            "api_b should report 1 in-flight operation (waiting for permit)"
+        );
+        assert_eq!(
+            shared_semaphore.available_permits(),
+            0,
+            "shared semaphore should have no available permits"
+        );
+
         // Release the first request so the second can proceed.
         gate.add_permits(1);
 
@@ -3548,6 +3567,23 @@ mod tests {
             max_active_requests.load(Ordering::SeqCst),
             1,
             "max concurrent requests must stay at 1 across both instances"
+        );
+
+        // Verify inflight_operations return to zero after both operations complete.
+        assert_eq!(
+            api_a.metrics.inflight_operations.load(Ordering::Relaxed),
+            0,
+            "api_a inflight should be 0 after completion"
+        );
+        assert_eq!(
+            api_b.metrics.inflight_operations.load(Ordering::Relaxed),
+            0,
+            "api_b inflight should be 0 after completion"
+        );
+        assert_eq!(
+            shared_semaphore.available_permits(),
+            1,
+            "all semaphore permits should be returned after both operations complete"
         );
     }
 }
