@@ -97,6 +97,35 @@ pub async fn send_request_with_retry_and_concurrency_limit_with_counter<F>(
 where
     F: Fn() -> RequestBuilder,
 {
+    send_request_with_retry_concurrency_and_inflight::<F>(
+        service_name,
+        operation_name,
+        build_request,
+        concurrency_limit,
+        max_retries,
+        backoff_method,
+        retry_counter,
+        None,
+    )
+    .await
+}
+
+/// Like [`send_request_with_retry_and_concurrency_limit_with_counter`] but
+/// also accepts an optional `inflight_counter` that is incremented only while
+/// a concurrency permit is held (i.e. an HTTP request is actually in-flight).
+pub async fn send_request_with_retry_concurrency_and_inflight<F>(
+    service_name: &str,
+    operation_name: &str,
+    build_request: F,
+    concurrency_limit: Option<&Semaphore>,
+    max_retries: Option<usize>,
+    backoff_method: Option<BackoffMethod>,
+    retry_counter: Option<&AtomicU64>,
+    inflight_counter: Option<&AtomicU64>,
+) -> Result<Response, reqwest::Error>
+where
+    F: Fn() -> RequestBuilder,
+{
     let max_retries = max_retries.unwrap_or(DEFAULT_HTTP_RETRIES);
     let transient_method = backoff_method.unwrap_or(BackoffMethod::Fibonacci);
     let mut transient_backoff = RetryBackoffBuilder::new()
@@ -115,10 +144,22 @@ where
         KeyValue::new("operation", operation_name.to_string()),
     ];
 
+    let inc_inflight = || {
+        if let Some(c) = inflight_counter {
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    };
+    let dec_inflight = || {
+        if let Some(c) = inflight_counter {
+            c.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    };
+
     loop {
         let permit =
             acquire_concurrency_permit(concurrency_limit, service_name, operation_name).await;
         telemetry::inc_connector_inflight_requests(&dimensions);
+        inc_inflight();
         match add_supported_accept_encoding_header(build_request())
             .send()
             .await
@@ -135,6 +176,7 @@ where
                             max_retries,
                             "HTTP retries exhausted after retryable response"
                         );
+                        dec_inflight();
                         telemetry::dec_connector_inflight_requests(&dimensions);
                         return Ok(response);
                     }
@@ -161,17 +203,20 @@ where
 
                     drain_response_body(response, service_name, operation_name, retries, status)
                         .await;
+                    dec_inflight();
                     telemetry::dec_connector_inflight_requests(&dimensions);
                     drop(permit);
                     tokio::time::sleep(delay).await;
                     continue;
                 }
 
+                dec_inflight();
                 telemetry::dec_connector_inflight_requests(&dimensions);
                 return Ok(response);
             }
             Err(error) => {
                 let Some(reason) = retry_reason_from_error(&error) else {
+                    dec_inflight();
                     telemetry::dec_connector_inflight_requests(&dimensions);
                     return Err(error);
                 };
@@ -185,6 +230,7 @@ where
                         error = %error,
                         "HTTP retries exhausted after transient request failure"
                     );
+                    dec_inflight();
                     telemetry::dec_connector_inflight_requests(&dimensions);
                     return Err(error);
                 }
@@ -205,6 +251,7 @@ where
                     "Retrying HTTP request after transient request failure"
                 );
 
+                dec_inflight();
                 telemetry::dec_connector_inflight_requests(&dimensions);
                 drop(permit);
                 tokio::time::sleep(delay).await;

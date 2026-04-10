@@ -55,7 +55,7 @@ use util::{
 };
 
 use crate::resilient_http::{
-    configure_client_builder, send_request_with_retry_and_concurrency_limit_with_counter,
+    configure_client_builder, send_request_with_retry_concurrency_and_inflight,
 };
 use tracing::Instrument;
 use util::retry_strategy::BackoffMethod;
@@ -117,8 +117,8 @@ pub struct DatabricksMetrics {
     pub retries_total: AtomicU64,
     /// Total non-retryable (permanent) errors detected.
     pub permanent_errors_total: AtomicU64,
-    /// Current number of in-progress operations (gauge, can go up and down).
-    /// Includes time spent waiting for a concurrency permit.
+    /// Current number of HTTP requests holding a concurrency permit (gauge).
+    /// Bounded by `max_concurrent_requests`.
     pub inflight_operations: AtomicU64,
 
     // -- Statement metrics --
@@ -584,12 +584,9 @@ impl SqlWarehouseApi {
             .and_then(|v| v.as_str())
             .unwrap_or("<unknown>");
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .inflight_operations
-            .fetch_add(1, Ordering::Relaxed);
         let url = format!("{}/api/2.0/sql/statements/", self.base_url);
-        let result = async {
-            let response = send_request_with_retry_and_concurrency_limit_with_counter(
+        async {
+            let response = send_request_with_retry_concurrency_and_inflight(
                 "Databricks SQL Warehouse",
                 "execute SQL statement",
                 || self.client.post(&url).bearer_auth(token).json(payload),
@@ -597,6 +594,7 @@ impl SqlWarehouseApi {
                 Some(self.http_max_retries),
                 Some(self.backoff_method),
                 Some(&self.metrics.retries_total),
+                Some(&self.metrics.inflight_operations),
             )
             .await
             .context(HttpRequestFailedSnafu)?;
@@ -618,11 +616,7 @@ impl SqlWarehouseApi {
             input = sql_text,
             warehouse_id = %self.sql_warehouse_id,
         ))
-        .await;
-        self.metrics
-            .inflight_operations
-            .fetch_sub(1, Ordering::Relaxed);
-        result
+        .await
     }
 
     async fn get_sql_statement_status(
@@ -635,34 +629,25 @@ impl SqlWarehouseApi {
             .statement_polls_total
             .fetch_add(1, Ordering::Relaxed);
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .inflight_operations
-            .fetch_add(1, Ordering::Relaxed);
         let url = format!("{}/api/2.0/sql/statements/{statement_id}", self.base_url);
-        let result = async {
-            let response = send_request_with_retry_and_concurrency_limit_with_counter(
-                "Databricks SQL Warehouse",
-                "poll SQL statement status",
-                || self.client.get(&url).bearer_auth(token),
-                Some(&self.request_semaphore),
-                Some(self.http_max_retries),
-                Some(self.backoff_method),
-                Some(&self.metrics.retries_total),
-            )
+        let response = send_request_with_retry_concurrency_and_inflight(
+            "Databricks SQL Warehouse",
+            "poll SQL statement status",
+            || self.client.get(&url).bearer_auth(token),
+            Some(&self.request_semaphore),
+            Some(self.http_max_retries),
+            Some(self.backoff_method),
+            Some(&self.metrics.retries_total),
+            Some(&self.metrics.inflight_operations),
+        )
+        .await
+        .context(HttpRequestFailedSnafu)?;
+        response
+            .error_for_status()
+            .context(HttpRequestFailedSnafu)?
+            .json()
             .await
-            .context(HttpRequestFailedSnafu)?;
-            response
-                .error_for_status()
-                .context(HttpRequestFailedSnafu)?
-                .json()
-                .await
-                .context(JsonParsingFailedSnafu)
-        }
-        .await;
-        self.metrics
-            .inflight_operations
-            .fetch_sub(1, Ordering::Relaxed);
-        result
+            .context(JsonParsingFailedSnafu)
     }
 
     // Fetch the arrow data at the external links, repeating for each chunk
@@ -715,10 +700,7 @@ impl SqlWarehouseApi {
                             return Some((Err(e), None));
                         }
                         api.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
-                        api.metrics
-                            .inflight_operations
-                            .fetch_add(1, Ordering::Relaxed);
-                        let resp = match send_request_with_retry_and_concurrency_limit_with_counter(
+                        let resp = match send_request_with_retry_concurrency_and_inflight(
                             "Databricks SQL Warehouse",
                             "fetch next external chunk link",
                             || api.client.get(&url).bearer_auth(&token),
@@ -726,20 +708,18 @@ impl SqlWarehouseApi {
                             Some(api.http_max_retries),
                             Some(api.backoff_method),
                             Some(&api.metrics.retries_total),
+                            Some(&api.metrics.inflight_operations),
                         )
                         .await
                         .context(HttpRequestFailedSnafu)
                         {
                             Ok(resp) => resp,
                             Err(e) => {
-                                api.metrics
-                                    .inflight_operations
-                                    .fetch_sub(1, Ordering::Relaxed);
                                 return Some((Err(e), None));
                             }
                         };
 
-                        let result = match resp.error_for_status().context(HttpRequestFailedSnafu) {
+                        match resp.error_for_status().context(HttpRequestFailedSnafu) {
                             Ok(response) => match response
                                 .json()
                                 .await
@@ -748,23 +728,13 @@ impl SqlWarehouseApi {
                             {
                                 Ok(next) => next,
                                 Err(e) => {
-                                    api.metrics
-                                        .inflight_operations
-                                        .fetch_sub(1, Ordering::Relaxed);
                                     return Some((Err(e), None));
                                 }
                             },
                             Err(e) => {
-                                api.metrics
-                                    .inflight_operations
-                                    .fetch_sub(1, Ordering::Relaxed);
                                 return Some((Err(e), None));
                             }
-                        };
-                        api.metrics
-                            .inflight_operations
-                            .fetch_sub(1, Ordering::Relaxed);
-                        result
+                        }
                     }
                     None => None,
                 };
@@ -835,35 +805,26 @@ impl SqlWarehouseApi {
     async fn fetch_chunk_data(&self, url: &str) -> Result<bytes::Bytes, Error> {
         self.check_permanently_disabled()?;
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .inflight_operations
-            .fetch_add(1, Ordering::Relaxed);
-        let result = async {
-            let response = send_request_with_retry_and_concurrency_limit_with_counter(
-                "Databricks SQL Warehouse",
-                "fetch statement result chunk",
-                || self.client.get(url),
-                Some(&self.request_semaphore),
-                Some(self.http_max_retries),
-                Some(self.backoff_method),
-                Some(&self.metrics.retries_total),
-            )
-            .await
-            .context(HttpRequestFailedSnafu)?;
-            // Skip permanent-error detection for external chunk URLs (pre-signed
-            // storage links). A 403/404 here typically means an expired link,
-            // not broken credentials/warehouse configuration.
-            response
-                .error_for_status()
-                .context(HttpRequestFailedSnafu)?
-                .bytes()
-                .await
-                .context(HttpRequestFailedSnafu)
-        }
-        .await;
-        self.metrics
-            .inflight_operations
-            .fetch_sub(1, Ordering::Relaxed);
+        let result = send_request_with_retry_concurrency_and_inflight(
+            "Databricks SQL Warehouse",
+            "fetch statement result chunk",
+            || self.client.get(url),
+            Some(&self.request_semaphore),
+            Some(self.http_max_retries),
+            Some(self.backoff_method),
+            Some(&self.metrics.retries_total),
+            Some(&self.metrics.inflight_operations),
+        )
+        .await
+        .context(HttpRequestFailedSnafu)?
+        // Skip permanent-error detection for external chunk URLs (pre-signed
+        // storage links). A 403/404 here typically means an expired link,
+        // not broken credentials/warehouse configuration.
+        .error_for_status()
+        .context(HttpRequestFailedSnafu)?
+        .bytes()
+        .await
+        .context(HttpRequestFailedSnafu);
         if result.is_ok() {
             self.metrics
                 .chunks_fetched_total
@@ -3523,18 +3484,17 @@ mod tests {
             "the second request (from another API instance) should wait for a permit"
         );
 
-        // Verify inflight_operations metrics: both operations are counted as
-        // in-flight (api_a is executing on the server, api_b is waiting for the
-        // concurrency semaphore permit).
+        // Verify inflight_operations metrics: only api_a holds a permit, so only
+        // it reports 1 in-flight. api_b is blocked waiting for the semaphore.
         assert_eq!(
             api_a.metrics.inflight_operations.load(Ordering::Relaxed),
             1,
-            "api_a should report 1 in-flight operation"
+            "api_a should report 1 in-flight operation (holding permit)"
         );
         assert_eq!(
             api_b.metrics.inflight_operations.load(Ordering::Relaxed),
-            1,
-            "api_b should report 1 in-flight operation (waiting for permit)"
+            0,
+            "api_b should report 0 in-flight operations (waiting for permit)"
         );
         assert_eq!(
             shared_semaphore.available_permits(),
