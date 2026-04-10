@@ -31,6 +31,8 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use super::get_cayenne_provider;
+use crate::cluster::executor_registry::ExecutorRegistry;
 use arrow::array::{RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::ddl::operations::{self, create_schema, create_table, drop_table};
@@ -42,9 +44,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_ddl::arrow_datatype_to_sql;
-
-use super::get_cayenne_provider;
-use crate::cluster::executor_registry::ExecutorRegistry;
+use futures::StreamExt;
 
 // Re-export single-node merge exec (no broadcast needed for local merge).
 pub use cayenne::ddl::physical_plans::CayenneMergeExec;
@@ -147,11 +147,22 @@ async fn forward_sql_to_executor(
     mut client: data_components::flightsql::FlightSqlClient,
     sql: &str,
 ) -> Result<(), String> {
-    client
+    let flight_info = client
         .execute(sql.to_string(), None)
         .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    for endpoint in flight_info.endpoint {
+        let Some(ticket) = endpoint.ticket else {
+            continue;
+        };
+        let mut stream = client.do_get(ticket).await.map_err(|e| e.to_string())?;
+        while let Some(batch) = stream.next().await {
+            batch.map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(())
 }
 
 // ── DistributedCayenneCreateTableExec ────────────────────────────────────────
