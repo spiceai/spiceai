@@ -838,7 +838,8 @@ const DATABRICKS_METRICS: &[MetricSpec] = &[
         "Total non-retryable errors (401, 403, 404) that permanently disabled the connector",
     ),
     MetricSpec::new("inflight_operations", MetricType::ObservableGaugeU64)
-        .description("Current number of in-flight SQL Warehouse operations holding a concurrency permit"),
+        .description("Current number of in-flight SQL Warehouse operations holding a concurrency permit")
+        .auto_register(),
     // -- Statement metrics --
     MetricSpec::new(
         "statements_executed_total",

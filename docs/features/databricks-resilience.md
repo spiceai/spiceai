@@ -111,7 +111,7 @@ All spans include a `warehouse_id` field (SQL Warehouse spans) or the table/cata
 
 ### Component-Level Metrics
 
-The SQL Warehouse connector exposes per-dataset operational metrics via the `MetricsProvider` interface. These metrics must be **explicitly enabled** in the dataset's `metrics` section in the spicepod to be registered.
+The SQL Warehouse connector exposes per-dataset operational metrics via the `MetricsProvider` interface. Most metrics must be **explicitly enabled** in the dataset's `metrics` section in the spicepod to be registered. The `inflight_operations` metric is **auto-registered** and always appears in `/v1/metrics` without opt-in (it can be explicitly disabled with `enabled: false`).
 
 #### Available Metrics
 
@@ -120,7 +120,7 @@ The SQL Warehouse connector exposes per-dataset operational metrics via the `Met
 | `requests_total`              | Counter | Requests        | Total HTTP requests issued to the SQL Warehouse API (excl. retries)               |
 | `retries_total`               | Counter | Requests        | Total HTTP retries performed for transient failures                               |
 | `permanent_errors_total`      | Counter | Requests        | Total non-retryable errors (401, 403, 404) detected                               |
-| `inflight_operations`         | Gauge   | Requests        | Current number of in-flight SQL Warehouse operations holding a concurrency permit |
+| `inflight_operations`         | Gauge   | Requests        | Current number of in-flight SQL Warehouse operations holding a concurrency permit. Bounded by `max_concurrent_requests`. **Auto-registered.** |
 | `statements_executed_total`   | Counter | Statements      | Total SQL statements submitted for execution                                      |
 | `statement_polls_total`       | Counter | Statements      | Total polls made when waiting for async statement completion                      |
 | `statements_failed_total`     | Counter | Statements      | Total SQL statements that completed with FAILED status                            |
@@ -158,14 +158,14 @@ datasets:
       - name: connector_disabled
 ```
 
-Individual metrics can be disabled by setting `enabled: false`:
+Individual metrics can be disabled by setting `enabled: false`. This also works for auto-registered metrics like `inflight_operations`:
 
 ```yaml
     metrics:
       - name: requests_total
       - name: pool_active_connections
       - name: semaphore_available_permits
-      - name: statement_polls_total
+      - name: inflight_operations
         enabled: false
 ```
 
