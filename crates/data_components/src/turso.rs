@@ -693,18 +693,19 @@ impl TursoTableProvider {
                                 })
                             }
                             TursoValue::Text(rfc3339_str) => {
-                                // RFC3339 TEXT format: Parse and convert to target unit
+                                // RFC3339 TEXT format: Parse and convert to target unit.
+                                // Use unit-appropriate methods to avoid i64 nanosecond overflow
+                                // for dates outside ~1677-2262.
                                 use chrono::DateTime;
 
                                 // Parse RFC3339 string
                                 if let Ok(dt) = DateTime::parse_from_rfc3339(rfc3339_str) {
-                                    let timestamp_nanos = dt.timestamp_nanos_opt().unwrap_or(0);
-                                    Some(match unit {
-                                        TimeUnit::Second => timestamp_nanos / 1_000_000_000,
-                                        TimeUnit::Millisecond => timestamp_nanos / 1_000_000,
-                                        TimeUnit::Microsecond => timestamp_nanos / 1_000,
-                                        TimeUnit::Nanosecond => timestamp_nanos,
-                                    })
+                                    match unit {
+                                        TimeUnit::Second => Some(dt.timestamp()),
+                                        TimeUnit::Millisecond => Some(dt.timestamp_millis()),
+                                        TimeUnit::Microsecond => Some(dt.timestamp_micros()),
+                                        TimeUnit::Nanosecond => dt.timestamp_nanos_opt(),
+                                    }
                                 } else {
                                     // Parse failed, return NULL (lenient read behavior)
                                     None
@@ -2325,5 +2326,80 @@ mod tests {
             !result.contains("BETWEEN"),
             "BETWEEN with negative bounds should be rewritten, got: {result}"
         );
+    }
+
+    #[test]
+    fn test_rfc3339_timestamp_outside_nanos_range() {
+        use arrow::datatypes::{DataType, Field, TimeUnit};
+
+        // Year 2300 is outside the i64 nanosecond range (~1677-2262).
+        // Previously, timestamp_nanos_opt().unwrap_or(0) silently returned epoch 0.
+        let rfc3339_date = "2300-01-01T00:00:00Z";
+        let rows = vec![vec![TursoValue::Text(rfc3339_date.to_string())]];
+
+        // Second unit should work for any reasonable date
+        let schema_second = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Second, None),
+            true,
+        )]));
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema_second)
+            .expect("should succeed for Second unit");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampSecondArray>()
+            .expect("should be TimestampSecondArray");
+        assert!(!arr.is_null(0), "Second-precision timestamp should not be NULL for year 2300");
+        // 2300-01-01T00:00:00Z in seconds since epoch
+        assert!(arr.value(0) > 10_000_000_000, "timestamp should be far in the future, not epoch 0");
+
+        // Millisecond unit should also work
+        let schema_millis = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        )]));
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema_millis)
+            .expect("should succeed for Millisecond unit");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMillisecondArray>()
+            .expect("should be TimestampMillisecondArray");
+        assert!(!arr.is_null(0), "Millisecond-precision timestamp should not be NULL for year 2300");
+        assert!(arr.value(0) > 10_000_000_000_000, "timestamp should be far in the future, not epoch 0");
+
+        // Microsecond unit should also work
+        let schema_micros = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]));
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema_micros)
+            .expect("should succeed for Microsecond unit");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .expect("should be TimestampMicrosecondArray");
+        assert!(!arr.is_null(0), "Microsecond-precision timestamp should not be NULL for year 2300");
+        assert!(arr.value(0) > 10_000_000_000_000_000, "timestamp should be far in the future, not epoch 0");
+
+        // Nanosecond unit should return NULL (overflow) instead of epoch 0
+        let schema_nanos = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]));
+        let batch = TursoTableProvider::values_to_record_batch(&rows, &schema_nanos)
+            .expect("should succeed for Nanosecond unit");
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+            .expect("should be TimestampNanosecondArray");
+        // Nanosecond cannot represent year 2300 — should be NULL, not epoch 0
+        assert!(arr.is_null(0), "Nanosecond-precision timestamp should be NULL for year 2300 (overflow)");
     }
 }
