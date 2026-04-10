@@ -326,20 +326,6 @@ impl RefreshTask {
     }
 }
 
-fn get_primary_key_log_fmt(
-    data: &RecordBatch,
-    primary_keys: &[String],
-) -> crate::accelerated_table::Result<String> {
-    primary_keys
-        .iter()
-        .map(|key| {
-            let (value, _) = get_primary_key_value(data, key)?;
-            Ok(format!("{key}={value}"))
-        })
-        .collect::<crate::accelerated_table::Result<Vec<String>>>()
-        .map(|keys| keys.join(", "))
-}
-
 pub(crate) fn get_primary_key_value(
     data: &RecordBatch,
     key: &str,
