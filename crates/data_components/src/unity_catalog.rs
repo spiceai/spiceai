@@ -445,6 +445,13 @@ impl UCTable {
     pub fn is_queryable(&self) -> bool {
         self.parsed_table_type().is_queryable()
     }
+
+    /// Returns `true` when the table should be rejected up front if UC does
+    /// not report a read-compatible privilege.
+    #[must_use]
+    pub fn requires_read_permission_validation(&self) -> bool {
+        self.parsed_table_type().requires_read_permission_validation()
+    }
 }
 
 /// Databricks Unity Catalog table types.
@@ -468,6 +475,13 @@ impl UCTableType {
             self,
             Self::Managed | Self::External | Self::Foreign | Self::MaterializedView
         )
+    }
+
+    /// Returns `true` when UC effective-permissions is authoritative enough to
+    /// reject access up front.
+    #[must_use]
+    pub const fn requires_read_permission_validation(self) -> bool {
+        !matches!(self, Self::Foreign)
     }
 }
 
@@ -579,5 +593,38 @@ impl UCPermissionsEnvelope {
             .iter()
             .flat_map(|pa| pa.privileges.iter().map(|p| p.privilege.as_str()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UCColumn, UCTable};
+
+    fn make_table(table_type: &str) -> UCTable {
+        UCTable {
+            name: "table".to_string(),
+            catalog_name: "catalog".to_string(),
+            schema_name: "schema".to_string(),
+            table_type: table_type.to_string(),
+            data_source_format: "DELTA".to_string(),
+            columns: Vec::<UCColumn>::new(),
+            storage_location: None,
+        }
+    }
+
+    #[test]
+    fn test_foreign_tables_skip_strict_permission_validation() {
+        let table = make_table("FOREIGN");
+
+        assert!(table.is_queryable());
+        assert!(!table.requires_read_permission_validation());
+    }
+
+    #[test]
+    fn test_managed_tables_keep_permission_validation() {
+        let table = make_table("MANAGED");
+
+        assert!(table.is_queryable());
+        assert!(table.requires_read_permission_validation());
     }
 }

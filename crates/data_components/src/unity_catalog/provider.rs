@@ -191,6 +191,15 @@ impl UnityCatalogSchemaProvider {
             futures::stream::iter(candidates.into_iter().map(|(table, table_ref)| {
                 let client = Arc::clone(&client);
                 async move {
+                    if !table.requires_read_permission_validation() {
+                        tracing::debug!(
+                            table = %table.full_name(),
+                            table_type = %table.table_type,
+                            "Skipping strict Unity Catalog permission precheck for foreign table during catalog discovery"
+                        );
+                        return (table, table_ref, true);
+                    }
+
                     let has_permission =
                         match client.get_effective_permissions(&table.full_name()).await {
                             Ok(Some(perms)) if !perms.has_read_permission() => {

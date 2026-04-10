@@ -603,9 +603,7 @@ impl Databricks {
         dataset: &Dataset,
     ) -> DataConnectorResult<()> {
         let full_name = table_reference.to_string();
-
-        // 1) Check table type via UC metadata.
-        match uc_client.get_table(table_reference).await {
+        let should_validate_permissions = match uc_client.get_table(table_reference).await {
             Ok(Some(uc_table)) => {
                 if !uc_table.is_queryable() {
                     return Err(DataConnectorError::InvalidConfigurationNoSource {
@@ -622,10 +620,19 @@ impl Databricks {
                     table_type = %uc_table.table_type,
                     "Unity Catalog table type is supported"
                 );
+
+                if !uc_table.requires_read_permission_validation() {
+                    tracing::debug!(
+                        table = %full_name,
+                        table_type = %uc_table.table_type,
+                        "Skipping strict Unity Catalog permission precheck for foreign table; Databricks validates access at query time"
+                    );
+                    return Ok(());
+                }
+
+                true
             }
             Ok(None) => {
-                // Table not in UC — could be a non-UC table or a different
-                // catalog system. Proceed without validation.
                 tracing::debug!(
                     table = %full_name,
                     "Table not found in Unity Catalog; skipping UC validation"
@@ -640,10 +647,11 @@ impl Databricks {
                 );
                 return Ok(());
             }
-        }
+        };
 
         // 2) Check permissions via UC effective-permissions endpoint.
-        match uc_client.get_effective_permissions(&full_name).await {
+        if should_validate_permissions {
+            match uc_client.get_effective_permissions(&full_name).await {
             Ok(Some(perms)) => {
                 if !perms.has_read_permission() {
                     tracing::warn!(
@@ -672,6 +680,7 @@ impl Databricks {
                     error = %e,
                     "Failed to check Unity Catalog permissions; proceeding without validation"
                 );
+            }
             }
         }
 

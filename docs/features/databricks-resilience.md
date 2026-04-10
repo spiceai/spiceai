@@ -81,6 +81,7 @@ Before creating a table provider, the connector calls the UC Effective Permissio
 
 - **Catalog connector path**: Tables without read permissions are skipped during discovery with a debug-level log.
 - **Data connector path**: Returns an `InsufficientPermissions` error when a fully-qualified table reference is used.
+- **Foreign tables**: `FOREIGN` tables skip the strict UC table-level permission precheck because Lakehouse Federation access can be valid even when the effective-permissions endpoint does not report a table-level read privilege. Access is still enforced by Databricks when the query runs.
 - **Graceful degradation**: If the UC API is unreachable, the connector logs a warning and proceeds without validation. If the table is not found in UC, the connector proceeds without validation with a debug-level log (the table may not be a UC-managed table).
 
 ## Task History Instrumentation
