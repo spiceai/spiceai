@@ -375,30 +375,46 @@ pub(crate) fn get_primary_key_value(
 /// Returns a vector of (`operation_type`, `row_indices`) tuples
 #[must_use]
 fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationType, Vec<usize>)> {
-    if change_batch.record.num_rows() == 0 {
+    let num_rows = change_batch.record.num_rows();
+    if num_rows == 0 {
         return vec![];
     }
+
+    // Extract data batch and PK column indices once, instead of per-row.
+    let data_batch = change_batch.data_batch();
+    let pk_column_names = change_batch.primary_keys(0);
+    let pk_col_indices: Vec<usize> = pk_column_names
+        .iter()
+        .filter_map(|name| data_batch.schema().index_of(name).ok())
+        .collect();
 
     let mut sub_batches = Vec::new();
     let mut current_batch_indices = Vec::new();
     let mut current_op_type: Option<ChangeOperationType> = None;
     let mut seen_primary_keys: HashSet<String> = HashSet::new();
 
-    for row_id in 0..change_batch.record.num_rows() {
-        let row = change_batch.data(row_id);
+    for row_id in 0..num_rows {
         let op = change_batch.op(row_id);
         let op_type = ChangeOperationType::from_operation(&op);
-        let primary_keys_columns = change_batch.primary_keys(row_id);
-        let primary_keys = match get_primary_key_log_fmt(&row, &primary_keys_columns) {
-            Ok(pk) => pk,
-            Err(e) => {
-                tracing::error!("Failed to get primary key log format for row {row_id}: {e}");
-                continue;
-            }
+
+        // Build PK string directly from column arrays — no per-row RecordBatch allocation.
+        // If there are no PK columns (e.g., Kafka append-only), skip dedup tracking entirely.
+        let has_pks = !pk_col_indices.is_empty();
+        let primary_keys = if has_pks {
+            pk_col_indices
+                .iter()
+                .filter_map(|&col_idx| {
+                    arrow::util::display::array_value_to_string(data_batch.column(col_idx), row_id)
+                        .ok()
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            String::new()
         };
 
         let should_split = if let Some(current_type) = current_op_type {
-            current_type != op_type || (seen_primary_keys.contains(&primary_keys))
+            current_type != op_type || (has_pks && seen_primary_keys.contains(&primary_keys))
         } else {
             false
         };
@@ -418,7 +434,9 @@ fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationTyp
         }
 
         current_batch_indices.push(row_id);
-        seen_primary_keys.insert(primary_keys);
+        if has_pks {
+            seen_primary_keys.insert(primary_keys);
+        }
     }
 
     if !current_batch_indices.is_empty()
@@ -902,5 +920,63 @@ mod tests {
                 .expect("write_change should succeed"),
             WriteChangeResult::NoChange
         );
+    }
+
+    /// Creates a large `ChangeBatch` with `n` rows, all upserts with NO primary keys
+    /// (like Kafka's `wrap_data_as_change_batch` produces).
+    fn create_large_change_batch_no_pks(n: usize) -> ChangeBatch {
+        let ops: Vec<&str> = vec!["c"; n];
+        let primary_keys: Vec<Vec<&str>> = vec![vec![]; n]; // empty PK lists
+        let ids: Vec<i32> = (0..n as i32).collect();
+        let names: Vec<Option<&str>> = (0..n)
+            .map(|i| Some(if i % 2 == 0 { "Alice" } else { "Bob" }))
+            .collect();
+        create_test_change_batch(ops, &primary_keys, ids, names)
+    }
+
+    #[test]
+    fn test_group_into_sub_batches_no_pks_single_batch() {
+        let batch = create_test_change_batch(
+            vec!["c", "c", "c"],
+            &[vec![], vec![], vec![]],
+            vec![1, 2, 3],
+            vec![Some("a"), Some("b"), Some("c")],
+        );
+
+        let result = group_into_sub_batches(&batch);
+
+        // No PKs + all same op → 1 sub-batch with all rows
+        assert_eq!(result.len(), 1, "Should produce 1 sub-batch when no PKs");
+        assert_eq!(result[0].0, ChangeOperationType::Upsert);
+        assert_eq!(result[0].1, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_group_into_sub_batches_no_pks_mixed_ops() {
+        // Mixed ops with no PKs: should split only on op type boundaries
+        let ops = vec!["c", "c", "c", "d", "d", "c", "c"];
+        let primary_keys: Vec<Vec<&str>> = vec![vec![]; 7];
+        let ids = vec![1, 2, 3, 4, 5, 6, 7];
+        let names = vec![
+            Some("a"),
+            Some("b"),
+            Some("c"),
+            Some("d"),
+            Some("e"),
+            Some("f"),
+            Some("g"),
+        ];
+        let batch = create_test_change_batch(ops, &primary_keys, ids, names);
+
+        let result = group_into_sub_batches(&batch);
+
+        // Should split into 3 groups: [c,c,c], [d,d], [c,c]
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].0, ChangeOperationType::Upsert);
+        assert_eq!(result[0].1.len(), 3);
+        assert_eq!(result[1].0, ChangeOperationType::Delete);
+        assert_eq!(result[1].1.len(), 2);
+        assert_eq!(result[2].0, ChangeOperationType::Upsert);
+        assert_eq!(result[2].1.len(), 2);
     }
 }
