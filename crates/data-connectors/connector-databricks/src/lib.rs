@@ -697,12 +697,12 @@ pub struct DatabricksFactory;
 impl DatabricksFactory {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 
     #[must_use]
     pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
-        Arc::new(Self::default()) as Arc<dyn DataConnectorFactory>
+        Arc::new(Self) as Arc<dyn DataConnectorFactory>
     }
 }
 
