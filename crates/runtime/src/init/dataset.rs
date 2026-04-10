@@ -279,11 +279,7 @@ impl Runtime {
                 if let Err(e) =
                     register_component_metric(&metrics_provider, *metric, &instance_name)
                 {
-                    tracing::error!(
-                        "Unable to register component metric {}: {}",
-                        metric.name,
-                        e
-                    );
+                    tracing::error!("Unable to register component metric {}: {}", metric.name, e);
                 }
             }
 
