@@ -188,13 +188,13 @@ impl Client {
 
         let stream = response.bytes_stream();
 
-        let parsed_stream = parse_sse_stream_response(Box::pin(stream));
+        let parsed_stream = parse_sse_stream(Box::pin(stream));
 
         Ok(Box::pin(parsed_stream))
     }
 }
 
-fn parse_sse_stream_response(
+fn parse_sse_stream(
     stream: Pin<Box<dyn Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>> + Send>>,
 ) -> impl Stream<Item = Result<GenerateContentResponse>> + Send {
     futures::stream::unfold(
@@ -210,7 +210,7 @@ fn parse_sse_stream_response(
                         });
 
                         match text {
-                            Ok(t) => buffer.push_str(t),
+                            Ok(t) => buffer.push_str(&t.replace("\r\n", "\n")),
                             Err(e) => return Some((Err(e), (stream, buffer))),
                         }
                     }
@@ -270,13 +270,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parse_sse_stream_response() {
-        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]}}]}\n\n";
+    async fn test_parse_sse_stream() {
+        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]}}]}\r\n\r\n";
 
         let stream =
             futures::stream::once(async move { Ok::<_, reqwest::Error>(bytes::Bytes::from(body)) });
 
-        let mut parsed_stream = Box::pin(parse_sse_stream_response(Box::pin(stream)));
+        let mut parsed_stream = Box::pin(parse_sse_stream(Box::pin(stream)));
 
         let first = parsed_stream
             .next()
@@ -288,13 +288,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parse_sse_stream_response_partial_chunk() {
+    async fn test_parse_sse_stream_partial_chunk() {
         let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\"";
 
         let stream =
             futures::stream::once(async move { Ok::<_, reqwest::Error>(bytes::Bytes::from(body)) });
 
-        let mut parsed_stream = Box::pin(parse_sse_stream_response(Box::pin(stream)));
+        let mut parsed_stream = Box::pin(parse_sse_stream(Box::pin(stream)));
 
         let chunk = parsed_stream.next().await;
 
@@ -302,13 +302,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parse_sse_stream_response_invalid_chunk() {
-        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\"\n\n";
+    async fn test_parse_sse_stream_invalid_chunk() {
+        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\"\r\n\r\n";
 
         let stream =
             futures::stream::once(async move { Ok::<_, reqwest::Error>(bytes::Bytes::from(body)) });
 
-        let mut parsed_stream = Box::pin(parse_sse_stream_response(Box::pin(stream)));
+        let mut parsed_stream = Box::pin(parse_sse_stream(Box::pin(stream)));
 
         let chunk = parsed_stream
             .next()
