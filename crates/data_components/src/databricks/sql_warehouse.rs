@@ -55,7 +55,7 @@ use util::{
 };
 
 use crate::resilient_http::{
-    configure_client_builder, send_request_with_retry_concurrency_and_inflight,
+    RetryConfig, configure_client_builder, send_request_with_retry_and_concurrency_limit,
 };
 use tracing::Instrument;
 use util::retry_strategy::BackoffMethod;
@@ -446,6 +446,16 @@ impl SqlWarehouseApi {
         })
     }
 
+    fn retry_config(&self) -> RetryConfig<'_> {
+        RetryConfig {
+            concurrency_limit: Some(&self.request_semaphore),
+            max_retries: Some(self.http_max_retries),
+            backoff_method: Some(self.backoff_method),
+            retry_counter: Some(&self.metrics.retries_total),
+            inflight_counter: Some(&self.metrics.inflight_operations),
+        }
+    }
+
     async fn get_schema(&self, table: &TableReference) -> Result<SchemaRef, Error> {
         let table_name = table.to_string();
 
@@ -586,15 +596,11 @@ impl SqlWarehouseApi {
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let url = format!("{}/api/2.0/sql/statements/", self.base_url);
         async {
-            let response = send_request_with_retry_concurrency_and_inflight(
+            let response = send_request_with_retry_and_concurrency_limit(
                 "Databricks SQL Warehouse",
                 "execute SQL statement",
                 || self.client.post(&url).bearer_auth(token).json(payload),
-                Some(&self.request_semaphore),
-                Some(self.http_max_retries),
-                Some(self.backoff_method),
-                Some(&self.metrics.retries_total),
-                Some(&self.metrics.inflight_operations),
+                &self.retry_config(),
             )
             .await
             .context(HttpRequestFailedSnafu)?;
@@ -630,15 +636,11 @@ impl SqlWarehouseApi {
             .fetch_add(1, Ordering::Relaxed);
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let url = format!("{}/api/2.0/sql/statements/{statement_id}", self.base_url);
-        let response = send_request_with_retry_concurrency_and_inflight(
+        let response = send_request_with_retry_and_concurrency_limit(
             "Databricks SQL Warehouse",
             "poll SQL statement status",
             || self.client.get(&url).bearer_auth(token),
-            Some(&self.request_semaphore),
-            Some(self.http_max_retries),
-            Some(self.backoff_method),
-            Some(&self.metrics.retries_total),
-            Some(&self.metrics.inflight_operations),
+            &self.retry_config(),
         )
         .await
         .context(HttpRequestFailedSnafu)?;
@@ -700,15 +702,11 @@ impl SqlWarehouseApi {
                             return Some((Err(e), None));
                         }
                         api.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
-                        let resp = match send_request_with_retry_concurrency_and_inflight(
+                        let resp = match send_request_with_retry_and_concurrency_limit(
                             "Databricks SQL Warehouse",
                             "fetch next external chunk link",
                             || api.client.get(&url).bearer_auth(&token),
-                            Some(&api.request_semaphore),
-                            Some(api.http_max_retries),
-                            Some(api.backoff_method),
-                            Some(&api.metrics.retries_total),
-                            Some(&api.metrics.inflight_operations),
+                            &api.retry_config(),
                         )
                         .await
                         .context(HttpRequestFailedSnafu)
@@ -805,15 +803,11 @@ impl SqlWarehouseApi {
     async fn fetch_chunk_data(&self, url: &str) -> Result<bytes::Bytes, Error> {
         self.check_permanently_disabled()?;
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
-        let result = send_request_with_retry_concurrency_and_inflight(
+        let result = send_request_with_retry_and_concurrency_limit(
             "Databricks SQL Warehouse",
             "fetch statement result chunk",
             || self.client.get(url),
-            Some(&self.request_semaphore),
-            Some(self.http_max_retries),
-            Some(self.backoff_method),
-            Some(&self.metrics.retries_total),
-            Some(&self.metrics.inflight_operations),
+            &self.retry_config(),
         )
         .await
         .context(HttpRequestFailedSnafu)?

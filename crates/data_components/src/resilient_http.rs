@@ -22,8 +22,6 @@ use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Semaphore;
 use util::retry_strategy::{Backoff, BackoffMethod, RetryBackoffBuilder};
-
-
 const DEFAULT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -34,6 +32,17 @@ const MAX_HTTP_BACKOFF: Duration = Duration::from_secs(300);
 const RETRY_AFTER_MS_HEADER: &str = "retry-after-ms";
 const X_RETRY_AFTER_MS_HEADER: &str = "x-retry-after-ms";
 pub const SUPPORTED_ACCEPT_ENCODINGS: &str = "zstd, br, gzip, deflate";
+
+/// Groups the optional retry, concurrency, and observability knobs accepted by
+/// the `send_request_with_retry*` family of helpers.
+#[derive(Default)]
+pub struct RetryConfig<'a> {
+    pub concurrency_limit: Option<&'a Semaphore>,
+    pub max_retries: Option<usize>,
+    pub backoff_method: Option<BackoffMethod>,
+    pub retry_counter: Option<&'a AtomicU64>,
+    pub inflight_counter: Option<&'a AtomicU64>,
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum RetryReason {
@@ -54,9 +63,7 @@ where
         service_name,
         operation_name,
         build_request,
-        None,
-        None,
-        None,
+        &RetryConfig::default(),
     )
     .await
 }
@@ -65,68 +72,13 @@ pub async fn send_request_with_retry_and_concurrency_limit<F>(
     service_name: &str,
     operation_name: &str,
     build_request: F,
-    concurrency_limit: Option<&Semaphore>,
-    max_retries: Option<usize>,
-    backoff_method: Option<BackoffMethod>,
+    config: &RetryConfig<'_>,
 ) -> Result<Response, reqwest::Error>
 where
     F: Fn() -> RequestBuilder,
 {
-    send_request_with_retry_and_concurrency_limit_with_counter(
-        service_name,
-        operation_name,
-        build_request,
-        concurrency_limit,
-        max_retries,
-        backoff_method,
-        None,
-    )
-    .await
-}
-
-pub async fn send_request_with_retry_and_concurrency_limit_with_counter<F>(
-    service_name: &str,
-    operation_name: &str,
-    build_request: F,
-    concurrency_limit: Option<&Semaphore>,
-    max_retries: Option<usize>,
-    backoff_method: Option<BackoffMethod>,
-    retry_counter: Option<&AtomicU64>,
-) -> Result<Response, reqwest::Error>
-where
-    F: Fn() -> RequestBuilder,
-{
-    send_request_with_retry_concurrency_and_inflight::<F>(
-        service_name,
-        operation_name,
-        build_request,
-        concurrency_limit,
-        max_retries,
-        backoff_method,
-        retry_counter,
-        None,
-    )
-    .await
-}
-
-/// Like [`send_request_with_retry_and_concurrency_limit_with_counter`] but
-/// also accepts an optional `inflight_counter` that is incremented only while
-/// a concurrency permit is held (i.e. an HTTP request is actually in-flight).
-pub async fn send_request_with_retry_concurrency_and_inflight<F>(
-    service_name: &str,
-    operation_name: &str,
-    build_request: F,
-    concurrency_limit: Option<&Semaphore>,
-    max_retries: Option<usize>,
-    backoff_method: Option<BackoffMethod>,
-    retry_counter: Option<&AtomicU64>,
-    inflight_counter: Option<&AtomicU64>,
-) -> Result<Response, reqwest::Error>
-where
-    F: Fn() -> RequestBuilder,
-{
-    let max_retries = max_retries.unwrap_or(DEFAULT_HTTP_RETRIES);
-    let transient_method = backoff_method.unwrap_or(BackoffMethod::Fibonacci);
+    let max_retries = config.max_retries.unwrap_or(DEFAULT_HTTP_RETRIES);
+    let transient_method = config.backoff_method.unwrap_or(BackoffMethod::Fibonacci);
     let mut transient_backoff = RetryBackoffBuilder::new()
         .method(transient_method)
         .max_duration(Some(MAX_HTTP_BACKOFF))
@@ -140,19 +92,20 @@ where
     let mut retries = 0usize;
 
     let inc_inflight = || {
-        if let Some(c) = inflight_counter {
+        if let Some(c) = config.inflight_counter {
             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     };
     let dec_inflight = || {
-        if let Some(c) = inflight_counter {
+        if let Some(c) = config.inflight_counter {
             c.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
     };
 
     loop {
         let permit =
-            acquire_concurrency_permit(concurrency_limit, service_name, operation_name).await;
+            acquire_concurrency_permit(config.concurrency_limit, service_name, operation_name)
+                .await;
         inc_inflight();
         match add_supported_accept_encoding_header(build_request())
             .send()
@@ -175,7 +128,7 @@ where
                     }
 
                     retries += 1;
-                    if let Some(counter) = retry_counter {
+                    if let Some(counter) = config.retry_counter {
                         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     let retry_after = retry_after_duration(response.headers());
@@ -225,7 +178,7 @@ where
                 }
 
                 retries += 1;
-                if let Some(counter) = retry_counter {
+                if let Some(counter) = config.retry_counter {
                     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 let delay = next_backoff(reason, &mut transient_backoff, &mut rate_limit_backoff);
