@@ -49,13 +49,13 @@ on:
           - '90'
         default: 'all'
       profile_option:
-        description: 'Which Rust build profile to use? (Default is release)'
+        description: 'Which Rust build profile to use? (Default is release-lto)'
         required: false
         type: choice
         options:
-          - 'release'
           - 'release-lto'
-        default: 'release'
+          - 'release'
+        default: 'release-lto'
 
 jobs:
   setup-matrix:
@@ -130,7 +130,7 @@ jobs:
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
     env:
-      RUST_PROFILE: ${{ github.event.inputs.profile_option || (startsWith(github.ref, 'refs/tags/v') && 'release-lto' || 'release') }}
+      RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
       CARGO_NET_GIT_FETCH_WITH_CLI: true

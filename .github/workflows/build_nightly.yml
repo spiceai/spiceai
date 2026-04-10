@@ -12,13 +12,13 @@ on:
         type: boolean
         default: false
       profile_option:
-        description: 'Which Rust build profile to use? (Default is release)'
+        description: 'Which Rust build profile to use? (Default is release-lto)'
         required: false
         type: choice
         options:
-          - 'release'
           - 'release-lto'
-        default: 'release'
+          - 'release'
+        default: 'release-lto'
 
 env:
   # CI performance optimizations
