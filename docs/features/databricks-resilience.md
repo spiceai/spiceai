@@ -43,13 +43,15 @@ This applies to both the data connector and catalog connector paths.
 
 ### Permanent-Disable Fuse
 
-When `disable_on_permanent_error` is `true` (default), non-retryable HTTP status codes (401 Unauthorized, 403 Forbidden, 404 Not Found) permanently disable the connector instance. Subsequent queries fail immediately with a `PermanentlyDisabled` error instead of issuing further HTTP requests. This prevents cascading failures when credentials are revoked or the warehouse is deleted. To recover, fix the underlying issue and restart the runtime.
+When `disable_on_permanent_error` is `true` (default), non-retryable HTTP status codes (401 Unauthorized, 403 Forbidden, 404 Not Found) on **statement-execution requests** permanently disable the connector instance. Subsequent queries fail immediately with a `PermanentlyDisabled` error instead of issuing further HTTP requests. This prevents cascading failures when credentials are revoked or the warehouse is deleted. To recover, fix the underlying issue and restart the runtime.
+
+Permanent-disable detection is **not** applied to statement-poll or result-fetch requests, because transient 403/404 responses on those paths (e.g., expired pre-signed URLs or purged statement results) do not indicate a configuration problem.
 
 ### Retry Behavior
 
 The SQL Warehouse connector has two layers of retry:
 
-1. **HTTP-level retries** — Handled by the shared `resilient_http` module. Retries on 429 (rate-limit) and 5xx (server error) responses. Respects `Retry-After`, `retry-after-ms`, and `x-retry-after-ms` headers. Uses the configured `backoff_method` with a maximum backoff of 300 seconds.
+1. **HTTP-level retries** — Handled by the shared `resilient_http` module. Retries on 408 (request timeout), 429 (rate-limit), and 5xx (server error) responses, as well as transient network, connection, and timeout errors. Respects `Retry-After`, `retry-after-ms`, and `x-retry-after-ms` headers. Uses the configured `backoff_method` with a maximum backoff of 300 seconds.
 
 2. **Statement poll retries** — When a SQL statement enters PENDING or RUNNING state (async execution), the connector polls `GET /api/2.0/sql/statements/{statement_id}` with fibonacci backoff up to `statement_max_retries` times. If the statement does not reach a terminal state within the retry budget, it returns a `QueryStillRunning` or `InvalidWarehouseState` error.
 
@@ -75,7 +77,7 @@ Unsupported table types are:
 
 ### Permission Checking
 
-Before creating a table provider, the connector calls the UC Effective Permissions API (`GET /api/2.1/unity-catalog/effective-permissions/table/{full_name}`) to verify the current principal has `SELECT` or `ALL_PRIVILEGES` on the table.
+Before creating a table provider, the connector calls the UC Effective Permissions API (`GET /api/2.1/unity-catalog/effective-permissions/table/{full_name}`) to verify the current principal has a read-compatible privilege on the table. The following privileges are treated as granting read access: `SELECT`, `ALL_PRIVILEGES`, `ALL PRIVILEGES`, `OWNER`, and `OWNERSHIP`.
 
 - **Catalog connector path**: Tables without read permissions are skipped during discovery with a warning-level log.
 - **Data connector path**: Returns an `InsufficientPermissions` error when a fully-qualified table reference is used.
