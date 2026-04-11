@@ -386,12 +386,7 @@ impl Runtime {
             }
 
             if let Err(err) = Arc::clone(&runtime)
-                .register_loaded_dataset(
-                    Arc::clone(&ds),
-                    connector,
-                    None,
-                    bootstrap_status.clone(),
-                )
+                .register_loaded_dataset(Arc::clone(&ds), connector, None, bootstrap_status.clone())
                 .await
             {
                 if runtime.status.is_shutdown() {
