@@ -75,48 +75,57 @@ impl ConnectorParamsBuilder {
         let mut unsupported_type_action = None;
         let (params, prefix, parameters, app, runtime) = match &self.component {
             ConnectorComponent::Catalog(catalog) => {
-                let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
-                let connector_factory = guard.get(&name);
+                let (prefix, parameters) = {
+                    let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+                    let connector_factory = guard.get(&name);
 
-                let factory =
-                    connector_factory.ok_or_else(|| DataConnectorError::InvalidConnectorType {
-                        dataconnector: name.clone(),
-                        connector_component: self.component.clone(),
+                    let factory = connector_factory.ok_or_else(|| {
+                        DataConnectorError::InvalidConnectorType {
+                            dataconnector: name.clone(),
+                            connector_component: self.component.clone(),
+                        }
                     })?;
+
+                    (factory.prefix(), factory.parameters())
+                };
 
                 (
                     get_params_with_secrets(Arc::clone(&secrets), &catalog.params).await,
-                    factory.prefix(),
-                    factory.parameters(),
+                    prefix,
+                    parameters,
                     Some(catalog.app()),
                     Some(catalog.runtime()),
                 )
             }
             ConnectorComponent::Dataset(dataset) => {
-                let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
-                let connector_factory = guard.get(&name);
-
                 unsupported_type_action = dataset.unsupported_type_action;
 
-                let factory = connector_factory.ok_or_else(|| {
-                    if name == ODBC_DATACONNECTOR {
-                        DataConnectorError::OdbcNotInstalled {
-                            connector_component: self.component.clone(),
+                let (prefix, parameters) = {
+                    let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+                    let connector_factory = guard.get(&name);
+
+                    let factory = connector_factory.ok_or_else(|| {
+                        if name == ODBC_DATACONNECTOR {
+                            DataConnectorError::OdbcNotInstalled {
+                                connector_component: self.component.clone(),
+                            }
+                        } else {
+                            DataConnectorError::InvalidConnectorType {
+                                dataconnector: name.clone(),
+                                connector_component: self.component.clone(),
+                            }
                         }
-                    } else {
-                        DataConnectorError::InvalidConnectorType {
-                            dataconnector: name.clone(),
-                            connector_component: self.component.clone(),
-                        }
-                    }
-                })?;
+                    })?;
+
+                    (factory.prefix(), factory.parameters())
+                };
 
                 let params = get_params_with_secrets(Arc::clone(&secrets), &dataset.params).await;
 
                 (
                     params,
-                    factory.prefix(),
-                    factory.parameters(),
+                    prefix,
+                    parameters,
                     Some(dataset.app()),
                     Some(dataset.runtime()),
                 )
