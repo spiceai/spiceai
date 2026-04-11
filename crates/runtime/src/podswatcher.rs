@@ -221,13 +221,13 @@ fn is_root_spicepod_event(root_spicepod_paths: &[PathBuf; 2], event: &notify::Ev
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::event::{AccessKind, DataChange, ModifyKind, RenameMode};
+    use notify::event::{AccessKind, DataChange, EventAttributes, ModifyKind, RenameMode};
 
     fn watcher_event(kind: EventKind, path: &str) -> notify::Event {
         notify::Event {
             kind,
             paths: vec![PathBuf::from(path)],
-            attrs: Default::default(),
+            attrs: EventAttributes::default(),
         }
     }
 
