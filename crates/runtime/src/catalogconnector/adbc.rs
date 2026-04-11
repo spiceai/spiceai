@@ -407,13 +407,13 @@ impl AdbcCatalogProvider {
         schema_name: &str,
         table_names: Vec<String>,
     ) -> HashMap<String, Arc<dyn TableProvider>> {
+        type ProviderResult =
+            std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+
         let start = Instant::now();
         let dialect = dialect_for_driver(&self.driver_name);
         let include = self.include.clone();
         let schema_name_owned = schema_name.to_owned();
-
-        type ProviderResult =
-            std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
         let mut tables: HashMap<String, Arc<dyn TableProvider>> = HashMap::new();
         let mut stream = stream::iter(

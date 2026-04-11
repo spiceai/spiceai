@@ -140,7 +140,7 @@ impl Runtime {
             let future: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
                 cloned_self
                     .load_dataset(ds_clone, bootstrap_status, load_semaphore)
-                    .await
+                    .await;
             })
                 as Pin<Box<dyn Future<Output = ()> + Send>>;
             dataset_futures.insert(ds.name.clone(), future);
