@@ -185,9 +185,10 @@ impl UnityCatalogSchemaProvider {
             candidates.push((table, table_reference));
         }
 
-        // Second pass: run advisory permission checks concurrently (bounded).
+        // Second pass: check permissions concurrently (bounded). Explicitly
+        // denied tables are excluded; ambiguous/unreachable cases are kept.
         let max_concurrent_permission_checks = 5;
-        let permission_results: Vec<(UCTable, TableReference)> =
+        let permission_results: Vec<Option<(UCTable, TableReference)>> =
             futures::stream::iter(candidates.into_iter().map(|(table, table_ref)| {
                 let client = Arc::clone(&client);
                 async move {
@@ -197,17 +198,20 @@ impl UnityCatalogSchemaProvider {
                             table_type = %table.table_type,
                             "Skipping strict Unity Catalog permission precheck for foreign table during catalog discovery"
                         );
-                        return (table, table_ref);
+                        return Some((table, table_ref));
                     }
 
                     match client.get_effective_permissions(&table.full_name()).await {
                         Ok(Some(perms)) if !perms.has_read_permission() => {
+                            // Explicit denial: skip this table during catalog
+                            // discovery so the connector-level retry handles it.
                             tracing::warn!(
                                 table = %table.full_name(),
                                 principals = ?perms.principals(),
                                 privileges = ?perms.all_privileges(),
-                                "Unity Catalog effective-permissions did not report a read-compatible privilege during catalog discovery; proceeding and deferring to Databricks query-time validation"
+                                "Skipping table during catalog discovery: no read-compatible privilege found in effective-permissions response"
                             );
+                            return None;
                         }
                         Ok(None) => {
                             tracing::warn!(
@@ -225,16 +229,16 @@ impl UnityCatalogSchemaProvider {
                         Ok(Some(_)) => {}
                     }
 
-                    (table, table_ref)
+                    Some((table, table_ref))
                 }
             }))
             .buffer_unordered(max_concurrent_permission_checks)
             .collect()
             .await;
 
-        // Third pass: create table providers for retained tables.
+        // Third pass: create table providers for permitted tables.
         let mut tables_map = HashMap::new();
-        for (table, table_reference) in permission_results {
+        for (table, table_reference) in permission_results.into_iter().flatten() {
             let table_provider = match table_creator.table_provider(table_reference.clone()).await {
                 Ok(provider) => provider,
                 Err(source) => {
@@ -369,12 +373,15 @@ impl UnityCatalogSchemaProvider {
         if table.requires_read_permission_validation() {
             match client.get_effective_permissions(&table.full_name()).await {
                 Ok(Some(perms)) if !perms.has_read_permission() => {
+                    // Explicit denial: skip this table so the connector-level
+                    // retry handles it when the dataset is loaded individually.
                     tracing::warn!(
                         table = %table.full_name(),
                         principals = ?perms.principals(),
                         privileges = ?perms.all_privileges(),
-                        "Unity Catalog effective-permissions did not report a read-compatible privilege during catalog refresh; proceeding and deferring to Databricks query-time validation"
+                        "Skipping table during catalog refresh: no read-compatible privilege found in effective-permissions response"
                     );
+                    return None;
                 }
                 Ok(None) => {
                     tracing::warn!(

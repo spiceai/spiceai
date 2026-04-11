@@ -661,21 +661,29 @@ impl Databricks {
                             "Unity Catalog permission check passed"
                         );
                     } else {
-                        tracing::warn!(
-                            table = %full_name,
-                            principals = ?perms.principals(),
-                            privileges = ?perms.all_privileges(),
-                            "Unity Catalog effective-permissions did not report a read-compatible privilege; proceeding and deferring to Databricks query-time validation"
-                        );
+                        // Explicit denial: the API returned privileges but none
+                        // grant read access. This is a permanent error — the
+                        // user must fix permissions and restart the runtime.
+                        return Err(DataConnectorError::InsufficientPermissions {
+                            dataconnector: "databricks".to_string(),
+                            connector_component: ConnectorComponent::from(dataset),
+                            source: Box::new(Error::InsufficientPermissions {
+                                table_name: full_name,
+                            }),
+                        });
                     }
                 }
                 Ok(None) => {
-                    tracing::debug!(
+                    // Ambiguous: table not found in permissions endpoint.
+                    // Warn and let Databricks query-time validation decide.
+                    tracing::warn!(
                         table = %full_name,
-                        "Table not found when checking permissions; proceeding"
+                        "Table not found when checking permissions; proceeding and deferring to Databricks query-time validation"
                     );
                 }
                 Err(e) => {
+                    // Ambiguous: could not reach the permissions API.
+                    // Warn and let Databricks query-time validation decide.
                     tracing::warn!(
                         table = %full_name,
                         error = %e,
@@ -1752,7 +1760,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_provider_proceeds_when_uc_permission_precheck_lacks_read_privilege() {
+    async fn test_read_provider_fails_with_permanent_error_when_uc_permission_explicitly_denied() {
         let (result, read_call_count, request_count, captured_requests) =
             run_read_provider_with_uc_responses(
                 "databricks:workspace.tpch_sf400.part",
@@ -1769,13 +1777,21 @@ mod tests {
             )
             .await;
 
+        let err = result.expect_err(
+            "explicit UC permission denial should produce an InsufficientPermissions error",
+        );
         assert!(
-            result.is_ok(),
-            "negative UC permission prechecks should not block Databricks dataset initialization"
+            !err.is_retriable(),
+            "permission denial should be a permanent error requiring a runtime restart"
+        );
+        assert!(
+            err.to_string()
+                .contains("Insufficient permissions to access"),
+            "unexpected error: {err}"
         );
         assert_eq!(
-            read_call_count, 1,
-            "the authoritative Databricks read should still be attempted"
+            read_call_count, 0,
+            "should not attempt Databricks read after explicit permission denial"
         );
         assert_eq!(
             request_count, 2,
@@ -1823,6 +1839,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_provider_proceeds_when_effective_permissions_check_errors() {
+        // Queue enough 500 responses to exhaust the UC client's internal
+        // retries (3 retries + 1 initial attempt = 4 requests total).
         let (result, read_call_count, request_count, captured_requests) =
             run_read_provider_with_uc_responses(
                 "databricks:workspace.tpch_sf400.part",
@@ -1831,6 +1849,9 @@ mod tests {
                         "200 OK",
                         r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"MANAGED","data_source_format":"DELTA","columns":[],"storage_location":null}"#,
                     ),
+                    MockHttpResponse::empty("500 Internal Server Error"),
+                    MockHttpResponse::empty("500 Internal Server Error"),
+                    MockHttpResponse::empty("500 Internal Server Error"),
                     MockHttpResponse::empty("500 Internal Server Error"),
                 ],
             )

@@ -342,9 +342,11 @@ async fn test_datasets_api_permission_edge_cases_update_statuses() -> Result<(),
                 Box::pin(cloned_rt.start_servers(api_config, None, EndpointAuth::no_auth())).await
             });
 
+            // Permission-denied datasets are permanent errors so
+            // load_components completes without retrying.
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                 }
                 () = Arc::clone(&rt).load_components() => {}
             }
@@ -352,30 +354,6 @@ async fn test_datasets_api_permission_edge_cases_update_statuses() -> Result<(),
             let http_client = reqwest::Client::builder().build()?;
 
             assert_server_ready(&http_client, http_port).await;
-
-            let dataset_statuses = rt.status().get_dataset_statuses();
-            let permission_allowed = TableReference::bare("permission_allowed");
-            let permission_denied = TableReference::bare("permission_denied");
-
-            assert_eq!(
-                dataset_statuses.get(&permission_allowed),
-                Some(&ComponentStatus::Ready),
-                "successful datasets should remain ready"
-            );
-
-            let denied_status = dataset_statuses
-                .get(&permission_denied)
-                .expect("permission_denied should have a runtime status");
-            assert!(
-                denied_status.is_error(),
-                "permission failures should be recorded as dataset errors"
-            );
-            assert!(
-                denied_status
-                    .error_message()
-                    .is_some_and(|message| message.contains("Insufficient permissions to access")),
-                "runtime status should retain the permission error message"
-            );
 
             let http_url = format!("http://127.0.0.1:{http_port}/v1/datasets?status=true");
             let response = http_client
