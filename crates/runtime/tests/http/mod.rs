@@ -164,7 +164,6 @@ fn expected_http_json_edge_rows() -> Value {
     ])
 }
 
-
 async fn start_http_server() -> Result<
     (
         tokio::sync::oneshot::Sender<()>,
@@ -281,8 +280,8 @@ async fn setup_http_json_edge_runtime(
     accelerated: bool,
     sql_results_cache: Option<SQLResultsCacheConfig>,
 ) -> Result<Arc<Runtime>, String> {
-    let mut app_builder = AppBuilder::new(test_name)
-        .with_dataset(make_http_json_edge_dataset(base_url, accelerated));
+    let mut app_builder =
+        AppBuilder::new(test_name).with_dataset(make_http_json_edge_dataset(base_url, accelerated));
 
     if let Some(sql_results_cache) = sql_results_cache {
         app_builder = app_builder.with_sql_cache(sql_results_cache);
@@ -292,9 +291,7 @@ async fn setup_http_json_edge_runtime(
     Ok(Arc::new(rt))
 }
 
-async fn run_http_json_edge_query(
-    rt: &Runtime,
-) -> Result<(CacheStatus, Vec<RecordBatch>), String> {
+async fn run_http_json_edge_query(rt: &Runtime) -> Result<(CacheStatus, Vec<RecordBatch>), String> {
     let query_result = rt
         .datafusion()
         .query_builder(HTTP_JSON_EDGE_QUERY)
@@ -325,10 +322,16 @@ fn assert_http_json_edge_batches(batches: &[RecordBatch]) {
         .expect("expected at least one record batch")
         .schema();
     assert!(matches!(schema.field(0).data_type(), DataType::Int64));
-    assert!(matches!(schema.field(1).data_type(), DataType::Utf8 | DataType::LargeUtf8));
+    assert!(matches!(
+        schema.field(1).data_type(),
+        DataType::Utf8 | DataType::LargeUtf8
+    ));
     assert!(matches!(schema.field(2).data_type(), DataType::Boolean));
     assert!(matches!(schema.field(3).data_type(), DataType::Float64));
-    assert!(matches!(schema.field(4).data_type(), DataType::Utf8 | DataType::LargeUtf8));
+    assert!(matches!(
+        schema.field(4).data_type(),
+        DataType::Utf8 | DataType::LargeUtf8
+    ));
     assert!(matches!(schema.field(5).data_type(), DataType::Union(_, _)));
     assert!(matches!(schema.field(6).data_type(), DataType::Union(_, _)));
     assert!(matches!(schema.field(7).data_type(), DataType::Int64));
@@ -684,7 +687,8 @@ async fn test_http_json_edge_cases_results_cache() -> Result<(), String> {
             assert_http_json_edge_batches(&first_batches);
             assert_eq!(edge_request_count.load(Ordering::SeqCst), 1);
 
-            let (second_cache_status, second_batches) = run_http_json_edge_query(rt.as_ref()).await?;
+            let (second_cache_status, second_batches) =
+                run_http_json_edge_query(rt.as_ref()).await?;
             assert_eq!(second_cache_status, CacheStatus::CacheHit);
             assert_http_json_edge_batches(&second_batches);
             assert_eq!(
@@ -708,7 +712,10 @@ async fn test_http_json_edge_cases_results_cache() -> Result<(), String> {
                 ),
                 "unexpected first HTTP cache header: {first_http_cache_header:?}"
             );
-            assert_eq!(second_http_cache_header.as_deref(), Some("Hit from spiceai"));
+            assert_eq!(
+                second_http_cache_header.as_deref(),
+                Some("Hit from spiceai")
+            );
 
             rt.shutdown().await;
 
