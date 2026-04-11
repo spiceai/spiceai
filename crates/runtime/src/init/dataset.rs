@@ -137,9 +137,12 @@ impl Runtime {
             let ds_clone = Arc::clone(ds);
             let cloned_self = Arc::clone(&self);
             let load_semaphore = Arc::clone(&semaphore);
-            let future: Pin<Box<dyn Future<Output = ()> + Send>> =
-                Box::pin(async move { cloned_self.load_dataset(ds_clone, bootstrap_status, load_semaphore).await })
-                    as Pin<Box<dyn Future<Output = ()> + Send>>;
+            let future: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+                cloned_self
+                    .load_dataset(ds_clone, bootstrap_status, load_semaphore)
+                    .await
+            })
+                as Pin<Box<dyn Future<Output = ()> + Send>>;
             dataset_futures.insert(ds.name.clone(), future);
         }
 
@@ -160,7 +163,9 @@ impl Runtime {
                 // Chain the localpod dataset load after its parent
                 let chained_future = Box::pin(async move {
                     parent_future.await;
-                    cloned_self.load_dataset(ds_clone, bootstrap_status, load_semaphore).await;
+                    cloned_self
+                        .load_dataset(ds_clone, bootstrap_status, load_semaphore)
+                        .await;
                 }) as Pin<Box<dyn Future<Output = ()> + Send>>;
 
                 // Replace parent future with the chained future
@@ -491,6 +496,10 @@ impl Runtime {
         };
 
         tracing::debug!(dataset = %ds.name, duration_ms = %schema_start.elapsed().as_millis(), "Dataset schema inference complete");
+
+        // Release the load permit now that schema inference is done.
+        // Registration and bookkeeping don't load the source.
+        drop(_load_guard);
 
         let register_start = Instant::now();
         match Arc::clone(&self)

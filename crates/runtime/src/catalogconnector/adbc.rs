@@ -407,29 +407,34 @@ impl AdbcCatalogProvider {
         type ProviderResult =
             std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
-        let results: Vec<(String, ProviderResult)> =
-            stream::iter(table_names.into_iter().filter_map(|table_name| {
-                let schema_with_table = format!("{schema_name_owned}.{table_name}");
-                if let Some(include) = &include
-                    && !include.is_match(&schema_with_table)
-                {
-                    tracing::debug!("Table {schema_with_table} is not included, skipping");
-                    return None;
-                }
-                Some(table_name)
-            }).map(|table_name| {
-                let table_factory = &self.table_factory;
-                let schema_ref = &schema_name_owned;
-                let dialect = dialect.clone();
-                async move {
-                    let table_ref = TableReference::partial(schema_ref.to_owned(), table_name.clone());
-                    let result = table_factory.table_provider(table_ref, dialect).await;
-                    (table_name, result)
-                }
-            }))
-            .buffer_unordered(CATALOG_DISCOVERY_CONCURRENCY)
-            .collect()
-            .await;
+        let results: Vec<(String, ProviderResult)> = stream::iter(
+            table_names
+                .into_iter()
+                .filter_map(|table_name| {
+                    let schema_with_table = format!("{schema_name_owned}.{table_name}");
+                    if let Some(include) = &include
+                        && !include.is_match(&schema_with_table)
+                    {
+                        tracing::debug!("Table {schema_with_table} is not included, skipping");
+                        return None;
+                    }
+                    Some(table_name)
+                })
+                .map(|table_name| {
+                    let table_factory = &self.table_factory;
+                    let schema_ref = &schema_name_owned;
+                    let dialect = dialect.clone();
+                    async move {
+                        let table_ref =
+                            TableReference::partial(schema_ref.to_owned(), table_name.clone());
+                        let result = table_factory.table_provider(table_ref, dialect).await;
+                        (table_name, result)
+                    }
+                }),
+        )
+        .buffer_unordered(CATALOG_DISCOVERY_CONCURRENCY)
+        .collect()
+        .await;
 
         let mut tables = HashMap::new();
         for (table_name, result) in results {
