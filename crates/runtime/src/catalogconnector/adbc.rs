@@ -366,7 +366,12 @@ impl AdbcCatalogProvider {
 
         let schema_count = schema_tables.len();
         let table_count: usize = schema_tables.iter().map(|(_, t)| t.len()).sum();
-        tracing::info!(duration_ms = %discovery_start.elapsed().as_millis(), schemas = schema_count, tables = table_count, "ADBC: metadata discovery complete");
+        tracing::info!(
+            duration_ms = discovery_start.elapsed().as_millis(),
+            schemas = schema_count,
+            tables = table_count,
+            "ADBC: metadata discovery complete"
+        );
 
         // Phase 2: Create table providers concurrently.
         let mut schemas = HashMap::new();
@@ -389,7 +394,10 @@ impl AdbcCatalogProvider {
             *guard = schemas;
         }
 
-        tracing::info!(duration_ms = %refresh_start.elapsed().as_millis(), "ADBC: catalog refresh complete");
+        tracing::info!(
+            duration_ms = refresh_start.elapsed().as_millis(),
+            "ADBC: catalog refresh complete"
+        );
 
         Ok(())
     }
@@ -407,7 +415,8 @@ impl AdbcCatalogProvider {
         type ProviderResult =
             std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
 
-        let results: Vec<(String, ProviderResult)> = stream::iter(
+        let mut tables: HashMap<String, Arc<dyn TableProvider>> = HashMap::new();
+        let mut stream = stream::iter(
             table_names
                 .into_iter()
                 .filter_map(|table_name| {
@@ -427,17 +436,15 @@ impl AdbcCatalogProvider {
                     async move {
                         let table_ref =
                             TableReference::partial(schema_ref.to_owned(), table_name.clone());
-                        let result = table_factory.table_provider(table_ref, dialect).await;
+                        let result: ProviderResult =
+                            table_factory.table_provider(table_ref, dialect).await;
                         (table_name, result)
                     }
                 }),
         )
-        .buffer_unordered(CATALOG_DISCOVERY_CONCURRENCY)
-        .collect()
-        .await;
+        .buffer_unordered(CATALOG_DISCOVERY_CONCURRENCY);
 
-        let mut tables = HashMap::new();
-        for (table_name, result) in results {
+        while let Some((table_name, result)) = stream.next().await {
             match result {
                 Ok(provider) => {
                     tables.insert(table_name, provider);
@@ -453,7 +460,7 @@ impl AdbcCatalogProvider {
             }
         }
 
-        tracing::debug!(duration_ms = %start.elapsed().as_millis(), schema = %schema_name, tables = tables.len(), "ADBC: schema table providers created");
+        tracing::debug!(duration_ms = start.elapsed().as_millis(), schema = %schema_name, tables = tables.len(), "ADBC: schema table providers created");
         tables
     }
 }

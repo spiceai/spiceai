@@ -155,7 +155,7 @@ impl SnowflakeConnectionPool {
         tracing::debug!("Snowflake API client created, validating connectivity...");
         let validation_start = Instant::now();
         if let Err(err) = api.exec("SELECT 1").await {
-            tracing::warn!(duration_ms = %validation_start.elapsed().as_millis(), error = %err, "Snowflake connectivity validation failed");
+            tracing::warn!(duration_ms = validation_start.elapsed().as_millis(), error = %err, "Snowflake connectivity validation failed");
             match err {
                 snowflake_api::SnowflakeApiError::AuthError(auth_err) => {
                     // for incorrect werehouse or account param the library fails
@@ -177,7 +177,10 @@ impl SnowflakeConnectionPool {
             }
         }
 
-        tracing::debug!(duration_ms = %validation_start.elapsed().as_millis(), "Snowflake connectivity validation succeeded");
+        tracing::debug!(
+            duration_ms = validation_start.elapsed().as_millis(),
+            "Snowflake connectivity validation succeeded"
+        );
 
         let mut join_push_context_str = format!("username={username},account={account}");
         if let Some(warehouse) = warehouse {
@@ -187,7 +190,10 @@ impl SnowflakeConnectionPool {
             let _ = write!(join_push_context_str, ",role={role}");
         }
 
-        tracing::info!(duration_ms = %pool_start.elapsed().as_millis(), "Snowflake connection pool created");
+        tracing::info!(
+            duration_ms = pool_start.elapsed().as_millis(),
+            "Snowflake connection pool created"
+        );
 
         Ok(Self {
             api: Arc::new(api),

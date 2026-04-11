@@ -160,7 +160,7 @@ impl SnowflakeCatalogProvider {
             *guard = schemas;
         }
 
-        tracing::info!(duration_ms = %refresh_start.elapsed().as_millis(), database = %self.database, "Snowflake: catalog refresh complete");
+        tracing::info!(duration_ms = refresh_start.elapsed().as_millis(), database = %self.database, "Snowflake: catalog refresh complete");
 
         Ok(())
     }
@@ -198,7 +198,11 @@ impl SnowflakeCatalogProvider {
                         }
                     }
                 }
-                tracing::debug!(duration_ms = %start.elapsed().as_millis(), count = names.len(), "Snowflake: listed schemas");
+                tracing::debug!(
+                    duration_ms = start.elapsed().as_millis(),
+                    count = names.len(),
+                    "Snowflake: listed schemas"
+                );
                 Ok(names)
             }
             snowflake_api::QueryResult::Json(_) => UnexpectedResponseSnafu {
@@ -291,9 +295,6 @@ impl SnowflakeSchemaProvider {
     /// Table providers are created concurrently (up to [`CATALOG_DISCOVERY_CONCURRENCY`]
     /// at a time) to reduce overall latency when a schema contains many tables.
     async fn refresh_tables(&self) -> Result<()> {
-        type ProviderResult =
-            std::result::Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
-
         let start = Instant::now();
         let table_names = self.list_tables().await?;
 
@@ -314,30 +315,27 @@ impl SnowflakeSchemaProvider {
 
         tracing::debug!(database = %self.database, schema = %self.schema_name, count = filtered_tables.len(), "Snowflake: creating table providers concurrently");
 
-        let results: Vec<(String, ProviderResult)> =
-            stream::iter(filtered_tables.into_iter().map(|table_name| {
-                let database = self.database.clone();
-                let schema_name = self.schema_name.clone();
-                let table_creator = Arc::clone(&self.table_creator);
-                async move {
-                    // Quote each part with double quotes for Snowflake SQL, matching the
-                    // pattern used by the Snowflake data connector.
-                    let escaped_database = database.replace('"', "\"\"");
-                    let escaped_schema = schema_name.replace('"', "\"\"");
-                    let escaped_table = table_name.replace('"', "\"\"");
-                    let quoted_path =
-                        format!("\"{escaped_database}\".\"{escaped_schema}\".\"{escaped_table}\"");
-                    let table_ref: TableReference = quoted_path.into();
-                    let result = table_creator.table_provider(table_ref).await;
-                    (table_name, result)
-                }
-            }))
-            .buffer_unordered(CATALOG_DISCOVERY_CONCURRENCY)
-            .collect()
-            .await;
-
         let mut tables = HashMap::new();
-        for (table_name, result) in results {
+        let mut stream = stream::iter(filtered_tables.into_iter().map(|table_name| {
+            let database = self.database.clone();
+            let schema_name = self.schema_name.clone();
+            let table_creator = Arc::clone(&self.table_creator);
+            async move {
+                // Quote each part with double quotes for Snowflake SQL, matching the
+                // pattern used by the Snowflake data connector.
+                let escaped_database = database.replace('"', "\"\"");
+                let escaped_schema = schema_name.replace('"', "\"\"");
+                let escaped_table = table_name.replace('"', "\"\"");
+                let quoted_path =
+                    format!("\"{escaped_database}\".\"{escaped_schema}\".\"{escaped_table}\"");
+                let table_ref: TableReference = quoted_path.into();
+                let result = table_creator.table_provider(table_ref).await;
+                (table_name, result)
+            }
+        }))
+        .buffer_unordered(CATALOG_DISCOVERY_CONCURRENCY);
+
+        while let Some((table_name, result)) = stream.next().await {
             match result {
                 Ok(provider) => {
                     tables.insert(table_name, provider);
@@ -363,7 +361,7 @@ impl SnowflakeSchemaProvider {
             *guard = tables;
         }
 
-        tracing::debug!(duration_ms = %start.elapsed().as_millis(), database = %self.database, schema = %self.schema_name, tables = table_count, "Snowflake: schema table refresh complete");
+        tracing::debug!(duration_ms = start.elapsed().as_millis(), database = %self.database, schema = %self.schema_name, tables = table_count, "Snowflake: schema table refresh complete");
 
         Ok(())
     }
@@ -406,7 +404,7 @@ impl SnowflakeSchemaProvider {
                         names.push(value.to_string());
                     }
                 }
-                tracing::debug!(duration_ms = %start.elapsed().as_millis(), schema = %self.schema_name, count = names.len(), "Snowflake: listed tables");
+                tracing::debug!(duration_ms = start.elapsed().as_millis(), schema = %self.schema_name, count = names.len(), "Snowflake: listed tables");
                 Ok(names)
             }
             snowflake_api::QueryResult::Json(_) => UnexpectedResponseSnafu {

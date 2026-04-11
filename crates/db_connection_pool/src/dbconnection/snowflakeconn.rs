@@ -120,7 +120,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
             }
             snowflake_api::QueryResult::Empty => Ok(Vec::new()),
         };
-        tracing::debug!(duration_ms = %start.elapsed().as_millis(), schema = %schema, count = result.as_ref().map_or(0, Vec::len), "Snowflake: listed tables");
+        tracing::debug!(duration_ms = start.elapsed().as_millis(), schema = %schema, count = result.as_ref().map_or(0, Vec::len), "Snowflake: listed tables");
         result
     }
 
@@ -145,7 +145,11 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
             }
             snowflake_api::QueryResult::Empty => Ok(Vec::new()),
         };
-        tracing::debug!(duration_ms = %start.elapsed().as_millis(), count = result.as_ref().map_or(0, Vec::len), "Snowflake: listed schemas");
+        tracing::debug!(
+            duration_ms = start.elapsed().as_millis(),
+            count = result.as_ref().map_or(0, Vec::len),
+            "Snowflake: listed schemas"
+        );
         result
     }
 
@@ -181,7 +185,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
                 source: "Empty response".to_string().into(),
             }),
         };
-        tracing::debug!(duration_ms = %start.elapsed().as_millis(), table = %table, "Snowflake: fetched schema");
+        tracing::debug!(duration_ms = start.elapsed().as_millis(), table = %table, "Snowflake: fetched schema");
         result
     }
 
@@ -192,16 +196,18 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnect
         _projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         let start = Instant::now();
-        let sql = sql.to_string();
-        tracing::debug!(sql = %sql, "Snowflake: executing query");
+        tracing::debug!("Snowflake: executing query");
 
         let stream = self
             .api
-            .exec_streamed(&sql)
+            .exec_streamed(sql)
             .await
             .context(SnowflakeQuerySnafu)?;
 
-        tracing::debug!(duration_ms = %start.elapsed().as_millis(), "Snowflake: query stream initiated");
+        tracing::debug!(
+            duration_ms = start.elapsed().as_millis(),
+            "Snowflake: query stream initiated"
+        );
 
         let mut transformed_stream = stream.map(|batch| {
             batch.and_then(|batch| {

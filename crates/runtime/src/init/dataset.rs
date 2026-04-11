@@ -309,10 +309,11 @@ impl Runtime {
 
     /// Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.
     ///
-    /// The `load_semaphore` gates the entire dataset load cycle — connector
-    /// creation, schema inference via `read_provider`, and initial data
-    /// load/refresh — so that `dataset_load_parallelism` controls how many
-    /// datasets hit the source concurrently.
+    /// The `load_semaphore` limits concurrent source access during the
+    /// upfront dataset setup phase — connector creation and schema inference
+    /// via `read_provider` — so that `dataset_load_parallelism` controls how
+    /// many datasets perform those source-facing initialization steps
+    /// concurrently.
     async fn load_dataset(
         self: Arc<Self>,
         ds: Arc<Dataset>,
@@ -356,7 +357,7 @@ impl Runtime {
                 .await
             {
                 Ok(connector) => {
-                    tracing::debug!(dataset = %ds.name, duration_ms = %connector_start.elapsed().as_millis(), "Dataset connector created");
+                    tracing::debug!(dataset = %ds.name, duration_ms = connector_start.elapsed().as_millis(), "Dataset connector created");
                     connector
                 }
                 Err(err) => {
@@ -490,7 +491,7 @@ impl Runtime {
             }
         };
 
-        tracing::debug!(dataset = %ds.name, duration_ms = %schema_start.elapsed().as_millis(), "Dataset schema inference complete");
+        tracing::debug!(dataset = %ds.name, duration_ms = schema_start.elapsed().as_millis(), "Dataset schema inference complete");
 
         let register_start = Instant::now();
         match Arc::clone(&self)
@@ -519,7 +520,7 @@ impl Runtime {
                     );
                 }
                 tracing::info!(
-                    duration_ms = %register_start.elapsed().as_millis(),
+                    duration_ms = register_start.elapsed().as_millis(),
                     "{}",
                     dataset_registered_trace(
                         data_connector.as_ref(),
