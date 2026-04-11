@@ -58,6 +58,7 @@ venv
 /result
 
 .env
+.make-lint.log
 .spice
 .data/
 data/

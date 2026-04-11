@@ -589,13 +589,14 @@ impl Databricks {
     }
 
     /// Validates that a Unity Catalog table is of a supported type and that the
-    /// current principal has read permissions on it.
+    /// dataset metadata is compatible with Databricks query-time access checks.
     ///
     /// Returns `Ok(())` if validation passes or if it cannot be performed
     /// (e.g., table not found in UC — the table may not be a UC table at all).
     ///
     /// Returns an error only when the UC API definitively reports an unsupported
-    /// table type or missing permissions.
+    /// table type. Permission prechecks are advisory because Databricks query-time
+    /// validation is the authoritative source of truth for table access.
     async fn validate_uc_table(
         &self,
         uc_client: &UnityCatalogClient,
@@ -653,7 +654,16 @@ impl Databricks {
         if should_validate_permissions {
             match uc_client.get_effective_permissions(&full_name).await {
                 Ok(Some(perms)) => {
-                    if !perms.has_read_permission() {
+                    if perms.has_read_permission() {
+                        tracing::debug!(
+                            table = %full_name,
+                            principals = ?perms.principals(),
+                            "Unity Catalog permission check passed"
+                        );
+                    } else {
+                        // Explicit denial: the API returned privileges but none
+                        // grant read access. This is a permanent error — the
+                        // user must fix permissions and restart the runtime.
                         return Err(DataConnectorError::InsufficientPermissions {
                             dataconnector: "databricks".to_string(),
                             connector_component: ConnectorComponent::from(dataset),
@@ -662,19 +672,18 @@ impl Databricks {
                             }),
                         });
                     }
-                    tracing::debug!(
-                        table = %full_name,
-                        principals = ?perms.principals(),
-                        "Unity Catalog permission check passed"
-                    );
                 }
                 Ok(None) => {
-                    tracing::debug!(
+                    // Ambiguous: table not found in permissions endpoint.
+                    // Warn and let Databricks query-time validation decide.
+                    tracing::warn!(
                         table = %full_name,
-                        "Table not found when checking permissions; proceeding"
+                        "Table not found when checking permissions; proceeding and deferring to Databricks query-time validation"
                     );
                 }
                 Err(e) => {
+                    // Ambiguous: could not reach the permissions API.
+                    // Warn and let Databricks query-time validation decide.
                     tracing::warn!(
                         table = %full_name,
                         error = %e,
@@ -1332,7 +1341,259 @@ fn table_reference_creator_delta_lake(uc_table: &UCTable) -> Option<TableReferen
 #[cfg(test)]
 mod tests {
     use super::*;
+    use app::App;
+    use datafusion::{
+        arrow::datatypes::{DataType, Field, Schema},
+        datasource::MemTable,
+    };
+    use runtime::component::{
+        access::AccessMode,
+        dataset::{CheckAvailability, ReadyState},
+    };
     use secrecy::ExposeSecret;
+    use spicepod::metric::Metrics;
+    use std::{
+        collections::{HashMap, VecDeque},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::Mutex,
+    };
+
+    #[derive(Clone)]
+    struct MockRead {
+        call_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Read for MockRead {
+        async fn table_provider(
+            &self,
+            _table_reference: TableReference,
+        ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+            let table = MemTable::try_new(Arc::clone(&schema), vec![Vec::new()])?;
+
+            Ok(Arc::new(table))
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockHttpResponse {
+        status_line: &'static str,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl MockHttpResponse {
+        fn json(status_line: &'static str, body: impl Into<String>) -> Self {
+            Self {
+                status_line,
+                headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                body: body.into(),
+            }
+        }
+
+        fn empty(status_line: &'static str) -> Self {
+            Self {
+                status_line,
+                headers: Vec::new(),
+                body: String::new(),
+            }
+        }
+    }
+
+    async fn start_mock_server(
+        responses: Vec<MockHttpResponse>,
+    ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind to a port");
+        let addr = listener
+            .local_addr()
+            .expect("should have a listener address");
+        let queued_responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let captured_requests = Arc::new(Mutex::new(Vec::new()));
+
+        let requests_for_server = Arc::clone(&requests);
+        let captured_requests_for_server = Arc::clone(&captured_requests);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+
+                let queued_responses = Arc::clone(&queued_responses);
+                let requests = Arc::clone(&requests_for_server);
+                let captured_requests = Arc::clone(&captured_requests_for_server);
+                tokio::spawn(async move {
+                    let captured_request = read_http_request(&mut stream).await;
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    captured_requests
+                        .lock()
+                        .await
+                        .push(String::from_utf8_lossy(&captured_request).into_owned());
+
+                    let response = queued_responses
+                        .lock()
+                        .await
+                        .pop_front()
+                        .unwrap_or_else(|| MockHttpResponse::json("200 OK", r#"{"ok":true}"#));
+
+                    let mut http_response = format!(
+                        "HTTP/1.1 {}\r\nContent-Length: {}\r\n",
+                        response.status_line,
+                        response.body.len()
+                    );
+                    for (header_name, header_value) in response.headers {
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut http_response,
+                            format_args!("{header_name}: {header_value}\r\n"),
+                        );
+                    }
+                    http_response.push_str("\r\n");
+                    http_response.push_str(&response.body);
+
+                    let _ = stream.write_all(http_response.as_bytes()).await;
+                });
+            }
+        });
+
+        (format!("http://{addr}"), requests, captured_requests)
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut captured_request = Vec::with_capacity(4096);
+        let mut buf = [0u8; 1024];
+        let mut expected_total_len = None;
+
+        loop {
+            let bytes_read = match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(bytes_read) => bytes_read,
+            };
+
+            captured_request.extend_from_slice(&buf[..bytes_read]);
+
+            if expected_total_len.is_none() {
+                expected_total_len = expected_http_request_len(&captured_request);
+            }
+
+            if let Some(expected_total_len) = expected_total_len
+                && captured_request.len() >= expected_total_len
+            {
+                break;
+            }
+        }
+
+        captured_request
+    }
+
+    fn expected_http_request_len(request: &[u8]) -> Option<usize> {
+        let headers_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|position| position + 4)?;
+
+        let content_length = String::from_utf8_lossy(&request[..headers_end])
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("Content-Length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        Some(headers_end.saturating_add(content_length))
+    }
+
+    async fn make_dataset(from: &str, name: &str) -> Dataset {
+        Dataset {
+            from: from.to_string(),
+            name: TableReference::bare(name),
+            access: AccessMode::Read,
+            params: HashMap::new(),
+            metadata: HashMap::new(),
+            columns: Vec::new(),
+            has_metadata_table: false,
+            replication: None,
+            time_column: None,
+            time_format: None,
+            time_partition_column: None,
+            time_partition_format: None,
+            acceleration: None,
+            embeddings: Vec::new(),
+            app: Arc::new(App::default()),
+            unsupported_type_action: None,
+            ready_state: ReadyState::default(),
+            metrics: Metrics::default(),
+            runtime: Arc::new(Runtime::builder().build().await),
+            vectors: None,
+            check_availability: CheckAvailability::default(),
+        }
+    }
+
+    async fn run_read_provider_with_uc_responses(
+        dataset_from: &str,
+        responses: Vec<MockHttpResponse>,
+    ) -> (DataConnectorResult<()>, usize, usize, Vec<String>) {
+        let (endpoint, requests, captured_requests) = start_mock_server(responses).await;
+
+        let read_call_count = Arc::new(AtomicUsize::new(0));
+        let connector = Databricks {
+            read_provider: Arc::new(MockRead {
+                call_count: Arc::clone(&read_call_count),
+            }),
+            initialization: ComponentInitialization::default(),
+            metrics: None,
+            uc_client: Some(Arc::new(
+                UnityCatalogClient::new(Endpoint(endpoint), None, None)
+                    .expect("mock Unity Catalog client should be created"),
+            )),
+        };
+        let dataset = make_dataset(dataset_from, "tpch_sf400_part").await;
+
+        let result = DataConnector::read_provider(&connector, &dataset)
+            .await
+            .map(|_| ());
+        let captured_requests = captured_requests.lock().await.clone();
+
+        (
+            result,
+            read_call_count.load(Ordering::SeqCst),
+            requests.load(Ordering::SeqCst),
+            captured_requests,
+        )
+    }
+
+    fn assert_request_seen(captured_requests: &[String], path_fragment: &str) {
+        assert!(
+            captured_requests
+                .iter()
+                .any(|request| request.contains(path_fragment)),
+            "expected request containing '{path_fragment}', got: {captured_requests:?}"
+        );
+    }
+
+    fn assert_request_not_seen(captured_requests: &[String], path_fragment: &str) {
+        assert!(
+            captured_requests
+                .iter()
+                .all(|request| !request.contains(path_fragment)),
+            "did not expect request containing '{path_fragment}', got: {captured_requests:?}"
+        );
+    }
 
     #[test]
     fn test_build_auth_credentials_token_only() {
@@ -1459,5 +1720,223 @@ mod tests {
         if let Err(error) = result {
             assert!(error.to_string().contains("Choose either `databricks_token` or `databricks_client_id` and `databricks_client_secret`"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_read_provider_proceeds_when_uc_permission_precheck_has_read_privilege() {
+        let (result, read_call_count, request_count, captured_requests) =
+            run_read_provider_with_uc_responses(
+                "databricks:workspace.tpch_sf400.part",
+                vec![
+                    MockHttpResponse::json(
+                        "200 OK",
+                        r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"MANAGED","data_source_format":"DELTA","columns":[],"storage_location":null}"#,
+                    ),
+                    MockHttpResponse::json(
+                        "200 OK",
+                        r#"{"privilege_assignments":[{"principal":"analytics-team","privileges":[{"privilege":"SELECT"}]}]}"#,
+                    ),
+                ],
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "positive UC permission prechecks should still allow initialization"
+        );
+        assert_eq!(
+            read_call_count, 1,
+            "expected the Databricks read to be attempted"
+        );
+        assert_eq!(
+            request_count, 2,
+            "expected table metadata and permission requests"
+        );
+        assert_request_seen(&captured_requests, "/api/2.1/unity-catalog/tables/");
+        assert_request_seen(
+            &captured_requests,
+            "/api/2.1/unity-catalog/effective-permissions/table/",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_provider_fails_with_permanent_error_when_uc_permission_explicitly_denied() {
+        let (result, read_call_count, request_count, captured_requests) =
+            run_read_provider_with_uc_responses(
+                "databricks:workspace.tpch_sf400.part",
+                vec![
+                    MockHttpResponse::json(
+                        "200 OK",
+                        r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"MANAGED","data_source_format":"DELTA","columns":[],"storage_location":null}"#,
+                    ),
+                    MockHttpResponse::json(
+                        "200 OK",
+                        r#"{"privilege_assignments":[{"principal":"analytics-team","privileges":[{"privilege":"MODIFY"}]}]}"#,
+                    ),
+                ],
+            )
+            .await;
+
+        let err = result.expect_err(
+            "explicit UC permission denial should produce an InsufficientPermissions error",
+        );
+        assert!(
+            !err.is_retriable(),
+            "permission denial should be a permanent error requiring a runtime restart"
+        );
+        assert!(
+            err.to_string()
+                .contains("Insufficient permissions to access"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            read_call_count, 0,
+            "should not attempt Databricks read after explicit permission denial"
+        );
+        assert_eq!(
+            request_count, 2,
+            "expected table metadata and effective-permissions requests"
+        );
+        assert_request_seen(&captured_requests, "/api/2.1/unity-catalog/tables/");
+        assert_request_seen(
+            &captured_requests,
+            "/api/2.1/unity-catalog/effective-permissions/table/",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_provider_proceeds_when_effective_permissions_are_missing() {
+        let (result, read_call_count, request_count, captured_requests) =
+            run_read_provider_with_uc_responses(
+                "databricks:workspace.tpch_sf400.part",
+                vec![
+                    MockHttpResponse::json(
+                        "200 OK",
+                        r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"MANAGED","data_source_format":"DELTA","columns":[],"storage_location":null}"#,
+                    ),
+                    MockHttpResponse::empty("404 Not Found"),
+                ],
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "missing effective-permissions responses should not block Databricks dataset initialization"
+        );
+        assert_eq!(
+            read_call_count, 1,
+            "expected the Databricks read to be attempted"
+        );
+        assert_eq!(
+            request_count, 2,
+            "expected table metadata and permission requests"
+        );
+        assert_request_seen(
+            &captured_requests,
+            "/api/2.1/unity-catalog/effective-permissions/table/",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_provider_proceeds_when_effective_permissions_check_errors() {
+        // Queue enough 500 responses to exhaust the UC client's internal
+        // retries (3 retries + 1 initial attempt = 4 requests total).
+        let (result, read_call_count, request_count, captured_requests) =
+            run_read_provider_with_uc_responses(
+                "databricks:workspace.tpch_sf400.part",
+                vec![
+                    MockHttpResponse::json(
+                        "200 OK",
+                        r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"MANAGED","data_source_format":"DELTA","columns":[],"storage_location":null}"#,
+                    ),
+                    MockHttpResponse::empty("500 Internal Server Error"),
+                    MockHttpResponse::empty("500 Internal Server Error"),
+                    MockHttpResponse::empty("500 Internal Server Error"),
+                    MockHttpResponse::empty("500 Internal Server Error"),
+                ],
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "effective-permissions lookup errors should not block Databricks dataset initialization"
+        );
+        assert_eq!(
+            read_call_count, 1,
+            "expected the Databricks read to be attempted"
+        );
+        assert!(
+            request_count >= 2,
+            "expected at least the table metadata request and one permission attempt"
+        );
+        assert_request_seen(
+            &captured_requests,
+            "/api/2.1/unity-catalog/effective-permissions/table/",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_provider_skips_effective_permissions_for_foreign_tables() {
+        let (result, read_call_count, request_count, captured_requests) =
+            run_read_provider_with_uc_responses(
+                "databricks:workspace.tpch_sf400.part",
+                vec![MockHttpResponse::json(
+                    "200 OK",
+                    r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"FOREIGN","data_source_format":"DELTA","columns":[],"storage_location":null}"#,
+                )],
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "foreign tables should skip strict permission prechecks and proceed"
+        );
+        assert_eq!(
+            read_call_count, 1,
+            "expected the Databricks read to be attempted"
+        );
+        assert_eq!(
+            request_count, 1,
+            "foreign tables should skip the permission request"
+        );
+        assert_request_seen(&captured_requests, "/api/2.1/unity-catalog/tables/");
+        assert_request_not_seen(
+            &captured_requests,
+            "/api/2.1/unity-catalog/effective-permissions/table/",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_provider_fails_for_unsupported_uc_table_types() {
+        let (result, read_call_count, request_count, captured_requests) =
+            run_read_provider_with_uc_responses(
+                "databricks:workspace.tpch_sf400.part",
+                vec![MockHttpResponse::json(
+                    "200 OK",
+                    r#"{"name":"part","catalog_name":"workspace","schema_name":"tpch_sf400","table_type":"VIEW","data_source_format":"VIEW","columns":[],"storage_location":null}"#,
+                )],
+            )
+            .await;
+
+        let err = result.expect_err("unsupported UC table types should still fail");
+
+        assert!(
+            err.to_string()
+                .contains("Unsupported Unity Catalog table type 'VIEW'"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            read_call_count, 0,
+            "unsupported types should fail before reading"
+        );
+        assert_eq!(
+            request_count, 1,
+            "unsupported types should stop after table metadata"
+        );
+        assert_request_seen(&captured_requests, "/api/2.1/unity-catalog/tables/");
+        assert_request_not_seen(
+            &captured_requests,
+            "/api/2.1/unity-catalog/effective-permissions/table/",
+        );
     }
 }

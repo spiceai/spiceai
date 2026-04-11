@@ -4017,6 +4017,7 @@ dependencies = [
 name = "connector-databricks"
 version = "2.0.0-unstable"
 dependencies = [
+ "app",
  "async-trait",
  "aws-sdk-credential-bridge",
  "data_components",
@@ -4029,6 +4030,7 @@ dependencies = [
  "runtime-secrets",
  "secrecy",
  "snafu",
+ "spicepod",
  "token_provider",
  "tokio",
  "tracing",
