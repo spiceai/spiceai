@@ -23,12 +23,12 @@ expression: "normalize_search_response(resp, round_scores)"
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
+          "The even multiples of 5 between 0 and 60 are the multiples of 10: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers."
         ]
       },
       "primary_key": {
-        "id": 458,
-        "question": "How many distinct permutations are there of the group of letters \\(\\{a, b, c, d\\}\\)?"
+        "id": 470,
+        "question": "How many numbers between 0 and 60 are even multiples of 5?"
       }
     },
     {
@@ -36,12 +36,12 @@ expression: "normalize_search_response(resp, round_scores)"
       "dataset": "qs_view",
       "matches": {
         "answer": [
-          "The even multiples of 5 between 0 and 60 are the multiples of 10: 10, 20, 30, 40, and 50. There are $\\boxed{5}$ such numbers."
+          "The number of distinct permutations of 4 distinct letters is \\(4! = 4 \\times 3 \\times 2 \\times 1 = \\boxed{24}\\)."
         ]
       },
       "primary_key": {
-        "id": 470,
-        "question": "How many numbers between 0 and 60 are even multiples of 5?"
+        "id": 458,
+        "question": "How many distinct permutations are there of the group of letters \\(\\{a, b, c, d\\}\\)?"
       }
     },
     {
