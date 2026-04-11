@@ -1347,12 +1347,8 @@ mod tests {
         arrow::datatypes::{DataType, Field, Schema},
         datasource::MemTable,
     };
-    use runtime::component::{
-        access::AccessMode,
-        dataset::{CheckAvailability, ReadyState},
-    };
+    use runtime::component::dataset::builder::DatasetBuilder;
     use secrecy::ExposeSecret;
-    use spicepod::metric::Metrics;
     use std::{
         collections::{HashMap, VecDeque},
         sync::{
@@ -1520,29 +1516,13 @@ mod tests {
     }
 
     async fn make_dataset(from: &str, name: &str) -> Dataset {
-        Dataset {
-            from: from.to_string(),
-            name: TableReference::bare(name),
-            access: AccessMode::Read,
-            params: HashMap::new(),
-            metadata: HashMap::new(),
-            columns: Vec::new(),
-            has_metadata_table: false,
-            replication: None,
-            time_column: None,
-            time_format: None,
-            time_partition_column: None,
-            time_partition_format: None,
-            acceleration: None,
-            embeddings: Vec::new(),
-            app: Arc::new(App::default()),
-            unsupported_type_action: None,
-            ready_state: ReadyState::default(),
-            metrics: Metrics::default(),
-            runtime: Arc::new(Runtime::builder().build().await),
-            vectors: None,
-            check_availability: CheckAvailability::default(),
-        }
+        let runtime = Arc::new(Runtime::builder().build().await);
+        DatasetBuilder::try_new(from.to_string(), name)
+            .expect("valid test dataset name")
+            .with_app(Arc::new(App::default()))
+            .with_runtime(runtime)
+            .build()
+            .expect("test dataset should build")
     }
 
     async fn run_read_provider_with_uc_responses(
