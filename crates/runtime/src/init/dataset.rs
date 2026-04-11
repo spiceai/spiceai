@@ -309,11 +309,10 @@ impl Runtime {
 
     /// Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.
     ///
-    /// The `load_semaphore` limits concurrent source access during the
-    /// upfront dataset setup phase — connector creation and schema inference
-    /// via `read_provider` — so that `dataset_load_parallelism` controls how
-    /// many datasets perform those source-facing initialization steps
-    /// concurrently.
+    /// The `load_semaphore` limits concurrent schema inference via
+    /// `read_provider` so that `dataset_load_parallelism` controls how many
+    /// datasets query the source for schema at the same time. Connector
+    /// creation and `DataFusion` registration run outside the permit.
     async fn load_dataset(
         self: Arc<Self>,
         ds: Arc<Dataset>,
@@ -346,10 +345,6 @@ impl Runtime {
                     },
                 ));
             }
-
-            let Ok(_load_guard) = load_semaphore.acquire().await else {
-                unreachable!("Semaphore is never closed.");
-            };
 
             let connector_start = Instant::now();
             let connector = match Arc::clone(&runtime)
@@ -387,7 +382,13 @@ impl Runtime {
             }
 
             if let Err(err) = Arc::clone(&runtime)
-                .register_loaded_dataset(Arc::clone(&ds), connector, None, bootstrap_status.clone())
+                .register_loaded_dataset(
+                    Arc::clone(&ds),
+                    connector,
+                    None,
+                    bootstrap_status.clone(),
+                    Some(Arc::clone(&load_semaphore)),
+                )
                 .await
             {
                 if runtime.status.is_shutdown() {
@@ -416,6 +417,7 @@ impl Runtime {
         data_connector: Arc<dyn DataConnector>,
         accelerated_table: Option<Arc<AcceleratedTable>>,
         bootstrap_status: BootstrapStatus,
+        load_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<()> {
         let source = ds.source();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
@@ -440,6 +442,15 @@ impl Runtime {
             .is_some_and(|a| a.mode == Mode::FileUpdate);
 
         // Test dataset connectivity by attempting to get a read provider.
+        // Acquire the load semaphore (if provided) to limit concurrent source queries.
+        let load_guard = if let Some(sem) = &load_semaphore {
+            let Ok(guard) = sem.acquire().await else {
+                unreachable!("Semaphore is never closed.");
+            };
+            Some(guard)
+        } else {
+            None
+        };
         let schema_start = Instant::now();
         let federated_table = match data_connector.read_provider(&ds).await {
             Ok(provider) => {
@@ -492,6 +503,10 @@ impl Runtime {
         };
 
         tracing::debug!(dataset = %ds.name, duration_ms = schema_start.elapsed().as_millis(), "Dataset schema inference complete");
+
+        // Release the load permit before registration so other datasets can
+        // begin their source-facing work while this one registers.
+        drop(load_guard);
 
         let register_start = Instant::now();
         match Arc::clone(&self)
@@ -658,6 +673,7 @@ impl Runtime {
                         Arc::clone(&connector),
                         None,
                         BootstrapStatus::None,
+                        None,
                     )
                     .await
                 {
@@ -772,6 +788,7 @@ impl Runtime {
             Arc::clone(&connector),
             Some(accelerated_table),
             BootstrapStatus::None,
+            None,
         )
         .await?;
 
