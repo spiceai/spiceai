@@ -29,7 +29,6 @@ use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::{DataType, Field, Schema},
     datasource::{MemTable, TableProvider},
-    sql::TableReference,
 };
 use rand::Rng;
 use runtime::{
