@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Runtime;
 use crate::config::ClusterRole;
+use crate::datafusion::query::write_to_json_value;
 use crate::jobs::{JobErrorCode, JobExecutor, JobState, JobStatus};
 
 /// Check if cluster mode with scheduler role is enabled.
@@ -787,29 +788,10 @@ fn build_chunk_response(
 fn batches_to_json(
     batches: &[arrow::array::RecordBatch],
 ) -> std::result::Result<Vec<serde_json::Value>, String> {
-    let mut result = Vec::new();
-
-    for batch in batches {
-        let buf = Vec::new();
-        let mut writer = arrow_json::ArrayWriter::new(buf);
-
-        writer
-            .write(batch)
-            .map_err(|e| format!("Failed to serialize RecordBatch to JSON: {e}"))?;
-        writer
-            .finish()
-            .map_err(|e| format!("Failed to finalize JSON serialization: {e}"))?;
-
-        let json_str = String::from_utf8(writer.into_inner())
-            .map_err(|e| format!("Invalid UTF-8 in JSON output: {e}"))?;
-
-        let arr = serde_json::from_str::<Vec<serde_json::Value>>(&json_str)
-            .map_err(|e| format!("Failed to parse JSON array: {e}"))?;
-
-        result.extend(arr);
+    match write_to_json_value(batches).map_err(|e| e.to_string())? {
+        serde_json::Value::Array(rows) => Ok(rows),
+        _ => Err("Expected JSON array when serializing query results".to_string()),
     }
-
-    Ok(result)
 }
 
 fn error_to_response(error: &crate::jobs::Error) -> Response {
