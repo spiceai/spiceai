@@ -39,7 +39,10 @@ use std::sync::Arc;
 
 use crate::{
     component::dataset::Dataset,
-    datafusion::{DataFusion, query::{QueryBuilder, write_to_json_string, write_to_json_value}},
+    datafusion::{
+        DataFusion,
+        query::{QueryBuilder, write_to_json_string, write_to_json_value},
+    },
     status::ComponentStatus,
 };
 use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
