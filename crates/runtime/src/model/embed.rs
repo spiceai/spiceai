@@ -19,6 +19,8 @@ use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU
 use bytes::Bytes;
 use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
+#[cfg(feature = "models")]
+use itertools::Itertools;
 use llms::HealthCheck;
 #[cfg(feature = "bedrock")]
 use llms::bedrock::{
@@ -37,22 +39,22 @@ use llms::embeddings::{Embed, Error as EmbedError};
 use llms::model2vec::Model2Vec;
 use llms::openai::embed::OpenaiEmbed;
 use llms::openai::{DEFAULT_EMBEDDING_MODEL, UsageTier};
+#[cfg(feature = "models")]
+use secrecy::SecretBox;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::ResultExt;
 use spicepod::component::{embeddings::EmbeddingPrefix, model::ModelFileType};
+#[cfg(feature = "models")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::result::Result;
 use std::str::FromStr;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
-use tokio::sync::RwLock;
-use url::Url;
-#[cfg(feature = "models")]
-use secrecy::SecretBox;
-#[cfg(feature = "models")]
-use std::path::Path;
 #[cfg(feature = "models")]
 use tokio::fs;
+use tokio::sync::RwLock;
+use url::Url;
 
 pub type EmbeddingModelStore = HashMap<String, Arc<dyn Embed>>;
 
@@ -688,7 +690,7 @@ async fn openai(
 ///   - Huggingface `FssSpec`: `hf://[<repo_type_prefix>]<repo_id>[@<revision>]/<path/in/repo>`.
 async fn get_bytes_for_file(
     url: &str,
-    params: &HashMap<String, SecretString>,
+    _params: &HashMap<String, SecretString>,
 ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(feature = "models")]
     {
@@ -709,7 +711,7 @@ async fn get_bytes_for_file(
                     model_id,
                     Some(branch),
                     file.join("/").as_str(),
-                    params
+                    _params
                         .get("hf_token")
                         .map(secrecy::ExposeSecret::expose_secret),
                 )
@@ -724,7 +726,7 @@ async fn get_bytes_for_file(
                     model_id,
                     branch,
                     file.join("/").as_str(),
-                    params
+                    _params
                         .get("hf_token")
                         .map(secrecy::ExposeSecret::expose_secret),
                 )
@@ -738,7 +740,7 @@ async fn get_bytes_for_file(
                     model_id,
                     branch,
                     file.join("/").as_str(),
-                    params
+                    _params
                         .get("hf_token")
                         .map(secrecy::ExposeSecret::expose_secret),
                 )
@@ -753,7 +755,7 @@ async fn get_bytes_for_file(
                     model_id,
                     branch,
                     file.join("/").as_str(),
-                    params
+                    _params
                         .get("hf_token")
                         .map(secrecy::ExposeSecret::expose_secret),
                 )
@@ -816,6 +818,7 @@ async fn get_file_from_hf(
     }
 }
 
+#[cfg(feature = "models")]
 fn max_seq_length_from_params(
     params: &HashMap<String, SecretString>,
 ) -> Result<Option<usize>, EmbedError> {
