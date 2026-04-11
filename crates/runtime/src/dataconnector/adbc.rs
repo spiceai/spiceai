@@ -1028,6 +1028,7 @@ fn is_query_federation_enabled(params: &Parameters) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::SecretString;
 
     #[test]
     fn test_factory_as_any() {
@@ -1346,7 +1347,6 @@ mod tests {
 
         let make_params = |dataset: &Dataset| {
             use runtime_parameters::Parameters;
-            use secrecy::SecretString;
 
             let parameters = Parameters::new(
                 vec![
@@ -1387,7 +1387,6 @@ mod tests {
 
         let make_params = |uri: &str| {
             use runtime_parameters::Parameters;
-            use secrecy::SecretString;
 
             let parameters = Parameters::new(
                 vec![
@@ -1422,8 +1421,6 @@ mod tests {
     async fn test_resolve_connection_namespace_bigquery_infers_from_hyphenated_project_path() {
         let dataset = test_dataset("adbc:my-project.my_dataset.my_table", "my_table").await;
 
-        use secrecy::SecretString;
-
         let parameters = Parameters::new(
             vec![
                 ("driver".to_string(), SecretString::from("bigquery")),
@@ -1450,8 +1447,6 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_connection_namespace_bigquery_preserves_explicit_values() {
         let dataset = test_dataset("adbc:my-project.path_dataset.my_table", "my_table").await;
-
-        use secrecy::SecretString;
 
         let parameters = Parameters::new(
             vec![
@@ -1488,8 +1483,6 @@ mod tests {
     async fn test_resolve_connection_namespace_rejects_empty_schema() {
         let dataset = test_dataset("adbc:my_dataset.my_table", "my_table").await;
 
-        use secrecy::SecretString;
-
         let parameters = Parameters::new(
             vec![
                 ("driver".to_string(), SecretString::from("bigquery")),
@@ -1522,8 +1515,6 @@ mod tests {
         let dataset_b = test_dataset("adbc:my_project.dataset_b.table_b", "table_b").await;
 
         let make_params = |dataset: &Dataset| {
-            use secrecy::SecretString;
-
             let parameters = Parameters::new(
                 vec![
                     ("driver".to_string(), SecretString::from("bigquery")),
@@ -1607,7 +1598,6 @@ mod tests {
     }
 
     fn make_params(pairs: Vec<(&str, &str)>) -> Parameters {
-        use secrecy::SecretString;
         Parameters::new(
             pairs
                 .into_iter()
