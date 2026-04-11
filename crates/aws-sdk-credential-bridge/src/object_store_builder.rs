@@ -391,9 +391,12 @@ impl S3ObjectStoreBuilder {
 
 /// Applies AWS SDK credentials to an S3 builder if available.
 ///
-/// This function initializes the AWS SDK configuration and applies the credential
-/// provider to the builder. If no credentials are available, the builder is
-/// returned unchanged (which may result in anonymous access for public buckets).
+/// This function initializes the AWS SDK configuration, threading the optional
+/// `region` into SDK config initialization so credential loading can use
+/// region-aware resolution when available and avoid regionless SDK loads.
+/// It then applies the resolved credential provider to the builder. If no
+/// credentials are available, the builder is returned unchanged (which may
+/// result in anonymous access for public buckets).
 async fn apply_sdk_credentials(
     mut builder: AmazonS3Builder,
     region: Option<&str>,

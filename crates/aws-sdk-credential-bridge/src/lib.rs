@@ -143,13 +143,30 @@ pub async fn get_or_init_sdk_config() -> std::result::Result<Option<Arc<SdkConfi
 pub async fn get_or_init_sdk_config_with_region(
     region: Option<&str>,
 ) -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
-    if let Some(cached) = SDK_CONFIG.get() {
+    get_or_init_sdk_config_with_region_for_cell(
+        &SDK_CONFIG,
+        region,
+        initialize_sdk_config_with_retry,
+    )
+    .await
+}
+
+async fn get_or_init_sdk_config_with_region_for_cell<F, Fut>(
+    sdk_config_cell: &OnceCell<Option<Arc<SdkConfig>>>,
+    region: Option<&str>,
+    initialize: F,
+) -> std::result::Result<Option<Arc<SdkConfig>>, LoadError>
+where
+    F: FnOnce(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<Option<Arc<SdkConfig>>, LoadError>>,
+{
+    if let Some(cached) = sdk_config_cell.get() {
         return Ok(cached.clone());
     }
 
     let region = region.map(ToString::to_string);
-    let value = SDK_CONFIG
-        .get_or_try_init(|| initialize_sdk_config_with_retry(region))
+    let value = sdk_config_cell
+        .get_or_try_init(|| initialize(region))
         .await?;
 
     Ok(value.clone())
@@ -300,7 +317,7 @@ pub fn from_s3_url_and_config(
 
     builder = builder.with_http_connector(SpawnedReqwestConnector::new(io_runtime));
 
-    if let Some(region) = region {
+    if let Some(region) = region.or_else(|| sdk_config.region().map(ToString::to_string)) {
         builder = builder.with_region(region);
     }
 
@@ -1024,6 +1041,64 @@ mod tests {
         assert_eq!(
             config.region().map(std::convert::AsRef::as_ref),
             Some("ap-south-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_or_init_sdk_config_with_region_uses_first_region() {
+        async fn initialize_test_sdk_config(
+            region: Option<String>,
+        ) -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
+            Ok(Some(Arc::new(
+                default_aws_config_for_region(region.as_deref())
+                    .load()
+                    .await,
+            )))
+        }
+
+        let sdk_config_cell = OnceCell::const_new();
+
+        let first = get_or_init_sdk_config_with_region_for_cell(
+            &sdk_config_cell,
+            Some("ap-south-1"),
+            initialize_test_sdk_config,
+        )
+        .await
+        .expect("first initialization should succeed")
+        .expect("test initializer should return a config");
+
+        let second = get_or_init_sdk_config_with_region_for_cell(
+            &sdk_config_cell,
+            Some("us-east-1"),
+            initialize_test_sdk_config,
+        )
+        .await
+        .expect("second initialization should succeed")
+        .expect("test initializer should return a config");
+
+        assert_eq!(
+            first.region().map(std::convert::AsRef::as_ref),
+            Some("ap-south-1")
+        );
+        assert_eq!(
+            second.region().map(std::convert::AsRef::as_ref),
+            Some("ap-south-1")
+        );
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn test_from_s3_url_and_config_uses_sdk_config_region_when_region_is_absent() {
+        let url = Url::parse("s3://my-bucket/path/to/data").expect("valid url");
+        let sdk_config = default_aws_config_for_region(Some("ap-south-1"))
+            .load()
+            .await;
+
+        let store = from_s3_url_and_config(&url, None, &sdk_config, Handle::current());
+
+        assert!(
+            store.is_ok(),
+            "object store should build when the SDK config provides the region"
         );
     }
 }
