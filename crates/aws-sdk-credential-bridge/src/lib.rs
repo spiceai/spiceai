@@ -133,8 +133,9 @@ pub async fn get_or_init_sdk_config() -> std::result::Result<Option<Arc<SdkConfi
 /// Returns the global SDK configuration, initializing it with an explicit region if necessary.
 ///
 /// The cached SDK config is used to share the resolved credentials provider across the process.
-/// Callers should still pass an explicit region when building AWS clients or object stores rather
-/// than relying on the cached config's region.
+/// Callers should pass an explicit region when they already know it when building AWS clients or
+/// object stores. If no explicit region is provided, downstream code may fall back to the cached
+/// config's region when one is available.
 ///
 /// # Errors
 ///
