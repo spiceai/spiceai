@@ -101,7 +101,7 @@ const HTTP_JSON_EDGE_CASES: &str = r#"[
   }
 ]"#;
 
-const HTTP_JSON_EDGE_QUERY: &str = r#"
+const HTTP_JSON_EDGE_QUERY: &str = r"
 SELECT
     CAST(json_get(content, 'id') AS BIGINT) AS id,
     CAST(json_get(content, 'name') AS VARCHAR) AS name,
@@ -115,7 +115,7 @@ SELECT
 FROM http_json_edges
 WHERE request_path = '/edge'
 ORDER BY id
-"#;
+";
 
 fn expected_http_json_edge_rows() -> Value {
     json!([
@@ -708,7 +708,7 @@ async fn test_http_json_edge_cases_results_cache() -> Result<(), String> {
             assert!(
                 matches!(
                     first_http_cache_header.as_deref(),
-                    Some("Hit from spiceai") | Some("Miss from spiceai")
+                    Some("Hit from spiceai" | "Miss from spiceai")
                 ),
                 "unexpected first HTTP cache header: {first_http_cache_header:?}"
             );
