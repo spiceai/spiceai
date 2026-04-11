@@ -344,8 +344,6 @@ impl ClusterHarnessBuilder {
             () = Arc::clone(&scheduler_rt).load_components() => {}
         }
 
-        runtime_ready_check(&scheduler_rt).await;
-
         // Wait for the scheduler's cluster port to be reachable.
         wait_for_tcp(
             &format!("127.0.0.1:{}", scheduler_ports.cluster),

@@ -131,7 +131,7 @@ impl CatalogConnector for UnityCatalog {
             Arc::new(StaticTokenProvider::new(token.clone())) as Arc<dyn TokenProvider>
         });
 
-        let client = UnityCatalogClient::new(endpoint, token_provider).map_err(|source| {
+        let client = UnityCatalogClient::new(endpoint, token_provider, None).map_err(|source| {
             super::Error::InternalWithSource {
                 connector: "unity_catalog".to_string(),
                 connector_component: ConnectorComponent::from(catalog),
