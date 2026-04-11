@@ -203,27 +203,26 @@ impl UnityCatalogSchemaProvider {
 
                     match client.get_effective_permissions(&table.full_name()).await {
                         Ok(Some(perms)) if !perms.has_read_permission() => {
-                            // Explicit denial: skip this table during catalog
-                            // discovery so the connector-level retry handles it.
+                            // Explicit denial: skip this table for the current
+                            // catalog discovery pass. It can be discovered on a
+                            // later refresh or restart if permissions change.
                             tracing::warn!(
                                 table = %table.full_name(),
-                                principals = ?perms.principals(),
-                                privileges = ?perms.all_privileges(),
                                 "Skipping table during catalog discovery: no read-compatible privilege found in effective-permissions response"
                             );
                             return None;
                         }
                         Ok(None) => {
-                            tracing::warn!(
+                            tracing::debug!(
                                 table = %table.full_name(),
-                                "Permission check returned no table; proceeding without permission validation"
+                                "Permission check returned no table during catalog discovery; proceeding without permission validation"
                             );
                         }
                         Err(e) => {
-                            tracing::warn!(
+                            tracing::debug!(
                                 table = %table.full_name(),
                                 error = %e,
-                                "Failed to check permissions; proceeding without permission validation"
+                                "Failed to check permissions during catalog discovery; proceeding without permission validation"
                             );
                         }
                         Ok(Some(_)) => {}
@@ -373,27 +372,25 @@ impl UnityCatalogSchemaProvider {
         if table.requires_read_permission_validation() {
             match client.get_effective_permissions(&table.full_name()).await {
                 Ok(Some(perms)) if !perms.has_read_permission() => {
-                    // Explicit denial: skip this table so the connector-level
-                    // retry handles it when the dataset is loaded individually.
+                    // Explicit denial: skip this table so a later refresh or
+                    // restart can discover it if permissions change.
                     tracing::warn!(
                         table = %table.full_name(),
-                        principals = ?perms.principals(),
-                        privileges = ?perms.all_privileges(),
                         "Skipping table during catalog refresh: no read-compatible privilege found in effective-permissions response"
                     );
                     return None;
                 }
                 Ok(None) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         table = %table.full_name(),
-                        "Permission check returned no table; proceeding without permission validation"
+                        "Permission check returned no table during catalog refresh; proceeding without permission validation"
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::debug!(
                         table = %table.full_name(),
                         error = %e,
-                        "Failed to check permissions; proceeding without permission validation"
+                        "Failed to check permissions during catalog refresh; proceeding without permission validation"
                     );
                 }
                 Ok(Some(_)) => {}

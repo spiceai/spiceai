@@ -594,9 +594,10 @@ impl Databricks {
     /// Returns `Ok(())` if validation passes or if it cannot be performed
     /// (e.g., table not found in UC — the table may not be a UC table at all).
     ///
-    /// Returns an error only when the UC API definitively reports an unsupported
-    /// table type. Permission prechecks are advisory because Databricks query-time
-    /// validation is the authoritative source of truth for table access.
+    /// Returns an error when the UC API definitively reports an unsupported
+    /// table type or when effective-permissions explicitly denies read access.
+    /// Ambiguous permission results (missing or unreachable) are advisory —
+    /// Databricks query-time validation is the authoritative access check.
     async fn validate_uc_table(
         &self,
         uc_client: &UnityCatalogClient,
