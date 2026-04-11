@@ -56,7 +56,9 @@ impl PodsWatcher {
             notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
                 match res {
                     Ok(event) => {
-                        if is_root_spicepod_event(&root_spicepod_path, &event) {
+                        if is_root_spicepod_event(&root_spicepod_path, &event)
+                            && is_relevant_spicepods_event_kind(&event.kind)
+                        {
                             refresh_watch_paths(&runtime_handle, &watch_paths, &root_path);
                         }
 
@@ -88,6 +90,13 @@ impl PodsWatcher {
 
         Ok(rx)
     }
+}
+
+fn is_relevant_spicepods_event_kind(event_kind: &EventKind) -> bool {
+    matches!(
+        event_kind,
+        EventKind::Any | EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_)
+    )
 }
 
 fn refresh_watch_paths(
@@ -150,15 +159,14 @@ async fn get_watch_paths(app_path: impl Into<PathBuf>) -> Vec<PathBuf> {
 }
 
 fn is_spicepods_modification_event(spicepod_paths: &[PathBuf], event: &notify::Event) -> bool {
-    match event.kind {
-        EventKind::Any | EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) => {
-            for event_path in &event.paths {
-                if spicepod_paths.iter().any(|dir| event_path.starts_with(dir)) {
-                    return true;
-                }
-            }
+    if !is_relevant_spicepods_event_kind(&event.kind) {
+        return false;
+    }
+
+    for event_path in &event.paths {
+        if spicepod_paths.iter().any(|dir| event_path.starts_with(dir)) {
+            return true;
         }
-        _ => { /*  ignore meta events and other changes */ }
     }
 
     false
@@ -174,7 +182,7 @@ fn is_root_spicepod_event(root_spicepod_paths: &[PathBuf; 2], event: &notify::Ev
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::event::{DataChange, ModifyKind, RenameMode};
+    use notify::event::{AccessKind, DataChange, ModifyKind, RenameMode};
 
     fn watcher_event(kind: EventKind, path: &str) -> notify::Event {
         notify::Event {
@@ -215,6 +223,14 @@ mod tests {
         );
 
         assert!(is_spicepods_modification_event(&watch_paths, &event));
+    }
+
+    #[test]
+    fn test_is_spicepods_modification_event_rejects_access() {
+        let watch_paths = vec![PathBuf::from("/tmp/app/spicepod.yaml")];
+        let event = watcher_event(EventKind::Access(AccessKind::Any), "/tmp/app/spicepod.yaml");
+
+        assert!(!is_spicepods_modification_event(&watch_paths, &event));
     }
 
     #[test]

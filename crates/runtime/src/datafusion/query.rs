@@ -1241,7 +1241,11 @@ fn strip_root_order_preserving_repartition(
 pub fn write_to_json_string(
     data: &[RecordBatch],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    serde_json::to_string(&write_to_json_value(data)?).boxed()
+    if data.iter().any(record_batch_has_union_columns) {
+        serde_json::to_string(&write_to_json_value(data)?).boxed()
+    } else {
+        String::from_utf8(write_to_json_bytes_with_arrow(data)?).boxed()
+    }
 }
 
 pub fn write_to_json_value(
@@ -1265,6 +1269,12 @@ pub fn write_to_json_value(
 fn write_to_json_value_with_arrow(
     data: &[RecordBatch],
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    serde_json::from_slice(write_to_json_bytes_with_arrow(data)?.as_slice()).boxed()
+}
+
+fn write_to_json_bytes_with_arrow(
+    data: &[RecordBatch],
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let buf = Vec::new();
     let mut writer = arrow_json::WriterBuilder::new()
         .with_explicit_nulls(true)
@@ -1273,7 +1283,7 @@ fn write_to_json_value_with_arrow(
     writer.write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())?;
     writer.finish()?;
 
-    serde_json::from_slice(writer.into_inner().as_slice()).boxed()
+    Ok(writer.into_inner())
 }
 
 fn record_batch_has_union_columns(batch: &RecordBatch) -> bool {
@@ -1322,8 +1332,13 @@ fn record_batch_to_json_rows(
         return json_value_to_rows(write_to_json_value_with_arrow(&[batch.clone()])?);
     }
 
+    let mut is_custom_index = vec![false; batch.num_columns()];
+    for &custom_index in &custom_indices {
+        is_custom_index[custom_index] = true;
+    }
+
     let non_union_indices: Vec<usize> = (0..batch.num_columns())
-        .filter(|index| !custom_indices.contains(index))
+        .filter(|index| !is_custom_index[*index])
         .collect();
 
     let mut rows = if non_union_indices.is_empty() {
@@ -2111,10 +2126,21 @@ mod tests {
                 Arc::new(BooleanArray::from(vec![None, None, None])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![None, None, None])) as ArrayRef,
                 Arc::new(arrow::array::Float64Array::from(vec![None, None, None])) as ArrayRef,
-                Arc::new(StringArray::from(vec![None, Some("draft"), None])) as ArrayRef,
-                Arc::new(StringArray::from(vec![None, None, None])) as ArrayRef,
-                Arc::new(StringArray::from(vec![Some(r#"{"enabled":true}"#), None, None]))
-                    as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Option::<&str>::None,
+                    Some("draft"),
+                    Option::<&str>::None,
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Option::<&str>::None,
+                    Option::<&str>::None,
+                    Option::<&str>::None,
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some(r#"{"enabled":true}"#),
+                    Option::<&str>::None,
+                    Option::<&str>::None,
+                ])) as ArrayRef,
             ],
         )
         .expect("to create JSON union array");
@@ -2170,8 +2196,8 @@ mod tests {
                 Arc::new(BooleanArray::from(vec![None])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![None])) as ArrayRef,
                 Arc::new(arrow::array::Float64Array::from(vec![None])) as ArrayRef,
-                Arc::new(StringArray::from(vec![None])) as ArrayRef,
-                Arc::new(StringArray::from(vec![None])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Option::<&str>::None])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Option::<&str>::None])) as ArrayRef,
                 Arc::new(StringArray::from(vec![Some(r#"{"enabled":true}"#)])) as ArrayRef,
             ],
         )
