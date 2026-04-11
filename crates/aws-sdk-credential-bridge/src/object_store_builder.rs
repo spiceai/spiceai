@@ -32,7 +32,7 @@ use snafu::prelude::*;
 use tokio::runtime::Handle;
 use url::Url;
 
-use crate::{S3CredentialProvider, get_bucket_name, get_or_init_sdk_config};
+use crate::{S3CredentialProvider, get_bucket_name, get_or_init_sdk_config_with_region};
 
 /// Error type for S3 object store building operations.
 #[derive(Debug, Snafu)]
@@ -380,7 +380,7 @@ impl S3ObjectStoreBuilder {
             }
         } else {
             // Load credentials from AWS SDK environment
-            s3_builder = apply_sdk_credentials(s3_builder).await?;
+            s3_builder = apply_sdk_credentials(s3_builder, self.region.as_deref()).await?;
         }
 
         let store = s3_builder.build().context(ObjectStoreBuildSnafu)?;
@@ -394,9 +394,12 @@ impl S3ObjectStoreBuilder {
 /// This function initializes the AWS SDK configuration and applies the credential
 /// provider to the builder. If no credentials are available, the builder is
 /// returned unchanged (which may result in anonymous access for public buckets).
-async fn apply_sdk_credentials(mut builder: AmazonS3Builder) -> Result<AmazonS3Builder> {
+async fn apply_sdk_credentials(
+    mut builder: AmazonS3Builder,
+    region: Option<&str>,
+) -> Result<AmazonS3Builder> {
     tracing::trace!("Loading S3 credentials from environment");
-    match get_or_init_sdk_config().await {
+    match get_or_init_sdk_config_with_region(region).await {
         Ok(Some(sdk_config)) => {
             if sdk_config.credentials_provider().is_some() {
                 tracing::trace!("Using S3 credentials provider from SDK config");

@@ -207,8 +207,18 @@ impl DataConnectorFactory for S3Factory {
                         // will handle the restricted source when building credentials.
                     }
                     _ => {
+                        let region = params
+                            .parameters
+                            .get("region")
+                            .expose()
+                            .ok()
+                            .map(ToString::to_string);
                         // Initialize global AWS SDK for default credential chain.
-                        if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
+                        if let Err(err) =
+                            aws_sdk_credential_bridge::get_or_init_sdk_config_with_region(
+                                region.as_deref(),
+                            )
+                            .await
                         {
                             tracing::warn!(
                                 "Unable to initialize AWS credentials for S3 connector: {err}"

@@ -107,6 +107,14 @@ pub fn default_aws_config() -> aws_config::ConfigLoader {
     aws_config::defaults(BehaviorVersion::v2026_01_12()).app_name(APN_APP_NAME.clone())
 }
 
+#[must_use]
+fn default_aws_config_for_region(region: Option<&str>) -> aws_config::ConfigLoader {
+    match region {
+        Some(region) => default_aws_config().region(Region::new(region.to_string())),
+        None => default_aws_config(),
+    }
+}
+
 static SDK_CONFIG: OnceCell<Option<Arc<SdkConfig>>> = OnceCell::const_new();
 
 /// Returns the global SDK configuration, initializing it if necessary.
@@ -119,12 +127,29 @@ static SDK_CONFIG: OnceCell<Option<Arc<SdkConfig>>> = OnceCell::const_new();
 /// Returns a [`LoadError`] if credential initialization continues to fail due to unrecoverable
 /// issues when communicating with the AWS credential provider.
 pub async fn get_or_init_sdk_config() -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
+    get_or_init_sdk_config_with_region(None).await
+}
+
+/// Returns the global SDK configuration, initializing it with an explicit region if necessary.
+///
+/// The cached SDK config is used to share the resolved credentials provider across the process.
+/// Callers should still pass an explicit region when building AWS clients or object stores rather
+/// than relying on the cached config's region.
+///
+/// # Errors
+///
+/// Returns a [`LoadError`] if credential initialization continues to fail due to unrecoverable
+/// issues when communicating with the AWS credential provider.
+pub async fn get_or_init_sdk_config_with_region(
+    region: Option<&str>,
+) -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
     if let Some(cached) = SDK_CONFIG.get() {
         return Ok(cached.clone());
     }
 
+    let region = region.map(ToString::to_string);
     let value = SDK_CONFIG
-        .get_or_try_init(initialize_sdk_config_with_retry)
+        .get_or_try_init(|| initialize_sdk_config_with_retry(region))
         .await?;
 
     Ok(value.clone())
@@ -137,9 +162,10 @@ pub fn get_sdk_config() -> Option<Arc<SdkConfig>> {
         .and_then(|value| value.as_ref().map(Arc::clone))
 }
 
-async fn initialize_sdk_config_with_retry() -> std::result::Result<Option<Arc<SdkConfig>>, LoadError>
-{
-    retry_with_backoff(load_sdk_config_from_env).await
+async fn initialize_sdk_config_with_retry(
+    region: Option<String>,
+) -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
+    retry_with_backoff(|| load_sdk_config_from_env(region.clone())).await
 }
 
 async fn retry_with_backoff<F, Fut, T>(mut attempt: F) -> std::result::Result<Option<T>, LoadError>
@@ -166,8 +192,12 @@ where
     }
 }
 
-async fn load_sdk_config_from_env() -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
-    let sdk_config = default_aws_config().load().await;
+async fn load_sdk_config_from_env(
+    region: Option<String>,
+) -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
+    let sdk_config = default_aws_config_for_region(region.as_deref())
+        .load()
+        .await;
 
     if let Some(creds_provider) = sdk_config.credentials_provider() {
         match creds_provider.provide_credentials().await {
@@ -232,7 +262,8 @@ pub async fn from_s3_url(url: &url::Url, region: Option<String>) -> Result<Box<d
     let mut builder = AmazonS3Builder::from_env()
         .with_bucket_name(bucket_name)
         .with_http_connector(SpawnedReqwestConnector::new(Handle::current()));
-    let (credential_provider, config) = S3CredentialProvider::from_env().await?;
+    let (credential_provider, config) =
+        S3CredentialProvider::from_env_with_region(region.as_deref()).await?;
 
     if let Some(region) = region.or(config.region().map(ToString::to_string)) {
         builder = builder.with_region(region);
@@ -269,7 +300,7 @@ pub fn from_s3_url_and_config(
 
     builder = builder.with_http_connector(SpawnedReqwestConnector::new(io_runtime));
 
-    if let Some(region) = region.or(sdk_config.region().map(ToString::to_string)) {
+    if let Some(region) = region {
         builder = builder.with_region(region);
     }
 
@@ -499,12 +530,12 @@ pub async fn initiate_config_with_credentials(
             Some("env") => initiate_config_auth_iam_env(region),
             _ => {
                 // Initialize AWS SDK credentials using the default credential chain.
-                if let Err(err) = get_or_init_sdk_config().await {
+                if let Err(err) = get_or_init_sdk_config_with_region(Some(region.as_str())).await {
                     tracing::warn!(
                         "Unable to initialize AWS credentials for {provider_name}: {err}"
                     );
                 }
-                default_aws_config().region(Region::new(region))
+                default_aws_config_for_region(Some(region.as_str()))
             }
         }
     }
@@ -526,10 +557,10 @@ pub async fn initiate_config_with_credentials(
 /// A [`ConfigLoader`] that can be further customized before loading.
 #[must_use]
 pub async fn initiate_config_default_auth(region: String) -> aws_config::ConfigLoader {
-    if let Err(err) = get_or_init_sdk_config().await {
+    if let Err(err) = get_or_init_sdk_config_with_region(Some(region.as_str())).await {
         tracing::warn!("Unable to initialize AWS credentials: {err}");
     }
-    default_aws_config().region(Region::new(region))
+    default_aws_config_for_region(Some(region.as_str()))
 }
 
 /// Initiates an AWS SDK configuration using only IAM role authentication.
@@ -981,6 +1012,18 @@ mod tests {
         assert!(
             name_str.starts_with("Spice-"),
             "APN app name should start with 'Spice-', got: {name_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_aws_config_for_region_sets_region() {
+        let config = default_aws_config_for_region(Some("ap-south-1"))
+            .load()
+            .await;
+
+        assert_eq!(
+            config.region().map(std::convert::AsRef::as_ref),
+            Some("ap-south-1")
         );
     }
 }
