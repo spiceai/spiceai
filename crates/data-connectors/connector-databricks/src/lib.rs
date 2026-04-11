@@ -716,6 +716,12 @@ impl DataConnectorFactory for DatabricksFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
         if let Some(runtime) = params.runtime {
+            let aws_region = params
+                .parameters
+                .get("aws_region")
+                .expose()
+                .ok()
+                .map(ToString::to_string);
             let param_map = params.parameters.to_secret_map();
 
             Box::pin(async move {
@@ -724,7 +730,11 @@ impl DataConnectorFactory for DatabricksFactory {
                     &param_map,
                     "aws_access_key_id",
                     "aws_secret_access_key",
-                ) && let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
+                ) && let Err(err) =
+                    aws_sdk_credential_bridge::get_or_init_sdk_config_with_region(
+                        aws_region.as_deref(),
+                    )
+                    .await
                 {
                     tracing::warn!(
                         "Unable to initialize AWS credentials for Databricks connector: {err}"
