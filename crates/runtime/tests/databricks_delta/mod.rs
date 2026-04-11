@@ -176,7 +176,7 @@ async fn databricks_delta_lake_schema_inference_test() -> Result<(), anyhow::Err
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            let total_columns: usize = result.iter().map(|b| b.num_rows()).sum();
+            let total_columns: usize = result.iter().map(datafusion::arrow::array::RecordBatch::num_rows).sum();
             assert_eq!(
                 total_columns, 15,
                 "Expected 15 columns in delta_all_types_table schema, got {total_columns}"

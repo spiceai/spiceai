@@ -59,7 +59,7 @@ fn get_params() -> Params {
 }
 
 /// Test that the Snowflake catalog connector discovers schemas and tables
-/// from a Snowflake database and registers them in information_schema.
+/// from a Snowflake database and registers them in `information_schema`.
 #[tokio::test]
 async fn snowflake_catalog_discovery_test() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
@@ -197,7 +197,7 @@ async fn snowflake_catalog_include_filter_test() -> Result<(), anyhow::Error> {
             );
 
             // TPCH_SF10 should NOT be present (excluded by include filter)
-            let sf10_result = rt
+            let excluded_result = rt
                 .datafusion()
                 .query_builder(
                     "SELECT COUNT(*) as cnt FROM information_schema.tables \
@@ -212,7 +212,7 @@ async fn snowflake_catalog_include_filter_test() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            let sf10_count: i64 = sf10_result
+            let excluded_count: i64 = excluded_result
                 .first()
                 .and_then(|b| {
                     b.column(0)
@@ -222,8 +222,8 @@ async fn snowflake_catalog_include_filter_test() -> Result<(), anyhow::Error> {
                 })
                 .unwrap_or(0);
             assert_eq!(
-                sf10_count, 0,
-                "Expected TPCH_SF10 tables to be excluded by include filter, found {sf10_count}"
+                excluded_count, 0,
+                "Expected TPCH_SF10 tables to be excluded by include filter, found {excluded_count}"
             );
 
             Ok(())
@@ -285,7 +285,7 @@ async fn snowflake_catalog_schema_inference_test() -> Result<(), anyhow::Error> 
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            let total_columns: usize = result.iter().map(|b| b.num_rows()).sum();
+            let total_columns: usize = result.iter().map(datafusion::arrow::array::RecordBatch::num_rows).sum();
             assert_eq!(
                 total_columns, 16,
                 "Expected 16 columns in TPCH LINEITEM via catalog, got {total_columns}"

@@ -1350,7 +1350,7 @@ mod tests {
     use runtime::component::dataset::builder::DatasetBuilder;
     use secrecy::ExposeSecret;
     use std::{
-        collections::{HashMap, VecDeque},
+        collections::VecDeque,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},

@@ -566,7 +566,7 @@ async fn test_adbc_sqlite_empty_table_schema() -> Result<(), String> {
                 .await
                 .map_err(|e| e.to_string())?;
 
-            let total_rows: usize = data_result.iter().map(|b| b.num_rows()).sum();
+            let total_rows: usize = data_result.iter().map(datafusion::arrow::array::RecordBatch::num_rows).sum();
             assert_eq!(total_rows, 0, "Expected 0 rows from empty table");
             if let Some(batch) = data_result.first() {
                 assert_eq!(batch.num_columns(), 3, "Expected 3 columns");

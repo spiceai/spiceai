@@ -104,7 +104,7 @@ async fn databricks_sql_warehouse_managed_table_test() -> Result<(), anyhow::Err
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+            let total_rows: usize = result.iter().map(datafusion::arrow::array::RecordBatch::num_rows).sum();
             assert_eq!(total_rows, 5, "Expected 5 rows from MANAGED table");
             for batch in &result {
                 assert_eq!(
@@ -163,7 +163,7 @@ async fn databricks_sql_warehouse_schema_inference_test() -> Result<(), anyhow::
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            let total_columns: usize = result.iter().map(|b| b.num_rows()).sum();
+            let total_columns: usize = result.iter().map(datafusion::arrow::array::RecordBatch::num_rows).sum();
             assert_eq!(
                 total_columns, 4,
                 "Expected 4 columns in TPCH nation schema, got {total_columns}"
@@ -174,7 +174,7 @@ async fn databricks_sql_warehouse_schema_inference_test() -> Result<(), anyhow::
         .await
 }
 
-/// Test that a dataset registered via SQL Warehouse appears in information_schema.tables.
+/// Test that a dataset registered via SQL Warehouse appears in `information_schema.tables`.
 #[tokio::test]
 async fn databricks_sql_warehouse_dataset_registration_test() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -275,7 +275,7 @@ async fn databricks_sql_warehouse_external_table_test() -> Result<(), anyhow::Er
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+            let total_rows: usize = result.iter().map(datafusion::arrow::array::RecordBatch::num_rows).sum();
             assert!(
                 total_rows <= 5,
                 "Expected at most 5 rows from EXTERNAL table"
@@ -331,7 +331,7 @@ async fn databricks_sql_warehouse_foreign_table_test() -> Result<(), anyhow::Err
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+            let total_rows: usize = result.iter().map(datafusion::arrow::array::RecordBatch::num_rows).sum();
             assert!(
                 total_rows <= 5,
                 "Expected at most 5 rows from FOREIGN table"
@@ -342,7 +342,7 @@ async fn databricks_sql_warehouse_foreign_table_test() -> Result<(), anyhow::Err
         .await
 }
 
-/// Test querying a MATERIALIZED_VIEW through the SQL Warehouse connector.
+/// Test querying a `MATERIALIZED_VIEW` through the SQL Warehouse connector.
 /// Materialized views are pre-computed result sets maintained by Databricks.
 #[tokio::test]
 async fn databricks_sql_warehouse_materialized_view_test() -> Result<(), anyhow::Error> {
@@ -386,7 +386,7 @@ async fn databricks_sql_warehouse_materialized_view_test() -> Result<(), anyhow:
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+            let total_rows: usize = result.iter().map(datafusion::arrow::array::RecordBatch::num_rows).sum();
             assert!(
                 total_rows <= 5,
                 "Expected at most 5 rows from MATERIALIZED_VIEW"
