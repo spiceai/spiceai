@@ -104,8 +104,11 @@ impl DataConnectorFactory for IcebergDataConnectorFactory {
 /// Holds the components needed for both read and read-write Iceberg providers.
 struct IcebergTableParts {
     provider: Arc<dyn TableProvider>,
+    #[cfg(feature = "iceberg-write")]
     catalog: Arc<dyn Catalog>,
+    #[cfg(feature = "iceberg-write")]
     namespace: NamespaceIdent,
+    #[cfg(feature = "iceberg-write")]
     table_name: String,
 }
 
@@ -270,8 +273,11 @@ impl IcebergDataConnector {
 
         Ok(IcebergTableParts {
             provider: Arc::new(table_provider),
+            #[cfg(feature = "iceberg-write")]
             catalog: catalog_client,
+            #[cfg(feature = "iceberg-write")]
             namespace: table_identifier.namespace().clone(),
+            #[cfg(feature = "iceberg-write")]
             table_name,
         })
     }
@@ -349,8 +355,11 @@ impl IcebergDataConnector {
 
         Ok(IcebergTableParts {
             provider: Arc::new(table_provider),
+            #[cfg(feature = "iceberg-write")]
             catalog: catalog_client,
+            #[cfg(feature = "iceberg-write")]
             namespace: table_identifier.namespace().clone(),
+            #[cfg(feature = "iceberg-write")]
             table_name: table_name_str,
         })
     }
