@@ -739,10 +739,10 @@ fn infer_bigquery_namespace(component: &ConnectorComponent) -> ConnectionNamespa
 
 fn infer_bigquery_namespace_from_dataset(dataset: &Dataset) -> ConnectionNamespace {
     let dialect = datafusion::sql::sqlparser::dialect::GenericDialect {};
-    dataset
-        .parse_path(true, Some(&dialect))
-        .map(|table_reference| connection_namespace_from_table_reference(&table_reference))
-        .unwrap_or_else(|_| infer_bigquery_namespace_from_path(dataset.path()))
+    dataset.parse_path(true, Some(&dialect)).map_or_else(
+        |_| infer_bigquery_namespace_from_path(dataset.path()),
+        |table_reference| connection_namespace_from_table_reference(&table_reference),
+    )
 }
 
 fn connection_namespace_from_table_reference(
