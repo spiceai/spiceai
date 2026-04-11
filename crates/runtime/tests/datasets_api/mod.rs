@@ -17,17 +17,37 @@ limitations under the License.
 //! Tests for the `/v1/datasets` HTTP API endpoint.
 
 use std::{
+    any::Any,
+    future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
 
+use async_trait::async_trait;
+use datafusion::{
+    arrow::datatypes::{DataType, Field, Schema},
+    datasource::{MemTable, TableProvider},
+    sql::TableReference,
+};
 use rand::Rng;
-use runtime::{Runtime, auth::EndpointAuth, config::Config, status::ComponentStatus};
-use runtime_api_types::v1::ComponentError;
+use runtime::{
+    Runtime,
+    auth::EndpointAuth,
+    component::dataset::Dataset as RuntimeDataset,
+    config::Config,
+    dataconnector::{
+        self, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
+        DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
+    },
+    status::ComponentStatus,
+};
+use runtime_api_types::v1::{ComponentError, ComponentErrorCategory, ComponentErrorType};
+use runtime_parameters::ParameterSpec;
 use serde::Deserialize;
 use serde_json::Value;
-use spicepod::component::dataset::Dataset;
+use spicepod::component::dataset::Dataset as SpicepodDataset;
 
 use crate::{
     init_tracing,
@@ -36,11 +56,17 @@ use crate::{
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
-fn get_s3_parquet_dataset(name: &str) -> Dataset {
-    Dataset::new(
+const PERMISSION_STATUS_CONNECTOR: &str = "permissionstatus";
+
+fn get_s3_parquet_dataset(name: &str) -> SpicepodDataset {
+    SpicepodDataset::new(
         "s3://spiceai-public-datasets/dictionary_example/dictionary_example.parquet",
         name,
     )
+}
+
+fn get_permission_status_dataset(name: &str) -> SpicepodDataset {
+    SpicepodDataset::new(format!("{PERMISSION_STATUS_CONNECTOR}:{name}"), name)
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +78,75 @@ struct DatasetResponse {
     status: Option<String>,
     error: Option<ComponentError>,
     error_message: Option<String>,
+}
+
+#[derive(Debug)]
+struct PermissionStatusConnector;
+
+#[async_trait]
+impl DataConnector for PermissionStatusConnector {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn read_provider(
+        &self,
+        dataset: &RuntimeDataset,
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        if dataset.name.table() == "permission_denied" {
+            return Err(DataConnectorError::InsufficientPermissions {
+                dataconnector: PERMISSION_STATUS_CONNECTOR.to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Grant SELECT or ALL PRIVILEGES on the table",
+                )),
+            });
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table =
+            MemTable::try_new(schema, vec![Vec::new()]).expect("test memtable should build");
+
+        Ok(Arc::new(table))
+    }
+}
+
+struct PermissionStatusConnectorFactory;
+
+impl PermissionStatusConnectorFactory {
+    fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+impl DataConnectorFactory for PermissionStatusConnectorFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn create(
+        &self,
+        _params: ConnectorParams,
+    ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        Box::pin(async move { Ok(Arc::new(PermissionStatusConnector) as Arc<dyn DataConnector>) })
+    }
+
+    fn prefix(&self) -> &'static str {
+        PERMISSION_STATUS_CONNECTOR
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        &[]
+    }
+}
+
+async fn register_permission_status_provider() {
+    dataconnector::register_connector_factory(
+        PERMISSION_STATUS_CONNECTOR,
+        PermissionStatusConnectorFactory::new_arc(),
+    )
+    .await;
 }
 
 /// Tests that the `/v1/datasets?status=true` endpoint returns the correct status
@@ -198,6 +293,122 @@ async fn test_datasets_api_returns_correct_status() -> Result<(), anyhow::Error>
             assert!(!test_dataset.acceleration_enabled);
             assert!(!test_dataset.replication_enabled);
             assert!(test_dataset.from.contains("s3://"));
+
+            rt.shutdown().await;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_datasets_api_permission_edge_cases_update_statuses() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+    register_permission_status_provider().await;
+
+    test_request_context()
+        .scope(async {
+            let span = tracing::info_span!("test_datasets_api_permission_edge_cases_update_statuses");
+            let _span_guard = span.enter();
+
+            let mut rng = rand::rng();
+            let http_port: u16 = rng.random_range(50000..60000);
+            let flight_port: u16 = http_port + 1;
+
+            let api_config = Config::new()
+                .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
+                .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
+
+            let app = app::AppBuilder::new("test_datasets_api_permission_cases")
+                .with_dataset(get_permission_status_dataset("permission_allowed"))
+                .with_dataset(get_permission_status_dataset("permission_denied"))
+                .build();
+
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            let cloned_rt = Arc::clone(&rt);
+
+            tokio::spawn(async move {
+                Box::pin(cloned_rt.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            let http_client = reqwest::Client::builder().build()?;
+
+            wait_until_true(Duration::from_secs(10), || async {
+                http_client
+                    .get(format!("http://127.0.0.1:{http_port}/health"))
+                    .send()
+                    .await
+                    .is_ok()
+            })
+            .await;
+
+            let dataset_statuses = rt.status().get_dataset_statuses();
+            let permission_allowed = TableReference::bare("permission_allowed");
+            let permission_denied = TableReference::bare("permission_denied");
+
+            assert_eq!(
+                dataset_statuses.get(&permission_allowed),
+                Some(&ComponentStatus::Ready),
+                "successful datasets should remain ready"
+            );
+
+            let denied_status = dataset_statuses
+                .get(&permission_denied)
+                .expect("permission_denied should have a runtime status");
+            assert!(
+                denied_status.is_error(),
+                "permission failures should be recorded as dataset errors"
+            );
+            assert!(
+                denied_status.error_message().is_some_and(|message| message.contains("Insufficient permissions to access")),
+                "runtime status should retain the permission error message"
+            );
+
+            let http_url = format!("http://127.0.0.1:{http_port}/v1/datasets?status=true");
+            let response = http_client.get(&http_url).send().await.expect("valid response");
+
+            assert!(response.status().is_success());
+
+            let datasets: Vec<DatasetResponse> = response.json().await?;
+
+            let permission_allowed = datasets
+                .iter()
+                .find(|dataset| dataset.name == "permission_allowed")
+                .expect("permission_allowed should be in the response");
+            assert_eq!(permission_allowed.status, Some("Ready".to_string()));
+            assert_eq!(permission_allowed.error, None);
+            assert_eq!(permission_allowed.error_message, None);
+
+            let permission_denied = datasets
+                .iter()
+                .find(|dataset| dataset.name == "permission_denied")
+                .expect("permission_denied should be in the response");
+            assert_eq!(permission_denied.status, Some("Error".to_string()));
+            assert_eq!(
+                permission_denied.error,
+                Some(ComponentError {
+                    category: ComponentErrorCategory::Dataset,
+                    error_type: ComponentErrorType::Permission,
+                    code: "dataset.permission".to_string(),
+                })
+            );
+            assert!(
+                permission_denied.error_message.as_deref().is_some_and(|message| {
+                    message.contains("Insufficient permissions to access")
+                        && message.contains("permission_denied")
+                }),
+                "API should surface the permission failure message"
+            );
 
             rt.shutdown().await;
 

@@ -185,7 +185,7 @@ impl UnityCatalogSchemaProvider {
             candidates.push((table, table_reference));
         }
 
-        // Second pass: check permissions concurrently (bounded).
+        // Second pass: run advisory permission checks concurrently (bounded).
         let max_concurrent_permission_checks = 5;
         let permission_results: Vec<(UCTable, TableReference, bool)> =
             futures::stream::iter(candidates.into_iter().map(|(table, table_ref)| {
@@ -200,14 +200,16 @@ impl UnityCatalogSchemaProvider {
                         return (table, table_ref, true);
                     }
 
-                    let has_permission =
+                    let should_include =
                         match client.get_effective_permissions(&table.full_name()).await {
                             Ok(Some(perms)) if !perms.has_read_permission() => {
-                                tracing::debug!(
+                                tracing::warn!(
                                     table = %table.full_name(),
-                                    "Skipping table during catalog discovery: no read-compatible privilege found in effective-permissions response"
+                                    principals = ?perms.principals(),
+                                    privileges = ?perms.all_privileges(),
+                                    "Unity Catalog effective-permissions did not report a read-compatible privilege during catalog discovery; proceeding and deferring to Databricks query-time validation"
                                 );
-                                false
+                                true
                             }
                             Ok(None) => {
                                 tracing::warn!(
@@ -226,17 +228,17 @@ impl UnityCatalogSchemaProvider {
                             }
                             Ok(Some(_)) => true,
                         };
-                    (table, table_ref, has_permission)
+                    (table, table_ref, should_include)
                 }
             }))
             .buffer_unordered(max_concurrent_permission_checks)
             .collect()
             .await;
 
-        // Third pass: create table providers for permitted tables.
+        // Third pass: create table providers for retained tables.
         let mut tables_map = HashMap::new();
-        for (table, table_reference, has_permission) in permission_results {
-            if !has_permission {
+        for (table, table_reference, should_include) in permission_results {
+            if !should_include {
                 continue;
             }
 
@@ -371,28 +373,37 @@ impl UnityCatalogSchemaProvider {
             return None;
         }
 
-        match client.get_effective_permissions(&table.full_name()).await {
-            Ok(Some(perms)) if !perms.has_read_permission() => {
-                tracing::debug!(
-                    table = %table.full_name(),
-                    "Skipping table during catalog discovery: no read-compatible privilege found in effective-permissions response"
-                );
-                return None;
+        if !table.requires_read_permission_validation() {
+            tracing::debug!(
+                table = %table.full_name(),
+                table_type = %table.table_type,
+                "Skipping strict Unity Catalog permission precheck for foreign table during catalog refresh"
+            );
+        } else {
+            match client.get_effective_permissions(&table.full_name()).await {
+                Ok(Some(perms)) if !perms.has_read_permission() => {
+                    tracing::warn!(
+                        table = %table.full_name(),
+                        principals = ?perms.principals(),
+                        privileges = ?perms.all_privileges(),
+                        "Unity Catalog effective-permissions did not report a read-compatible privilege during catalog refresh; proceeding and deferring to Databricks query-time validation"
+                    );
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        table = %table.full_name(),
+                        "Permission check returned no table; proceeding without permission validation"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        table = %table.full_name(),
+                        error = %e,
+                        "Failed to check permissions; proceeding without permission validation"
+                    );
+                }
+                Ok(Some(_)) => {}
             }
-            Ok(None) => {
-                tracing::warn!(
-                    table = %table.full_name(),
-                    "Permission check returned no table; proceeding without permission validation"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    table = %table.full_name(),
-                    error = %e,
-                    "Failed to check permissions; proceeding without permission validation"
-                );
-            }
-            Ok(Some(_)) => {}
         }
 
         let table_provider = match table_creator.table_provider(table_reference.clone()).await {
