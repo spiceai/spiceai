@@ -304,9 +304,10 @@ impl Runtime {
 
     /// Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.
     ///
-    /// The `load_semaphore` gates the data-intensive parts (schema inference via
-    /// `read_provider` and initial data load/refresh) while allowing connector
-    /// creation and validation to proceed without the permit.
+    /// The `load_semaphore` gates the entire dataset load cycle — connector
+    /// creation, schema inference via `read_provider`, and initial data
+    /// load/refresh — so that `dataset_load_parallelism` controls how many
+    /// datasets hit the source concurrently.
     async fn load_dataset(
         self: Arc<Self>,
         ds: Arc<Dataset>,
@@ -339,6 +340,10 @@ impl Runtime {
                     },
                 ));
             }
+
+            let Ok(_load_guard) = load_semaphore.acquire().await else {
+                unreachable!("Semaphore is never closed.");
+            };
 
             let connector_start = Instant::now();
             let connector = match Arc::clone(&runtime)
@@ -381,7 +386,6 @@ impl Runtime {
                     connector,
                     None,
                     bootstrap_status.clone(),
-                    Arc::clone(&load_semaphore),
                 )
                 .await
             {
@@ -411,7 +415,6 @@ impl Runtime {
         data_connector: Arc<dyn DataConnector>,
         accelerated_table: Option<Arc<AcceleratedTable>>,
         bootstrap_status: BootstrapStatus,
-        load_semaphore: Arc<Semaphore>,
     ) -> Result<()> {
         let source = ds.source();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
@@ -434,13 +437,6 @@ impl Runtime {
             .acceleration
             .as_ref()
             .is_some_and(|a| a.mode == Mode::FileUpdate);
-
-        // Acquire the load semaphore before schema inference and data loading.
-        // This limits the concurrent load on the source (e.g., Snowflake) while
-        // allowing connector creation and validation to proceed freely.
-        let Ok(_load_guard) = load_semaphore.acquire().await else {
-            unreachable!("Semaphore is never closed.");
-        };
 
         // Test dataset connectivity by attempting to get a read provider.
         let schema_start = Instant::now();
@@ -661,7 +657,6 @@ impl Runtime {
                         Arc::clone(&connector),
                         None,
                         BootstrapStatus::None,
-                        Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
                     )
                     .await
                 {
@@ -776,7 +771,6 @@ impl Runtime {
             Arc::clone(&connector),
             Some(accelerated_table),
             BootstrapStatus::None,
-            Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
         )
         .await?;
 

@@ -436,11 +436,10 @@ pub async fn create_new_connector(
     name: &str,
     params: ConnectorParams,
 ) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
-    let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
-
-    let connector_factory = guard.get(name);
-
-    let factory = connector_factory?;
+    let factory = {
+        let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+        guard.get(name).cloned()
+    }?;
 
     let ConnectorComponent::Dataset(ds) = &params.component else {
         unreachable!("Component is always a dataset at this point")
