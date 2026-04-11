@@ -36,8 +36,17 @@ impl CachingEngineSys {
     pub fn update_fetched_at(&self) -> Result<()> {
         #[cfg(feature = "duckdb")]
         {
-            let AccelerationConnection::DuckDB(pool) = &self.acceleration_connection;
-            return self.update_fetched_at_duckdb(pool);
+            match &self.acceleration_connection {
+                AccelerationConnection::DuckDB(pool) => self.update_fetched_at_duckdb(pool),
+                #[cfg(feature = "postgres-accel")]
+                AccelerationConnection::Postgres(_) => Err(Error::NoAccelerationConnection),
+                #[cfg(feature = "sqlite")]
+                AccelerationConnection::SQLite(_) => Err(Error::NoAccelerationConnection),
+                #[cfg(feature = "turso")]
+                AccelerationConnection::Turso(_) => Err(Error::NoAccelerationConnection),
+                #[cfg(all(not(windows), feature = "sqlite"))]
+                AccelerationConnection::Cayenne(_) => Err(Error::NoAccelerationConnection),
+            }
         }
 
         #[cfg(not(feature = "duckdb"))]

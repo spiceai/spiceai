@@ -690,8 +690,11 @@ async fn openai(
 ///   - Huggingface `FssSpec`: `hf://[<repo_type_prefix>]<repo_id>[@<revision>]/<path/in/repo>`.
 async fn get_bytes_for_file(
     url: &str,
-    _params: &HashMap<String, SecretString>,
+    params: &HashMap<String, SecretString>,
 ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(not(feature = "models"))]
+    let _ = params;
+
     #[cfg(feature = "models")]
     {
         match url.split('/').collect_vec().as_slice() {
@@ -711,7 +714,7 @@ async fn get_bytes_for_file(
                     model_id,
                     Some(branch),
                     file.join("/").as_str(),
-                    _params
+                    params
                         .get("hf_token")
                         .map(secrecy::ExposeSecret::expose_secret),
                 )
@@ -726,7 +729,7 @@ async fn get_bytes_for_file(
                     model_id,
                     branch,
                     file.join("/").as_str(),
-                    _params
+                    params
                         .get("hf_token")
                         .map(secrecy::ExposeSecret::expose_secret),
                 )
@@ -740,7 +743,7 @@ async fn get_bytes_for_file(
                     model_id,
                     branch,
                     file.join("/").as_str(),
-                    _params
+                    params
                         .get("hf_token")
                         .map(secrecy::ExposeSecret::expose_secret),
                 )
@@ -755,7 +758,7 @@ async fn get_bytes_for_file(
                     model_id,
                     branch,
                     file.join("/").as_str(),
-                    _params
+                    params
                         .get("hf_token")
                         .map(secrecy::ExposeSecret::expose_secret),
                 )
