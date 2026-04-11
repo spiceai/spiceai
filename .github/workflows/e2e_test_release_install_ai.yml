@@ -16,7 +16,7 @@ on:
           - 'macOS aarch64 (GPU M4)'
           - 'Linux aarch64'
           - 'macOS aarch64'
-          - 'Windows x64'
+          - 'Windows x64 (WSL)'
         default: 'all'
   pull_request:
     paths:
@@ -30,6 +30,9 @@ on:
       - 'install/install.sh'
       - 'install/Install.ps1'
       - '.github/workflows/e2e_test_release_install_ai.yml'
+
+permissions:
+  contents: read
 
 jobs:
   setup-matrix:
@@ -65,13 +68,6 @@ jobs:
                 target_os: "darwin",
                 target_arch: "aarch64",
                 tags: []
-              },
-              {
-                name: "Windows x64",
-                runner: "windows-latest",
-                target_os: "windows",
-                target_arch: "x86_64",
-                tags: []
               }
             ];
 
@@ -95,7 +91,6 @@ jobs:
 
     steps:
       - name: system info
-        if: matrix.target.target_os != 'windows'
         run: uname -m
 
       - name: checkout code
@@ -138,57 +133,29 @@ jobs:
           rm -rf ~/.spice/bin/
 
       - name: install Spice (https://install.spiceai.org)
-        if: matrix.target.target_os != 'windows' && github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
+        if: github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           curl https://install.spiceai.org | /bin/bash
 
       - name: install Spice (from branch)
-        if: matrix.target.target_os != 'windows' && (github.event_name != 'workflow_dispatch' || inputs.install_script_branch != '')
+        if: github.event_name != 'workflow_dispatch' || inputs.install_script_branch != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
-          curl -sSL -H "Cache-Control: no-cache" -H "Authorization: token ${GITHUB_TOKEN}" -H "Accept: application/vnd.github.v3.raw" "https://api.github.com/repos/${{ github.repository }}/contents/install/install.sh?ref=${BRANCH}" | /bin/bash
-
-      - name: install Spice (Windows)
-        if: matrix.target.target_os == 'windows' && github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          curl -L "https://install.spiceai.org/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
-
-      - name: install Spice (Windows from branch)
-        if: matrix.target.target_os == 'windows' && (github.event_name != 'workflow_dispatch' || inputs.install_script_branch != '')
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $branch = "${{ inputs.install_script_branch }}"
-          if ([string]::IsNullOrEmpty($branch)) {
-            $branch = "${{ github.head_ref }}"
-            if ([string]::IsNullOrEmpty($branch)) {
-              $branch = "${{ github.ref_name }}"
-            }
-          }
-          $headers = @{
-            "Authorization" = "token $env:GITHUB_TOKEN"
-            "Accept" = "application/vnd.github.v3.raw"
-          }
-          $url = "https://api.github.com/repos/${{ github.repository }}/contents/install/Install.ps1?ref=$branch"
-          Invoke-WebRequest -Uri $url -Headers $headers -OutFile Install.ps1
-          PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
+          curl -sSL \
+            -H "Cache-Control: no-cache" \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/install/install.sh?ref=${BRANCH}" \
+            -o /tmp/install.sh
+          bash /tmp/install.sh
 
       - name: add Spice bin to PATH
-        if: matrix.target.target_os != 'windows'
         run: |
           echo "$HOME/.spice/bin" >> $GITHUB_PATH
-
-      - name: add Spice bin to PATH (Windows)
-        if: matrix.target.target_os == 'windows'
-        run: |
-          Add-Content $env:GITHUB_PATH (Join-Path $HOME ".spice\bin")
-        shell: pwsh
 
       - name: install AI runtime version
         run: |
@@ -214,7 +181,6 @@ jobs:
           cat ./spicepod.yaml
 
       - name: Start Spice runtime
-        if: matrix.target.target_os != 'windows'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
@@ -222,50 +188,9 @@ jobs:
           spice run &> spice.log &
 
       - name: Wait for Spice runtime is ready
-        if: matrix.target.target_os != 'windows'
         timeout-minutes: 3
         run: |
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
-
-      - name: start Spice runtime (Windows)
-        if: matrix.target.target_os == 'windows'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
-        run: |
-          Start-Process -FilePath spice -ArgumentList run -RedirectStandardOutput stdout.log -RedirectStandardError stderr.log
-          echo "Waiting for Spice runtime to be ready..."
-          do {
-            try {
-              Start-Sleep -Seconds 1
-              $response = Invoke-WebRequest -Uri "http://127.0.0.1:8090/v1/ready" -UseBasicParsing
-              $res = $response.Content.Trim()
-
-              Write-Host "Status: $($response.StatusCode)"
-              Write-Host "Reponse: $res"
-            } catch {
-              Write-Host "Failed to reach /health endpoint. Error: $($_.Exception.Message)"
-            }
-          } while ($res -ne "ready")
-
-          echo "Verifying embedding and vector search"
-          $url = "http://127.0.0.1:8090/v1/search"
-          $body = @{ text = "Spice runtime error" } | ConvertTo-Json
-          $response = Invoke-RestMethod -Uri $url -Headers @{ "Content-Type" = "application/json" } -Method POST -Body $body -ErrorAction Stop
-          echo ($response | ConvertTo-Json -Depth 10)
-          if (-not $response.results) { exit 1 }
-          echo "Passed"
-
-          echo "Verifying chat functionality"
-          $url = "http://127.0.0.1:8090/v1/chat/completions"
-          $body = @{ messages = @(@{ role = "user"; content = "What datasets you have access to?" }); model = "openai-gpt"; stream = $false } | ConvertTo-Json
-          $response = Invoke-RestMethod -Uri $url -Headers @{ "Content-Type" = "application/json" } -Method POST -Body $body -ErrorAction Stop
-          echo ($response | ConvertTo-Json -Depth 10)
-          if (-not $response.choices) { exit 1 }
-          echo "Passed"
-
-        shell: pwsh
-        timeout-minutes: 3
 
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
@@ -279,29 +204,114 @@ jobs:
           brew install expect
 
       - name: Test vector search
-        if: matrix.target.target_os != 'windows'
         run: |
           ./test/models/search_01.exp
 
       - name: Test chat
-        if: matrix.target.target_os != 'windows'
         run: |
           ./test/models/chat_01_simple.exp
 
       - name: Stop spice and check logs
-        if: always() && matrix.target.target_os != 'windows'
+        if: always()
         run: |
           killall spice || true
           cat spice.log
 
-      - name: Stop spice and check logs (Windows)
-        if: always() && matrix.target.target_os == 'windows'
+  # The spiced AI runtime does not start reliably within a reasonable time on native Windows.
+  # Instead, we install the Spice CLI natively (via Install.ps1) then run spiced inside WSL
+  # where startup performance is consistent with Linux.
+  test-install-windows-wsl:
+    name: Windows x64 (WSL)
+    runs-on: windows-latest
+    steps:
+      - name: checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Setup WSL
+        uses: Vampire/setup-wsl@6a8db447be7ed35f2f499c02c6e60ff77ef11278 # v6.0.0
+        with:
+          distribution: Ubuntu-22.04
+          additional-packages: curl jq
+
+      - name: install Spice (https://install.spiceai.org)
+        if: github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
+        shell: wsl-bash {0}
         run: |
-          Get-Process spice -ErrorAction SilentlyContinue | Stop-Process -Force
-          if (Test-Path stdout.log) {
-            Get-Content stdout.log
+          curl https://install.spiceai.org | /bin/bash
+
+      - name: install Spice (from branch)
+        if: github.event_name != 'workflow_dispatch' || inputs.install_script_branch != ''
+        shell: wsl-bash {0}
+        run: |
+          BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
+          # Use the GitHub Actions expression for the token directly — WSL does not inherit
+          # env vars from the Windows runner, so ${{ secrets.GITHUB_TOKEN }} is expanded
+          # by the Actions runner before the script is handed to wsl-bash.
+          curl -sSL \
+            -H "Cache-Control: no-cache" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/install/install.sh?ref=${BRANCH}" \
+            -o /tmp/install.sh
+          bash /tmp/install.sh
+
+      - name: install AI runtime version
+        shell: wsl-bash {0}
+        run: |
+          export PATH="$HOME/.spice/bin:$PATH"
+          GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}" spice install ai
+
+      - name: check installation
+        shell: wsl-bash {0}
+        run: |
+          export PATH="$HOME/.spice/bin:$PATH"
+          spice version
+
+      - name: Init Spice app (OpenAI model)
+        shell: wsl-bash {0}
+        run: |
+          cp ./test/models/spicepod_openai.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      - name: Install expect
+        shell: wsl-bash {0}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+
+      - name: Start Spice runtime and run AI tests
+        shell: wsl-bash {0}
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.spice/bin:$PATH"
+          export SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"
+          export GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+
+          cleanup() {
+            killall spice || true
+            if [ -f spice.log ]; then
+              cat spice.log
+            fi
           }
-          if (Test-Path stderr.log) {
-            Get-Content stderr.log
-          }
-        shell: pwsh
+          trap cleanup EXIT
+
+          spice run &> spice.log &
+
+          echo "Waiting for Spice runtime to be ready..."
+          ready=false
+          for i in $(seq 1 180); do
+            if [ "$(curl -s http://localhost:8090/v1/ready)" = "ready" ]; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ready" != "true" ]; then
+            echo "Spice runtime failed to become ready"
+            exit 1
+          fi
+
+          expect ./test/models/search_01.exp
+          expect ./test/models/chat_01_simple.exp

@@ -117,7 +117,7 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true' && github.event_name == 'schedule'
 
-    runs-on: hosted-linux-arm-runner
+    runs-on: 'spiceai-dgx-spark-runners'
     env:
       SELECTED_VARIANT: ${{ needs.setup.outputs.variant }}
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}

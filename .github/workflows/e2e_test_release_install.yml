@@ -21,6 +21,9 @@ on:
       - 'install/Install.ps1'
       - '.github/workflows/e2e_test_release_install.yml'
 
+permissions:
+  contents: read
+
 jobs:
   test-install:
     name: install on ${{ matrix.name }}
@@ -146,11 +149,18 @@ jobs:
       - name: install Spice (from branch)
         if: github.event_name != 'workflow_dispatch' || inputs.install_script_branch != ''
         shell: wsl-bash {0}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
-          curl -sSL -H "Cache-Control: no-cache" -H "Authorization: token ${GITHUB_TOKEN}" -H "Accept: application/vnd.github.v3.raw" "https://api.github.com/repos/${{ github.repository }}/contents/install/install.sh?ref=${BRANCH}" | /bin/bash
+          # Use the GitHub Actions expression for the token directly — WSL does not inherit
+          # env vars from the Windows runner, so ${{ secrets.GITHUB_TOKEN }} is expanded
+          # by the Actions runner before the script is handed to wsl-bash.
+          curl -sSL \
+            -H "Cache-Control: no-cache" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/install/install.sh?ref=${BRANCH}" \
+            -o /tmp/install.sh
+          bash /tmp/install.sh
 
       - name: check installation
         shell: wsl-bash {0}
