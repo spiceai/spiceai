@@ -1330,7 +1330,7 @@ fn record_batch_to_json_rows(
         .collect();
 
     if custom_indices.is_empty() {
-        return json_value_to_rows(write_to_json_value_with_arrow(&[batch.clone()])?);
+        return json_value_to_rows(write_to_json_value_with_arrow(std::slice::from_ref(batch))?);
     }
 
     let mut is_custom_index = vec![false; batch.num_columns()];
@@ -1346,12 +1346,14 @@ fn record_batch_to_json_rows(
         vec![Map::new(); batch.num_rows()]
     } else {
         let projected_batch = batch.project(&non_union_indices)?;
-        json_value_to_rows(write_to_json_value_with_arrow(&[projected_batch])?)?
+        json_value_to_rows(write_to_json_value_with_arrow(std::slice::from_ref(
+            &projected_batch,
+        ))?)?
     };
 
     for custom_index in custom_indices {
         let column_values = column_to_json_values(batch.column(custom_index).as_ref())?;
-        let field_name = batch.schema().field(custom_index).name().to_string();
+        let field_name = batch.schema().field(custom_index).name().clone();
 
         for (row, value) in rows.iter_mut().zip(column_values) {
             row.insert(field_name.clone(), value);
@@ -1398,7 +1400,10 @@ fn union_array_to_json_values(
 
     if let Some(encoder) = JsonUnionEncoder::from_union(union_array.clone()) {
         return (0..encoder.len())
-            .map(|index| json_union_value_to_json(encoder.get_value(index)))
+            .map(|index| {
+                let value = encoder.get_value(index);
+                json_union_value_to_json(&value)
+            })
             .collect();
     }
 
@@ -1408,14 +1413,14 @@ fn union_array_to_json_values(
 }
 
 fn json_union_value_to_json(
-    value: JsonUnionValue<'_>,
+    value: &JsonUnionValue<'_>,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     match value {
         JsonUnionValue::JsonNull => Ok(Value::Null),
-        JsonUnionValue::Bool(value) => Ok(Value::Bool(value)),
-        JsonUnionValue::Int(value) => Ok(Value::Number(Number::from(value))),
-        JsonUnionValue::Float(value) => number_to_json(value),
-        JsonUnionValue::Str(value) => Ok(Value::String(value.to_string())),
+        JsonUnionValue::Bool(value) => Ok(Value::Bool(*value)),
+        JsonUnionValue::Int(value) => Ok(Value::Number(Number::from(*value))),
+        JsonUnionValue::Float(value) => number_to_json(*value),
+        JsonUnionValue::Str(value) => Ok(Value::String((*value).to_owned())),
         JsonUnionValue::Array(value) | JsonUnionValue::Object(value) => {
             serde_json::from_str(value).boxed()
         }
@@ -1429,7 +1434,8 @@ fn array_value_to_json(
     if let Some(union_array) = array.as_any().downcast_ref::<UnionArray>()
         && let Some(encoder) = JsonUnionEncoder::from_union(union_array.clone())
     {
-        return json_union_value_to_json(encoder.get_value(index));
+        let value = encoder.get_value(index);
+        return json_union_value_to_json(&value);
     }
 
     scalar_to_json_value(&ScalarValue::try_from_array(array, index)?)
@@ -1439,56 +1445,54 @@ fn scalar_to_json_value(
     value: &ScalarValue,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     match value {
-        ScalarValue::Null => Ok(Value::Null),
         ScalarValue::Boolean(value) => Ok(value.map(Value::Bool).unwrap_or(Value::Null)),
         ScalarValue::Float16(Some(value)) => number_to_json(f64::from(f32::from(*value))),
-        ScalarValue::Float16(None) => Ok(Value::Null),
         ScalarValue::Float32(Some(value)) => number_to_json(f64::from(*value)),
-        ScalarValue::Float32(None) => Ok(Value::Null),
         ScalarValue::Float64(Some(value)) => number_to_json(*value),
-        ScalarValue::Float64(None) => Ok(Value::Null),
         ScalarValue::Int8(Some(value)) => Ok(Value::Number(Number::from(*value))),
-        ScalarValue::Int8(None) => Ok(Value::Null),
         ScalarValue::Int16(Some(value)) => Ok(Value::Number(Number::from(*value))),
-        ScalarValue::Int16(None) => Ok(Value::Null),
         ScalarValue::Int32(Some(value)) => Ok(Value::Number(Number::from(*value))),
-        ScalarValue::Int32(None) => Ok(Value::Null),
         ScalarValue::Int64(Some(value)) => Ok(Value::Number(Number::from(*value))),
-        ScalarValue::Int64(None) => Ok(Value::Null),
         ScalarValue::UInt8(Some(value)) => Ok(Value::Number(Number::from(*value))),
-        ScalarValue::UInt8(None) => Ok(Value::Null),
         ScalarValue::UInt16(Some(value)) => Ok(Value::Number(Number::from(*value))),
-        ScalarValue::UInt16(None) => Ok(Value::Null),
         ScalarValue::UInt32(Some(value)) => Ok(Value::Number(Number::from(*value))),
-        ScalarValue::UInt32(None) => Ok(Value::Null),
         ScalarValue::UInt64(Some(value)) => Ok(Value::Number(Number::from(*value))),
-        ScalarValue::UInt64(None) => Ok(Value::Null),
         ScalarValue::Utf8(Some(value))
         | ScalarValue::Utf8View(Some(value))
         | ScalarValue::LargeUtf8(Some(value)) => Ok(Value::String(value.clone())),
-        ScalarValue::Utf8(None) | ScalarValue::Utf8View(None) | ScalarValue::LargeUtf8(None) => {
-            Ok(Value::Null)
-        }
         ScalarValue::Binary(Some(value))
         | ScalarValue::BinaryView(Some(value))
-        | ScalarValue::LargeBinary(Some(value)) => {
+        | ScalarValue::LargeBinary(Some(value))
+        | ScalarValue::FixedSizeBinary(_, Some(value)) => {
             Ok(Value::String(bytes_to_hex(value.as_slice())))
         }
-        ScalarValue::Binary(None)
-        | ScalarValue::BinaryView(None)
-        | ScalarValue::LargeBinary(None) => Ok(Value::Null),
-        ScalarValue::FixedSizeBinary(_, Some(value)) => {
-            Ok(Value::String(bytes_to_hex(value.as_slice())))
-        }
-        ScalarValue::FixedSizeBinary(_, None) => Ok(Value::Null),
         ScalarValue::FixedSizeList(array) => single_row_fixed_size_list_to_json(array),
         ScalarValue::List(array) => single_row_list_to_json(array),
         ScalarValue::LargeList(array) => single_row_large_list_to_json(array),
         ScalarValue::Struct(array) => single_row_struct_to_json(array),
         ScalarValue::Map(array) => single_row_map_to_json(array),
         ScalarValue::Union(Some((_type_id, value)), _, _) => scalar_to_json_value(value),
-        ScalarValue::Union(None, _, _) => Ok(Value::Null),
         ScalarValue::Dictionary(_, value) => scalar_to_json_value(value),
+        ScalarValue::Null
+        | ScalarValue::Float16(None)
+        | ScalarValue::Float32(None)
+        | ScalarValue::Float64(None)
+        | ScalarValue::Int8(None)
+        | ScalarValue::Int16(None)
+        | ScalarValue::Int32(None)
+        | ScalarValue::Int64(None)
+        | ScalarValue::UInt8(None)
+        | ScalarValue::UInt16(None)
+        | ScalarValue::UInt32(None)
+        | ScalarValue::UInt64(None)
+        | ScalarValue::Utf8(None)
+        | ScalarValue::Utf8View(None)
+        | ScalarValue::LargeUtf8(None)
+        | ScalarValue::Binary(None)
+        | ScalarValue::BinaryView(None)
+        | ScalarValue::LargeBinary(None)
+        | ScalarValue::FixedSizeBinary(_, None)
+        | ScalarValue::Union(None, _, _) => Ok(Value::Null),
         ScalarValue::Decimal32(..)
         | ScalarValue::Decimal64(..)
         | ScalarValue::Decimal128(..)
@@ -1566,7 +1570,7 @@ fn single_row_struct_to_json(
     let mut object = Map::with_capacity(array.num_columns());
     for (field, column) in array.fields().iter().zip(array.columns()) {
         object.insert(
-            field.name().to_string(),
+            field.name().clone(),
             array_value_to_json(column.as_ref(), 0)?,
         );
     }

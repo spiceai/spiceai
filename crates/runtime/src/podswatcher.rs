@@ -17,7 +17,7 @@ limitations under the License.
 use notify::{EventKind, RecursiveMode, Watcher};
 use spicepod::component::ComponentOrReference;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
 use tokio::{
@@ -56,7 +56,7 @@ impl PodsWatcher {
             move |res: Result<notify::Event, notify::Error>| match res {
                 Ok(event) => {
                     if is_root_spicepod_event(&root_spicepod_path, &event)
-                        && is_relevant_spicepods_event_kind(&event.kind)
+                        && is_relevant_spicepods_event_kind(event.kind)
                     {
                         refresh_watch_paths(&runtime_handle, &watch_paths, &root_path);
                     }
@@ -91,7 +91,7 @@ impl PodsWatcher {
     }
 }
 
-fn is_relevant_spicepods_event_kind(event_kind: &EventKind) -> bool {
+fn is_relevant_spicepods_event_kind(event_kind: EventKind) -> bool {
     matches!(
         event_kind,
         EventKind::Any | EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_)
@@ -101,11 +101,11 @@ fn is_relevant_spicepods_event_kind(event_kind: &EventKind) -> bool {
 fn refresh_watch_paths(
     runtime_handle: &Handle,
     watch_paths: &Arc<RwLock<Vec<PathBuf>>>,
-    root_path: &PathBuf,
+    root_path: &Path,
 ) {
     let runtime_handle = runtime_handle.clone();
     let watch_paths = Arc::clone(watch_paths);
-    let root_path = root_path.clone();
+    let root_path = root_path.to_path_buf();
 
     runtime_handle.spawn(async move {
         let refreshed_paths = get_watch_paths(&root_path).await;
@@ -158,7 +158,7 @@ async fn get_watch_paths(app_path: impl Into<PathBuf>) -> Vec<PathBuf> {
 }
 
 fn is_spicepods_modification_event(spicepod_paths: &[PathBuf], event: &notify::Event) -> bool {
-    if !is_relevant_spicepods_event_kind(&event.kind) {
+    if !is_relevant_spicepods_event_kind(event.kind) {
         return false;
     }
 
