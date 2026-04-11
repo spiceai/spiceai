@@ -15,10 +15,11 @@ limitations under the License.
 */
 
 use notify::{EventKind, RecursiveMode, Watcher};
+use parking_lot::RwLock;
 use spicepod::component::ComponentOrReference;
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
 use tokio::{
     runtime::Handle,
@@ -61,15 +62,7 @@ impl PodsWatcher {
                         refresh_watch_paths(&runtime_handle, &watch_paths, &root_path);
                     }
 
-                    let current_watch_paths = match watch_paths.read() {
-                        Ok(paths) => paths,
-                        Err(e) => {
-                            tracing::error!(
-                                "Pods content watcher failed to read watched paths: {e}"
-                            );
-                            return;
-                        }
-                    };
+                    let current_watch_paths = watch_paths.read();
 
                     if !is_spicepods_modification_event(&current_watch_paths, &event) {
                         return;
@@ -109,15 +102,8 @@ fn refresh_watch_paths(
 
     runtime_handle.spawn(async move {
         let refreshed_paths = get_watch_paths(&root_path).await;
-        match watch_paths.write() {
-            Ok(mut paths) => {
-                *paths = refreshed_paths;
-                tracing::debug!("Refreshed watched pods paths after main spicepod change");
-            }
-            Err(e) => {
-                tracing::error!("Pods content watcher failed to refresh watched paths: {e}");
-            }
-        }
+        *watch_paths.write() = refreshed_paths;
+        tracing::debug!("Refreshed watched pods paths after main spicepod change");
     });
 }
 
