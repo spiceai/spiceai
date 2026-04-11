@@ -492,10 +492,6 @@ impl Runtime {
 
         tracing::debug!(dataset = %ds.name, duration_ms = %schema_start.elapsed().as_millis(), "Dataset schema inference complete");
 
-        // Release the load permit now that schema inference is done.
-        // Registration and bookkeeping don't load the source.
-        drop(_load_guard);
-
         let register_start = Instant::now();
         match Arc::clone(&self)
             .register_dataset(
