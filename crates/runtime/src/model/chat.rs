@@ -27,8 +27,12 @@ use llms::{config::GenericAuthMechanism, openai::DEFAULT_LLM_MODEL};
 use secrecy::SecretString;
 use serde_json::Value;
 use snafu::ResultExt;
-use spicepod::component::model::{Model, ModelFileType, ModelSource};
-use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
+#[cfg(feature = "models")]
+use spicepod::component::model::ModelFileType;
+use spicepod::component::model::{Model, ModelSource};
+#[cfg(feature = "models")]
+use std::path::PathBuf;
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
 
 use super::wrapper::OPENAI_DEFAULT_PARAM_KEYS;
