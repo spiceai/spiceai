@@ -55,9 +55,7 @@ pub enum Error {
     ))]
     InvalidPoolParameter { name: String, value: String },
 
-    #[snafu(display(
-        "Invalid value for parameter '{name}': expected a non-empty string"
-    ))]
+    #[snafu(display("Invalid value for parameter 'adbc_{name}': expected a non-empty string"))]
     InvalidEmptyParameter { name: String },
 
     #[snafu(display("Failed to load ADBC driver '{driver_location}': {source}"))]
@@ -367,16 +365,13 @@ impl AdbcFactory {
         let driver_options = params.parameters.get("driver_options").expose().ok();
         let db_options = build_db_options(&uri_str, username, password, driver_options);
 
-        let connection_namespace = resolve_connection_namespace(
-            &driver_name_owned,
-            &params.component,
-            &params.parameters,
-        )
-        .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
-            dataconnector: "adbc".to_string(),
-            connector_component: params.component.clone(),
-            source: Box::new(e),
-        })?;
+        let connection_namespace =
+            resolve_connection_namespace(&driver_name_owned, &params.component, &params.parameters)
+                .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
+                    dataconnector: "adbc".to_string(),
+                    connector_component: params.component.clone(),
+                    source: Box::new(e),
+                })?;
 
         let conn_options = build_conn_options(
             connection_namespace.catalog.as_deref(),
@@ -796,8 +791,18 @@ fn infer_bigquery_namespace_from_path(path: &str) -> ConnectionNamespace {
 
 fn connection_namespace_for_cache_key(params: &ConnectorParams) -> ConnectionNamespace {
     let explicit = ConnectionNamespace {
-        catalog: params.parameters.get("catalog").expose().ok().map(String::from),
-        schema: params.parameters.get("schema").expose().ok().map(String::from),
+        catalog: params
+            .parameters
+            .get("catalog")
+            .expose()
+            .ok()
+            .map(String::from),
+        schema: params
+            .parameters
+            .get("schema")
+            .expose()
+            .ok()
+            .map(String::from),
     };
 
     if params.parameters.get("driver").expose().ok() != Some("bigquery") {
@@ -1422,7 +1427,10 @@ mod tests {
         let parameters = Parameters::new(
             vec![
                 ("driver".to_string(), SecretString::from("bigquery")),
-                ("uri".to_string(), SecretString::from("bigquery:///my-project")),
+                (
+                    "uri".to_string(),
+                    SecretString::from("bigquery:///my-project"),
+                ),
             ],
             "adbc",
             PARAMETERS,
@@ -1448,7 +1456,10 @@ mod tests {
         let parameters = Parameters::new(
             vec![
                 ("driver".to_string(), SecretString::from("bigquery")),
-                ("uri".to_string(), SecretString::from("bigquery:///my-project")),
+                (
+                    "uri".to_string(),
+                    SecretString::from("bigquery:///my-project"),
+                ),
                 (
                     "catalog".to_string(),
                     SecretString::from("configured-project"),
@@ -1482,7 +1493,10 @@ mod tests {
         let parameters = Parameters::new(
             vec![
                 ("driver".to_string(), SecretString::from("bigquery")),
-                ("uri".to_string(), SecretString::from("bigquery:///my-project")),
+                (
+                    "uri".to_string(),
+                    SecretString::from("bigquery:///my-project"),
+                ),
                 ("schema".to_string(), SecretString::from("")),
             ],
             "adbc",
@@ -1498,7 +1512,7 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "Invalid value for parameter 'schema': expected a non-empty string"
+            "Invalid value for parameter 'adbc_schema': expected a non-empty string"
         );
     }
 
@@ -1513,7 +1527,10 @@ mod tests {
             let parameters = Parameters::new(
                 vec![
                     ("driver".to_string(), SecretString::from("bigquery")),
-                    ("uri".to_string(), SecretString::from("bigquery:///my_project")),
+                    (
+                        "uri".to_string(),
+                        SecretString::from("bigquery:///my_project"),
+                    ),
                 ],
                 "adbc",
                 PARAMETERS,
