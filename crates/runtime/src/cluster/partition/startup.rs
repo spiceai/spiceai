@@ -100,7 +100,7 @@ pub async fn initialize_partition_metadata(
         .collect();
 
     for (table, partitioning) in tables {
-        let table_name = table.to_string();
+        let table_name = super::metadata::normalized_table_name(&table);
 
         if existing_tables.contains(&table_name) {
             tracing::debug!(
