@@ -22,7 +22,9 @@ use ::cache::{
     result::{CacheStatus, query::QueryResult},
 };
 use arrow::{
-    array::{Array, FixedSizeListArray, LargeListArray, MapArray, RecordBatch, StructArray, UnionArray},
+    array::{
+        Array, FixedSizeListArray, LargeListArray, MapArray, RecordBatch, StructArray, UnionArray,
+    },
     datatypes::Schema,
 };
 use arrow_json::writer::JsonArray;
@@ -1287,7 +1289,8 @@ fn write_to_json_bytes_with_arrow(
 }
 
 fn record_batch_has_union_columns(batch: &RecordBatch) -> bool {
-    batch.schema()
+    batch
+        .schema()
         .fields()
         .iter()
         .any(|field| data_type_contains_union(field.data_type()))
@@ -1302,9 +1305,9 @@ fn data_type_contains_union(data_type: &arrow::datatypes::DataType) -> bool {
         | arrow::datatypes::DataType::ListView(field)
         | arrow::datatypes::DataType::LargeListView(field)
         | arrow::datatypes::DataType::Map(field, _) => data_type_contains_union(field.data_type()),
-        arrow::datatypes::DataType::Struct(fields) => {
-            fields.iter().any(|field| data_type_contains_union(field.data_type()))
-        }
+        arrow::datatypes::DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| data_type_contains_union(field.data_type())),
         arrow::datatypes::DataType::Dictionary(_, value_type) => {
             data_type_contains_union(value_type)
         }
@@ -1323,9 +1326,7 @@ fn record_batch_to_json_rows(
         .fields()
         .iter()
         .enumerate()
-        .filter_map(|(index, field)| {
-            data_type_contains_union(field.data_type()).then_some(index)
-        })
+        .filter_map(|(index, field)| data_type_contains_union(field.data_type()).then_some(index))
         .collect();
 
     if custom_indices.is_empty() {
@@ -1465,9 +1466,9 @@ fn scalar_to_json_value(
         ScalarValue::Utf8(Some(value))
         | ScalarValue::Utf8View(Some(value))
         | ScalarValue::LargeUtf8(Some(value)) => Ok(Value::String(value.clone())),
-        ScalarValue::Utf8(None)
-        | ScalarValue::Utf8View(None)
-        | ScalarValue::LargeUtf8(None) => Ok(Value::Null),
+        ScalarValue::Utf8(None) | ScalarValue::Utf8View(None) | ScalarValue::LargeUtf8(None) => {
+            Ok(Value::Null)
+        }
         ScalarValue::Binary(Some(value))
         | ScalarValue::BinaryView(Some(value))
         | ScalarValue::LargeBinary(Some(value)) => {
@@ -1538,7 +1539,8 @@ fn single_row_nested_array_to_json(
         return Ok(Value::Null);
     }
 
-    let values = if let Some(list_array) = array.as_any().downcast_ref::<arrow::array::ListArray>() {
+    let values = if let Some(list_array) = array.as_any().downcast_ref::<arrow::array::ListArray>()
+    {
         list_array.value(index)
     } else if let Some(list_array) = array.as_any().downcast_ref::<LargeListArray>() {
         list_array.value(index)
@@ -1563,7 +1565,10 @@ fn single_row_struct_to_json(
 
     let mut object = Map::with_capacity(array.num_columns());
     for (field, column) in array.fields().iter().zip(array.columns()) {
-        object.insert(field.name().to_string(), array_value_to_json(column.as_ref(), 0)?);
+        object.insert(
+            field.name().to_string(),
+            array_value_to_json(column.as_ref(), 0)?,
+        );
     }
 
     Ok(Value::Object(object))
@@ -1609,9 +1614,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
     output
 }
 
-fn number_to_json(
-    value: f64,
-) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+fn number_to_json(value: f64) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     Number::from_f64(value)
         .map(Value::Number)
         .ok_or_else(|| format!("Unable to represent floating point value {value} as JSON").into())
@@ -1785,17 +1788,17 @@ mod tests {
     use ::cache::{Caching, QueryResultsCacheProvider, result::CacheStatus};
     use arrow::{
         array::{
-            ArrayRef, BooleanArray, Int64Array, NullArray, RecordBatch, StringArray,
-            StructArray, UnionArray,
+            ArrayRef, BooleanArray, Int64Array, NullArray, RecordBatch, StringArray, StructArray,
+            UnionArray,
         },
         buffer::Buffer,
         datatypes::{DataType, Field, Schema, UnionMode},
     };
-    use datafusion_functions_json::JSON_UNION_DATA_TYPE;
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
     use datafusion::physical_plan::{DisplayAs, DisplayFormatType, PlanProperties};
+    use datafusion_functions_json::JSON_UNION_DATA_TYPE;
     use serde_json::json;
     use spicepod::component::caching::SQLResultsCacheConfig;
     use std::any::Any;

@@ -52,37 +52,36 @@ impl PodsWatcher {
 
         let watch_paths = Arc::new(RwLock::new(get_watch_paths(&root_path).await));
 
-        let mut watcher =
-            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-                match res {
-                    Ok(event) => {
-                        if is_root_spicepod_event(&root_spicepod_path, &event)
-                            && is_relevant_spicepods_event_kind(&event.kind)
-                        {
-                            refresh_watch_paths(&runtime_handle, &watch_paths, &root_path);
-                        }
+        let mut watcher = notify::recommended_watcher(
+            move |res: Result<notify::Event, notify::Error>| match res {
+                Ok(event) => {
+                    if is_root_spicepod_event(&root_spicepod_path, &event)
+                        && is_relevant_spicepods_event_kind(&event.kind)
+                    {
+                        refresh_watch_paths(&runtime_handle, &watch_paths, &root_path);
+                    }
 
-                        let current_watch_paths = match watch_paths.read() {
-                            Ok(paths) => paths,
-                            Err(e) => {
-                                tracing::error!(
-                                    "Pods content watcher failed to read watched paths: {e}"
-                                );
-                                return;
-                            }
-                        };
-
-                        if !is_spicepods_modification_event(&current_watch_paths, &event) {
+                    let current_watch_paths = match watch_paths.read() {
+                        Ok(paths) => paths,
+                        Err(e) => {
+                            tracing::error!(
+                                "Pods content watcher failed to read watched paths: {e}"
+                            );
                             return;
                         }
+                    };
 
-                        tracing::debug!("Detected pods content changes: {:?}", event);
-
-                        let _ = tx.blocking_send(root_path.clone());
+                    if !is_spicepods_modification_event(&current_watch_paths, &event) {
+                        return;
                     }
-                    Err(e) => tracing::error!("Pods content watcher error: {e}"),
+
+                    tracing::debug!("Detected pods content changes: {:?}", event);
+
+                    let _ = tx.blocking_send(root_path.clone());
                 }
-            })?;
+                Err(e) => tracing::error!("Pods content watcher error: {e}"),
+            },
+        )?;
 
         watcher.watch(&self.root_path, RecursiveMode::Recursive)?;
 
@@ -195,10 +194,7 @@ mod tests {
     #[test]
     fn test_is_spicepods_modification_event_accepts_modify_any() {
         let watch_paths = vec![PathBuf::from("/tmp/app/spicepod.yaml")];
-        let event = watcher_event(
-            EventKind::Modify(ModifyKind::Any),
-            "/tmp/app/spicepod.yaml",
-        );
+        let event = watcher_event(EventKind::Modify(ModifyKind::Any), "/tmp/app/spicepod.yaml");
 
         assert!(is_spicepods_modification_event(&watch_paths, &event));
     }
@@ -239,10 +235,7 @@ mod tests {
             PathBuf::from("/tmp/app/spicepod.yaml"),
             PathBuf::from("/tmp/app/spicepod.yml"),
         ];
-        let event = watcher_event(
-            EventKind::Modify(ModifyKind::Any),
-            "/tmp/app/spicepod.yaml",
-        );
+        let event = watcher_event(EventKind::Modify(ModifyKind::Any), "/tmp/app/spicepod.yaml");
 
         assert!(is_root_spicepod_event(&root_spicepod_paths, &event));
     }
