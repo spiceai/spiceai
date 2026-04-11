@@ -20,6 +20,7 @@ use adbc_core::{Driver as _, LOAD_FLAG_DEFAULT};
 use adbc_driver_manager::ManagedDriver;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::{BigQueryDialect, Dialect};
 use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::JoinPushDown;
@@ -53,6 +54,11 @@ pub enum Error {
         "Invalid value for parameter '{name}': expected a positive integer, got '{value}'"
     ))]
     InvalidPoolParameter { name: String, value: String },
+
+    #[snafu(display(
+        "Invalid value for parameter '{name}': expected a non-empty string"
+    ))]
+    InvalidEmptyParameter { name: String },
 
     #[snafu(display("Failed to load ADBC driver '{driver_location}': {source}"))]
     UnableToLoadDriver {
@@ -361,23 +367,28 @@ impl AdbcFactory {
         let driver_options = params.parameters.get("driver_options").expose().ok();
         let db_options = build_db_options(&uri_str, username, password, driver_options);
 
-        let catalog = params
-            .parameters
-            .get("catalog")
-            .expose()
-            .ok()
-            .map(String::from);
-        let schema = params
-            .parameters
-            .get("schema")
-            .expose()
-            .ok()
-            .map(String::from);
+        let connection_namespace = resolve_connection_namespace(
+            &driver_name_owned,
+            &params.component,
+            &params.parameters,
+        )
+        .map_err(|e| DataConnectorError::InvalidConfigurationSourceOnly {
+            dataconnector: "adbc".to_string(),
+            connector_component: params.component.clone(),
+            source: Box::new(e),
+        })?;
 
-        let conn_options = build_conn_options(catalog.as_deref(), schema.as_deref());
+        let conn_options = build_conn_options(
+            connection_namespace.catalog.as_deref(),
+            connection_namespace.schema.as_deref(),
+        );
 
-        let join_context =
-            build_join_context(&uri_str, username, catalog.as_deref(), schema.as_deref());
+        let join_context = build_join_context(
+            &uri_str,
+            username,
+            connection_namespace.catalog.as_deref(),
+            connection_namespace.schema.as_deref(),
+        );
 
         let federation_enabled = is_query_federation_enabled(&params.parameters).map_err(|e| {
             DataConnectorError::InvalidConfigurationNoSource {
@@ -603,7 +614,6 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
     // All ADBC configuration parameters that determine connection identity,
     // listed alphabetically for deterministic output.
     let keys = [
-        "catalog",
         "connection_pool_min_idle",
         "connection_pool_size",
         "driver",
@@ -611,7 +621,6 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
         "driver_path",
         "password",
         "query_federation",
-        "schema",
         "uri",
         "username",
     ];
@@ -624,6 +633,27 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
         hasher.update(v.as_bytes());
         hasher.update(b"\0");
     }
+
+    let connection_namespace = connection_namespace_for_cache_key(params);
+    hasher.update(b"catalog\0");
+    hasher.update(
+        connection_namespace
+            .catalog
+            .as_deref()
+            .unwrap_or("")
+            .as_bytes(),
+    );
+    hasher.update(b"\0");
+    hasher.update(b"schema\0");
+    hasher.update(
+        connection_namespace
+            .schema
+            .as_deref()
+            .unwrap_or("")
+            .as_bytes(),
+    );
+    hasher.update(b"\0");
+
     hasher.finalize().to_hex().to_string()
 }
 
@@ -665,6 +695,120 @@ pub(crate) fn build_db_options(
         }
     }
     opts
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ConnectionNamespace {
+    catalog: Option<String>,
+    schema: Option<String>,
+}
+
+fn optional_connection_name(params: &Parameters, name: &str) -> Result<Option<String>> {
+    match params.get(name).expose().ok() {
+        Some(value) if value.trim().is_empty() => InvalidEmptyParameterSnafu {
+            name: name.to_string(),
+        }
+        .fail(),
+        Some(value) => Ok(Some(value.to_string())),
+        None => Ok(None),
+    }
+}
+
+fn resolve_connection_namespace(
+    driver_name: &str,
+    component: &ConnectorComponent,
+    params: &Parameters,
+) -> Result<ConnectionNamespace> {
+    let explicit = ConnectionNamespace {
+        catalog: optional_connection_name(params, "catalog")?,
+        schema: optional_connection_name(params, "schema")?,
+    };
+
+    if driver_name != "bigquery" {
+        return Ok(explicit);
+    }
+
+    let inferred = infer_bigquery_namespace(component);
+    Ok(ConnectionNamespace {
+        catalog: explicit.catalog.or(inferred.catalog),
+        schema: explicit.schema.or(inferred.schema),
+    })
+}
+
+fn infer_bigquery_namespace(component: &ConnectorComponent) -> ConnectionNamespace {
+    match component {
+        ConnectorComponent::Dataset(dataset) => infer_bigquery_namespace_from_dataset(dataset),
+        ConnectorComponent::Catalog(_) => ConnectionNamespace::default(),
+    }
+}
+
+fn infer_bigquery_namespace_from_dataset(dataset: &Dataset) -> ConnectionNamespace {
+    let dialect = datafusion::sql::sqlparser::dialect::GenericDialect {};
+    dataset
+        .parse_path(true, Some(&dialect))
+        .map(|table_reference| connection_namespace_from_table_reference(&table_reference))
+        .unwrap_or_else(|_| infer_bigquery_namespace_from_path(dataset.path()))
+}
+
+fn connection_namespace_from_table_reference(
+    table_reference: &TableReference,
+) -> ConnectionNamespace {
+    match table_reference {
+        TableReference::Full {
+            catalog, schema, ..
+        } => ConnectionNamespace {
+            catalog: Some(catalog.to_string()),
+            schema: Some(schema.to_string()),
+        },
+        TableReference::Partial { schema, .. } => ConnectionNamespace {
+            catalog: None,
+            schema: Some(schema.to_string()),
+        },
+        TableReference::Bare { .. } => ConnectionNamespace::default(),
+    }
+}
+
+fn infer_bigquery_namespace_from_path(path: &str) -> ConnectionNamespace {
+    if path
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch == '`' || ch == '"')
+    {
+        return ConnectionNamespace::default();
+    }
+
+    let parts: Vec<&str> = path.split('.').map(str::trim).collect();
+    match parts.as_slice() {
+        [schema, table] if !schema.is_empty() && !table.is_empty() => ConnectionNamespace {
+            catalog: None,
+            schema: Some((*schema).to_string()),
+        },
+        [catalog, schema, table]
+            if !catalog.is_empty() && !schema.is_empty() && !table.is_empty() =>
+        {
+            ConnectionNamespace {
+                catalog: Some((*catalog).to_string()),
+                schema: Some((*schema).to_string()),
+            }
+        }
+        _ => ConnectionNamespace::default(),
+    }
+}
+
+fn connection_namespace_for_cache_key(params: &ConnectorParams) -> ConnectionNamespace {
+    let explicit = ConnectionNamespace {
+        catalog: params.parameters.get("catalog").expose().ok().map(String::from),
+        schema: params.parameters.get("schema").expose().ok().map(String::from),
+    };
+
+    if params.parameters.get("driver").expose().ok() != Some("bigquery") {
+        return explicit;
+    }
+
+    let inferred = infer_bigquery_namespace(&params.component);
+    ConnectionNamespace {
+        catalog: explicit.catalog.or(inferred.catalog),
+        schema: explicit.schema.or(inferred.schema),
+    }
 }
 
 /// Builds connection-level options from connector parameters.
@@ -1263,6 +1407,131 @@ mod tests {
         let params_b = make_params("grpc://other-endpoint.example.com");
 
         // Different URIs → different cache keys
+        assert_ne!(
+            compute_adbc_cache_key(&params_a),
+            compute_adbc_cache_key(&params_b)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_connection_namespace_bigquery_infers_from_hyphenated_project_path() {
+        let dataset = test_dataset("adbc:my-project.my_dataset.my_table", "my_table").await;
+
+        use secrecy::SecretString;
+
+        let parameters = Parameters::new(
+            vec![
+                ("driver".to_string(), SecretString::from("bigquery")),
+                ("uri".to_string(), SecretString::from("bigquery:///my-project")),
+            ],
+            "adbc",
+            PARAMETERS,
+        );
+
+        let namespace = resolve_connection_namespace(
+            "bigquery",
+            &ConnectorComponent::from(&dataset),
+            &parameters,
+        )
+        .expect("bigquery namespace should resolve");
+
+        assert_eq!(namespace.catalog.as_deref(), Some("my-project"));
+        assert_eq!(namespace.schema.as_deref(), Some("my_dataset"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_connection_namespace_bigquery_preserves_explicit_values() {
+        let dataset = test_dataset("adbc:my-project.path_dataset.my_table", "my_table").await;
+
+        use secrecy::SecretString;
+
+        let parameters = Parameters::new(
+            vec![
+                ("driver".to_string(), SecretString::from("bigquery")),
+                ("uri".to_string(), SecretString::from("bigquery:///my-project")),
+                (
+                    "catalog".to_string(),
+                    SecretString::from("configured-project"),
+                ),
+                (
+                    "schema".to_string(),
+                    SecretString::from("configured_dataset"),
+                ),
+            ],
+            "adbc",
+            PARAMETERS,
+        );
+
+        let namespace = resolve_connection_namespace(
+            "bigquery",
+            &ConnectorComponent::from(&dataset),
+            &parameters,
+        )
+        .expect("explicit namespace should be preserved");
+
+        assert_eq!(namespace.catalog.as_deref(), Some("configured-project"));
+        assert_eq!(namespace.schema.as_deref(), Some("configured_dataset"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_connection_namespace_rejects_empty_schema() {
+        let dataset = test_dataset("adbc:my_dataset.my_table", "my_table").await;
+
+        use secrecy::SecretString;
+
+        let parameters = Parameters::new(
+            vec![
+                ("driver".to_string(), SecretString::from("bigquery")),
+                ("uri".to_string(), SecretString::from("bigquery:///my-project")),
+                ("schema".to_string(), SecretString::from("")),
+            ],
+            "adbc",
+            PARAMETERS,
+        );
+
+        let err = resolve_connection_namespace(
+            "bigquery",
+            &ConnectorComponent::from(&dataset),
+            &parameters,
+        )
+        .expect_err("empty schema should be rejected");
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid value for parameter 'schema': expected a non-empty string"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_key_bigquery_inferred_schema_differs() {
+        let dataset_a = test_dataset("adbc:my_project.dataset_a.table_a", "table_a").await;
+        let dataset_b = test_dataset("adbc:my_project.dataset_b.table_b", "table_b").await;
+
+        let make_params = |dataset: &Dataset| {
+            use secrecy::SecretString;
+
+            let parameters = Parameters::new(
+                vec![
+                    ("driver".to_string(), SecretString::from("bigquery")),
+                    ("uri".to_string(), SecretString::from("bigquery:///my_project")),
+                ],
+                "adbc",
+                PARAMETERS,
+            );
+
+            ConnectorParams {
+                parameters,
+                unsupported_type_action: None,
+                component: ConnectorComponent::from(dataset),
+                app: None,
+                runtime: None,
+                io_runtime: tokio::runtime::Handle::current(),
+            }
+        };
+
+        let params_a = make_params(&dataset_a);
+        let params_b = make_params(&dataset_b);
+
         assert_ne!(
             compute_adbc_cache_key(&params_a),
             compute_adbc_cache_key(&params_b)
