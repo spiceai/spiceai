@@ -417,7 +417,7 @@ jobs:
             exit 1
           fi
 
-      - name: restart Spice runtime after preview upgrade
+      - name: restart Spice runtime after preview upgrade and wait for healthy
         shell: wsl-bash {0}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -426,10 +426,6 @@ jobs:
           cd app
           spice run &
 
-      - name: wait for preview Spice runtime healthy
-        shell: wsl-bash {0}
-        run: |
-          export PATH="$HOME/.spice/bin:$PATH"
           for i in $(seq 1 60); do
             if [ "$(curl -s http://localhost:8090/health)" = "ok" ]; then
               echo "Spice runtime is healthy"
