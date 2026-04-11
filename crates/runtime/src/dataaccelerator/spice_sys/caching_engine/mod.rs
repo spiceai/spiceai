@@ -34,10 +34,15 @@ impl CachingEngineSys {
     }
 
     pub fn update_fetched_at(&self) -> Result<()> {
-        match &self.acceleration_connection {
-            #[cfg(feature = "duckdb")]
-            AccelerationConnection::DuckDB(pool) => self.update_fetched_at_duckdb(pool),
-            _ => Err(Error::NoAccelerationConnection),
+        #[cfg(feature = "duckdb")]
+        {
+            let AccelerationConnection::DuckDB(pool) = &self.acceleration_connection;
+            return self.update_fetched_at_duckdb(pool);
+        }
+
+        #[cfg(not(feature = "duckdb"))]
+        {
+            Err(Error::NoAccelerationConnection)
         }
     }
 }

@@ -19,7 +19,6 @@ use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU
 use bytes::Bytes;
 use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
-use itertools::Itertools;
 use llms::HealthCheck;
 #[cfg(feature = "bedrock")]
 use llms::bedrock::{
@@ -38,17 +37,22 @@ use llms::embeddings::{Embed, Error as EmbedError};
 use llms::model2vec::Model2Vec;
 use llms::openai::embed::OpenaiEmbed;
 use llms::openai::{DEFAULT_EMBEDDING_MODEL, UsageTier};
-use secrecy::{ExposeSecret, SecretBox, SecretString};
+use secrecy::{ExposeSecret, SecretString};
 use snafu::ResultExt;
 use spicepod::component::{embeddings::EmbeddingPrefix, model::ModelFileType};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::result::Result;
 use std::str::FromStr;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
-use tokio::fs;
 use tokio::sync::RwLock;
 use url::Url;
+#[cfg(feature = "models")]
+use secrecy::SecretBox;
+#[cfg(feature = "models")]
+use std::path::Path;
+#[cfg(feature = "models")]
+use tokio::fs;
 
 pub type EmbeddingModelStore = HashMap<String, Arc<dyn Embed>>;
 
