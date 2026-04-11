@@ -735,8 +735,7 @@ async fn test_adbc_sqlite_missing_driver_param() -> Result<(), String> {
             let mut params = HashMap::new();
             params.insert("adbc_uri".to_string(), "/tmp/test.db".to_string());
 
-            let mut dataset =
-                Dataset::new("adbc:some_table".to_string(), "some_table".to_string());
+            let mut dataset = Dataset::new("adbc:some_table".to_string(), "some_table".to_string());
             dataset.params = Some(Params::from_string_map(params));
 
             let app = AppBuilder::new("adbc_missing_driver_test")
@@ -774,8 +773,7 @@ async fn test_adbc_invalid_driver_name() -> Result<(), String> {
             );
             params.insert("adbc_uri".to_string(), "/tmp/test.db".to_string());
 
-            let mut dataset =
-                Dataset::new("adbc:some_table".to_string(), "some_table".to_string());
+            let mut dataset = Dataset::new("adbc:some_table".to_string(), "some_table".to_string());
             dataset.params = Some(Params::from_string_map(params));
 
             let app = AppBuilder::new("adbc_invalid_driver_test")

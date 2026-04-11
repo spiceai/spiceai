@@ -133,8 +133,10 @@ async fn databricks_delta_lake_catalog_schema_discovery_test() -> Result<(), any
     test_request_context()
         .scope(async {
             // Only include tpch — tpcds should NOT appear
-            let mut db_catalog =
-                Catalog::new("databricks:spiceai_sandbox".to_string(), "db_uc".to_string());
+            let mut db_catalog = Catalog::new(
+                "databricks:spiceai_sandbox".to_string(),
+                "db_uc".to_string(),
+            );
             db_catalog.include = vec!["tpch.*".to_string()];
             db_catalog.params = Some(get_params());
 

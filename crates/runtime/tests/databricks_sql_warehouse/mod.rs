@@ -76,10 +76,7 @@ async fn databricks_sql_warehouse_managed_table_test() -> Result<(), anyhow::Err
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("databricks_sql_warehouse_managed_test")
-                .with_dataset(make_dataset(
-                    "spiceai_sandbox.tpch.lineitem",
-                    "lineitem",
-                ))
+                .with_dataset(make_dataset("spiceai_sandbox.tpch.lineitem", "lineitem"))
                 .build();
 
             configure_test_datafusion();
@@ -134,10 +131,7 @@ async fn databricks_sql_warehouse_schema_inference_test() -> Result<(), anyhow::
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("databricks_sql_warehouse_schema_test")
-                .with_dataset(make_dataset(
-                    "spiceai_sandbox.tpch.nation",
-                    "nation",
-                ))
+                .with_dataset(make_dataset("spiceai_sandbox.tpch.nation", "nation"))
                 .build();
 
             configure_test_datafusion();
@@ -192,10 +186,7 @@ async fn databricks_sql_warehouse_dataset_registration_test() -> Result<(), anyh
     test_request_context()
         .scope(async {
             let app = AppBuilder::new("databricks_sql_warehouse_registration_test")
-                .with_dataset(make_dataset(
-                    "spiceai_sandbox.tpch.nation",
-                    "nation",
-                ))
+                .with_dataset(make_dataset("spiceai_sandbox.tpch.nation", "nation"))
                 .build();
 
             configure_test_datafusion();
