@@ -654,18 +654,18 @@ impl Databricks {
         if should_validate_permissions {
             match uc_client.get_effective_permissions(&full_name).await {
                 Ok(Some(perms)) => {
-                    if !perms.has_read_permission() {
+                    if perms.has_read_permission() {
+                        tracing::debug!(
+                            table = %full_name,
+                            principals = ?perms.principals(),
+                            "Unity Catalog permission check passed"
+                        );
+                    } else {
                         tracing::warn!(
                             table = %full_name,
                             principals = ?perms.principals(),
                             privileges = ?perms.all_privileges(),
                             "Unity Catalog effective-permissions did not report a read-compatible privilege; proceeding and deferring to Databricks query-time validation"
-                        );
-                    } else {
-                        tracing::debug!(
-                            table = %full_name,
-                            principals = ?perms.principals(),
-                            "Unity Catalog permission check passed"
                         );
                     }
                 }
@@ -1736,8 +1736,14 @@ mod tests {
             result.is_ok(),
             "positive UC permission prechecks should still allow initialization"
         );
-        assert_eq!(read_call_count, 1, "expected the Databricks read to be attempted");
-        assert_eq!(request_count, 2, "expected table metadata and permission requests");
+        assert_eq!(
+            read_call_count, 1,
+            "expected the Databricks read to be attempted"
+        );
+        assert_eq!(
+            request_count, 2,
+            "expected table metadata and permission requests"
+        );
         assert_request_seen(&captured_requests, "/api/2.1/unity-catalog/tables/");
         assert_request_seen(
             &captured_requests,
@@ -1801,8 +1807,14 @@ mod tests {
             result.is_ok(),
             "missing effective-permissions responses should not block Databricks dataset initialization"
         );
-        assert_eq!(read_call_count, 1, "expected the Databricks read to be attempted");
-        assert_eq!(request_count, 2, "expected table metadata and permission requests");
+        assert_eq!(
+            read_call_count, 1,
+            "expected the Databricks read to be attempted"
+        );
+        assert_eq!(
+            request_count, 2,
+            "expected table metadata and permission requests"
+        );
         assert_request_seen(
             &captured_requests,
             "/api/2.1/unity-catalog/effective-permissions/table/",
@@ -1828,7 +1840,10 @@ mod tests {
             result.is_ok(),
             "effective-permissions lookup errors should not block Databricks dataset initialization"
         );
-        assert_eq!(read_call_count, 1, "expected the Databricks read to be attempted");
+        assert_eq!(
+            read_call_count, 1,
+            "expected the Databricks read to be attempted"
+        );
         assert!(
             request_count >= 2,
             "expected at least the table metadata request and one permission attempt"
@@ -1855,8 +1870,14 @@ mod tests {
             result.is_ok(),
             "foreign tables should skip strict permission prechecks and proceed"
         );
-        assert_eq!(read_call_count, 1, "expected the Databricks read to be attempted");
-        assert_eq!(request_count, 1, "foreign tables should skip the permission request");
+        assert_eq!(
+            read_call_count, 1,
+            "expected the Databricks read to be attempted"
+        );
+        assert_eq!(
+            request_count, 1,
+            "foreign tables should skip the permission request"
+        );
         assert_request_seen(&captured_requests, "/api/2.1/unity-catalog/tables/");
         assert_request_not_seen(
             &captured_requests,
@@ -1879,11 +1900,18 @@ mod tests {
         let err = result.expect_err("unsupported UC table types should still fail");
 
         assert!(
-            err.to_string().contains("Unsupported Unity Catalog table type 'VIEW'"),
+            err.to_string()
+                .contains("Unsupported Unity Catalog table type 'VIEW'"),
             "unexpected error: {err}"
         );
-        assert_eq!(read_call_count, 0, "unsupported types should fail before reading");
-        assert_eq!(request_count, 1, "unsupported types should stop after table metadata");
+        assert_eq!(
+            read_call_count, 0,
+            "unsupported types should fail before reading"
+        );
+        assert_eq!(
+            request_count, 1,
+            "unsupported types should stop after table metadata"
+        );
         assert_request_seen(&captured_requests, "/api/2.1/unity-catalog/tables/");
         assert_request_not_seen(
             &captured_requests,

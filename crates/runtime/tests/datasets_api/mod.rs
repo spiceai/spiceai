@@ -149,6 +149,20 @@ async fn register_permission_status_provider() {
     .await;
 }
 
+async fn assert_server_ready(http_client: &reqwest::Client, http_port: u16) {
+    assert!(
+        wait_until_true(Duration::from_secs(10), || async {
+            http_client
+                .get(format!("http://127.0.0.1:{http_port}/health"))
+                .send()
+                .await
+                .is_ok()
+        })
+        .await,
+        "Timed out waiting for server health endpoint to become ready on port {http_port}"
+    );
+}
+
 /// Tests that the `/v1/datasets?status=true` endpoint returns the correct status
 /// from `RuntimeStatus` for each dataset.
 #[tokio::test]
@@ -196,14 +210,7 @@ async fn test_datasets_api_returns_correct_status() -> Result<(), anyhow::Error>
             let http_client = reqwest::Client::builder().build()?;
 
             tracing::info!("Waiting for servers to start...");
-            wait_until_true(Duration::from_secs(10), || async {
-                http_client
-                    .get(format!("http://127.0.0.1:{http_port}/health"))
-                    .send()
-                    .await
-                    .is_ok()
-            })
-            .await;
+            assert_server_ready(&http_client, http_port).await;
 
             // Verify the dataset is Ready in RuntimeStatus
             let status = rt.status();
@@ -311,7 +318,8 @@ async fn test_datasets_api_permission_edge_cases_update_statuses() -> Result<(),
 
     test_request_context()
         .scope(async {
-            let span = tracing::info_span!("test_datasets_api_permission_edge_cases_update_statuses");
+            let span =
+                tracing::info_span!("test_datasets_api_permission_edge_cases_update_statuses");
             let _span_guard = span.enter();
 
             let mut rng = rand::rng();
@@ -343,14 +351,7 @@ async fn test_datasets_api_permission_edge_cases_update_statuses() -> Result<(),
 
             let http_client = reqwest::Client::builder().build()?;
 
-            wait_until_true(Duration::from_secs(10), || async {
-                http_client
-                    .get(format!("http://127.0.0.1:{http_port}/health"))
-                    .send()
-                    .await
-                    .is_ok()
-            })
-            .await;
+            assert_server_ready(&http_client, http_port).await;
 
             let dataset_statuses = rt.status().get_dataset_statuses();
             let permission_allowed = TableReference::bare("permission_allowed");
@@ -370,12 +371,18 @@ async fn test_datasets_api_permission_edge_cases_update_statuses() -> Result<(),
                 "permission failures should be recorded as dataset errors"
             );
             assert!(
-                denied_status.error_message().is_some_and(|message| message.contains("Insufficient permissions to access")),
+                denied_status
+                    .error_message()
+                    .is_some_and(|message| message.contains("Insufficient permissions to access")),
                 "runtime status should retain the permission error message"
             );
 
             let http_url = format!("http://127.0.0.1:{http_port}/v1/datasets?status=true");
-            let response = http_client.get(&http_url).send().await.expect("valid response");
+            let response = http_client
+                .get(&http_url)
+                .send()
+                .await
+                .expect("valid response");
 
             assert!(response.status().is_success());
 
@@ -403,10 +410,13 @@ async fn test_datasets_api_permission_edge_cases_update_statuses() -> Result<(),
                 })
             );
             assert!(
-                permission_denied.error_message.as_deref().is_some_and(|message| {
-                    message.contains("Insufficient permissions to access")
-                        && message.contains("permission_denied")
-                }),
+                permission_denied
+                    .error_message
+                    .as_deref()
+                    .is_some_and(|message| {
+                        message.contains("Insufficient permissions to access")
+                            && message.contains("permission_denied")
+                    }),
                 "API should surface the permission failure message"
             );
 
@@ -458,14 +468,7 @@ async fn test_datasets_api_without_status_param() -> Result<(), anyhow::Error> {
 
             let http_client = reqwest::Client::builder().build()?;
 
-            wait_until_true(Duration::from_secs(10), || async {
-                http_client
-                    .get(format!("http://127.0.0.1:{http_port}/health"))
-                    .send()
-                    .await
-                    .is_ok()
-            })
-            .await;
+            assert_server_ready(&http_client, http_port).await;
 
             // Call the /v1/datasets API without status=true
             let http_url = format!("http://127.0.0.1:{http_port}/v1/datasets");
