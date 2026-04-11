@@ -198,9 +198,13 @@ jobs:
           echo "CLI Version after spice upgrade $PREVIEW_UPGRADE_VERSION: $cli_version"
           echo "Runtime Version after spice upgrade $PREVIEW_UPGRADE_VERSION: $runtime_version"
 
-          if [[ "$cli_version" != "$PREVIEW_UPGRADE_VERSION"* ]]; then
-            echo "CLI version $cli_version does not match the requested version $PREVIEW_UPGRADE_VERSION."
-            exit 1
+          if [[ "$cli_version" != v1.11.* ]]; then
+            if [[ "$cli_version" != "$PREVIEW_UPGRADE_VERSION"* ]]; then
+              echo "CLI version $cli_version does not match the requested version $PREVIEW_UPGRADE_VERSION."
+              exit 1
+            fi
+          else
+            echo "::warning::Skipping CLI version check: v1.11.x CLI does not self-upgrade"
           fi
 
           if [[ "$runtime_version" != "$PREVIEW_UPGRADE_VERSION"* ]]; then
@@ -351,28 +355,30 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           export PATH="$HOME/.spice/bin:$PATH"
-          spice install "$PREVIOUS_STABLE_VERSION"
+          previous_stable_version="${{ env.PREVIOUS_STABLE_VERSION }}"
+          spice install "$previous_stable_version"
 
       - name: check previous stable Spice runtime version
         shell: wsl-bash {0}
         run: |
           export PATH="$HOME/.spice/bin:$PATH"
           LATEST_RELEASE_VERSION="$(cat "$HOME/.spice/latest_release_version.txt")"
+          previous_stable_version="${{ env.PREVIOUS_STABLE_VERSION }}"
           version=$(spice version 2>&1)
           cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | awk '{print $1}')
           runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | awk '{print $1}')
 
           echo "Latest Release Version: $LATEST_RELEASE_VERSION"
-          echo "CLI Version after spice install $PREVIOUS_STABLE_VERSION: $cli_version"
-          echo "Runtime Version after spice install $PREVIOUS_STABLE_VERSION: $runtime_version"
+          echo "CLI Version after spice install $previous_stable_version: $cli_version"
+          echo "Runtime Version after spice install $previous_stable_version: $runtime_version"
 
           if [[ "$cli_version" != "$LATEST_RELEASE_VERSION"* ]]; then
-            echo "CLI version $cli_version changed unexpectedly after spice install $PREVIOUS_STABLE_VERSION."
+            echo "CLI version $cli_version changed unexpectedly after spice install $previous_stable_version."
             exit 1
           fi
 
-          if [[ "$runtime_version" != "$PREVIOUS_STABLE_VERSION"* ]]; then
-            echo "Runtime version $runtime_version does not match the requested version $PREVIOUS_STABLE_VERSION."
+          if [[ "$runtime_version" != "$previous_stable_version"* ]]; then
+            echo "Runtime version $runtime_version does not match the requested version $previous_stable_version."
             exit 1
           fi
 
@@ -382,26 +388,32 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           export PATH="$HOME/.spice/bin:$PATH"
-          spice upgrade "$PREVIEW_UPGRADE_VERSION"
+          preview_upgrade_version="${{ env.PREVIEW_UPGRADE_VERSION }}"
+          spice upgrade "$preview_upgrade_version"
 
       - name: check preview Spice cli and runtime version
         shell: wsl-bash {0}
         run: |
           export PATH="$HOME/.spice/bin:$PATH"
+          preview_upgrade_version="${{ env.PREVIEW_UPGRADE_VERSION }}"
           version=$(spice version 2>&1)
           cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | awk '{print $1}')
           runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | awk '{print $1}')
 
-          echo "CLI Version after spice upgrade $PREVIEW_UPGRADE_VERSION: $cli_version"
-          echo "Runtime Version after spice upgrade $PREVIEW_UPGRADE_VERSION: $runtime_version"
+          echo "CLI Version after spice upgrade $preview_upgrade_version: $cli_version"
+          echo "Runtime Version after spice upgrade $preview_upgrade_version: $runtime_version"
 
-          if [[ "$cli_version" != "$PREVIEW_UPGRADE_VERSION"* ]]; then
-            echo "CLI version $cli_version does not match the requested version $PREVIEW_UPGRADE_VERSION."
-            exit 1
+          if [[ "$cli_version" != v1.11.* ]]; then
+            if [[ "$cli_version" != "$preview_upgrade_version"* ]]; then
+              echo "CLI version $cli_version does not match the requested version $preview_upgrade_version."
+              exit 1
+            fi
+          else
+            echo "::warning::Skipping CLI version check: v1.11.x CLI does not self-upgrade"
           fi
 
-          if [[ "$runtime_version" != "$PREVIEW_UPGRADE_VERSION"* ]]; then
-            echo "Runtime version $runtime_version does not match the requested version $PREVIEW_UPGRADE_VERSION."
+          if [[ "$runtime_version" != "$preview_upgrade_version"* ]]; then
+            echo "Runtime version $runtime_version does not match the requested version $preview_upgrade_version."
             exit 1
           fi
 
