@@ -41,7 +41,8 @@ pub(crate) struct CatalogFilter {
     from: Option<String>,
 }
 
-type CatalogResponseItem = runtime_api_types::v1::CatalogInfo;
+pub use runtime_api_types::v1::CatalogInfo;
+pub type CatalogResponseItem = CatalogInfo;
 
 const APPLICATION_JSON: MediaType = MediaType::from_parts(APPLICATION, JSON, None, &[]);
 const TEXT_CSV: MediaType = MediaType::from_parts(TEXT, CSV, None, &[]);
