@@ -763,15 +763,13 @@ mod tests {
         runtime: Arc<crate::Runtime>,
         secrets: Arc<RwLock<Secrets>>,
     ) -> ConnectorParams {
-        let dataset = DatasetBuilder::try_new(
-            format!("{connector_name}:{dataset_name}"),
-            dataset_name,
-        )
-        .expect("Failed to create builder")
-        .with_app(app)
-        .with_runtime(runtime)
-        .build()
-        .expect("Failed to build dataset");
+        let dataset =
+            DatasetBuilder::try_new(format!("{connector_name}:{dataset_name}"), dataset_name)
+                .expect("Failed to create builder")
+                .with_app(app)
+                .with_runtime(runtime)
+                .build()
+                .expect("Failed to build dataset");
 
         ConnectorParamsBuilder::new(
             connector_name.into(),
@@ -933,14 +931,8 @@ mod tests {
             Arc::clone(&secrets),
         )
         .await;
-        let params_two = build_test_connector_params(
-            "test_concurrent",
-            "second",
-            app,
-            runtime,
-            secrets,
-        )
-        .await;
+        let params_two =
+            build_test_connector_params("test_concurrent", "second", app, runtime, secrets).await;
 
         let (result_one, result_two) = timeout(Duration::from_secs(5), async move {
             tokio::join!(
