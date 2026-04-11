@@ -302,7 +302,7 @@ impl IcebergDataConnector {
             })?;
 
         // Load the specific table
-    #[cfg(feature = "iceberg-write")]
+        #[cfg(feature = "iceberg-write")]
         let table_name_str = table_name.clone();
         let table_identifier = TableIdent::new(namespace.name().clone(), table_name);
 
