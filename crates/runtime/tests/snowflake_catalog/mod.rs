@@ -285,7 +285,10 @@ async fn snowflake_catalog_schema_inference_test() -> Result<(), anyhow::Error> 
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-            let total_columns: usize = result.iter().map(datafusion::arrow::array::RecordBatch::num_rows).sum();
+            let total_columns: usize = result
+                .iter()
+                .map(datafusion::arrow::array::RecordBatch::num_rows)
+                .sum();
             assert_eq!(
                 total_columns, 16,
                 "Expected 16 columns in TPCH LINEITEM via catalog, got {total_columns}"
