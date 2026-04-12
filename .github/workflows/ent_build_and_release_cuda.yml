@@ -129,6 +129,7 @@ jobs:
     name: Build CUDA ${{ matrix.target.compute_cap }} binaries
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
+    timeout-minutes: 180
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
       CARGO_TERM_COLOR: always

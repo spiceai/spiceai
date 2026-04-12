@@ -92,6 +92,7 @@ jobs:
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
     runs-on: spicehq-dev-runners
+    timeout-minutes: 180
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
       CARGO_TERM_COLOR: always
@@ -165,6 +166,7 @@ jobs:
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
     runs-on: hosted-linux-arm-runner
+    timeout-minutes: 180
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
       CARGO_TERM_COLOR: always
@@ -238,6 +240,7 @@ jobs:
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
     runs-on: spiceai-macos
+    timeout-minutes: 180
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
       CARGO_TERM_COLOR: always

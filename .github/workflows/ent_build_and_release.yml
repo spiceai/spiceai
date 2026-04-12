@@ -93,9 +93,16 @@ jobs:
             // Include Linux ARM only for tagged releases, release branches, or manual dispatch (exclude trunk pushes)
             const includeLinuxArm = isTaggedRelease || isReleaseBranch || isManualDispatch;
 
-            // Tagged releases use GitHub hosted runners, others use spiceai runners
+            // Tagged releases use GitHub hosted runners, release branches use spicehq-dev-large-runners, others use spicehq-dev-runners
             const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos";
-            const linuxRunner = isTaggedRelease ? "ubuntu-22.04" : "spicehq-dev-runners";
+            let linuxRunner;
+            if (isTaggedRelease) {
+              linuxRunner = "ubuntu-22.04";
+            } else if (isReleaseBranch) {
+              linuxRunner = "spicehq-dev-large-runners";
+            } else {
+              linuxRunner = "spicehq-dev-runners";
+            }
 
             // Use minio for spiceai runners (trunk, release branches, manual dispatch on non-tagged)
             const useMinio = !isTaggedRelease;
@@ -163,6 +170,7 @@ jobs:
     name: Build ${{ matrix.target.name }} (${{ matrix.flavor.name }})
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
+    timeout-minutes: 180
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
       CARGO_TERM_COLOR: always
@@ -332,6 +340,7 @@ jobs:
     name: Build Windows CLI
     runs-on: windows-latest
     needs: setup-matrix
+    timeout-minutes: 180
     if: >-
       startswith(github.ref, 'refs/tags/v') ||
       startswith(github.ref, 'refs/heads/release-') ||
