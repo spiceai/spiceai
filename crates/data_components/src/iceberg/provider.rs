@@ -182,6 +182,35 @@ impl RefreshableCatalogProvider for IcebergCatalogProvider {
         )
         .await?;
 
+        // Transfer user-registered table overrides from old schemas to new schemas.
+        // These overrides (e.g. AcceleratedTable wrappers from DDL) must survive the
+        // refresh, since the fresh schemas only contain raw catalog-loaded providers.
+        let old_schemas = match self.schemas.read() {
+            Ok(schemas) => schemas.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+
+        for (schema_name, new_schema) in &new_schemas {
+            let Some(old_schema) = old_schemas.get(schema_name) else {
+                continue;
+            };
+            let Some(old_iceberg) = old_schema.as_any().downcast_ref::<IcebergSchemaProvider>()
+            else {
+                continue;
+            };
+            let Some(new_iceberg) = new_schema.as_any().downcast_ref::<IcebergSchemaProvider>()
+            else {
+                continue;
+            };
+            if let Ok(old_overrides) = old_iceberg.overrides.read() {
+                if let Ok(mut new_overrides) = new_iceberg.overrides.write() {
+                    for (table_name, provider) in old_overrides.iter() {
+                        new_overrides.insert(table_name.clone(), Arc::clone(provider));
+                    }
+                }
+            }
+        }
+
         match self.schemas.write() {
             Ok(mut schemas) => {
                 *schemas = new_schemas;
@@ -203,10 +232,11 @@ pub struct IcebergSchemaProvider {
     catalog: Arc<dyn Catalog>,
     /// The namespace this schema provider manages.
     namespace: NamespaceIdent,
-    /// A `RwLock`-protected `HashMap` where keys are table names
-    /// and values are dynamic references to objects implementing the
-    /// [`TableProvider`] trait.
+    /// Catalog-loaded tables. Refreshed periodically from the Iceberg catalog.
     tables: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
+    /// User-registered table overrides (e.g. `AcceleratedTable` wrappers from DDL).
+    /// These take priority over catalog-loaded tables and survive catalog refreshes.
+    overrides: RwLock<HashMap<String, Arc<dyn TableProvider>>>,
 }
 
 impl IcebergSchemaProvider {
@@ -236,6 +266,7 @@ impl IcebergSchemaProvider {
             catalog: client,
             namespace,
             tables: RwLock::new(tables),
+            overrides: RwLock::new(HashMap::new()),
         })
     }
 
@@ -363,13 +394,25 @@ impl SchemaProvider for IcebergSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        self.tables
+        let mut names: std::collections::HashSet<String> = self
+            .tables
             .read()
             .map(|tables| tables.keys().cloned().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if let Ok(overrides) = self.overrides.read() {
+            names.extend(overrides.keys().cloned());
+        }
+        names.into_iter().collect()
     }
 
     fn table_exist(&self, name: &str) -> bool {
+        if self
+            .overrides
+            .read()
+            .is_ok_and(|overrides| overrides.contains_key(name))
+        {
+            return true;
+        }
         self.tables
             .read()
             .map(|tables| tables.contains_key(name))
@@ -377,6 +420,17 @@ impl SchemaProvider for IcebergSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        // Check overrides first — these are user-registered providers (e.g. AcceleratedTable)
+        // that take priority over catalog-loaded providers and survive catalog refreshes.
+        if let Some(provider) = self
+            .overrides
+            .read()
+            .ok()
+            .and_then(|overrides| overrides.get(name).cloned())
+        {
+            return Ok(Some(provider));
+        }
+
         Ok(self
             .tables
             .read()
@@ -389,6 +443,18 @@ impl SchemaProvider for IcebergSchemaProvider {
         name: String,
         table: Arc<dyn TableProvider>,
     ) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        // Store in overrides so this registration survives catalog refreshes.
+        match self.overrides.write() {
+            Ok(mut overrides) => {
+                overrides.insert(name.clone(), Arc::clone(&table));
+            }
+            Err(_) => {
+                return Err(datafusion::error::DataFusionError::Internal(
+                    "Failed to acquire write lock on table overrides".to_string(),
+                ));
+            }
+        }
+
         match self.tables.write() {
             Ok(mut tables) => Ok(tables.insert(name, table)),
             Err(_) => Err(datafusion::error::DataFusionError::Internal(
@@ -398,6 +464,12 @@ impl SchemaProvider for IcebergSchemaProvider {
     }
 
     fn deregister_table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
+        // Remove from overrides so the table reverts to the catalog-loaded provider
+        // on the next refresh.
+        if let Ok(mut overrides) = self.overrides.write() {
+            overrides.remove(name);
+        }
+
         match self.tables.write() {
             Ok(mut tables) => Ok(tables.remove(name)),
             Err(_) => Err(datafusion::error::DataFusionError::Internal(

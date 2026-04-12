@@ -438,10 +438,19 @@ fn get_partitions_from_manager(
 impl TablePartitionProvider for ExecutorRegistry {
     /// Partitions accelerated tables using the accelerations partition manager.
     fn should_partition(&self, tbl: &TableScan) -> bool {
-        let Some(default) = tbl.source.as_any().downcast_ref::<DefaultTableSource>() else {
-            return false;
-        };
-        is_accelerated_table_provider(&default.table_provider)
+        if let Some(default) = tbl.source.as_any().downcast_ref::<DefaultTableSource>() {
+            if is_accelerated_table_provider(&default.table_provider) {
+                return true;
+            }
+        }
+
+        // Fall back to checking the accelerations partition manager by table name.
+        // This handles tables where the provider type changed (e.g. during an Iceberg
+        // catalog refresh that replaced the AcceleratedTable with a raw provider)
+        // but the partition metadata still indicates it should be distributed.
+        self.accelerations_partition_manager
+            .get_cached_table_metadata(&tbl.table_name)
+            .is_some()
     }
 
     fn get_partitions(

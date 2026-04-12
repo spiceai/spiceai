@@ -2925,7 +2925,22 @@ fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -
         let partition_exprs = partitioned
             .partition_by()
             .iter()
-            .map(|partition| partition.expression.to_string())
+            .filter_map(|partition| {
+                // Use the SQL unparser to convert back to valid SQL instead of
+                // DataFusion's `Expr::Display` which produces non-SQL tokens like
+                // `Int64(5)` for literals, causing parse failures downstream.
+                match datafusion::sql::unparser::expr_to_sql(&partition.expression) {
+                    Ok(sql_expr) => Some(sql_expr.to_string()),
+                    Err(e) => {
+                        tracing::warn!(
+                            expression = %partition.expression,
+                            error = %e,
+                            "Failed to unparse partition expression to SQL, skipping"
+                        );
+                        None
+                    }
+                }
+            })
             .collect_vec();
 
         return match partition_exprs.as_slice() {
