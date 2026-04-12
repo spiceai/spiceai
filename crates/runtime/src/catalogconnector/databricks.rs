@@ -399,7 +399,11 @@ async fn create_token_provider_for_catalog(
     })?;
 
     match auth_credentials {
-        AuthCredentials::Token(token) => Ok(Arc::new(StaticTokenProvider::new(token.clone()))),
+        AuthCredentials::Token(token) => {
+            let token_provider: Arc<dyn TokenProvider> =
+                Arc::new(StaticTokenProvider::new(token.clone()));
+            Ok(token_provider)
+        }
         AuthCredentials::ServicePrincipal(client_id, client_secret) => {
             get_m2m_token_provider(endpoint, client_id, client_secret, &token_provider_registry)
                 .await
