@@ -79,7 +79,7 @@ impl PodsWatcher {
 
                     tracing::debug!("Detected pods content changes: {:?}", event);
 
-                    let _ = tx.blocking_send(root_path.clone());
+                    let _ = tx.try_send(root_path.clone());
                 }
                 Err(e) => tracing::error!("Pods content watcher error: {e}"),
             },

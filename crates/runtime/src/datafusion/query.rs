@@ -1414,7 +1414,7 @@ fn union_array_to_json_values(
     }
 
     (0..union_array.len())
-        .map(|index| array_value_to_json(array, index))
+        .map(|index| scalar_to_json_value(&ScalarValue::try_from_array(union_array, index)?))
         .collect()
 }
 
