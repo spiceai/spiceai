@@ -295,7 +295,7 @@ impl Databricks {
                         Arc::new(
                             data_components::databricks::sql_warehouse::DatabricksPermissions::new(
                                 Arc::clone(uc),
-                                true, // strict validation for standalone datasets
+                                false, // advisory only — table type unknown at dataset level; foreign tables must not be blocked
                             ),
                         )
                     } else {
