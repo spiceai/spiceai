@@ -302,16 +302,15 @@ impl Databricks {
                         Arc::new(data_components::schema_discovery::NoPermissionsCheck)
                     };
 
-                let read_provider =
-                    DatabricksSqlWarehouse::with_config_semaphore_and_permissions(
-                        endpoint,
-                        sql_warehouse_id,
-                        token_provider,
-                        sql_warehouse_config,
-                        shared_semaphore,
-                        permissions,
-                    )
-                    .context(UnableToConstructDatabricksSqlWarehouseSnafu)?;
+                let read_provider = DatabricksSqlWarehouse::with_config_semaphore_and_permissions(
+                    endpoint,
+                    sql_warehouse_id,
+                    token_provider,
+                    sql_warehouse_config,
+                    shared_semaphore,
+                    permissions,
+                )
+                .context(UnableToConstructDatabricksSqlWarehouseSnafu)?;
                 let metrics = Some(Arc::clone(read_provider.metrics()));
 
                 Ok(Self {

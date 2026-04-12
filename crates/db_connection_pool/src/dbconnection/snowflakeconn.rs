@@ -500,6 +500,12 @@ where
     ))
 }
 
+/// Parses a Snowflake JSON type descriptor (e.g. `{"type":"FIXED","precision":38,...}`)
+/// into an Arrow [`DataType`].
+///
+/// # Errors
+///
+/// Returns an error if the JSON is malformed or contains an unsupported type.
 #[expect(clippy::cast_possible_truncation)]
 pub fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error> {
     let data_type: serde_json::Value =
@@ -533,6 +539,11 @@ pub fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error>
     }
 }
 
+/// Parses a `SHOW COLUMNS IN <table>` JSON response into an Arrow [`SchemaRef`].
+///
+/// # Errors
+///
+/// Returns an error if the response format is unexpected or contains unsupported types.
 pub fn parse_schema_from_json(resp: &serde_json::Value) -> Result<SchemaRef, Error> {
     let columns: Vec<Vec<serde_json::Value>> = resp
         .as_array()

@@ -844,9 +844,6 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(
-            perms.all_privileges(),
-            vec!["SELECT", "MODIFY", "CREATE"]
-        );
+        assert_eq!(perms.all_privileges(), vec!["SELECT", "MODIFY", "CREATE"]);
     }
 }

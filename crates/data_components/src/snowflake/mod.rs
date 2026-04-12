@@ -24,16 +24,13 @@ use datafusion::{
     sql::{TableReference, unparser::dialect},
 };
 use datafusion_table_providers::sql::{
-    db_connection_pool::DbConnectionPool,
-    sql_provider_datafusion::SqlTable,
+    db_connection_pool::DbConnectionPool, sql_provider_datafusion::SqlTable,
 };
 use snowflake_api::SnowflakeApi;
 use std::sync::Arc;
 
 use crate::Read;
-use crate::schema_discovery::{
-    NoPermissionsCheck, SchemaProbeResult, discover_schema,
-};
+use crate::schema_discovery::{NoPermissionsCheck, SchemaProbeResult, discover_schema};
 
 pub type SnowflakeConnectionPool =
     dyn DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> + Send + Sync;
@@ -92,7 +89,7 @@ async fn probe_snowflake_information_schema(
             match parse_information_schema_json(&resp.value, &table_reference.to_string()) {
                 Ok(schema) => SchemaProbeResult::Ok(schema),
                 Err(e) if is_snowflake_access_denied(&e) => {
-                    SchemaProbeResult::AccessDenied(e.to_string())
+                    SchemaProbeResult::AccessDenied(e.clone())
                 }
                 Err(e) => SchemaProbeResult::Failed(e.into()),
             }
@@ -103,9 +100,11 @@ async fn probe_snowflake_information_schema(
                 Err(e) => SchemaProbeResult::Failed(e.into()),
             }
         }
-        Ok(snowflake_api::QueryResult::Empty) => {
-            SchemaProbeResult::Failed("information_schema returned empty result".to_string().into())
-        }
+        Ok(snowflake_api::QueryResult::Empty) => SchemaProbeResult::Failed(
+            "information_schema returned empty result"
+                .to_string()
+                .into(),
+        ),
         Err(e) => classify_snowflake_error(e),
     }
 }
@@ -138,7 +137,9 @@ async fn probe_snowflake_show_columns(
             }
         }
         Ok(snowflake_api::QueryResult::Arrow(_)) => SchemaProbeResult::Failed(
-            "Unexpected Arrow response from SHOW COLUMNS".to_string().into(),
+            "Unexpected Arrow response from SHOW COLUMNS"
+                .to_string()
+                .into(),
         ),
         Ok(snowflake_api::QueryResult::Empty) => {
             SchemaProbeResult::Failed("SHOW COLUMNS returned empty result".to_string().into())
@@ -187,7 +188,9 @@ fn parse_information_schema_json(
             .as_array()
             .ok_or_else(|| format!("information_schema row {i} is not an array"))?;
         if row.len() < 3 {
-            return Err(format!("information_schema row {i} has fewer than 3 fields"));
+            return Err(format!(
+                "information_schema row {i} has fewer than 3 fields"
+            ));
         }
 
         let col_name = row[0]
@@ -196,13 +199,16 @@ fn parse_information_schema_json(
         let data_type_str = row[1]
             .as_str()
             .ok_or_else(|| format!("information_schema row {i}: invalid data type"))?;
-        let is_nullable = row[2]
-            .as_str()
-            .map(|s| s.to_uppercase() == "YES")
-            .unwrap_or(true);
+        let is_nullable = row[2].as_str().is_none_or(|s| s.to_uppercase() == "YES");
 
-        let precision = row.get(3).and_then(|v| v.as_str()).and_then(|s| s.parse::<u8>().ok());
-        let scale = row.get(4).and_then(|v| v.as_str()).and_then(|s| s.parse::<i8>().ok());
+        let precision = row
+            .get(3)
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u8>().ok());
+        let scale = row
+            .get(4)
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<i8>().ok());
 
         let data_type = map_snowflake_sql_type(data_type_str, precision, scale);
 
@@ -279,16 +285,12 @@ fn parse_information_schema_arrow(
 /// Maps a Snowflake SQL `DATA_TYPE` name to an Arrow `DataType`.
 ///
 /// Uses the standard SQL type names returned by `information_schema.columns`.
-fn map_snowflake_sql_type(
-    sql_type: &str,
-    precision: Option<u8>,
-    scale: Option<i8>,
-) -> DataType {
+fn map_snowflake_sql_type(sql_type: &str, precision: Option<u8>, scale: Option<i8>) -> DataType {
     let upper = sql_type.to_uppercase();
     match upper.as_str() {
         "NUMBER" | "DECIMAL" | "NUMERIC" | "INT" | "INTEGER" | "BIGINT" | "SMALLINT"
-        | "TINYINT" | "BYTEINT" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE"
-        | "DOUBLE PRECISION" | "REAL" => {
+        | "TINYINT" | "BYTEINT" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION"
+        | "REAL" => {
             let p = precision.unwrap_or(38);
             let s = scale.unwrap_or(0);
             if s == 0 && upper != "NUMBER" {
@@ -321,15 +323,22 @@ impl Read for SnowflakeTableFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-    ) -> std::result::Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> std::result::Result<
+        Arc<dyn TableProvider + 'static>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         let dialect = Arc::new(snowflake_dialect());
         let pool = Arc::clone(&self.pool);
 
-        // Get a connection to access the Snowflake API for parallel probes
-        let conn = pool.connect().await?;
-        let sf_conn = conn.as_any().downcast_ref::<db_connection_pool::dbconnection::snowflakeconn::SnowflakeConnection>()
-            .ok_or_else(|| "Failed to downcast Snowflake connection".to_string())?;
-        let api = Arc::clone(&sf_conn.api);
+        // Get a connection only long enough to extract the API handle.
+        let api = {
+            let conn = pool.connect().await?;
+            let sf_conn = conn
+                .as_any()
+                .downcast_ref::<db_connection_pool::dbconnection::snowflakeconn::SnowflakeConnection>()
+                .ok_or_else(|| "Failed to downcast Snowflake connection".to_string())?;
+            Arc::clone(&sf_conn.api)
+        };
 
         let result = discover_schema(
             &table_reference.to_string(),
@@ -342,14 +351,8 @@ impl Read for SnowflakeTableFactory {
         result.log_warnings(table_reference.to_string());
 
         let table_provider = Arc::new(
-            SqlTable::new_with_schema(
-                "snowflake",
-                &pool,
-                result.schema,
-                table_reference,
-                None,
-            )
-            .with_dialect(dialect),
+            SqlTable::new_with_schema("snowflake", &pool, result.schema, table_reference, None)
+                .with_dialect(dialect),
         );
 
         let table_provider = Arc::new(

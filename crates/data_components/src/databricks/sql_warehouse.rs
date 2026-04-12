@@ -604,9 +604,7 @@ impl SqlWarehouseApi {
         let token = self.token_provider.get_token();
         match self.get_schema_from_information_schema(&token, table).await {
             Ok(schema) => SchemaProbeResult::Ok(schema),
-            Err(e) if is_access_denied_error(&e) => {
-                SchemaProbeResult::AccessDenied(e.to_string())
-            }
+            Err(e) if is_access_denied_error(&e) => SchemaProbeResult::AccessDenied(e.to_string()),
             Err(e) => SchemaProbeResult::Failed(Box::new(e)),
         }
     }
@@ -638,9 +636,7 @@ impl SqlWarehouseApi {
         };
         match schema_from_describe_json(&response, &table.to_string()) {
             Ok(schema) => SchemaProbeResult::Ok(schema),
-            Err(e) if is_access_denied_error(&e) => {
-                SchemaProbeResult::AccessDenied(e.to_string())
-            }
+            Err(e) if is_access_denied_error(&e) => SchemaProbeResult::AccessDenied(e.to_string()),
             Err(e) => SchemaProbeResult::Failed(Box::new(e)),
         }
     }
@@ -1147,7 +1143,6 @@ fn is_access_denied_error(err: &Error) -> bool {
         Error::HttpRequestFailed { source } => source
             .status()
             .is_some_and(|s| s == reqwest::StatusCode::FORBIDDEN),
-        Error::PermanentlyDisabled => false,
         _ => false,
     }
 }
@@ -1169,7 +1164,11 @@ impl DatabricksPermissions {
     ///
     /// `requires_strict_validation` should be `false` for foreign tables where
     /// UC permissions are not authoritative.
-    pub fn new(uc_client: Arc<crate::unity_catalog::UnityCatalog>, requires_strict_validation: bool) -> Self {
+    #[must_use]
+    pub fn new(
+        uc_client: Arc<crate::unity_catalog::UnityCatalog>,
+        requires_strict_validation: bool,
+    ) -> Self {
         Self {
             uc_client,
             requires_strict_validation,
@@ -2834,9 +2833,9 @@ mod tests {
             .local_addr()
             .expect("should have an address")
             .port();
-        let info_responses = Arc::new(tokio::sync::Mutex::new(
-            std::collections::VecDeque::from(info_schema_responses),
-        ));
+        let info_responses = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from(
+            info_schema_responses,
+        )));
         let describe = Arc::new(describe_response);
 
         tokio::spawn(async move {
@@ -2949,8 +2948,7 @@ mod tests {
             }
         });
 
-        let port =
-            start_routing_mock_server(vec![info_schema_response], describe_response).await;
+        let port = start_routing_mock_server(vec![info_schema_response], describe_response).await;
         let api = create_test_api(port);
         let table = TableReference::full("catalog", "schema", "orders");
 
@@ -3064,8 +3062,7 @@ mod tests {
             "statement_id": "stmt-2"
         });
 
-        let port =
-            start_routing_mock_server(vec![info_failure], describe_failure).await;
+        let port = start_routing_mock_server(vec![info_failure], describe_failure).await;
         let api = create_test_api(port);
         let table = TableReference::full("catalog", "schema", "my_table");
 
@@ -3102,8 +3099,7 @@ mod tests {
             }
         });
 
-        let port =
-            start_routing_mock_server(vec![info_failure], describe_response).await;
+        let port = start_routing_mock_server(vec![info_failure], describe_response).await;
         let api = create_test_api(port);
         let table = TableReference::full("catalog", "schema", "my_table");
 
@@ -3141,8 +3137,7 @@ mod tests {
             }
         });
 
-        let port =
-            start_routing_mock_server(vec![unsupported_response], describe_response).await;
+        let port = start_routing_mock_server(vec![unsupported_response], describe_response).await;
         let api = create_test_api(port);
         let table = TableReference::full("catalog", "schema", "foreign_table");
 
@@ -3181,8 +3176,7 @@ mod tests {
             }
         });
 
-        let port =
-            start_routing_mock_server(vec![info_response], describe_response).await;
+        let port = start_routing_mock_server(vec![info_response], describe_response).await;
         let api = create_test_api(port);
         let table = TableReference::full("catalog", "schema", "my_table");
 
@@ -3217,8 +3211,7 @@ mod tests {
             "statement_id": "stmt-2"
         });
 
-        let port =
-            start_routing_mock_server(vec![info_response], describe_denied).await;
+        let port = start_routing_mock_server(vec![info_response], describe_denied).await;
         let api = create_test_api(port);
         let table = TableReference::full("catalog", "schema", "restricted_table");
 
@@ -3254,8 +3247,7 @@ mod tests {
             }
         });
 
-        let port =
-            start_routing_mock_server(vec![info_denied], describe_response).await;
+        let port = start_routing_mock_server(vec![info_denied], describe_response).await;
         let api = create_test_api(port);
         let table = TableReference::full("catalog", "schema", "my_table");
 
@@ -3294,8 +3286,7 @@ mod tests {
             "result": { "data_array": [["id", "int", ""]] }
         });
 
-        let port =
-            start_routing_mock_server(vec![info_response], describe_response).await;
+        let port = start_routing_mock_server(vec![info_response], describe_response).await;
         let api = create_test_api(port);
         let table = TableReference::full("catalog", "schema", "my_table");
 
@@ -3331,8 +3322,7 @@ mod tests {
             "statement_id": "stmt-2"
         });
 
-        let port =
-            start_routing_mock_server(vec![info_denied], describe_denied).await;
+        let port = start_routing_mock_server(vec![info_denied], describe_denied).await;
         let api = create_test_api(port);
         let table = TableReference::full("catalog", "schema", "restricted_table");
 

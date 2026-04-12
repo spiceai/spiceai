@@ -59,7 +59,7 @@ impl DatasetPermissions for NoPermissionsCheck {
 
 // ── Schema probes ──────────────────────────────────────────────────
 
-/// Result of a single schema probe (information_schema or direct SQL).
+/// Result of a single schema probe (`information_schema` or direct SQL).
 #[derive(Debug)]
 pub enum SchemaProbeResult {
     /// Schema successfully retrieved.
@@ -132,10 +132,7 @@ pub async fn discover_schema(
 
     // 1. Permissions API says Denied → permanent error
     if let PermissionCheckResult::Denied { reason } = &perm_result {
-        return Err(format!(
-            "Access denied for table '{table_name}': {reason}"
-        )
-        .into());
+        return Err(format!("Access denied for table '{table_name}': {reason}").into());
     }
 
     // Track permissions unavailability as a warning
@@ -147,10 +144,7 @@ pub async fn discover_schema(
 
     // 2. direct_probe returns AccessDenied → permanent error (can't query the table)
     if let SchemaProbeResult::AccessDenied(reason) = &direct_result {
-        return Err(format!(
-            "Access denied for table '{table_name}': {reason}"
-        )
-        .into());
+        return Err(format!("Access denied for table '{table_name}': {reason}").into());
     }
 
     // 3. metadata_probe succeeds → use it
@@ -294,9 +288,7 @@ mod tests {
     async fn test_metadata_failed_direct_ok_warns_and_falls_back() {
         let result = discover_schema(
             "catalog.schema.table",
-            async {
-                SchemaProbeResult::Failed("UNSUPPORTED_DATA_SOURCE".to_string().into())
-            },
+            async { SchemaProbeResult::Failed("UNSUPPORTED_DATA_SOURCE".to_string().into()) },
             async { SchemaProbeResult::Ok(direct_schema()) },
             &MockPermissions(PermissionCheckResult::Allowed),
         )
@@ -427,9 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_no_permissions_check_returns_allowed() {
-        let result = NoPermissionsCheck
-            .check_read_permission("any.table")
-            .await;
+        let result = NoPermissionsCheck.check_read_permission("any.table").await;
         assert!(matches!(result, PermissionCheckResult::Allowed));
     }
 }
