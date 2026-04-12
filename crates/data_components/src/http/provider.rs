@@ -1828,6 +1828,19 @@ fn extract_next_page_info(
                     )?;
                     return Ok(Some(NextPageInfo::Url(next_url)));
                 }
+                serde_json::Value::Number(n) => {
+                    // Numeric values (e.g. page numbers) are coerced to string tokens.
+                    let token = n.to_string();
+                    if config.token_param.is_some() {
+                        return Ok(Some(NextPageInfo::Token(token)));
+                    }
+                    let next_url = resolve_and_validate_url(
+                        &token,
+                        base_url,
+                        &format!("JSON pointer '{pointer}'"),
+                    )?;
+                    return Ok(Some(NextPageInfo::Url(next_url)));
+                }
                 serde_json::Value::Null | serde_json::Value::String(_) => {
                     // Null or empty string is an explicit end of pagination.
                     return Ok(None);
@@ -1835,7 +1848,7 @@ fn extract_next_page_info(
                 _ => {
                     return PaginationSnafu {
                         message: format!(
-                            "Failed to extract pagination value from JSON pointer '{pointer}': expected a string or null"
+                            "Failed to extract pagination value from JSON pointer '{pointer}': expected a string, number, or null"
                         ),
                     }
                     .fail();
@@ -4499,19 +4512,41 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_next_page_info_non_string_pointer_value_errors() {
+    fn test_extract_next_page_info_numeric_pointer_as_token() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/page".to_string()),
+            token_param: Some("page".to_string()),
+            ..Default::default()
+        };
+        let content = r#"{"data": [1, 2], "page": 3}"#;
+        let headers = vec![];
+
+        let result =
+            extract_next_page_info(content, &headers, &config, &base_url).expect("should succeed");
+        match result {
+            Some(NextPageInfo::Token(token)) => {
+                assert_eq!(token, "3");
+            }
+            other => panic!("Expected Token with numeric value, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_extract_next_page_info_non_string_non_number_pointer_value_errors() {
         let base_url = Url::parse("https://api.example.com").expect("valid URL");
         let config = PaginationConfig {
             next_pointer: Some("/next".to_string()),
             ..Default::default()
         };
-        let content = r#"{"next": 42}"#;
+        // Boolean value is not a valid pagination pointer
+        let content = r#"{"next": true}"#;
         let headers = vec![];
 
         let result = extract_next_page_info(content, &headers, &config, &base_url);
         assert!(
             result.is_err(),
-            "non-string pointer value should return error"
+            "non-string/non-number pointer value should return error"
         );
     }
 
