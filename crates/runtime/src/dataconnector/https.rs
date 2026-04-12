@@ -334,12 +334,23 @@ impl Https {
                 .ok()
                 .map(std::string::ToString::to_string);
 
-            let page_size = self
+            let page_size_raw = self
                 .params
                 .get("pagination_page_size")
                 .expose()
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok());
+                .ok();
+            let page_size = page_size_raw.and_then(|v| {
+                match v.parse::<usize>() {
+                    Ok(n) => Some(n),
+                    Err(_) => {
+                        tracing::warn!(
+                            "Invalid pagination_page_size value '{}': expected a positive integer. The parameter will be ignored.",
+                            v
+                        );
+                        None
+                    }
+                }
+            });
 
             // In 'auto' mode with no explicit pagination sub-params,
             // use Link header detection only (respecting pagination_link_header if set).
@@ -741,7 +752,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("pagination_query_params")
             .description("Query parameter template for client-driven pagination. Supports {offset}, {limit}, and {page} variables. Example: 'offset={offset}&limit={limit}'. Requires pagination_page_size."),
         ParameterSpec::runtime("pagination_page_size")
-            .description("Number of items per page for query-parameter pagination. Used to expand {limit} in pagination_query_params and to detect the last page (fewer results than page_size = done)."),
+            .description("Number of items per page for query-parameter pagination. Must be a positive integer greater than 0. Used to expand {limit} in pagination_query_params and to detect the last page (fewer results than page_size = done)."),
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters
