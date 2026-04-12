@@ -10,19 +10,6 @@ expression: "normalize_search_response(resp, round_scores)"
       "dataset": "qs",
       "matches": {
         "answer": [
-          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
-        ]
-      },
-      "primary_key": {
-        "id": 1277,
-        "question": "Which base number, when raised to the fifth power, equals thirty-two?"
-      }
-    },
-    {
-      "_score": "0.54",
-      "dataset": "qs",
-      "matches": {
-        "answer": [
           "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
         ]
       },
@@ -42,6 +29,19 @@ expression: "normalize_search_response(resp, round_scores)"
       "primary_key": {
         "id": 189,
         "question": "Evaluate the expression \\( 2 - 2x^2 \\), where \\( x = -3 \\)."
+      }
+    },
+    {
+      "_score": "0.54",
+      "dataset": "qs",
+      "matches": {
+        "answer": [
+          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+        ]
+      },
+      "primary_key": {
+        "id": 1277,
+        "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       }
     },
     {
