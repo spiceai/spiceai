@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use crate::Read;
 use crate::schema_discovery::{
-    NoPermissionsCheck, SchemaDiscoveryWarning, SchemaProbeResult, discover_schema,
+    NoPermissionsCheck, SchemaProbeResult, discover_schema,
 };
 
 pub type SnowflakeConnectionPool =
@@ -81,7 +81,7 @@ async fn probe_snowflake_information_schema(
         .unwrap_or_default();
 
     let sql = format!(
-        "SELECT column_name, data_type, is_nullable, numeric_precision, numeric_scale, character_maximum_length \
+        "SELECT column_name, data_type, is_nullable, numeric_precision, numeric_scale \
          FROM information_schema.columns \
          WHERE table_name = '{table}'{schema_filter}{catalog_filter} \
          ORDER BY ordinal_position"
@@ -106,17 +106,7 @@ async fn probe_snowflake_information_schema(
         Ok(snowflake_api::QueryResult::Empty) => {
             SchemaProbeResult::Failed("information_schema returned empty result".to_string().into())
         }
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("Insufficient privileges")
-                || msg.contains("access denied")
-                || msg.contains("does not exist or not authorized")
-            {
-                SchemaProbeResult::AccessDenied(msg)
-            } else {
-                SchemaProbeResult::Failed(Box::new(e))
-            }
-        }
+        Err(e) => classify_snowflake_error(e),
     }
 }
 
@@ -133,14 +123,18 @@ async fn probe_snowflake_show_columns(
 
     match api.exec(&sql).await {
         Ok(snowflake_api::QueryResult::Json(resp)) => {
-            // Delegate to the existing connection-pool parser via re-executing
-            // get_schema on a temporary connection. Instead, parse inline.
-            match parse_show_columns_json(&resp.value) {
+            match db_connection_pool::dbconnection::snowflakeconn::parse_schema_from_json(
+                &resp.value,
+            ) {
                 Ok(schema) => SchemaProbeResult::Ok(schema),
-                Err(e) if is_snowflake_access_denied(&e) => {
-                    SchemaProbeResult::AccessDenied(e.to_string())
+                Err(e) => {
+                    let msg = e.to_string();
+                    if is_snowflake_access_denied(&msg) {
+                        SchemaProbeResult::AccessDenied(msg)
+                    } else {
+                        SchemaProbeResult::Failed(msg.into())
+                    }
                 }
-                Err(e) => SchemaProbeResult::Failed(e.into()),
             }
         }
         Ok(snowflake_api::QueryResult::Arrow(_)) => SchemaProbeResult::Failed(
@@ -149,17 +143,17 @@ async fn probe_snowflake_show_columns(
         Ok(snowflake_api::QueryResult::Empty) => {
             SchemaProbeResult::Failed("SHOW COLUMNS returned empty result".to_string().into())
         }
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("Insufficient privileges")
-                || msg.contains("access denied")
-                || msg.contains("does not exist or not authorized")
-            {
-                SchemaProbeResult::AccessDenied(msg)
-            } else {
-                SchemaProbeResult::Failed(Box::new(e))
-            }
-        }
+        Err(e) => classify_snowflake_error(e),
+    }
+}
+
+/// Classifies a Snowflake API error as access-denied or generic failure.
+fn classify_snowflake_error(e: snowflake_api::SnowflakeApiError) -> SchemaProbeResult {
+    let msg = e.to_string();
+    if is_snowflake_access_denied(&msg) {
+        SchemaProbeResult::AccessDenied(msg)
+    } else {
+        SchemaProbeResult::Failed(Box::new(e))
     }
 }
 
@@ -169,49 +163,10 @@ fn is_snowflake_access_denied(msg: &str) -> bool {
         || msg.contains("does not exist or not authorized")
 }
 
-/// Parses the JSON response from `SHOW COLUMNS IN <table>`.
-///
-/// This mirrors the `parse_schema_from_json` logic in `snowflakeconn.rs`.
-fn parse_show_columns_json(resp: &serde_json::Value) -> std::result::Result<SchemaRef, String> {
-    let columns = resp
-        .as_array()
-        .ok_or_else(|| "SHOW COLUMNS response is not an array".to_string())?;
-
-    let mut fields = Vec::new();
-    for (i, column) in columns.iter().enumerate() {
-        let row = column
-            .as_array()
-            .ok_or_else(|| format!("SHOW COLUMNS row {i} is not an array"))?;
-        if row.len() < 5 {
-            return Err(format!("SHOW COLUMNS row {i} has fewer than 5 fields"));
-        }
-
-        let col_name = row[2]
-            .as_str()
-            .ok_or_else(|| format!("SHOW COLUMNS row {i}: invalid column name"))?;
-        let data_type_json = row[3]
-            .as_str()
-            .ok_or_else(|| format!("SHOW COLUMNS row {i}: invalid data type"))?;
-        let data_type =
-            parse_snowflake_type_json(data_type_json).map_err(|e| format!("row {i}: {e}"))?;
-        let is_nullable = row[4]
-            .as_str()
-            .is_none_or(|s| s.to_uppercase() == "TRUE");
-
-        fields.push(Field::new(col_name, data_type, is_nullable));
-    }
-
-    if fields.is_empty() {
-        return Err("SHOW COLUMNS returned no columns".to_string());
-    }
-
-    Ok(Arc::new(Schema::new(fields)))
-}
-
 /// Parses the JSON response from `information_schema.columns`.
 ///
 /// Expected columns: `column_name`, `data_type`, `is_nullable`,
-/// `numeric_precision`, `numeric_scale`, `character_maximum_length`.
+/// `numeric_precision`, `numeric_scale`.
 fn parse_information_schema_json(
     resp: &serde_json::Value,
     table_name: &str,
@@ -329,15 +284,15 @@ fn map_snowflake_sql_type(
     precision: Option<u8>,
     scale: Option<i8>,
 ) -> DataType {
-    match sql_type.to_uppercase().as_str() {
+    let upper = sql_type.to_uppercase();
+    match upper.as_str() {
         "NUMBER" | "DECIMAL" | "NUMERIC" | "INT" | "INTEGER" | "BIGINT" | "SMALLINT"
         | "TINYINT" | "BYTEINT" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE"
         | "DOUBLE PRECISION" | "REAL" => {
             let p = precision.unwrap_or(38);
             let s = scale.unwrap_or(0);
-            if s == 0 && sql_type.to_uppercase().as_str() != "NUMBER" {
-                // Integer-like types
-                match sql_type.to_uppercase().as_str() {
+            if s == 0 && upper != "NUMBER" {
+                match upper.as_str() {
                     "FLOAT" | "FLOAT4" | "REAL" => DataType::Float32,
                     "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" => DataType::Float64,
                     _ => DataType::Decimal128(p, s),
@@ -357,34 +312,7 @@ fn map_snowflake_sql_type(
         }
         "TIMESTAMP_TZ" => DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         "TIME" => DataType::Time64(TimeUnit::Nanosecond),
-        _ => DataType::Utf8, // fallback for unrecognized types
-    }
-}
-
-/// Parses a JSON type descriptor from `SHOW COLUMNS` (e.g. `{"type":"FIXED","precision":38,...}`).
-fn parse_snowflake_type_json(json_str: &str) -> std::result::Result<DataType, String> {
-    let v: serde_json::Value =
-        serde_json::from_str(json_str).map_err(|e| format!("invalid type JSON: {e}"))?;
-
-    match v["type"].as_str() {
-        Some("FIXED") => {
-            let precision = v["precision"].as_u64().unwrap_or(38) as u8;
-            let scale = v["scale"].as_i64().unwrap_or(0) as i8;
-            Ok(DataType::Decimal128(precision, scale))
-        }
-        Some("TEXT" | "VARIANT" | "ARRAY") => Ok(DataType::Utf8),
-        Some("REAL") => Ok(DataType::Float64),
-        Some("BINARY") => Ok(DataType::Binary),
-        Some("BOOLEAN") => Ok(DataType::Boolean),
-        Some("DATE") => Ok(DataType::Date32),
-        Some("TIMESTAMP_NTZ") => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
-        Some("TIME") => Ok(DataType::Time64(TimeUnit::Nanosecond)),
-        Some("TIMESTAMP_TZ") => Ok(DataType::Timestamp(
-            TimeUnit::Nanosecond,
-            Some("UTC".into()),
-        )),
-        Some(t) => Err(format!("unsupported Snowflake type: {t}")),
-        None => Err("missing type field in JSON descriptor".to_string()),
+        _ => DataType::Utf8,
     }
 }
 
@@ -411,16 +339,7 @@ impl Read for SnowflakeTableFactory {
         )
         .await?;
 
-        for warning in &result.warnings {
-            match warning {
-                SchemaDiscoveryWarning::MetadataFallback { reason, nuance } => {
-                    tracing::warn!(table = %table_reference, "{reason}. {nuance}");
-                }
-                SchemaDiscoveryWarning::PermissionsUnavailable { reason } => {
-                    tracing::warn!(table = %table_reference, "Permissions check unavailable: {reason}");
-                }
-            }
-        }
+        result.log_warnings(table_reference.to_string());
 
         let table_provider = Arc::new(
             SqlTable::new_with_schema(

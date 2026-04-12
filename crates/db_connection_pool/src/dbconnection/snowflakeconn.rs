@@ -501,7 +501,7 @@ where
 }
 
 #[expect(clippy::cast_possible_truncation)]
-fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error> {
+pub fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error> {
     let data_type: serde_json::Value =
         serde_json::from_str(data_type_str).map_err(|e| Error::UnableToRetrieveSchema {
             reason: e.to_string(),
@@ -533,7 +533,7 @@ fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error> {
     }
 }
 
-fn parse_schema_from_json(resp: &serde_json::Value) -> Result<SchemaRef, Error> {
+pub fn parse_schema_from_json(resp: &serde_json::Value) -> Result<SchemaRef, Error> {
     let columns: Vec<Vec<serde_json::Value>> = resp
         .as_array()
         .ok_or_else(|| Error::UnableToRetrieveSchema {

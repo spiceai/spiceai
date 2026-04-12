@@ -27,7 +27,7 @@ use std::future::Future;
 // ── Permissions trait ──────────────────────────────────────────────
 
 /// Outcome of a provider-specific permissions check.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PermissionCheckResult {
     /// The principal has read access (or the check is inconclusive / advisory).
     Allowed,
@@ -84,6 +84,22 @@ pub enum SchemaDiscoveryWarning {
 pub struct SchemaDiscoveryResult {
     pub schema: SchemaRef,
     pub warnings: Vec<SchemaDiscoveryWarning>,
+}
+
+impl SchemaDiscoveryResult {
+    /// Logs all warnings using `tracing::warn`.
+    pub fn log_warnings(&self, table: impl std::fmt::Display) {
+        for warning in &self.warnings {
+            match warning {
+                SchemaDiscoveryWarning::MetadataFallback { reason, nuance } => {
+                    tracing::warn!(table = %table, "{reason}. {nuance}");
+                }
+                SchemaDiscoveryWarning::PermissionsUnavailable { reason } => {
+                    tracing::warn!(table = %table, "Permissions check unavailable: {reason}");
+                }
+            }
+        }
+    }
 }
 
 /// Runs schema discovery by executing three probes in parallel:
@@ -189,17 +205,7 @@ mod tests {
     #[async_trait]
     impl DatasetPermissions for MockPermissions {
         async fn check_read_permission(&self, _table_name: &str) -> PermissionCheckResult {
-            match &self.0 {
-                PermissionCheckResult::Allowed => PermissionCheckResult::Allowed,
-                PermissionCheckResult::Denied { reason } => PermissionCheckResult::Denied {
-                    reason: reason.clone(),
-                },
-                PermissionCheckResult::Unavailable { reason } => {
-                    PermissionCheckResult::Unavailable {
-                        reason: reason.clone(),
-                    }
-                }
-            }
+            self.0.clone()
         }
     }
 

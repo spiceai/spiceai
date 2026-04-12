@@ -59,8 +59,8 @@ use crate::resilient_http::{
     RetryConfig, configure_client_builder, send_request_with_retry_and_concurrency_limit,
 };
 use crate::schema_discovery::{
-    DatasetPermissions, NoPermissionsCheck, PermissionCheckResult, SchemaDiscoveryWarning,
-    SchemaProbeResult, discover_schema,
+    DatasetPermissions, NoPermissionsCheck, PermissionCheckResult, SchemaProbeResult,
+    discover_schema,
 };
 use tracing::Instrument;
 use util::retry_strategy::BackoffMethod;
@@ -583,16 +583,7 @@ impl SqlWarehouseApi {
                 message: e.to_string(),
             })?;
 
-            for warning in &result.warnings {
-                match warning {
-                    SchemaDiscoveryWarning::MetadataFallback { reason, nuance } => {
-                        tracing::warn!(table = %table, "{reason}. {nuance}");
-                    }
-                    SchemaDiscoveryWarning::PermissionsUnavailable { reason } => {
-                        tracing::warn!(table = %table, "Permissions check unavailable: {reason}");
-                    }
-                }
-            }
+            result.log_warnings(table);
             Ok(result.schema)
         }
         .instrument(tracing::info_span!(
