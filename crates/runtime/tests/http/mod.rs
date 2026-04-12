@@ -338,6 +338,12 @@ fn assert_http_json_edge_batches(batches: &[RecordBatch]) {
     assert!(matches!(schema.field(8).data_type(), DataType::Float64));
 }
 
+/// Returns a [`Config`] configured with ephemeral ports for HTTP and Flight.
+///
+/// Note: there is an inherent TOCTOU race between discovering the free port
+/// and `start_servers` actually binding it. In practice this is negligible in
+/// test environments; if it ever becomes flaky, switch to passing the bound
+/// listeners directly.
 fn create_runtime_http_config() -> Config {
     let localhost = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
@@ -369,9 +375,12 @@ async fn start_runtime_http_server(rt: Arc<Runtime>) -> Result<String, String> {
     let server_rt = Arc::clone(&rt);
 
     tokio::spawn(async move {
-        let _ = server_rt
+        if let Err(e) = server_rt
             .start_servers(api_config, None, EndpointAuth::no_auth())
-            .await;
+            .await
+        {
+            tracing::error!("Test runtime server failed to start: {e}");
+        }
     });
 
     let client = Client::new();
