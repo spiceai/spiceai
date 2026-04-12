@@ -1128,10 +1128,12 @@ fn is_permanent_http_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 401 | 403 | 404)
 }
 
-/// Returns `true` if the error indicates a permission/access denial.
+/// Returns `true` if the error indicates a SQL-level table permission denial.
 ///
-/// Checks for Databricks-specific error patterns in SQL query failures
-/// and HTTP 403 responses.
+/// Only matches Databricks SQL query failures that explicitly report
+/// permission errors on a specific table. HTTP 403 from the SQL Statements
+/// API is NOT matched here — that's an infrastructure auth error (bad token,
+/// no warehouse access) and is handled by `check_permanent_http_error`.
 fn is_access_denied_error(err: &Error) -> bool {
     match err {
         Error::QueryFailure { message } => {
@@ -1140,9 +1142,6 @@ fn is_access_denied_error(err: &Error) -> bool {
                 || message.contains("does not have")
                 || message.contains("permission denied")
         }
-        Error::HttpRequestFailed { source } => source
-            .status()
-            .is_some_and(|s| s == reqwest::StatusCode::FORBIDDEN),
         _ => false,
     }
 }
@@ -4227,5 +4226,24 @@ mod tests {
     fn test_is_not_access_denied_for_other_errors() {
         let err = Error::NotImplemented;
         assert!(!is_access_denied_error(&err));
+    }
+
+    /// HTTP 403 from the SQL Statements API is an infrastructure auth error
+    /// (bad token, no warehouse access), NOT a SQL-level table permission
+    /// denial. It should NOT be classified as access denied.
+    #[test]
+    fn test_http_403_is_not_sql_access_denied() {
+        // Build a reqwest::Error that reports status 403.
+        // We can't easily construct one, but we can verify via QueryFailure
+        // that only SQL-level messages trigger access denied, not HTTP errors.
+        let err = Error::QueryFailure {
+            message: "HTTP status client error (403 Forbidden)".into(),
+        };
+        // Generic "403 Forbidden" text should NOT match — it lacks the specific
+        // SQL error codes (INSUFFICIENT_PERMISSIONS, ACCESS_DENIED, etc.)
+        assert!(
+            !is_access_denied_error(&err),
+            "HTTP 403 in a QueryFailure should not be treated as SQL access denied"
+        );
     }
 }
