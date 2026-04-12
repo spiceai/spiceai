@@ -199,14 +199,16 @@ fn parse_information_schema_json(
             .ok_or_else(|| format!("information_schema row {i}: invalid data type"))?;
         let is_nullable = row[2].as_str().is_none_or(|s| s.to_uppercase() == "YES");
 
-        let precision = row
-            .get(3)
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<u8>().ok());
-        let scale = row
-            .get(4)
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<i8>().ok());
+        let precision = row.get(3).and_then(|v| {
+            v.as_u64()
+                .and_then(|n| u8::try_from(n).ok())
+                .or_else(|| v.as_str().and_then(|s| s.parse::<u8>().ok()))
+        });
+        let scale = row.get(4).and_then(|v| {
+            v.as_i64()
+                .and_then(|n| i8::try_from(n).ok())
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i8>().ok()))
+        });
 
         let data_type = map_snowflake_sql_type(data_type_str, precision, scale);
 
@@ -312,7 +314,10 @@ fn map_snowflake_sql_type(sql_type: &str, precision: Option<u8>, scale: Option<i
         }
         "TIMESTAMP_TZ" => DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         "TIME" => DataType::Time64(TimeUnit::Nanosecond),
-        _ => DataType::Utf8,
+        other => {
+            tracing::warn!("Unrecognized Snowflake data type '{other}', defaulting to Utf8");
+            DataType::Utf8
+        }
     }
 }
 

@@ -1183,13 +1183,17 @@ impl DatasetPermissions for DatabricksPermissions {
             return PermissionCheckResult::Allowed;
         }
         match self.uc_client.get_effective_permissions(table_name).await {
-            Ok(Some(perms)) if !perms.has_read_permission() => PermissionCheckResult::Denied {
-                reason: format!(
-                    "Unity Catalog reports no read privilege for '{table_name}'. Principals: {:?}, Privileges: {:?}",
-                    perms.principals(),
-                    perms.all_privileges(),
-                ),
-            },
+            Ok(Some(perms)) if !perms.has_read_permission() => {
+                tracing::debug!(
+                    table_name,
+                    principals = ?perms.principals(),
+                    privileges = ?perms.all_privileges(),
+                    "Unity Catalog denied read permission"
+                );
+                PermissionCheckResult::Denied {
+                    reason: format!("Unity Catalog reports no read privilege for '{table_name}'"),
+                }
+            }
             Ok(Some(_)) => PermissionCheckResult::Allowed,
             Ok(None) => PermissionCheckResult::Unavailable {
                 reason: format!("Table '{table_name}' not found in UC permissions API"),
