@@ -1144,7 +1144,9 @@ fn is_access_denied_error(err: &Error) -> bool {
                 || message.contains("does not have")
                 || message.contains("permission denied")
         }
-        Error::HttpRequestFailed { source } => source.status().is_some_and(|s| s == 403),
+        Error::HttpRequestFailed { source } => source
+            .status()
+            .is_some_and(|s| s == reqwest::StatusCode::FORBIDDEN),
         Error::PermanentlyDisabled => false,
         _ => false,
     }

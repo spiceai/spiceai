@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -162,7 +162,7 @@ pub async fn discover_schema(
     if let SchemaProbeResult::Ok(schema) = direct_result {
         warnings.push(SchemaDiscoveryWarning::MetadataFallback {
             reason: "information_schema query failed".to_string(),
-            nuance: "Falling back to DESCRIBE TABLE. Column nullability will default to nullable."
+            nuance: "Falling back to the direct schema probe. Column nullability will default to nullable."
                 .to_string(),
         });
         return Ok(SchemaDiscoveryResult { schema, warnings });
@@ -263,7 +263,7 @@ mod tests {
             result.warnings.iter().any(|w| matches!(
                 w,
                 SchemaDiscoveryWarning::MetadataFallback { nuance, .. }
-                    if nuance.contains("DESCRIBE TABLE")
+                    if nuance.contains("direct schema probe")
             )),
             "should warn about metadata fallback"
         );
@@ -417,7 +417,7 @@ mod tests {
             result.warnings.iter().any(|w| matches!(
                 w,
                 SchemaDiscoveryWarning::MetadataFallback { nuance, .. }
-                    if nuance.contains("DESCRIBE TABLE")
+                    if nuance.contains("direct schema probe")
             )),
             "should warn about metadata fallback"
         );
