@@ -1798,7 +1798,7 @@ fn resolve_and_validate_url(raw: &str, base_url: &Url, context: &str) -> Result<
 /// we fall through to check the `Link` header (if configured) before giving up.
 ///
 /// In query-params mode, always returns `QueryParams { page: current_page + 1 }`;
-/// the stop condition (row count < page_size) is checked separately in the loop.
+/// the stop condition (row count < `page_size`) is checked separately in the loop.
 fn extract_next_page_info(
     parsed_json: Option<&serde_json::Value>,
     response_headers: &[(String, String)],
@@ -1987,14 +1987,14 @@ fn extract_page_data(
                 .map(std::string::ToString::to_string)
                 .collect());
         }
-        if config.data_map_to_array {
-            if let Some(obj) = data.as_object() {
-                return Ok(obj
-                    .values()
-                    .take(limit.unwrap_or(usize::MAX))
-                    .map(std::string::ToString::to_string)
-                    .collect());
-            }
+        if config.data_map_to_array
+            && let Some(obj) = data.as_object()
+        {
+            return Ok(obj
+                .values()
+                .take(limit.unwrap_or(usize::MAX))
+                .map(std::string::ToString::to_string)
+                .collect());
         }
         // Not an array (and not a map-to-array) — return as a single row
         return Ok(vec![data.to_string()]);
