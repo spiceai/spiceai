@@ -518,17 +518,14 @@ impl HttpTableProvider {
                     message: "pagination_query_params is mutually exclusive with pagination_next_pointer and pagination_token_param.".to_string(),
                 });
             }
-        } else {
-            if config.next_pointer.is_none() && !config.use_link_header {
-                return Err(Error::Configuration {
-                    message: "Pagination requires either 'pagination_next_pointer', 'pagination_link_header', or 'pagination_query_params' to be configured.".to_string(),
-                });
-            }
-            if config.token_param.is_some() && config.next_pointer.is_none() {
-                return Err(Error::Configuration {
-                    message: "Pagination 'pagination_token_param' requires 'pagination_next_pointer' to be configured.".to_string(),
-                });
-            }
+        } else if config.next_pointer.is_none() && !config.use_link_header {
+            return Err(Error::Configuration {
+                message: "Pagination requires either 'pagination_next_pointer', 'pagination_link_header', or 'pagination_query_params' to be configured.".to_string(),
+            });
+        } else if config.token_param.is_some() && config.next_pointer.is_none() {
+            return Err(Error::Configuration {
+                message: "Pagination 'pagination_token_param' requires 'pagination_next_pointer' to be configured.".to_string(),
+            });
         }
         ensure!(
             config.max_pages > 0,
@@ -1622,7 +1619,6 @@ impl ExecutionPlan for HttpExec {
                         // Parse response JSON once for both next-page and data extraction
                         let parsed_json = if config.next_pointer.is_some()
                             || config.data_pointer.is_some()
-                            || config.data_map_to_array
                         {
                             Some(
                                     serde_json::from_str::<serde_json::Value>(
@@ -1671,11 +1667,11 @@ impl ExecutionPlan for HttpExec {
                         }
 
                         // Query-param pagination stop condition: fewer rows than page_size = last page
-                        if let Some(page_size) = config.page_size {
-                            let content_count = content_rows.len();
-                            if content_count < page_size {
-                                state.done = true;
-                            }
+                        if config
+                            .page_size
+                            .is_some_and(|page_size| content_rows.len() < page_size)
+                        {
+                            state.done = true;
                         }
 
                         // Skip empty pages internally — loop again instead of yielding
@@ -1982,43 +1978,25 @@ fn extract_page_data(
     ))
 }
 
-/// Like `HttpExec::parse_content` but with optional map-to-array conversion.
+/// Like `HttpExec::parse_content` but when `data_map_to_array` is `true`,
+/// a top-level JSON object has its values extracted as rows.
 fn parse_content_with_map_to_array(
     content: &str,
     limit: Option<usize>,
     data_map_to_array: bool,
 ) -> Vec<String> {
-    if !data_map_to_array {
-        return HttpExec::parse_content(content, limit);
-    }
-
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        return vec![content.to_string()];
-    }
-
-    if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        match json_value {
-            serde_json::Value::Array(arr) => {
-                return arr
-                    .into_iter()
-                    .take(limit.unwrap_or(usize::MAX))
-                    .map(|item| item.to_string())
-                    .collect();
-            }
-            serde_json::Value::Object(map) => {
-                return map
-                    .values()
-                    .take(limit.unwrap_or(usize::MAX))
-                    .map(std::string::ToString::to_string)
-                    .collect();
-            }
-            _ => {
-                return vec![json_value.to_string()];
-            }
+    if data_map_to_array {
+        let trimmed = content.trim();
+        if let Ok(serde_json::Value::Object(map)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            return map
+                .values()
+                .take(limit.unwrap_or(usize::MAX))
+                .map(std::string::ToString::to_string)
+                .collect();
         }
     }
-
     HttpExec::parse_content(content, limit)
 }
 
@@ -2066,19 +2044,10 @@ fn merge_queries(
     token_param: &str,
     token: &str,
 ) -> String {
-    let merged = merge_base_and_partition_queries(base_query, partition_query).unwrap_or_default();
-
-    // Parse the merged result, add the token param
-    let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(merged.as_bytes())
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
-
-    pairs.retain(|(k, _)| k != token_param);
-    pairs.push((token_param.to_string(), token.to_string()));
-
-    url::form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(pairs)
-        .finish()
+    let override_params = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair(token_param, token)
+        .finish();
+    merge_base_and_partition_queries_with_override(base_query, partition_query, &override_params)
 }
 
 /// Expand `{offset}`, `{limit}`, and `{page}` variables in a query-param template.
@@ -2089,7 +2058,8 @@ fn expand_query_params_template(template: &str, page: usize, page_size: usize) -
         .replace("{page}", &page.to_string())
 }
 
-/// Merge base + partition queries, then override with expanded pagination query params.
+/// Merge base + partition queries, then override with additional query params.
+/// Override params replace any base/partition params with the same key.
 fn merge_base_and_partition_queries_with_override(
     base_query: Option<&str>,
     partition_query: Option<&str>,
@@ -2101,7 +2071,6 @@ fn merge_base_and_partition_queries_with_override(
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
 
-    // Override with the expanded template params
     for (key, value) in url::form_urlencoded::parse(override_params.as_bytes()) {
         let key_str: &str = &key;
         pairs.retain(|(k, _)| k != key_str);
