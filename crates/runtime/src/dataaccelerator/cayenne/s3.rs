@@ -1260,7 +1260,7 @@ pub async fn build_s3_object_store_for_validation(
     // Load credentials from environment using our credential bridge
     if load_credentials_from_environment {
         tracing::debug!("Loading S3 credentials from environment for validation");
-        match aws_sdk_credential_bridge::get_or_init_sdk_config().await {
+        match aws_sdk_credential_bridge::get_or_init_sdk_config_with_region(Some(region)).await {
             Ok(Some(sdk_config)) => {
                 if sdk_config.credentials_provider().is_some() {
                     tracing::debug!("Using S3 credentials provider from SDK config for validation");
@@ -1575,7 +1575,11 @@ async fn build_single_s3_store_for_path(
     s3_builder = s3_builder.with_client_options(client_options);
 
     if load_credentials_from_environment {
-        match aws_sdk_credential_bridge::get_or_init_sdk_config().await {
+        match aws_sdk_credential_bridge::get_or_init_sdk_config_with_region(Some(
+            effective_region.as_str(),
+        ))
+        .await
+        {
             Ok(Some(sdk_config)) => {
                 if sdk_config.credentials_provider().is_some() {
                     s3_builder = s3_builder.with_credentials(Arc::new(
