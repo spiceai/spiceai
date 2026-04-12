@@ -22,7 +22,7 @@ use pkcs8::{LineEnding, SecretDocument};
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use snafu::prelude::*;
 use snowflake_api::{SnowflakeApi, SnowflakeApiError};
-use std::{collections::HashMap, fmt::Write, fs, sync::Arc};
+use std::{collections::HashMap, fmt::Write, fs, sync::Arc, time::Instant};
 
 use crate::dbconnection::snowflakeconn::SnowflakeConnection;
 
@@ -101,6 +101,8 @@ impl SnowflakeConnectionPool {
     ///
     /// Returns an error if there is a problem creating the connection pool.
     pub async fn new(params: &HashMap<String, SecretString>) -> Result<Self, Error> {
+        let pool_start = Instant::now();
+
         let username = params
             .get("username")
             .map(SecretBox::expose_secret)
@@ -150,7 +152,10 @@ impl SnowflakeConnectionPool {
             .fail()?,
         };
 
+        tracing::debug!("Snowflake API client created, validating connectivity...");
+        let validation_start = Instant::now();
         if let Err(err) = api.exec("SELECT 1").await {
+            tracing::warn!(duration_ms = validation_start.elapsed().as_millis(), error = %err, "Snowflake connectivity validation failed");
             match err {
                 snowflake_api::SnowflakeApiError::AuthError(auth_err) => {
                     // for incorrect werehouse or account param the library fails
@@ -172,6 +177,11 @@ impl SnowflakeConnectionPool {
             }
         }
 
+        tracing::debug!(
+            duration_ms = validation_start.elapsed().as_millis(),
+            "Snowflake connectivity validation succeeded"
+        );
+
         let mut join_push_context_str = format!("username={username},account={account}");
         if let Some(warehouse) = warehouse {
             let _ = write!(join_push_context_str, ",warehouse={warehouse}");
@@ -179,6 +189,11 @@ impl SnowflakeConnectionPool {
         if let Some(role) = role {
             let _ = write!(join_push_context_str, ",role={role}");
         }
+
+        tracing::info!(
+            duration_ms = pool_start.elapsed().as_millis(),
+            "Snowflake connection pool created"
+        );
 
         Ok(Self {
             api: Arc::new(api),

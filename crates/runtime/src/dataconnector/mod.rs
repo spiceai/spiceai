@@ -384,8 +384,8 @@ pub enum DataConnectorError {
 
 impl DataConnectorError {
     /// Returns `true` if this error is transient and the operation may succeed
-    /// on retry. Configuration errors, permission errors, and unsupported
-    /// type/table errors are permanent and should not be retried.
+    /// on retry. Configuration errors, unsupported type/table errors, and
+    /// permission errors are permanent and should not be retried.
     #[must_use]
     pub fn is_retriable(&self) -> bool {
         !matches!(
@@ -396,6 +396,7 @@ impl DataConnectorError {
                 | Self::InvalidConnectorType { .. }
                 | Self::InvalidGlobPattern { .. }
                 | Self::InvalidTableName { .. }
+                | Self::InsufficientPermissions { .. }
                 | Self::UnableToConnectInvalidHostOrPort { .. }
                 | Self::UnableToConnectInvalidUsernameOrPassword { .. }
                 | Self::UnableToConnectTlsError { .. }
@@ -403,7 +404,6 @@ impl DataConnectorError {
                 | Self::UnsupportedDataType { .. }
                 | Self::OdbcNotInstalled { .. }
                 | Self::UseOfProtectedKeyword { .. }
-                | Self::InsufficientPermissions { .. }
         )
     }
 }
@@ -436,11 +436,10 @@ pub async fn create_new_connector(
     name: &str,
     params: ConnectorParams,
 ) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
-    let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
-
-    let connector_factory = guard.get(name);
-
-    let factory = connector_factory?;
+    let factory = {
+        let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+        Arc::clone(guard.get(name)?)
+    };
 
     let ConnectorComponent::Dataset(ds) = &params.component else {
         unreachable!("Component is always a dataset at this point")
@@ -748,13 +747,38 @@ fn include_computed_columns(
 mod tests {
     use datafusion_table_providers::UnsupportedTypeAction;
     use tokio::runtime::Handle;
-    use tokio::sync::RwLock;
+    use tokio::sync::{Barrier, RwLock};
+    use tokio::time::{Duration, timeout};
 
     use super::*;
     use crate::component::dataset::UnsupportedTypeAction as DatasetUnsupportedTypeAction;
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::parameters::ConnectorParamsBuilder;
     use crate::secrets::Secrets;
+
+    async fn build_test_connector_params(
+        connector_name: &str,
+        dataset_name: &str,
+        app: Arc<app::App>,
+        runtime: Arc<crate::Runtime>,
+        secrets: Arc<RwLock<Secrets>>,
+    ) -> ConnectorParams {
+        let dataset =
+            DatasetBuilder::try_new(format!("{connector_name}:{dataset_name}"), dataset_name)
+                .expect("Failed to create builder")
+                .with_app(app)
+                .with_runtime(runtime)
+                .build()
+                .expect("Failed to build dataset");
+
+        ConnectorParamsBuilder::new(
+            connector_name.into(),
+            ConnectorComponent::Dataset(Arc::new(dataset)),
+        )
+        .build(secrets, Handle::current())
+        .await
+        .expect("failed to build connector params")
+    }
 
     #[tokio::test]
     async fn test_connector_params_builder_unsupported_type_action() {
@@ -833,6 +857,101 @@ mod tests {
             params.unsupported_type_action,
             Some(UnsupportedTypeAction::Ignore),
             "Unsupported type action should be properly set in connector params"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_new_connector_allows_concurrent_factory_initialization() {
+        struct ConcurrentConnectorFactory {
+            barrier: Arc<Barrier>,
+        }
+
+        impl DataConnectorFactory for ConcurrentConnectorFactory {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            fn create(
+                &self,
+                _params: ConnectorParams,
+            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+                let barrier = Arc::clone(&self.barrier);
+
+                Box::pin(async move {
+                    barrier.wait().await;
+
+                    let connector: Arc<dyn DataConnector> = Arc::new(TestConnector);
+                    Ok(connector)
+                })
+            }
+
+            fn prefix(&self) -> &'static str {
+                "test_concurrent"
+            }
+
+            fn parameters(&self) -> &'static [ParameterSpec] {
+                &[]
+            }
+        }
+
+        #[derive(Debug)]
+        struct TestConnector;
+
+        #[async_trait]
+        impl DataConnector for TestConnector {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            async fn read_provider(
+                &self,
+                _dataset: &Dataset,
+            ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+                unimplemented!()
+            }
+        }
+
+        register_connector_factory(
+            "test_concurrent",
+            Arc::new(ConcurrentConnectorFactory {
+                barrier: Arc::new(Barrier::new(2)),
+            }),
+        )
+        .await;
+
+        let app = Arc::new(app::AppBuilder::new("test_app").build());
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let secrets = Arc::new(RwLock::new(Secrets::default()));
+
+        let params_one = build_test_connector_params(
+            "test_concurrent",
+            "first",
+            Arc::clone(&app),
+            Arc::clone(&runtime),
+            Arc::clone(&secrets),
+        )
+        .await;
+        let params_two =
+            build_test_connector_params("test_concurrent", "second", app, runtime, secrets).await;
+
+        let (result_one, result_two) = timeout(Duration::from_secs(5), async move {
+            tokio::join!(
+                create_new_connector("test_concurrent", params_one),
+                create_new_connector("test_concurrent", params_two),
+            )
+        })
+        .await
+        .expect("create_new_connector should not serialize concurrent factory initialization");
+
+        assert!(result_one.is_some(), "first factory should be registered");
+        assert!(result_two.is_some(), "second factory should be registered");
+        assert!(
+            result_one.expect("first factory should exist").is_ok(),
+            "first connector should initialize successfully"
+        );
+        assert!(
+            result_two.expect("second factory should exist").is_ok(),
+            "second connector should initialize successfully"
         );
     }
 }
