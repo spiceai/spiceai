@@ -334,11 +334,7 @@ impl Https {
                 .ok()
                 .map(std::string::ToString::to_string);
 
-            let page_size_raw = self
-                .params
-                .get("pagination_page_size")
-                .expose()
-                .ok();
+            let page_size_raw = self.params.get("pagination_page_size").expose().ok();
             let page_size = page_size_raw.and_then(|v| {
                 match v.parse::<usize>() {
                     Ok(n) => Some(n),

@@ -510,7 +510,9 @@ impl HttpTableProvider {
             // Query-param pagination mode
             if config.page_size.is_none() || config.page_size == Some(0) {
                 return Err(Error::Configuration {
-                    message: "pagination_query_params requires pagination_page_size to be set (and > 0).".to_string(),
+                    message:
+                        "pagination_query_params requires pagination_page_size to be set (and > 0)."
+                            .to_string(),
                 });
             }
             if config.next_pointer.is_some() || config.token_param.is_some() {
@@ -526,7 +528,9 @@ impl HttpTableProvider {
         } else {
             if config.page_size.is_some() {
                 return Err(Error::Configuration {
-                    message: "pagination_page_size requires pagination_query_params to be configured.".to_string(),
+                    message:
+                        "pagination_page_size requires pagination_query_params to be configured."
+                            .to_string(),
                 });
             }
             if config.next_pointer.is_none() && !config.use_link_header {
@@ -4917,12 +4921,10 @@ mod tests {
 
     #[test]
     fn test_expand_query_params_template() {
-        let result =
-            expand_query_params_template("offset={offset}&limit={limit}", 0, 100).unwrap();
+        let result = expand_query_params_template("offset={offset}&limit={limit}", 0, 100).unwrap();
         assert_eq!(result, "offset=0&limit=100");
 
-        let result =
-            expand_query_params_template("offset={offset}&limit={limit}", 3, 50).unwrap();
+        let result = expand_query_params_template("offset={offset}&limit={limit}", 3, 50).unwrap();
         assert_eq!(result, "offset=150&limit=50");
 
         let result = expand_query_params_template("page={page}&size={limit}", 2, 25).unwrap();
