@@ -290,14 +290,28 @@ impl Databricks {
                 let sql_warehouse_config =
                     runtime::catalogconnector::databricks::build_sql_warehouse_config(&params);
 
-                let read_provider = DatabricksSqlWarehouse::with_config_and_semaphore(
-                    endpoint,
-                    sql_warehouse_id,
-                    token_provider,
-                    sql_warehouse_config,
-                    shared_semaphore,
-                )
-                .context(UnableToConstructDatabricksSqlWarehouseSnafu)?;
+                let permissions: Arc<dyn data_components::schema_discovery::DatasetPermissions> =
+                    if let Some(ref uc) = uc_client {
+                        Arc::new(
+                            data_components::databricks::sql_warehouse::DatabricksPermissions::new(
+                                Arc::clone(uc),
+                                true, // strict validation for standalone datasets
+                            ),
+                        )
+                    } else {
+                        Arc::new(data_components::schema_discovery::NoPermissionsCheck)
+                    };
+
+                let read_provider =
+                    DatabricksSqlWarehouse::with_config_semaphore_and_permissions(
+                        endpoint,
+                        sql_warehouse_id,
+                        token_provider,
+                        sql_warehouse_config,
+                        shared_semaphore,
+                        permissions,
+                    )
+                    .context(UnableToConstructDatabricksSqlWarehouseSnafu)?;
                 let metrics = Some(Arc::clone(read_provider.metrics()));
 
                 Ok(Self {
