@@ -335,16 +335,20 @@ impl Https {
                 .map(std::string::ToString::to_string);
 
             let page_size_raw = self.params.get("pagination_page_size").expose().ok();
-            let page_size = page_size_raw.and_then(|v| {
-                match v.parse::<usize>() {
-                    Ok(n) => Some(n),
-                    Err(_) => {
-                        tracing::warn!(
-                            "Invalid pagination_page_size value '{}': expected a positive integer. The parameter will be ignored.",
-                            v
-                        );
-                        None
-                    }
+            let page_size = page_size_raw.and_then(|v| match v.parse::<usize>() {
+                Ok(0) => {
+                    tracing::warn!(
+                        "Invalid pagination_page_size value '0': must be greater than 0. The parameter will be ignored."
+                    );
+                    None
+                }
+                Ok(n) => Some(n),
+                Err(_) => {
+                    tracing::warn!(
+                        "Invalid pagination_page_size value '{}': expected a positive integer. The parameter will be ignored.",
+                        v
+                    );
+                    None
                 }
             });
 
