@@ -506,7 +506,7 @@ impl HttpTableProvider {
     ///
     /// At least one of `next_pointer`, `use_link_header`, or `query_params` must be set.
     pub fn with_pagination(mut self, config: PaginationConfig) -> Result<Self> {
-        if config.query_params.is_some() {
+        if let Some(ref template) = config.query_params {
             // Query-param pagination mode
             if config.page_size.is_none() || config.page_size == Some(0) {
                 return Err(Error::Configuration {
@@ -518,14 +518,26 @@ impl HttpTableProvider {
                     message: "pagination_query_params is mutually exclusive with pagination_next_pointer and pagination_token_param.".to_string(),
                 });
             }
-        } else if config.next_pointer.is_none() && !config.use_link_header {
-            return Err(Error::Configuration {
-                message: "Pagination requires either 'pagination_next_pointer', 'pagination_link_header', or 'pagination_query_params' to be configured.".to_string(),
-            });
-        } else if config.token_param.is_some() && config.next_pointer.is_none() {
-            return Err(Error::Configuration {
-                message: "Pagination 'pagination_token_param' requires 'pagination_next_pointer' to be configured.".to_string(),
-            });
+            if !template.contains("{offset}") && !template.contains("{page}") {
+                return Err(Error::Configuration {
+                    message: "pagination_query_params must contain at least one pagination variable ({offset} or {page}) to advance between pages.".to_string(),
+                });
+            }
+        } else {
+            if config.page_size.is_some() {
+                return Err(Error::Configuration {
+                    message: "pagination_page_size requires pagination_query_params to be configured.".to_string(),
+                });
+            }
+            if config.next_pointer.is_none() && !config.use_link_header {
+                return Err(Error::Configuration {
+                    message: "Pagination requires either 'pagination_next_pointer', 'pagination_link_header', or 'pagination_query_params' to be configured.".to_string(),
+                });
+            } else if config.token_param.is_some() && config.next_pointer.is_none() {
+                return Err(Error::Configuration {
+                    message: "Pagination 'pagination_token_param' requires 'pagination_next_pointer' to be configured.".to_string(),
+                });
+            }
         }
         ensure!(
             config.max_pages > 0,
@@ -1505,7 +1517,7 @@ impl ExecutionPlan for HttpExec {
                             let merged_query = if let Some(ref template) = config.query_params {
                                 let page_size = config.page_size.unwrap_or(0);
                                 let expanded =
-                                    expand_query_params_template(template, 0, page_size);
+                                    expand_query_params_template(template, 0, page_size)?;
                                 Some(merge_base_and_partition_queries_with_override(
                                     provider.base_url.query(),
                                     state.query.as_deref(),
@@ -1587,7 +1599,7 @@ impl ExecutionPlan for HttpExec {
                                     let template = config.query_params.as_deref().unwrap_or("");
                                     let page_size = config.page_size.unwrap_or(0);
                                     let expanded =
-                                        expand_query_params_template(template, *page, page_size);
+                                        expand_query_params_template(template, *page, page_size)?;
                                     let merged_query =
                                         merge_base_and_partition_queries_with_override(
                                             provider.base_url.query(),
@@ -1667,9 +1679,10 @@ impl ExecutionPlan for HttpExec {
                         }
 
                         // Query-param pagination stop condition: fewer rows than page_size = last page
-                        if config
-                            .page_size
-                            .is_some_and(|page_size| content_rows.len() < page_size)
+                        if config.query_params.is_some()
+                            && config
+                                .page_size
+                                .is_some_and(|page_size| content_rows.len() < page_size)
                         {
                             state.done = true;
                         }
@@ -2051,11 +2064,20 @@ fn merge_queries(
 }
 
 /// Expand `{offset}`, `{limit}`, and `{page}` variables in a query-param template.
-fn expand_query_params_template(template: &str, page: usize, page_size: usize) -> String {
-    template
-        .replace("{offset}", &(page * page_size).to_string())
+fn expand_query_params_template(
+    template: &str,
+    page: usize,
+    page_size: usize,
+) -> DataFusionResult<String> {
+    let offset = page.checked_mul(page_size).ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "Pagination offset overflow: page ({page}) * page_size ({page_size}) exceeds maximum"
+        ))
+    })?;
+    Ok(template
+        .replace("{offset}", &offset.to_string())
         .replace("{limit}", &page_size.to_string())
-        .replace("{page}", &page.to_string())
+        .replace("{page}", &page.to_string()))
 }
 
 /// Merge base + partition queries, then override with additional query params.
@@ -4860,14 +4882,19 @@ mod tests {
 
     #[test]
     fn test_expand_query_params_template() {
-        let result = expand_query_params_template("offset={offset}&limit={limit}", 0, 100);
+        let result =
+            expand_query_params_template("offset={offset}&limit={limit}", 0, 100).unwrap();
         assert_eq!(result, "offset=0&limit=100");
 
-        let result = expand_query_params_template("offset={offset}&limit={limit}", 3, 50);
+        let result =
+            expand_query_params_template("offset={offset}&limit={limit}", 3, 50).unwrap();
         assert_eq!(result, "offset=150&limit=50");
 
-        let result = expand_query_params_template("page={page}&size={limit}", 2, 25);
+        let result = expand_query_params_template("page={page}&size={limit}", 2, 25).unwrap();
         assert_eq!(result, "page=2&size=25");
+
+        // Overflow should return an error
+        assert!(expand_query_params_template("offset={offset}", usize::MAX, 2).is_err());
     }
 
     #[test]
@@ -4927,6 +4954,48 @@ mod tests {
         base_provider()
             .with_pagination(config)
             .expect("should succeed with query_params and page_size");
+    }
+
+    #[test]
+    fn test_pagination_config_page_size_requires_query_params() {
+        let config = PaginationConfig {
+            page_size: Some(100),
+            ..Default::default()
+        };
+        let err = base_provider()
+            .with_pagination(config)
+            .expect_err("should fail with page_size but no query_params");
+        match err {
+            Error::Configuration { message } => {
+                assert!(
+                    message.contains("pagination_query_params"),
+                    "error should mention query_params: {message}"
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pagination_config_query_params_requires_pagination_variable() {
+        let config = PaginationConfig {
+            query_params: Some("limit=100".to_string()),
+            page_size: Some(100),
+            use_link_header: false,
+            ..Default::default()
+        };
+        let err = base_provider()
+            .with_pagination(config)
+            .expect_err("should fail without pagination variable");
+        match err {
+            Error::Configuration { message } => {
+                assert!(
+                    message.contains("{offset}") || message.contains("{page}"),
+                    "error should mention pagination variables: {message}"
+                );
+            }
+            other => panic!("Unexpected error: {other:?}"),
+        }
     }
 
     #[test]
