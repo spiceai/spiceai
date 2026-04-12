@@ -542,13 +542,15 @@ async fn test_adbc_sqlite_empty_table_schema() -> Result<(), String> {
                 .await
                 .map_err(|e| e.to_string())?;
 
+            // SQLite uses dynamic typing; for empty tables the ADBC driver
+            // cannot infer column types from data and falls back to Int64.
             let expected_schema = [
                 "+-------------+-----------+",
                 "| column_name | data_type |",
                 "+-------------+-----------+",
                 "| id          | Int64     |",
-                "| name        | Utf8      |",
-                "| value       | Float64   |",
+                "| name        | Int64     |",
+                "| value       | Int64     |",
                 "+-------------+-----------+",
             ];
             assert_batches_eq!(expected_schema, &schema_result);
