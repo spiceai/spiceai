@@ -1019,8 +1019,15 @@ impl DataFusion {
     ) -> Result<Option<String>, DataFusionError> {
         let catalog_name = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
         let catalog = ctx.catalog(catalog_name);
-        resolve_table_partition_expr(catalog.as_deref(), Some(executor_registry), table_reference)
-            .await
+        let partition_expr = resolve_table_partition_expr(
+            catalog.as_deref(),
+            Some(executor_registry),
+            table_reference,
+        )
+        .await?
+        .map(|s| s.trim_start_matches('(').trim_end_matches(')').to_string());
+
+        Ok(partition_expr)
     }
 
     /// Parses a SQL expression string into a `DataFusion` `Expr`, using the schema of the given table reference for resolution.

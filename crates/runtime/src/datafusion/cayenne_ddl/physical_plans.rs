@@ -1234,48 +1234,52 @@ async fn validate_partition_compatibility(
     )
     .await?;
 
-    let Some(target_part) = target_partition else {
-        return Err(DataFusionError::Plan(format!(
-            "Distributed MERGE requires '{target_table}' to have PARTITION BY configured"
-        )));
+    let target_part_sql_expr: SqlExpr = match (source_partition, target_partition) {
+        (None, _) => {
+            return Err(DataFusionError::Plan(format!(
+                "Distributed MERGE requires '{source_table}' to have PARTITION BY configured"
+            )));
+        }
+        (_, None) => {
+            return Err(DataFusionError::Plan(format!(
+                "Distributed MERGE requires '{target_table}' to have PARTITION BY configured"
+            )));
+        }
+        (Some(source_part), Some(target_part)) if source_part != target_part => {
+            return Err(DataFusionError::Plan(format!(
+                "Distributed MERGE requires identical partition expressions. Target: '{target_part}', Source: '{source_part}'"
+            )));
+        }
+        (Some(_), Some(target_part)) => {
+            let dialect = GenericDialect {};
+            let mut parser = Parser::new(&dialect)
+                .try_with_sql(&target_part)
+                .map_err(|e| {
+                    DataFusionError::Plan(format!(
+                        "Failed to parse partition expression '{target_part}': {e}"
+                    ))
+                })?;
+            parser.parse_expr().map_err(|e| {
+                DataFusionError::Plan(format!(
+                    "Failed to parse partition expression '{target_part}': {e}"
+                ))
+            })?
+        }
     };
-    let Some(source_part) = source_partition else {
-        return Err(DataFusionError::Plan(format!(
-            "Distributed MERGE requires '{source_table}' to have PARTITION BY configured"
-        )));
-    };
-    if target_part != source_part {
-        return Err(DataFusionError::Plan(format!(
-            "Distributed MERGE requires identical partition expressions. Target: '{target_part}', Source: '{source_part}'"
-        )));
-    }
 
-    let dialect = GenericDialect {};
-    let mut parser = Parser::new(&dialect)
-        .try_with_sql(&target_part)
-        .map_err(|e| {
-            DataFusionError::Plan(format!(
-                "Failed to parse partition expression '{target_part}': {e}"
-            ))
-        })?;
-    let sql_expr = parser.parse_expr().map_err(|e| {
-        DataFusionError::Plan(format!(
-            "Failed to parse partition expression '{target_part}': {e}"
-        ))
-    })?;
     let mut collector = ColumnCollector {
         columns: Vec::new(),
     };
-    let _ = sql_expr.visit(&mut collector);
-    let partition_cols = collector.columns;
+    let _ = target_part_sql_expr.visit(&mut collector);
 
-    let all_covered = !partition_cols.is_empty()
-        && partition_cols
+    if collector.columns.is_empty()
+        || !collector
+            .columns
             .iter()
-            .all(|pc| on_keys.iter().any(|(target_col, _)| target_col == pc));
-    if !all_covered {
+            .all(|pc| on_keys.iter().any(|(target_col, _)| target_col == pc))
+    {
         return Err(DataFusionError::Plan(format!(
-            "Distributed MERGE requires partition column(s) from '{target_part}' in the ON clause"
+            "Distributed MERGE requires partition column(s) from '{target_part_sql_expr}' in the ON clause",
         )));
     }
     Ok(())
