@@ -1833,17 +1833,17 @@ fn extract_next_page_info(
                     return Ok(Some(NextPageInfo::Url(next_url)));
                 }
                 serde_json::Value::Number(n) => {
-                    // Numeric values (e.g. page numbers) are coerced to string tokens.
+                    // Numeric values (e.g. page numbers) are only valid in token mode.
                     let token = n.to_string();
                     if config.token_param.is_some() {
                         return Ok(Some(NextPageInfo::Token(token)));
                     }
-                    let next_url = resolve_and_validate_url(
-                        &token,
-                        base_url,
-                        &format!("JSON pointer '{pointer}'"),
-                    )?;
-                    return Ok(Some(NextPageInfo::Url(next_url)));
+                    return PaginationSnafu {
+                        message: format!(
+                            "Failed to extract pagination value from JSON pointer '{pointer}': numeric values require 'token_param' to be configured"
+                        ),
+                    }
+                    .fail();
                 }
                 serde_json::Value::Null | serde_json::Value::String(_) => {
                     // Null or empty string is an explicit end of pagination.
@@ -4590,6 +4590,24 @@ mod tests {
             }
             other => panic!("Expected Token with numeric value, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_extract_next_page_info_numeric_pointer_without_token_param_errors() {
+        let base_url = Url::parse("https://api.example.com").expect("valid URL");
+        let config = PaginationConfig {
+            next_pointer: Some("/page".to_string()),
+            // No token_param — numeric values should error in URL mode
+            ..Default::default()
+        };
+        let content = r#"{"data": [1, 2], "page": 3}"#;
+        let headers = vec![];
+
+        let result = extract_next_page_info(content, &headers, &config, &base_url);
+        assert!(
+            result.is_err(),
+            "numeric pointer without token_param should error"
+        );
     }
 
     #[test]
