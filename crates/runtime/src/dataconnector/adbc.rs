@@ -630,24 +630,24 @@ fn compute_adbc_cache_key(params: &ConnectorParams) -> String {
     }
 
     let connection_namespace = connection_namespace_for_cache_key(params);
-    hasher.update(b"catalog\0");
-    hasher.update(
-        connection_namespace
-            .catalog
-            .as_deref()
-            .unwrap_or("")
-            .as_bytes(),
-    );
-    hasher.update(b"\0");
-    hasher.update(b"schema\0");
-    hasher.update(
-        connection_namespace
-            .schema
-            .as_deref()
-            .unwrap_or("")
-            .as_bytes(),
-    );
-    hasher.update(b"\0");
+    for (key, value) in [
+        ("catalog", connection_namespace.catalog.as_deref()),
+        ("schema", connection_namespace.schema.as_deref()),
+    ] {
+        hasher.update(key.as_bytes());
+        hasher.update(b"\0");
+        match value {
+            Some(value) => {
+                hasher.update(b"1");
+                hasher.update(b"\0");
+                hasher.update(value.as_bytes());
+            }
+            None => {
+                hasher.update(b"0");
+            }
+        }
+        hasher.update(b"\0");
+    }
 
     hasher.finalize().to_hex().to_string()
 }
