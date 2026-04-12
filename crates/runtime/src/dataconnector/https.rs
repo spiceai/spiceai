@@ -153,6 +153,9 @@ impl Https {
                 "pagination_data_pointer",
                 "pagination_link_header",
                 "pagination_max_pages",
+                "pagination_data_map_to_array",
+                "pagination_query_params",
+                "pagination_page_size",
             ]
             .iter()
             .any(|key| self.params.get(key).expose().ok().is_some());
@@ -317,6 +320,27 @@ impl Https {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(data_components::http::provider::DEFAULT_PAGINATION_MAX_PAGES);
 
+            let data_map_to_array = self
+                .params
+                .get("pagination_data_map_to_array")
+                .expose()
+                .ok()
+                .is_some_and(util::parse_enabled);
+
+            let query_params = self
+                .params
+                .get("pagination_query_params")
+                .expose()
+                .ok()
+                .map(std::string::ToString::to_string);
+
+            let page_size = self
+                .params
+                .get("pagination_page_size")
+                .expose()
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok());
+
             // In 'auto' mode with no explicit pagination sub-params,
             // use Link header detection only (respecting pagination_link_header if set).
             if pagination_mode == "auto"
@@ -324,6 +348,8 @@ impl Https {
                 && token_param.is_none()
                 && data_pointer.is_none()
                 && link_header_param.is_none()
+                && query_params.is_none()
+                && !data_map_to_array
             {
                 Some(data_components::http::provider::PaginationConfig {
                     next_pointer: None,
@@ -331,6 +357,9 @@ impl Https {
                     token_param: None,
                     data_pointer: None,
                     max_pages,
+                    data_map_to_array: false,
+                    query_params: None,
+                    page_size: None,
                 })
             } else {
                 Some(data_components::http::provider::PaginationConfig {
@@ -339,6 +368,9 @@ impl Https {
                     token_param,
                     data_pointer,
                     max_pages,
+                    data_map_to_array,
+                    query_params,
+                    page_size,
                 })
             }
         };
@@ -555,13 +587,16 @@ impl Https {
 
         if let Some(pagination_config) = pagination {
             tracing::trace!(
-                "Enabling pagination for {}: next_pointer={:?}, link_header={}, token_param={:?}, data_pointer={:?}, max_pages={}",
+                "Enabling pagination for {}: next_pointer={:?}, link_header={}, token_param={:?}, data_pointer={:?}, max_pages={}, data_map_to_array={}, query_params={:?}, page_size={:?}",
                 dataset.name,
                 pagination_config.next_pointer,
                 pagination_config.use_link_header,
                 pagination_config.token_param,
                 pagination_config.data_pointer,
                 pagination_config.max_pages,
+                pagination_config.data_map_to_array,
+                pagination_config.query_params,
+                pagination_config.page_size,
             );
             provider = provider.with_pagination(pagination_config).map_err(|e| {
                 DataConnectorError::InvalidConfiguration {
@@ -700,6 +735,13 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .description("JSON pointer (RFC 6901) to the data array in each page's response (e.g., '/data', '/results', '/items'). When set, only the array at this path is returned as data rows."),
         ParameterSpec::runtime("pagination_max_pages")
             .description("Maximum number of pages to fetch for pagination. Default: 100."),
+        ParameterSpec::runtime("pagination_data_map_to_array")
+            .description("When 'enabled', if the data at pagination_data_pointer (or the top-level response) is a JSON object/map, extract its values as rows instead of treating it as a single row. Default: 'disabled'.")
+            .one_of(&["enabled", "disabled"]),
+        ParameterSpec::runtime("pagination_query_params")
+            .description("Query parameter template for client-driven pagination. Supports {offset}, {limit}, and {page} variables. Example: 'offset={offset}&limit={limit}'. Requires pagination_page_size."),
+        ParameterSpec::runtime("pagination_page_size")
+            .description("Number of items per page for query-parameter pagination. Used to expand {limit} in pagination_query_params and to detect the last page (fewer results than page_size = done)."),
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters
