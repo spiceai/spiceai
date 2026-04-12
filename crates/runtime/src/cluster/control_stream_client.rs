@@ -33,23 +33,19 @@ use futures::StreamExt;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
 use runtime_proto::scheduler_control_message::Message as SchedulerMessage;
 use runtime_proto::{
-    ComponentStatusUpdate, ExecutorControlMessage, ExecutorHeartbeat, ExecutorShutdown,
-    MetricsResponse, executor_control_message::Message as ExecutorMessage,
+    ExecutorControlMessage, ExecutorHeartbeat, ExecutorShutdown, MetricsResponse,
+    executor_control_message::Message as ExecutorMessage,
 };
 use tokio::sync::{Notify, RwLock, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::ClientTlsConfig;
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
-use uuid::Uuid;
 
-use crate::cluster::proto_conv::component_status_to_proto;
 use crate::metrics_reader::MetricsReader;
-use crate::status::{ComponentStatus, RuntimeStatus};
 
 const CONTROL_STREAM_BACKOFF_MAX: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-const STATUS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Callback type for when an executor has received an update to its partitions (via the control stream).
 ///
@@ -99,7 +95,6 @@ fn spawn_control_stream(
     outbound_tx_state: Arc<RwLock<Option<mpsc::Sender<ExecutorControlMessage>>>>,
     partition_update_handler: Option<&PartitionUpdateHandler>,
     refresh_dataset_handler: Option<&RefreshDatasetHandler>,
-    runtime_status: Arc<RuntimeStatus>,
 ) -> ControlStreamHandle {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
@@ -112,9 +107,6 @@ fn spawn_control_stream(
         let mut backoff = FibonacciBackoffBuilder::new()
             .max_duration(Some(CONTROL_STREAM_BACKOFF_MAX))
             .build();
-        // Channel for forwarding ComponentStatusAck update_ids to the status sender task.
-        // Re-created each connection since the sender task is re-spawned.
-        let mut component_ack_rx: Option<mpsc::Receiver<String>>;
 
         loop {
             if token.is_cancelled() {
@@ -184,9 +176,6 @@ fn spawn_control_stream(
 
             // Create channels for outbound messages
             let (outbound_tx, outbound_rx) = mpsc::channel::<ExecutorControlMessage>(32);
-            // Create channel for forwarding acks to the component status task
-            let (ack_tx, ack_rx_new) = mpsc::channel::<String>(32);
-            component_ack_rx = Some(ack_rx_new);
             {
                 let mut outbound_guard = outbound_tx_state_for_task.write().await;
                 *outbound_guard = Some(outbound_tx.clone());
@@ -202,7 +191,18 @@ fn spawn_control_stream(
                     tokio::select! {
                         () = heartbeat_token.cancelled() => break,
                         _ = interval.tick() => {
-                            let msg = build_heartbeat_message(&heartbeat_executor_id);
+                            let timestamp_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
+                                .unwrap_or(0);
+
+                            let msg = ExecutorControlMessage {
+                                executor_id: heartbeat_executor_id.clone(),
+                                message: Some(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
+                                    timestamp_ms,
+                                })),
+                            };
+
                             if heartbeat_tx.send(msg).await.is_err() {
                                 break;
                             }
@@ -211,20 +211,18 @@ fn spawn_control_stream(
                 }
             });
 
-            // Spawn component status sender (ack-based, with retry)
-            let component_status_task = tokio::spawn(run_component_status_sender(
-                executor_id.clone(),
-                outbound_tx.clone(),
-                token.clone(),
-                Arc::clone(&runtime_status),
-                component_ack_rx.take(),
-            ));
-
             // Send initial identification message
-            let init_msg = build_heartbeat_message(&executor_id);
+            let init_msg = ExecutorControlMessage {
+                executor_id: executor_id.clone(),
+                message: Some(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
+                    timestamp_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
+                        .unwrap_or(0),
+                })),
+            };
             if outbound_tx.send(init_msg).await.is_err() {
                 heartbeat_task.abort();
-                component_status_task.abort();
                 let mut outbound_guard = outbound_tx_state_for_task.write().await;
                 *outbound_guard = None;
                 continue;
@@ -241,7 +239,6 @@ fn spawn_control_stream(
                         "Failed to establish control stream to {scheduler_address}: {e}"
                     );
                     heartbeat_task.abort();
-                    component_status_task.abort();
                     let mut outbound_guard = outbound_tx_state_for_task.write().await;
                     *outbound_guard = None;
                     if let Some(delay) = backoff.next_duration() {
@@ -262,7 +259,6 @@ fn spawn_control_stream(
                 tokio::select! {
                     () = token.cancelled() => {
                         heartbeat_task.abort();
-                        component_status_task.abort();
                         {
                             let mut outbound_guard = outbound_tx_state_for_task.write().await;
                             *outbound_guard = None;
@@ -286,7 +282,6 @@ fn spawn_control_stream(
                                         &poll_now_notify,
                                         partition_update_handler.as_ref(),
                                         refresh_dataset_handler.as_ref(),
-                                        &ack_tx,
                                     )
                                     .await;
                                 }
@@ -309,7 +304,6 @@ fn spawn_control_stream(
             }
 
             heartbeat_task.abort();
-            component_status_task.abort();
             {
                 let mut outbound_guard = outbound_tx_state_for_task.write().await;
                 *outbound_guard = None;
@@ -332,124 +326,6 @@ fn spawn_control_stream(
     }
 }
 
-/// Builds an `ExecutorControlMessage` heartbeat.
-fn build_heartbeat_message(executor_id: &str) -> ExecutorControlMessage {
-    let timestamp_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
-        .unwrap_or(0);
-
-    ExecutorControlMessage {
-        executor_id: executor_id.to_string(),
-        message: Some(ExecutorMessage::Heartbeat(ExecutorHeartbeat {
-            timestamp_ms,
-        })),
-    }
-}
-
-/// Builds a `ComponentStatusUpdate` message.
-fn build_component_status_message(
-    executor_id: &str,
-    update_id: &str,
-    component_name: &str,
-    status: &ComponentStatus,
-) -> ExecutorControlMessage {
-    ExecutorControlMessage {
-        executor_id: executor_id.to_string(),
-        message: Some(ExecutorMessage::ComponentStatus(ComponentStatusUpdate {
-            update_id: update_id.to_string(),
-            component_name: component_name.to_string(),
-            status: component_status_to_proto(status),
-        })),
-    }
-}
-
-/// Runs the component status sender task for one control stream connection.
-///
-/// Sends `ComponentStatusUpdate` messages to the scheduler whenever component
-/// statuses change on the executor, and retries unacked updates periodically.
-/// On reconnect (not initial connect), sends all current statuses immediately.
-async fn run_component_status_sender(
-    executor_id: String,
-    tx: mpsc::Sender<ExecutorControlMessage>,
-    cancel: CancellationToken,
-    runtime_status: Arc<RuntimeStatus>,
-    ack_rx: Option<mpsc::Receiver<String>>,
-) {
-    let Some(mut ack_rx) = ack_rx else {
-        cancel.cancelled().await;
-        return;
-    };
-
-    let mut change_rx = runtime_status.subscribe_component_status_changes();
-    // component_name → (update_id, most_recent_status)
-    let mut pending: HashMap<String, (String, ComponentStatus)> = HashMap::new();
-
-    // Send all current component statuses on connect (no-op if empty)
-    for (component_name, cs_status) in runtime_status.get_all_statuses() {
-        let update_id = Uuid::new_v4().to_string();
-        let msg =
-            build_component_status_message(&executor_id, &update_id, &component_name, &cs_status);
-        if tx.send(msg).await.is_err() {
-            return;
-        }
-        pending.insert(component_name, (update_id, cs_status));
-    }
-
-    let mut retry_interval = tokio::time::interval(STATUS_RETRY_INTERVAL);
-    retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    loop {
-        tokio::select! {
-            () = cancel.cancelled() => break,
-            // Status changed — send update for the specific component
-            result = change_rx.recv() => {
-                match result {
-                    Ok((component_name, new_status)) => {
-                        let update_id = Uuid::new_v4().to_string();
-                        let msg = build_component_status_message(
-                            &executor_id, &update_id, &component_name, &new_status,
-                        );
-                        if tx.send(msg).await.is_err() {
-                            return;
-                        }
-                        pending.insert(component_name, (update_id, new_status));
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Fell behind — re-send all current statuses
-                        for (component_name, cs_status) in runtime_status.get_all_statuses() {
-                            let update_id = Uuid::new_v4().to_string();
-                            let msg = build_component_status_message(
-                                &executor_id, &update_id, &component_name, &cs_status,
-                            );
-                            if tx.send(msg).await.is_err() {
-                                return;
-                            }
-                            pending.insert(component_name, (update_id, cs_status));
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-            // Ack received — remove from pending
-            Some(acked_id) = ack_rx.recv() => {
-                pending.retain(|_, (id, _)| id != &acked_id);
-            }
-            // Retry unacked updates periodically
-            _ = retry_interval.tick() => {
-                for (component_name, (update_id, cs_status)) in &pending {
-                    let msg = build_component_status_message(
-                        &executor_id, update_id, component_name, cs_status,
-                    );
-                    if tx.send(msg).await.is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Handles a message from the scheduler on the control stream.
 #[expect(clippy::too_many_arguments)]
 async fn handle_scheduler_message(
@@ -462,7 +338,6 @@ async fn handle_scheduler_message(
     poll_now_notify: &Notify,
     partition_update_handler: Option<&PartitionUpdateHandler>,
     refresh_dataset_handler: Option<&RefreshDatasetHandler>,
-    ack_tx: &mpsc::Sender<String>,
 ) {
     match message {
         SchedulerMessage::RequestMetrics(request) => {
@@ -573,9 +448,6 @@ async fn handle_scheduler_message(
                 tracing::warn!("Received RefreshDataset command but no handler is registered");
             }
         }
-        SchedulerMessage::ComponentStatusAck(ack) => {
-            let _ = ack_tx.send(ack.update_id.clone()).await;
-        }
     }
 }
 
@@ -608,15 +480,11 @@ pub struct ControlStreamManager {
     partition_update_handler: Option<PartitionUpdateHandler>,
     /// Callback handler for dataset refresh commands.
     refresh_dataset_handler: Option<RefreshDatasetHandler>,
-    /// Executor's runtime status, used to send real-time
-    /// `ComponentStatusUpdate` messages for runtime components.
-    runtime_status: Arc<RuntimeStatus>,
 }
 
 impl ControlStreamManager {
     /// Creates a new control stream manager.
     #[must_use]
-    #[expect(clippy::too_many_arguments)]
     pub fn new(
         executor_id: String,
         ballista_executor_id: String,
@@ -625,7 +493,6 @@ impl ControlStreamManager {
         partition_update_handler: Option<PartitionUpdateHandler>,
         executor: Option<Arc<Executor>>,
         refresh_dataset_handler: Option<RefreshDatasetHandler>,
-        runtime_status: Arc<RuntimeStatus>,
     ) -> Self {
         Self {
             executor_id,
@@ -638,7 +505,6 @@ impl ControlStreamManager {
             poll_now_notify: Arc::new(Notify::new()),
             partition_update_handler,
             refresh_dataset_handler,
-            runtime_status,
         }
     }
 
@@ -722,7 +588,6 @@ impl ControlStreamManager {
                 Arc::clone(&outbound_tx_state),
                 self.partition_update_handler.as_ref(),
                 self.refresh_dataset_handler.as_ref(),
-                Arc::clone(&self.runtime_status),
             );
             self.streams.insert(address, handle);
         }
@@ -806,7 +671,6 @@ mod tests {
             None,
             None,
             None,
-            RuntimeStatus::new(),
         );
         assert!(manager.known_schedulers.is_empty());
         assert!(manager.streams.is_empty());
@@ -824,7 +688,6 @@ mod tests {
             None,
             None,
             None,
-            RuntimeStatus::new(),
         );
         assert!(manager.metrics_reader.is_some());
     }
@@ -839,7 +702,6 @@ mod tests {
             None,
             None,
             None,
-            RuntimeStatus::new(),
         );
         manager.update_schedulers(vec![]);
         assert!(manager.known_schedulers.is_empty());
@@ -856,189 +718,10 @@ mod tests {
             None,
             None,
             None,
-            RuntimeStatus::new(),
         );
         // Should not panic on empty manager
         manager.shutdown();
         assert!(manager.known_schedulers.is_empty());
         assert!(manager.streams.is_empty());
-    }
-
-    // --- Component status sender tests ---
-
-    /// Extract `ComponentStatusUpdate` from an outbound message, or panic.
-    fn expect_status_update(msg: ExecutorControlMessage) -> runtime_proto::ComponentStatusUpdate {
-        match msg.message {
-            Some(ExecutorMessage::ComponentStatus(update)) => update,
-            other => panic!("Expected ComponentStatus, got {other:?}"),
-        }
-    }
-
-    /// Spawn `run_component_status_sender` and return channels to drive it.
-    fn spawn_status_sender(
-        status: Arc<RuntimeStatus>,
-    ) -> (
-        mpsc::Receiver<ExecutorControlMessage>,
-        mpsc::Sender<String>,
-        CancellationToken,
-    ) {
-        let (outbound_tx, outbound_rx) = mpsc::channel(32);
-        let (ack_tx, ack_rx) = mpsc::channel(32);
-        let cancel = CancellationToken::new();
-
-        tokio::spawn(run_component_status_sender(
-            "test-executor".to_string(),
-            outbound_tx,
-            cancel.clone(),
-            status,
-            Some(ack_rx),
-        ));
-
-        (outbound_rx, ack_tx, cancel)
-    }
-
-    #[tokio::test]
-    async fn test_sends_current_statuses_on_connect() {
-        let status = RuntimeStatus::new();
-        status.update_dataset(
-            &datafusion::sql::TableReference::bare("orders"),
-            ComponentStatus::Ready,
-        );
-
-        let (mut rx, _ack_tx, cancel) = spawn_status_sender(Arc::clone(&status));
-
-        let msg = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("should receive message")
-            .expect("channel open");
-        let update = expect_status_update(msg);
-        assert_eq!(update.component_name, "dataset:orders");
-        assert_eq!(update.status, 1); // Ready
-
-        cancel.cancel();
-    }
-
-    #[tokio::test]
-    async fn test_sends_update_on_status_change() {
-        let status = RuntimeStatus::new();
-        let (mut rx, _ack_tx, cancel) = spawn_status_sender(Arc::clone(&status));
-
-        // Give the task a moment to start
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        // Change a status
-        status.update_dataset(
-            &datafusion::sql::TableReference::bare("orders"),
-            ComponentStatus::Refreshing,
-        );
-
-        let msg = tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("should receive message")
-            .expect("channel open");
-        let update = expect_status_update(msg);
-        assert_eq!(update.component_name, "dataset:orders");
-        assert_eq!(update.status, 4); // Refreshing
-
-        cancel.cancel();
-    }
-
-    #[tokio::test]
-    async fn test_ack_removes_from_pending_no_retry() {
-        let status = RuntimeStatus::new();
-        status.update_dataset(
-            &datafusion::sql::TableReference::bare("orders"),
-            ComponentStatus::Ready,
-        );
-
-        let (mut rx, ack_tx, cancel) = spawn_status_sender(Arc::clone(&status));
-
-        // Receive the initial update
-        let msg = rx.recv().await.expect("channel open");
-        let update = expect_status_update(msg);
-
-        // Ack it
-        ack_tx
-            .send(update.update_id)
-            .await
-            .expect("ack channel open");
-
-        // Wait longer than the retry interval. If acked properly, no retry should arrive.
-        let result =
-            tokio::time::timeout(STATUS_RETRY_INTERVAL + Duration::from_secs(2), rx.recv()).await;
-        assert!(
-            result.is_err(),
-            "Should not retry after ack (timeout expected)"
-        );
-
-        cancel.cancel();
-    }
-
-    #[tokio::test]
-    async fn test_status_change_before_ack_sends_latest() {
-        let status = RuntimeStatus::new();
-        let table_ref = datafusion::sql::TableReference::bare("orders");
-        status.update_dataset(&table_ref, ComponentStatus::Initializing);
-
-        let (mut rx, ack_tx, cancel) = spawn_status_sender(Arc::clone(&status));
-
-        // Receive initial update (Initializing)
-        let msg = rx.recv().await.expect("channel open");
-        let update1 = expect_status_update(msg);
-        assert_eq!(update1.status, 0); // Initializing
-        let old_update_id = update1.update_id.clone();
-
-        // Change status before acking
-        status.update_dataset(&table_ref, ComponentStatus::Ready);
-
-        // Should receive new update (Ready) with a different update_id
-        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("should receive update")
-            .expect("channel open");
-        let update2 = expect_status_update(msg);
-        assert_eq!(update2.status, 1); // Ready
-        assert_ne!(update2.update_id, old_update_id);
-
-        // Ack the OLD update_id — should be ignored (stale)
-        ack_tx.send(old_update_id).await.expect("ack channel open");
-
-        // Wait for retry — should still retry the new update (not acked)
-        let msg = tokio::time::timeout(STATUS_RETRY_INTERVAL + Duration::from_secs(2), rx.recv())
-            .await
-            .expect("should receive retry")
-            .expect("channel open");
-        let retry = expect_status_update(msg);
-        assert_eq!(retry.update_id, update2.update_id);
-        assert_eq!(retry.status, 1); // Still Ready
-
-        cancel.cancel();
-    }
-
-    #[tokio::test]
-    async fn test_retry_resends_unacked() {
-        let status = RuntimeStatus::new();
-        status.update_dataset(
-            &datafusion::sql::TableReference::bare("orders"),
-            ComponentStatus::Ready,
-        );
-
-        let (mut rx, _ack_tx, cancel) = spawn_status_sender(Arc::clone(&status));
-
-        // Receive initial update
-        let msg = rx.recv().await.expect("channel open");
-        let update = expect_status_update(msg);
-
-        // Don't ack — advance past retry interval
-        tokio::time::sleep(STATUS_RETRY_INTERVAL + Duration::from_secs(1)).await;
-
-        // Should receive a retry with the same update_id
-        let msg = rx.recv().await.expect("channel open");
-        let retry = expect_status_update(msg);
-        assert_eq!(retry.update_id, update.update_id);
-        assert_eq!(retry.component_name, "dataset:orders");
-        assert_eq!(retry.status, 1); // Ready
-
-        cancel.cancel();
     }
 }
