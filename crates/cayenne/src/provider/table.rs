@@ -4271,6 +4271,64 @@ impl CayenneTableProvider {
         )))
     }
 
+    /// Delete rows by hash-probing key columns against a set of matched keys.
+    ///
+    /// Fast path for `MERGE INTO` on PositionBased tables. Bypasses filter
+    /// construction and the O(N) filter-per-file evaluation. Instead, scans
+    /// each file and performs O(1) `HashSet` lookups per row.
+    ///
+    /// Acquires the write lock to prevent concurrent writes/refreshes.
+    pub async fn delete_matched_rows_by_key_probe(
+        &self,
+        matched_keys: std::collections::HashSet<Vec<datafusion_common::ScalarValue>>,
+        key_columns: &[String],
+    ) -> datafusion_common::Result<u64> {
+        let _write_guard = self.write_lock.lock().await;
+
+        let ctx = datafusion::execution::context::SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            Arc::clone(self.context.runtime_env()),
+        );
+
+        let listing_table = {
+            let guard = self.listing_table.read().map_err(|_| {
+                datafusion_common::DataFusionError::Internal(format!(
+                    "Failed to read listing table lock for '{}'",
+                    self.table_metadata.table_name
+                ))
+            })?;
+            Arc::clone(&guard)
+        };
+
+        // PositionBased tables have no protected snapshots (table.rs:3373-3375),
+        // so we only scan the main listing table.
+        let all_tables = vec![listing_table];
+
+        // Build the deletion sink with write_lock=None (we already hold it).
+        let sink = CayenneDeletionSink::new(
+            self.table_metadata.clone(),
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.listing_table),
+            Arc::clone(&self.table_metadata.schema),
+            &[], // no filters — positions are resolved by key probe
+            self.pk_deletion_strategy.clone(),
+            self.pk_row_converter.as_ref().map(Arc::clone),
+            self.pk_column_indices.clone(),
+            Vec::new(), // no protected snapshots for PositionBased
+            Arc::clone(self.context.runtime_env()),
+            None, // write lock already held above
+        );
+
+        sink.delete_by_key_hash_probe(&ctx, &all_tables, matched_keys, key_columns)
+            .await
+            .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))
+    }
+
+    /// Returns `true` if this table uses the `PositionBased` deletion strategy.
+    pub fn is_position_based(&self) -> bool {
+        self.pk_deletion_strategy.is_position_based()
+    }
+
     /// Build listing tables for all protected snapshots.
     ///
     /// Returns a vec of `(snapshot_id, listing_table)` pairs.
