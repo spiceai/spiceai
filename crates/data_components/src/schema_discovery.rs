@@ -154,10 +154,18 @@ pub async fn discover_schema(
 
     // 4. metadata_probe failed, direct_probe succeeds → warn + use direct
     if let SchemaProbeResult::Ok(schema) = direct_result {
+        let reason = match &metadata_result {
+            SchemaProbeResult::AccessDenied(msg) => {
+                format!("metadata schema probe access denied: {msg}")
+            }
+            SchemaProbeResult::Failed(err) => {
+                format!("metadata schema probe failed: {err}")
+            }
+            SchemaProbeResult::Ok(_) => unreachable!("handled above"),
+        };
         warnings.push(SchemaDiscoveryWarning::MetadataFallback {
-            reason: "information_schema query failed".to_string(),
-            nuance: "Falling back to the direct schema probe. Column nullability will default to nullable."
-                .to_string(),
+            reason,
+            nuance: "Falling back to the direct schema probe.".to_string(),
         });
         return Ok(SchemaDiscoveryResult { schema, warnings });
     }
