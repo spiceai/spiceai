@@ -4108,6 +4108,62 @@ mod tests {
         assert_eq!(count, 2, "Should have counted exactly 2 rows for 2 shows");
     }
 
+    /// Integration test: Open Library search API with query-parameter pagination.
+    /// Uses `pagination_query_params` with `offset={offset}&limit={limit}` to
+    /// paginate through search results, and `pagination_data_pointer` to extract
+    /// the `docs` array from each page.
+    #[tokio::test]
+    async fn test_integration_openlibrary_query_param_pagination() {
+        use datafusion::prelude::SessionContext;
+
+        let url = Url::parse("https://openlibrary.org/search.json?q=tolkien").expect("valid URL");
+        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+            .with_pagination(PaginationConfig {
+                query_params: Some("offset={offset}&limit={limit}".to_string()),
+                page_size: Some(3),
+                data_pointer: Some("/docs".to_string()),
+                max_pages: 2,
+                use_link_header: false,
+                ..Default::default()
+            })
+            .expect("pagination config");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("books", Arc::new(provider))
+            .expect("register table");
+
+        let df = ctx
+            .sql("SELECT content FROM books")
+            .await
+            .expect("query should succeed");
+
+        let results = df.collect().await.expect("collect should succeed");
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+
+        // With page_size=3 and max_pages=2, we expect up to 6 rows.
+        // If the last page has fewer than 3 rows, we get fewer.
+        assert!(
+            total_rows >= 4,
+            "Should have fetched multiple pages of results, got {total_rows}"
+        );
+        assert!(
+            total_rows <= 6,
+            "Should not exceed 2 pages * 3 items = 6 rows, got {total_rows}"
+        );
+
+        // Verify content looks like book records
+        let content_col = results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("content should be string array");
+        let first_row = content_col.value(0);
+        assert!(
+            first_row.contains("title"),
+            "Book records should contain a title field: {first_row}"
+        );
+    }
+
     // --- Pagination tests ---
 
     #[test]
