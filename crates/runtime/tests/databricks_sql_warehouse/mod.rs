@@ -66,6 +66,10 @@ fn get_params() -> Params {
 /// Test querying a MANAGED table through the SQL Warehouse connector.
 /// MANAGED tables are the default UC table type backed by Delta storage.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
 async fn databricks_sql_warehouse_managed_table_test() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -124,6 +128,10 @@ async fn databricks_sql_warehouse_managed_table_test() -> Result<(), anyhow::Err
 
 /// Test schema inference for a dataset loaded via SQL Warehouse.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
 async fn databricks_sql_warehouse_schema_inference_test() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -182,6 +190,10 @@ async fn databricks_sql_warehouse_schema_inference_test() -> Result<(), anyhow::
 
 /// Test that a dataset registered via SQL Warehouse appears in `information_schema.tables`.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
 async fn databricks_sql_warehouse_dataset_registration_test() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -240,6 +252,10 @@ async fn databricks_sql_warehouse_dataset_registration_test() -> Result<(), anyh
 /// Test querying an EXTERNAL table through the SQL Warehouse connector.
 /// EXTERNAL tables are UC tables backed by external storage locations.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
 async fn databricks_sql_warehouse_external_table_test() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -299,6 +315,10 @@ async fn databricks_sql_warehouse_external_table_test() -> Result<(), anyhow::Er
 /// SQL Warehouse connector. FOREIGN tables skip strict UC permission
 /// prechecks because Databricks validates access at query time.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
 async fn databricks_sql_warehouse_foreign_table_test() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
@@ -357,6 +377,10 @@ async fn databricks_sql_warehouse_foreign_table_test() -> Result<(), anyhow::Err
 /// Test querying a `MATERIALIZED_VIEW` through the SQL Warehouse connector.
 /// Materialized views are pre-computed result sets maintained by Databricks.
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
 async fn databricks_sql_warehouse_materialized_view_test() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
