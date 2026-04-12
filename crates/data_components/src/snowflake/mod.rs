@@ -89,7 +89,7 @@ async fn probe_snowflake_information_schema(
             match parse_information_schema_json(&resp.value, &table_reference.to_string()) {
                 Ok(schema) => SchemaProbeResult::Ok(schema),
                 Err(e) if is_snowflake_access_denied(&e) => {
-                    SchemaProbeResult::AccessDenied(e.clone())
+                    SchemaProbeResult::AccessDenied(e)
                 }
                 Err(e) => SchemaProbeResult::Failed(e.into()),
             }
