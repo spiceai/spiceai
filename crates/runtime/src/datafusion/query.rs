@@ -1244,7 +1244,7 @@ pub fn write_to_json_string(
     data: &[RecordBatch],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     if data.iter().any(record_batch_has_union_columns) {
-        serde_json::to_string(&write_to_json_value(data)?).boxed()
+        serde_json::to_string(&write_union_batches_to_json_value(data)?).boxed()
     } else {
         String::from_utf8(write_to_json_bytes_with_arrow(data)?).boxed()
     }
@@ -1254,18 +1254,24 @@ pub fn write_to_json_value(
     data: &[RecordBatch],
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     if data.iter().any(record_batch_has_union_columns) {
-        let rows = data
-            .iter()
-            .map(record_batch_to_json_rows)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .map(Value::Object)
-            .collect();
-        Ok(Value::Array(rows))
+        write_union_batches_to_json_value(data)
     } else {
         write_to_json_value_with_arrow(data)
     }
+}
+
+fn write_union_batches_to_json_value(
+    data: &[RecordBatch],
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let rows = data
+        .iter()
+        .map(record_batch_to_json_rows)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .map(Value::Object)
+        .collect();
+    Ok(Value::Array(rows))
 }
 
 fn write_to_json_value_with_arrow(
