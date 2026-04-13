@@ -1,0 +1,10 @@
+---
+source: crates/runtime/tests/duckdb/mod.rs
+assertion_line: 491
+expression: pretty
+---
++----+
+| id |
++----+
+| 1  |
++----+

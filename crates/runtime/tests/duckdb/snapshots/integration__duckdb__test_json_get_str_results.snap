@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/duckdb/mod.rs
+expression: pretty
+---
++---------+
+| name    |
++---------+
+| alice   |
+| bob     |
+| charlie |
++---------+
