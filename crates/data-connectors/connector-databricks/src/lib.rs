@@ -633,15 +633,15 @@ impl Databricks {
                     "Unity Catalog table type is supported"
                 );
 
-                if !uc_table.requires_read_permission_validation() {
+                if uc_table.requires_read_permission_validation() {
+                    true
+                } else {
                     tracing::debug!(
                         table = %full_name,
                         table_type = %uc_table.table_type,
                         "Skipping strict Unity Catalog permission precheck for foreign table; Databricks validates access at query time"
                     );
                     false
-                } else {
-                    true
                 }
             }
             Ok(None) => {
