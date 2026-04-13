@@ -88,7 +88,7 @@ type DeletedRowKeysMap = HashMap<Box<[u8]>, i64>;
 /// `ColumnStats` entries for metastore persistence.
 #[derive(Debug)]
 pub(crate) struct ColumnStatsAccumulator {
-    /// Per-column accumulated state: (min_string, max_string, null_count, row_count)
+    /// Per-column accumulated state: (`min_value`, `max_value`, `null_count`, `row_count`)
     columns: std::sync::Mutex<Vec<PerColumnAcc>>,
     /// Column names from the schema
     column_names: Vec<String>,
@@ -115,12 +115,9 @@ impl ColumnStatsAccumulator {
 
     /// Update accumulated stats from a `RecordBatch`.
     pub(crate) fn update(&self, batch: &RecordBatch) {
-        let mut cols = match self.columns.lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                tracing::warn!("ColumnStatsAccumulator: mutex poisoned in update(), skipping");
-                return;
-            }
+        let Ok(mut cols) = self.columns.lock() else {
+            tracing::warn!("ColumnStatsAccumulator: mutex poisoned in update(), skipping");
+            return;
         };
 
         for (i, col) in batch.columns().iter().enumerate() {
@@ -136,8 +133,8 @@ impl ColumnStatsAccumulator {
                 continue;
             }
 
-            // O(n) linear scan to find min/max using ScalarValue comparison.
-            // Skips NaN values (partial_cmp returns None) to keep stats deterministic.
+            // O(n) linear scan to find min/max using `ScalarValue` comparison.
+            // Skips NaN values (`partial_cmp` returns `None`) to keep stats deterministic.
             let mut batch_min: Option<datafusion_common::ScalarValue> = None;
             let mut batch_max: Option<datafusion_common::ScalarValue> = None;
 
@@ -145,46 +142,56 @@ impl ColumnStatsAccumulator {
                 if col.is_null(row_idx) {
                     continue;
                 }
-                let value =
-                    match datafusion_common::ScalarValue::try_from_array(col.as_ref(), row_idx) {
-                        Ok(v) => v,
-                        Err(_) => continue, // unsupported type for this row
-                    };
+                let Ok(value) =
+                    datafusion_common::ScalarValue::try_from_array(col.as_ref(), row_idx)
+                else {
+                    continue; // unsupported type for this row
+                };
 
                 batch_min = Some(match batch_min {
                     None => value.clone(),
-                    Some(existing) => match value.partial_cmp(&existing) {
-                        Some(std::cmp::Ordering::Less) => value.clone(),
-                        None => existing, // NaN — keep existing
-                        _ => existing,
-                    },
+                    Some(existing) => {
+                        if value.partial_cmp(&existing) == Some(std::cmp::Ordering::Less) {
+                            value.clone()
+                        } else {
+                            existing
+                        }
+                    }
                 });
                 batch_max = Some(match batch_max {
                     None => value,
-                    Some(existing) => match value.partial_cmp(&existing) {
-                        Some(std::cmp::Ordering::Greater) => value,
-                        None => existing, // NaN — keep existing
-                        _ => existing,
-                    },
+                    Some(existing) => {
+                        if value.partial_cmp(&existing) == Some(std::cmp::Ordering::Greater) {
+                            value
+                        } else {
+                            existing
+                        }
+                    }
                 });
             }
 
             if let Some(bmin) = batch_min {
                 acc.min_value = Some(match &acc.min_value {
                     None => bmin,
-                    Some(existing) => match bmin.partial_cmp(existing) {
-                        Some(std::cmp::Ordering::Less) => bmin,
-                        _ => existing.clone(),
-                    },
+                    Some(existing) => {
+                        if bmin.partial_cmp(existing) == Some(std::cmp::Ordering::Less) {
+                            bmin
+                        } else {
+                            existing.clone()
+                        }
+                    }
                 });
             }
             if let Some(bmax) = batch_max {
                 acc.max_value = Some(match &acc.max_value {
                     None => bmax,
-                    Some(existing) => match bmax.partial_cmp(existing) {
-                        Some(std::cmp::Ordering::Greater) => bmax,
-                        _ => existing.clone(),
-                    },
+                    Some(existing) => {
+                        if bmax.partial_cmp(existing) == Some(std::cmp::Ordering::Greater) {
+                            bmax
+                        } else {
+                            existing.clone()
+                        }
+                    }
                 });
             }
         }
@@ -192,14 +199,11 @@ impl ColumnStatsAccumulator {
 
     /// Convert accumulated stats to `ColumnStats` entries for persistence.
     pub(crate) fn to_column_stats(&self, table_id: &str) -> Vec<crate::metadata::ColumnStats> {
-        let cols = match self.columns.lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                tracing::warn!(
-                    "ColumnStatsAccumulator: mutex poisoned in to_column_stats(), returning empty"
-                );
-                return Vec::new();
-            }
+        let Ok(cols) = self.columns.lock() else {
+            tracing::warn!(
+                "ColumnStatsAccumulator: mutex poisoned in to_column_stats(), returning empty"
+            );
+            return Vec::new();
         };
 
         self.column_names
@@ -209,8 +213,8 @@ impl ColumnStatsAccumulator {
             .map(|(name, acc)| crate::metadata::ColumnStats {
                 table_id: table_id.to_string(),
                 column_name: name.clone(),
-                min_value: acc.min_value.as_ref().map(|v| v.to_string()),
-                max_value: acc.max_value.as_ref().map(|v| v.to_string()),
+                min_value: acc.min_value.as_ref().map(std::string::ToString::to_string),
+                max_value: acc.max_value.as_ref().map(std::string::ToString::to_string),
                 null_count: Some(acc.null_count),
                 row_count: Some(acc.row_count),
             })
@@ -3457,7 +3461,7 @@ impl CayenneTableProvider {
         let schema = Arc::clone(&self.table_metadata.schema);
         let mem_exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
             &[batches],
-            schema.clone(),
+            Arc::clone(&schema),
             None,
         )?;
 

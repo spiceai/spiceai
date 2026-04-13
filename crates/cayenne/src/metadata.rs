@@ -326,7 +326,7 @@ pub struct ColumnStats {
 
 /// Per-file, per-column statistics for scan pruning.
 ///
-/// Stores min/max/null_count/row_count for each column in each data file.
+/// Stores min/max/`null_count`/`row_count` for each column in each data file.
 /// Used for file-level scan pruning: files whose min/max ranges don't
 /// overlap with filter predicates can be skipped entirely.
 #[derive(Debug, Clone)]
