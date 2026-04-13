@@ -116,7 +116,7 @@ fn explain_to_string(batches: &[RecordBatch]) -> String {
 }
 
 /// Wrapper around [`insta::assert_snapshot!`] that redacts ephemeral
-/// `127.0.0.1:<port>` addresses in FlightSQL physical-plan output so that
+/// `127.0.0.1:<port>` addresses in `FlightSQL` physical-plan output so that
 /// snapshots are stable across runs.
 macro_rules! assert_explain_snapshot {
     ($name:expr, $plan:expr) => {{
@@ -203,7 +203,7 @@ async fn test_distributed_cayenne_ddl_lifecycle() -> Result<(), anyhow::Error> {
                     harness.wait_for_executors(Duration::from_secs(15)).await?;
                     ddl_lifecycle_create_table(harness).await?;
                     ddl_lifecycle_insert(harness).await?;
-                    // ddl_lifecycle_update_row(harness).await?;
+                    ddl_lifecycle_update_row(harness).await?;
                     ddl_lifecycle_bulk_update(harness).await?;
                     ddl_lifecycle_update_null(harness).await?;
                     ddl_lifecycle_delete_single(harness).await?;
