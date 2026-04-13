@@ -82,21 +82,17 @@ When registering a dataset, the connector discovers the table schema by running 
 1. **Metadata probe** — Queries `information_schema.columns` for column names, data types, and nullability. This is the preferred source because it reports explicit `IS_NULLABLE` values.
 2. **Direct probe** — Runs `DESCRIBE TABLE` for column names and data types. Nullability defaults to `true` (nullable) because `DESCRIBE TABLE` does not report it.
 
-An optional third probe runs in parallel when a Unity Catalog client is available:
+The schema probe results are evaluated using a deterministic decision matrix:
 
-3. **Permissions probe** — Calls the UC Effective Permissions API to check whether the principal has a read-compatible privilege.
+| Metadata Probe      | Direct Probe | Outcome                                                  |
+| ------------------- | ------------ | -------------------------------------------------------- |
+| OK                  | OK           | Use metadata schema (preferred — has nullability)        |
+| OK                  | AccessDenied | **Permanent error** — table cannot be queried at runtime |
+| AccessDenied/Failed | OK           | **Warning** + use direct schema (fallback)               |
+| AccessDenied        | AccessDenied | **Permanent error**                                      |
+| Failed              | Failed       | Propagate error                                          |
 
-The results are evaluated using a deterministic decision matrix:
-
-| Metadata Probe      | Direct Probe | Permissions | Outcome                                                  |
-| ------------------- | ------------ | ----------- | -------------------------------------------------------- |
-| OK                  | OK           | Allowed     | Use metadata schema (preferred — has nullability)        |
-| OK                  | AccessDenied | *           | **Permanent error** — table cannot be queried at runtime |
-| AccessDenied/Failed | OK           | Allowed     | **Warning** + use direct schema (fallback)               |
-| AccessDenied        | AccessDenied | *           | **Permanent error**                                      |
-| Failed              | Failed       | *           | Propagate error                                          |
-| *                   | *            | Denied      | **Permanent error** (permissions override)               |
-| *                   | *            | Unavailable | Warning + proceed with probe results                     |
+When a Unity Catalog client is available, read access is validated separately by the `validate_uc_table` pre-check **before** schema discovery runs. Explicit UC permission denials block dataset initialization (preventing thundering herd requests to the SQL Warehouse). Ambiguous results (API unreachable, table not found) are advisory — Databricks query-time validation is the fallback.
 
 Key design decisions:
 
