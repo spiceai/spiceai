@@ -94,7 +94,7 @@ jobs:
             const includeLinuxArm = isTaggedRelease || isReleaseBranch || isManualDispatch;
 
             // Tagged releases use GitHub hosted runners, release branches use spicehq-dev-large-runners, others use spicehq-dev-runners
-            const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos";
+            const macosRunner = isTaggedRelease ? "macos-latest-xlarge" : "spiceai-macos";
             let linuxRunner;
             if (isTaggedRelease) {
               linuxRunner = "ubuntu-22.04-16core";
