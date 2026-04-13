@@ -254,8 +254,8 @@ impl CayenneDataSink {
             && !has_sort_columns
             && !self.table.has_retention_filters();
         if can_inline {
-            // Collect the stream incrementally, checking row count to avoid buffering
-            // arbitrarily large data when it exceeds the inline threshold.
+            // Collect the stream incrementally. Stop as soon as the inline
+            // threshold is exceeded so we don't buffer the entire large insert.
             let schema = prepared_stream.schema();
             let mut batches = Vec::new();
             let mut total_rows = 0usize;
@@ -265,20 +265,12 @@ impl CayenneDataSink {
                 total_rows += batch.num_rows();
                 batches.push(batch);
                 if total_rows > super::table::INLINE_MAX_ROWS {
-                    // Exceeded inline threshold — drain remaining stream and use Vortex path
-                    while let Some(b) = futures::StreamExt::next(&mut prepared_stream).await {
-                        batches.push(b?);
-                    }
                     exceeded = true;
                     break;
                 }
             }
-            let total_rows_in_batches: usize = batches
-                .iter()
-                .map(arrow::record_batch::RecordBatch::num_rows)
-                .sum();
 
-            if !exceeded && total_rows_in_batches > 0 {
+            if !exceeded && total_rows > 0 {
                 // Concatenate into a single batch for efficient storage
                 let single_batch = arrow::compute::concat_batches(&schema, &batches)?;
 
@@ -313,22 +305,34 @@ impl CayenneDataSink {
                         );
                     }
 
-                    return Ok(u64::try_from(total_rows_in_batches).unwrap_or(u64::MAX));
+                    return Ok(u64::try_from(total_rows).unwrap_or(u64::MAX));
                 }
                 // Fell through — batch was too large after IPC serialization.
-                // Re-stream for normal write.
             }
 
-            // Re-create a stream from collected batches for the normal write path
-            let mem_exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+            // Exceeded threshold or IPC too large. Chain the already-read batches
+            // with the remaining stream so nothing is lost or fully buffered.
+            let remaining_stream = prepared_stream;
+            let buffered_exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
                 &[batches],
-                schema,
+                Arc::clone(&schema),
                 None,
             )?;
             let ctx = datafusion::prelude::SessionContext::new();
-            let re_stream = datafusion_physical_plan::execute_stream(mem_exec, ctx.task_ctx())?;
+            let buffered_stream =
+                datafusion_physical_plan::execute_stream(buffered_exec, ctx.task_ctx())?;
 
-            // Continue with the normal write path using the re-created stream
+            // Chain: yield buffered batches first, then the remaining un-read stream
+            let chained_stream =
+                Box::pin(futures::StreamExt::chain(buffered_stream, remaining_stream));
+            let re_stream: datafusion_physical_plan::SendableRecordBatchStream = Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    schema,
+                    chained_stream,
+                ),
+            );
+
+            // Continue with the normal write path (staging dir already cleared above)
             let target_size_bytes = self.context.target_file_size_bytes();
 
             let (rows, _writer_ops, stats_acc) = match self
@@ -387,10 +391,8 @@ impl CayenneDataSink {
             // stream errors, which would advance the watermark past lost data.
             let target_size_bytes = self.context.target_file_size_bytes();
 
-            // Step 1: Clear staging dir (removes leftovers from previous crash)
-            self.table.clear_staging_dir().await?;
-
-            // Step 2: Write to _staging/ directory
+            // Staging dir already cleared at the top of write_all_append.
+            // Write to _staging/ directory
             let (rows, writer_ops, stats_acc) = match self
                 .table
                 .write_to_snapshot(prepared_stream, target_size_bytes, STAGING_DIR_NAME)

@@ -199,8 +199,11 @@ async fn test_inlined_data_visible_in_scan(
 
     assert_eq!(total_rows, 3, "Expected 3 rows from inlined data scan");
 
-    // Verify actual values
-    let id_col = results[0]
+    // Concatenate all result batches to avoid flaky assertions when the planner
+    // splits results across multiple RecordBatches.
+    let combined =
+        arrow::compute::concat_batches(&results[0].schema(), &results).expect("concat batches");
+    let id_col = combined
         .column(0)
         .as_any()
         .downcast_ref::<Int64Array>()

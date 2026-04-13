@@ -136,72 +136,55 @@ impl ColumnStatsAccumulator {
                 continue;
             }
 
-            // Find the index of the min value using sort_to_indices
-            let batch_min = arrow::compute::sort_to_indices(
-                col.as_ref(),
-                Some(arrow::compute::SortOptions {
-                    descending: false,
-                    nulls_first: false,
-                }),
-                Some(1),
-            )
-            .ok()
-            .and_then(|indices| {
-                if indices.is_empty() {
-                    None
-                } else {
-                    datafusion_common::ScalarValue::try_from_array(
-                        col.as_ref(),
-                        indices.value(0) as usize,
-                    )
-                    .ok()
-                }
-            });
+            // O(n) linear scan to find min/max using ScalarValue comparison.
+            // Skips NaN values (partial_cmp returns None) to keep stats deterministic.
+            let mut batch_min: Option<datafusion_common::ScalarValue> = None;
+            let mut batch_max: Option<datafusion_common::ScalarValue> = None;
 
-            // Find the index of the max value using sort_to_indices
-            let batch_max = arrow::compute::sort_to_indices(
-                col.as_ref(),
-                Some(arrow::compute::SortOptions {
-                    descending: true,
-                    nulls_first: false,
-                }),
-                Some(1),
-            )
-            .ok()
-            .and_then(|indices| {
-                if indices.is_empty() {
-                    None
-                } else {
-                    datafusion_common::ScalarValue::try_from_array(
-                        col.as_ref(),
-                        indices.value(0) as usize,
-                    )
-                    .ok()
+            for row_idx in 0..col.len() {
+                if col.is_null(row_idx) {
+                    continue;
                 }
-            });
+                let value =
+                    match datafusion_common::ScalarValue::try_from_array(col.as_ref(), row_idx) {
+                        Ok(v) => v,
+                        Err(_) => continue, // unsupported type for this row
+                    };
+
+                batch_min = Some(match batch_min {
+                    None => value.clone(),
+                    Some(existing) => match value.partial_cmp(&existing) {
+                        Some(std::cmp::Ordering::Less) => value.clone(),
+                        None => existing, // NaN — keep existing
+                        _ => existing,
+                    },
+                });
+                batch_max = Some(match batch_max {
+                    None => value,
+                    Some(existing) => match value.partial_cmp(&existing) {
+                        Some(std::cmp::Ordering::Greater) => value,
+                        None => existing, // NaN — keep existing
+                        _ => existing,
+                    },
+                });
+            }
 
             if let Some(bmin) = batch_min {
                 acc.min_value = Some(match &acc.min_value {
                     None => bmin,
-                    Some(existing) => {
-                        if bmin.partial_cmp(existing) == Some(std::cmp::Ordering::Less) {
-                            bmin
-                        } else {
-                            existing.clone()
-                        }
-                    }
+                    Some(existing) => match bmin.partial_cmp(existing) {
+                        Some(std::cmp::Ordering::Less) => bmin,
+                        _ => existing.clone(),
+                    },
                 });
             }
             if let Some(bmax) = batch_max {
                 acc.max_value = Some(match &acc.max_value {
                     None => bmax,
-                    Some(existing) => {
-                        if bmax.partial_cmp(existing) == Some(std::cmp::Ordering::Greater) {
-                            bmax
-                        } else {
-                            existing.clone()
-                        }
-                    }
+                    Some(existing) => match bmax.partial_cmp(existing) {
+                        Some(std::cmp::Ordering::Greater) => bmax,
+                        _ => existing.clone(),
+                    },
                 });
             }
         }
