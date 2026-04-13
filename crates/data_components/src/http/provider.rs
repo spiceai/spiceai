@@ -1840,7 +1840,7 @@ fn extract_next_page_info(
                     }
                     return PaginationSnafu {
                         message: format!(
-                            "Failed to extract pagination value from JSON pointer '{pointer}': numeric values require 'token_param' to be configured"
+                            "Failed to extract pagination value from JSON pointer '{pointer}': numeric values require 'pagination_token_param' to be configured"
                         ),
                     }
                     .fail();
