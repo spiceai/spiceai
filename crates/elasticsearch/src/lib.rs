@@ -25,6 +25,7 @@ use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use std::collections::HashMap;
+use std::time::Duration;
 use url::Url;
 
 // ── Error ──────────────────────────────────────────────────────────────────
@@ -42,6 +43,9 @@ pub enum Error {
 
     #[snafu(display("Invalid URL: {source}"))]
     InvalidUrl { source: url::ParseError },
+
+    #[snafu(display("Failed to serialize JSON: {source}"))]
+    JsonSerialize { source: serde_json::Error },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -132,7 +136,8 @@ pub struct Hit {
 #[derive(Debug, Clone)]
 pub struct Client {
     http: reqwest::Client,
-    base_url: Url,
+    /// Base URL as a string, without trailing slash (e.g. `http://localhost:9200`).
+    base_url: String,
     username: Option<String>,
     password: Option<String>,
 }
@@ -142,23 +147,23 @@ impl Client {
     ///
     /// Optional basic-auth credentials are applied to every request.
     pub fn new(base_url: &str, username: Option<&str>, password: Option<&str>) -> Result<Self> {
-        let mut url: Url = base_url.parse().context(InvalidUrlSnafu)?;
-
-        // Strip trailing slash for clean path joining.
-        let path = url.path().trim_end_matches('/').to_string();
-        url.set_path(&path);
+        // Validate the URL.
+        let _: Url = base_url.parse().context(InvalidUrlSnafu)?;
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         let http = reqwest::Client::builder()
             .default_headers(headers)
+            .user_agent(concat!("spiceai/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()
             .context(HttpRequestSnafu)?;
 
         Ok(Self {
             http,
-            base_url: url,
+            base_url: base_url.trim_end_matches('/').to_string(),
             username: username.map(ToString::to_string),
             password: password.map(ToString::to_string),
         })
@@ -183,7 +188,7 @@ impl Client {
             .send()
             .await
             .context(HttpRequestSnafu)?;
-        check_status(&resp)?;
+        let resp = check_status(resp).await?;
         resp.json().await.context(JsonParseSnafu)
     }
 
@@ -198,7 +203,7 @@ impl Client {
             .send()
             .await
             .context(HttpRequestSnafu)?;
-        check_status(&resp)?;
+        let resp = check_status(resp).await?;
         resp.json().await.context(JsonParseSnafu)
     }
 
@@ -215,7 +220,7 @@ impl Client {
             .send()
             .await
             .context(HttpRequestSnafu)?;
-        check_status(&resp)?;
+        let resp = check_status(resp).await?;
         resp.json().await.context(JsonParseSnafu)
     }
 
@@ -235,7 +240,7 @@ impl Client {
             .send()
             .await
             .context(HttpRequestSnafu)?;
-        check_status(&resp)?;
+        let resp = check_status(resp).await?;
         resp.json().await.context(JsonParseSnafu)
     }
 
@@ -253,9 +258,9 @@ impl Client {
             } else {
                 serde_json::json!({"index": {"_index": index}})
             };
-            ndjson.push_str(&serde_json::to_string(&action).unwrap_or_default());
+            ndjson.push_str(&serde_json::to_string(&action).context(JsonSerializeSnafu)?);
             ndjson.push('\n');
-            ndjson.push_str(&serde_json::to_string(doc).unwrap_or_default());
+            ndjson.push_str(&serde_json::to_string(doc).context(JsonSerializeSnafu)?);
             ndjson.push('\n');
         }
 
@@ -266,18 +271,20 @@ impl Client {
             .send()
             .await
             .context(HttpRequestSnafu)?;
-        check_status(&resp)?;
+        let resp = check_status(resp).await?;
         resp.json().await.context(JsonParseSnafu)
     }
 }
 
-fn check_status(resp: &reqwest::Response) -> Result<()> {
+async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
     if resp.status().is_client_error() || resp.status().is_server_error() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
         return Err(Error::ElasticsearchError {
-            message: format!("HTTP {}", resp.status()),
+            message: format!("HTTP {status}: {body}"),
         });
     }
-    Ok(())
+    Ok(resp)
 }
 
 // ── Helpers for building common queries ────────────────────────────────────

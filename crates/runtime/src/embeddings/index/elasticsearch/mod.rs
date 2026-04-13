@@ -21,12 +21,11 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow_schema::SchemaRef;
+use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use datafusion_expr::Expr;
 use elasticsearch::{Client, Elasticsearch};
+use search::generation::util::get_primary_keys;
 use search::index::elasticsearch::ElasticsearchIndex;
-use secrecy::ExposeSecret;
 use spicepod::{
     param::Params,
     semantic::{Column, ColumnLevelEmbeddingConfig},
@@ -39,7 +38,6 @@ use crate::{
     parameters::{ParameterSpec, Parameters},
 };
 use runtime_secrets::{Secrets, get_params_with_secrets};
-use search::generation::util::get_primary_keys;
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("endpoint")
@@ -64,15 +62,16 @@ pub async fn try_from_table(
     column: String,
     config: ColumnLevelEmbeddingConfig,
     vector_store_config: &VectorStore,
-    inner_schema: SchemaRef,
+    inner_table_provider: &Arc<dyn TableProvider>,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     dataset_columns: Vec<Column>,
     secrets: Arc<RwLock<Secrets>>,
 ) -> Result<ElasticsearchIndex, Box<dyn std::error::Error + Send + Sync>> {
-    let primary_keys: Vec<String> = config.row_ids.clone().unwrap_or_else(|| {
-        // We can't call get_primary_keys here without a table provider, so fall back to empty.
-        vec![]
-    });
+    let inner_schema = inner_table_provider.schema();
+    let primary_keys: Vec<String> = config
+        .row_ids
+        .clone()
+        .unwrap_or_else(|| get_primary_keys(inner_table_provider).unwrap_or_default());
 
     let primary_key: Vec<_> = primary_keys
         .iter()
@@ -98,13 +97,13 @@ pub async fn try_from_table(
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
     );
 
-    let es_index = string_from_params(&params, "index")
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("{}-{}-{}", ds_name, column, config.model).replace('_', "-"));
+    let es_index = string_from_params(&params, "index").map_or_else(
+        || format!("{}-{}-{}", ds_name, column, config.model).replace('_', "-"),
+        ToString::to_string,
+    );
 
     let vector_field = string_from_params(&params, "vector_field")
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("{column}_embedding"));
+        .map_or_else(|| format!("{column}_embedding"), ToString::to_string);
 
     // Determine text fields for full-text search from the dataset columns.
     let text_fields: Vec<String> = dataset_columns

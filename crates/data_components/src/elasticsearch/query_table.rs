@@ -217,7 +217,6 @@ pub fn hits_to_record_batch(
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
-#[expect(clippy::cast_possible_truncation)]
 fn build_array_from_hits(
     hits: &[elasticsearch::Hit],
     field_name: &str,
@@ -243,7 +242,9 @@ fn build_array_from_hits(
             let values: Vec<Option<i32>> = hits
                 .iter()
                 .map(|h| {
-                    extract_field(&h.source, field_name).and_then(|v| v.as_i64().map(|n| n as i32))
+                    extract_field(&h.source, field_name)
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|n| i32::try_from(n).ok())
                 })
                 .collect();
             Ok(Arc::new(Int32Array::from(values)) as ArrayRef)
@@ -252,7 +253,9 @@ fn build_array_from_hits(
             let values: Vec<Option<i16>> = hits
                 .iter()
                 .map(|h| {
-                    extract_field(&h.source, field_name).and_then(|v| v.as_i64().map(|n| n as i16))
+                    extract_field(&h.source, field_name)
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|n| i16::try_from(n).ok())
                 })
                 .collect();
             Ok(Arc::new(Int16Array::from(values)) as ArrayRef)
@@ -261,7 +264,9 @@ fn build_array_from_hits(
             let values: Vec<Option<i8>> = hits
                 .iter()
                 .map(|h| {
-                    extract_field(&h.source, field_name).and_then(|v| v.as_i64().map(|n| n as i8))
+                    extract_field(&h.source, field_name)
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|n| i8::try_from(n).ok())
                 })
                 .collect();
             Ok(Arc::new(Int8Array::from(values)) as ArrayRef)
@@ -274,6 +279,7 @@ fn build_array_from_hits(
             Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
         }
         DataType::Float32 => {
+            #[expect(clippy::cast_possible_truncation)]
             let values: Vec<Option<f32>> = hits
                 .iter()
                 .map(|h| {

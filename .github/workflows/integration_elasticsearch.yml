@@ -1,0 +1,79 @@
+---
+name: integration tests (elasticsearch)
+
+on:
+  push:
+    branches:
+      - trunk
+    paths:
+      - 'crates/elasticsearch/**'
+      - 'crates/data_components/src/elasticsearch/**'
+      - 'crates/data-connectors/connector-elasticsearch/**'
+      - 'crates/search/src/index/elasticsearch/**'
+      - 'crates/runtime/src/embeddings/index/elasticsearch/**'
+  pull_request:
+    paths:
+      - 'crates/elasticsearch/**'
+      - 'crates/data_components/src/elasticsearch/**'
+      - 'crates/data-connectors/connector-elasticsearch/**'
+      - 'crates/search/src/index/elasticsearch/**'
+      - 'crates/runtime/src/embeddings/index/elasticsearch/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_NET_RETRY: 10
+  CARGO_HTTP_TIMEOUT: 60
+
+jobs:
+  test-elasticsearch:
+    name: Elasticsearch Integration Tests
+    runs-on: spiceai-dev-runners
+
+    services:
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: 'false'
+          ES_JAVA_OPTS: -Xms512m -Xmx512m
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\\|yellow\"'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 30
+
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Set up make
+        uses: ./.github/actions/setup-make
+
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
+      - name: Run elasticsearch client tests
+        env:
+          ELASTICSEARCH_URL: http://localhost:9200
+        run: |
+          RUSTC_WRAPPER="" cargo test -p elasticsearch --test integration_test -- --nocapture
+
+      - name: Run elasticsearch data_components tests
+        env:
+          ELASTICSEARCH_URL: http://localhost:9200
+        run: |
+          RUSTC_WRAPPER="" cargo test -p data_components --features elasticsearch --test elasticsearch_test -- --nocapture

@@ -343,7 +343,7 @@ async fn wrap_table_as_index_elasticsearch(
             column,
             config,
             vector_store,
-            inner_table_provider.schema(),
+            &inner_table_provider,
             Arc::clone(embedding_models),
             columns.to_vec(),
             Arc::clone(secrets),

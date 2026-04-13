@@ -38,8 +38,26 @@ use runtime_datafusion_index::Index;
 use crate::SEARCH_SCORE_COLUMN_NAME;
 use crate::index::{SearchIndex, VectorIndex, embedding_col};
 use data_components::elasticsearch::search_table::{
-    ElasticsearchKnnTable, ElasticsearchTextSearchTable,
+    ElasticsearchKnnTable, ElasticsearchTextSearchTable, QueryEmbedder,
 };
+
+/// Adapter that implements [`QueryEmbedder`] using an [`Embed`] model.
+#[derive(Debug)]
+struct EmbedQueryAdapter(Arc<dyn Embed>);
+
+#[async_trait]
+impl QueryEmbedder for EmbedQueryAdapter {
+    async fn embed_query(&self, query: &str) -> Result<Vec<f32>, DataFusionError> {
+        let mut vectors = self
+            .0
+            .embed(llms::embeddings::EmbeddingInput::String(query.to_string()))
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        vectors.pop().ok_or_else(|| {
+            DataFusionError::Execution("No embedding vector computed for query".to_string())
+        })
+    }
+}
 
 /// Elasticsearch-backed vector search index.
 ///
@@ -96,21 +114,17 @@ impl SearchIndex for ElasticsearchIndex {
     }
 
     fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
-        // Compute query embedding synchronously is not possible here since this is a sync method.
-        // Instead, we defer the embedding computation to the execution plan.
-        // We use a placeholder empty vector that will be filled at execution time.
-        //
-        // To handle this properly, we create a kNN table provider that accepts a text query
-        // and computes the embedding internally during execution.
         let schema = self.query_result_schema();
         let table: Arc<dyn TableProvider> = Arc::new(ElasticsearchKnnTable {
             client: Arc::clone(&self.client),
             index: self.es_index.clone(),
             vector_field: self.vector_field.clone(),
-            query_vector: vec![], // Placeholder - see note above
+            query_vector: vec![],
             k: 10,
             schema: Arc::clone(&schema),
             source_schema: Arc::clone(&self.source_schema),
+            query_text: Some(query.to_string()),
+            embedder: Some(Arc::new(EmbedQueryAdapter(Arc::clone(&self.compute_query)))),
         });
 
         Ok(

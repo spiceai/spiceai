@@ -45,11 +45,25 @@ pub static ES_SCORE_COLUMN_NAME: &str = "_score";
 /// The column name for the document `_id`.
 pub static ES_ID_COLUMN_NAME: &str = "_id";
 
+/// Trait for lazily computing query embedding vectors.
+///
+/// This allows the kNN table provider to be constructed in a sync context
+/// (e.g. `query_table_provider`) and defer the async embedding computation
+/// to execution time.
+#[async_trait]
+pub trait QueryEmbedder: std::fmt::Debug + Send + Sync {
+    async fn embed_query(&self, query: &str) -> Result<Vec<f32>, DataFusionError>;
+}
+
 // ── kNN Vector Search Table ────────────────────────────────────────────────
 
 /// A [`TableProvider`] that executes an Elasticsearch kNN vector search.
 ///
 /// Returns the primary key fields, embedding vector, and `_score` column.
+///
+/// Supports two modes:
+/// - Pre-computed vector: supply `query_vector` directly
+/// - Lazy embedding: supply `query_text` + `embedder` to compute at execution time
 #[derive(Debug)]
 pub struct ElasticsearchKnnTable {
     pub client: Arc<dyn Elasticsearch>,
@@ -61,6 +75,10 @@ pub struct ElasticsearchKnnTable {
     pub schema: SchemaRef,
     /// Schema of the full source document (for extracting fields from _source).
     pub source_schema: SchemaRef,
+    /// Query text for lazy embedding computation.
+    pub query_text: Option<String>,
+    /// Embedder for computing query vectors from text at execution time.
+    pub embedder: Option<Arc<dyn QueryEmbedder>>,
 }
 
 #[async_trait]
@@ -95,6 +113,8 @@ impl TableProvider for ElasticsearchKnnTable {
             source_schema: Arc::clone(&self.source_schema),
             projected_schema,
             projection: projection.cloned(),
+            query_text: self.query_text.clone(),
+            embedder: self.embedder.clone(),
             properties: PlanProperties::new(
                 EquivalenceProperties::new(project_schema(&self.schema, projection)?),
                 Partitioning::UnknownPartitioning(1),
@@ -116,6 +136,8 @@ struct ElasticsearchKnnExec {
     source_schema: SchemaRef,
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
+    query_text: Option<String>,
+    embedder: Option<Arc<dyn QueryEmbedder>>,
     properties: PlanProperties,
 }
 
@@ -167,8 +189,24 @@ impl ExecutionPlan for ElasticsearchKnnExec {
         let source_schema = Arc::clone(&self.source_schema);
         let projected_schema = Arc::clone(&self.projected_schema);
         let projection = self.projection.clone();
+        let query_text = self.query_text.clone();
+        let embedder = self.embedder.clone();
 
         let stream = futures::stream::once(async move {
+            // Compute the query vector: use embedder if available, otherwise use pre-set vector.
+            let query_vector = if let (Some(embedder), Some(query_text)) = (&embedder, &query_text)
+            {
+                embedder.embed_query(query_text).await?
+            } else {
+                query_vector
+            };
+
+            if query_vector.is_empty() {
+                return Err(DataFusionError::Execution(
+                    "Elasticsearch kNN search requires a non-empty query vector".to_string(),
+                ));
+            }
+
             let req = SearchRequest {
                 knn: Some(KnnQuery {
                     field: vector_field,
@@ -207,9 +245,11 @@ fn knn_hits_to_batch(
     output_schema: &SchemaRef,
     source_schema: &SchemaRef,
 ) -> Result<RecordBatch, DataFusionError> {
-    // Build columns from _source for non-score fields, and from hit metadata for _score/_id.
     let num_rows = hits.len();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+
+    // Build the source batch once for all _source-derived fields.
+    let source_batch = hits_to_record_batch(hits, source_schema)?;
 
     for field in output_schema.fields() {
         if field.name() == ES_SCORE_COLUMN_NAME {
@@ -218,15 +258,11 @@ fn knn_hits_to_batch(
         } else if field.name() == ES_ID_COLUMN_NAME {
             let ids: Vec<Option<&str>> = hits.iter().map(|h| Some(h.id.as_str())).collect();
             columns.push(Arc::new(StringArray::from(ids)) as ArrayRef);
+        } else if let Ok(col_idx) = source_batch.schema().index_of(field.name()) {
+            columns.push(Arc::clone(source_batch.column(col_idx)));
         } else {
-            // Extract from _source using the source_schema field definition.
-            let source_batch = hits_to_record_batch(hits, source_schema)?;
-            if let Ok(col_idx) = source_batch.schema().index_of(field.name()) {
-                columns.push(Arc::clone(source_batch.column(col_idx)));
-            } else {
-                // Field not in source; fill with nulls.
-                columns.push(arrow::array::new_null_array(field.data_type(), num_rows));
-            }
+            // Field not in source; fill with nulls.
+            columns.push(arrow::array::new_null_array(field.data_type(), num_rows));
         }
     }
 
