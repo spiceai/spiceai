@@ -140,6 +140,7 @@ fn try_bucket_assignment(
 /// Compiled once at first use; case-insensitive to handle `BUCKET(...)` and `bucket(...)`.
 static BUCKET_REGEX: OnceLock<Regex> = OnceLock::new();
 
+#[expect(clippy::expect_used, reason = "regex literal is always valid; OnceLock::get_or_init requires an infallible closure")]
 fn bucket_regex() -> &'static Regex {
     BUCKET_REGEX.get_or_init(|| {
         Regex::new(r"(?i)^\s*\(?\s*bucket\s*\(\s*(\d+)\s*,.*\)\s*\)?\s*$")
