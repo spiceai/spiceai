@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp)
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -22,7 +22,23 @@ expression: normalize_search_response(resp)
       }
     },
     {
-      "_score": "0.53",
+      "_score": "0.54",
+      "data": {
+        "reference_answer": "-16",
+        "source": "textbook_reasoning"
+      },
+      "dataset": "qs_view",
+      "matches": {
+        "answer": [
+          "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
+        ]
+      },
+      "primary_key": {
+        "id": 189
+      }
+    },
+    {
+      "_score": "0.54",
       "data": {
         "reference_answer": "2",
         "source": "textbook_reasoning"
@@ -39,22 +55,6 @@ expression: normalize_search_response(resp)
     },
     {
       "_score": "0.53",
-      "data": {
-        "reference_answer": "-16",
-        "source": "textbook_reasoning"
-      },
-      "dataset": "qs_view",
-      "matches": {
-        "answer": [
-          "\\[\n2 - 2(-3)^2 = 2 - 2(9) = 2 - 18 = \\boxed{-16}\n\\]"
-        ]
-      },
-      "primary_key": {
-        "id": 189
-      }
-    },
-    {
-      "_score": "0.52",
       "data": {
         "reference_answer": "2",
         "source": "textbook_reasoning"

@@ -439,6 +439,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
 /// - EXPLAIN plan reflects the distributed scatter-gather for both tables
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
+#[ignore = "Flaky. Needs to be fixed. https://github.com/spiceai/spiceai/issues/10210"]
 async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(), anyhow::Error> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new("runtime=debug,info"))

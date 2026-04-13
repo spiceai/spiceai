@@ -22,12 +22,14 @@ limitations under the License.
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
 use datafusion::sql::TableReference;
+use futures::stream::{self, StreamExt};
 use globset::GlobSet;
 use snafu::prelude::*;
 use snowflake_api::SnowflakeApi;
@@ -68,6 +70,9 @@ fn quote_sql_string_literal(value: &str) -> Result<String> {
 
     Ok(format!("'{}'", value.replace('\'', "''")))
 }
+
+/// Maximum number of concurrent Snowflake API requests during catalog discovery.
+const CATALOG_DISCOVERY_CONCURRENCY: usize = 10;
 
 /// A catalog provider for Snowflake that discovers schemas and tables
 /// by querying Snowflake's `INFORMATION_SCHEMA`.
@@ -115,19 +120,36 @@ impl SnowflakeCatalogProvider {
     /// into the cache only after discovery and table-provider creation succeeds for
     /// every discovered schema. This avoids exposing partially refreshed metadata.
     async fn refresh_schemas(&self) -> Result<()> {
+        let refresh_start = Instant::now();
         let schema_names = self.list_schemas().await?;
+        tracing::info!(database = %self.database, count = schema_names.len(), "Snowflake: discovered schemas, refreshing tables");
+
+        let results: Vec<(String, Result<Arc<SnowflakeSchemaProvider>>)> =
+            stream::iter(schema_names.into_iter().map(|schema_name| {
+                let api = Arc::clone(&self.api);
+                let database = self.database.clone();
+                let table_creator = Arc::clone(&self.table_creator);
+                let include = self.include.clone();
+                async move {
+                    let provider = SnowflakeSchemaProvider::new(
+                        api,
+                        database,
+                        schema_name.clone(),
+                        table_creator,
+                        include,
+                    );
+                    let result = provider.refresh_tables().await;
+                    (schema_name, result.map(|()| Arc::new(provider)))
+                }
+            }))
+            .buffer_unordered(CATALOG_DISCOVERY_CONCURRENCY)
+            .collect()
+            .await;
 
         let mut schemas = HashMap::new();
-        for schema_name in schema_names {
-            let schema_provider = SnowflakeSchemaProvider::new(
-                Arc::clone(&self.api),
-                self.database.clone(),
-                schema_name.clone(),
-                Arc::clone(&self.table_creator),
-                self.include.clone(),
-            );
-            schema_provider.refresh_tables().await?;
-            schemas.insert(schema_name, Arc::new(schema_provider));
+        for (schema_name, result) in results {
+            let provider = result?;
+            schemas.insert(schema_name, provider);
         }
 
         {
@@ -138,15 +160,19 @@ impl SnowflakeCatalogProvider {
             *guard = schemas;
         }
 
+        tracing::info!(duration_ms = refresh_start.elapsed().as_millis(), database = %self.database, "Snowflake: catalog refresh complete");
+
         Ok(())
     }
 
     /// Lists schema names in the configured database, excluding system schemas.
     async fn list_schemas(&self) -> Result<Vec<String>> {
+        let start = Instant::now();
         let quoted_db = quote_sql_identifier(&self.database)?;
         let query = format!(
             "SELECT SCHEMA_NAME FROM {quoted_db}.INFORMATION_SCHEMA.SCHEMATA ORDER BY SCHEMA_NAME"
         );
+        tracing::debug!(query = %query, "Snowflake: listing schemas");
 
         let result = self.api.exec(&query).await.context(QueryFailedSnafu)?;
 
@@ -172,6 +198,11 @@ impl SnowflakeCatalogProvider {
                         }
                     }
                 }
+                tracing::debug!(
+                    duration_ms = start.elapsed().as_millis(),
+                    count = names.len(),
+                    "Snowflake: listed schemas"
+                );
                 Ok(names)
             }
             snowflake_api::QueryResult::Json(_) => UnexpectedResponseSnafu {
@@ -260,29 +291,52 @@ impl SnowflakeSchemaProvider {
     }
 
     /// Discovers tables in this schema and creates table providers for each.
+    ///
+    /// Table providers are created concurrently (up to [`CATALOG_DISCOVERY_CONCURRENCY`]
+    /// at a time) to reduce overall latency when a schema contains many tables.
     async fn refresh_tables(&self) -> Result<()> {
+        let start = Instant::now();
         let table_names = self.list_tables().await?;
 
+        // Filter table names first, then create providers concurrently.
+        let filtered_tables: Vec<String> = table_names
+            .into_iter()
+            .filter(|table_name| {
+                let schema_with_table = format!("{}.{}", self.schema_name, table_name);
+                if let Some(include) = &self.include
+                    && !include.is_match(&schema_with_table)
+                {
+                    tracing::debug!("Table {schema_with_table} is not included, skipping");
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        tracing::debug!(database = %self.database, schema = %self.schema_name, count = filtered_tables.len(), "Snowflake: creating table providers concurrently");
+
         let mut tables = HashMap::new();
-        for table_name in table_names {
-            let schema_with_table = format!("{}.{}", self.schema_name, table_name);
-            if let Some(include) = &self.include
-                && !include.is_match(&schema_with_table)
-            {
-                tracing::debug!("Table {schema_with_table} is not included, skipping");
-                continue;
+        let mut stream = stream::iter(filtered_tables.into_iter().map(|table_name| {
+            let database = self.database.clone();
+            let schema_name = self.schema_name.clone();
+            let table_creator = Arc::clone(&self.table_creator);
+            async move {
+                // Quote each part with double quotes for Snowflake SQL, matching the
+                // pattern used by the Snowflake data connector.
+                let escaped_database = database.replace('"', "\"\"");
+                let escaped_schema = schema_name.replace('"', "\"\"");
+                let escaped_table = table_name.replace('"', "\"\"");
+                let quoted_path =
+                    format!("\"{escaped_database}\".\"{escaped_schema}\".\"{escaped_table}\"");
+                let table_ref: TableReference = quoted_path.into();
+                let result = table_creator.table_provider(table_ref).await;
+                (table_name, result)
             }
+        }))
+        .buffer_unordered(CATALOG_DISCOVERY_CONCURRENCY);
 
-            // Quote each part with double quotes for Snowflake SQL, matching the
-            // pattern used by the Snowflake data connector.
-            let escaped_database = self.database.replace('"', "\"\"");
-            let escaped_schema = self.schema_name.replace('"', "\"\"");
-            let escaped_table = table_name.replace('"', "\"\"");
-            let quoted_path =
-                format!("\"{escaped_database}\".\"{escaped_schema}\".\"{escaped_table}\"");
-            let table_ref: TableReference = quoted_path.clone().into();
-
-            match self.table_creator.table_provider(table_ref).await {
+        while let Some((table_name, result)) = stream.next().await {
+            match result {
                 Ok(provider) => {
                     tables.insert(table_name, provider);
                 }
@@ -292,12 +346,13 @@ impl SnowflakeSchemaProvider {
                         schema = %self.schema_name,
                         table = %table_name,
                         error = %e,
-                        "Failed to create table provider for Snowflake table {quoted_path}, skipping"
+                        "Failed to create table provider for Snowflake table, skipping"
                     );
                 }
             }
         }
 
+        let table_count = tables.len();
         {
             let mut guard = match self.tables.write() {
                 Ok(guard) => guard,
@@ -306,11 +361,14 @@ impl SnowflakeSchemaProvider {
             *guard = tables;
         }
 
+        tracing::debug!(duration_ms = start.elapsed().as_millis(), database = %self.database, schema = %self.schema_name, tables = table_count, "Snowflake: schema table refresh complete");
+
         Ok(())
     }
 
     /// Lists table names in this schema using `INFORMATION_SCHEMA`.
     async fn list_tables(&self) -> Result<Vec<String>> {
+        let start = Instant::now();
         // snowflake-api currently exposes only SQL-string execution APIs (`exec`, `exec_raw`,
         // `exec_streamed`) and does not expose bind-parameter APIs for metadata queries.
         // Build metadata SQL with explicit identifier/literal quoting and validation instead.
@@ -322,6 +380,7 @@ impl SnowflakeSchemaProvider {
              AND TABLE_TYPE IN ('BASE TABLE', 'VIEW') \
              ORDER BY TABLE_NAME"
         );
+        tracing::debug!(query = %query, "Snowflake: listing tables");
 
         let result = self.api.exec(&query).await.context(QueryFailedSnafu)?;
 
@@ -345,6 +404,7 @@ impl SnowflakeSchemaProvider {
                         names.push(value.to_string());
                     }
                 }
+                tracing::debug!(duration_ms = start.elapsed().as_millis(), schema = %self.schema_name, count = names.len(), "Snowflake: listed tables");
                 Ok(names)
             }
             snowflake_api::QueryResult::Json(_) => UnexpectedResponseSnafu {

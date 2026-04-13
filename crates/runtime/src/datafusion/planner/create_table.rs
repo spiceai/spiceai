@@ -33,32 +33,13 @@ use datafusion::sql::sqlparser::ast::{
 };
 
 use crate::datafusion::cayenne_ddl::is_cayenne_catalog;
-use crate::datafusion::cayenne_ddl::logical_nodes::CayenneCreateTableNode;
-use crate::datafusion::ddl::acceleration_options::{
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use datafusion_ddl::{
     CreateTableStatementExtension, SharedDdlExtensionStore, parse_ddl_table_options,
 };
-use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
-/// Returns `true` if the `CREATE TABLE` has extensions we need to intercept:
-/// recognized `WITH (...)` options (`acceleration.*`, `dataset.*`) or a
-/// `PARTITION BY` clause.
-pub(crate) fn has_ddl_extensions(ct: &CreateTable) -> bool {
-    if ct.partition_by.is_some() {
-        return true;
-    }
-
-    if let CreateTableOptions::With(options) = &ct.table_options {
-        return options.iter().any(|opt| {
-            if let SqlOption::KeyValue { key, .. } = opt {
-                key.value.starts_with("acceleration.") || key.value.starts_with("dataset.")
-            } else {
-                false
-            }
-        });
-    }
-
-    false
-}
+// Returns `true` if the `CREATE TABLE` has extensions we need to intercept:
+// `has_ddl_extensions` is re-exported from `datafusion_ddl` via the `use` above.
 
 /// Plan a `CREATE TABLE` with DDL extensions.
 ///
@@ -258,7 +239,7 @@ pub(super) async fn plan_create_table_like(
     if !is_cayenne_catalog(source_catalog.as_ref()) {
         return Err(DataFusionError::Plan(format!(
             "CREATE TABLE ... (LIKE ...) is only supported for Cayenne catalog tables. \
-             Source table '{source_name}' is not in a Cayenne catalog."
+             Table '{source_name}' is not in a Cayenne catalog."
         )));
     }
 
@@ -277,9 +258,7 @@ pub(super) async fn plan_create_table_like(
                 "Failed to resolve source table '{source_name}': {e}"
             ))
         })?
-        .ok_or_else(|| {
-            DataFusionError::Plan(format!("Source table '{source_name}' not found for LIKE"))
-        })?;
+        .ok_or_else(|| DataFusionError::Plan(format!("Table '{source_name}' not found")))?;
 
     let arrow_schema = source_provider.schema();
 
@@ -358,11 +337,6 @@ pub(super) async fn plan_create_table_like(
         }
     }
 
-    // Pass the partition expression SQL through to the physical plan.
-    // The CayenneCreateTableExec will parse it against the schema at execution time
-    // using the full SessionContext (with all registered UDFs like bucket()).
-    let partition_expr = None;
-
     // Resolve the target table reference.
     let target_name = create_table.name.to_string();
     let target_table_ref = TableReference::parse_str(&target_name);
@@ -385,24 +359,65 @@ pub(super) async fn plan_create_table_like(
 
     if !is_cayenne_catalog(target_catalog.as_ref()) {
         return Err(DataFusionError::Plan(format!(
-            "CREATE TABLE ... LIKE is only supported for Cayenne catalog tables. \
-             Target catalog '{target_catalog_name}' is not a Cayenne catalog."
+            "CREATE TABLE ... (LIKE ...) is only supported for Cayenne catalog tables. \
+             Table '{target_name}' is not in a Cayenne catalog."
         )));
     }
 
-    // Build the CayenneCreateTableNode directly.
-    let node = CayenneCreateTableNode::builder(
-        target_table_name,
+    // Validate source and target are in the same catalog.
+    if source_catalog_name != target_catalog_name {
+        return Err(DataFusionError::Plan(format!(
+            "CREATE TABLE ... (LIKE ...) requires the source and target tables to be \
+             in the same catalog. Source '{source_name}' is in catalog \
+             '{source_catalog_name}', but target is in '{target_catalog_name}'."
+        )));
+    }
+
+    let handler = planner_ctx.ddl_handler.clone().ok_or_else(|| {
+        DataFusionError::Internal(
+            "CREATE TABLE ... LIKE requires a DDL handler in PlannerContext".to_string(),
+        )
+    })?;
+
+    let params = datafusion_ddl::CreateTableParams {
+        catalog_name: target_catalog_name,
+        schema_name: target_schema_name,
+        table_name: target_table_name,
         arrow_schema,
-        target_catalog_name,
-        target_schema_name,
-    )
-    .if_not_exists(create_table.if_not_exists)
-    .partition_expr(partition_expr)
-    .partition_expr_sql(partition_expr_sql)
-    .primary_key(vec![]) // LIKE never copies primary keys
-    .like_source_table(Some(source_full_ref))
-    .build();
+        primary_key: vec![], // LIKE never copies primary keys
+        extension: {
+            // Encode the partition SQL back into the extension's partition_by field
+            // as a bare identifier — the handler will call .to_string() on it.
+            datafusion_ddl::CreateTableStatementExtension {
+                partition_by: partition_expr_sql.map(|sql| {
+                    use datafusion::sql::sqlparser::dialect::GenericDialect;
+                    use datafusion::sql::sqlparser::parser::Parser;
+                    // Parse back into a real AST expression so that function calls
+                    // like `bucket(4, region)` are not mangled into an identifier.
+                    Parser::new(&GenericDialect {})
+                        .try_with_sql(&sql)
+                        .and_then(|mut p| p.parse_expr())
+                        .map_or_else(
+                            |_| {
+                                Box::new(datafusion::sql::sqlparser::ast::Expr::Identifier(
+                                    datafusion::sql::sqlparser::ast::Ident::new(sql),
+                                ))
+                            },
+                            Box::new,
+                        )
+                }),
+                ..Default::default()
+            }
+        },
+        if_not_exists: create_table.if_not_exists,
+        or_replace: false,
+        like_source_table: Some(source_full_ref),
+    };
+
+    let node = datafusion_ddl::DdlExtensionNode::new(
+        datafusion_ddl::DdlNodeOp::CreateTable(Box::new(params)),
+        handler,
+    );
 
     Ok(LogicalPlan::Extension(Extension {
         node: Arc::new(node),
@@ -569,9 +584,10 @@ fn extract_primary_key_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datafusion::ddl::acceleration_options::new_shared_store;
     use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
     use datafusion::sql::sqlparser::parser::Parser;
+    use datafusion_ddl::has_ddl_extensions;
+    use datafusion_ddl::new_shared_store;
 
     /// Parse SQL into a `CreateTable` AST node for testing.
     fn parse_create_table(sql: &str) -> CreateTable {
@@ -628,7 +644,7 @@ mod tests {
         let ct = parse_create_table(
             r#"CREATE TABLE foo (id INT, name VARCHAR) WITH ("acceleration.engine" = 'arrow', "acceleration.mode" = 'memory')"#,
         );
-        let store = new_shared_store();
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
         let (modified, store_key) =
             extract_and_store_extensions(ct, &store).expect("should succeed");
 
@@ -650,7 +666,7 @@ mod tests {
         let ct = parse_create_table(
             r#"CREATE TABLE foo (id INT, ts TIMESTAMP) WITH ("dataset.time_column" = 'ts', "dataset.time_format" = 'timestamp')"#,
         );
-        let store = new_shared_store();
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
         let (_, store_key) = extract_and_store_extensions(ct, &store).expect("should succeed");
 
         assert!(store_key.is_some());
@@ -671,7 +687,7 @@ mod tests {
         let ct = parse_create_table(
             r#"CREATE TABLE foo (id INT, ts TIMESTAMP) WITH ("acceleration.engine" = 'arrow', "acceleration.refresh_mode" = 'append', "dataset.time_column" = 'ts')"#,
         );
-        let store = new_shared_store();
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
         let (_, store_key) = extract_and_store_extensions(ct, &store).expect("should succeed");
         assert!(store_key.is_some());
 
@@ -687,7 +703,7 @@ mod tests {
     #[test]
     fn test_extract_unrecognized_only_returns_none() {
         let ct = parse_create_table("CREATE TABLE foo (id INT) WITH (fillfactor = 70)");
-        let store = new_shared_store();
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
         let (_, store_key) = extract_and_store_extensions(ct, &store).expect("should succeed");
         assert!(store_key.is_none());
     }
@@ -697,7 +713,7 @@ mod tests {
         let ct = parse_create_table(
             r#"CREATE TABLE foo (id INT) WITH ("acceleration.engine" = 'arrow', fillfactor = 70)"#,
         );
-        let store = new_shared_store();
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
         let err = extract_and_store_extensions(ct, &store)
             .expect_err("should error")
             .to_string();
@@ -709,7 +725,7 @@ mod tests {
         let ct = parse_create_table(
             "CREATE TABLE foo (id INT, region TEXT, ts TIMESTAMP) PARTITION BY region",
         );
-        let store = new_shared_store();
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
         let (modified, store_key) =
             extract_and_store_extensions(ct, &store).expect("should succeed");
 
@@ -729,7 +745,7 @@ mod tests {
         let ct = parse_create_table(
             r#"CREATE TABLE foo (id INT, region TEXT) WITH ("acceleration.engine" = 'arrow') PARTITION BY region"#,
         );
-        let store = new_shared_store();
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
         let (modified, store_key) =
             extract_and_store_extensions(ct, &store).expect("should succeed");
 
@@ -755,7 +771,7 @@ mod tests {
         let ct = parse_create_table(
             "CREATE TABLE foo (id INT, p TEXT, PRIMARY KEY (id, p)) PARTITION BY p",
         );
-        let store = new_shared_store();
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
         extract_and_store_extensions(ct, &store)
             .expect("partition key in primary key should succeed");
     }
@@ -765,7 +781,7 @@ mod tests {
         let ct = parse_create_table(
             "CREATE TABLE foo (id INT, p TEXT, PRIMARY KEY (id)) PARTITION BY p",
         );
-        let store = new_shared_store();
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
         let err = extract_and_store_extensions(ct, &store)
             .expect_err("should error")
             .to_string();
@@ -779,7 +795,7 @@ mod tests {
     #[test]
     fn test_column_level_primary_key_missing_partition() {
         let ct = parse_create_table("CREATE TABLE foo (id INT PRIMARY KEY, p TEXT) PARTITION BY p");
-        let store = new_shared_store();
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
         let err = extract_and_store_extensions(ct, &store)
             .expect_err("should error")
             .to_string();
@@ -789,7 +805,7 @@ mod tests {
     #[test]
     fn test_partition_by_no_primary_key_ok() {
         let ct = parse_create_table("CREATE TABLE foo (id INT, p TEXT) PARTITION BY p");
-        let store = new_shared_store();
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
         extract_and_store_extensions(ct, &store)
             .expect("partition by without primary key should succeed");
     }
@@ -799,7 +815,7 @@ mod tests {
         let ct = parse_create_table(
             "CREATE TABLE foo (a INT, b TEXT, c VARCHAR, PRIMARY KEY (a, b)) PARTITION BY b",
         );
-        let store = new_shared_store();
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
         extract_and_store_extensions(ct, &store)
             .expect("composite primary key with partition should succeed");
     }
@@ -809,7 +825,7 @@ mod tests {
         let ct = parse_create_table(
             "CREATE TABLE foo (id INT, region TEXT, PRIMARY KEY (id, region)) PARTITION BY bucket(4, region)",
         );
-        let store = new_shared_store();
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
         extract_and_store_extensions(ct, &store)
             .expect("bucket partition in primary key should succeed");
     }
@@ -819,7 +835,7 @@ mod tests {
         let ct = parse_create_table(
             "CREATE TABLE foo (id INT, region TEXT, PRIMARY KEY (id)) PARTITION BY bucket(4, region)",
         );
-        let store = new_shared_store();
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
         let err = extract_and_store_extensions(ct, &store)
             .expect_err("should error")
             .to_string();

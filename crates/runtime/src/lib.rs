@@ -300,6 +300,12 @@ pub enum Error {
     #[snafu(display("Unable to load dataset connector: {dataset}"))]
     UnableToLoadDatasetConnector { dataset: TableReference },
 
+    #[snafu(display("Unable to load dataset connector: {dataset}. {reason}"))]
+    PermanentDatasetFailure {
+        dataset: TableReference,
+        reason: String,
+    },
+
     #[snafu(display("Unable to load data connector for catalog {catalog}: {source}"))]
     UnableToLoadCatalogConnector {
         catalog: String,
@@ -474,6 +480,8 @@ pub struct Runtime {
     df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
     completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
+    /// Per-model rate controllers for AI UDF concurrency control.
+    model_rate_controllers: Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>>,
     // LLMs that support the OpenAI Responses API
     responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
@@ -571,6 +579,13 @@ impl Runtime {
     #[must_use]
     pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
         Arc::clone(&self.completion_llms)
+    }
+
+    #[must_use]
+    pub fn model_rate_controllers(
+        &self,
+    ) -> Arc<RwLock<HashMap<String, Arc<runtime_rate_control::RateController>>>> {
+        Arc::clone(&self.model_rate_controllers)
     }
 
     #[must_use]

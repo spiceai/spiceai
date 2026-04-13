@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use crate::cluster::partition::get_partition_filter_exprs;
 use crate::component::dataset::acceleration::Mode;
@@ -24,10 +24,11 @@ use crate::dataaccelerator::spice_sys::caching_engine::CachingEngineSys;
 use crate::{
     AcceleratedReadWriteTableWithoutReplicationSnafu, AcceleratedTableInvalidChangesSnafu,
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, Error,
-    FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu, Result, Runtime,
-    UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
-    UnableToCreateAcceleratedTableSnafu, UnableToInitializeDataConnectorSnafu,
-    UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
+    FullTextSearchRequiresAccelerationSnafu, LogErrors, OdbcNotInstalledSnafu,
+    PermanentDatasetFailureSnafu, Result, Runtime, UnableToAttachDataConnectorSnafu,
+    UnableToBuildDatasetSnafu, UnableToCreateAcceleratedTableSnafu,
+    UnableToInitializeDataConnectorSnafu, UnableToLoadDatasetConnectorSnafu,
+    UnknownDataConnectorSnafu,
     accelerated_table::AcceleratedTable,
     component::{
         access::AccessMode,
@@ -41,7 +42,7 @@ use crate::{
         AccelerationSource, validate_cayenne_snapshot_consistency, validate_snapshot_paths,
     },
     dataconnector::{
-        self, ConnectorComponent, DataConnector, DataConnectorError, ODBC_DATACONNECTOR,
+        self, ConnectorComponent, DataConnector, ODBC_DATACONNECTOR,
         deferred::DeferredConnector,
         localpod::{LOCALPOD_DATACONNECTOR, LocalPodConnector},
         parameters::ConnectorParamsBuilder,
@@ -135,9 +136,13 @@ impl Runtime {
                 .update_dataset(&ds.name, status::ComponentStatus::Initializing);
             let ds_clone = Arc::clone(ds);
             let cloned_self = Arc::clone(&self);
-            let future: Pin<Box<dyn Future<Output = ()> + Send>> =
-                Box::pin(async move { cloned_self.load_dataset(ds_clone, bootstrap_status).await })
-                    as Pin<Box<dyn Future<Output = ()> + Send>>;
+            let load_semaphore = Arc::clone(&semaphore);
+            let future: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+                cloned_self
+                    .load_dataset(ds_clone, bootstrap_status, load_semaphore)
+                    .await;
+            })
+                as Pin<Box<dyn Future<Output = ()> + Send>>;
             dataset_futures.insert(ds.name.clone(), future);
         }
 
@@ -154,10 +159,13 @@ impl Runtime {
             if let Some(parent_future) = dataset_futures.remove(&path_table_ref) {
                 let ds_clone = Arc::clone(&ds);
                 let cloned_self = Arc::clone(&self);
+                let load_semaphore = Arc::clone(&semaphore);
                 // Chain the localpod dataset load after its parent
                 let chained_future = Box::pin(async move {
                     parent_future.await;
-                    cloned_self.load_dataset(ds_clone, bootstrap_status).await;
+                    cloned_self
+                        .load_dataset(ds_clone, bootstrap_status, load_semaphore)
+                        .await;
                 }) as Pin<Box<dyn Future<Output = ()> + Send>>;
 
                 // Replace parent future with the chained future
@@ -183,11 +191,7 @@ impl Runtime {
         let mut spawned_tasks = vec![];
 
         for (ds, dataset_load_future) in dataset_futures {
-            let semaphore = Arc::clone(&semaphore);
             let handle = tokio::spawn(async move {
-                let Ok(_guard) = semaphore.acquire().await else {
-                    unreachable!("Semaphore is never closed.");
-                };
                 tracing::info!("Dataset {ds} initializing...");
                 dataset_load_future.await;
             });
@@ -265,39 +269,56 @@ impl Runtime {
             }
         };
 
-        // Register any component metrics that the user has enabled for this dataset.
-        if ds.metrics.has_enabled_metrics() {
+        // Register component metrics for this dataset.
+        if let Some(metrics_provider) = data_connector.metrics_provider() {
             let enabled_metrics = ds.metrics.enabled_metrics();
-            let Some(metrics_provider) = data_connector.metrics_provider() else {
-                tracing::warn!(
-                    "Dataset {} does not support metrics. Skipping metric registration for {}.",
-                    ds.name,
-                    enabled_metrics.join(", ")
-                );
-                return Ok(data_connector);
-            };
-            for metric in enabled_metrics {
-                if let Some(metric) = metrics_provider.get_metric(&metric) {
-                    if let Err(e) =
-                        register_component_metric(&metrics_provider, *metric, &ds.name.to_string())
-                    {
-                        tracing::error!(
-                            "Unable to register component metric {}: {}",
-                            metric.name,
-                            e
-                        );
-                    }
-                } else {
-                    tracing::warn!("Metric {metric} not available in {source}");
+            let instance_name = ds.name.to_string();
+
+            for metric in metrics_provider.available_metrics() {
+                let explicitly_disabled = ds.metrics.metrics.iter().any(|configured_metric| {
+                    configured_metric.name == metric.name && !configured_metric.enabled
+                });
+                let user_enabled = enabled_metrics.iter().any(|m| m == metric.name);
+                if explicitly_disabled || (!metric.auto_register && !user_enabled) {
+                    continue;
+                }
+                if let Err(e) =
+                    register_component_metric(&metrics_provider, *metric, &instance_name)
+                {
+                    tracing::error!("Unable to register component metric {}: {}", metric.name, e);
                 }
             }
+
+            // Warn about user-enabled metrics that don't exist on this connector.
+            for name in &enabled_metrics {
+                if metrics_provider.get_metric(name).is_none() {
+                    tracing::warn!("Metric {name} not available in {source}");
+                }
+            }
+        } else if ds.metrics.has_enabled_metrics() {
+            let enabled_metrics = ds.metrics.enabled_metrics();
+            tracing::warn!(
+                "Dataset {} does not support metrics. Skipping metric registration for {}.",
+                ds.name,
+                enabled_metrics.join(", ")
+            );
         }
 
         Ok(data_connector)
     }
 
     /// Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.
-    async fn load_dataset(self: Arc<Self>, ds: Arc<Dataset>, bootstrap_status: BootstrapStatus) {
+    ///
+    /// The `load_semaphore` limits concurrent schema inference via
+    /// `read_provider` so that `dataset_load_parallelism` controls how many
+    /// datasets query the source for schema at the same time. Connector
+    /// creation and `DataFusion` registration run outside the permit.
+    async fn load_dataset(
+        self: Arc<Self>,
+        ds: Arc<Dataset>,
+        bootstrap_status: BootstrapStatus,
+        load_semaphore: Arc<Semaphore>,
+    ) {
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
 
         if let Err(err) = validate_dataset(&ds) {
@@ -325,11 +346,15 @@ impl Runtime {
                 ));
             }
 
+            let connector_start = Instant::now();
             let connector = match Arc::clone(&runtime)
                 .load_dataset_connector(Arc::clone(&ds))
                 .await
             {
-                Ok(connector) => connector,
+                Ok(connector) => {
+                    tracing::debug!(dataset = %ds.name, duration_ms = connector_start.elapsed().as_millis(), "Dataset connector created");
+                    connector
+                }
                 Err(err) => {
                     if runtime.status.is_shutdown() {
                         // should not retry or trace error if runtime is shutting down
@@ -357,11 +382,19 @@ impl Runtime {
             }
 
             if let Err(err) = Arc::clone(&runtime)
-                .register_loaded_dataset(Arc::clone(&ds), connector, None, bootstrap_status.clone())
+                .register_loaded_dataset(
+                    Arc::clone(&ds),
+                    connector,
+                    None,
+                    bootstrap_status.clone(),
+                    Some(Arc::clone(&load_semaphore)),
+                )
                 .await
             {
                 if runtime.status.is_shutdown() {
-                    // should not retry if runtime is shutting down
+                    return Err(RetryError::permanent(err));
+                }
+                if matches!(err, Error::PermanentDatasetFailure { .. }) {
                     return Err(RetryError::permanent(err));
                 }
                 return Err(RetryError::transient(err));
@@ -384,6 +417,7 @@ impl Runtime {
         data_connector: Arc<dyn DataConnector>,
         accelerated_table: Option<Arc<AcceleratedTable>>,
         bootstrap_status: BootstrapStatus,
+        load_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<()> {
         let source = ds.source();
         let spaced_tracer = Arc::clone(&self.spaced_tracer);
@@ -408,6 +442,16 @@ impl Runtime {
             .is_some_and(|a| a.mode == Mode::FileUpdate);
 
         // Test dataset connectivity by attempting to get a read provider.
+        // Acquire the load semaphore (if provided) to limit concurrent source queries.
+        let load_guard = if let Some(sem) = &load_semaphore {
+            let Ok(guard) = sem.acquire().await else {
+                unreachable!("Semaphore is never closed.");
+            };
+            Some(guard)
+        } else {
+            None
+        };
+        let schema_start = Instant::now();
         let federated_table = match data_connector.read_provider(&ds).await {
             Ok(provider) => {
                 FederatedTable::new(
@@ -441,11 +485,15 @@ impl Runtime {
                         status::ComponentStatus::error_with_message(err.to_string()),
                     );
                     metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    if let DataConnectorError::UnsupportedDataType { .. } = err {
+                    if !err.is_retriable() {
                         error_spaced!(spaced_tracer, "{}{err}", "");
-                    } else {
-                        warn_spaced!(spaced_tracer, "{}{err}", "");
+                        return PermanentDatasetFailureSnafu {
+                            dataset: ds.name.clone(),
+                            reason: err.to_string(),
+                        }
+                        .fail();
                     }
+                    warn_spaced!(spaced_tracer, "{}{err}", "");
                     return UnableToLoadDatasetConnectorSnafu {
                         dataset: ds.name.clone(),
                     }
@@ -454,6 +502,13 @@ impl Runtime {
             }
         };
 
+        tracing::debug!(dataset = %ds.name, duration_ms = schema_start.elapsed().as_millis(), "Dataset schema inference complete");
+
+        // Release the load permit before registration so other datasets can
+        // begin their source-facing work while this one registers.
+        drop(load_guard);
+
+        let register_start = Instant::now();
         match Arc::clone(&self)
             .register_dataset(
                 Arc::clone(&ds),
@@ -480,6 +535,7 @@ impl Runtime {
                     );
                 }
                 tracing::info!(
+                    duration_ms = register_start.elapsed().as_millis(),
                     "{}",
                     dataset_registered_trace(
                         data_connector.as_ref(),
@@ -617,6 +673,7 @@ impl Runtime {
                         Arc::clone(&connector),
                         None,
                         BootstrapStatus::None,
+                        None,
                     )
                     .await
                 {
@@ -731,6 +788,7 @@ impl Runtime {
             Arc::clone(&connector),
             Some(accelerated_table),
             BootstrapStatus::None,
+            None,
         )
         .await?;
 
@@ -960,7 +1018,11 @@ impl Runtime {
                 self.status
                     .update_dataset(&ds.name, status::ComponentStatus::Initializing);
                 Arc::clone(&self)
-                    .load_dataset(Arc::clone(ds), bootstrap_status)
+                    .load_dataset(
+                        Arc::clone(ds),
+                        bootstrap_status,
+                        Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
+                    )
                     .await;
             }
         }

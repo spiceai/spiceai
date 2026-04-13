@@ -17,8 +17,10 @@ limitations under the License.
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::delta_lake::DeltaTableFactory;
+use datafusion::config::TableParquetOptions;
 use datafusion::datasource::TableProvider;
 use runtime::component::dataset::Dataset;
+use runtime::dataconnector::listing::build_table_parquet_options;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -38,9 +40,14 @@ pub struct DeltaLake {
 impl DeltaLake {
     #[must_use]
     #[expect(clippy::needless_pass_by_value)]
-    pub fn new(params: Parameters, io_runtime: Handle) -> Self {
+    pub fn new(
+        params: Parameters,
+        io_runtime: Handle,
+        table_parquet_options: TableParquetOptions,
+    ) -> Self {
         Self {
-            delta_table_factory: DeltaTableFactory::new(params.to_secret_map(), io_runtime),
+            delta_table_factory: DeltaTableFactory::new(params.to_secret_map(), io_runtime)
+                .with_table_parquet_options(table_parquet_options),
         }
     }
 }
@@ -116,6 +123,12 @@ impl DataConnectorFactory for DeltaLakeFactory {
         &self,
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+        let aws_region = params
+            .parameters
+            .get("aws_region")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
         let param_map = params.parameters.to_secret_map();
         Box::pin(async move {
             // Initialize AWS SDK credentials if not using explicit credentials
@@ -123,14 +136,22 @@ impl DataConnectorFactory for DeltaLakeFactory {
                 &param_map,
                 "aws_access_key_id",
                 "aws_secret_access_key",
-            ) && let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
+            ) && let Err(err) =
+                aws_sdk_credential_bridge::get_or_init_sdk_config_with_region(aws_region.as_deref())
+                    .await
             {
                 tracing::warn!(
                     "Unable to initialize AWS credentials for Delta Lake connector: {err}"
                 );
             }
 
-            let delta = DeltaLake::new(params.parameters, params.io_runtime);
+            let parquet_opts = build_table_parquet_options(params.runtime.as_deref()).await?;
+
+            tracing::debug!(
+                ?parquet_opts,
+                "Creating Delta Lake connector with parquet options"
+            );
+            let delta = DeltaLake::new(params.parameters, params.io_runtime, parquet_opts);
             Ok(Arc::new(delta) as Arc<dyn DataConnector>)
         })
     }

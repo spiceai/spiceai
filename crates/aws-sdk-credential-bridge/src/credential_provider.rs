@@ -57,7 +57,16 @@ impl S3CredentialProvider {
     ///
     /// Returns an error if the credentials cannot be loaded from the environment.
     pub async fn from_env() -> Result<(Self, SdkConfig)> {
-        let config = super::default_aws_config().load().await;
+        Self::from_env_with_region(None).await
+    }
+
+    /// Loads credentials from the environment with an explicit region when available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the credentials cannot be loaded from the environment.
+    pub async fn from_env_with_region(region: Option<&str>) -> Result<(Self, SdkConfig)> {
+        let config = super::default_aws_config_for_region(region).load().await;
 
         Ok((Self::from_config(&config)?, config))
     }

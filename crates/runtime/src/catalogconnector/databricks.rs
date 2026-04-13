@@ -28,6 +28,7 @@ use crate::token_providers::databricks::{
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::RefreshableCatalogProvider;
+use data_components::databricks::sql_warehouse::{SqlWarehouseConfig, shared_request_semaphore};
 use data_components::databricks::{DatabricksSparkConnect, DatabricksSqlWarehouse};
 use data_components::delta_lake::DeltaTableFactory;
 use data_components::unity_catalog::CatalogId;
@@ -83,6 +84,24 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("sql_warehouse_id")
         .secret()
         .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'"),
+
+    // Connection / resilience tuning (sql_warehouse mode)
+    ParameterSpec::runtime("max_concurrent_requests")
+        .description("Maximum number of concurrent HTTP requests to the SQL Warehouse API.")
+        .default("8"),
+    ParameterSpec::runtime("http_max_retries")
+        .description("Maximum number of HTTP-level retries for transient failures (429, 5xx).")
+        .default("3"),
+    ParameterSpec::runtime("backoff_method")
+        .description("Backoff strategy for transient HTTP retries.")
+        .one_of(&["fibonacci", "exponential"])
+        .default("fibonacci"),
+    ParameterSpec::runtime("statement_max_retries")
+        .description("Maximum number of poll retries when waiting for async statement completion.")
+        .default("14"),
+    ParameterSpec::runtime("disable_on_permanent_error")
+        .description("When true, non-retryable errors (401, 403, 404) permanently disable the connector to prevent a thundering herd of failed requests.")
+        .default("true"),
 
     // Databricks M2M Service Principal credentials
     ParameterSpec::component("client_id").description("The client ID of the Databricks service principal."),
@@ -189,13 +208,12 @@ impl CatalogConnector for Databricks {
         };
 
         let unity_catalog =
-            UnityCatalogClient::new(Endpoint(endpoint.to_string()), Some(token_provider)).map_err(
-                |source| super::Error::UnableToGetCatalogProvider {
+            UnityCatalogClient::new(Endpoint(endpoint.to_string()), Some(token_provider), None)
+                .map_err(|source| super::Error::UnableToGetCatalogProvider {
                     connector: "databricks".to_string(),
                     source: source.into(),
                     connector_component: ConnectorComponent::from(catalog),
-                },
-            )?;
+                })?;
         let client = Arc::new(unity_catalog);
 
         // Copy the catalog params into the dataset params, and allow user to override
@@ -248,14 +266,30 @@ impl CatalogConnector for Databricks {
             )
             .await?;
 
-            let read_provider =
-                DatabricksSqlWarehouse::new(endpoint, sql_warehouse_id, token_provider).map_err(
-                    |source| super::Error::UnableToGetCatalogProvider {
-                        connector: "databricks".to_string(),
-                        source: source.into(),
-                        connector_component: ConnectorComponent::from(catalog),
-                    },
-                )?;
+            let config = build_sql_warehouse_config(&params);
+            let shared_semaphore = shared_request_semaphore(
+                endpoint,
+                sql_warehouse_id,
+                config.max_concurrent_requests,
+            )
+            .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                connector: "databricks".to_string(),
+                source: source.into(),
+                connector_component: ConnectorComponent::from(catalog),
+            })?;
+
+            let read_provider = DatabricksSqlWarehouse::with_config_and_semaphore(
+                endpoint,
+                sql_warehouse_id,
+                token_provider,
+                config,
+                Some(shared_semaphore),
+            )
+            .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                connector: "databricks".to_string(),
+                source: source.into(),
+                connector_component: ConnectorComponent::from(catalog),
+            })?;
 
             (
                 Arc::new(read_provider) as Arc<dyn Read>,
@@ -339,7 +373,12 @@ fn table_reference_creator_spark(uc_table: &UCTable) -> Option<TableReference> {
 
 fn table_reference_creator_delta_lake(uc_table: &UCTable) -> Option<TableReference> {
     let storage_location = uc_table.storage_location.as_deref()?;
-    Some(TableReference::bare(format!("{storage_location}/")))
+    // Don't append a trailing slash here — `DeltaTable::from` calls
+    // `ensure_folder_location` which already adds one when needed.
+    // Unconditionally appending caused double-slash paths (e.g.
+    // "file:///path/to/table//") when the catalog API returned
+    // locations that already ended with '/'.
+    Some(TableReference::bare(storage_location.to_string()))
 }
 
 use token_provider::TokenProvider;
@@ -360,7 +399,11 @@ async fn create_token_provider_for_catalog(
     })?;
 
     match auth_credentials {
-        AuthCredentials::Token(token) => Ok(Arc::new(StaticTokenProvider::new(token.clone()))),
+        AuthCredentials::Token(token) => {
+            let token_provider: Arc<dyn TokenProvider> =
+                Arc::new(StaticTokenProvider::new(token.clone()));
+            Ok(token_provider)
+        }
         AuthCredentials::ServicePrincipal(client_id, client_secret) => {
             get_m2m_token_provider(endpoint, client_id, client_secret, &token_provider_registry)
                 .await
@@ -382,9 +425,74 @@ async fn create_token_provider_for_catalog(
     }
 }
 
+pub fn build_sql_warehouse_config(params: &Parameters) -> SqlWarehouseConfig {
+    let mut config = SqlWarehouseConfig::default();
+
+    if let Some(v) = params.get("max_concurrent_requests").expose().ok() {
+        match v.parse::<usize>() {
+            Ok(0) => {
+                tracing::warn!(
+                    parameter = "max_concurrent_requests",
+                    value = v,
+                    "Invalid Databricks SQL Warehouse config value; must be >= 1; using default"
+                );
+            }
+            Ok(n) => config.max_concurrent_requests = n,
+            Err(e) => {
+                tracing::warn!(parameter = "max_concurrent_requests", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default");
+            }
+        }
+    }
+    if let Some(v) = params.get("http_max_retries").expose().ok() {
+        match v.parse::<usize>() {
+            Ok(n) => config.http_max_retries = n,
+            Err(e) => {
+                tracing::warn!(parameter = "http_max_retries", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default");
+            }
+        }
+    }
+    if let Some(v) = params.get("backoff_method").expose().ok() {
+        match v.parse::<util::retry_strategy::BackoffMethod>() {
+            Ok(m) => config.backoff_method = m,
+            Err(e) => {
+                tracing::warn!(parameter = "backoff_method", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default");
+            }
+        }
+    }
+    if let Some(v) = params.get("statement_max_retries").expose().ok() {
+        match v.parse::<usize>() {
+            Ok(n) => config.statement_max_retries = n,
+            Err(e) => {
+                tracing::warn!(parameter = "statement_max_retries", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default");
+            }
+        }
+    }
+    if let Some(v) = params.get("disable_on_permanent_error").expose().ok() {
+        match v.parse::<bool>() {
+            Ok(b) => config.disable_on_permanent_error = b,
+            Err(e) => {
+                tracing::warn!(parameter = "disable_on_permanent_error", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default");
+            }
+        }
+    }
+
+    config
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_parameters(entries: &[(&str, &str)]) -> Parameters {
+        Parameters::new(
+            entries
+                .iter()
+                .map(|(key, value)| (key.to_string(), SecretString::from(*value)))
+                .collect(),
+            "databricks",
+            PARAMETERS,
+        )
+    }
 
     fn make_uc_table(storage_location: Option<&str>) -> UCTable {
         UCTable {
@@ -455,7 +563,7 @@ mod tests {
         );
         match reference {
             TableReference::Bare { table } => {
-                assert_eq!(table.as_ref(), "s3://bucket/path/");
+                assert_eq!(table.as_ref(), "s3://bucket/path");
             }
             _ => unreachable!("already asserted to be Bare table reference"),
         }
@@ -471,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_reference_creator_delta_lake_appends_trailing_slash() {
+    fn test_table_reference_creator_delta_lake_preserves_location() {
         let table = make_uc_table(Some("abfss://container@account.dfs.core.windows.net/path"));
         let reference = table_reference_creator_delta_lake(&table).expect("should return Some");
         assert!(
@@ -480,12 +588,32 @@ mod tests {
         );
         match reference {
             TableReference::Bare { table } => {
-                assert!(
-                    table.as_ref().ends_with('/'),
-                    "delta lake reference should end with trailing slash"
+                assert_eq!(
+                    table.as_ref(),
+                    "abfss://container@account.dfs.core.windows.net/path",
+                    "delta lake reference should preserve location without modification"
                 );
             }
             _ => unreachable!("already asserted to be Bare table reference"),
+        }
+    }
+
+    /// Regression test for <https://github.com/spiceai/spiceai/issues/7904>
+    /// Storage locations ending with '/' must not get a second '/' appended.
+    #[test]
+    fn test_table_reference_creator_delta_lake_no_double_slash() {
+        let table = make_uc_table(Some("s3://bucket/path/"));
+        let reference = table_reference_creator_delta_lake(&table).expect("should return Some");
+        match reference {
+            TableReference::Bare { table } => {
+                assert!(
+                    !table.as_ref().ends_with("//"),
+                    "must not produce double trailing slash, got: {}",
+                    table.as_ref()
+                );
+                assert_eq!(table.as_ref(), "s3://bucket/path/");
+            }
+            _ => panic!("Expected Bare table reference"),
         }
     }
 
@@ -532,10 +660,58 @@ mod tests {
             TableReference::Bare { table } => {
                 assert_eq!(
                     table.as_ref(),
-                    "s3://my-bucket/warehouse/catalog/schema/table/"
+                    "s3://my-bucket/warehouse/catalog/schema/table"
                 );
             }
             _ => unreachable!("already asserted to be Bare table reference"),
         }
+    }
+
+    #[test]
+    fn test_build_sql_warehouse_config_parses_valid_overrides() {
+        let params = make_parameters(&[
+            ("max_concurrent_requests", "4"),
+            ("http_max_retries", "6"),
+            ("backoff_method", "exponential"),
+            ("statement_max_retries", "21"),
+            ("disable_on_permanent_error", "false"),
+        ]);
+
+        let config = build_sql_warehouse_config(&params);
+
+        assert_eq!(config.max_concurrent_requests, 4);
+        assert_eq!(config.http_max_retries, 6);
+        assert_eq!(
+            config.backoff_method,
+            util::retry_strategy::BackoffMethod::Exponential
+        );
+        assert_eq!(config.statement_max_retries, 21);
+        assert!(!config.disable_on_permanent_error);
+    }
+
+    #[test]
+    fn test_build_sql_warehouse_config_uses_defaults_for_invalid_values() {
+        let params = make_parameters(&[
+            ("max_concurrent_requests", "0"),
+            ("http_max_retries", "NaN"),
+            ("backoff_method", "quadratic"),
+            ("statement_max_retries", "bad"),
+            ("disable_on_permanent_error", "maybe"),
+        ]);
+
+        let config = build_sql_warehouse_config(&params);
+        let defaults = SqlWarehouseConfig::default();
+
+        assert_eq!(
+            config.max_concurrent_requests,
+            defaults.max_concurrent_requests
+        );
+        assert_eq!(config.http_max_retries, defaults.http_max_retries);
+        assert_eq!(config.backoff_method, defaults.backoff_method);
+        assert_eq!(config.statement_max_retries, defaults.statement_max_retries);
+        assert_eq!(
+            config.disable_on_permanent_error,
+            defaults.disable_on_permanent_error
+        );
     }
 }
