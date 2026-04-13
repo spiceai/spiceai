@@ -121,6 +121,17 @@ pub async fn try_from_table(
 
     tracing::debug!("s3 vector index metadata columns: {metadata_columns:?}");
 
+    let model = {
+        let model_read = embedding_models.read().await;
+        let Some(model) = model_read.get(&config.model) else {
+            return Err(Box::from(format!(
+                "Cannot make S3 vector index for table '{ds_name}' column '{column}'. Embedding model '{}' is not defined in the Spicepod or failed to load. Define it under `embeddings` and try again.",
+                config.model
+            )));
+        };
+        Arc::clone(model)
+    };
+
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
 
     let batch_write_rows = string_from_params(&params, "batch_write_rows")
@@ -155,20 +166,12 @@ pub async fn try_from_table(
     )
     .await?;
 
-    let model_read = embedding_models.read().await;
-    let Some(model) = model_read.get(&config.model) else {
-        return Err(Box::from(format!(
-            "Cannot make S3 vector index for table '{}'. No embedding model named: '{}'.",
-            ds_name, config.model
-        )));
-    };
-
     let mut s3_vec = S3Vector::new(
         table,
         column.clone(),
         primary_key,
         metadata_columns,
-        Arc::clone(model),
+        model,
         partition_by,
         batch_write_rows,
     );
@@ -378,4 +381,55 @@ fn s3_vector_metadata_columns(columns: &[Column], schema: &SchemaRef) -> Metadat
         })
         .collect();
     metadata_columns.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::sql::TableReference;
+    use spicepod::{semantic::ColumnLevelEmbeddingConfig, vector::VectorStore};
+
+    #[tokio::test]
+    async fn missing_embedding_model_returns_specific_error_before_s3_setup() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("answer", DataType::Utf8, true),
+        ]));
+        let embedding_models = Arc::new(RwLock::new(EmbeddingModelStore::new()));
+        let secrets = Arc::new(RwLock::new(Secrets::default()));
+        let config = ColumnLevelEmbeddingConfig::model("missing_embeddings").with_row_id("id");
+        let vector_store = VectorStore {
+            engine: Some("s3_vectors".to_string()),
+            ..Default::default()
+        };
+
+        let result = try_from_table(
+            &TableReference::bare("daily_journal"),
+            "answer".to_string(),
+            config,
+            &vector_store,
+            vec!["id".to_string()],
+            schema,
+            embedding_models,
+            vec![],
+            secrets,
+            vec![],
+        )
+        .await;
+
+        let Err(err) = result else {
+            panic!("missing embedding model should fail");
+        };
+        let message = err.to_string();
+
+        assert!(
+            message.contains("Embedding model 'missing_embeddings' is not defined"),
+            "unexpected error message: {message}"
+        );
+        assert!(
+            !message.contains("embedding dimension could not be inferred"),
+            "missing model should not fall through to dimension inference: {message}"
+        );
+    }
 }
