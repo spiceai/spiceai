@@ -117,15 +117,19 @@ pub async fn try_from_table(
         .collect();
 
     // Get the embedding model to determine dimension.
-    let model_read = embedding_models.read().await;
-    let Some(model) = model_read.get(&config.model) else {
-        return Err(Box::from(format!(
-            "Cannot create Elasticsearch vector index for table '{}'. No embedding model named: '{}'.",
-            ds_name, config.model
-        )));
+    // Clone the Arc before dropping the read lock to avoid holding it across .await.
+    let model = {
+        let model_read = embedding_models.read().await;
+        let Some(model) = model_read.get(&config.model) else {
+            return Err(Box::from(format!(
+                "Cannot create Elasticsearch vector index for table '{}'. No embedding model named: '{}'.",
+                ds_name, config.model
+            )));
+        };
+        Arc::clone(model)
     };
 
-    let dims = llms::embeddings::get_or_infer_size(model)
+    let dims = llms::embeddings::get_or_infer_size(&model)
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
         as i32;
@@ -137,7 +141,7 @@ pub async fn try_from_table(
         vector_field,
         text_fields,
         primary_key,
-        compute_query: Arc::clone(model),
+        compute_query: model,
         dims,
         source_schema: inner_schema,
     })
