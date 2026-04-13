@@ -140,7 +140,8 @@ async fn query_count(ctx: &SessionContext, table_name: &str) -> usize {
 // Stats Tests
 // ============================================================================
 
-/// Stats should accumulate correctly across multiple append operations.
+/// Stats are updated on each write (upserted per column, not cumulative).
+/// Each append overwrites column stats with the latest batch's values.
 async fn test_stats_accumulate_across_appends(fixture: common::TestFixture) -> TestResult {
     let schema = simple_schema();
     let (table, _ctx) = create_table_no_pk(&fixture, "stats_accum", Arc::clone(&schema)).await;

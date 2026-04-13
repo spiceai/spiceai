@@ -327,6 +327,9 @@ impl SqliteMetastore {
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
+
+    const INLINED_DATA_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_data_table_seq ON cayenne_inlined_data(table_id, sequence_number)";
+    const INLINED_DELETE_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_delete_table_seq ON cayenne_inlined_delete(table_id, sequence_number)";
 }
 
 /// `SQLite` row wrapper implementing `MetastoreRow`.
@@ -465,6 +468,8 @@ impl MetastoreBackend for SqliteMetastore {
         guard
             .call(|conn| {
                 conn.execute(DELETE_FILE_TABLE_UNIQUE_INDEX_DDL, [])?;
+                conn.execute(Self::INLINED_DATA_INDEX_DDL, [])?;
+                conn.execute(Self::INLINED_DELETE_INDEX_DDL, [])?;
                 Ok::<_, rusqlite::Error>(())
             })
             .await

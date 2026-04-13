@@ -138,7 +138,8 @@ impl ColumnStatsAccumulator {
             }
 
             // O(n) linear scan to find min/max using `ScalarValue` comparison.
-            // Skips NaN values (`partial_cmp` returns `None`) to keep stats deterministic.
+            // NaN values are skipped entirely (including as seed values) so that
+            // stats remain deterministic and comparable.
             let mut batch_min: Option<datafusion_common::ScalarValue> = None;
             let mut batch_max: Option<datafusion_common::ScalarValue> = None;
 
@@ -151,6 +152,12 @@ impl ColumnStatsAccumulator {
                 else {
                     continue; // unsupported type for this row
                 };
+
+                // Skip NaN: a NaN seed would poison all subsequent comparisons
+                // because partial_cmp(NaN, x) always returns None.
+                if value.partial_cmp(&value) != Some(std::cmp::Ordering::Equal) {
+                    continue;
+                }
 
                 batch_min = Some(match batch_min {
                     None => value.clone(),
