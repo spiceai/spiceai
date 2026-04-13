@@ -19,8 +19,9 @@ limitations under the License.
 //! with `DuckDB`. Validates:
 //!
 //! 1. Initial load of the view returns correct data.
-//! 2. Hot-reload (adding new `json_get_*` columns to the view) picks up the
-//!    schema change without a restart.
+//! 2. Hot-reload (adding new `json_get_*` columns to the view, including
+//!    nested JSON extraction via `json_get_str(json_get_json(...), ...)`) picks
+//!    up the schema change without a restart.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -44,7 +45,7 @@ use crate::utils::{
 use crate::{configure_test_datafusion, init_tracing};
 
 /// Simulates an API returning nested JSON audit log entries with mixed field
-/// types (strings, booleans, integers, nulls).
+/// types (strings, booleans, integers, nulls) and nested JSON objects.
 const AUDIT_LOGS_JSON: &str = r#"[
   {
     "id": "evt-001",
@@ -58,7 +59,8 @@ const AUDIT_LOGS_JSON: &str = r#"[
     "actor": "admin@example.com",
     "approvedBy": "security@example.com",
     "resourceId": "res-100",
-    "policyId": "pol-200"
+    "policyId": "pol-200",
+    "metadata": {"region": "us-east-1", "source": "web-client", "retryCount": 0}
   },
   {
     "id": "evt-002",
@@ -72,7 +74,8 @@ const AUDIT_LOGS_JSON: &str = r#"[
     "actor": "system",
     "approvedBy": null,
     "resourceId": "res-101",
-    "policyId": "pol-201"
+    "policyId": "pol-201",
+    "metadata": {"region": "eu-west-2", "source": "api-gateway", "retryCount": 3}
   },
   {
     "id": "evt-003",
@@ -86,7 +89,8 @@ const AUDIT_LOGS_JSON: &str = r#"[
     "actor": "admin@example.com",
     "approvedBy": "admin@example.com",
     "resourceId": "res-102",
-    "policyId": null
+    "policyId": null,
+    "metadata": null
   }
 ]"#;
 
@@ -167,7 +171,8 @@ views:
 }
 
 /// Generates the updated spicepod YAML with additional `json_get_*` columns
-/// added to the view, simulating a hot-reload scenario.
+/// added to the view, including nested JSON extraction via
+/// `json_get_str(json_get_json(...), ...)`, simulating a hot-reload scenario.
 fn spicepod_yaml_updated(base_url: &str) -> String {
     format!(
         r"version: v1
@@ -203,7 +208,10 @@ views:
         json_get_str(content, 'actor') AS actor,
         json_get_str(content, 'approvedBy') AS approved_by,
         json_get_str(content, 'resourceId') AS resource_id,
-        json_get_str(content, 'policyId') AS policy_id
+        json_get_str(content, 'policyId') AS policy_id,
+        json_get_str(json_get_json(content, 'metadata'), 'region') AS metadata_region,
+        json_get_str(json_get_json(content, 'metadata'), 'source') AS metadata_source,
+        json_get_int(json_get_json(content, 'metadata'), 'retryCount') AS metadata_retry_count
       FROM audit_logs_raw
       WHERE request_path = '/audit-logs'
       ORDER BY json_get_str(content, 'id')
@@ -316,11 +324,12 @@ async fn http_json_nested_fields_duckdb_hot_reload() -> Result<(), String> {
                 );
             }
 
-            // Verify the full updated view with all columns
+            // Verify the full updated view with all columns, including nested JSON
             let updated_query = "\
                 SELECT id, action, description, severity, status, automated, \
                        retention_days, timestamp, actor, approved_by, \
-                       resource_id, policy_id \
+                       resource_id, policy_id, metadata_region, \
+                       metadata_source, metadata_retry_count \
                 FROM audit_logs ORDER BY id";
             let batches = run_query(&rt, updated_query).await?;
             let pretty = pretty_format_batches(&batches).map_err(|e| e.to_string())?;
