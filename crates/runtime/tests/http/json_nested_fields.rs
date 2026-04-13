@@ -209,9 +209,9 @@ views:
         json_get_str(content, 'approvedBy') AS approved_by,
         json_get_str(content, 'resourceId') AS resource_id,
         json_get_str(content, 'policyId') AS policy_id,
-        json_get_str(json_get_json(content, 'metadata'), 'region') AS metadata_region,
-        json_get_str(json_get_json(content, 'metadata'), 'source') AS metadata_source,
-        json_get_int(json_get_json(content, 'metadata'), 'retryCount') AS metadata_retry_count
+        json_get_str(json_get(content, 'metadata'), 'region') AS metadata_region,
+        json_get_str(json_get(content, 'metadata'), 'source') AS metadata_source,
+        json_get_int(json_get(content, 'metadata'), 'retryCount') AS metadata_retry_count
       FROM audit_logs_raw
       WHERE request_path = '/audit-logs'
       ORDER BY json_get_str(content, 'id')
