@@ -158,7 +158,10 @@ async fn test_stats_accumulate_across_appends(fixture: common::TestFixture) -> T
     common::insert_batch(&table, batch1).await?;
 
     let stats = fixture.catalog.get_column_stats(&table_id).await?;
-    let value_stats = stats.iter().find(|s| s.column_name == "value").unwrap();
+    let value_stats = stats
+        .iter()
+        .find(|s| s.column_name == "value")
+        .expect("stats lookup");
     assert_eq!(value_stats.row_count, Some(3));
 
     // Second append: 2 rows with values 5, 50
@@ -174,7 +177,10 @@ async fn test_stats_accumulate_across_appends(fixture: common::TestFixture) -> T
     // Stats should reflect the latest write's data (not cumulative across writes —
     // each write persists its own batch stats via upsert)
     let stats = fixture.catalog.get_column_stats(&table_id).await?;
-    let value_stats = stats.iter().find(|s| s.column_name == "value").unwrap();
+    let value_stats = stats
+        .iter()
+        .find(|s| s.column_name == "value")
+        .expect("stats lookup");
     assert!(
         value_stats.row_count.is_some(),
         "row_count should be populated after second append"
@@ -204,7 +210,10 @@ async fn test_stats_correct_after_overwrite(fixture: common::TestFixture) -> Tes
         .await?;
 
     let stats = fixture.catalog.get_column_stats(&table_id).await?;
-    let value_stats = stats.iter().find(|s| s.column_name == "value").unwrap();
+    let value_stats = stats
+        .iter()
+        .find(|s| s.column_name == "value")
+        .expect("stats lookup");
     assert_eq!(
         value_stats.row_count,
         Some(2),
@@ -234,7 +243,10 @@ async fn test_stats_with_all_null_column(fixture: common::TestFixture) -> TestRe
     common::insert_batch(&table, batch).await?;
 
     let stats = fixture.catalog.get_column_stats(&table_id).await?;
-    let value_stats = stats.iter().find(|s| s.column_name == "value").unwrap();
+    let value_stats = stats
+        .iter()
+        .find(|s| s.column_name == "value")
+        .expect("stats lookup");
     assert_eq!(value_stats.null_count, Some(3), "All 3 values are NULL");
     assert!(
         value_stats.min_value.is_none(),
@@ -320,7 +332,10 @@ async fn test_stats_min_max_correct_for_strings(fixture: common::TestFixture) ->
     common::insert_batch(&table, batch).await?;
 
     let stats = fixture.catalog.get_column_stats(&table_id).await?;
-    let name_stats = stats.iter().find(|s| s.column_name == "name").unwrap();
+    let name_stats = stats
+        .iter()
+        .find(|s| s.column_name == "name")
+        .expect("stats lookup");
     assert_eq!(name_stats.min_value.as_deref(), Some("apple"));
     assert_eq!(name_stats.max_value.as_deref(), Some("cherry"));
 

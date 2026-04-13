@@ -34,7 +34,7 @@ test_with_backends!(test_file_column_stats_crud);
 test_with_backends!(test_stats_persisted_after_insert);
 test_with_backends!(test_stats_cleared_on_drop_table);
 
-/// Test basic CRUD operations on cayenne_column_stats.
+/// Test basic CRUD operations on `cayenne_column_stats`.
 async fn test_column_stats_crud(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -106,7 +106,10 @@ async fn test_column_stats_crud(
 
     let stats = catalog.get_column_stats(&table_id).await?;
     assert_eq!(stats.len(), 2); // still 2 columns
-    let id_stats = stats.iter().find(|s| s.column_name == "id").unwrap();
+    let id_stats = stats
+        .iter()
+        .find(|s| s.column_name == "id")
+        .expect("id stats");
     assert_eq!(id_stats.max_value.as_deref(), Some("200"));
     assert_eq!(id_stats.row_count, Some(200));
 
@@ -118,7 +121,7 @@ async fn test_column_stats_crud(
     Ok(())
 }
 
-/// Test basic CRUD operations on cayenne_file_column_stats.
+/// Test basic CRUD operations on `cayenne_file_column_stats`.
 async fn test_file_column_stats_crud(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -178,11 +181,11 @@ async fn test_file_column_stats_crud(
     assert_eq!(all_stats.len(), 3);
 
     // Get stats for specific file
-    let file1_stats = catalog
+    let specific_file_stats = catalog
         .get_file_column_stats_for_file(&table_id, "file_001.vortex")
         .await?;
-    assert_eq!(file1_stats.len(), 2);
-    assert_eq!(file1_stats[0].file_path, "file_001.vortex");
+    assert_eq!(specific_file_stats.len(), 2);
+    assert_eq!(specific_file_stats[0].file_path, "file_001.vortex");
 
     // Remove stats for one file
     catalog
@@ -263,7 +266,7 @@ async fn test_stats_persisted_after_insert(
     );
 
     // Verify row count is populated
-    let id_stats = id_stats.unwrap();
+    let id_stats = id_stats.expect("id column stats should exist");
     assert!(
         id_stats.row_count.is_some(),
         "Expected row_count to be populated"

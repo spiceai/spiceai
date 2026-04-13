@@ -195,7 +195,7 @@ async fn test_inlined_data_visible_in_scan(
         .sql("SELECT * FROM scan_inline_test ORDER BY id")
         .await?;
     let results = df.collect().await?;
-    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
 
     assert_eq!(total_rows, 3, "Expected 3 rows from inlined data scan");
 
