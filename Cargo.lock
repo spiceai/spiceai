@@ -5617,7 +5617,7 @@ dependencies = [
 
 [[package]]
 name = "datafusion-ddl"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.2-enterprise"
 dependencies = [
  "arrow",
  "async-trait",
