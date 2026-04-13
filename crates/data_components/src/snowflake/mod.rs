@@ -77,9 +77,20 @@ async fn probe_snowflake_information_schema(
         .map(|c| format!(" AND table_catalog = '{}'", c.replace('\'', "''")))
         .unwrap_or_default();
 
+    // When a catalog (database) is specified, qualify `information_schema` with it so
+    // Snowflake can resolve the view even when the session has no current database set
+    // (error 090105: "Cannot perform SELECT. This session does not have a current database.").
+    let from_clause = table_reference
+        .catalog()
+        .map(|c| {
+            let escaped = c.replace('\'', "''");
+            format!("\"{escaped}\".information_schema.columns")
+        })
+        .unwrap_or_else(|| "information_schema.columns".to_string());
+
     let sql = format!(
         "SELECT column_name, data_type, is_nullable, numeric_precision, numeric_scale \
-         FROM information_schema.columns \
+         FROM {from_clause} \
          WHERE table_name = '{table}'{schema_filter}{catalog_filter} \
          ORDER BY ordinal_position"
     );
