@@ -4138,7 +4138,7 @@ mod tests {
             .expect("query should succeed");
 
         let results = df.collect().await.expect("collect should succeed");
-        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
 
         // With page_size=3 and max_pages=2, we expect up to 6 rows.
         // If the last page has fewer than 3 rows, we get fewer.
@@ -4995,17 +4995,21 @@ mod tests {
 
     #[test]
     fn test_expand_query_params_template() {
-        let result = expand_query_params_template("offset={offset}&limit={limit}", 0, 100).unwrap();
+        let result = expand_query_params_template("offset={offset}&limit={limit}", 0, 100)
+            .expect("page 0 should not overflow");
         assert_eq!(result, "offset=0&limit=100");
 
-        let result = expand_query_params_template("offset={offset}&limit={limit}", 3, 50).unwrap();
+        let result = expand_query_params_template("offset={offset}&limit={limit}", 3, 50)
+            .expect("page 3 should not overflow");
         assert_eq!(result, "offset=150&limit=50");
 
-        let result = expand_query_params_template("page={page}&size={limit}", 2, 25).unwrap();
+        let result = expand_query_params_template("page={page}&size={limit}", 2, 25)
+            .expect("page 2 should not overflow");
         assert_eq!(result, "page=2&size=25");
 
         // Overflow should return an error
-        assert!(expand_query_params_template("offset={offset}", usize::MAX, 2).is_err());
+        expand_query_params_template("offset={offset}", usize::MAX, 2)
+            .expect_err("usize::MAX * 2 should overflow");
     }
 
     #[test]
