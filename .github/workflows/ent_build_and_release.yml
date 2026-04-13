@@ -97,7 +97,7 @@ jobs:
             const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos";
             let linuxRunner;
             if (isTaggedRelease) {
-              linuxRunner = "ubuntu-22.04";
+              linuxRunner = "ubuntu-22.04-16core";
             } else if (isReleaseBranch) {
               linuxRunner = "spicehq-dev-large-runners";
             } else {
@@ -170,7 +170,7 @@ jobs:
     name: Build ${{ matrix.target.name }} (${{ matrix.flavor.name }})
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
-    timeout-minutes: 180
+    timeout-minutes: 300
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release-lto' }}
       CARGO_TERM_COLOR: always
@@ -178,6 +178,7 @@ jobs:
       CARGO_NET_GIT_FETCH_WITH_CLI: true
 
     strategy:
+      fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
         flavor:
@@ -340,7 +341,7 @@ jobs:
     name: Build Windows CLI
     runs-on: windows-latest
     needs: setup-matrix
-    timeout-minutes: 180
+    timeout-minutes: 300
     if: >-
       startswith(github.ref, 'refs/tags/v') ||
       startswith(github.ref, 'refs/heads/release-') ||
