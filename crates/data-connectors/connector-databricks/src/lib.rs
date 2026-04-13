@@ -117,11 +117,6 @@ pub enum Error {
     UnableToGetToken {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-
-    #[snafu(display(
-        "Insufficient permissions to read table '{table_name}'. The current principal does not have a read-compatible privilege on this table. Grant SELECT or ALL PRIVILEGES on the table, and try again."
-    ))]
-    InsufficientPermissions { table_name: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -601,16 +596,18 @@ impl Databricks {
         Arc::clone(&self.read_provider)
     }
 
-    /// Validates that a Unity Catalog table is of a supported type and that the
-    /// dataset metadata is compatible with Databricks query-time access checks.
+    /// Validates that a Unity Catalog table is of a supported type and that
+    /// the current principal has read access.
     ///
     /// Returns `Ok(())` if validation passes or if it cannot be performed
     /// (e.g., table not found in UC — the table may not be a UC table at all).
     ///
     /// Returns an error when the UC API definitively reports an unsupported
     /// table type or when effective-permissions explicitly denies read access.
-    /// Ambiguous permission results (missing or unreachable) are advisory —
-    /// Databricks query-time validation is the authoritative access check.
+    /// Explicit denials are permanent errors to protect against thundering herd
+    /// requests to the SQL Warehouse when credentials lack access.
+    /// Ambiguous results (API unreachable, table not found) are advisory —
+    /// Databricks query-time validation is the fallback.
     async fn validate_uc_table(
         &self,
         uc_client: &UnityCatalogClient,
@@ -618,7 +615,7 @@ impl Databricks {
         dataset: &Dataset,
     ) -> DataConnectorResult<()> {
         let full_name = table_reference.to_string();
-        let should_validate_permissions = match uc_client.get_table(table_reference).await {
+        let requires_permission_check = match uc_client.get_table(table_reference).await {
             Ok(Some(uc_table)) => {
                 if !uc_table.is_queryable() {
                     return Err(DataConnectorError::InvalidConfigurationNoSource {
@@ -642,17 +639,17 @@ impl Databricks {
                         table_type = %uc_table.table_type,
                         "Skipping strict Unity Catalog permission precheck for foreign table; Databricks validates access at query time"
                     );
-                    return Ok(());
+                    false
+                } else {
+                    true
                 }
-
-                true
             }
             Ok(None) => {
                 tracing::debug!(
                     table = %full_name,
                     "Table not found in Unity Catalog; skipping UC validation"
                 );
-                return Ok(());
+                false
             }
             Err(e) => {
                 tracing::warn!(
@@ -660,44 +657,41 @@ impl Databricks {
                     error = %e,
                     "Failed to check Unity Catalog table metadata; proceeding without validation"
                 );
-                return Ok(());
+                false
             }
         };
 
-        // 2) Check permissions via UC effective-permissions endpoint.
-        if should_validate_permissions {
+        if requires_permission_check {
             match uc_client.get_effective_permissions(&full_name).await {
-                Ok(Some(perms)) => {
-                    if perms.has_read_permission() {
-                        tracing::debug!(
-                            table = %full_name,
-                            principals = ?perms.principals(),
-                            "Unity Catalog permission check passed"
-                        );
-                    } else {
-                        // Explicit denial: the API returned privileges but none
-                        // grant read access. This is a permanent error — the
-                        // user must fix permissions and restart the runtime.
-                        return Err(DataConnectorError::InsufficientPermissions {
-                            dataconnector: "databricks".to_string(),
-                            connector_component: ConnectorComponent::from(dataset),
-                            source: Box::new(Error::InsufficientPermissions {
-                                table_name: full_name,
-                            }),
-                        });
-                    }
-                }
-                Ok(None) => {
-                    // Ambiguous: table not found in permissions endpoint.
-                    // Warn and let Databricks query-time validation decide.
+                Ok(Some(perms)) if !perms.has_read_permission() => {
                     tracing::warn!(
                         table = %full_name,
-                        "Table not found when checking permissions; proceeding and deferring to Databricks query-time validation"
+                        principals = ?perms.principals(),
+                        privileges = ?perms.all_privileges(),
+                        "Unity Catalog reports no read-compatible privilege"
+                    );
+                    return Err(DataConnectorError::InsufficientPermissions {
+                        dataconnector: "databricks".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        source: format!(
+                            "No read-compatible privilege for table '{full_name}'. Grant SELECT or ALL PRIVILEGES on the table."
+                        ).into(),
+                    });
+                }
+                Ok(Some(perms)) => {
+                    tracing::debug!(
+                        table = %full_name,
+                        principals = ?perms.principals(),
+                        "Unity Catalog permission check passed"
+                    );
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        table = %full_name,
+                        "Table not found when checking permissions; proceeding"
                     );
                 }
                 Err(e) => {
-                    // Ambiguous: could not reach the permissions API.
-                    // Warn and let Databricks query-time validation decide.
                     tracing::warn!(
                         table = %full_name,
                         error = %e,
@@ -1459,7 +1453,7 @@ mod tests {
                         .unwrap_or_else(|| MockHttpResponse::json("200 OK", r#"{"ok":true}"#));
 
                     let mut http_response = format!(
-                        "HTTP/1.1 {}\r\nContent-Length: {}\r\n",
+                        "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n",
                         response.status_line,
                         response.body.len()
                     );
@@ -1481,30 +1475,34 @@ mod tests {
     }
 
     async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
-        let mut captured_request = Vec::with_capacity(4096);
-        let mut buf = [0u8; 1024];
-        let mut expected_total_len = None;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut captured_request = Vec::with_capacity(4096);
+            let mut buf = [0u8; 1024];
+            let mut expected_total_len = None;
 
-        loop {
-            let bytes_read = match stream.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(bytes_read) => bytes_read,
-            };
+            loop {
+                let bytes_read = match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(bytes_read) => bytes_read,
+                };
 
-            captured_request.extend_from_slice(&buf[..bytes_read]);
+                captured_request.extend_from_slice(&buf[..bytes_read]);
 
-            if expected_total_len.is_none() {
-                expected_total_len = expected_http_request_len(&captured_request);
+                if expected_total_len.is_none() {
+                    expected_total_len = expected_http_request_len(&captured_request);
+                }
+
+                if let Some(expected_total_len) = expected_total_len
+                    && captured_request.len() >= expected_total_len
+                {
+                    break;
+                }
             }
 
-            if let Some(expected_total_len) = expected_total_len
-                && captured_request.len() >= expected_total_len
-            {
-                break;
-            }
-        }
-
-        captured_request
+            captured_request
+        })
+        .await
+        .unwrap_or_default()
     }
 
     fn expected_http_request_len(request: &[u8]) -> Option<usize> {

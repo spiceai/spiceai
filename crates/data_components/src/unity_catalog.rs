@@ -400,6 +400,45 @@ impl UnityCatalog {
             .collect::<Vec<_>>()
             .join(".")
     }
+
+    /// Runs an advisory permission check and logs the result.
+    ///
+    /// This never blocks initialization or filters tables — it only produces
+    /// diagnostic log output so operators can identify likely access issues
+    /// before queries hit Databricks at runtime.
+    pub async fn log_advisory_permission_check(&self, table_name: &str, context: &str) {
+        match self.get_effective_permissions(table_name).await {
+            Ok(Some(perms)) => {
+                if perms.has_read_permission() {
+                    tracing::debug!(
+                        table = %table_name,
+                        principals = ?perms.principals(),
+                        "Unity Catalog permission check passed"
+                    );
+                } else {
+                    tracing::warn!(
+                        table = %table_name,
+                        principals = ?perms.principals(),
+                        privileges = ?perms.all_privileges(),
+                        "Unity Catalog effective-permissions did not report a read-compatible privilege during {context}; proceeding and deferring to Databricks query-time validation"
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    table = %table_name,
+                    "Table not found when checking permissions; proceeding"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    table = %table_name,
+                    error = %e,
+                    "Failed to check Unity Catalog permissions; proceeding without validation"
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
