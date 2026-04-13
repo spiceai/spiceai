@@ -126,8 +126,12 @@ impl ColumnStatsAccumulator {
             }
             let acc = &mut cols[i];
             let num_rows = col.len();
-            acc.row_count += i64::try_from(num_rows).unwrap_or(i64::MAX);
-            acc.null_count += i64::try_from(col.null_count()).unwrap_or(0);
+            acc.row_count = acc
+                .row_count
+                .saturating_add(i64::try_from(num_rows).unwrap_or(i64::MAX));
+            acc.null_count = acc
+                .null_count
+                .saturating_add(i64::try_from(col.null_count()).unwrap_or(0));
 
             if col.is_empty() || col.null_count() == col.len() {
                 continue;
