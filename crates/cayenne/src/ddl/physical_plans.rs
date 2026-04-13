@@ -50,6 +50,7 @@ use super::operations::{CreateTableParams, create_schema, create_table, drop_tab
 use crate::ddl::get_cayenne_provider;
 use crate::provider::CayenneTableProvider;
 use data_components::delete::DeletionTableProviderAdapter;
+use runtime_table_partition::provider::PartitionTableProvider;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -610,24 +611,25 @@ async fn execute_merge(
     // matched key tuples and probe each file's rows with O(1) lookups. This
     // replaces the O(N) filter expression that the legacy path builds and
     // evaluates against every chunk of every file.
-    let delete_count = if let Some(cayenne) =
-        unwrap_position_based_cayenne(&target_provider)
+    let delete_count = match try_key_probe_delete(
+        &target_provider,
+        &normalized_batches,
+        &target_key_columns,
+    )
+    .await?
     {
-        let matched_keys =
-            extract_matched_key_set(&normalized_batches, &target_key_columns)?;
-        cayenne
-            .delete_matched_rows_by_key_probe(matched_keys, &target_key_columns)
-            .await?
-    } else {
-        // Legacy path: build filter expression and push through delete_from.
-        let delete_filter =
-            build_delete_filter(&normalized_batches, &target_key_columns)?;
-        let delete_plan = target_provider
-            .delete_from(&session_state, vec![delete_filter])
-            .await?;
-        let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
-        let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
-        extract_dml_count(&delete_batches)
+        Some(count) => count,
+        None => {
+            // Legacy path: build filter expression and push through delete_from.
+            let delete_filter =
+                build_delete_filter(&normalized_batches, &target_key_columns)?;
+            let delete_plan = target_provider
+                .delete_from(&session_state, vec![delete_filter])
+                .await?;
+            let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
+            let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
+            extract_dml_count(&delete_batches)
+        }
     };
 
     // Verify the delete count matches the expected number of rows.
@@ -863,27 +865,30 @@ fn extract_matched_key_set(
     Ok(keys)
 }
 
-/// Attempt to unwrap a `dyn TableProvider` into a `&CayenneTableProvider` that
-/// uses the `PositionBased` deletion strategy.
+/// Try the fast key-probe deletion path for PositionBased Cayenne tables.
 ///
-/// Handles the common wrapper types:
-/// - Direct `CayenneTableProvider`
-/// - `DeletionTableProviderAdapter` wrapping `CayenneTableProvider`
-/// - `PartitionTableProvider` — returns `None` (partition dispatch handled separately below)
-///
-/// Returns `None` if the provider is not a PositionBased Cayenne table.
-fn unwrap_position_based_cayenne(
+/// Returns `Some(delete_count)` if the provider is a PositionBased Cayenne table
+/// (direct, adapter-wrapped, or partitioned) and the deletion succeeded.
+/// Returns `None` if the provider doesn't support the fast path, in which case
+/// the caller should fall back to the legacy filter-based deletion.
+async fn try_key_probe_delete(
     provider: &Arc<dyn TableProvider>,
-) -> Option<&CayenneTableProvider> {
-    // Direct CayenneTableProvider.
+    batches: &[RecordBatch],
+    key_columns: &[String],
+) -> Result<Option<u64>, DataFusionError> {
+    // Case 1: Direct CayenneTableProvider.
     if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>() {
         if cayenne.is_position_based() {
-            return Some(cayenne);
+            let matched_keys = extract_matched_key_set(batches, key_columns)?;
+            let count = cayenne
+                .delete_matched_rows_by_key_probe(matched_keys, key_columns)
+                .await?;
+            return Ok(Some(count));
         }
-        return None;
+        return Ok(None);
     }
 
-    // DeletionTableProviderAdapter wrapping CayenneTableProvider.
+    // Case 2: DeletionTableProviderAdapter wrapping CayenneTableProvider.
     if let Some(adapter) = provider
         .as_any()
         .downcast_ref::<DeletionTableProviderAdapter>()
@@ -894,15 +899,65 @@ fn unwrap_position_based_cayenne(
             .downcast_ref::<CayenneTableProvider>()
         {
             if cayenne.is_position_based() {
-                return Some(cayenne);
+                let matched_keys = extract_matched_key_set(batches, key_columns)?;
+                let count = cayenne
+                    .delete_matched_rows_by_key_probe(matched_keys, key_columns)
+                    .await?;
+                return Ok(Some(count));
             }
         }
-        return None;
+        return Ok(None);
     }
 
-    // PartitionTableProvider: each partition must be handled individually.
-    // For now, fall back to the legacy filter-based path for partitioned tables.
-    // TODO: iterate partition_table_providers() and call delete_matched_rows_by_key_probe
-    // on each inner CayenneTableProvider.
-    None
+    // Case 3: PartitionTableProvider wrapping per-partition Cayenne providers.
+    // All partitions share the same table metadata and deletion strategy, so
+    // checking the first partition is sufficient to decide the fast path.
+    if let Some(partitioned) = provider
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+    {
+        let providers = partitioned.partition_table_providers().await;
+        let first_is_position_based = providers
+            .first()
+            .and_then(unwrap_to_cayenne)
+            .is_some_and(CayenneTableProvider::is_position_based);
+        if !first_is_position_based {
+            return Ok(None);
+        }
+
+        let matched_keys = extract_matched_key_set(batches, key_columns)?;
+        let mut total = 0u64;
+        for pp in &providers {
+            if let Some(cayenne) = unwrap_to_cayenne(pp) {
+                // Each partition's listing table only contains its own files, so
+                // the full matched_keys set is passed to each — hash probes for
+                // keys not in this partition simply find no matches.
+                total += cayenne
+                    .delete_matched_rows_by_key_probe(matched_keys.clone(), key_columns)
+                    .await?;
+            }
+        }
+        return Ok(Some(total));
+    }
+
+    Ok(None)
+}
+
+/// Unwrap a `dyn TableProvider` to the inner `CayenneTableProvider`, handling
+/// the `DeletionTableProviderAdapter` wrapper.
+fn unwrap_to_cayenne(provider: &Arc<dyn TableProvider>) -> Option<&CayenneTableProvider> {
+    provider
+        .as_any()
+        .downcast_ref::<CayenneTableProvider>()
+        .or_else(|| {
+            provider
+                .as_any()
+                .downcast_ref::<DeletionTableProviderAdapter>()
+                .and_then(|adapter| {
+                    adapter
+                        .source()
+                        .as_any()
+                        .downcast_ref::<CayenneTableProvider>()
+                })
+        })
 }
