@@ -1,5 +1,5 @@
 /*
-Copyright 2026 The Spice.ai OSS Authors
+Copyright 2026, Spice AI, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,33 +14,40 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Cayenne DDL support: analyzer rule, logical nodes, extension planner,
-//! and physical execution plans for `CREATE TABLE` / `DROP TABLE` / `CREATE SCHEMA` on
-//! Cayenne-backed DDL-enabled catalogs.
+//! Broadcast (distributed) Cayenne DDL and DML support for the runtime.
 //!
-//! Reuses the shared DDL infrastructure from [`super::ddl`].
+//! DDL: [`DistributedCayenneDdlHandler`] implements [`CatalogDdlHandler`] and is
+//! paired with `datafusion_ddl::DdlAnalyzerRule` + `DdlExtensionPlanner`.
+//!
+//! DML: [`CayenneDmlExtensionPlanner`] handles local MERGE, [`DistributedCayenneDmlExtensionPlanner`] handles distributed DML extension
+//! nodes (`DistributedCayenneDelete/Update/Insert/Merge`) and the local
+//! `CayenneMerge` node.
 
-pub mod analyzer_rule;
+pub mod dml_planner;
+pub mod handler;
 pub mod logical_nodes;
 pub mod physical_plans;
-pub mod planner;
+
+pub use dml_planner::{
+    DistributedCayenneDmlExtensionPlanner, extract_filter_sql, extract_update_assignments,
+};
+pub use handler::DistributedCayenneDdlHandler;
 
 use datafusion::catalog::CatalogProvider;
 
-use cayenne::CayenneCatalogProvider;
+use cayenne::catalog_provider::CayenneCatalogProvider;
 
 use super::composed_catalog::ComposedCatalogProvider;
 use crate::catalogconnector::PartitionAwareCatalog;
 
-/// Check whether the given catalog provider is a Cayenne-backed catalog.
+/// Returns `true` if `provider` is Cayenne-backed — handles both a direct
+/// [`CayenneCatalogProvider`] and the runtime's [`ComposedCatalogProvider`] wrapper.
 pub fn is_cayenne_catalog(provider: &dyn CatalogProvider) -> bool {
     get_cayenne_provider(provider).is_some()
 }
 
-/// Extract the [`CayenneCatalogProvider`] reference from a `CatalogProvider`.
-///
-/// Handles both direct `CayenneCatalogProvider` and `ComposedCatalogProvider`
-/// wrapping a `CayenneCatalogProvider`.
+/// Extract the [`CayenneCatalogProvider`] reference, handling both direct and
+/// `ComposedCatalogProvider`-wrapped cases.
 pub fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCatalogProvider> {
     if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneCatalogProvider>() {
         return Some(cayenne);
@@ -51,16 +58,10 @@ pub fn get_cayenne_provider(provider: &dyn CatalogProvider) -> Option<&CayenneCa
             .as_any()
             .downcast_ref::<CayenneCatalogProvider>();
     }
-
     None
 }
 
-/// If the catalog provider is Cayenne-backed and implements [`PartitionAwareCatalog`],
-/// return a trait reference.
-///
-/// Handles both direct [`CayenneCatalogProvider`] providers and
-/// [`ComposedCatalogProvider`] wrappers whose external provider is a
-/// [`CayenneCatalogProvider`].
+/// Return a [`PartitionAwareCatalog`] reference if the provider is Cayenne-backed.
 pub fn as_partition_aware(provider: &dyn CatalogProvider) -> Option<&dyn PartitionAwareCatalog> {
     let cayenne_catalog = get_cayenne_provider(provider)?;
     Some(cayenne_catalog as &dyn PartitionAwareCatalog)

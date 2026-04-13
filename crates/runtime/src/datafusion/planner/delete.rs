@@ -28,7 +28,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{Extension, LogicalPlan};
 use datafusion_expr::DmlStatement;
 
-use crate::datafusion::cayenne_ddl::analyzer_rule::extract_filter_sql;
+use crate::datafusion::cayenne_ddl::dml_planner::extract_filter_sql;
 use crate::datafusion::cayenne_ddl::logical_nodes::DistributedCayenneDeleteNode;
 
 /// Wrap a `DataFusion` `DmlStatement` (DELETE) into a distributed Cayenne
