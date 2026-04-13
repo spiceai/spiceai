@@ -213,7 +213,7 @@ impl CayenneDataSink {
         // validate_on_conflict() (via prepare_stream_for_insert) on the incoming stream
         // to handle upserts for PKs that already exist in the table. Without this,
         // duplicate PKs would appear in query results.
-        let (prepared_stream, delete_specs, deleted_pk_i64, deleted_row_keys) =
+        let (mut prepared_stream, delete_specs, deleted_pk_i64, deleted_row_keys) =
             self.table.prepare_stream_for_insert(data).await?;
 
         let has_on_conflict_deletions = !delete_specs.is_empty();
@@ -254,17 +254,33 @@ impl CayenneDataSink {
             && !has_sort_columns
             && !self.table.has_retention_filters();
         if can_inline {
-            // Collect the stream to check if it's small enough to inline
+            // Collect the stream incrementally, checking row count to avoid buffering
+            // arbitrarily large data when it exceeds the inline threshold.
             let schema = prepared_stream.schema();
-            let batches: Vec<arrow::record_batch::RecordBatch> =
-                futures::TryStreamExt::try_collect(prepared_stream).await?;
-            let total_rows_in_batches: usize =
-                batches.iter().map(arrow::record_batch::RecordBatch::num_rows).sum();
+            let mut batches = Vec::new();
+            let mut total_rows = 0usize;
+            let mut exceeded = false;
+            while let Some(batch) = futures::StreamExt::next(&mut prepared_stream).await {
+                let batch = batch?;
+                total_rows += batch.num_rows();
+                batches.push(batch);
+                if total_rows > super::table::INLINE_MAX_ROWS {
+                    // Exceeded inline threshold — drain remaining stream and use Vortex path
+                    while let Some(b) = futures::StreamExt::next(&mut prepared_stream).await {
+                        batches.push(b?);
+                    }
+                    exceeded = true;
+                    break;
+                }
+            }
+            let total_rows_in_batches: usize = batches
+                .iter()
+                .map(arrow::record_batch::RecordBatch::num_rows)
+                .sum();
 
-            if total_rows_in_batches > 0 && total_rows_in_batches <= super::table::INLINE_MAX_ROWS {
+            if !exceeded && total_rows_in_batches > 0 {
                 // Concatenate into a single batch for efficient storage
-                let single_batch =
-                    arrow::compute::concat_batches(&schema, &batches)?;
+                let single_batch = arrow::compute::concat_batches(&schema, &batches)?;
 
                 if self.table.try_inline_batch(&single_batch).await? {
                     // Persist stats from the inlined batch
@@ -273,19 +289,28 @@ impl CayenneDataSink {
                     self.table.persist_table_stats(&stats_acc).await;
 
                     // Auto-checkpoint when accumulated inline data exceeds 10K rows
-                    let inlined_count = self
+                    let inlined_count = match self
                         .table
                         .catalog()
                         .get_inlined_data_count(self.table.table_id())
                         .await
-                        .unwrap_or(0);
-                    if inlined_count > 10_000 {
-                        if let Err(e) = self.table.checkpoint_inlined_data().await {
+                    {
+                        Ok(count) => count,
+                        Err(e) => {
                             tracing::warn!(
-                                "Auto-checkpoint of inlined data failed for {}: {e}",
+                                "Failed to get inlined data count for table {}, triggering checkpoint conservatively: {e}",
                                 self.table.table_name(),
                             );
+                            i64::MAX
                         }
+                    };
+                    if inlined_count > 10_000
+                        && let Err(e) = self.table.checkpoint_inlined_data().await
+                    {
+                        tracing::warn!(
+                            "Auto-checkpoint of inlined data failed for {}: {e}",
+                            self.table.table_name(),
+                        );
                     }
 
                     return Ok(u64::try_from(total_rows_in_batches).unwrap_or(u64::MAX));
@@ -295,15 +320,13 @@ impl CayenneDataSink {
             }
 
             // Re-create a stream from collected batches for the normal write path
-            let mem_exec =
-                datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
-                    &[batches],
-                    schema,
-                    None,
-                )?;
+            let mem_exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+                &[batches],
+                schema,
+                None,
+            )?;
             let ctx = datafusion::prelude::SessionContext::new();
-            let re_stream =
-                datafusion_physical_plan::execute_stream(mem_exec, ctx.task_ctx())?;
+            let re_stream = datafusion_physical_plan::execute_stream(mem_exec, ctx.task_ctx())?;
 
             // Continue with the normal write path using the re-created stream
             let target_size_bytes = self.context.target_file_size_bytes();

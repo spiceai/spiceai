@@ -387,9 +387,7 @@ async fn test_wal_persists_on_move_failure_impl(
     // Step 3: Attempt another insert — should fail during the move phase.
     // Insert >1024 rows to bypass the data inlining fast-path and ensure the
     // write goes through the Vortex staging WAL path.
-    let values: Vec<String> = (2..1030)
-        .map(|i| format!("({i}, 'name_{i}')"))
-        .collect();
+    let values: Vec<String> = (2..1030).map(|i| format!("({i}, 'name_{i}')")).collect();
     let insert_sql = format!("INSERT INTO wal_move_fail VALUES {}", values.join(", "));
     let result = ctx.sql(&insert_sql).await?.collect().await;
 

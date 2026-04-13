@@ -96,8 +96,8 @@ pub(crate) struct ColumnStatsAccumulator {
 
 #[derive(Debug, Default, Clone)]
 struct PerColumnAcc {
-    min_value: Option<String>,
-    max_value: Option<String>,
+    min_value: Option<datafusion_common::ScalarValue>,
+    max_value: Option<datafusion_common::ScalarValue>,
     null_count: i64,
     row_count: i64,
 }
@@ -117,7 +117,10 @@ impl ColumnStatsAccumulator {
     pub(crate) fn update(&self, batch: &RecordBatch) {
         let mut cols = match self.columns.lock() {
             Ok(guard) => guard,
-            Err(_) => return, // poisoned lock — skip update
+            Err(_) => {
+                tracing::warn!("ColumnStatsAccumulator: mutex poisoned in update(), skipping");
+                return;
+            }
         };
 
         for (i, col) in batch.columns().iter().enumerate() {
@@ -129,13 +132,59 @@ impl ColumnStatsAccumulator {
             acc.row_count += i64::try_from(num_rows).unwrap_or(i64::MAX);
             acc.null_count += i64::try_from(col.null_count()).unwrap_or(0);
 
-            let (batch_min, batch_max) = array_min_max_strings(col.as_ref());
+            if col.is_empty() || col.null_count() == col.len() {
+                continue;
+            }
+
+            // Find the index of the min value using sort_to_indices
+            let batch_min = arrow::compute::sort_to_indices(
+                col.as_ref(),
+                Some(arrow::compute::SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+                Some(1),
+            )
+            .ok()
+            .and_then(|indices| {
+                if indices.is_empty() {
+                    None
+                } else {
+                    datafusion_common::ScalarValue::try_from_array(
+                        col.as_ref(),
+                        indices.value(0) as usize,
+                    )
+                    .ok()
+                }
+            });
+
+            // Find the index of the max value using sort_to_indices
+            let batch_max = arrow::compute::sort_to_indices(
+                col.as_ref(),
+                Some(arrow::compute::SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                }),
+                Some(1),
+            )
+            .ok()
+            .and_then(|indices| {
+                if indices.is_empty() {
+                    None
+                } else {
+                    datafusion_common::ScalarValue::try_from_array(
+                        col.as_ref(),
+                        indices.value(0) as usize,
+                    )
+                    .ok()
+                }
+            });
 
             if let Some(bmin) = batch_min {
                 acc.min_value = Some(match &acc.min_value {
                     None => bmin,
                     Some(existing) => {
-                        if bmin < *existing {
+                        if bmin.partial_cmp(existing) == Some(std::cmp::Ordering::Less) {
                             bmin
                         } else {
                             existing.clone()
@@ -147,7 +196,7 @@ impl ColumnStatsAccumulator {
                 acc.max_value = Some(match &acc.max_value {
                     None => bmax,
                     Some(existing) => {
-                        if bmax > *existing {
+                        if bmax.partial_cmp(existing) == Some(std::cmp::Ordering::Greater) {
                             bmax
                         } else {
                             existing.clone()
@@ -162,7 +211,12 @@ impl ColumnStatsAccumulator {
     pub(crate) fn to_column_stats(&self, table_id: &str) -> Vec<crate::metadata::ColumnStats> {
         let cols = match self.columns.lock() {
             Ok(guard) => guard,
-            Err(_) => return Vec::new(),
+            Err(_) => {
+                tracing::warn!(
+                    "ColumnStatsAccumulator: mutex poisoned in to_column_stats(), returning empty"
+                );
+                return Vec::new();
+            }
         };
 
         self.column_names
@@ -172,87 +226,12 @@ impl ColumnStatsAccumulator {
             .map(|(name, acc)| crate::metadata::ColumnStats {
                 table_id: table_id.to_string(),
                 column_name: name.clone(),
-                min_value: acc.min_value.clone(),
-                max_value: acc.max_value.clone(),
+                min_value: acc.min_value.as_ref().map(|v| v.to_string()),
+                max_value: acc.max_value.as_ref().map(|v| v.to_string()),
                 null_count: Some(acc.null_count),
                 row_count: Some(acc.row_count),
             })
             .collect()
-    }
-}
-
-/// Extract min and max values from an Arrow array as strings.
-///
-/// Dispatches on data type to use the appropriate typed aggregate kernel.
-/// Returns `(None, None)` for unsupported types or all-null arrays.
-fn array_min_max_strings(array: &dyn arrow::array::Array) -> (Option<String>, Option<String>) {
-    use arrow::array::*;
-    use arrow::compute::{max, max_string, min, min_string};
-    use arrow::datatypes::{DataType, TimeUnit};
-
-    if array.is_empty() || array.null_count() == array.len() {
-        return (None, None);
-    }
-
-    macro_rules! primitive_min_max {
-        ($array_ty:ty) => {{
-            let typed = array.as_any().downcast_ref::<$array_ty>();
-            match typed {
-                Some(arr) => (
-                    min(arr).map(|v| v.to_string()),
-                    max(arr).map(|v| v.to_string()),
-                ),
-                None => (None, None),
-            }
-        }};
-    }
-
-    match array.data_type() {
-        DataType::Int8 => primitive_min_max!(Int8Array),
-        DataType::Int16 => primitive_min_max!(Int16Array),
-        DataType::Int32 => primitive_min_max!(Int32Array),
-        DataType::Int64 => primitive_min_max!(Int64Array),
-        DataType::UInt8 => primitive_min_max!(UInt8Array),
-        DataType::UInt16 => primitive_min_max!(UInt16Array),
-        DataType::UInt32 => primitive_min_max!(UInt32Array),
-        DataType::UInt64 => primitive_min_max!(UInt64Array),
-        DataType::Float32 => primitive_min_max!(Float32Array),
-        DataType::Float64 => primitive_min_max!(Float64Array),
-        DataType::Date32 => primitive_min_max!(Date32Array),
-        DataType::Date64 => primitive_min_max!(Date64Array),
-        DataType::Timestamp(TimeUnit::Second, _) => {
-            primitive_min_max!(TimestampSecondArray)
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            primitive_min_max!(TimestampMillisecondArray)
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            primitive_min_max!(TimestampMicrosecondArray)
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            primitive_min_max!(TimestampNanosecondArray)
-        }
-        DataType::Utf8 => {
-            let typed = array.as_any().downcast_ref::<StringArray>();
-            match typed {
-                Some(arr) => (
-                    min_string(arr).map(String::from),
-                    max_string(arr).map(String::from),
-                ),
-                None => (None, None),
-            }
-        }
-        DataType::LargeUtf8 => {
-            let typed = array.as_any().downcast_ref::<LargeStringArray>();
-            match typed {
-                Some(arr) => (
-                    min_string(arr).map(String::from),
-                    max_string(arr).map(String::from),
-                ),
-                None => (None, None),
-            }
-        }
-        _ => (None, None),
     }
 }
 
@@ -263,11 +242,12 @@ pub(crate) const INLINE_MAX_ROWS: usize = 1024;
 const INLINE_MAX_BYTES: usize = 1_048_576; // 1 MB
 
 /// Serialize a `RecordBatch` to Arrow IPC bytes (stream format, single batch).
-fn serialize_batch_to_ipc(batch: &RecordBatch) -> std::result::Result<Vec<u8>, arrow::error::ArrowError> {
+fn serialize_batch_to_ipc(
+    batch: &RecordBatch,
+) -> std::result::Result<Vec<u8>, arrow::error::ArrowError> {
     let mut buf = Vec::new();
     {
-        let mut writer =
-            arrow::ipc::writer::StreamWriter::try_new(&mut buf, batch.schema_ref())?;
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, batch.schema_ref())?;
         writer.write(batch)?;
         writer.finish()?;
     }
@@ -1639,8 +1619,7 @@ impl CayenneTableProvider {
         let total_rows_written = Arc::new(AtomicU64::new(0));
 
         // Column stats accumulator — updated per batch during writes
-        let stats_accumulator =
-            Arc::new(ColumnStatsAccumulator::new(&self.table_metadata.schema));
+        let stats_accumulator = Arc::new(ColumnStatsAccumulator::new(&self.table_metadata.schema));
 
         // Log when starting S3 upload process
         if is_s3_storage {
@@ -3409,19 +3388,14 @@ impl CayenneTableProvider {
     ///
     /// Returns `true` if the batch was inlined, `false` if it's too large and should
     /// go through the normal Vortex write path.
-    pub(crate) async fn try_inline_batch(
-        &self,
-        batch: &RecordBatch,
-    ) -> Result<bool> {
+    pub(crate) async fn try_inline_batch(&self, batch: &RecordBatch) -> Result<bool> {
         if batch.num_rows() == 0 {
             return Ok(true); // nothing to write
         }
         if batch.num_rows() > INLINE_MAX_ROWS {
             return Ok(false);
         }
-        let ipc_bytes = serialize_batch_to_ipc(batch).map_err(|e| Error::Arrow {
-            source: e,
-        })?;
+        let ipc_bytes = serialize_batch_to_ipc(batch).map_err(|e| Error::Arrow { source: e })?;
         if ipc_bytes.len() > INLINE_MAX_BYTES {
             return Ok(false);
         }
@@ -3469,16 +3443,9 @@ impl CayenneTableProvider {
 
         let mut batches = Vec::new();
         for entry in &inlined {
-            match deserialize_ipc_to_batch(&entry.data_ipc) {
-                Ok(entry_batches) => batches.extend(entry_batches),
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to deserialize inlined data {} for table {}: {e}",
-                        entry.inlined_id,
-                        self.table_metadata.table_name
-                    );
-                }
-            }
+            let entry_batches = deserialize_ipc_to_batch(&entry.data_ipc)
+                .map_err(|e| super::Error::Arrow { source: e })?;
+            batches.extend(entry_batches);
         }
 
         Ok(batches)
@@ -3487,7 +3454,7 @@ impl CayenneTableProvider {
     /// Checkpoint: flush all inlined data to a Vortex file and clear from metastore.
     ///
     /// Reads all inlined data entries, concatenates them into a single stream,
-    /// writes to a new snapshot via the normal write path, and clears the
+    /// writes to the current snapshot via the normal write path, and clears the
     /// inlined data in the metastore.
     pub(crate) async fn checkpoint_inlined_data(&self) -> Result<u64> {
         let batches = self.read_inlined_batches().await?;
@@ -4324,7 +4291,12 @@ impl TableProvider for CayenneTableProvider {
             .await?;
 
         // Read any inlined data and create a MemoryExec plan for it.
-        let inlined_batches = self.read_inlined_batches().await.unwrap_or_default();
+        let inlined_batches = self.read_inlined_batches().await.map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Failed to read inlined data for table {}: {e}",
+                self.table_metadata.table_name
+            ))
+        })?;
         let inlined_plan: Option<Arc<dyn ExecutionPlan>> = if inlined_batches.is_empty() {
             None
         } else {
@@ -4341,26 +4313,30 @@ impl TableProvider for CayenneTableProvider {
 
             let projected_batches: Vec<RecordBatch> = inlined_batches
                 .into_iter()
-                .filter_map(|batch| {
+                .map(|batch| {
                     if let Some(ref proj) = effective_projection {
-                        batch.project(proj).ok()
+                        batch.project(proj).map_err(|e| {
+                            datafusion_common::DataFusionError::Execution(format!(
+                                "Failed to project inlined batch for table {}: {e}",
+                                self.table_metadata.table_name
+                            ))
+                        })
                     } else {
-                        Some(batch)
+                        Ok(batch)
                     }
                 })
-                .collect();
+                .collect::<datafusion_common::Result<Vec<_>>>()?;
 
             if projected_batches.is_empty() {
                 None
             } else {
-                match datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
-                    &[projected_batches],
-                    proj_schema,
-                    None,
-                ) {
-                    Ok(exec) => Some(exec),
-                    Err(_) => None,
-                }
+                Some(
+                    datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+                        &[projected_batches],
+                        proj_schema,
+                        None,
+                    )?,
+                )
             }
         };
 
@@ -4597,7 +4573,12 @@ impl DeletionTableProvider for CayenneTableProvider {
             .catalog
             .get_inlined_data_count(&self.table_metadata.table_id)
             .await
-            .unwrap_or(0);
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "Failed to get inlined data count for table {}: {e}",
+                    self.table_metadata.table_name
+                ))
+            })?;
         if inlined_count > 0 {
             self.checkpoint_inlined_data().await.map_err(|e| {
                 datafusion_common::DataFusionError::Execution(format!(

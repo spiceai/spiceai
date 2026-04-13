@@ -1265,23 +1265,46 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn upsert_column_stats(&self, stats: &[ColumnStats]) -> CatalogResult<()> {
-        for stat in stats {
-            self.metastore
-                .execute_helper(ExecuteParams {
-                    sql: r"
-                    INSERT OR REPLACE INTO cayenne_column_stats
-                        (table_id, column_name, min_value, max_value, null_count, row_count)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                    ",
-                    params: vec![
-                        MetastoreValue::Text(stat.table_id.clone()),
-                        MetastoreValue::Text(stat.column_name.clone()),
-                        stat.min_value.clone().into(),
-                        stat.max_value.clone().into(),
-                        stat.null_count.into(),
-                        stat.row_count.into(),
-                    ],
+        const COLUMN_STATS_PARAMS_PER_ROW: usize = 6;
+        const BATCH_SIZE: usize = 999 / COLUMN_STATS_PARAMS_PER_ROW; // 166
+
+        for chunk in stats.chunks(BATCH_SIZE) {
+            let placeholders: Vec<String> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let base = i * COLUMN_STATS_PARAMS_PER_ROW;
+                    format!(
+                        "(?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
+                        base + 1,
+                        base + 2,
+                        base + 3,
+                        base + 4,
+                        base + 5,
+                        base + 6,
+                    )
                 })
+                .collect();
+
+            let sql = format!(
+                "INSERT OR REPLACE INTO cayenne_column_stats \
+                 (table_id, column_name, min_value, max_value, null_count, row_count) \
+                 VALUES {}",
+                placeholders.join(", ")
+            );
+
+            let mut params = Vec::with_capacity(chunk.len() * COLUMN_STATS_PARAMS_PER_ROW);
+            for stat in chunk {
+                params.push(MetastoreValue::Text(stat.table_id.clone()));
+                params.push(MetastoreValue::Text(stat.column_name.clone()));
+                params.push(stat.min_value.clone().into());
+                params.push(stat.max_value.clone().into());
+                params.push(stat.null_count.into());
+                params.push(stat.row_count.into());
+            }
+
+            self.metastore
+                .execute_helper(ExecuteParams { sql: &sql, params })
                 .await?;
         }
         Ok(())
@@ -1323,24 +1346,48 @@ impl MetadataCatalog for CayenneCatalog {
     }
 
     async fn upsert_file_column_stats(&self, stats: &[FileColumnStats]) -> CatalogResult<()> {
-        for stat in stats {
-            self.metastore
-                .execute_helper(ExecuteParams {
-                    sql: r"
-                    INSERT OR REPLACE INTO cayenne_file_column_stats
-                        (table_id, file_path, column_name, min_value, max_value, null_count, row_count)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                    ",
-                    params: vec![
-                        MetastoreValue::Text(stat.table_id.clone()),
-                        MetastoreValue::Text(stat.file_path.clone()),
-                        MetastoreValue::Text(stat.column_name.clone()),
-                        stat.min_value.clone().into(),
-                        stat.max_value.clone().into(),
-                        stat.null_count.into(),
-                        stat.row_count.into(),
-                    ],
+        const PARAMS_PER_ROW: usize = 7;
+        const BATCH_SIZE: usize = 999 / PARAMS_PER_ROW; // 142
+
+        for chunk in stats.chunks(BATCH_SIZE) {
+            let placeholders: Vec<String> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    let base = i * PARAMS_PER_ROW;
+                    format!(
+                        "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
+                        base + 1,
+                        base + 2,
+                        base + 3,
+                        base + 4,
+                        base + 5,
+                        base + 6,
+                        base + 7,
+                    )
                 })
+                .collect();
+
+            let sql = format!(
+                "INSERT OR REPLACE INTO cayenne_file_column_stats \
+                 (table_id, file_path, column_name, min_value, max_value, null_count, row_count) \
+                 VALUES {}",
+                placeholders.join(", ")
+            );
+
+            let mut params = Vec::with_capacity(chunk.len() * PARAMS_PER_ROW);
+            for stat in chunk {
+                params.push(MetastoreValue::Text(stat.table_id.clone()));
+                params.push(MetastoreValue::Text(stat.file_path.clone()));
+                params.push(MetastoreValue::Text(stat.column_name.clone()));
+                params.push(stat.min_value.clone().into());
+                params.push(stat.max_value.clone().into());
+                params.push(stat.null_count.into());
+                params.push(stat.row_count.into());
+            }
+
+            self.metastore
+                .execute_helper(ExecuteParams { sql: &sql, params })
                 .await?;
         }
         Ok(())
@@ -1428,10 +1475,7 @@ impl MetadataCatalog for CayenneCatalog {
             params.push(MetastoreValue::Text(path.clone()));
         }
         self.metastore
-            .execute_helper(ExecuteParams {
-                sql: &sql,
-                params,
-            })
+            .execute_helper(ExecuteParams { sql: &sql, params })
             .await
     }
 

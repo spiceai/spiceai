@@ -282,9 +282,7 @@ async fn test_stats_cleared_on_drop_table(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let catalog = &fixture.catalog;
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
     let table_id = catalog
         .create_table(CreateTableOptions {

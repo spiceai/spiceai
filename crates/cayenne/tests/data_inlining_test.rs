@@ -39,9 +39,7 @@ async fn test_inlined_data_crud(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let catalog = &fixture.catalog;
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
     let table_id = catalog
         .create_table(CreateTableOptions {
