@@ -1139,6 +1139,7 @@ fn is_access_denied_error(err: &Error) -> bool {
         Error::QueryFailure { message } => {
             message.contains("INSUFFICIENT_PERMISSIONS")
                 || message.contains("ACCESS_DENIED")
+                || message.contains("PERMISSION_DENIED")
                 || message.contains("does not have")
                 || message.contains("permission denied")
         }

@@ -418,9 +418,13 @@ impl UnityCatalog {
                 } else {
                     tracing::warn!(
                         table = %table_name,
+                        "Unity Catalog effective-permissions did not report a read-compatible privilege during {context}; proceeding and deferring to Databricks query-time validation"
+                    );
+                    tracing::debug!(
+                        table = %table_name,
                         principals = ?perms.principals(),
                         privileges = ?perms.all_privileges(),
-                        "Unity Catalog effective-permissions did not report a read-compatible privilege during {context}; proceeding and deferring to Databricks query-time validation"
+                        "Permission denial details"
                     );
                 }
             }

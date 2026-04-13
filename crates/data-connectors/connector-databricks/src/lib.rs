@@ -666,16 +666,20 @@ impl Databricks {
                 Ok(Some(perms)) if !perms.has_read_permission() => {
                     tracing::warn!(
                         table = %full_name,
+                        "Unity Catalog reports no read-compatible privilege"
+                    );
+                    tracing::debug!(
+                        table = %full_name,
                         principals = ?perms.principals(),
                         privileges = ?perms.all_privileges(),
-                        "Unity Catalog reports no read-compatible privilege"
+                        "Permission denial details"
                     );
                     return Err(DataConnectorError::InsufficientPermissions {
                         dataconnector: "databricks".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
-                        source: format!(
+                        source: Box::<dyn std::error::Error + Send + Sync>::from(format!(
                             "No read-compatible privilege for table '{full_name}'. Grant SELECT or ALL PRIVILEGES on the table."
-                        ).into(),
+                        )),
                     });
                 }
                 Ok(Some(perms)) => {

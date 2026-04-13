@@ -394,8 +394,8 @@ mod tests {
 
     #[test]
     fn test_databricks_permission_error_classifies_as_permission() {
-        // The exact message produced by DataConnectorError::InsufficientPermissions
-        // when wrapping the Databricks connector's Error::InsufficientPermissions.
+        // A representative message from DataConnectorError::InsufficientPermissions
+        // as produced by the Databricks connector's UC permission check.
         let msg = "Insufficient permissions to access the catalog.schema.table dataset (databricks). Grant SELECT or ALL PRIVILEGES on the table";
         let error = ComponentError::from_status_message(ComponentErrorCategory::Dataset, Some(msg));
         assert_eq!(
