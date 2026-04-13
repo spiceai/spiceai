@@ -281,7 +281,7 @@ ssh2 = { version = "0.9.5" }
 suppaftp = { version = "6.3.0", features = ["async"] }
 sysinfo = "0.37.2"
 system-adapter-protocol = { git = "https://github.com/spiceai/spicebench.git", rev = "6327983bc1a90123e0c754b79781b931c969831e", features = ["server"] }
-tantivy = "0.25.0"
+tantivy = "0.26.0"
 tempfile = "3"
 tiberius = { version = "0.12.3", default-features = false, features = [
     "tds73",
