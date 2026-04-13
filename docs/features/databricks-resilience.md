@@ -88,15 +88,15 @@ An optional third probe runs in parallel when a Unity Catalog client is availabl
 
 The results are evaluated using a deterministic decision matrix:
 
-| Metadata Probe | Direct Probe | Permissions | Outcome |
-| --- | --- | --- | --- |
-| OK | OK | Allowed | Use metadata schema (preferred — has nullability) |
-| OK | AccessDenied | * | **Permanent error** — table cannot be queried at runtime |
-| AccessDenied/Failed | OK | Allowed | **Warning** + use direct schema (fallback) |
-| AccessDenied | AccessDenied | * | **Permanent error** |
-| Failed | Failed | * | Propagate error |
-| * | * | Denied | **Permanent error** (permissions override) |
-| * | * | Unavailable | Warning + proceed with probe results |
+| Metadata Probe      | Direct Probe | Permissions | Outcome                                                  |
+| ------------------- | ------------ | ----------- | -------------------------------------------------------- |
+| OK                  | OK           | Allowed     | Use metadata schema (preferred — has nullability)        |
+| OK                  | AccessDenied | *           | **Permanent error** — table cannot be queried at runtime |
+| AccessDenied/Failed | OK           | Allowed     | **Warning** + use direct schema (fallback)               |
+| AccessDenied        | AccessDenied | *           | **Permanent error**                                      |
+| Failed              | Failed       | *           | Propagate error                                          |
+| *                   | *            | Denied      | **Permanent error** (permissions override)               |
+| *                   | *            | Unavailable | Warning + proceed with probe results                     |
 
 Key design decisions:
 
