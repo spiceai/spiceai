@@ -248,10 +248,12 @@ impl CayenneDataSink {
         // for on-conflict deduplication and PK-based deletion to work correctly.
         let has_primary_key = !self.table.pk_deletion_strategy().is_position_based();
         let has_sort_columns = self.context.has_sort_columns();
+        let is_partitioned = self.table.metadata().partition_column.is_some();
         let can_inline = !needs_new_snapshot
             && !has_on_conflict_deletions
             && !has_primary_key
             && !has_sort_columns
+            && !is_partitioned
             && !self.table.has_retention_filters();
         if can_inline {
             // Collect the stream incrementally. Stop as soon as the inline

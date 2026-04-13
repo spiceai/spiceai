@@ -553,7 +553,7 @@ impl CayenneTableProvider {
     /// Returns whether retention filters are configured for this table.
     #[must_use]
     pub(crate) fn has_retention_filters(&self) -> bool {
-        !self.retention_filters.is_empty()
+        !self.retention_filters.is_empty() || self.time_retention_filter_builder.is_some()
     }
 
     /// Returns the path to a snapshot directory for this table.
