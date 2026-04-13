@@ -43,10 +43,13 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 /// application in the user-agent header of AWS API requests.
 ///
 /// The `AppName::new` call is infallible for this input: the name contains only alphanumeric
-/// characters plus `.` and `-`, all of which are permitted.
+/// characters plus `.` and `-`, all of which are permitted. The name is truncated to 50
+/// characters to stay within the AWS SDK's recommended limit.
 static APN_APP_NAME: LazyLock<AppName> = LazyLock::new(|| {
     let version = env!("CARGO_PKG_VERSION");
-    match AppName::new(format!("Spice-{version}")) {
+    let mut name = format!("Spice-{version}");
+    name.truncate(50);
+    match AppName::new(name) {
         Ok(name) => name,
         Err(_) => unreachable!("Spice version string should always be a valid AppName"),
     }
@@ -104,6 +107,14 @@ pub fn default_aws_config() -> aws_config::ConfigLoader {
     aws_config::defaults(BehaviorVersion::v2026_01_12()).app_name(APN_APP_NAME.clone())
 }
 
+#[must_use]
+fn default_aws_config_for_region(region: Option<&str>) -> aws_config::ConfigLoader {
+    match region {
+        Some(region) => default_aws_config().region(Region::new(region.to_string())),
+        None => default_aws_config(),
+    }
+}
+
 static SDK_CONFIG: OnceCell<Option<Arc<SdkConfig>>> = OnceCell::const_new();
 
 /// Returns the global SDK configuration, initializing it if necessary.
@@ -116,12 +127,47 @@ static SDK_CONFIG: OnceCell<Option<Arc<SdkConfig>>> = OnceCell::const_new();
 /// Returns a [`LoadError`] if credential initialization continues to fail due to unrecoverable
 /// issues when communicating with the AWS credential provider.
 pub async fn get_or_init_sdk_config() -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
-    if let Some(cached) = SDK_CONFIG.get() {
+    get_or_init_sdk_config_with_region(None).await
+}
+
+/// Returns the global SDK configuration, initializing it with an explicit region if necessary.
+///
+/// The cached SDK config is used to share the resolved credentials provider across the process.
+/// Callers should pass an explicit region when they already know it when building AWS clients or
+/// object stores. If no explicit region is provided, downstream code may fall back to the cached
+/// config's region when one is available.
+///
+/// # Errors
+///
+/// Returns a [`LoadError`] if credential initialization continues to fail due to unrecoverable
+/// issues when communicating with the AWS credential provider.
+pub async fn get_or_init_sdk_config_with_region(
+    region: Option<&str>,
+) -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
+    get_or_init_sdk_config_with_region_for_cell(
+        &SDK_CONFIG,
+        region,
+        initialize_sdk_config_with_retry,
+    )
+    .await
+}
+
+async fn get_or_init_sdk_config_with_region_for_cell<F, Fut>(
+    sdk_config_cell: &OnceCell<Option<Arc<SdkConfig>>>,
+    region: Option<&str>,
+    initialize: F,
+) -> std::result::Result<Option<Arc<SdkConfig>>, LoadError>
+where
+    F: FnOnce(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<Option<Arc<SdkConfig>>, LoadError>>,
+{
+    if let Some(cached) = sdk_config_cell.get() {
         return Ok(cached.clone());
     }
 
-    let value = SDK_CONFIG
-        .get_or_try_init(initialize_sdk_config_with_retry)
+    let region = region.map(ToString::to_string);
+    let value = sdk_config_cell
+        .get_or_try_init(|| initialize(region))
         .await?;
 
     Ok(value.clone())
@@ -134,9 +180,10 @@ pub fn get_sdk_config() -> Option<Arc<SdkConfig>> {
         .and_then(|value| value.as_ref().map(Arc::clone))
 }
 
-async fn initialize_sdk_config_with_retry() -> std::result::Result<Option<Arc<SdkConfig>>, LoadError>
-{
-    retry_with_backoff(load_sdk_config_from_env).await
+async fn initialize_sdk_config_with_retry(
+    region: Option<String>,
+) -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
+    retry_with_backoff(|| load_sdk_config_from_env(region.clone())).await
 }
 
 async fn retry_with_backoff<F, Fut, T>(mut attempt: F) -> std::result::Result<Option<T>, LoadError>
@@ -163,8 +210,12 @@ where
     }
 }
 
-async fn load_sdk_config_from_env() -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
-    let sdk_config = default_aws_config().load().await;
+async fn load_sdk_config_from_env(
+    region: Option<String>,
+) -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
+    let sdk_config = default_aws_config_for_region(region.as_deref())
+        .load()
+        .await;
 
     if let Some(creds_provider) = sdk_config.credentials_provider() {
         match creds_provider.provide_credentials().await {
@@ -229,7 +280,8 @@ pub async fn from_s3_url(url: &url::Url, region: Option<String>) -> Result<Box<d
     let mut builder = AmazonS3Builder::from_env()
         .with_bucket_name(bucket_name)
         .with_http_connector(SpawnedReqwestConnector::new(Handle::current()));
-    let (credential_provider, config) = S3CredentialProvider::from_env().await?;
+    let (credential_provider, config) =
+        S3CredentialProvider::from_env_with_region(region.as_deref()).await?;
 
     if let Some(region) = region.or(config.region().map(ToString::to_string)) {
         builder = builder.with_region(region);
@@ -266,7 +318,7 @@ pub fn from_s3_url_and_config(
 
     builder = builder.with_http_connector(SpawnedReqwestConnector::new(io_runtime));
 
-    if let Some(region) = region.or(sdk_config.region().map(ToString::to_string)) {
+    if let Some(region) = region.or_else(|| sdk_config.region().map(ToString::to_string)) {
         builder = builder.with_region(region);
     }
 
@@ -496,12 +548,12 @@ pub async fn initiate_config_with_credentials(
             Some("env") => initiate_config_auth_iam_env(region),
             _ => {
                 // Initialize AWS SDK credentials using the default credential chain.
-                if let Err(err) = get_or_init_sdk_config().await {
+                if let Err(err) = get_or_init_sdk_config_with_region(Some(region.as_str())).await {
                     tracing::warn!(
                         "Unable to initialize AWS credentials for {provider_name}: {err}"
                     );
                 }
-                default_aws_config().region(Region::new(region))
+                default_aws_config_for_region(Some(region.as_str()))
             }
         }
     }
@@ -523,10 +575,10 @@ pub async fn initiate_config_with_credentials(
 /// A [`ConfigLoader`] that can be further customized before loading.
 #[must_use]
 pub async fn initiate_config_default_auth(region: String) -> aws_config::ConfigLoader {
-    if let Err(err) = get_or_init_sdk_config().await {
+    if let Err(err) = get_or_init_sdk_config_with_region(Some(region.as_str())).await {
         tracing::warn!("Unable to initialize AWS credentials: {err}");
     }
-    default_aws_config().region(Region::new(region))
+    default_aws_config_for_region(Some(region.as_str()))
 }
 
 /// Initiates an AWS SDK configuration using only IAM role authentication.
@@ -962,6 +1014,11 @@ mod tests {
             name_str.starts_with("Spice-"),
             "APN app name should start with 'Spice-', got: {name_str}"
         );
+        assert!(
+            name_str.len() <= 50,
+            "APN app name must be at most 50 characters, got {} ({name_str})",
+            name_str.len()
+        );
     }
 
     #[tokio::test]
@@ -973,6 +1030,76 @@ mod tests {
         assert!(
             name_str.starts_with("Spice-"),
             "APN app name should start with 'Spice-', got: {name_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_aws_config_for_region_sets_region() {
+        let config = default_aws_config_for_region(Some("ap-south-1"))
+            .load()
+            .await;
+
+        assert_eq!(
+            config.region().map(std::convert::AsRef::as_ref),
+            Some("ap-south-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_or_init_sdk_config_with_region_uses_first_region() {
+        async fn initialize_test_sdk_config(
+            region: Option<String>,
+        ) -> std::result::Result<Option<Arc<SdkConfig>>, LoadError> {
+            Ok(Some(Arc::new(
+                default_aws_config_for_region(region.as_deref())
+                    .load()
+                    .await,
+            )))
+        }
+
+        let sdk_config_cell = OnceCell::const_new();
+
+        let first = get_or_init_sdk_config_with_region_for_cell(
+            &sdk_config_cell,
+            Some("ap-south-1"),
+            initialize_test_sdk_config,
+        )
+        .await
+        .expect("first initialization should succeed")
+        .expect("test initializer should return a config");
+
+        let second = get_or_init_sdk_config_with_region_for_cell(
+            &sdk_config_cell,
+            Some("us-east-1"),
+            initialize_test_sdk_config,
+        )
+        .await
+        .expect("second initialization should succeed")
+        .expect("test initializer should return a config");
+
+        assert_eq!(
+            first.region().map(std::convert::AsRef::as_ref),
+            Some("ap-south-1")
+        );
+        assert_eq!(
+            second.region().map(std::convert::AsRef::as_ref),
+            Some("ap-south-1")
+        );
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn test_from_s3_url_and_config_uses_sdk_config_region_when_region_is_absent() {
+        let url = Url::parse("s3://my-bucket/path/to/data").expect("valid url");
+        let sdk_config = default_aws_config_for_region(Some("ap-south-1"))
+            .load()
+            .await;
+
+        let store = from_s3_url_and_config(&url, None, &sdk_config, Handle::current());
+
+        assert!(
+            store.is_ok(),
+            "object store should build when the SDK config provides the region"
         );
     }
 }

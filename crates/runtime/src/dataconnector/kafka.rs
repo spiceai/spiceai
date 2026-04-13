@@ -563,18 +563,21 @@ const METRICS: &[MetricSpec] = &[
         description: Some("Total number of records consumed"),
         unit: Some("records"),
         metric_type: MetricType::ObservableCounterU64,
+        auto_register: false,
     },
     MetricSpec {
         name: "bytes_consumed_total",
         description: Some("Total bytes consumed"),
         unit: Some("bytes"),
         metric_type: MetricType::ObservableCounterU64,
+        auto_register: false,
     },
     MetricSpec {
         name: "records_lag",
         description: Some("Total consumer lag across all partitions"),
         unit: Some("records"),
         metric_type: MetricType::ObservableGaugeU64,
+        auto_register: false,
     },
 ];
 
