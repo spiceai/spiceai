@@ -15,13 +15,16 @@ limitations under the License.
 */
 
 use crate::embeddings::Embed;
-use crate::embeddings::Error::{FailedToInstantiateEmbeddingModel, UnsupportedEmbeddingInput};
+use crate::embeddings::Error::{
+    FailedToInstantiateEmbeddingModel, LocalModelPathDoesNotExist, UnsupportedEmbeddingInput,
+};
 use async_openai::types::embeddings::EmbeddingInput;
 use async_trait::async_trait;
 use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
 use model2vec_rs::model::StaticModel;
 use std::fmt::{Debug, Formatter};
+use std::path::Path;
 use std::sync::Arc;
 
 /// A wrapper around the `model2vec` library for generating text embeddings.
@@ -73,6 +76,12 @@ impl Model2Vec {
         embed_max_token_length: Option<usize>,
         embed_custom_batch_size: Option<usize>,
     ) -> Result<Self, super::embeddings::Error> {
+        if looks_like_local_model_path(name) && !Path::new(name).exists() {
+            return Err(LocalModelPathDoesNotExist {
+                path: name.to_string(),
+            });
+        }
+
         let model = StaticModel::from_pretrained(name, hf_token, normalize, subfolder)
             .map_err(|e| FailedToInstantiateEmbeddingModel { source: e.into() })?;
 
@@ -99,6 +108,17 @@ impl Model2Vec {
         self.cache = cache;
         self
     }
+}
+
+fn looks_like_local_model_path(name: &str) -> bool {
+    let path = Path::new(name);
+    path.is_absolute()
+        || name.starts_with("./")
+        || name.starts_with("../")
+        || name.starts_with(".\\")
+        || name.starts_with("..\\")
+        || name.starts_with("~/")
+        || name.starts_with("~\\")
 }
 
 impl Debug for Model2Vec {
@@ -190,8 +210,44 @@ impl Embed for Model2Vec {
 #[cfg(test)]
 mod tests {
     use crate::embeddings::Embed;
+    use crate::embeddings::Error;
     use crate::model2vec::Model2Vec;
     use async_openai::types::embeddings::EmbeddingInput;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::looks_like_local_model_path;
+
+    #[test]
+    fn detects_local_model_paths() {
+        assert!(looks_like_local_model_path("/tmp/model"));
+        assert!(looks_like_local_model_path("//tmp/model"));
+        assert!(looks_like_local_model_path("./model"));
+        assert!(looks_like_local_model_path("../model"));
+        assert!(looks_like_local_model_path("~/model"));
+        assert!(!looks_like_local_model_path("minishlab/potion-base-8M"));
+    }
+
+    #[test]
+    fn missing_local_model_path_returns_specific_error() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let missing_path = std::env::temp_dir().join(format!("missing-model2vec-{suffix}"));
+        assert!(
+            !missing_path.exists(),
+            "test path should not exist before model loading"
+        );
+        let missing_path = missing_path.to_string_lossy().into_owned();
+
+        let err = Model2Vec::from_params(&missing_path, None, None, None, None, None, None)
+            .expect_err("missing local model path should fail before Hugging Face lookup");
+
+        assert!(
+            matches!(err, Error::LocalModelPathDoesNotExist { path } if path == missing_path),
+            "unexpected error: {err}"
+        );
+    }
 
     #[expect(dead_code)]
     async fn test_embed() {
