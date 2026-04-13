@@ -47,15 +47,25 @@ jobs:
         ports:
           - 9200:9200
         options: >-
-          --health-cmd "curl -s http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\\|yellow\"'"
+          --health-cmd "curl -sf http://localhost:9200/_cluster/health"
           --health-interval 10s
-          --health-timeout 5s
-          --health-retries 30
+          --health-timeout 10s
+          --health-retries 60
+          --health-start-period 30s
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
           fetch-depth: 1
+
+      - name: Verify Elasticsearch is ready
+        run: |
+          curl -sf http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=60s || {
+            echo "Elasticsearch failed to reach yellow status"
+            curl -s http://localhost:9200/_cluster/health || true
+            exit 1
+          }
+          echo "Elasticsearch is ready"
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
