@@ -389,6 +389,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::sql::TableReference;
     use spicepod::{semantic::ColumnLevelEmbeddingConfig, vector::VectorStore};
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn missing_embedding_model_returns_specific_error_before_s3_setup() {
@@ -399,8 +400,13 @@ mod tests {
         let embedding_models = Arc::new(RwLock::new(EmbeddingModelStore::new()));
         let secrets = Arc::new(RwLock::new(Secrets::default()));
         let config = ColumnLevelEmbeddingConfig::model("missing_embeddings").with_row_id("id");
+        let params = spicepod::param::Params::from_string_map(HashMap::from([(
+            "s3_vectors_aws_iam_role_source".to_string(),
+            "invalid".to_string(),
+        )]));
         let vector_store = VectorStore {
             engine: Some("s3_vectors".to_string()),
+            params: Some(params),
             ..Default::default()
         };
 
