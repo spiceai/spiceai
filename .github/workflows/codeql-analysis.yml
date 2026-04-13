@@ -19,6 +19,8 @@ jobs:
   analyze:
     name: Analyze
     runs-on: self-hosted
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
     permissions:
       actions: read
       contents: read
@@ -37,7 +39,7 @@ jobs:
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set up spiceio
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
         with:
@@ -48,7 +50,7 @@ jobs:
           region: us-west-1
 
       - name: Set up sccache
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
@@ -88,7 +90,7 @@ jobs:
       #   make release
 
       - name: Show sccache stats
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         run: sccache --show-stats
 
       - name: Perform CodeQL Analysis

@@ -58,6 +58,8 @@ impl Client {
 
         let http_client = reqwest::Client::builder()
             .default_headers(headers)
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(300))
             .build()
             .context(HttpSnafu)?;
 

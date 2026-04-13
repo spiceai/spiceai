@@ -44,6 +44,8 @@ jobs:
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -52,6 +54,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
         with:
@@ -62,6 +65,7 @@ jobs:
           region: us-west-1
 
       - name: Set up sccache
+        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
@@ -88,10 +92,11 @@ jobs:
           BRANCH: spiceai-52
 
       - name: Show sccache stats
+        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         run: sccache --show-stats
 
       - name: Kill spiceio
-        if: always() && steps.setup-spiceio.outputs.pid != ''
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
       - name: Upload spiceio logs
@@ -107,6 +112,8 @@ jobs:
     needs: check_changes
     if: needs.check_changes.outputs.relevant_changes == 'true'
     runs-on: spiceai-macos
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -115,6 +122,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
         with:
@@ -125,6 +133,7 @@ jobs:
           region: us-west-1
 
       - name: Set up sccache
+        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
@@ -156,6 +165,7 @@ jobs:
         run: cargo build -p testoperator --all-features --locked
 
       - name: Show sccache stats
+        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         run: sccache --show-stats
 
       - name: Check if Cargo.lock is updated
@@ -168,7 +178,7 @@ jobs:
           fi
 
       - name: Kill spiceio
-        if: always() && steps.setup-spiceio.outputs.pid != ''
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
       - name: Upload spiceio logs

@@ -300,6 +300,12 @@ pub enum Error {
     #[snafu(display("Unable to load dataset connector: {dataset}"))]
     UnableToLoadDatasetConnector { dataset: TableReference },
 
+    #[snafu(display("Unable to load dataset connector: {dataset}. {reason}"))]
+    PermanentDatasetFailure {
+        dataset: TableReference,
+        reason: String,
+    },
+
     #[snafu(display("Unable to load data connector for catalog {catalog}: {source}"))]
     UnableToLoadCatalogConnector {
         catalog: String,

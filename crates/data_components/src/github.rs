@@ -40,7 +40,7 @@ use util::ExponentialBackoff;
 use util::fibonacci_backoff::{Backoff, FibonacciBackoffBuilder};
 
 use reqwest::{
-    StatusCode,
+    StatusCode, Url,
     header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::Deserialize;
@@ -96,6 +96,12 @@ pub struct GithubFilesTableProvider {
     include: Option<Arc<GlobSet>>,
     fetch_content: bool,
     include_commits: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubRef {
+    pub name: String,
+    pub qualified_name: String,
 }
 
 impl GithubFilesTableProvider {
@@ -1012,6 +1018,246 @@ impl GithubRestClient {
         })
     }
 
+    pub async fn fetch_refs(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut refs = self
+            .fetch_qualified_refs(owner, repo)
+            .await?
+            .into_iter()
+            .map(|git_ref| git_ref.name)
+            .collect::<Vec<_>>();
+        refs.sort_unstable();
+        refs.dedup();
+        Ok(refs)
+    }
+
+    pub async fn fetch_qualified_refs(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut refs = self
+            .fetch_refs_for_resource(owner, repo, "branches", "refs/heads/", None)
+            .await?;
+        refs.extend(
+            self.fetch_refs_for_resource(owner, repo, "tags", "refs/tags/", None)
+                .await?,
+        );
+        refs.sort_unstable_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
+        refs.dedup_by(|left, right| left.qualified_name == right.qualified_name);
+        Ok(refs)
+    }
+
+    pub async fn fetch_qualified_refs_bounded(
+        &self,
+        owner: &str,
+        repo: &str,
+        max_refs: usize,
+    ) -> Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut refs = self
+            .fetch_refs_for_resource(owner, repo, "branches", "refs/heads/", Some(max_refs))
+            .await?;
+        let remaining_refs = max_refs.saturating_sub(refs.len());
+        if remaining_refs == 0 {
+            refs.sort_unstable_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
+            refs.dedup_by(|left, right| left.qualified_name == right.qualified_name);
+            return Ok(refs);
+        }
+
+        refs.extend(
+            self.fetch_refs_for_resource(owner, repo, "tags", "refs/tags/", Some(remaining_refs))
+                .await?,
+        );
+        refs.sort_unstable_by(|left, right| left.qualified_name.cmp(&right.qualified_name));
+        refs.dedup_by(|left, right| left.qualified_name == right.qualified_name);
+        Ok(refs)
+    }
+
+    pub async fn fetch_qualified_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        qualified_name: &str,
+    ) -> Result<Option<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
+        self.rate_limiter.check_rate_limit().await?;
+
+        let Some(git_ref_path) = qualified_name.strip_prefix("refs/") else {
+            return Ok(None);
+        };
+
+        let action = format!("retrieve GitHub ref {qualified_name}");
+        let endpoint = git_ref_endpoint(owner, repo, git_ref_path)?;
+
+        let client = &self.client;
+        let token = &self.token;
+        let rate_limiter = &self.rate_limiter;
+
+        let response = retry_with_adaptive_backoff(&action, 3, rate_limiter, || async {
+            let mut headers = HeaderMap::new();
+            headers.insert(USER_AGENT, HeaderValue::from_static(SPICE_USER_AGENT));
+            headers.insert(
+                ACCEPT,
+                HeaderValue::from_static("application/vnd.github.v3+json"),
+            );
+
+            add_optional_github_auth(&mut headers, token.as_ref());
+
+            tracing::debug!(owner, repo, qualified_name, endpoint = %endpoint, "Requesting GitHub ref");
+
+            client.get(endpoint.clone()).headers(headers).send().await
+        })
+        .await
+        .map_err(|e: reqwest::Error| -> Box<dyn std::error::Error + Send + Sync> {
+            boxed_github_request_error(&action, owner, repo, &e)
+        })?;
+
+        rate_limiter.update_from_headers(response.headers()).await;
+
+        if response.status().is_success() {
+            let git_ref = response.json::<GitQualifiedRef>().await?;
+            return Ok(Some(GithubRef {
+                name: short_ref_name(&git_ref.qualified_name),
+                qualified_name: git_ref.qualified_name,
+            }));
+        }
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        let (response_headers, response_status, response_json, detail) =
+            read_github_error_response(response).await;
+
+        if let Some(response_json) = response_json.as_ref() {
+            error_checker(&response_headers, response_json).map_err(|e| {
+                if let graphql::Error::RateLimited { message } = e {
+                    Error::RateLimited { message }
+                } else {
+                    Error::GithubApiError { source: e.into() }
+                }
+            })?;
+        }
+
+        Err(boxed_github_status_error(
+            &action,
+            owner,
+            repo,
+            response_status,
+            detail.as_deref(),
+        ))
+    }
+
+    async fn fetch_refs_for_resource(
+        &self,
+        owner: &str,
+        repo: &str,
+        resource: &str,
+        qualified_name_prefix: &str,
+        max_refs: Option<usize>,
+    ) -> Result<Vec<GithubRef>, Box<dyn std::error::Error + Send + Sync>> {
+        if max_refs == Some(0) {
+            return Ok(Vec::new());
+        }
+
+        self.rate_limiter.check_rate_limit().await?;
+
+        let action = format!("retrieve GitHub {resource} refs");
+        let client = &self.client;
+        let token = &self.token;
+        let rate_limiter = &self.rate_limiter;
+
+        let mut refs = Vec::new();
+        let mut page = 1;
+        let per_page = 100;
+
+        loop {
+            let endpoint = format!(
+                "https://api.github.com/repos/{owner}/{repo}/{resource}?per_page={per_page}&page={page}"
+            );
+
+            let response = retry_with_adaptive_backoff(&action, 3, rate_limiter, || async {
+                let mut headers = HeaderMap::new();
+                headers.insert(USER_AGENT, HeaderValue::from_static(SPICE_USER_AGENT));
+                headers.insert(
+                    ACCEPT,
+                    HeaderValue::from_static("application/vnd.github.v3+json"),
+                );
+
+                add_optional_github_auth(&mut headers, token.as_ref());
+
+                tracing::debug!(owner, repo, resource, page, endpoint = %endpoint, "Requesting GitHub refs");
+
+                client.get(&endpoint).headers(headers).send().await
+            })
+            .await
+            .map_err(|e: reqwest::Error| -> Box<dyn std::error::Error + Send + Sync> {
+                boxed_github_request_error(&action, owner, repo, &e)
+            })?;
+
+            rate_limiter.update_from_headers(response.headers()).await;
+
+            if !response.status().is_success() {
+                let (response_headers, response_status, response_json, detail) =
+                    read_github_error_response(response).await;
+
+                if let Some(response_json) = response_json.as_ref() {
+                    error_checker(&response_headers, response_json).map_err(|e| {
+                        if let graphql::Error::RateLimited { message } = e {
+                            Error::RateLimited { message }
+                        } else {
+                            Error::GithubApiError { source: e.into() }
+                        }
+                    })?;
+                }
+
+                return Err(boxed_github_status_error(
+                    &action,
+                    owner,
+                    repo,
+                    response_status,
+                    detail.as_deref(),
+                ));
+            }
+
+            let page_refs = response.json::<Vec<GitRefName>>().await?;
+            if page_refs.is_empty() {
+                break;
+            }
+
+            let page_len = page_refs.len();
+            if let Some(max_refs) = max_refs
+                && refs.len() + page_len > max_refs
+            {
+                // Truncate to max_refs instead of erroring so dynamic scans
+                // work on repos with more refs than the limit. Only the first
+                // max_refs refs are included; the caller is responsible for
+                // documenting that dynamic ref scans are best-effort.
+                let take = max_refs.saturating_sub(refs.len());
+                refs.extend(page_refs.into_iter().take(take).map(|git_ref| GithubRef {
+                    qualified_name: format!("{qualified_name_prefix}{}", git_ref.name),
+                    name: git_ref.name,
+                }));
+                break;
+            }
+
+            refs.extend(page_refs.into_iter().map(|git_ref| GithubRef {
+                qualified_name: format!("{qualified_name_prefix}{}", git_ref.name),
+                name: git_ref.name,
+            }));
+
+            if page_len < per_page {
+                break;
+            }
+
+            page += 1;
+        }
+
+        Ok(refs)
+    }
+
     async fn fetch_file_content(
         &self,
         owner: &str,
@@ -1706,6 +1952,51 @@ struct GitHubRepository {
 }
 
 #[derive(Debug, Deserialize)]
+struct GitRefName {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitQualifiedRef {
+    #[serde(rename = "ref")]
+    qualified_name: String,
+}
+
+fn short_ref_name(qualified_name: &str) -> String {
+    qualified_name
+        .strip_prefix("refs/heads/")
+        .or_else(|| qualified_name.strip_prefix("refs/tags/"))
+        .or_else(|| qualified_name.strip_prefix("refs/"))
+        .unwrap_or(qualified_name)
+        .to_string()
+}
+
+fn git_ref_endpoint(
+    owner: &str,
+    repo: &str,
+    git_ref_path: &str,
+) -> Result<Url, Box<dyn std::error::Error + Send + Sync>> {
+    let mut endpoint = Url::parse(&format!(
+        "https://api.github.com/repos/{owner}/{repo}/git/ref/"
+    ))
+    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+    {
+        let mut path_segments = endpoint.path_segments_mut().map_err(|()| {
+            Box::new(std::io::Error::other(format!(
+                "Failed to construct GitHub ref URL for {owner}/{repo}: {git_ref_path}"
+            ))) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        path_segments.pop_if_empty();
+        for segment in git_ref_path.split('/') {
+            path_segments.push(segment);
+        }
+    }
+
+    Ok(endpoint)
+}
+
+#[derive(Debug, Deserialize)]
 struct GitTreeNode {
     path: String,
     mode: String,
@@ -1812,8 +2103,9 @@ pub fn error_checker(
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, boxed_github_status_error, format_github_status_error, github_response_message,
-        github_response_message_from_text, ref_from_filter, requested_ref_from_filters,
+        Error, boxed_github_status_error, format_github_status_error, git_ref_endpoint,
+        github_response_message, github_response_message_from_text, ref_from_filter,
+        requested_ref_from_filters,
     };
     use datafusion::prelude::{col, lit};
     use datafusion::scalar::ScalarValue;
@@ -1954,5 +2246,16 @@ mod tests {
             err.downcast_ref::<Error>(),
             Some(Error::GithubApiError { .. })
         ));
+    }
+
+    #[test]
+    fn test_git_ref_endpoint_percent_encodes_each_path_segment() {
+        let endpoint =
+            git_ref_endpoint("spiceai", "spiceai", "heads/feature#1").expect("valid endpoint");
+
+        assert_eq!(
+            endpoint.as_str(),
+            "https://api.github.com/repos/spiceai/spiceai/git/ref/heads/feature%231"
+        );
     }
 }

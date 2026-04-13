@@ -19,6 +19,7 @@ use crate::token_providers::databricks::{DatabricksM2MTokenProvider, DatabricksU
 use bytes::Bytes;
 use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
+#[cfg(feature = "models")]
 use itertools::Itertools;
 use llms::HealthCheck;
 #[cfg(feature = "bedrock")]
@@ -38,14 +39,19 @@ use llms::embeddings::{Embed, Error as EmbedError};
 use llms::model2vec::Model2Vec;
 use llms::openai::embed::OpenaiEmbed;
 use llms::openai::{DEFAULT_EMBEDDING_MODEL, UsageTier};
-use secrecy::{ExposeSecret, SecretBox, SecretString};
+#[cfg(feature = "models")]
+use secrecy::SecretBox;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::ResultExt;
 use spicepod::component::{embeddings::EmbeddingPrefix, model::ModelFileType};
-use std::path::{Path, PathBuf};
+#[cfg(feature = "models")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::result::Result;
 use std::str::FromStr;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
+#[cfg(feature = "models")]
 use tokio::fs;
 use tokio::sync::RwLock;
 use url::Url;
@@ -686,6 +692,9 @@ async fn get_bytes_for_file(
     url: &str,
     params: &HashMap<String, SecretString>,
 ) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(not(feature = "models"))]
+    let _ = params;
+
     #[cfg(feature = "models")]
     {
         match url.split('/').collect_vec().as_slice() {
@@ -812,6 +821,7 @@ async fn get_file_from_hf(
     }
 }
 
+#[cfg(feature = "models")]
 fn max_seq_length_from_params(
     params: &HashMap<String, SecretString>,
 ) -> Result<Option<usize>, EmbedError> {

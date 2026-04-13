@@ -609,11 +609,7 @@ impl PartitionManagementTask {
             }
 
             metadata.updated_at = now;
-            match self
-                .partition_manager
-                .write_metadata(&table.to_string(), metadata)
-                .await
-            {
+            match self.partition_manager.write_metadata(table, metadata).await {
                 Ok(()) => {
                     tracing::debug!(
                         table = %table,
@@ -714,11 +710,7 @@ impl PartitionManagementTask {
 
             metadata.updated_at = now_ms();
 
-            match self
-                .partition_manager
-                .write_metadata(&table.to_string(), metadata)
-                .await
-            {
+            match self.partition_manager.write_metadata(table, metadata).await {
                 Ok(()) => {
                     tracing::debug!(
                         table = %table,

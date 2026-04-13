@@ -25,7 +25,7 @@ use datafusion_expr::{Expr, ExprSchemable, lit};
 use datafusion_proto::bytes::Serializeable;
 use serde::{Deserialize, Serialize};
 
-use crate::datafusion::DataFusion;
+use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 /// A specific value for partitioning keys.
 /// For example, if a table is partitioned by:
@@ -108,7 +108,7 @@ pub async fn partition_value_to_bytes(
 /// Contains how the table is partitioned and which executors are responsible for each partition (refreshing and handling queries).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TablePartitionMetadata {
-    /// Fully qualified table name
+    /// Fully qualified table name (always normalized via [`normalized_table_name`]).
     pub table_name: String,
     /// All partitions for this table
     pub partitions: Vec<PartitionMetadata>,
@@ -124,9 +124,13 @@ pub struct TablePartitionMetadata {
 
 impl TablePartitionMetadata {
     #[must_use]
-    pub fn new(table_name: String, updated_at: u128, partition_expressions: Vec<String>) -> Self {
+    pub fn new(
+        table: &TableReference,
+        updated_at: u128,
+        partition_expressions: Vec<String>,
+    ) -> Self {
         Self {
-            table_name,
+            table_name: normalized_table_name(table),
             partitions: Vec::new(),
             schema_version: 1,
             updated_at,
@@ -192,4 +196,14 @@ impl TablePartitionMetadata {
         }
         Ok(map)
     }
+}
+
+/// Normalize a [`TableReference`] to a canonical string key by resolving bare/partial
+/// references with the default catalog and schema. This ensures that
+/// `my_table`, `public.my_table`, and `spice.public.my_table` all map to the same key.
+pub(crate) fn normalized_table_name(table: &TableReference) -> String {
+    table
+        .clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+        .to_string()
 }
