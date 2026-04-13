@@ -73,7 +73,10 @@ pub use catalog_provider::{
     CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,
 };
 pub use cayenne_catalog::CayenneCatalog;
-pub use metadata::{DataFile, DeleteFile, ObjectStoreConfig, PartitionMetadata, TableMetadata};
+pub use metadata::{
+    ColumnStats, DataFile, DeleteFile, FileColumnStats, InlinedData, InlinedDelete,
+    ObjectStoreConfig, PartitionMetadata, TableMetadata,
+};
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};
 pub use provider::{
     CayenneContext, CayenneStagedAppend, CayenneTableProvider, CayenneTableProviderBuilder,

@@ -237,7 +237,110 @@ impl CayenneDataSink {
         let needs_new_snapshot =
             needs_new_snapshot_for_pending_deletions || has_on_conflict_deletions;
 
-        let total_rows = if needs_new_snapshot {
+        // Always clear staging dir first to self-heal from previous crashes,
+        // even if we end up using the inline fast-path.
+        self.table.clear_staging_dir().await?;
+
+        // ── Data inlining fast-path ────────────────────────────────────
+        // For simple appends (no deletions, no on-conflict) with small data,
+        // store directly in the metastore as Arrow IPC to avoid Vortex file overhead.
+        // Skip inlining for tables with primary keys — they need data in Vortex
+        // for on-conflict deduplication and PK-based deletion to work correctly.
+        let has_primary_key = !self.table.pk_deletion_strategy().is_position_based();
+        let has_sort_columns = self.context.has_sort_columns();
+        let can_inline = !needs_new_snapshot
+            && !has_on_conflict_deletions
+            && !has_primary_key
+            && !has_sort_columns
+            && !self.table.has_retention_filters();
+        if can_inline {
+            // Collect the stream to check if it's small enough to inline
+            let schema = prepared_stream.schema();
+            let batches: Vec<arrow::record_batch::RecordBatch> =
+                futures::TryStreamExt::try_collect(prepared_stream).await?;
+            let total_rows_in_batches: usize =
+                batches.iter().map(arrow::record_batch::RecordBatch::num_rows).sum();
+
+            if total_rows_in_batches > 0 && total_rows_in_batches <= super::table::INLINE_MAX_ROWS {
+                // Concatenate into a single batch for efficient storage
+                let single_batch =
+                    arrow::compute::concat_batches(&schema, &batches)?;
+
+                if self.table.try_inline_batch(&single_batch).await? {
+                    // Persist stats from the inlined batch
+                    let stats_acc = super::table::ColumnStatsAccumulator::new(&schema);
+                    stats_acc.update(&single_batch);
+                    self.table.persist_table_stats(&stats_acc).await;
+
+                    // Auto-checkpoint when accumulated inline data exceeds 10K rows
+                    let inlined_count = self
+                        .table
+                        .catalog()
+                        .get_inlined_data_count(self.table.table_id())
+                        .await
+                        .unwrap_or(0);
+                    if inlined_count > 10_000 {
+                        if let Err(e) = self.table.checkpoint_inlined_data().await {
+                            tracing::warn!(
+                                "Auto-checkpoint of inlined data failed for {}: {e}",
+                                self.table.table_name(),
+                            );
+                        }
+                    }
+
+                    return Ok(u64::try_from(total_rows_in_batches).unwrap_or(u64::MAX));
+                }
+                // Fell through — batch was too large after IPC serialization.
+                // Re-stream for normal write.
+            }
+
+            // Re-create a stream from collected batches for the normal write path
+            let mem_exec =
+                datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+                    &[batches],
+                    schema,
+                    None,
+                )?;
+            let ctx = datafusion::prelude::SessionContext::new();
+            let re_stream =
+                datafusion_physical_plan::execute_stream(mem_exec, ctx.task_ctx())?;
+
+            // Continue with the normal write path using the re-created stream
+            let target_size_bytes = self.context.target_file_size_bytes();
+
+            let (rows, _writer_ops, stats_acc) = match self
+                .table
+                .write_to_snapshot(re_stream, target_size_bytes, STAGING_DIR_NAME)
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    if let Err(cleanup_err) = self.table.clear_staging_dir().await {
+                        tracing::warn!(
+                            "Failed to clean staging dir after write error for table {}: {cleanup_err}",
+                            self.table.table_name(),
+                        );
+                    }
+                    return Err(e);
+                }
+            };
+
+            let staged_append = self.table.staged_append_for_existing_staging();
+            staged_append.finalize_staged_write().await?;
+
+            self.table
+                .apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
+                .await?;
+
+            self.apply_retention_if_configured().await?;
+            self.sort_if_configured().await?;
+            self.table.refresh_listing_table()?;
+            self.table.persist_table_stats(&stats_acc).await;
+
+            return Ok(rows);
+        }
+
+        let (total_rows, write_stats_acc) = if needs_new_snapshot {
             // Apply on-conflict deletion vectors BEFORE creating the protected snapshot.
             self.table
                 .apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
@@ -265,7 +368,7 @@ impl CayenneDataSink {
             self.table.clear_staging_dir().await?;
 
             // Step 2: Write to _staging/ directory
-            let (rows, writer_ops) = match self
+            let (rows, writer_ops, stats_acc) = match self
                 .table
                 .write_to_snapshot(prepared_stream, target_size_bytes, STAGING_DIR_NAME)
                 .await
@@ -300,7 +403,7 @@ impl CayenneDataSink {
                 .apply_on_conflict_deletions(delete_specs, deleted_pk_i64, deleted_row_keys)
                 .await?;
 
-            rows
+            (rows, stats_acc)
         };
 
         // Listing table refresh is already part of the staged WAL finalize flow.
@@ -321,6 +424,9 @@ impl CayenneDataSink {
         // Refresh the listing table to pick up new/rewritten files and update statistics,
         // so subsequent query plans see the latest data.
         self.table.refresh_listing_table()?;
+
+        // Persist table-level column statistics to the metastore (best-effort).
+        self.table.persist_table_stats(&write_stats_acc).await;
 
         // Write lock is released when `_write_guard` drops (in write_all).
 
@@ -382,7 +488,7 @@ impl CayenneDataSink {
 
         // Write data to the new snapshot.
         let target_size = self.context.target_file_size_bytes();
-        let (total_rows, _files_written) = self
+        let (total_rows, _files_written, write_stats_acc) = self
             .table
             .write_to_snapshot(data, target_size, &new_snapshot_id)
             .await?;
@@ -420,6 +526,42 @@ impl CayenneDataSink {
         self.table
             .trigger_old_snapshot_cleanup(&new_snapshot_id)
             .await;
+
+        // Clear stale inlined data and file stats since all data was replaced.
+        if let Err(e) = self
+            .table
+            .catalog()
+            .clear_inlined_data(self.table.table_id())
+            .await
+        {
+            tracing::warn!(
+                "Failed to clear inlined data after overwrite for table {}: {e}",
+                self.table.table_name()
+            );
+        }
+        if let Err(e) = self
+            .table
+            .catalog()
+            .clear_inlined_deletes(self.table.table_id())
+            .await
+        {
+            tracing::warn!(
+                "Failed to clear inlined deletes after overwrite for table {}: {e}",
+                self.table.table_name()
+            );
+        }
+        if let Err(e) = self
+            .table
+            .catalog()
+            .clear_file_column_stats(self.table.table_id())
+            .await
+        {
+            tracing::warn!(
+                "Failed to clear stale file column stats after overwrite for table {}: {e}",
+                self.table.table_name()
+            );
+        }
+        self.table.persist_table_stats(&write_stats_acc).await;
 
         Ok(total_rows)
     }

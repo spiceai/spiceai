@@ -255,6 +255,78 @@ impl SqliteMetastore {
             PRIMARY KEY (table_id, snapshot_id)
         )
     ";
+
+    /// Schema for the `cayenne_column_stats` table.
+    ///
+    /// Stores table-level aggregate statistics per column: min, max, null count,
+    /// and total row count. Used by the query optimizer for join ordering,
+    /// aggregation strategies, and partition pruning.
+    const COLUMN_STATS_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_column_stats (
+            table_id TEXT NOT NULL,
+            column_name TEXT NOT NULL,
+            min_value TEXT,
+            max_value TEXT,
+            null_count BIGINT,
+            row_count BIGINT,
+            PRIMARY KEY (table_id, column_name),
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
+
+    /// Schema for the `cayenne_file_column_stats` table.
+    ///
+    /// Stores per-file, per-column statistics (min, max, null count, row count).
+    /// Used for file-level scan pruning: files whose min/max ranges don't overlap
+    /// with filter predicates can be skipped entirely.
+    const FILE_COLUMN_STATS_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_file_column_stats (
+            table_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            column_name TEXT NOT NULL,
+            min_value TEXT,
+            max_value TEXT,
+            null_count BIGINT,
+            row_count BIGINT,
+            PRIMARY KEY (table_id, file_path, column_name),
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
+
+    /// Schema for the `cayenne_inlined_data` table.
+    ///
+    /// Stores small batches of insert data as Arrow IPC blobs directly in the
+    /// metastore, avoiding the overhead of creating individual Vortex files for
+    /// each small write. A `CHECKPOINT` operation flushes accumulated inline data
+    /// to consolidated Vortex files.
+    const INLINED_DATA_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_inlined_data (
+            inlined_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
+            partition_key TEXT,
+            data_ipc BLOB NOT NULL,
+            record_count BIGINT NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
+
+    /// Schema for the `cayenne_inlined_delete` table.
+    ///
+    /// Stores small batches of delete identifiers directly in the metastore.
+    /// Flushed to deletion vector files during checkpoint.
+    const INLINED_DELETE_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_inlined_delete (
+            inlined_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
+            delete_ipc BLOB NOT NULL,
+            delete_count BIGINT NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
 }
 
 /// `SQLite` row wrapper implementing `MetastoreRow`.
@@ -361,13 +433,17 @@ impl MetastoreBackend for SqliteMetastore {
             .call(|conn| {
                 // Create tables in a transaction
                 conn.execute_batch(&format!(
-                    "{}; {}; {}; {}; {}; {};",
+                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
                     Self::TABLE_TABLE_DDL,
                     Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                     Self::DELETE_FILE_TABLE_DDL,
                     Self::PARTITION_TABLE_DDL,
                     Self::INSERT_RECORD_TABLE_DDL,
-                    Self::SNAPSHOT_SEQUENCE_TABLE_DDL
+                    Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
+                    Self::COLUMN_STATS_TABLE_DDL,
+                    Self::FILE_COLUMN_STATS_TABLE_DDL,
+                    Self::INLINED_DATA_TABLE_DDL,
+                    Self::INLINED_DELETE_TABLE_DDL
                 ))?;
 
                 // Backfill new columns for existing deployments (SQLite doesn't support IF NOT EXISTS for ALTER TABLE until v3.35)

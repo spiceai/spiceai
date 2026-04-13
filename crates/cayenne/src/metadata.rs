@@ -303,6 +303,94 @@ pub struct CreateTableOptions {
     pub vortex_config: VortexConfig,
 }
 
+/// Table-level aggregate statistics for a single column.
+///
+/// Stores min/max values (serialized as strings for cross-type compatibility),
+/// null count, and total row count. Used by the query optimizer to make
+/// informed decisions about join ordering, aggregation strategies, and pruning.
+#[derive(Debug, Clone)]
+pub struct ColumnStats {
+    /// Table this stats entry belongs to (`UUIDv7`)
+    pub table_id: String,
+    /// Name of the column
+    pub column_name: String,
+    /// Minimum value (serialized as string), `None` if all values are null
+    pub min_value: Option<String>,
+    /// Maximum value (serialized as string), `None` if all values are null
+    pub max_value: Option<String>,
+    /// Number of null values in this column across all files
+    pub null_count: Option<i64>,
+    /// Total number of rows in the table (same for all columns)
+    pub row_count: Option<i64>,
+}
+
+/// Per-file, per-column statistics for scan pruning.
+///
+/// Stores min/max/null_count/row_count for each column in each data file.
+/// Used for file-level scan pruning: files whose min/max ranges don't
+/// overlap with filter predicates can be skipped entirely.
+#[derive(Debug, Clone)]
+pub struct FileColumnStats {
+    /// Table this stats entry belongs to (`UUIDv7`)
+    pub table_id: String,
+    /// Path to the data file (snapshot-relative)
+    pub file_path: String,
+    /// Name of the column
+    pub column_name: String,
+    /// Minimum value in this column for this file (serialized as string)
+    pub min_value: Option<String>,
+    /// Maximum value in this column for this file (serialized as string)
+    pub max_value: Option<String>,
+    /// Number of null values in this column for this file
+    pub null_count: Option<i64>,
+    /// Number of rows in this file
+    pub row_count: Option<i64>,
+}
+
+/// A small batch of insert data inlined directly in the metastore.
+///
+/// For streaming workloads that produce many tiny writes, storing data as
+/// Arrow IPC blobs in the catalog avoids the overhead of creating individual
+/// Vortex files. A checkpoint operation flushes accumulated inline data to
+/// consolidated Vortex files when the total size exceeds a threshold.
+#[derive(Debug, Clone)]
+pub struct InlinedData {
+    /// Unique identifier for this inlined entry (`UUIDv7`)
+    pub inlined_id: String,
+    /// Table this data belongs to (`UUIDv7`)
+    pub table_id: String,
+    /// Partition key (for partitioned tables), `None` for non-partitioned
+    pub partition_key: Option<String>,
+    /// Arrow IPC serialized `RecordBatch`
+    pub data_ipc: Vec<u8>,
+    /// Number of rows in this batch
+    pub record_count: i64,
+    /// Sequence number when this data was inlined
+    pub sequence_number: i64,
+    /// ISO 8601 timestamp of when this entry was created
+    pub created_at: String,
+}
+
+/// A small batch of delete identifiers inlined in the metastore.
+///
+/// Mirrors `InlinedData` but for deletions. Stores deletion identifiers
+/// (row IDs or primary key bytes) as Arrow IPC blobs.
+#[derive(Debug, Clone)]
+pub struct InlinedDelete {
+    /// Unique identifier for this inlined entry (`UUIDv7`)
+    pub inlined_id: String,
+    /// Table this delete belongs to (`UUIDv7`)
+    pub table_id: String,
+    /// Arrow IPC serialized deletion identifiers
+    pub delete_ipc: Vec<u8>,
+    /// Number of deleted rows in this batch
+    pub delete_count: i64,
+    /// Sequence number when this delete was inlined
+    pub sequence_number: i64,
+    /// ISO 8601 timestamp
+    pub created_at: String,
+}
+
 /// Configuration for an external object store (e.g., S3).
 #[derive(Debug, Clone)]
 pub struct ObjectStoreConfig {

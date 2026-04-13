@@ -225,6 +225,60 @@ impl TursoMetastore {
             PRIMARY KEY (table_id, snapshot_id)
         )
     ";
+
+    /// Schema for the `cayenne_column_stats` table.
+    const COLUMN_STATS_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_column_stats (
+            table_id TEXT NOT NULL,
+            column_name TEXT NOT NULL,
+            min_value TEXT,
+            max_value TEXT,
+            null_count BIGINT,
+            row_count BIGINT,
+            PRIMARY KEY (table_id, column_name),
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
+
+    /// Schema for the `cayenne_file_column_stats` table.
+    const FILE_COLUMN_STATS_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_file_column_stats (
+            table_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            column_name TEXT NOT NULL,
+            min_value TEXT,
+            max_value TEXT,
+            null_count BIGINT,
+            row_count BIGINT,
+            PRIMARY KEY (table_id, file_path, column_name),
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
+
+    const INLINED_DATA_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_inlined_data (
+            inlined_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
+            partition_key TEXT,
+            data_ipc BLOB NOT NULL,
+            record_count BIGINT NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
+
+    const INLINED_DELETE_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_inlined_delete (
+            inlined_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
+            delete_ipc BLOB NOT NULL,
+            delete_count BIGINT NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
 }
 
 /// Turso row wrapper implementing `MetastoreRow`.
@@ -343,13 +397,17 @@ impl MetastoreBackend for TursoMetastore {
 
         // Create tables
         let schema_sql = format!(
-            "{}; {}; {}; {}; {}; {};",
+            "{}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
             Self::TABLE_TABLE_DDL,
             Self::TABLE_NAME_UNIQUE_INDEX_DDL,
             Self::DELETE_FILE_TABLE_DDL,
             Self::PARTITION_TABLE_DDL,
             Self::INSERT_RECORD_TABLE_DDL,
-            Self::SNAPSHOT_SEQUENCE_TABLE_DDL
+            Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
+            Self::COLUMN_STATS_TABLE_DDL,
+            Self::FILE_COLUMN_STATS_TABLE_DDL,
+            Self::INLINED_DATA_TABLE_DDL,
+            Self::INLINED_DELETE_TABLE_DDL
         );
 
         conn.execute_batch(&schema_sql)

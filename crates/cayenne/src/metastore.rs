@@ -106,6 +106,52 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         name: "cayenne_snapshot_sequence",
         columns: &["table_id", "snapshot_id", "sequence_number"],
     },
+    ExpectedTable {
+        name: "cayenne_column_stats",
+        columns: &[
+            "table_id",
+            "column_name",
+            "min_value",
+            "max_value",
+            "null_count",
+            "row_count",
+        ],
+    },
+    ExpectedTable {
+        name: "cayenne_file_column_stats",
+        columns: &[
+            "table_id",
+            "file_path",
+            "column_name",
+            "min_value",
+            "max_value",
+            "null_count",
+            "row_count",
+        ],
+    },
+    ExpectedTable {
+        name: "cayenne_inlined_data",
+        columns: &[
+            "inlined_id",
+            "table_id",
+            "partition_key",
+            "data_ipc",
+            "record_count",
+            "sequence_number",
+            "created_at",
+        ],
+    },
+    ExpectedTable {
+        name: "cayenne_inlined_delete",
+        columns: &[
+            "inlined_id",
+            "table_id",
+            "delete_ipc",
+            "delete_count",
+            "sequence_number",
+            "created_at",
+        ],
+    },
 ];
 
 /// Validate the existing metadata table schemas against the expected definitions.
