@@ -117,6 +117,7 @@ static DENY_SPICE_SPECIFIC_FUNCTIONS: LazyLock<FunctionSupport> = LazyLock::new(
 });
 
 /// Return the cached [`FunctionSupport`] that denies Spice-specific functions for federation.
+#[must_use]
 pub fn deny_spice_specific_functions() -> &'static FunctionSupport {
     &DENY_SPICE_SPECIFIC_FUNCTIONS
 }
