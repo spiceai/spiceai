@@ -154,14 +154,14 @@ views:
   - name: audit_logs
     sql: |
       SELECT
-        json_get_str(CAST(content AS VARCHAR), 'id') AS id,
-        json_get_str(CAST(content AS VARCHAR), 'action') AS action,
-        json_get_str(CAST(content AS VARCHAR), 'severity') AS severity,
-        json_get_bool(CAST(content AS VARCHAR), 'automated') AS automated,
-        json_get_int(CAST(content AS VARCHAR), 'retentionDays') AS retention_days
+        json_get_str(content, 'id') AS id,
+        json_get_str(content, 'action') AS action,
+        json_get_str(content, 'severity') AS severity,
+        json_get_bool(content, 'automated') AS automated,
+        json_get_int(content, 'retentionDays') AS retention_days
       FROM audit_logs_raw
       WHERE request_path = '/audit-logs'
-      ORDER BY json_get_str(CAST(content AS VARCHAR), 'id')
+      ORDER BY json_get_str(content, 'id')
 "
     )
 }
@@ -192,21 +192,21 @@ views:
   - name: audit_logs
     sql: |
       SELECT
-        json_get_str(CAST(content AS VARCHAR), 'id') AS id,
-        json_get_str(CAST(content AS VARCHAR), 'action') AS action,
-        json_get_str(CAST(content AS VARCHAR), 'description') AS description,
-        json_get_str(CAST(content AS VARCHAR), 'severity') AS severity,
-        json_get_str(CAST(content AS VARCHAR), 'status') AS status,
-        json_get_bool(CAST(content AS VARCHAR), 'automated') AS automated,
-        json_get_int(CAST(content AS VARCHAR), 'retentionDays') AS retention_days,
-        json_get_int(CAST(content AS VARCHAR), 'timestamp') AS timestamp,
-        json_get_str(CAST(content AS VARCHAR), 'actor') AS actor,
-        json_get_str(CAST(content AS VARCHAR), 'approvedBy') AS approved_by,
-        json_get_str(CAST(content AS VARCHAR), 'resourceId') AS resource_id,
-        json_get_str(CAST(content AS VARCHAR), 'policyId') AS policy_id
+        json_get_str(content, 'id') AS id,
+        json_get_str(content, 'action') AS action,
+        json_get_str(content, 'description') AS description,
+        json_get_str(content, 'severity') AS severity,
+        json_get_str(content, 'status') AS status,
+        json_get_bool(content, 'automated') AS automated,
+        json_get_int(content, 'retentionDays') AS retention_days,
+        json_get_int(content, 'timestamp') AS timestamp,
+        json_get_str(content, 'actor') AS actor,
+        json_get_str(content, 'approvedBy') AS approved_by,
+        json_get_str(content, 'resourceId') AS resource_id,
+        json_get_str(content, 'policyId') AS policy_id
       FROM audit_logs_raw
       WHERE request_path = '/audit-logs'
-      ORDER BY json_get_str(CAST(content AS VARCHAR), 'id')
+      ORDER BY json_get_str(content, 'id')
 "
     )
 }
