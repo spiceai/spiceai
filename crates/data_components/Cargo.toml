@@ -71,6 +71,7 @@ num_cpus = "1.16"
 object_store = { workspace = true }
 opendal.workspace = true
 oracle = { version = "0.6", optional = true }
+percent-encoding.workspace = true
 rand.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
@@ -155,7 +156,7 @@ postgres = [
 s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
 scylladb = ["dep:scylla", "datafusion-table-providers/federation"]
 sharepoint = ["dep:graph-rs-sdk"]
-snowflake = ["dep:snowflake-api", "datafusion-table-providers/federation"]
+snowflake = ["dep:snowflake-api", "datafusion-table-providers/federation", "db_connection_pool/snowflake"]
 spark_connect = ["dep:spark-connect-rs"]
 sqlite = [
     "dep:rusqlite",
@@ -170,9 +171,11 @@ test_hadoop_catalog_docker = []
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-array = { workspace = true }
 aws-smithy-types = { workspace = true }
+brotli = "8.0.2"
 chrono = { workspace = true }
 criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
-ctor = "0.6.3"
+ctor = "0.8.0"
+flate2 = "1.1.5"
 iceberg-storage-opendal.workspace = true
 iceberg_test_utils = { workspace = true, features = ["tests"] }
 insta.workspace = true
@@ -180,6 +183,7 @@ object_store = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+zstd = "0.13.3"
 
 [[bench]]
 harness = false

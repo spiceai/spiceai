@@ -17,7 +17,7 @@ limitations under the License.
 use arrow::{
     array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, new_null_array},
     buffer::{Buffer, OffsetBuffer},
-    datatypes::{DataType, Field, SchemaRef},
+    datatypes::{DataType, Field, SchemaRef, TimeUnit},
     error::ArrowError,
 };
 use arrow_cast::{CastOptions, cast_with_options};
@@ -85,8 +85,7 @@ pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<Recor
                 if field.contains(existing_field) {
                     Ok(Arc::clone(column))
                 } else {
-                    cast_with_options(column.as_ref(), field.data_type(), &cast_options)
-                        .context(UnableToConvertRecordBatchSnafu)
+                    cast_column(column, existing_field.data_type(), field, &cast_options)
                 }
             } else if field.is_nullable() {
                 Ok(new_null_array(field.data_type(), record_batch.num_rows()))
@@ -111,6 +110,63 @@ pub fn try_cast_to(record_batch: RecordBatch, schema: SchemaRef) -> Result<Recor
     }
 
     RecordBatch::try_new(schema, cols).context(UnableToConvertRecordBatchSnafu)
+}
+
+/// Returns `true` when `source` → `target` is a timestamp-to-timestamp cast that
+/// only changes the time unit (and possibly the timezone string), meaning the
+/// underlying physical values need rescaling and may overflow on far-future/past
+/// sentinel dates.
+fn is_timestamp_unit_cast(source: &DataType, target: &DataType) -> bool {
+    matches!(
+        (source, target),
+        (DataType::Timestamp(_, _), DataType::Timestamp(_, _))
+    ) && timestamp_unit(source) != timestamp_unit(target)
+}
+
+fn timestamp_unit(dt: &DataType) -> Option<&TimeUnit> {
+    match dt {
+        DataType::Timestamp(unit, _) => Some(unit),
+        _ => None,
+    }
+}
+
+/// Cast a single column, with special handling for timestamp unit conversions
+/// that may overflow (e.g. far-future sentinel values like year 9999 when
+/// converting from microseconds to nanoseconds).
+fn cast_column(
+    column: &ArrayRef,
+    source_type: &DataType,
+    target_field: &Field,
+    strict_options: &CastOptions,
+) -> Result<ArrayRef> {
+    match cast_with_options(column.as_ref(), target_field.data_type(), strict_options) {
+        Ok(casted) => Ok(casted),
+        Err(ref e)
+            if is_timestamp_unit_cast(source_type, target_field.data_type())
+                && is_overflow_error(e) =>
+        {
+            tracing::warn!(
+                "Timestamp overflow casting column '{}' from {source_type:?} to {:?}. Values outside the representable range will be NULL.",
+                target_field.name(),
+                target_field.data_type(),
+            );
+            let safe_options = CastOptions {
+                safe: true,
+                ..strict_options.clone()
+            };
+            cast_with_options(column.as_ref(), target_field.data_type(), &safe_options)
+                .context(UnableToConvertRecordBatchSnafu)
+        }
+        Err(e) => Err(e).context(UnableToConvertRecordBatchSnafu),
+    }
+}
+
+fn is_overflow_error(e: &ArrowError) -> bool {
+    matches!(
+        e,
+        ArrowError::CastError(msg) | ArrowError::ArithmeticOverflow(msg)
+            if msg.contains("Overflow") || msg.contains("overflow")
+    )
 }
 
 /// Flattens a list of struct types with a single field into a list of primitive types.
@@ -799,6 +855,132 @@ mod test {
         assert!(
             result.is_ok(),
             "Decimal cast should succeed when value fits: {result:?}"
+        );
+    }
+
+    /// Casting Timestamp(Microsecond) → Timestamp(Nanosecond) with a far-future
+    /// sentinel value (year 9999) should not panic. Overflowing values become NULL
+    /// via the safe-cast fallback.
+    #[test]
+    fn test_try_cast_to_timestamp_us_to_ns_overflow_produces_null() {
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::datatypes::TimeUnit;
+
+        // 9999-12-31T23:59:59.999 in microseconds — overflows when multiplied by 1000
+        let sentinel_us: i64 = 253_402_300_799_999_000;
+        let normal_us: i64 = 1_700_000_000_000_000; // ~2023-11-14
+
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]));
+
+        let source_array =
+            TimestampMicrosecondArray::from(vec![Some(sentinel_us), Some(normal_us), None])
+                .with_timezone("UTC");
+
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(source_array)]).expect("valid batch");
+
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            true,
+        )]));
+
+        let result = try_cast_to(batch, target_schema);
+        assert!(
+            result.is_ok(),
+            "timestamp µs→ns cast should not fail on overflow: {:?}",
+            result.err()
+        );
+
+        let casted = result.expect("already checked");
+        let ts_col = casted
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+            .expect("should be TimestampNanosecondArray");
+
+        // Overflowing sentinel becomes NULL
+        assert!(ts_col.is_null(0), "overflowing sentinel should be NULL");
+        // Normal value is correctly scaled (µs * 1000 = ns)
+        assert_eq!(ts_col.value(1), normal_us * 1000);
+        // Original NULL stays NULL
+        assert!(ts_col.is_null(2), "original NULL should stay NULL");
+    }
+
+    /// Casting Timestamp(Microsecond) → Timestamp(Nanosecond) when all values fit
+    /// should succeed with exact values (no fallback needed).
+    #[test]
+    fn test_try_cast_to_timestamp_us_to_ns_no_overflow() {
+        use arrow::array::TimestampMicrosecondArray;
+        use arrow::datatypes::TimeUnit;
+
+        let value_us: i64 = 1_700_000_000_000_000; // ~2023-11-14
+
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]));
+
+        let source_array =
+            TimestampMicrosecondArray::from(vec![Some(value_us)]).with_timezone("UTC");
+
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(source_array)]).expect("valid batch");
+
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            true,
+        )]));
+
+        let result = try_cast_to(batch, target_schema);
+        assert!(result.is_ok(), "cast should succeed: {:?}", result.err());
+
+        let casted = result.expect("already checked");
+        let ts_col = casted
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+            .expect("should be TimestampNanosecondArray");
+        assert_eq!(ts_col.value(0), value_us * 1000);
+    }
+
+    /// Non-timestamp overflow errors should still propagate (no fallback).
+    #[test]
+    fn test_try_cast_to_non_timestamp_overflow_still_errors() {
+        use arrow::array::Decimal128Array;
+
+        // A value that overflows Decimal128(10, 2)
+        let value: i128 = 99_999_999_999_000_000_000;
+
+        let source_schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(38, 9),
+            true,
+        )]));
+
+        let source_array = Decimal128Array::from(vec![Some(value)])
+            .with_precision_and_scale(38, 9)
+            .expect("valid");
+
+        let batch =
+            RecordBatch::try_new(source_schema, vec![Arc::new(source_array)]).expect("valid batch");
+
+        let target_schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(10, 2),
+            true,
+        )]));
+
+        let result = try_cast_to(batch, target_schema);
+        assert!(
+            result.is_err(),
+            "non-timestamp overflow should still return an error"
         );
     }
 }

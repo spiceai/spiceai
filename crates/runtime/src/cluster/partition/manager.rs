@@ -24,7 +24,7 @@ use snafu::prelude::*;
 
 use crate::cluster::partition::metadata::PartitionValue;
 
-use super::metadata::{PartitionMetadata, TablePartitionMetadata};
+use super::metadata::{PartitionMetadata, TablePartitionMetadata, normalized_table_name};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -58,6 +58,20 @@ static PARTITION_PREFIX: &str = "accelerations/partitions/";
 #[derive(Debug)]
 pub struct PartitionManager {
     state: ObjectState<TablePartitionMetadata>,
+}
+
+/// Result of copying partition assignments from one table to another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyAssignmentsResult {
+    /// Assignments were copied from the source table.
+    Copied {
+        /// Number of partition values with executor assignments that were copied.
+        partition_count: usize,
+    },
+    /// Source table had no partition metadata (unpartitioned or newly created).
+    NoSourceMetadata,
+    /// Source table had partition metadata but no assigned partitions.
+    NoAssignments,
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +116,7 @@ impl PartitionManager {
         &self,
         table: &TableReference,
     ) -> Result<Option<TablePartitionMetadata>> {
-        let key = table.to_string();
+        let key = normalized_table_name(table);
         self.state
             .get(&key)
             .await
@@ -115,7 +129,7 @@ impl PartitionManager {
         &self,
         table: &TableReference,
     ) -> Option<TablePartitionMetadata> {
-        let key = table.to_string();
+        let key = normalized_table_name(table);
         self.state.get_cached(&key)
     }
 
@@ -131,10 +145,9 @@ impl PartitionManager {
         if self.get_cached_table_metadata(table).is_some() {
             return Ok(false);
         }
-        let key = table.to_string();
+        let key = normalized_table_name(table);
         let now_ms = now_ms()?;
-        let metadata =
-            TablePartitionMetadata::new(table.to_string(), now_ms, partition_expressions);
+        let metadata = TablePartitionMetadata::new(table, now_ms, partition_expressions);
 
         match self
             .state
@@ -158,12 +171,12 @@ impl PartitionManager {
         partition_values: Vec<HashMap<String, String>>,
         partition_expressions: Vec<String>,
     ) -> Result<()> {
-        let key = table.to_string();
         let now_ms = now_ms()?;
 
-        let mut metadata = self.get_table_metadata(table).await?.unwrap_or_else(|| {
-            TablePartitionMetadata::new(table.to_string(), now_ms, partition_expressions)
-        });
+        let mut metadata = self
+            .get_table_metadata(table)
+            .await?
+            .unwrap_or_else(|| TablePartitionMetadata::new(table, now_ms, partition_expressions));
 
         metadata.partitions = partition_values
             .into_iter()
@@ -171,7 +184,7 @@ impl PartitionManager {
             .collect();
         metadata.updated_at = now_ms;
 
-        self.write_metadata(&key, metadata).await
+        self.write_metadata(table, metadata).await
     }
 
     /// Allocates unassigned partitions to an executor.
@@ -183,7 +196,7 @@ impl PartitionManager {
         executor_id: &str,
         limit: usize,
     ) -> Result<AllocationResult> {
-        let key = table.to_string();
+        let key = normalized_table_name(table);
         let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
             .max_retries(Some(5))
             .build();
@@ -231,7 +244,7 @@ impl PartitionManager {
 
             metadata.updated_at = now_ms;
 
-            match self.write_metadata(&key, metadata).await {
+            match self.write_metadata(table, metadata).await {
                 Ok(()) => return Ok(result),
                 Err(Error::ConcurrentModification { .. }) => {
                     if let Some(delay) = backoff.next_duration() {
@@ -252,7 +265,7 @@ impl PartitionManager {
         partition_value: &PartitionValue,
         executor_id: &str,
     ) -> Result<()> {
-        let key = table.to_string();
+        let key = normalized_table_name(table);
         let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
             .max_retries(Some(5))
             .build();
@@ -282,7 +295,7 @@ impl PartitionManager {
 
             metadata.updated_at = now_ms;
 
-            match self.write_metadata(&key, metadata).await {
+            match self.write_metadata(table, metadata).await {
                 Ok(()) => return Ok(()),
                 Err(Error::ConcurrentModification { .. }) => {
                     if let Some(delay) = backoff.next_duration() {
@@ -324,7 +337,7 @@ impl PartitionManager {
             return Ok(());
         }
 
-        let key = table.to_string();
+        let key = normalized_table_name(table);
         let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
             .max_retries(Some(5))
             .build();
@@ -363,7 +376,7 @@ impl PartitionManager {
 
             metadata.updated_at = now_ms;
 
-            match self.write_metadata(&key, metadata).await {
+            match self.write_metadata(table, metadata).await {
                 Ok(()) => return Ok(()),
                 Err(Error::ConcurrentModification { .. }) => {
                     if let Some(delay) = backoff.next_duration() {
@@ -377,23 +390,61 @@ impl PartitionManager {
         }
     }
 
+    /// Copy partition-to-executor assignments from one table to another.
+    ///
+    /// Creates (or overwrites) the target table's metadata with the same
+    /// partition expressions, partition values, and executor assignments
+    /// as the source table. This ensures `DoPut` write-through routes data
+    /// to the same executors for both tables.
+    ///
+    /// If the source table has no partition metadata, this is a no-op because
+    /// the source exists but is unpartitioned and there is nothing to copy.
+    pub async fn copy_assignments(
+        &self,
+        source_table: &TableReference,
+        target_table: &TableReference,
+    ) -> Result<CopyAssignmentsResult> {
+        let Some(source_metadata) = self.get_table_metadata(source_table).await? else {
+            return Ok(CopyAssignmentsResult::NoSourceMetadata);
+        };
+
+        let assigned_count = source_metadata
+            .partitions
+            .iter()
+            .filter(|p| p.is_assigned())
+            .count();
+
+        let now_ms = now_ms()?;
+        let mut target_metadata = source_metadata;
+        target_metadata.table_name = normalized_table_name(target_table);
+        target_metadata.updated_at = now_ms;
+
+        self.write_metadata(target_table, target_metadata).await?;
+
+        if assigned_count == 0 {
+            Ok(CopyAssignmentsResult::NoAssignments)
+        } else {
+            Ok(CopyAssignmentsResult::Copied {
+                partition_count: assigned_count,
+            })
+        }
+    }
+
     /// Write metadata using `insert_or_update` with conflict handling.
     pub(crate) async fn write_metadata(
         &self,
-        key: &str,
+        table: &TableReference,
         metadata: TablePartitionMetadata,
     ) -> Result<()> {
+        let key = normalized_table_name(table);
         match self
             .state
-            .insert_or_update(key, &metadata)
+            .insert_or_update(&key, &metadata)
             .await
-            .context(MetadataAccessSnafu {
-                table: key.to_string(),
-            })? {
+            .context(MetadataAccessSnafu { table: key.clone() })?
+        {
             WriteResult::Inserted | WriteResult::Updated => Ok(()),
-            WriteResult::Conflict { .. } => Err(Error::ConcurrentModification {
-                table: key.to_string(),
-            }),
+            WriteResult::Conflict { .. } => Err(Error::ConcurrentModification { table: key }),
         }
     }
 }
@@ -404,4 +455,202 @@ fn now_ms() -> Result<u128> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .context(SystemTimeSnafu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+    use object_store::memory::InMemory;
+
+    fn test_manager() -> PartitionManager {
+        PartitionManager::new(Arc::new(InMemory::new())).with_prefix("test/")
+    }
+
+    #[tokio::test]
+    async fn copy_assignments_copies_metadata() {
+        let pm = test_manager();
+        let source = TableReference::parse_str("catalog.schema.source");
+        let target = TableReference::parse_str("catalog.schema.target");
+
+        // Initialize source with partition expressions
+        pm.initialize_metadata(&source, vec!["region".to_string()])
+            .await
+            .expect("should initialize");
+
+        // Add a partition and assign it
+        let pv = HashMap::from([("region".to_string(), "us-east-1".to_string())]);
+        pm.set_unassigned_partitions(&source, vec![pv], vec![])
+            .await
+            .expect("should set partitions");
+        let partition_value: PartitionValue =
+            HashMap::from([("region".to_string(), "us-east-1".to_string())]);
+        pm.assign_partition(&source, &partition_value, "executor-1")
+            .await
+            .expect("should assign");
+
+        // Copy assignments
+        let result = pm
+            .copy_assignments(&source, &target)
+            .await
+            .expect("should copy");
+        assert_eq!(result, CopyAssignmentsResult::Copied { partition_count: 1 });
+
+        // Verify target has the same metadata
+        let target_meta = pm
+            .get_table_metadata(&target)
+            .await
+            .expect("should get")
+            .expect("should exist");
+
+        assert_eq!(target_meta.table_name, normalized_table_name(&target));
+        assert_eq!(
+            target_meta.partition_expressions,
+            vec!["region".to_string()]
+        );
+        assert_eq!(target_meta.partitions.len(), 1);
+        assert!(target_meta.partitions[0].is_assigned_to("executor-1"));
+    }
+
+    #[tokio::test]
+    async fn copy_assignments_noop_when_source_missing() {
+        let pm = test_manager();
+        let source = TableReference::parse_str("catalog.schema.missing");
+        let target = TableReference::parse_str("catalog.schema.target");
+
+        // Missing source metadata is a no-op (source exists but is unpartitioned).
+        let result = pm
+            .copy_assignments(&source, &target)
+            .await
+            .expect("should be a no-op for missing source metadata");
+        assert_eq!(result, CopyAssignmentsResult::NoSourceMetadata);
+
+        // Target should have no metadata since nothing was copied.
+        let target_meta = pm.get_table_metadata(&target).await.expect("should get");
+        assert!(target_meta.is_none());
+    }
+
+    #[tokio::test]
+    async fn copy_assignments_overwrites_existing_target() {
+        let pm = test_manager();
+        let source = TableReference::parse_str("catalog.schema.source");
+        let target = TableReference::parse_str("catalog.schema.target");
+
+        // Initialize both
+        pm.initialize_metadata(&source, vec!["region".to_string()])
+            .await
+            .expect("should initialize source");
+        pm.initialize_metadata(&target, vec!["old_expr".to_string()])
+            .await
+            .expect("should initialize target");
+
+        // Add partition to source
+        let pv = HashMap::from([("region".to_string(), "eu-west-1".to_string())]);
+        pm.set_unassigned_partitions(&source, vec![pv], vec![])
+            .await
+            .expect("should set partitions");
+
+        // Copy should overwrite target
+        let result = pm
+            .copy_assignments(&source, &target)
+            .await
+            .expect("should copy");
+        assert_eq!(result, CopyAssignmentsResult::NoAssignments);
+
+        let target_meta = pm
+            .get_table_metadata(&target)
+            .await
+            .expect("should get")
+            .expect("should exist");
+
+        assert_eq!(target_meta.table_name, normalized_table_name(&target));
+        assert_eq!(
+            target_meta.partition_expressions,
+            vec!["region".to_string()]
+        );
+        assert_eq!(target_meta.partitions.len(), 1);
+    }
+
+    #[test]
+    fn table_key_normalizes_bare_partial_full() {
+        let bare = TableReference::bare("my_table");
+        let partial = TableReference::partial(SPICE_DEFAULT_SCHEMA, "my_table");
+        let full = TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "my_table");
+
+        assert_eq!(
+            normalized_table_name(&bare),
+            normalized_table_name(&full),
+            "bare and full should produce the same key"
+        );
+        assert_eq!(
+            normalized_table_name(&partial),
+            normalized_table_name(&full),
+            "partial and full should produce the same key"
+        );
+        assert_eq!(
+            normalized_table_name(&bare),
+            normalized_table_name(&partial),
+            "bare and partial should produce the same key"
+        );
+    }
+
+    #[test]
+    fn table_key_distinguishes_different_tables() {
+        let a = TableReference::bare("table_a");
+        let b = TableReference::bare("table_b");
+        assert_ne!(normalized_table_name(&a), normalized_table_name(&b));
+    }
+
+    #[test]
+    fn table_key_distinguishes_different_schemas() {
+        let default_schema = TableReference::bare("my_table");
+        let other_schema = TableReference::partial("other_schema", "my_table");
+        assert_ne!(
+            normalized_table_name(&default_schema),
+            normalized_table_name(&other_schema)
+        );
+    }
+
+    #[tokio::test]
+    async fn fully_qualified_and_bare_resolve_to_same_partition() {
+        let pm = test_manager();
+        let bare = TableReference::bare("my_table");
+        let full = TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "my_table");
+
+        // Initialize with bare name
+        pm.initialize_metadata(&bare, vec!["org_id".to_string()])
+            .await
+            .expect("should initialize");
+
+        // Set partitions using bare name
+        let pv = HashMap::from([("org_id".to_string(), "test_org_name".to_string())]);
+        pm.set_unassigned_partitions(&bare, vec![pv], vec![])
+            .await
+            .expect("should set partitions");
+
+        // Look up using fully qualified name — should find the same metadata
+        let meta_via_full = pm
+            .get_table_metadata(&full)
+            .await
+            .expect("should get")
+            .expect("fully qualified lookup should find metadata stored with bare name");
+
+        assert_eq!(meta_via_full.partitions.len(), 1);
+
+        // Assign using fully qualified name
+        let partition_value: PartitionValue =
+            HashMap::from([("org_id".to_string(), "test_org_name".to_string())]);
+        pm.assign_partition(&full, &partition_value, "executor-1")
+            .await
+            .expect("should assign via fully qualified ref");
+
+        // Verify assignment is visible via bare name
+        let meta_via_bare = pm
+            .get_table_metadata(&bare)
+            .await
+            .expect("should get")
+            .expect("bare lookup should see assignment made with fully qualified name");
+
+        assert!(meta_via_bare.partitions[0].is_assigned_to("executor-1"));
+    }
 }

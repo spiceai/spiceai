@@ -31,6 +31,9 @@ pub struct MetricSpec {
     pub metric_type: MetricType,
     pub description: Option<&'static str>,
     pub unit: Option<&'static str>,
+    /// When `true`, this metric is registered automatically without requiring
+    /// the user to list it in the dataset's `metrics` config.
+    pub auto_register: bool,
 }
 
 impl MetricSpec {
@@ -41,6 +44,7 @@ impl MetricSpec {
             metric_type,
             description: None,
             unit: None,
+            auto_register: false,
         }
     }
 
@@ -53,6 +57,12 @@ impl MetricSpec {
     #[must_use]
     pub const fn unit(mut self, unit: &'static str) -> Self {
         self.unit = Some(unit);
+        self
+    }
+
+    #[must_use]
+    pub const fn auto_register(mut self) -> Self {
+        self.auto_register = true;
         self
     }
 }

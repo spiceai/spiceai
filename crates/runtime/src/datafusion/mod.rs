@@ -62,6 +62,7 @@ use cache::TabledCacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
 use cache::result::search::CachedSearchResult;
 use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey};
+use data_components::poly::PolyTableProvider;
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::common::{Constraint, Constraints, ToDFSchema};
@@ -91,6 +92,7 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::SpiceSchemaProvider;
+use runtime_table_partition::provider::PartitionTableProvider;
 use schema::ensure_schema_exists;
 use snafu::prelude::*;
 use spicepod::acceleration::SnapshotsTrigger;
@@ -111,7 +113,6 @@ pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub mod composed_catalog;
-pub mod ddl;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
@@ -539,7 +540,7 @@ pub struct DataFusion {
     /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
     ddl_enabled_catalogs: Arc<RwLock<HashSet<String>>>,
     /// Shared store for DDL extensions from `CREATE TABLE` statements.
-    ddl_extension_store: ddl::acceleration_options::SharedDdlExtensionStore,
+    ddl_extension_store: datafusion_ddl::SharedDdlExtensionStore,
     /// Shared weak self-reference, populated after `Arc::new(DataFusion)`.
     /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
@@ -570,6 +571,8 @@ pub struct DataFusion {
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
     /// Executor registry for distributed write forwarding (scheduler mode only).
     pub executor_registry: Option<Arc<ExecutorRegistry>>,
+    #[cfg(not(windows))]
+    pub(crate) cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -902,7 +905,7 @@ impl DataFusion {
     /// `CREATE TABLE` statements (e.g. `WITH (acceleration.*, dataset.*)` or
     /// `PARTITION BY`), which are then consumed by catalog-specific analyzer rules.
     #[must_use]
-    pub fn ddl_extension_store(&self) -> &ddl::acceleration_options::SharedDdlExtensionStore {
+    pub fn ddl_extension_store(&self) -> &datafusion_ddl::SharedDdlExtensionStore {
         &self.ddl_extension_store
     }
 
@@ -1016,8 +1019,15 @@ impl DataFusion {
     ) -> Result<Option<String>, DataFusionError> {
         let catalog_name = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
         let catalog = ctx.catalog(catalog_name);
-        resolve_table_partition_expr(catalog.as_deref(), Some(executor_registry), table_reference)
-            .await
+        let partition_expr = resolve_table_partition_expr(
+            catalog.as_deref(),
+            Some(executor_registry),
+            table_reference,
+        )
+        .await?
+        .map(|s| s.trim_start_matches('(').trim_end_matches(')').to_string());
+
+        Ok(partition_expr)
     }
 
     /// Parses a SQL expression string into a `DataFusion` `Expr`, using the schema of the given table reference for resolution.
@@ -2718,6 +2728,8 @@ impl DataFusion {
             },
             cluster_role: self.cluster_config.effective_role(),
             ddl_extension_store: Arc::clone(&self.ddl_extension_store),
+            executor_registry: self.executor_registry.clone(),
+            ddl_handler: self.cayenne_ddl_handler.clone(),
         };
 
         planner::create_logical_plan(sql, session, &ctx).await
@@ -2837,20 +2849,41 @@ async fn resolve_table_partition_expr(
 ) -> Result<Option<String>, DataFusionError> {
     let schema_name = table_reference.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
 
-    let Some(catalog) = catalog else {
-        return Ok(None);
+    let expr_string = if let Some(catalog) = catalog
+        && let Some(aware) = cayenne_ddl::as_partition_aware(catalog)
+    {
+        aware
+            .table_partition_expr(schema_name, table_reference.table())
+            .await
+            .boxed()
+            .map_err(DataFusionError::External)?
+    } else {
+        None
     };
 
-    let Some(aware) = cayenne_ddl::as_partition_aware(catalog) else {
-        return Ok(None);
+    let provider_expr_string = if let Some(catalog) = catalog
+        && let Some(schema) = catalog.schema(schema_name)
+    {
+        match schema.table(table_reference.table()).await {
+            Ok(Some(table_provider)) => partition_expr_from_table_provider(&table_provider),
+            Ok(None) => None,
+            Err(err) => {
+                tracing::debug!(table = %table_reference, error = %err, "Failed to resolve table provider while reading partition expression");
+                None
+            }
+        }
+    } else {
+        None
     };
 
-    let Some(expr_string) = aware
-        .table_partition_expr(schema_name, table_reference.table())
-        .await
-        .boxed()
-        .map_err(DataFusionError::External)?
-    else {
+    let Some(expr_string) = expr_string.or(provider_expr_string).or_else(|| {
+        executor_registry.and_then(|registry| {
+            registry
+                .federated_partition_manager()
+                .get_cached_table_metadata(table_reference)
+                .and_then(|metadata| metadata.partition_expressions.first().cloned())
+        })
+    }) else {
         return Ok(None);
     };
 
@@ -2869,6 +2902,45 @@ async fn resolve_table_partition_expr(
     }
 
     Ok(Some(expr_string))
+}
+
+fn partition_expr_from_table_provider(table_provider: &Arc<dyn TableProvider>) -> Option<String> {
+    if let Some(partitioned) = table_provider
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+    {
+        let partition_exprs = partitioned
+            .partition_by()
+            .iter()
+            .map(|partition| partition.expression.to_string())
+            .collect_vec();
+
+        return match partition_exprs.as_slice() {
+            [] => None,
+            [single] => Some(single.clone()),
+            _ => unreachable!(
+                "Multi-expression partition expressions are not supported yet: https://github.com/spiceai/spiceai/issues/9937"
+            ),
+        };
+    }
+
+    if let Some(poly) = table_provider.as_any().downcast_ref::<PolyTableProvider>() {
+        return partition_expr_from_table_provider(&poly.writer());
+    }
+
+    if let Some(accelerated) = table_provider.as_any().downcast_ref::<AcceleratedTable>() {
+        return partition_expr_from_table_provider(&accelerated.get_accelerator());
+    }
+
+    if let Some(adaptor) = table_provider
+        .as_any()
+        .downcast_ref::<FederatedTableProviderAdaptor>()
+        && let Some(inner_provider) = adaptor.table_provider.as_ref()
+    {
+        return partition_expr_from_table_provider(inner_provider);
+    }
+
+    None
 }
 
 #[must_use]

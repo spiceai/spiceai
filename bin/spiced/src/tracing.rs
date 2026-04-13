@@ -90,33 +90,61 @@ const INTERNAL_COMPONENTS: &[&str] = &[
 ];
 
 const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off,delta_kernel::listed_log_files=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off,tower::buffer=off,h2::codec=off";
-const OFF_UNLESS_VERY_VERBOSE_FILTERS: &str = "datafusion_datasource::source=off,datafusion_optimizer::utils=off,datafusion_optimizer::optimizer=off,datafusion::physical_planner=off";
+const OFF_UNLESS_VERY_VERBOSE_FILTERS: &str = "datafusion_datasource::source=off,datafusion_optimizer::utils=off,datafusion_optimizer::optimizer=off,datafusion::physical_planner=off,opentelemetry=warn";
+
+fn specific_env_filter(filter: &str) -> String {
+    format!("{OFF_FILTERS},{filter}")
+}
+
+fn env_filter_string(v: &LogVerbosity) -> String {
+    fn internal_components(level: &str) -> String {
+        INTERNAL_COMPONENTS
+            .iter()
+            .map(|component| format!("{component}={level}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    match v {
+        LogVerbosity::Default => format!(
+            "{},{OFF_FILTERS},{OFF_UNLESS_VERY_VERBOSE_FILTERS},WARN",
+            internal_components("INFO")
+        ),
+        LogVerbosity::Verbose => format!(
+            "{},{OFF_FILTERS},{OFF_UNLESS_VERY_VERBOSE_FILTERS},INFO",
+            internal_components("DEBUG")
+        ),
+        LogVerbosity::VeryVerbose => {
+            format!("{},{OFF_FILTERS},DEBUG", internal_components("TRACE"))
+        }
+        LogVerbosity::Specific(filter) => specific_env_filter(filter),
+    }
+}
 
 impl From<LogVerbosity> for EnvFilter {
     fn from(v: LogVerbosity) -> Self {
-        fn internal_components(level: &str) -> String {
-            INTERNAL_COMPONENTS
-                .iter()
-                .map(|component| format!("{component}={level}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        }
+        EnvFilter::new(env_filter_string(&v))
+    }
+}
 
-        match v {
-            LogVerbosity::Default => EnvFilter::new(format!(
-                "{},{OFF_FILTERS},{OFF_UNLESS_VERY_VERBOSE_FILTERS},WARN",
-                internal_components("INFO")
-            )),
-            LogVerbosity::Verbose => EnvFilter::new(format!(
-                "{},{OFF_FILTERS},{OFF_UNLESS_VERY_VERBOSE_FILTERS},INFO",
-                internal_components("DEBUG")
-            )),
-            LogVerbosity::VeryVerbose => EnvFilter::new(format!(
-                "{},{OFF_FILTERS},DEBUG",
-                internal_components("TRACE")
-            )),
-            LogVerbosity::Specific(filter) => EnvFilter::new(filter),
-        }
+fn specific_filter_enables_trace_logging(filter: &str) -> bool {
+    filter.split(',').map(str::trim).any(|directive| {
+        matches!(
+            directive.rsplit('=').next().map(str::trim),
+            Some(level) if level.eq_ignore_ascii_case("trace")
+        )
+    })
+}
+
+fn should_include_otel_location(is_release_build: bool, verbosity: &LogVerbosity) -> bool {
+    if !is_release_build {
+        return true;
+    }
+
+    match verbosity {
+        LogVerbosity::Default | LogVerbosity::Verbose => false,
+        LogVerbosity::VeryVerbose => true,
+        LogVerbosity::Specific(filter) => specific_filter_enables_trace_logging(filter),
     }
 }
 
@@ -126,6 +154,7 @@ pub(crate) async fn init_tracing(
     df: Arc<DataFusion>,
     verbosity: LogVerbosity,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let include_otel_location = should_include_otel_location(!cfg!(debug_assertions), &verbosity);
     let filter: EnvFilter = verbosity.into();
 
     if let Some(app) = app.as_ref()
@@ -146,7 +175,7 @@ pub(crate) async fn init_tracing(
 
     let subscriber = tracing_subscriber::registry()
         .with(filter)
-        .with(datafusion_task_history_tracing(df, app, config).await?)
+        .with(datafusion_task_history_tracing(df, app, config, include_otel_location).await?)
         .with(
             event_stream::EventStreamLayer::new("progress").with_filter(filter::filter_fn(
                 |metadata| metadata.target() == "task_history",
@@ -170,6 +199,7 @@ async fn datafusion_task_history_tracing<S>(
     df: Arc<DataFusion>,
     app: Option<&Arc<App>>,
     config: Option<&TracingConfig>,
+    include_otel_location: bool,
 ) -> Result<impl Layer<S> + use<S>, Box<dyn std::error::Error + Send + Sync>>
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
@@ -200,8 +230,8 @@ where
         .transpose()?
         .flatten();
 
-    // Compute scheduler_id for cluster mode: "host:port"
-    let scheduler_id: Option<Arc<str>> = df.cluster_config.effective_role().and_then(|_| {
+    // Compute node_id for cluster mode: "host:port"
+    let node_id: Option<Arc<str>> = df.cluster_config.effective_role().and_then(|_| {
         let host = df.cluster_config.node_advertise_address()?;
         let port = df.cluster_config.node_bind_address().port();
         Some(format!("{host}:{port}").into())
@@ -213,7 +243,7 @@ where
         min_sql_duration_ms,
         captured_plan,
         min_plan_duration_ms,
-        scheduler_id,
+        node_id,
     );
 
     let zipkin_exporter = zipkin_task_history_otel_exporter(config).await?;
@@ -238,6 +268,7 @@ where
 
     let layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)
+        .with_location(include_otel_location)
         .with_filter(filter::filter_fn(|metadata| {
             metadata.target() == "task_history"
         }));
@@ -271,18 +302,28 @@ async fn zipkin_task_history_otel_exporter(
     Ok(Some(
         ZipkinExporter::builder()
             .with_collector_endpoint(collector_endpoint)
-            .with_http_client(Client::new())
+            .with_http_client(
+                Client::builder()
+                    .connect_timeout(Duration::from_secs(10))
+                    .timeout(Duration::from_secs(30))
+                    .build()?,
+            )
             .build()?,
     ))
 }
 
 async fn is_zipkin_endpoint_reachable(endpoint: &str) -> bool {
-    let client = Client::new();
-    let timeout = Duration::from_secs(5);
+    let Ok(client) = Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(5))
+        .build()
+    else {
+        return false;
+    };
 
     let url = format!("{endpoint}?serviceName=test");
 
-    match client.get(&url).timeout(timeout).send().await {
+    match client.get(&url).send().await {
         Ok(response) => response.status().is_success(),
         Err(_) => false,
     }
@@ -411,5 +452,52 @@ mod tests {
         let result =
             LogVerbosity::from_flags_and_env_and_config(false, false, "NON_EXISTENT_ENV", None);
         assert_eq!(result, LogVerbosity::Default);
+    }
+
+    #[test]
+    fn includes_otel_location_for_non_release_builds() {
+        assert!(should_include_otel_location(false, &LogVerbosity::Default));
+    }
+
+    #[test]
+    fn excludes_otel_location_for_release_builds_without_trace_logging() {
+        assert!(!should_include_otel_location(true, &LogVerbosity::Default));
+        assert!(!should_include_otel_location(true, &LogVerbosity::Verbose));
+        assert!(!should_include_otel_location(
+            true,
+            &LogVerbosity::Specific("warn,task_history=info".to_string())
+        ));
+        assert!(!should_include_otel_location(
+            true,
+            &LogVerbosity::Specific("warn,task_history=debug".to_string())
+        ));
+    }
+
+    #[test]
+    fn includes_otel_location_for_release_trace_logging() {
+        assert!(should_include_otel_location(
+            true,
+            &LogVerbosity::VeryVerbose
+        ));
+        assert!(should_include_otel_location(
+            true,
+            &LogVerbosity::Specific("trace".to_string())
+        ));
+        assert!(should_include_otel_location(
+            true,
+            &LogVerbosity::Specific("warn,task_history=trace".to_string())
+        ));
+    }
+
+    #[test]
+    fn specific_filter_keeps_off_filters() {
+        assert_eq!(specific_env_filter("trace"), format!("{OFF_FILTERS},trace"));
+    }
+
+    #[test]
+    fn verbose_filter_suppresses_opentelemetry_info() {
+        assert!(env_filter_string(&LogVerbosity::Default).contains("opentelemetry=warn"));
+        assert!(env_filter_string(&LogVerbosity::Verbose).contains("opentelemetry=warn"));
+        assert!(!env_filter_string(&LogVerbosity::VeryVerbose).contains("opentelemetry=warn"));
     }
 }

@@ -146,7 +146,7 @@ jobs:
       # Upload the test archive as an artifact
       - name: Upload test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-test-archive
           path: ./integration.tar.zst
@@ -154,7 +154,7 @@ jobs:
 
       - name: Upload retention OOM test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-retention-oom-test-archive
           path: ./retention_oom.tar.zst
@@ -162,7 +162,7 @@ jobs:
 
       - name: Upload AWS SDK test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-aws-sdk-test-archive
           path: ./integration_aws_sdk.tar.zst
@@ -170,7 +170,7 @@ jobs:
 
       - name: Upload AWS SDK credential bridge test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-aws-sdk-credential-bridge-test-archive
           path: ./integration_aws_sdk_credential_bridge.tar.zst
@@ -178,7 +178,7 @@ jobs:
 
       - name: Upload partition table test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-partition-table-test-archive
           path: ./partition_table_test.tar.zst
@@ -186,7 +186,7 @@ jobs:
 
       - name: Upload data components test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-data-components-test-archive
           path: ./data_components_hadoop.tar.zst
@@ -243,7 +243,7 @@ jobs:
 
       - name: Login to ACR
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: spiceaitestimages.azurecr.io
           username: spiceai-repo-pull
@@ -263,7 +263,7 @@ jobs:
 
       - name: Set up Github Token
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v2
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v2
         id: github-app-token
         with:
           app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
@@ -344,7 +344,7 @@ jobs:
         shell: bash
       - name: Store integration snapshots artifact
         if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true' && needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-snapshots-part-${{ matrix.label }}
           path: integration-snapshots-part-${{ matrix.label }}.tar.gz
@@ -422,7 +422,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -462,7 +462,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
@@ -535,7 +535,7 @@ jobs:
         uses: ./.github/actions/setup-nextest
 
       - name: Login to ACR
-        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
