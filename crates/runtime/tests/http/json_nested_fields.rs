@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Integration test for HTTP datasets with nested JSON fields extracted via
 //! `json_get_str` / `json_get_int` / `json_get_bool` in views, accelerated
-//! with DuckDB. Validates:
+//! with `DuckDB`. Validates:
 //!
 //! 1. Initial load of the view returns correct data.
 //! 2. Hot-reload (adding new `json_get_*` columns to the view) picks up the
@@ -132,7 +132,7 @@ fn write_spicepod(content: &str) -> Result<(), String> {
 /// Generates the initial spicepod YAML with a subset of `json_get_*` columns.
 fn spicepod_yaml_initial(base_url: &str) -> String {
     format!(
-        r#"version: v1
+        r"version: v1
 kind: Spicepod
 name: http_json_nested_test
 
@@ -162,7 +162,7 @@ views:
       FROM audit_logs_raw
       WHERE request_path = '/audit-logs'
       ORDER BY json_get_str(CAST(content AS VARCHAR), 'id')
-"#
+"
     )
 }
 
@@ -170,7 +170,7 @@ views:
 /// added to the view, simulating a hot-reload scenario.
 fn spicepod_yaml_updated(base_url: &str) -> String {
     format!(
-        r#"version: v1
+        r"version: v1
 kind: Spicepod
 name: http_json_nested_test
 
@@ -207,7 +207,7 @@ views:
       FROM audit_logs_raw
       WHERE request_path = '/audit-logs'
       ORDER BY json_get_str(CAST(content AS VARCHAR), 'id')
-"#
+"
     )
 }
 
@@ -227,7 +227,7 @@ async fn run_query(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, String> 
         .map_err(|e| format!("Failed to collect results: {e}"))
 }
 
-/// Validates that an HTTP dataset with DuckDB acceleration works with
+/// Validates that an HTTP dataset with `DuckDB` acceleration works with
 /// `json_get_str`/`json_get_int`/`json_get_bool` in views, including
 /// hot-reload of the view definition with additional nested JSON columns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
