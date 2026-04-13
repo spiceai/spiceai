@@ -157,7 +157,6 @@ datafusion-common-runtime = "52.0.0"
 datafusion-datasource = "52.0.0"
 datafusion-execution = "52.0.0"
 datafusion-expr = "52.0.0"
-# datafusion-federation = { path = "/Users/jeadie/Github/datafusion-federation/datafusion-federation", features = ["sql"] } # local override
 datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "edccff923f27a33803e01fdb855f2cb66437f760", features = ["sql"] }
 datafusion-functions = "52.0.0"
 datafusion-functions-json = "0.52"
@@ -451,6 +450,3 @@ vortex-datafusion = { git = "https://github.com/spiceai/vortex.git", rev = "d694
 vortex-scan = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
 vortex-session = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
 vortex-utils = { git = "https://github.com/spiceai/vortex.git", rev = "d694abda6cf4081a7a6e93b08da1bba28204f41e" } # spiceai-52.5
-
-# [patch."https://github.com/spiceai/datafusion-federation.git"]
-# datafusion-federation = { path = "/Users/jeadie/Github/datafusion-federation/datafusion-federation" }
