@@ -58,6 +58,10 @@ use util::{
 use crate::resilient_http::{
     RetryConfig, configure_client_builder, send_request_with_retry_and_concurrency_limit,
 };
+use crate::schema_discovery::{
+    DatasetPermissions, NoPermissionsCheck, PermissionCheckResult, SchemaProbeResult,
+    discover_schema,
+};
 use tracing::Instrument;
 use util::retry_strategy::BackoffMethod;
 
@@ -325,6 +329,26 @@ impl DatabricksSqlWarehouse {
         config: SqlWarehouseConfig,
         shared_semaphore: Option<Arc<Semaphore>>,
     ) -> Result<Self, Error> {
+        Self::with_config_semaphore_and_permissions(
+            endpoint,
+            sql_warehouse_id,
+            token_provider,
+            config,
+            shared_semaphore,
+            Arc::new(NoPermissionsCheck),
+        )
+    }
+
+    /// Creates a new Databricks SQL Warehouse instance with explicit configuration,
+    /// a shared concurrency semaphore, and a dataset permissions checker.
+    pub fn with_config_semaphore_and_permissions(
+        endpoint: &str,
+        sql_warehouse_id: &str,
+        token_provider: Arc<dyn TokenProvider>,
+        config: SqlWarehouseConfig,
+        shared_semaphore: Option<Arc<Semaphore>>,
+        permissions: Arc<dyn DatasetPermissions>,
+    ) -> Result<Self, Error> {
         ensure!(
             config.max_concurrent_requests > 0,
             InvalidConcurrencyLimitSnafu {
@@ -363,6 +387,7 @@ impl DatabricksSqlWarehouse {
         let pool = Arc::new(SqlWarehouseConnectionPool {
             api,
             metrics: Arc::clone(&metrics),
+            permissions,
         });
         Ok(Self { pool, metrics })
     }
@@ -416,6 +441,7 @@ pub fn shared_request_semaphore(
 struct SqlWarehouseConnectionPool {
     api: Arc<SqlWarehouseApi>,
     metrics: Arc<DatabricksMetrics>,
+    permissions: Arc<dyn DatasetPermissions>,
 }
 
 #[async_trait]
@@ -435,6 +461,7 @@ impl DbConnectionPool<Arc<SqlWarehouseApi>, &'static dyn Sync> for SqlWarehouseC
         Ok(Box::new(SqlWarehouseConnection {
             api: Arc::clone(&self.api),
             metrics: Arc::clone(&self.metrics),
+            permissions: Arc::clone(&self.permissions),
         }))
     }
 
@@ -537,35 +564,27 @@ impl SqlWarehouseApi {
         }
     }
 
-    async fn get_schema(&self, table: &TableReference) -> Result<SchemaRef, Error> {
+    async fn get_schema(
+        &self,
+        table: &TableReference,
+        permissions: &dyn DatasetPermissions,
+    ) -> Result<SchemaRef, Error> {
         let table_name = table.to_string();
 
         async {
-            let token = self.token_provider.get_token();
+            let result = discover_schema(
+                &table_name,
+                self.probe_information_schema(table),
+                self.probe_describe_table(table),
+                permissions,
+            )
+            .await
+            .map_err(|e| Error::QueryFailure {
+                message: e.to_string(),
+            })?;
 
-            match self.get_schema_from_information_schema(&token, table).await {
-                Ok(schema) => return Ok(schema),
-                Err(Error::TableSchemaNotRegistered { .. } | Error::NoColumnsInDataset { .. }) => {
-                    tracing::warn!(
-                        table = %table,
-                        "information_schema.columns has no metadata for this table, falling back to DESCRIBE TABLE. Column nullability will default to nullable."
-                    );
-                }
-                Err(Error::QueryFailure { ref message })
-                    if message.contains("UNSUPPORTED_DATA_SOURCE") =>
-                {
-                    tracing::warn!(
-                        table = %table,
-                        "information_schema query returned UNSUPPORTED_DATA_SOURCE, falling back to DESCRIBE TABLE. Column nullability will default to nullable."
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-
-            let payload = self.create_describe_payload(table)?;
-            let response = self.execute_sql_statement(&token, &payload).await?;
-            let response = self.wait_for_statement_completion(&token, response).await?;
-            schema_from_describe_json(&response, &table_name)
+            result.log_warnings(table);
+            Ok(result.schema)
         }
         .instrument(tracing::info_span!(
             target: "task_history",
@@ -574,6 +593,52 @@ impl SqlWarehouseApi {
             warehouse_id = %self.sql_warehouse_id,
         ))
         .await
+    }
+
+    /// Probes `information_schema.columns` for the table schema.
+    ///
+    /// Returns [`SchemaProbeResult::Ok`] on success, [`SchemaProbeResult::AccessDenied`]
+    /// if the query fails with a permission error, or [`SchemaProbeResult::Failed`] for
+    /// non-permission errors (e.g. `UNSUPPORTED_DATA_SOURCE`, missing metadata).
+    async fn probe_information_schema(&self, table: &TableReference) -> SchemaProbeResult {
+        let token = self.token_provider.get_token();
+        match self.get_schema_from_information_schema(&token, table).await {
+            Ok(schema) => SchemaProbeResult::Ok(schema),
+            Err(e) if is_access_denied_error(&e) => SchemaProbeResult::AccessDenied(e.to_string()),
+            Err(e) => SchemaProbeResult::Failed(Box::new(e)),
+        }
+    }
+
+    /// Probes `DESCRIBE TABLE` for the table schema.
+    ///
+    /// Returns [`SchemaProbeResult::Ok`] on success, [`SchemaProbeResult::AccessDenied`]
+    /// if the query fails with a permission error, or [`SchemaProbeResult::Failed`] for
+    /// other errors.
+    async fn probe_describe_table(&self, table: &TableReference) -> SchemaProbeResult {
+        let token = self.token_provider.get_token();
+        let payload = match self.create_describe_payload(table) {
+            Ok(p) => p,
+            Err(e) => return SchemaProbeResult::Failed(Box::new(e)),
+        };
+        let response = match self.execute_sql_statement(&token, &payload).await {
+            Ok(r) => r,
+            Err(e) if is_access_denied_error(&e) => {
+                return SchemaProbeResult::AccessDenied(e.to_string());
+            }
+            Err(e) => return SchemaProbeResult::Failed(Box::new(e)),
+        };
+        let response = match self.wait_for_statement_completion(&token, response).await {
+            Ok(r) => r,
+            Err(e) if is_access_denied_error(&e) => {
+                return SchemaProbeResult::AccessDenied(e.to_string());
+            }
+            Err(e) => return SchemaProbeResult::Failed(Box::new(e)),
+        };
+        match schema_from_describe_json(&response, &table.to_string()) {
+            Ok(schema) => SchemaProbeResult::Ok(schema),
+            Err(e) if is_access_denied_error(&e) => SchemaProbeResult::AccessDenied(e.to_string()),
+            Err(e) => SchemaProbeResult::Failed(Box::new(e)),
+        }
     }
 
     /// Attempts to read the schema from `information_schema.columns`,
@@ -1063,6 +1128,83 @@ fn is_permanent_http_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 401 | 403 | 404)
 }
 
+/// Returns `true` if the error indicates a SQL-level table permission denial.
+///
+/// Only matches Databricks SQL query failures that explicitly report
+/// permission errors on a specific table. HTTP 403 from the SQL Statements
+/// API is NOT matched here — that's an infrastructure auth error (bad token,
+/// no warehouse access) and is handled by `check_permanent_http_error`.
+fn is_access_denied_error(err: &Error) -> bool {
+    match err {
+        Error::QueryFailure { message } => {
+            message.contains("INSUFFICIENT_PERMISSIONS")
+                || message.contains("ACCESS_DENIED")
+                || message.contains("PERMISSION_DENIED")
+                || message.contains("does not have")
+                || message.contains("permission denied")
+        }
+        _ => false,
+    }
+}
+
+/// Databricks-specific permissions check using the Unity Catalog
+/// effective-permissions API.
+///
+/// For foreign tables (where UC permissions are not authoritative),
+/// it always returns [`PermissionCheckResult::Allowed`].
+pub struct DatabricksPermissions {
+    uc_client: Arc<crate::unity_catalog::UnityCatalog>,
+    /// When `true`, an explicit denial from UC is treated as authoritative.
+    /// Foreign tables set this to `false`.
+    requires_strict_validation: bool,
+}
+
+impl DatabricksPermissions {
+    /// Creates a new permissions checker.
+    ///
+    /// `requires_strict_validation` should be `false` for foreign tables where
+    /// UC permissions are not authoritative.
+    #[must_use]
+    pub fn new(
+        uc_client: Arc<crate::unity_catalog::UnityCatalog>,
+        requires_strict_validation: bool,
+    ) -> Self {
+        Self {
+            uc_client,
+            requires_strict_validation,
+        }
+    }
+}
+
+#[async_trait]
+impl DatasetPermissions for DatabricksPermissions {
+    async fn check_read_permission(&self, table_name: &str) -> PermissionCheckResult {
+        if !self.requires_strict_validation {
+            return PermissionCheckResult::Allowed;
+        }
+        match self.uc_client.get_effective_permissions(table_name).await {
+            Ok(Some(perms)) if !perms.has_read_permission() => {
+                tracing::debug!(
+                    table_name,
+                    principals = ?perms.principals(),
+                    privileges = ?perms.all_privileges(),
+                    "Unity Catalog denied read permission"
+                );
+                PermissionCheckResult::Denied {
+                    reason: format!("Unity Catalog reports no read privilege for '{table_name}'"),
+                }
+            }
+            Ok(Some(_)) => PermissionCheckResult::Allowed,
+            Ok(None) => PermissionCheckResult::Unavailable {
+                reason: format!("Table '{table_name}' not found in UC permissions API"),
+            },
+            Err(e) => PermissionCheckResult::Unavailable {
+                reason: format!("UC permissions API error: {e}"),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ExternalLink {
     chunk_index: u64,
@@ -1257,6 +1399,7 @@ fn schema_from_describe_json(json_value: &Value, dataset_name: &str) -> Result<S
 struct SqlWarehouseConnection {
     api: Arc<SqlWarehouseApi>,
     metrics: Arc<DatabricksMetrics>,
+    permissions: Arc<dyn DatasetPermissions>,
 }
 
 impl Drop for SqlWarehouseConnection {
@@ -1285,7 +1428,11 @@ impl<'a> DbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseConnec
 impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseConnection {
     fn new(api: Arc<SqlWarehouseApi>) -> Self {
         let metrics = Arc::clone(&api.metrics);
-        Self { api, metrics }
+        Self {
+            api,
+            metrics,
+            permissions: Arc::new(NoPermissionsCheck),
+        }
     }
 
     async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {
@@ -1353,7 +1500,7 @@ impl<'a> AsyncDbConnection<Arc<SqlWarehouseApi>, &'a dyn Sync> for SqlWarehouseC
         table_reference: &TableReference,
     ) -> Result<SchemaRef, dbconnection::Error> {
         self.api
-            .get_schema(table_reference)
+            .get_schema(table_reference, self.permissions.as_ref())
             .await
             .map_err(|source| dbconnection::Error::UnableToGetSchema {
                 source: Box::new(source),
@@ -2674,10 +2821,67 @@ mod tests {
         assert_eq!(schema.field(4).data_type(), &DataType::Decimal128(38, 10));
     }
 
+    /// Routing mock server that dispatches based on SQL statement content.
+    ///
+    /// Routes requests to either the `info_schema_response` or `describe_response`
+    /// based on whether the SQL contains `information_schema` or `DESCRIBE TABLE`.
+    /// Supports multiple sequential responses per route.
+    async fn start_routing_mock_server(
+        info_schema_responses: Vec<Value>,
+        describe_response: Value,
+    ) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind to a port");
+        let port = listener
+            .local_addr()
+            .expect("should have an address")
+            .port();
+        let info_responses = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from(
+            info_schema_responses,
+        )));
+        let describe = Arc::new(describe_response);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let info_responses = Arc::clone(&info_responses);
+                let describe = Arc::clone(&describe);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+
+                    let response_json = if request.contains("information_schema") {
+                        let mut q = info_responses.lock().await;
+                        q.pop_front().unwrap_or_else(|| (*describe).clone())
+                    } else {
+                        (*describe).clone()
+                    };
+
+                    let body =
+                        serde_json::to_string(&response_json).expect("should serialize response");
+                    let http_response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(http_response.as_bytes()).await;
+                });
+            }
+        });
+
+        port
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_get_schema_falls_back_to_data_type_on_unresolved_column() {
-        // First call returns UNRESOLVED_COLUMN error (full_data_type doesn't exist).
-        // Second call returns a successful schema response using data_type column.
+        // First info_schema call returns UNRESOLVED_COLUMN error (full_data_type doesn't exist).
+        // Second info_schema call returns a successful schema response using data_type column.
+        // DESCRIBE TABLE also succeeds as fallback.
         let unresolved_column_response = json!({
             "status": {
                 "state": "FAILED",
@@ -2697,17 +2901,27 @@ mod tests {
                 ]
             }
         });
+        let describe_response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "stmt-3",
+            "result": {
+                "data_array": [
+                    ["id", "int", ""],
+                    ["name", "string", ""]
+                ]
+            }
+        });
 
-        let port = start_mock_server(
+        let port = start_routing_mock_server(
             vec![unresolved_column_response, success_response],
-            json!({}),
+            describe_response,
         )
         .await;
         let api = create_test_api(port);
         let table = TableReference::full("my_catalog", "my_schema", "my_table");
 
         let schema = api
-            .get_schema(&table)
+            .get_schema(&table, &NoPermissionsCheck)
             .await
             .expect("should succeed via data_type fallback");
         assert_eq!(schema.fields().len(), 2);
@@ -2717,7 +2931,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_get_schema_succeeds_with_full_data_type() {
-        let success_response = json!({
+        let info_schema_response = json!({
             "status": { "state": "SUCCEEDED" },
             "statement_id": "stmt-1",
             "result": {
@@ -2727,13 +2941,23 @@ mod tests {
                 ]
             }
         });
+        let describe_response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "stmt-2",
+            "result": {
+                "data_array": [
+                    ["id", "int", ""],
+                    ["amount", "decimal(10,2)", ""]
+                ]
+            }
+        });
 
-        let port = start_mock_server(vec![success_response], json!({})).await;
+        let port = start_routing_mock_server(vec![info_schema_response], describe_response).await;
         let api = create_test_api(port);
         let table = TableReference::full("catalog", "schema", "orders");
 
         let schema = api
-            .get_schema(&table)
+            .get_schema(&table, &NoPermissionsCheck)
             .await
             .expect("should succeed on first try with full_data_type");
         assert_eq!(schema.fields().len(), 2);
@@ -2825,34 +3049,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn test_get_schema_propagates_non_unresolved_column_errors() {
-        // A FAILED response that is NOT about UNRESOLVED_COLUMN should not trigger fallback.
-        let other_failure = json!({
+    async fn test_get_schema_propagates_error_when_both_probes_fail() {
+        // Both info_schema and DESCRIBE TABLE fail with non-permission errors.
+        let info_failure = json!({
             "status": {
                 "state": "FAILED",
                 "error": { "message": "Table or view not found: my_table" }
             },
             "statement_id": "stmt-1"
         });
+        let describe_failure = json!({
+            "status": {
+                "state": "FAILED",
+                "error": { "message": "Table or view not found: my_table" }
+            },
+            "statement_id": "stmt-2"
+        });
 
-        let port = start_mock_server(vec![other_failure], json!({})).await;
+        let port = start_routing_mock_server(vec![info_failure], describe_failure).await;
         let api = create_test_api(port);
         let table = TableReference::full("catalog", "schema", "my_table");
 
         let err = api
-            .get_schema(&table)
+            .get_schema(&table, &NoPermissionsCheck)
             .await
-            .expect_err("should propagate non-UNRESOLVED_COLUMN error");
+            .expect_err("should propagate error when both probes fail");
         assert!(
-            matches!(&err, Error::QueryFailure { message } if message.contains("Table or view not found")),
+            err.to_string().contains("Table or view not found"),
             "unexpected error: {err}"
         );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn test_get_schema_no_fallback_for_unresolved_column_other_than_full_data_type() {
-        // UNRESOLVED_COLUMN for a column other than full_data_type should NOT trigger fallback.
-        let unresolved_other = json!({
+    async fn test_get_schema_info_schema_fails_describe_succeeds() {
+        // information_schema fails with non-permission error, DESCRIBE TABLE succeeds.
+        let info_failure = json!({
             "status": {
                 "state": "FAILED",
                 "error": {
@@ -2861,19 +3092,26 @@ mod tests {
             },
             "statement_id": "stmt-1"
         });
+        let describe_response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "stmt-2",
+            "result": {
+                "data_array": [
+                    ["id", "int", ""],
+                    ["name", "string", ""]
+                ]
+            }
+        });
 
-        let port = start_mock_server(vec![unresolved_other], json!({})).await;
+        let port = start_routing_mock_server(vec![info_failure], describe_response).await;
         let api = create_test_api(port);
         let table = TableReference::full("catalog", "schema", "my_table");
 
-        let err = api
-            .get_schema(&table)
+        let schema = api
+            .get_schema(&table, &NoPermissionsCheck)
             .await
-            .expect_err("should not fall back for unrelated UNRESOLVED_COLUMN");
-        assert!(
-            matches!(&err, Error::QueryFailure { message } if message.contains("UNRESOLVED_COLUMN")),
-            "unexpected error: {err}"
-        );
+            .expect("should fall back to DESCRIBE TABLE");
+        assert_eq!(schema.fields().len(), 2);
     }
 
     /// Regression test: tables backed by unsupported data sources (e.g.
@@ -2903,18 +3141,203 @@ mod tests {
             }
         });
 
-        let port =
-            start_mock_server(vec![unsupported_response, describe_response], json!({})).await;
+        let port = start_routing_mock_server(vec![unsupported_response], describe_response).await;
         let api = create_test_api(port);
         let table = TableReference::full("catalog", "schema", "foreign_table");
 
         let schema = api
-            .get_schema(&table)
+            .get_schema(&table, &NoPermissionsCheck)
             .await
             .expect("should fall back to DESCRIBE TABLE on UNSUPPORTED_DATA_SOURCE");
         assert_eq!(schema.fields().len(), 2);
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(1).name(), "name");
+    }
+
+    // ── Parallel schema discovery integration tests ──
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_get_schema_parallel_both_succeed_prefers_info_schema() {
+        // When both probes succeed, information_schema is preferred (has nullability).
+        let info_response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "stmt-1",
+            "result": {
+                "data_array": [
+                    ["id", "int", "NO"],
+                    ["name", "string", "YES"]
+                ]
+            }
+        });
+        let describe_response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "stmt-2",
+            "result": {
+                "data_array": [
+                    ["id", "int", ""],
+                    ["name", "string", ""]
+                ]
+            }
+        });
+
+        let port = start_routing_mock_server(vec![info_response], describe_response).await;
+        let api = create_test_api(port);
+        let table = TableReference::full("catalog", "schema", "my_table");
+
+        let schema = api
+            .get_schema(&table, &NoPermissionsCheck)
+            .await
+            .expect("should prefer information_schema");
+        assert_eq!(schema.fields().len(), 2);
+        // information_schema has nullability info: id is NOT NULL
+        assert!(!schema.field(0).is_nullable());
+        assert!(schema.field(1).is_nullable());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_get_schema_parallel_describe_denied_is_permanent_error() {
+        // information_schema succeeds but DESCRIBE TABLE returns access denied.
+        // This is a permanent error because the table itself is not accessible.
+        let info_response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "stmt-1",
+            "result": {
+                "data_array": [
+                    ["id", "int", "NO"]
+                ]
+            }
+        });
+        let describe_denied = json!({
+            "status": {
+                "state": "FAILED",
+                "error": { "message": "INSUFFICIENT_PERMISSIONS: User does not have permission to access table" }
+            },
+            "statement_id": "stmt-2"
+        });
+
+        let port = start_routing_mock_server(vec![info_response], describe_denied).await;
+        let api = create_test_api(port);
+        let table = TableReference::full("catalog", "schema", "restricted_table");
+
+        let err = api
+            .get_schema(&table, &NoPermissionsCheck)
+            .await
+            .expect_err("should fail when DESCRIBE TABLE is access denied");
+        assert!(
+            err.to_string().contains("Access denied"),
+            "error should mention access denied: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_get_schema_parallel_info_schema_denied_describe_ok() {
+        // information_schema returns access denied, but DESCRIBE TABLE succeeds.
+        // This should warn and fall back to DESCRIBE TABLE.
+        let info_denied = json!({
+            "status": {
+                "state": "FAILED",
+                "error": { "message": "INSUFFICIENT_PERMISSIONS: User does not have access to information_schema" }
+            },
+            "statement_id": "stmt-1"
+        });
+        let describe_response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "stmt-2",
+            "result": {
+                "data_array": [
+                    ["id", "int", ""],
+                    ["name", "string", ""]
+                ]
+            }
+        });
+
+        let port = start_routing_mock_server(vec![info_denied], describe_response).await;
+        let api = create_test_api(port);
+        let table = TableReference::full("catalog", "schema", "my_table");
+
+        let schema = api
+            .get_schema(&table, &NoPermissionsCheck)
+            .await
+            .expect("should fall back to DESCRIBE TABLE when info_schema denied");
+        assert_eq!(schema.fields().len(), 2);
+        // DESCRIBE TABLE defaults to nullable
+        assert!(schema.field(0).is_nullable());
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_get_schema_parallel_permissions_denied() {
+        use crate::schema_discovery::PermissionCheckResult;
+
+        struct DeniedPermissions;
+        #[async_trait]
+        impl DatasetPermissions for DeniedPermissions {
+            async fn check_read_permission(&self, _: &str) -> PermissionCheckResult {
+                PermissionCheckResult::Denied {
+                    reason: "UC says no SELECT privilege".into(),
+                }
+            }
+        }
+
+        // Both probes succeed, but permissions are denied.
+        let info_response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "stmt-1",
+            "result": { "data_array": [["id", "int", "NO"]] }
+        });
+        let describe_response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "stmt-2",
+            "result": { "data_array": [["id", "int", ""]] }
+        });
+
+        let port = start_routing_mock_server(vec![info_response], describe_response).await;
+        let api = create_test_api(port);
+        let table = TableReference::full("catalog", "schema", "my_table");
+
+        let err = api
+            .get_schema(&table, &DeniedPermissions)
+            .await
+            .expect_err("should fail when permissions denied");
+        assert!(
+            err.to_string().contains("Access denied"),
+            "error should mention access denied: {err}"
+        );
+        assert!(
+            err.to_string().contains("UC says no SELECT privilege"),
+            "error should contain denial reason: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_get_schema_parallel_both_denied_is_permanent_error() {
+        // Both probes return access denied.
+        let info_denied = json!({
+            "status": {
+                "state": "FAILED",
+                "error": { "message": "INSUFFICIENT_PERMISSIONS: no access to information_schema" }
+            },
+            "statement_id": "stmt-1"
+        });
+        let describe_denied = json!({
+            "status": {
+                "state": "FAILED",
+                "error": { "message": "INSUFFICIENT_PERMISSIONS: no access to table" }
+            },
+            "statement_id": "stmt-2"
+        });
+
+        let port = start_routing_mock_server(vec![info_denied], describe_denied).await;
+        let api = create_test_api(port);
+        let table = TableReference::full("catalog", "schema", "restricted_table");
+
+        let err = api
+            .get_schema(&table, &NoPermissionsCheck)
+            .await
+            .expect_err("should fail when both probes denied");
+        assert!(
+            err.to_string().contains("Access denied"),
+            "error should mention access denied: {err}"
+        );
     }
 
     /// Schema parsed from `full_data_type` column values matching a real
@@ -3750,6 +4173,78 @@ mod tests {
             shared_semaphore.available_permits(),
             1,
             "all semaphore permits should be returned after both operations complete"
+        );
+    }
+
+    // ── is_access_denied_error tests ──
+
+    #[test]
+    fn test_is_access_denied_insufficient_permissions() {
+        let err = Error::QueryFailure {
+            message: "Query failed with state FAILED: INSUFFICIENT_PERMISSIONS: User does not have access".into(),
+        };
+        assert!(is_access_denied_error(&err));
+    }
+
+    #[test]
+    fn test_is_access_denied_access_denied_keyword() {
+        let err = Error::QueryFailure {
+            message: "ACCESS_DENIED: Operation not allowed".into(),
+        };
+        assert!(is_access_denied_error(&err));
+    }
+
+    #[test]
+    fn test_is_access_denied_does_not_have() {
+        let err = Error::QueryFailure {
+            message: "User does not have permission to read this table".into(),
+        };
+        assert!(is_access_denied_error(&err));
+    }
+
+    #[test]
+    fn test_is_access_denied_permission_denied() {
+        let err = Error::QueryFailure {
+            message: "permission denied for table my_table".into(),
+        };
+        assert!(is_access_denied_error(&err));
+    }
+
+    #[test]
+    fn test_is_not_access_denied_for_generic_failure() {
+        let err = Error::QueryFailure {
+            message: "Table or view not found: my_table".into(),
+        };
+        assert!(!is_access_denied_error(&err));
+    }
+
+    #[test]
+    fn test_is_not_access_denied_for_permanently_disabled() {
+        assert!(!is_access_denied_error(&Error::PermanentlyDisabled));
+    }
+
+    #[test]
+    fn test_is_not_access_denied_for_other_errors() {
+        let err = Error::NotImplemented;
+        assert!(!is_access_denied_error(&err));
+    }
+
+    /// HTTP 403 from the SQL Statements API is an infrastructure auth error
+    /// (bad token, no warehouse access), NOT a SQL-level table permission
+    /// denial. It should NOT be classified as access denied.
+    #[test]
+    fn test_http_403_is_not_sql_access_denied() {
+        // Build a reqwest::Error that reports status 403.
+        // We can't easily construct one, but we can verify via QueryFailure
+        // that only SQL-level messages trigger access denied, not HTTP errors.
+        let err = Error::QueryFailure {
+            message: "HTTP status client error (403 Forbidden)".into(),
+        };
+        // Generic "403 Forbidden" text should NOT match — it lacks the specific
+        // SQL error codes (INSUFFICIENT_PERMISSIONS, ACCESS_DENIED, etc.)
+        assert!(
+            !is_access_denied_error(&err),
+            "HTTP 403 in a QueryFailure should not be treated as SQL access denied"
         );
     }
 }
