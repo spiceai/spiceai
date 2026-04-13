@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc};
 use crate::search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc};
@@ -91,8 +91,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     }
 }
 
-/// Create a [`FunctionSupport`] with all spice specific functions as unsupported for federation.
-pub fn deny_spice_specific_functions() -> FunctionSupport {
+static DENY_SPICE_SPECIFIC_FUNCTIONS: LazyLock<FunctionSupport> = LazyLock::new(|| {
     let builtin = [
         "rand",
         BUCKET_SCALAR_UDF_NAME,
@@ -115,6 +114,11 @@ pub fn deny_spice_specific_functions() -> FunctionSupport {
         None,
         None,
     )
+});
+
+/// Return the cached [`FunctionSupport`] that denies Spice-specific functions for federation.
+pub fn deny_spice_specific_functions() -> &'static FunctionSupport {
+    &DENY_SPICE_SPECIFIC_FUNCTIONS
 }
 
 fn json_functions() -> Vec<String> {
