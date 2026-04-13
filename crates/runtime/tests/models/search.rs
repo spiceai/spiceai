@@ -282,10 +282,99 @@ fn assert_search_response_snapshot(test_name: &str, resp: Value, round_scores: b
                 normalize_search_response_json(resp, true, round_scores)
             );
         }
+        // S3 Vectors HTTP search results are non-deterministic: the backend may return
+        // different items with the same rounded score across runs. Use structural validation
+        // instead of exact snapshot comparison for these tests.
+        name if name.starts_with("s3vectors_composite")
+            && !name.contains("vector_search_sql")
+            && !name.contains("with_where") =>
+        {
+            assert_search_response_structure(name, resp, round_scores);
+        }
         _ => {
             insta::assert_snapshot!(
                 format!("{test_name}_response"),
                 normalize_search_response(resp, round_scores)
+            );
+        }
+    }
+}
+
+/// Validate the structure and invariants of a search response without asserting exact item content.
+/// Used for S3 Vectors HTTP search tests where the result set is non-deterministic.
+fn assert_search_response_structure(test_name: &str, resp: Value, round_scores: bool) {
+    let normalized = normalize_search_response_json(resp, true, round_scores);
+
+    let results = normalized
+        .get("results")
+        .and_then(|r| r.as_array())
+        .unwrap_or_else(|| panic!("{test_name}: response should have a 'results' array"));
+
+    assert_eq!(
+        results.len(),
+        4,
+        "{test_name}: expected 4 results, got {}",
+        results.len()
+    );
+
+    let expected_dataset = if test_name.contains("_view") {
+        "qs_view"
+    } else {
+        "qs"
+    };
+
+    let mut prev_score = f64::MAX;
+    for (i, result) in results.iter().enumerate() {
+        // Verify required fields exist
+        assert!(
+            result.get("_score").is_some(),
+            "{test_name}: result[{i}] missing '_score'"
+        );
+        assert!(
+            result.get("matches").is_some(),
+            "{test_name}: result[{i}] missing 'matches'"
+        );
+        assert!(
+            result.get("primary_key").is_some(),
+            "{test_name}: result[{i}] missing 'primary_key'"
+        );
+
+        // Verify dataset name
+        let dataset = result.get("dataset").and_then(|d| d.as_str()).unwrap_or("");
+        assert_eq!(
+            dataset, expected_dataset,
+            "{test_name}: result[{i}] dataset should be '{expected_dataset}', got '{dataset}'"
+        );
+
+        // Verify scores are in descending order and within [0, 1]
+        let score: f64 = result
+            .get("_score")
+            .and_then(|s| s.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(-1.0);
+        assert!(
+            (0.0..=1.0).contains(&score),
+            "{test_name}: result[{i}] score {score} not in [0, 1]"
+        );
+        assert!(
+            score <= prev_score,
+            "{test_name}: result[{i}] score {score} > previous {prev_score} (not descending)"
+        );
+        prev_score = score;
+
+        // Verify matches contain the 'answer' field
+        let matches = result.get("matches").and_then(|m| m.as_object());
+        assert!(
+            matches.is_some_and(|m| m.contains_key("answer")),
+            "{test_name}: result[{i}] matches should contain 'answer'"
+        );
+
+        // For additional_columns tests, verify extra fields in primary_key
+        if test_name.contains("additional_columns") {
+            let pk = result.get("primary_key").and_then(|p| p.as_object());
+            assert!(
+                pk.is_some_and(|p| p.contains_key("question")),
+                "{test_name}: result[{i}] primary_key should contain 'question' for additional_columns test"
             );
         }
     }
