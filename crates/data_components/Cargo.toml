@@ -158,7 +158,7 @@ postgres = [
 s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
 scylladb = ["dep:scylla", "datafusion-table-providers/federation"]
 sharepoint = ["dep:graph-rs-sdk"]
-snowflake = ["dep:snowflake-api", "datafusion-table-providers/federation"]
+snowflake = ["dep:snowflake-api", "datafusion-table-providers/federation", "db_connection_pool/snowflake"]
 spark_connect = ["dep:spark-connect-rs"]
 sqlite = [
     "dep:rusqlite",

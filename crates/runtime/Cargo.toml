@@ -50,6 +50,7 @@ datafusion-datasource.workspace = true
 datafusion-expr.workspace = true
 datafusion-federation = { workspace = true }
 datafusion-functions-json = { workspace = true }
+datafusion-ddl = { path = "../datafusion-ddl" }
 datafusion-optimizer-rules = { path = "../datafusion-optimizer-rules" }
 datafusion-proto = { workspace = true }
 datafusion-spark.workspace = true
