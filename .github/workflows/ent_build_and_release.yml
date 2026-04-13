@@ -131,7 +131,7 @@ jobs:
             if (includeLinuxArm) {
               matrix.push({
                 name: "Linux aarch64",
-                runner: isTaggedRelease ? "hosted-linux-arm-runner" : "hosted-linux-arm-runner",
+                runner: "ubuntu-22.04-arm-16core",
                 target_os: "linux",
                 target_arch: "aarch64",
                 target_arch_go: "arm64",

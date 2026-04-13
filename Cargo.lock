@@ -3479,6 +3479,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-row",
  "arrow-schema",
+ "arrow_tools",
  "async-stream",
  "async-trait",
  "base64 0.22.1",
@@ -3490,6 +3491,7 @@ dependencies = [
  "datafusion-catalog",
  "datafusion-common",
  "datafusion-datasource",
+ "datafusion-ddl",
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-federation",
@@ -3503,6 +3505,7 @@ dependencies = [
  "object_store",
  "parking_lot 0.12.5",
  "paste",
+ "regex",
  "roaring",
  "rstest 0.26.1",
  "runtime-datafusion",
@@ -5610,6 +5613,16 @@ dependencies = [
  "parking_lot 0.12.5",
  "parquet",
  "tokio",
+]
+
+[[package]]
+name = "datafusion-ddl"
+version = "2.0.0-rc.2-enterprise"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "datafusion",
+ "spicepod",
 ]
 
 [[package]]
@@ -15972,6 +15985,7 @@ dependencies = [
  "dataformat-json",
  "datafusion",
  "datafusion-datasource",
+ "datafusion-ddl",
  "datafusion-expr",
  "datafusion-federation",
  "datafusion-functions-json",

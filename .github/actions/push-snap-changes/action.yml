@@ -59,8 +59,8 @@ runs:
             if [[ -z "${BODY}" ]]; then
               BODY="Automated snapshot update from workflow run [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."
             fi
-            gh pr create --title "${{ inputs.title }}" --body "${BODY}" --base develop --head ${BRANCH_NAME} --label kind/bug
-            gh pr merge --squash --auto ${BRANCH_NAME}
+            gh pr create --title "${{ inputs.title }}" --body "${BODY}" --base trunk --head ${BRANCH_NAME} --label kind/bug
+            gh pr merge --squash --auto ${BRANCH_NAME} || echo "Auto-merge not available for this branch; PR created and requires manual merge."
           fi
         fi
       env:

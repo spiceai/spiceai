@@ -400,6 +400,49 @@ impl UnityCatalog {
             .collect::<Vec<_>>()
             .join(".")
     }
+
+    /// Runs an advisory permission check and logs the result.
+    ///
+    /// This never blocks initialization or filters tables — it only produces
+    /// diagnostic log output so operators can identify likely access issues
+    /// before queries hit Databricks at runtime.
+    pub async fn log_advisory_permission_check(&self, table_name: &str, context: &str) {
+        match self.get_effective_permissions(table_name).await {
+            Ok(Some(perms)) => {
+                if perms.has_read_permission() {
+                    tracing::debug!(
+                        table = %table_name,
+                        principals = ?perms.principals(),
+                        "Unity Catalog permission check passed"
+                    );
+                } else {
+                    tracing::warn!(
+                        table = %table_name,
+                        "Unity Catalog effective-permissions did not report a read-compatible privilege during {context}; proceeding and deferring to Databricks query-time validation"
+                    );
+                    tracing::debug!(
+                        table = %table_name,
+                        principals = ?perms.principals(),
+                        privileges = ?perms.all_privileges(),
+                        "Permission denial details"
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    table = %table_name,
+                    "Table not found when checking permissions; proceeding"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    table = %table_name,
+                    error = %e,
+                    "Failed to check Unity Catalog permissions; proceeding without validation"
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -599,7 +642,9 @@ impl UCPermissionsEnvelope {
 
 #[cfg(test)]
 mod tests {
-    use super::{UCColumn, UCTable};
+    use super::{
+        UCColumn, UCPermissionsEnvelope, UCPrivilege, UCPrivilegeAssignment, UCTable, UCTableType,
+    };
 
     fn make_table(table_type: &str) -> UCTable {
         UCTable {
@@ -612,6 +657,65 @@ mod tests {
             storage_location: None,
         }
     }
+
+    fn make_permissions(privileges: &[&str]) -> UCPermissionsEnvelope {
+        UCPermissionsEnvelope {
+            privilege_assignments: vec![UCPrivilegeAssignment {
+                principal: "test_user".to_string(),
+                privileges: privileges
+                    .iter()
+                    .map(|p| UCPrivilege {
+                        privilege: (*p).to_string(),
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // UCTableType parsing
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_uc_table_type_from_string() {
+        assert_eq!(UCTableType::from("MANAGED"), UCTableType::Managed);
+        assert_eq!(UCTableType::from("EXTERNAL"), UCTableType::External);
+        assert_eq!(UCTableType::from("FOREIGN"), UCTableType::Foreign);
+        assert_eq!(UCTableType::from("VIEW"), UCTableType::View);
+        assert_eq!(
+            UCTableType::from("MATERIALIZED_VIEW"),
+            UCTableType::MaterializedView
+        );
+        assert_eq!(
+            UCTableType::from("STREAMING_TABLE"),
+            UCTableType::StreamingTable
+        );
+        assert_eq!(UCTableType::from("SOMETHING_NEW"), UCTableType::Unknown);
+        assert_eq!(UCTableType::from(""), UCTableType::Unknown);
+    }
+
+    // ----------------------------------------------------------------
+    // is_queryable
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_queryable_table_types() {
+        assert!(make_table("MANAGED").is_queryable());
+        assert!(make_table("EXTERNAL").is_queryable());
+        assert!(make_table("FOREIGN").is_queryable());
+        assert!(make_table("MATERIALIZED_VIEW").is_queryable());
+    }
+
+    #[test]
+    fn test_non_queryable_table_types() {
+        assert!(!make_table("VIEW").is_queryable());
+        assert!(!make_table("STREAMING_TABLE").is_queryable());
+        assert!(!make_table("UNKNOWN_TYPE").is_queryable());
+    }
+
+    // ----------------------------------------------------------------
+    // requires_read_permission_validation
+    // ----------------------------------------------------------------
 
     #[test]
     fn test_foreign_tables_skip_strict_permission_validation() {
@@ -627,5 +731,162 @@ mod tests {
 
         assert!(table.is_queryable());
         assert!(table.requires_read_permission_validation());
+    }
+
+    #[test]
+    fn test_external_tables_keep_permission_validation() {
+        assert!(make_table("EXTERNAL").requires_read_permission_validation());
+    }
+
+    #[test]
+    fn test_materialized_view_keeps_permission_validation() {
+        assert!(make_table("MATERIALIZED_VIEW").requires_read_permission_validation());
+    }
+
+    #[test]
+    fn test_non_queryable_types_still_require_permission_validation() {
+        assert!(make_table("VIEW").requires_read_permission_validation());
+        assert!(make_table("STREAMING_TABLE").requires_read_permission_validation());
+    }
+
+    // ----------------------------------------------------------------
+    // UCPermissionsEnvelope::has_read_permission
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_has_read_permission_with_select() {
+        assert!(make_permissions(&["SELECT"]).has_read_permission());
+    }
+
+    #[test]
+    fn test_has_read_permission_with_all_privileges() {
+        assert!(make_permissions(&["ALL_PRIVILEGES"]).has_read_permission());
+    }
+
+    #[test]
+    fn test_has_read_permission_with_all_privileges_space() {
+        assert!(make_permissions(&["ALL PRIVILEGES"]).has_read_permission());
+    }
+
+    #[test]
+    fn test_has_read_permission_with_owner() {
+        assert!(make_permissions(&["OWNER"]).has_read_permission());
+    }
+
+    #[test]
+    fn test_has_read_permission_with_ownership() {
+        assert!(make_permissions(&["OWNERSHIP"]).has_read_permission());
+    }
+
+    #[test]
+    fn test_no_read_permission_with_only_modify() {
+        assert!(!make_permissions(&["MODIFY"]).has_read_permission());
+    }
+
+    #[test]
+    fn test_no_read_permission_with_only_create() {
+        assert!(!make_permissions(&["CREATE"]).has_read_permission());
+    }
+
+    #[test]
+    fn test_no_read_permission_empty_assignments() {
+        let perms = UCPermissionsEnvelope {
+            privilege_assignments: vec![],
+        };
+        assert!(!perms.has_read_permission());
+    }
+
+    #[test]
+    fn test_no_read_permission_empty_privileges() {
+        let perms = UCPermissionsEnvelope {
+            privilege_assignments: vec![UCPrivilegeAssignment {
+                principal: "test_user".to_string(),
+                privileges: vec![],
+            }],
+        };
+        assert!(!perms.has_read_permission());
+    }
+
+    #[test]
+    fn test_has_read_permission_mixed_privileges() {
+        assert!(make_permissions(&["MODIFY", "CREATE", "SELECT"]).has_read_permission());
+    }
+
+    #[test]
+    fn test_has_read_permission_multiple_principals() {
+        let perms = UCPermissionsEnvelope {
+            privilege_assignments: vec![
+                UCPrivilegeAssignment {
+                    principal: "user_no_access".to_string(),
+                    privileges: vec![UCPrivilege {
+                        privilege: "MODIFY".to_string(),
+                    }],
+                },
+                UCPrivilegeAssignment {
+                    principal: "user_with_access".to_string(),
+                    privileges: vec![UCPrivilege {
+                        privilege: "SELECT".to_string(),
+                    }],
+                },
+            ],
+        };
+        assert!(perms.has_read_permission());
+    }
+
+    // ----------------------------------------------------------------
+    // UCTable::full_name
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_full_name() {
+        let table = make_table("MANAGED");
+        assert_eq!(table.full_name(), "catalog.schema.table");
+    }
+
+    // ----------------------------------------------------------------
+    // UCPermissionsEnvelope helpers
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_principals_returns_all_principal_names() {
+        let perms = UCPermissionsEnvelope {
+            privilege_assignments: vec![
+                UCPrivilegeAssignment {
+                    principal: "alice".to_string(),
+                    privileges: vec![],
+                },
+                UCPrivilegeAssignment {
+                    principal: "bob".to_string(),
+                    privileges: vec![],
+                },
+            ],
+        };
+        assert_eq!(perms.principals(), vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn test_all_privileges_returns_flattened_privileges() {
+        let perms = UCPermissionsEnvelope {
+            privilege_assignments: vec![
+                UCPrivilegeAssignment {
+                    principal: "alice".to_string(),
+                    privileges: vec![
+                        UCPrivilege {
+                            privilege: "SELECT".to_string(),
+                        },
+                        UCPrivilege {
+                            privilege: "MODIFY".to_string(),
+                        },
+                    ],
+                },
+                UCPrivilegeAssignment {
+                    principal: "bob".to_string(),
+                    privileges: vec![UCPrivilege {
+                        privilege: "CREATE".to_string(),
+                    }],
+                },
+            ],
+        };
+        assert_eq!(perms.all_privileges(), vec!["SELECT", "MODIFY", "CREATE"]);
     }
 }
