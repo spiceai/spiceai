@@ -954,4 +954,49 @@ mod tests {
             "second connector should initialize successfully"
         );
     }
+
+    async fn make_test_connector_component() -> ConnectorComponent {
+        let app = Arc::new(app::AppBuilder::new("test_app").build());
+        let rt = Arc::new(crate::Runtime::builder().build().await);
+        ConnectorComponent::Dataset(Arc::new(
+            DatasetBuilder::try_new("databricks:my_table".to_string(), "my_table")
+                .expect("valid builder")
+                .with_app(app)
+                .with_runtime(rt)
+                .build()
+                .expect("valid dataset"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_insufficient_permissions_is_not_retriable() {
+        let err = DataConnectorError::InsufficientPermissions {
+            dataconnector: "databricks".to_string(),
+            connector_component: make_test_connector_component().await,
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Grant SELECT or ALL PRIVILEGES on the table",
+            )),
+        };
+        assert!(
+            !err.is_retriable(),
+            "InsufficientPermissions should be a permanent (non-retriable) error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unable_to_connect_internal_is_retriable() {
+        let err = DataConnectorError::UnableToConnectInternal {
+            dataconnector: "databricks".to_string(),
+            connector_component: make_test_connector_component().await,
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "connection refused",
+            )),
+        };
+        assert!(
+            err.is_retriable(),
+            "UnableToConnectInternal should be a transient (retriable) error"
+        );
+    }
 }

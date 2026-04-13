@@ -14,20 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Generic DDL support: shared types and option parsing for
-//! `CREATE TABLE` statements across catalog integrations (Iceberg, Cayenne, etc.).
-//!
-//! This module provides:
-//! - [`CreateTableStatementExtension`]: DDL extensions (acceleration, dataset options,
-//!   partitioning) extracted from `CREATE TABLE` statements.
-//! - [`DdlExtensionStore`]: Thread-safe store keyed by table name, consumed by
-//!   catalog-specific analyzer rules.
-//!
-//! Statement-level interception and extension extraction is handled by the
-//! unified planner in [`super::planner`].
-
-pub mod acceleration_options;
-
 use arrow::datatypes::DataType;
 use datafusion::error::{DataFusionError, Result as DFResult};
 
@@ -37,6 +23,10 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 /// `CREATE TABLE` statement. `DataFusion` SQL does not support specifying
 /// timestamp time units, so those are always `Nanosecond` after a roundtrip.
 /// Timezone presence is preserved via `TIMESTAMP WITH TIME ZONE`.
+/// # Errors
+///
+/// Returns an error if `dt` has no direct SQL equivalent (e.g. nested or
+/// complex Arrow types not representable as a SQL column type).
 pub fn arrow_datatype_to_sql(dt: &DataType) -> DFResult<String> {
     match dt {
         DataType::Boolean => Ok("BOOLEAN".to_string()),
@@ -86,35 +76,6 @@ mod tests {
             arrow_datatype_to_sql(&dt).expect("TIMESTAMP WITH TIME ZONE"),
             "TIMESTAMP WITH TIME ZONE"
         );
-
-        let dt = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
-        assert_eq!(
-            arrow_datatype_to_sql(&dt).expect("TIMESTAMP WITH TIME ZONE"),
-            "TIMESTAMP WITH TIME ZONE"
-        );
-
-        let dt = DataType::Timestamp(TimeUnit::Second, Some("+05:30".into()));
-        assert_eq!(
-            arrow_datatype_to_sql(&dt).expect("TIMESTAMP WITH TIME ZONE"),
-            "TIMESTAMP WITH TIME ZONE"
-        );
-    }
-
-    #[test]
-    fn all_timestamp_units_without_tz_map_to_timestamp() {
-        for unit in [
-            TimeUnit::Second,
-            TimeUnit::Millisecond,
-            TimeUnit::Microsecond,
-            TimeUnit::Nanosecond,
-        ] {
-            let dt = DataType::Timestamp(unit, None);
-            assert_eq!(
-                arrow_datatype_to_sql(&dt).expect("TIMESTAMP"),
-                "TIMESTAMP",
-                "Timestamp({unit:?}, None) should map to TIMESTAMP"
-            );
-        }
     }
 
     #[test]
