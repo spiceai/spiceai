@@ -24,8 +24,9 @@ use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
 use model2vec_rs::model::StaticModel;
 use std::fmt::{Debug, Formatter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use util::home_dir::home_dir;
 
 /// A wrapper around the `model2vec` library for generating text embeddings.
 ///
@@ -76,13 +77,25 @@ impl Model2Vec {
         embed_max_token_length: Option<usize>,
         embed_custom_batch_size: Option<usize>,
     ) -> Result<Self, super::embeddings::Error> {
-        if looks_like_local_model_path(name) && !Path::new(name).exists() {
-            return Err(LocalModelPathDoesNotExist {
-                path: name.to_string(),
-            });
-        }
+        let name = if let Some(local_model_path) = local_model_path(name)? {
+            match local_model_path.try_exists() {
+                Ok(true) => local_model_path.to_string_lossy().into_owned(),
+                Ok(false) => {
+                    return Err(LocalModelPathDoesNotExist {
+                        path: name.to_string(),
+                    });
+                }
+                Err(source) => {
+                    return Err(FailedToInstantiateEmbeddingModel {
+                        source: source.into(),
+                    });
+                }
+            }
+        } else {
+            name.to_string()
+        };
 
-        let model = StaticModel::from_pretrained(name, hf_token, normalize, subfolder)
+        let model = StaticModel::from_pretrained(&name, hf_token, normalize, subfolder)
             .map_err(|e| FailedToInstantiateEmbeddingModel { source: e.into() })?;
 
         let model2vec = Self {
@@ -119,6 +132,24 @@ fn looks_like_local_model_path(name: &str) -> bool {
         || name.starts_with("..\\")
         || name.starts_with("~/")
         || name.starts_with("~\\")
+}
+
+fn local_model_path(name: &str) -> Result<Option<PathBuf>, super::embeddings::Error> {
+    if let Some(home_relative_path) = name.strip_prefix("~/").or_else(|| name.strip_prefix("~\\")) {
+        let Some(home_dir) = home_dir() else {
+            return Err(LocalModelPathDoesNotExist {
+                path: name.to_string(),
+            });
+        };
+
+        return Ok(Some(home_dir.join(home_relative_path)));
+    }
+
+    if looks_like_local_model_path(name) {
+        return Ok(Some(Path::new(name).to_path_buf()));
+    }
+
+    Ok(None)
 }
 
 impl Debug for Model2Vec {
@@ -235,7 +266,9 @@ mod tests {
             .as_nanos();
         let missing_path = std::env::temp_dir().join(format!("missing-model2vec-{suffix}"));
         assert!(
-            !missing_path.exists(),
+            !missing_path
+                .try_exists()
+                .expect("test path check should not fail"),
             "test path should not exist before model loading"
         );
         let missing_path = missing_path.to_string_lossy().into_owned();
@@ -246,6 +279,28 @@ mod tests {
         assert!(
             matches!(err, Error::LocalModelPathDoesNotExist { path } if path == missing_path),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn expands_home_directory_model_paths() {
+        let Some(home_dir_path) = home_dir() else {
+            return;
+        };
+
+        assert_eq!(
+            local_model_path("~/model")
+                .expect("home-relative model path should resolve")
+                .expect("home-relative model path should be treated as local"),
+            home_dir_path.join("model")
+        );
+
+        #[cfg(windows)]
+        assert_eq!(
+            local_model_path("~\\model")
+                .expect("home-relative model path should resolve")
+                .expect("home-relative model path should be treated as local"),
+            home_dir_path.join("model")
         );
     }
 
