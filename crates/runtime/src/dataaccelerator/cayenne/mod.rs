@@ -23,7 +23,6 @@ use std::sync::{Arc, LazyLock};
 
 use regex::Regex;
 
-use arrow::datatypes::DataType;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use data_components::delete::DeletionTableProviderAdapter;
@@ -114,108 +113,27 @@ static UNSUPPORTED_LOCAL_PARTITION_PATTERN: LazyLock<Regex> =
         Err(e) => unreachable!("Unable to compile regexp: {e}"),
     });
 
-/// Check if a data type is supported by Vortex natively
-fn is_vortex_supported_type(data_type: &DataType) -> bool {
-    !matches!(
-        data_type,
-        DataType::Interval(_) | DataType::Duration(_) | DataType::FixedSizeBinary(_)
-    )
-}
-
-/// Transform schema according to `unsupported_type_action` policy
-/// Always converts Float16 to Float32 and normalizes timestamps to Microsecond (these are compatible transformations)
-/// Handles truly unsupported types according to the action: String (convert to Utf8) or Error (return error)
+/// Transform schema according to `unsupported_type_action` policy.
+/// Delegates to `cayenne::transform_schema_for_vortex`.
 pub(crate) fn transform_schema_for_vortex(
     schema: &arrow::datatypes::Schema,
     unsupported_type_action: UnsupportedTypeAction,
 ) -> Result<arrow::datatypes::Schema> {
-    let mut unsupported_fields = Vec::new();
-    let mut transformed_fields = Vec::new();
-
-    for field in schema.fields() {
-        let data_type = field.data_type();
-
-        // Always convert Float16 to Float32 (compatible transformation that Vortex can handle)
-        if matches!(data_type, DataType::Float16) {
-            tracing::debug!(
-                "Converting Float16 field '{}' to Float32 for Vortex compatibility",
-                field.name()
-            );
-            transformed_fields.push(Arc::new(arrow::datatypes::Field::new(
-                field.name(),
-                DataType::Float32,
-                field.is_nullable(),
-            )));
-            continue;
-        }
-
-        // Always convert non-Microsecond timestamps to Microsecond (compatible transformation)
-        if let DataType::Timestamp(unit, tz) = data_type
-            && !matches!(unit, arrow::datatypes::TimeUnit::Microsecond)
+    match cayenne::transform_schema_for_vortex(schema, unsupported_type_action) {
+        Ok(schema) => Ok(schema),
+        Err(datafusion::error::DataFusionError::Execution(msg))
+            if msg.starts_with("Unsupported data type(s) in schema:") =>
         {
-            tracing::debug!(
-                "Converting timestamp field '{}' from {:?} to Microsecond precision for Vortex compatibility",
-                field.name(),
-                unit
-            );
-            transformed_fields.push(Arc::new(arrow::datatypes::Field::new(
-                field.name(),
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, tz.clone()),
-                field.is_nullable(),
-            )));
-            continue;
+            // Extract just the field list from the structured error message.
+            let details = msg
+                .strip_prefix("Unsupported data type(s) in schema: ")
+                .and_then(|s| s.split(". By default").next())
+                .unwrap_or(&msg)
+                .to_string();
+            Err(Error::UnsupportedDataTypes { details })
         }
-
-        // Handle truly unsupported types (those that Vortex cannot handle natively)
-        if is_vortex_supported_type(data_type) {
-            // Supported type, keep as-is
-            transformed_fields.push(Arc::clone(field));
-        } else {
-            match unsupported_type_action {
-                UnsupportedTypeAction::String => {
-                    tracing::warn!(
-                        "Converting unsupported type {:?} for field '{}' to Utf8. Note: Data insertion will require the source to provide data already converted to string format.",
-                        data_type,
-                        field.name()
-                    );
-                    transformed_fields.push(Arc::new(arrow::datatypes::Field::new(
-                        field.name(),
-                        DataType::Utf8,
-                        field.is_nullable(),
-                    )));
-                }
-                UnsupportedTypeAction::Error => {
-                    unsupported_fields.push(format!("'{}' (type: {:?})", field.name(), data_type));
-                }
-                UnsupportedTypeAction::Ignore => {
-                    tracing::warn!(
-                        "Ignoring unsupported type {:?} for field '{}' in Vortex acceleration",
-                        data_type,
-                        field.name()
-                    );
-                    // Skip this field entirely
-                }
-                UnsupportedTypeAction::Warn => {
-                    tracing::warn!(
-                        "Including unsupported type {:?} for field '{}' - insertion may fail",
-                        data_type,
-                        field.name()
-                    );
-                    // Include the field as-is and let Vortex fail during insertion
-                    transformed_fields.push(Arc::clone(field));
-                }
-            }
-        }
+        Err(source) => Err(Error::UnableToCreateTable { source }),
     }
-
-    // If there are unsupported fields and action is Error, return error
-    if !unsupported_fields.is_empty() {
-        return Err(Error::UnsupportedDataTypes {
-            details: unsupported_fields.join(", "),
-        });
-    }
-
-    Ok(arrow::datatypes::Schema::new(transformed_fields))
 }
 
 pub struct CayenneAccelerator {

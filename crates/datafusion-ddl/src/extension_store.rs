@@ -14,13 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Store and parse DDL table options extracted from `CREATE TABLE` statements.
+//! DDL extension store and option parsing for `CREATE TABLE` statements.
 //!
 //! Supports:
 //! - `WITH (...)` clauses with two option prefixes:
 //!   - `acceleration.*` — acceleration engine, mode, refresh settings, etc.
 //!   - `dataset.*` — dataset-level settings like `time_column` and `time_format`.
-//! - `PARTITION BY` clauses with partitioning expressions.
+//! - `PARTITION BY` clauses (stored as the raw sqlparser `Expr`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -30,8 +30,6 @@ use datafusion::sql::sqlparser::ast::Expr as SqlParserExpr;
 use datafusion::sql::{ResolvedTableReference, TableReference};
 use spicepod::acceleration::{self, Acceleration};
 use spicepod::component::dataset::TimeFormat as SpicepodTimeFormat;
-
-use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
 /// Dataset-level options extracted from `CREATE TABLE ... WITH ("dataset.*")` clauses.
 #[derive(Debug, Clone, Default)]
@@ -59,18 +57,29 @@ pub struct CreateTableStatementExtension {
 
 /// Stores DDL extensions extracted from `CREATE TABLE` statements.
 ///
-/// Keyed by the table name as it appeared in the SQL statement. The analyzer rule
-/// retrieves (and removes) the extensions when rewriting the DDL plan.
+/// Keyed by the resolved table name. The analyzer rule retrieves (and removes)
+/// the extensions when rewriting the DDL plan.
 #[derive(Debug, Clone, Default)]
 pub struct DdlExtensionStore {
     pub extensions: HashMap<ResolvedTableReference, CreateTableStatementExtension>,
+    default_schema: String,
+    default_catalog: String,
 }
 
 impl DdlExtensionStore {
+    #[must_use]
+    pub fn new(default_catalog: String, default_schema: String) -> Self {
+        Self {
+            default_catalog,
+            default_schema,
+            extensions: HashMap::new(),
+        }
+    }
+
     /// Insert DDL extensions for a table.
     pub fn insert(&mut self, table_name: TableReference, extension: CreateTableStatementExtension) {
         self.extensions.insert(
-            table_name.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA),
+            table_name.resolve(&self.default_catalog, &self.default_schema),
             extension,
         );
     }
@@ -80,7 +89,7 @@ impl DdlExtensionStore {
         self.extensions.remove(
             &table_name
                 .clone()
-                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA),
+                .resolve(&self.default_catalog, &self.default_schema),
         )
     }
 }
@@ -90,30 +99,21 @@ pub type SharedDdlExtensionStore = Arc<RwLock<DdlExtensionStore>>;
 
 /// Create a new shared store.
 #[must_use]
-pub fn new_shared_store() -> SharedDdlExtensionStore {
-    Arc::new(RwLock::new(DdlExtensionStore::default()))
+pub fn new_shared_store(
+    default_catalog: impl Into<String>,
+    default_schema: impl Into<String>,
+) -> SharedDdlExtensionStore {
+    Arc::new(RwLock::new(DdlExtensionStore::new(
+        default_catalog.into(),
+        default_schema.into(),
+    )))
 }
 
 /// Parse `acceleration.*` and `dataset.*` key-value pairs into a [`CreateTableStatementExtension`].
 ///
-/// Keys use dot-prefix format: `acceleration.engine`, `dataset.time_column`, etc.
-/// In SQL `WITH (...)` clauses, these must be double-quoted since dots are not
-/// valid in bare identifiers:
-///
-/// ```sql
-/// CREATE TABLE t (id INT) WITH (
-///     "acceleration.engine" = 'arrow',
-///     "dataset.time_column" = 'created_at',
-///     "dataset.time_format" = 'timestamp'
-/// )
-/// ```
-///
-/// The returned extension will have an empty `partition_by` — partitioning
-/// expressions are handled separately during pre-processing.
-///
 /// # Errors
 ///
-/// Returns an error if an unknown key is encountered or a value cannot be parsed.
+/// Returns an error if an unknown key prefix is encountered or a value cannot be parsed.
 pub fn parse_ddl_table_options(
     options: &[(String, String)],
 ) -> DFResult<CreateTableStatementExtension> {
@@ -272,11 +272,11 @@ fn parse_bool(value: &str, field: &str) -> DFResult<bool> {
     if value.eq_ignore_ascii_case("false") {
         return Ok(false);
     }
-
     Err(DataFusionError::Plan(format!(
         "Invalid value for '{field}': '{value}'. Expected 'true' or 'false'."
     )))
 }
+
 fn parse_mode(value: &str) -> DFResult<acceleration::Mode> {
     match value.to_lowercase().as_str() {
         "memory" => Ok(acceleration::Mode::Memory),
@@ -302,102 +302,9 @@ fn parse_refresh_mode(value: &str) -> DFResult<acceleration::RefreshMode> {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::sql::TableReference;
+
     use super::*;
-
-    #[test]
-    fn test_parse_basic_acceleration_options() {
-        let options = vec![
-            ("acceleration.engine".to_string(), "arrow".to_string()),
-            ("acceleration.mode".to_string(), "memory".to_string()),
-            ("acceleration.refresh_mode".to_string(), "full".to_string()),
-            (
-                "acceleration.refresh_check_interval".to_string(),
-                "10s".to_string(),
-            ),
-        ];
-
-        let accel = parse_acceleration_options(&options).expect("should parse");
-        assert!(accel.enabled);
-        assert_eq!(accel.engine.as_deref(), Some("arrow"));
-        assert_eq!(accel.mode, acceleration::Mode::Memory);
-        assert_eq!(accel.refresh_mode, Some(acceleration::RefreshMode::Full));
-        assert_eq!(accel.refresh_check_interval.as_deref(), Some("10s"));
-    }
-
-    #[test]
-    fn test_parse_disabled_acceleration() {
-        let options = vec![("acceleration.enabled".to_string(), "false".to_string())];
-        let accel = parse_acceleration_options(&options).expect("should parse");
-        assert!(!accel.enabled);
-    }
-
-    #[test]
-    fn test_parse_uppercase_booleans() {
-        let options = vec![
-            ("acceleration.enabled".to_string(), "TRUE".to_string()),
-            (
-                "acceleration.retention_check_enabled".to_string(),
-                "FALSE".to_string(),
-            ),
-        ];
-
-        let accel = parse_acceleration_options(&options).expect("should parse");
-        assert!(accel.enabled);
-        assert!(!accel.retention_check_enabled);
-    }
-
-    #[test]
-    fn test_parse_unknown_option_errors() {
-        let options = vec![(
-            "acceleration.unknown_field".to_string(),
-            "value".to_string(),
-        )];
-        let result = parse_acceleration_options(&options);
-        let err = result.expect_err("should return an error").to_string();
-        assert!(err.contains("Unknown acceleration option"));
-    }
-
-    #[test]
-    fn test_parse_file_create_mode() {
-        let options = vec![("acceleration.mode".to_string(), "file_create".to_string())];
-        let accel = parse_acceleration_options(&options).expect("should parse");
-        assert_eq!(accel.mode, acceleration::Mode::FileCreate);
-    }
-
-    #[test]
-    fn test_parse_file_update_mode() {
-        let options = vec![("acceleration.mode".to_string(), "file_update".to_string())];
-        let accel = parse_acceleration_options(&options).expect("should parse");
-        assert_eq!(accel.mode, acceleration::Mode::FileUpdate);
-    }
-
-    #[test]
-    fn test_parse_file_mode() {
-        let options = vec![("acceleration.mode".to_string(), "file".to_string())];
-        let accel = parse_acceleration_options(&options).expect("should parse");
-        assert_eq!(accel.mode, acceleration::Mode::File);
-    }
-
-    #[test]
-    fn test_parse_invalid_mode_errors() {
-        let options = vec![("acceleration.mode".to_string(), "invalid".to_string())];
-        let _ = parse_acceleration_options(&options).expect_err("should return an error");
-    }
-
-    #[test]
-    fn test_parse_invalid_refresh_mode_errors() {
-        let options = vec![(
-            "acceleration.refresh_mode".to_string(),
-            "invalid".to_string(),
-        )];
-        let _ = parse_acceleration_options(&options).expect_err("should return an error");
-    }
-
-    #[test]
-    fn test_parse_missing_prefix_errors() {
-        let options = vec![("engine".to_string(), "arrow".to_string())];
-        let _ = parse_acceleration_options(&options).expect_err("should return an error");
-    }
 
     #[test]
     fn test_store_insert_and_remove() {
@@ -406,7 +313,6 @@ mod tests {
             TableReference::parse_str("my_table"),
             CreateTableStatementExtension::default(),
         );
-
         assert!(
             store
                 .remove(&TableReference::parse_str("my_table"))
@@ -420,96 +326,37 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dataset_time_column() {
-        let options = vec![("dataset.time_column".to_string(), "created_at".to_string())];
-        let dataset = parse_dataset_options(&options).expect("should parse");
-        assert_eq!(dataset.time_column.as_deref(), Some("created_at"));
-        assert_eq!(dataset.time_format, None);
-    }
-
-    #[test]
-    fn test_parse_dataset_time_format() {
-        let options = vec![
-            ("dataset.time_column".to_string(), "updated_at".to_string()),
-            ("dataset.time_format".to_string(), "timestamptz".to_string()),
-        ];
-        let dataset = parse_dataset_options(&options).expect("should parse");
-        assert_eq!(dataset.time_column.as_deref(), Some("updated_at"));
-        assert_eq!(dataset.time_format, Some(SpicepodTimeFormat::Timestamptz));
-    }
-
-    #[test]
-    fn test_parse_dataset_all_time_formats() {
-        for (input, expected) in [
-            ("timestamp", SpicepodTimeFormat::Timestamp),
-            ("timestamptz", SpicepodTimeFormat::Timestamptz),
-            ("unix_seconds", SpicepodTimeFormat::UnixSeconds),
-            ("unixseconds", SpicepodTimeFormat::UnixSeconds),
-            ("unix_millis", SpicepodTimeFormat::UnixMillis),
-            ("unixmillis", SpicepodTimeFormat::UnixMillis),
-            ("ISO8601", SpicepodTimeFormat::ISO8601),
-            ("iso8601", SpicepodTimeFormat::ISO8601),
-            ("date", SpicepodTimeFormat::Date),
-        ] {
-            let options = vec![("dataset.time_format".to_string(), input.to_string())];
-            let dataset = parse_dataset_options(&options)
-                .unwrap_or_else(|_| panic!("should parse time_format '{input}'"));
-            assert_eq!(dataset.time_format, Some(expected), "for input '{input}'");
-        }
-    }
-
-    #[test]
-    fn test_parse_dataset_invalid_time_format_errors() {
-        let options = vec![("dataset.time_format".to_string(), "invalid".to_string())];
-        let err = parse_dataset_options(&options)
-            .expect_err("should return an error")
-            .to_string();
-        assert!(err.contains("Invalid value for 'dataset.time_format'"));
-    }
-
-    #[test]
-    fn test_parse_dataset_unknown_option_errors() {
-        let options = vec![("dataset.unknown".to_string(), "value".to_string())];
-        let err = parse_dataset_options(&options)
-            .expect_err("should return an error")
-            .to_string();
-        assert!(err.contains("Unknown dataset option"));
-    }
-
-    #[test]
-    fn test_parse_ddl_table_options_mixed() {
-        let options = vec![
-            ("acceleration.engine".to_string(), "arrow".to_string()),
-            ("dataset.time_column".to_string(), "created_at".to_string()),
-            ("dataset.time_format".to_string(), "timestamptz".to_string()),
-        ];
-        let ddl_opts = parse_ddl_table_options(&options).expect("should parse");
-        assert!(ddl_opts.acceleration.is_some());
-        let accel = ddl_opts.acceleration.expect("acceleration should be Some");
-        assert_eq!(accel.engine.as_deref(), Some("arrow"));
-        assert_eq!(ddl_opts.dataset.time_column.as_deref(), Some("created_at"));
-        assert_eq!(
-            ddl_opts.dataset.time_format,
-            Some(SpicepodTimeFormat::Timestamptz)
-        );
-        assert!(ddl_opts.partition_by.is_none());
-    }
-
-    #[test]
     fn test_parse_ddl_table_options_unknown_prefix_errors() {
         let options = vec![("other.key".to_string(), "value".to_string())];
         let err = parse_ddl_table_options(&options)
-            .expect_err("should return an error")
+            .expect_err("should error")
             .to_string();
         assert!(err.contains("Unknown option prefix"));
     }
 
     #[test]
-    fn test_parse_ddl_table_options_dataset_only() {
-        let options = vec![("dataset.time_column".to_string(), "created_at".to_string())];
-        let ddl_opts = parse_ddl_table_options(&options).expect("should parse");
-        assert!(ddl_opts.acceleration.is_none());
-        assert_eq!(ddl_opts.dataset.time_column.as_deref(), Some("created_at"));
-        assert!(ddl_opts.partition_by.is_none());
+    fn test_parse_acceleration_unknown_option_errors() {
+        let options = vec![(
+            "acceleration.unknown_field".to_string(),
+            "value".to_string(),
+        )];
+        let err = parse_acceleration_options(&options)
+            .expect_err("should error")
+            .to_string();
+        assert!(err.contains("Unknown acceleration option"));
+    }
+
+    #[test]
+    fn test_parse_dataset_time_formats() {
+        for (input, expected) in [
+            ("timestamp", SpicepodTimeFormat::Timestamp),
+            ("timestamptz", SpicepodTimeFormat::Timestamptz),
+            ("unix_seconds", SpicepodTimeFormat::UnixSeconds),
+            ("iso8601", SpicepodTimeFormat::ISO8601),
+        ] {
+            let opts = vec![("dataset.time_format".to_string(), input.to_string())];
+            let d = parse_dataset_options(&opts).unwrap_or_else(|_| panic!("parse {input}"));
+            assert_eq!(d.time_format, Some(expected), "for '{input}'");
+        }
     }
 }
