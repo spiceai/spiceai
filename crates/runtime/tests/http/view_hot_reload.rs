@@ -18,7 +18,7 @@ limitations under the License.
 //! accelerated HTTP connector dataset.
 //!
 //! The scenario being tested:
-//! 1. An HTTP dataset is accelerated (DuckDB or Arrow).
+//! 1. An HTTP dataset is accelerated (`DuckDB` or Arrow).
 //! 2. A view is created using `json_get` to extract columns from the JSON content.
 //! 3. While the runtime is running, the spicepod is updated with a new view SQL
 //!    that adds an extra column.
