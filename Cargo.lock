@@ -6125,7 +6125,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=64da4a7d9dbfd2fc1c111d2bf7cb70590f74d139#64da4a7d9dbfd2fc1c111d2bf7cb70590f74d139"
+source = "git+https://github.com/datafusion-contrib/datafusion-table-providers.git?rev=fded3b402f8d4145fa82b77a446842b1ba063321#fded3b402f8d4145fa82b77a446842b1ba063321"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -11705,9 +11705,9 @@ checksum = "224484c5d09285a7b8cb0a0c117e847ebd14cb6e4470ecf68cdb89c503b0edb9"
 
 [[package]]
 name = "mongodb"
-version = "3.5.1"
+version = "3.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "803dd859e8afa084c255a8effd8000ff86f7c8076a50cd6d8c99e8f3496f75c2"
+checksum = "2c5941683db2ab2697f71e58dc0319024e808d3b28e7cf20f4bfb445fe54a30b"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.10.0",
@@ -11754,9 +11754,9 @@ dependencies = [
 
 [[package]]
 name = "mongodb-internal-macros"
-version = "3.5.1"
+version = "3.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a973ef3dd3dbc6f6e65bbdecfd9ec5e781b9e7493b0f369a7c62e35d8e5ae2c8"
+checksum = "47021a12bbf0dffde9c890fa2d36ff6ae342c532016226b04a42301b2b912660"
 dependencies = [
  "macro_magic",
  "proc-macro2",

@@ -100,6 +100,9 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("direct_connection")
         .description("Whether to connect directly to a single MongoDB host instead of discovering the topology. Accepts 'true' or 'false'.")
         .is_boolean(),
+    ParameterSpec::component("srv")
+        .description("Use mongodb+srv:// connection scheme for DNS SRV record discovery. Auto-detected for .mongodb.net hosts. Accepts 'true' or 'false'. Defaults to 'false'.")
+        .is_boolean(),
     ParameterSpec::component("time_zone")
         .description("Time zone to use for interpreting and returning timestamp values (e.g., 'UTC', 'America/Los_Angeles')."),
     ParameterSpec::component("unnest_depth")
@@ -122,7 +125,15 @@ const IGNORED_IF_URI: &[&str] = &[
     "pass",
     "auth_source",
     "direct_connection",
+    "srv",
 ];
+
+/// Returns `true` if the host looks like a MongoDB SRV endpoint
+/// (e.g. `cluster0.abc123.mongodb.net`).
+fn is_srv_host(host: &str) -> bool {
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    normalized.ends_with(".mongodb.net")
+}
 
 impl DataConnectorFactory for MongoDBFactory {
     fn as_any(&self) -> &dyn Any {
@@ -148,6 +159,31 @@ impl DataConnectorFactory for MongoDBFactory {
                         parameters = ignored.join(", "),
                         component = params.component
                     );
+                }
+            } else {
+                // Auto-detect SRV from the host parameter unless the user already set it.
+                let host = params
+                    .parameters
+                    .get("host")
+                    .ok()
+                    .map(|s| s.expose_secret().to_string());
+                let srv_provided = params.parameters.get("srv").ok().is_some();
+
+                if let Some(ref h) = host {
+                    if is_srv_host(h) {
+                        if !srv_provided {
+                            params
+                                .parameters
+                                .insert("srv".to_string(), "true".to_string().into());
+                        }
+
+                        if params.parameters.get("port").ok().is_some() {
+                            tracing::warn!(
+                                "The 'port' parameter is ignored for SRV host '{h}' on the {component}. mongodb+srv:// uses DNS SRV records for host/port discovery.",
+                                component = params.component
+                            );
+                        }
+                    }
                 }
             }
 
