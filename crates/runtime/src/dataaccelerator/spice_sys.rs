@@ -219,7 +219,7 @@ pub enum OpenOption {
 async fn acceleration_connection(
     source: &dyn AccelerationSource,
     #[cfg_attr(
-        not(any(feature = "duckdb", feature = "sqlite")),
+        not(any(feature = "duckdb", feature = "sqlite", feature = "turso")),
         expect(unused_variables)
     )]
     open_option: OpenOption,
