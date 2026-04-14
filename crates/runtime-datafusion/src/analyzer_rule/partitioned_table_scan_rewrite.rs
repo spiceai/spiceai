@@ -302,11 +302,7 @@ fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, D
             // Push filter predicates into each union leg so federation can unparse
             // the full query (including WHERE) for each executor.
             if let Some(filter) = filter_predicates.clone().into_iter().reduce(Expr::and) {
-                leg = Arc::new(
-                    LogicalPlanBuilder::from(leg)
-                        .filter(filter.clone())?
-                        .build()?,
-                );
+                leg = Arc::new(LogicalPlanBuilder::from(leg).filter(filter)?.build()?);
             }
 
             Ok(Arc::new(LogicalPlan::Sort(Sort {
