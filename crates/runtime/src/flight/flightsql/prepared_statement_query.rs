@@ -48,9 +48,9 @@ use crate::{
         Service, metrics, to_tonic_err,
         util::{attach_cache_metadata, set_flightsql_protocol},
     },
-    timing::TimedStream,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
+use telemetry::timing::TimedStream;
 
 /// Arrow `DataType` to SQL type name conversion for CAST expressions.
 ///
