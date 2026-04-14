@@ -128,8 +128,10 @@ impl TableProvider for S3VectorsQueryTable {
                 S3_VECTOR_MAX_TOPK
             }
             Some(Ok(l)) => l,
-            // No limit, or failed conversion - default to one page of results
-            None | Some(Err(_)) => S3_VECTOR_PAGE_SIZE,
+            // Conversion failed (limit > i32::MAX) — clamp to max
+            Some(Err(_)) => S3_VECTOR_MAX_TOPK,
+            // No limit specified — default to one page of results
+            None => S3_VECTOR_PAGE_SIZE,
         };
         return Ok(Arc::new(S3VectorsQueryExec::new(
             &self.table,
@@ -1230,9 +1232,7 @@ mod tests {
     fn test_page_size_less_than_max_topk() {
         assert!(
             S3_VECTOR_PAGE_SIZE < S3_VECTOR_MAX_TOPK,
-            "S3_VECTOR_PAGE_SIZE ({}) must be less than S3_VECTOR_MAX_TOPK ({})",
-            S3_VECTOR_PAGE_SIZE,
-            S3_VECTOR_MAX_TOPK
+            "S3_VECTOR_PAGE_SIZE ({S3_VECTOR_PAGE_SIZE}) must be less than S3_VECTOR_MAX_TOPK ({S3_VECTOR_MAX_TOPK})",
         );
     }
 
@@ -1270,12 +1270,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_limit_usize_max_falls_back_to_page_size() {
+    async fn test_limit_usize_max_clamps_to_max_topk() {
         let query_table = make_query_table(Arc::new(MockClient::new()));
-        // usize::MAX fails i32::try_from, so falls back to S3_VECTOR_PAGE_SIZE
+        // usize::MAX fails i32::try_from, so clamps to S3_VECTOR_MAX_TOPK
         assert_eq!(
             scan_limit(&query_table, Some(usize::MAX)).await,
-            S3_VECTOR_PAGE_SIZE
+            S3_VECTOR_MAX_TOPK
         );
     }
 

@@ -330,7 +330,10 @@ impl S3Vectors for Client {
         &self,
         input: &QueryVectorsInput,
     ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError>> {
-        let top_k = input.top_k.unwrap_or(QUERY_VECTORS_PAGE_SIZE);
+        let top_k = input
+            .top_k
+            .unwrap_or(QUERY_VECTORS_PAGE_SIZE)
+            .min(QUERY_VECTORS_MAX_TOPK);
 
         if top_k <= QUERY_VECTORS_PAGE_SIZE {
             return self
@@ -340,7 +343,7 @@ impl S3Vectors for Client {
                 .set_index_name(input.index_name.clone())
                 .set_index_arn(input.index_arn.clone())
                 .set_query_vector(input.query_vector.clone())
-                .set_top_k(input.top_k)
+                .top_k(top_k)
                 .set_return_distance(input.return_distance)
                 .set_return_metadata(input.return_metadata)
                 .set_filter(input.filter.clone())
@@ -367,7 +370,7 @@ impl S3Vectors for Client {
                 .set_index_name(input.index_name.clone())
                 .set_index_arn(input.index_arn.clone())
                 .set_query_vector(input.query_vector.clone())
-                .set_top_k(input.top_k)
+                .top_k(top_k)
                 .set_return_distance(input.return_distance)
                 .set_return_metadata(input.return_metadata)
                 .set_filter(input.filter.clone())
@@ -423,15 +426,23 @@ impl S3Vectors for Client {
             distance_metric = distance_metric.or(output.distance_metric);
             all_vectors.extend(output.vectors);
 
-            let response_token = captured.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let response_token = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
 
-            if all_vectors.len() >= top_k as usize || response_token.is_none() {
+            let top_k_usize = usize::try_from(top_k).unwrap_or(usize::MAX);
+            let is_done = all_vectors.len() >= top_k_usize
+                || response_token.as_ref().is_none_or(String::is_empty)
+                || response_token == next_token;
+            if is_done {
                 break;
             }
             next_token = response_token;
         }
 
-        all_vectors.truncate(top_k as usize);
+        let top_k_usize = usize::try_from(top_k).unwrap_or(usize::MAX);
+        all_vectors.truncate(top_k_usize);
 
         QueryVectorsOutput::builder()
             .set_vectors(Some(all_vectors))
