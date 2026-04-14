@@ -128,7 +128,7 @@ const IGNORED_IF_URI: &[&str] = &[
     "srv",
 ];
 
-/// Returns `true` if the host looks like a MongoDB SRV endpoint
+/// Returns `true` if the host looks like a `MongoDB` SRV endpoint
 /// (e.g. `cluster0.abc123.mongodb.net`).
 fn is_srv_host(host: &str) -> bool {
     let normalized = host.trim_end_matches('.').to_ascii_lowercase();
@@ -169,8 +169,9 @@ impl DataConnectorFactory for MongoDBFactory {
                     .map(|s| s.expose_secret().to_string());
                 let srv_provided = params.parameters.get("srv").ok().is_some();
 
-                if let Some(ref h) = host {
-                    if is_srv_host(h) {
+                if let Some(ref h) = host
+                    && is_srv_host(h)
+                {
                         if !srv_provided {
                             params
                                 .parameters
@@ -183,7 +184,6 @@ impl DataConnectorFactory for MongoDBFactory {
                                 component = params.component
                             );
                         }
-                    }
                 }
             }
 
@@ -325,5 +325,36 @@ impl DataConnector for MongoDB {
                     connector_component: ConnectorComponent::from(dataset),
                 })?,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_srv_host_basic() {
+        assert!(is_srv_host("cluster0.abc123.mongodb.net"));
+        assert!(is_srv_host("my-cluster.xyz.mongodb.net"));
+    }
+
+    #[test]
+    fn test_is_srv_host_case_insensitive() {
+        assert!(is_srv_host("Cluster0.ABC123.MongoDB.Net"));
+        assert!(is_srv_host("CLUSTER0.ABC123.MONGODB.NET"));
+        assert!(is_srv_host("cluster0.abc123.MongoDB.NET"));
+    }
+
+    #[test]
+    fn test_is_srv_host_trailing_dot() {
+        assert!(is_srv_host("cluster0.abc123.mongodb.net."));
+    }
+
+    #[test]
+    fn test_is_srv_host_non_srv() {
+        assert!(!is_srv_host("localhost"));
+        assert!(!is_srv_host("192.168.1.1"));
+        assert!(!is_srv_host("mongo.example.com"));
+        assert!(!is_srv_host("mongodb.net")); // bare domain, no subdomain
     }
 }
