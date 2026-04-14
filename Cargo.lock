@@ -16160,6 +16160,7 @@ dependencies = [
  "num_cpus",
  "snafu",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -19234,10 +19235,12 @@ dependencies = [
  "arrow",
  "async-trait",
  "flight_client",
+ "futures",
  "hostname 0.4.2",
  "opentelemetry",
  "opentelemetry_sdk",
  "otel-arrow",
+ "pin-project",
  "sha2 0.10.9",
  "snafu",
  "sysinfo 0.37.2",
