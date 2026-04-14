@@ -113,14 +113,14 @@ async-trait = "0.1.89"
 aws-config = "1.8.15"
 aws-credential-types = "1.2.13"
 aws-runtime = "1.7.1"
-aws-sdk-bedrockruntime = "1.126.0"
-aws-sdk-cognitoidentity = "1.96.0"
-aws-sdk-cognitoidentityprovider = "1.110.0"
-aws-sdk-dynamodb = "1.107.0"
-aws-sdk-dynamodbstreams = "1.96.0"
+aws-sdk-bedrockruntime = "1.129.0"
+aws-sdk-cognitoidentity = "1.98.0"
+aws-sdk-cognitoidentityprovider = "1.113.0"
+aws-sdk-dynamodb = "1.110.0"
+aws-sdk-dynamodbstreams = "1.98.0"
 aws-sdk-glue = "1.142.0"
-aws-sdk-s3 = "1.124.0"
-aws-sdk-s3vectors = "1.21.0"
+aws-sdk-s3 = "1.129.0"
+aws-sdk-s3vectors = "1.23.0"
 aws-sdk-secretsmanager = "1.103.0"
 aws-sdk-sts = "1.99.0"
 aws-smithy-async = "1.2.14"
@@ -396,9 +396,9 @@ datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev 
 
 datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "64da4a7d9dbfd2fc1c111d2bf7cb70590f74d139" } # spiceai-52
 
-ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "869b1a0245244accfcc725de82e95ec7e604349a" }      # spiceai-52.5
-ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "869b1a0245244accfcc725de82e95ec7e604349a" } # spiceai-52.5
-ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "869b1a0245244accfcc725de82e95ec7e604349a" } # spiceai-52.5
+ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "729428c650a0d0fe2a10662e35d14250505140a2" }      # spiceai-52.5
+ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "729428c650a0d0fe2a10662e35d14250505140a2" } # spiceai-52.5
+ballista-scheduler = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "729428c650a0d0fe2a10662e35d14250505140a2" } # spiceai-52.5
 
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "47034733a0477f72e4f6abbbf6a27d0da069860a" } # spiceai-0.18.2
 

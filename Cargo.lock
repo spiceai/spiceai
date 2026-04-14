@@ -1490,9 +1490,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-bedrockruntime"
-version = "1.126.0"
+version = "1.129.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31a2249b926688f4fb3c687be770aad39d666a7757ebc83da08bab6d2ad59314"
+checksum = "c710f0b7dbd906047724ec892afc0de0b92c7484ba25f499a91563e0417a96d6"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1517,9 +1517,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-cognitoidentity"
-version = "1.96.0"
+version = "1.98.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc439cdc9ee8685b6190e779330cbcaaa3052ca78fd9ecbc0548d8646e1ea209"
+checksum = "c19648c04fce956f98548cd9f547fc0d6da3b06831652d77405a7b5ee7539d77"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1541,9 +1541,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-cognitoidentityprovider"
-version = "1.110.0"
+version = "1.113.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7b4cb3dd10d900981fe9b6ee7661d193644fe187f3971a3a91e3935dd5b2c39"
+checksum = "6df7edb40b8bf37221da2139b460b80fae93dc95f5801305692a8ed11868386c"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1593,9 +1593,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-dynamodb"
-version = "1.107.0"
+version = "1.110.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "561bf86e858a2759c6876b517b13f3f4051a6484abbb0d8a1f4dfc5d902cc85a"
+checksum = "0c597424385739456cd04535982831c15bd58f97ca28c5bcb232c0d730d5cb39"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1617,9 +1617,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-dynamodbstreams"
-version = "1.96.0"
+version = "1.98.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0700f2e76e641f3972d80e7d9d4074a86b9cec48bd4de7fa9135aae023db41c"
+checksum = "55029fc1203b398fa60d7d0d21db8f380c8ace6c8646092285d8602fd49ddae9"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1665,9 +1665,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3"
-version = "1.124.0"
+version = "1.129.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "744c09d75dfec039a05cf8e117c995ded3b0baffa6eb83f3ed7075a01d8d8947"
+checksum = "6d4e8410fadbc0ee453145dd77a4958227b18b05bf67c2795d0a8b8596c9aa0f"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1700,9 +1700,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3vectors"
-version = "1.21.0"
+version = "1.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17dfd1a965685f51c8303a8c895c291039f79574fae4218e93a1c023b63d9eaa"
+checksum = "fd0b7ff048fa6614f7c3995cca1dcb248bf26a408b36c7b56595e3c3c651fe23"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",
@@ -1860,9 +1860,9 @@ dependencies = [
 
 [[package]]
 name = "aws-smithy-checksums"
-version = "0.64.5"
+version = "0.64.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "180dddf5ef0f52a2f99e2fada10e16ea610e507ef6148a42bdc4d5867596aa00"
+checksum = "6750f3dd509b0694a4377f0293ed2f9630d710b1cebe281fa8bac8f099f88bc6"
 dependencies = [
  "aws-smithy-http",
  "aws-smithy-types",
@@ -2296,7 +2296,7 @@ dependencies = [
 [[package]]
 name = "ballista-core"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=869b1a0245244accfcc725de82e95ec7e604349a#869b1a0245244accfcc725de82e95ec7e604349a"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=729428c650a0d0fe2a10662e35d14250505140a2#729428c650a0d0fe2a10662e35d14250505140a2"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2337,7 +2337,7 @@ dependencies = [
 [[package]]
 name = "ballista-executor"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=869b1a0245244accfcc725de82e95ec7e604349a#869b1a0245244accfcc725de82e95ec7e604349a"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=729428c650a0d0fe2a10662e35d14250505140a2#729428c650a0d0fe2a10662e35d14250505140a2"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2370,7 +2370,7 @@ dependencies = [
 [[package]]
 name = "ballista-scheduler"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=869b1a0245244accfcc725de82e95ec7e604349a#869b1a0245244accfcc725de82e95ec7e604349a"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=729428c650a0d0fe2a10662e35d14250505140a2#729428c650a0d0fe2a10662e35d14250505140a2"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -16155,6 +16155,7 @@ dependencies = [
  "num_cpus",
  "snafu",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -19237,10 +19238,12 @@ dependencies = [
  "arrow",
  "async-trait",
  "flight_client",
+ "futures",
  "hostname 0.4.2",
  "opentelemetry",
  "opentelemetry_sdk",
  "otel-arrow",
+ "pin-project",
  "sha2 0.10.9",
  "snafu",
  "sysinfo 0.37.2",

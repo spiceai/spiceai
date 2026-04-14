@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/http/json_nested_fields.rs
+expression: pretty
+---
++---------+---------------+----------------------------------+----------+-----------+-----------+----------------+------------+-------------------+----------------------+-------------+-----------+-----------------+-----------------+----------------------+
+| id      | action        | description                      | severity | status    | automated | retention_days | timestamp  | actor             | approved_by          | resource_id | policy_id | metadata_region | metadata_source | metadata_retry_count |
++---------+---------------+----------------------------------+----------+-----------+-----------+----------------+------------+-------------------+----------------------+-------------+-----------+-----------------+-----------------+----------------------+
+| evt-001 | user.login    | Successful login from web client | info     | completed | false     | 30             | 1700000000 | admin@example.com | security@example.com | res-100     | pol-200   | us-east-1       | web-client      | 0                    |
+| evt-002 | config.update | Updated rate-limit settings      | warning  | pending   | true      | 7              | 1710000000 | system            |                      | res-101     | pol-201   | eu-west-2       | api-gateway     | 3                    |
+| evt-003 | data.export   |                                  | info     | archived  | false     | 90             | 1720000000 | admin@example.com | admin@example.com    | res-102     |           |                 |                 |                      |
++---------+---------------+----------------------------------+----------+-----------+-----------+----------------+------------+-------------------+----------------------+-------------+-----------+-----------------+-----------------+----------------------+
