@@ -86,8 +86,8 @@ rust-version = "1.93.1"
 version = "2.0.0-unstable"
 
 [workspace.dependencies]
-adbc_core = "0.21.0"
-adbc_driver_manager = "0.21.0"
+adbc_core = "0.23"
+adbc_driver_manager = "0.23"
 ahash = "0.8.12"
 anyhow = "1.0.102"
 arrow = { version = "57.0.0", features = ["prettyprint"] }
@@ -394,7 +394,7 @@ datafusion-physical-optimizer = { git = "https://github.com/spiceai/datafusion.g
 datafusion-spark = { git = "https://github.com/spiceai/datafusion.git", rev = "c434c7b5a4e1ddb3137f1cea8da1006c514ae889" }                    # spiceai-52.5
 datafusion-substrait = { git = "https://github.com/spiceai/datafusion.git", rev = "c434c7b5a4e1ddb3137f1cea8da1006c514ae889" }                # spiceai-52.5
 
-datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "fded3b402f8d4145fa82b77a446842b1ba063321" } # spiceai-52
+datafusion-table-providers = { git = "https://github.com/datafusion-contrib/datafusion-table-providers.git", rev = "d1b911a5ed7c5a814572b3ce86b65e15129d6fe5" } # spiceai-52
 
 ballista-core = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "729428c650a0d0fe2a10662e35d14250505140a2" }      # spiceai-52.5
 ballista-executor = { git = "https://github.com/spiceai/datafusion-ballista.git", rev = "729428c650a0d0fe2a10662e35d14250505140a2" } # spiceai-52.5
