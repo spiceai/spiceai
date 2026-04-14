@@ -1025,13 +1025,7 @@ impl DataFusion {
             table_reference,
         )
         .await?
-        .map(|s| {
-            if s.starts_with('(') && s.ends_with(')') {
-                s[1..s.len() - 1].to_string()
-            } else {
-                s
-            }
-        });
+        .map(strip_outer_parens);
 
         Ok(partition_expr)
     }
@@ -2842,6 +2836,19 @@ impl DataFusion {
     }
 }
 
+/// Strips a single layer of outer parentheses from `s` if, and only if, it both starts
+/// with `(` and ends with `)`.  For example `(bucket(10, foo))` → `bucket(10, foo)`.
+///
+/// Using [`str::trim_start_matches`] / [`str::trim_end_matches`] would greedily strip
+/// *all* consecutive matching characters, corrupting expressions like `bucket(10, foo)`.
+fn strip_outer_parens(s: String) -> String {
+    if s.starts_with('(') && s.ends_with(')') {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s
+    }
+}
+
 /// Shared implementation for resolving a table's partition expression from its catalog
 /// provider and optional [`ExecutorRegistry`] metadata.
 ///
@@ -3937,6 +3944,29 @@ mod tests {
                     Constraint::Unique(vec![2]),
                 ]))
             );
+        }
+    }
+
+    mod strip_outer_parens_tests {
+        use super::super::strip_outer_parens;
+
+        #[test]
+        fn strip_outer_parens_cases() {
+            // Primary case: catalog stores "(bucket(10, foo))" and we want "bucket(10, foo)"
+            assert_eq!(
+                strip_outer_parens("(bucket(10, foo))".to_string()),
+                "bucket(10, foo)"
+            );
+
+            // Expression that is already bare must not be corrupted
+            assert_eq!(
+                strip_outer_parens("bucket(10, foo)".to_string()),
+                "bucket(10, foo)"
+            );
+
+            assert_eq!(strip_outer_parens("foo".to_string()), "foo");
+            assert_eq!(strip_outer_parens("(foo".to_string()), "(foo");
+            assert_eq!(strip_outer_parens("foo)".to_string()), "foo)");
         }
     }
 }
