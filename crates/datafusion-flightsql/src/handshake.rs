@@ -33,15 +33,25 @@ type HandshakeStream = Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Statu
 
 /// Handle a Flight SQL handshake request.
 ///
-/// Ignores any credentials present in the request metadata — authentication
-/// should be enforced upstream by a gRPC interceptor or Tower middleware
-/// before this is called.  A new session is always created from `base_ctx`.
+/// Authentication should be enforced upstream (gRPC interceptor / middleware).
+/// If an authorization credential is present, it is associated with the
+/// created session so session-aware auth wrappers can re-validate it later.
 pub(crate) fn handle(
-    _metadata: &tonic::metadata::MetadataMap,
+    metadata: &tonic::metadata::MetadataMap,
     base_ctx: &Arc<SessionContext>,
     session_store: &SessionStore,
 ) -> Result<Response<HandshakeStream>, Status> {
-    let (session_id, _ctx) = session_store.create_session(base_ctx, None);
+    let credential = metadata
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(|auth| {
+            auth.strip_prefix("Bearer ")
+                .or_else(|| auth.strip_prefix("bearer "))
+                .unwrap_or(auth)
+                .to_string()
+        });
+
+    let (session_id, _ctx) = session_store.create_session(base_ctx, credential.as_deref());
 
     tracing::debug!("Flight SQL: created session {session_id}");
 
@@ -57,12 +67,14 @@ pub(crate) fn handle(
         .map_err(|_| Status::internal("session ID could not be converted to header value"))?;
     resp.metadata_mut().insert("x-session-id", header_value);
 
-    // Return the session ID as a Bearer token so that `FlightSqlServiceClient`
-    // (which reads the `authorization` response header) can use it for all
-    // subsequent requests without needing custom-header support.
-    let auth_value = MetadataValue::try_from(format!("Bearer {session_id}"))
-        .map_err(|_| Status::internal("session ID could not be converted to auth header value"))?;
-    resp.metadata_mut().insert("authorization", auth_value);
+    // Return the session ID as a Bearer token for clients that rely on the
+    // authorization response header, but only when handshake included auth.
+    if credential.is_some() {
+        let auth_value = MetadataValue::try_from(format!("Bearer {session_id}")).map_err(|_| {
+            Status::internal("session ID could not be converted to auth header value")
+        })?;
+        resp.metadata_mut().insert("authorization", auth_value);
+    }
 
     Ok(resp)
 }

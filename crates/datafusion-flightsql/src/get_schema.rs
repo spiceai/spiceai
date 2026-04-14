@@ -24,7 +24,7 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use tonic::{Request, Response, Status};
 
-use crate::{FlightSqlService, to_tonic_err};
+use crate::{FlightSqlService, handle_datafusion_error, to_tonic_err};
 
 pub(crate) async fn handle(
     ctx: Arc<SessionContext>,
@@ -48,9 +48,10 @@ pub(crate) async fn handle(
         }
         x if x == DescriptorType::Path as i32 => {
             let table_ref = TableReference::from(fd.path.join("."));
-            let Some(table) = ctx.table_provider(table_ref).await.ok() else {
-                return Err(Status::not_found("Table not found"));
-            };
+            let table = ctx
+                .table_provider(table_ref)
+                .await
+                .map_err(handle_datafusion_error)?;
             let schema = table.schema();
             let options = IpcWriteOptions::default();
             let IpcMessage(schema_bytes) = SchemaAsIpc::new(schema.as_ref(), &options)
