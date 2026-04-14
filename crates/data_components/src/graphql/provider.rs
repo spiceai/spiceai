@@ -212,6 +212,13 @@ impl std::fmt::Debug for GraphQLTableProvider {
     }
 }
 
+impl GraphQLTableProvider {
+    #[must_use]
+    pub fn client(&self) -> Arc<GraphQLClient> {
+        Arc::clone(&self.client)
+    }
+}
+
 #[async_trait]
 impl TableProvider for GraphQLTableProvider {
     fn as_any(&self) -> &dyn Any {

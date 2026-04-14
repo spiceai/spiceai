@@ -520,7 +520,7 @@ async fn add_partitions_with_retry(
 
         metadata.updated_at = now;
         match partition_store
-            .write_metadata(&table.to_string(), metadata)
+            .write_metadata(table, metadata)
             .await
         {
             Ok(()) => {
@@ -618,7 +618,7 @@ async fn remove_partitions_with_cleanup(
         metadata.updated_at = now_ms();
 
         match partition_store
-            .write_metadata(&table.to_string(), metadata)
+            .write_metadata(table, metadata)
             .await
         {
             Ok(()) => {

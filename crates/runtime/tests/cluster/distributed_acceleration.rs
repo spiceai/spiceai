@@ -751,7 +751,10 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
                         .ok()
                         .flatten()
                         .is_some_and(|m| {
-                            m.partitions.len() == 10 && m.partitions.iter().all(runtime::cluster::PartitionMetadata::is_assigned)
+                            m.partitions.len() == 10
+                                && m.partitions
+                                    .iter()
+                                    .all(runtime::cluster::PartitionMetadata::is_assigned)
                         })
                 })
                 .await;

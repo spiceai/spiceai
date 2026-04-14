@@ -1102,7 +1102,7 @@ fn build_forwarded_create_sql(
     Ok(sql)
 }
 
-use crate::datafusion::ddl::arrow_datatype_to_sql;
+use datafusion_ddl::arrow_datatype_to_sql;
 
 fn render_refresh_mode(mode: &spicepod::acceleration::RefreshMode) -> &'static str {
     match mode {

@@ -114,7 +114,6 @@ pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub mod composed_catalog;
-pub mod ddl;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
@@ -545,7 +544,7 @@ pub struct DataFusion {
     /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
     ddl_enabled_catalogs: Arc<RwLock<HashSet<String>>>,
     /// Shared store for DDL extensions from `CREATE TABLE` statements.
-    ddl_extension_store: ddl::acceleration_options::SharedDdlExtensionStore,
+    ddl_extension_store: datafusion_ddl::SharedDdlExtensionStore,
     /// Shared weak self-reference, populated after `Arc::new(DataFusion)`.
     /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
@@ -578,6 +577,8 @@ pub struct DataFusion {
     pub executor_registry: Option<Arc<ExecutorRegistry>>,
     /// Partition service for discovering/assigning partitions (scheduler mode only).
     pub(crate) partition_service: Option<Arc<PartitionService>>,
+    #[cfg(not(windows))]
+    pub(crate) cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -910,7 +911,7 @@ impl DataFusion {
     /// `CREATE TABLE` statements (e.g. `WITH (acceleration.*, dataset.*)` or
     /// `PARTITION BY`), which are then consumed by catalog-specific analyzer rules.
     #[must_use]
-    pub fn ddl_extension_store(&self) -> &ddl::acceleration_options::SharedDdlExtensionStore {
+    pub fn ddl_extension_store(&self) -> &datafusion_ddl::SharedDdlExtensionStore {
         &self.ddl_extension_store
     }
 
@@ -1024,8 +1025,15 @@ impl DataFusion {
     ) -> Result<Option<String>, DataFusionError> {
         let catalog_name = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
         let catalog = ctx.catalog(catalog_name);
-        resolve_table_partition_expr(catalog.as_deref(), Some(executor_registry), table_reference)
-            .await
+        let partition_expr = resolve_table_partition_expr(
+            catalog.as_deref(),
+            Some(executor_registry),
+            table_reference,
+        )
+        .await?
+        .map(strip_outer_parens);
+
+        Ok(partition_expr)
     }
 
     /// Parses a SQL expression string into a `DataFusion` `Expr`, using the schema of the given table reference for resolution.
@@ -2747,6 +2755,7 @@ impl DataFusion {
             cluster_role: self.cluster_config.effective_role(),
             ddl_extension_store: Arc::clone(&self.ddl_extension_store),
             executor_registry: self.executor_registry.clone(),
+            ddl_handler: self.cayenne_ddl_handler.clone(),
         };
 
         planner::create_logical_plan(sql, session, &ctx).await
@@ -2850,6 +2859,19 @@ impl DataFusion {
         };
         self.ctx
             .parse_sql_expr(expr, &tbl_provider.schema().to_dfschema()?)
+    }
+}
+
+/// Strips a single layer of outer parentheses from `s` if, and only if, it both starts
+/// with `(` and ends with `)`.  For example `(bucket(10, foo))` → `bucket(10, foo)`.
+///
+/// Using [`str::trim_start_matches`] / [`str::trim_end_matches`] would greedily strip
+/// *all* consecutive matching characters, corrupting expressions like `bucket(10, foo)`.
+fn strip_outer_parens(s: String) -> String {
+    if s.starts_with('(') && s.ends_with(')') {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s
     }
 }
 
@@ -3948,6 +3970,29 @@ mod tests {
                     Constraint::Unique(vec![2]),
                 ]))
             );
+        }
+    }
+
+    mod strip_outer_parens_tests {
+        use super::super::strip_outer_parens;
+
+        #[test]
+        fn strip_outer_parens_cases() {
+            // Primary case: catalog stores "(bucket(10, foo))" and we want "bucket(10, foo)"
+            assert_eq!(
+                strip_outer_parens("(bucket(10, foo))".to_string()),
+                "bucket(10, foo)"
+            );
+
+            // Expression that is already bare must not be corrupted
+            assert_eq!(
+                strip_outer_parens("bucket(10, foo)".to_string()),
+                "bucket(10, foo)"
+            );
+
+            assert_eq!(strip_outer_parens("foo".to_string()), "foo");
+            assert_eq!(strip_outer_parens("(foo".to_string()), "(foo");
+            assert_eq!(strip_outer_parens("foo)".to_string()), "foo)");
         }
     }
 }

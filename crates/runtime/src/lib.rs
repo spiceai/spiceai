@@ -50,7 +50,6 @@ use datafusion_proto::bytes::Serializeable;
 use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterRole};
 
 use builder::RuntimeBuilder;
-use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 use config::Config;
 use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
@@ -78,10 +77,10 @@ pub use util::shutdown_signal;
 use crate::cluster::{DistributedNode, PartitionStore, SchedulerPeers};
 use crate::extension::Extension;
 use crate::udtfs::ListUDFTableFunc;
+use runtime_async::cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 pub mod accelerated_table;
 pub mod auth;
 mod builder;
-mod cancellable_task;
 pub mod catalogconnector;
 mod changes;
 pub mod component;
@@ -127,11 +126,9 @@ pub mod cluster;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
-pub mod timing;
 pub mod tls;
 pub mod token_providers;
 pub mod tools;
-pub mod topological_ordering;
 pub(crate) mod tracers;
 mod tracing_util;
 mod udtfs;
@@ -299,6 +296,12 @@ pub enum Error {
 
     #[snafu(display("Unable to load dataset connector: {dataset}"))]
     UnableToLoadDatasetConnector { dataset: TableReference },
+
+    #[snafu(display("Unable to load dataset connector: {dataset}. {reason}"))]
+    PermanentDatasetFailure {
+        dataset: TableReference,
+        reason: String,
+    },
 
     #[snafu(display("Unable to load data connector for catalog {catalog}: {source}"))]
     UnableToLoadCatalogConnector {
@@ -1441,7 +1444,9 @@ impl Runtime {
     where
         F: Future<Output = Result<(), Error>> + Send + 'static,
     {
-        let (future, handle) = spawn_cancellable_task(cancellation_token, task_fn);
+        let (future, handle) = spawn_cancellable_task(cancellation_token, task_fn, |err| {
+            Error::FailedToExecuteTask { source: err }
+        });
 
         self.tasks
             .write()

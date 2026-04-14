@@ -19,11 +19,15 @@ use std::{fmt::Write, sync::Arc};
 use datafusion::sql::TableReference;
 use serde::Deserialize;
 use snafu::prelude::*;
+use tokio::sync::Semaphore;
 use url::Url;
 
 use token_provider::TokenProvider;
+use tracing::Instrument;
 
-use crate::resilient_http::{configure_client_builder, send_request_with_retry};
+use crate::resilient_http::{
+    RetryConfig, configure_client_builder, send_request_with_retry_and_concurrency_limit,
+};
 
 pub mod provider;
 
@@ -85,6 +89,7 @@ pub struct UnityCatalog {
     token_provider: Option<Arc<dyn TokenProvider>>,
     client: reqwest::Client,
     user_agent: Option<String>,
+    request_semaphore: Option<Arc<Semaphore>>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,7 +100,11 @@ pub struct CatalogId(pub String);
 
 impl UnityCatalog {
     #[expect(clippy::needless_pass_by_value)]
-    pub fn new(endpoint: Endpoint, token_provider: Option<Arc<dyn TokenProvider>>) -> Result<Self> {
+    pub fn new(
+        endpoint: Endpoint,
+        token_provider: Option<Arc<dyn TokenProvider>>,
+        request_semaphore: Option<Arc<Semaphore>>,
+    ) -> Result<Self> {
         let mut endpoint_str = endpoint.0.trim_end_matches('/').to_string();
         if !endpoint_str.starts_with("http") {
             endpoint_str = format!("https://{endpoint_str}");
@@ -126,6 +135,7 @@ impl UnityCatalog {
             token_provider,
             client,
             user_agent,
+            request_semaphore,
         })
     }
 
@@ -190,58 +200,86 @@ impl UnityCatalog {
 
     pub async fn get_table(&self, table_reference: &TableReference) -> Result<Option<UCTable>> {
         let table_name = table_reference.to_string();
-        let path = format!("/api/2.1/unity-catalog/tables/{table_name}");
-        let response = self.send_get_with_retry("get table", &path).await?;
+        let encoded = Self::encode_uc_name(&table_name);
+        let path = format!("/api/2.1/unity-catalog/tables/{encoded}");
+        async {
+            let response = self.send_get_with_retry("get table", &path).await?;
 
-        if response.status().is_success() {
-            let api_response: UCTable = response.json().await.context(ConnectionSnafu)?;
-            Ok(Some(api_response))
-        } else if response.status().as_u16() == 404 {
-            Ok(None)
-        } else {
-            UnexpectedStatusCodeSnafu {
-                status: response.status(),
+            if response.status().is_success() {
+                let api_response: UCTable = response.json().await.context(ConnectionSnafu)?;
+                Ok(Some(api_response))
+            } else if response.status().as_u16() == 404 {
+                Ok(None)
+            } else {
+                UnexpectedStatusCodeSnafu {
+                    status: response.status(),
+                }
+                .fail()
             }
-            .fail()
         }
+        .instrument(tracing::info_span!(
+            target: "task_history",
+            "uc_get_table",
+            input = %table_name,
+        ))
+        .await
     }
 
     pub async fn get_catalog(&self, catalog_id: &str) -> Result<Option<UCCatalog>> {
         let path = format!("/api/2.1/unity-catalog/catalogs/{catalog_id}");
-        let response = self.send_get_with_retry("get catalog", &path).await?;
+        async {
+            let response = self.send_get_with_retry("get catalog", &path).await?;
 
-        tracing::debug!("get_catalog: Response status: {}", response.status());
+            tracing::debug!("get_catalog: Response status: {}", response.status());
 
-        if response.status().is_success() {
-            let api_response: UCCatalog = response.json().await.context(ConnectionSnafu)?;
-            Ok(Some(api_response))
-        } else if response.status().as_u16() == 404 {
-            Ok(None)
-        } else {
-            UnexpectedStatusCodeSnafu {
-                status: response.status(),
+            if response.status().is_success() {
+                let api_response: UCCatalog = response.json().await.context(ConnectionSnafu)?;
+                Ok(Some(api_response))
+            } else if response.status().as_u16() == 404 {
+                Ok(None)
+            } else {
+                UnexpectedStatusCodeSnafu {
+                    status: response.status(),
+                }
+                .fail()
             }
-            .fail()
         }
+        .instrument(tracing::info_span!(
+            target: "task_history",
+            "uc_get_catalog",
+            input = catalog_id,
+        ))
+        .await
     }
 
     pub async fn list_schemas(&self, catalog_id: &str) -> Result<Option<Vec<UCSchema>>> {
-        let path = format!("/api/2.1/unity-catalog/schemas?catalog_name={catalog_id}");
-        let response = self.send_get_with_retry("list schemas", &path).await?;
+        let encoded_catalog =
+            percent_encoding::utf8_percent_encode(catalog_id, percent_encoding::NON_ALPHANUMERIC);
+        let path = format!("/api/2.1/unity-catalog/schemas?catalog_name={encoded_catalog}");
+        async {
+            let response = self.send_get_with_retry("list schemas", &path).await?;
 
-        tracing::debug!("list_schemas: Response status: {}", response.status());
+            tracing::debug!("list_schemas: Response status: {}", response.status());
 
-        if response.status().is_success() {
-            let api_response: UCSchemaEnvelope = response.json().await.context(ConnectionSnafu)?;
-            Ok(Some(api_response.schemas))
-        } else if response.status().as_u16() == 404 {
-            Ok(None)
-        } else {
-            UnexpectedStatusCodeSnafu {
-                status: response.status(),
+            if response.status().is_success() {
+                let api_response: UCSchemaEnvelope =
+                    response.json().await.context(ConnectionSnafu)?;
+                Ok(Some(api_response.schemas))
+            } else if response.status().as_u16() == 404 {
+                Ok(None)
+            } else {
+                UnexpectedStatusCodeSnafu {
+                    status: response.status(),
+                }
+                .fail()
             }
-            .fail()
         }
+        .instrument(tracing::info_span!(
+            target: "task_history",
+            "uc_list_schemas",
+            input = catalog_id,
+        ))
+        .await
     }
 
     pub async fn list_tables(
@@ -249,24 +287,73 @@ impl UnityCatalog {
         catalog_id: &str,
         schema_name: &str,
     ) -> Result<Option<Vec<UCTable>>> {
+        let encoded_catalog =
+            percent_encoding::utf8_percent_encode(catalog_id, percent_encoding::NON_ALPHANUMERIC);
+        let encoded_schema =
+            percent_encoding::utf8_percent_encode(schema_name, percent_encoding::NON_ALPHANUMERIC);
         let path = format!(
-            "/api/2.1/unity-catalog/tables?catalog_name={catalog_id}&schema_name={schema_name}"
+            "/api/2.1/unity-catalog/tables?catalog_name={encoded_catalog}&schema_name={encoded_schema}"
         );
-        let response = self.send_get_with_retry("list tables", &path).await?;
+        async {
+            let response = self.send_get_with_retry("list tables", &path).await?;
 
-        tracing::debug!("list_tables: Response status: {}", response.status());
+            tracing::debug!("list_tables: Response status: {}", response.status());
 
-        if response.status().is_success() {
-            let api_response: UCTableEnvelope = response.json().await.context(ConnectionSnafu)?;
-            Ok(Some(api_response.tables))
-        } else if response.status().as_u16() == 404 {
-            Ok(None)
-        } else {
-            UnexpectedStatusCodeSnafu {
-                status: response.status(),
+            if response.status().is_success() {
+                let api_response: UCTableEnvelope =
+                    response.json().await.context(ConnectionSnafu)?;
+                Ok(Some(api_response.tables))
+            } else if response.status().as_u16() == 404 {
+                Ok(None)
+            } else {
+                UnexpectedStatusCodeSnafu {
+                    status: response.status(),
+                }
+                .fail()
             }
-            .fail()
         }
+        .instrument(tracing::info_span!(
+            target: "task_history",
+            "uc_list_tables",
+            input = %format!("{catalog_id}.{schema_name}"),
+        ))
+        .await
+    }
+
+    /// Fetches the effective permissions for a table from the UC API.
+    ///
+    /// Returns `Ok(None)` if the table is not found (404).
+    /// The `full_name` should be in `catalog.schema.table` format.
+    pub async fn get_effective_permissions(
+        &self,
+        full_name: &str,
+    ) -> Result<Option<UCPermissionsEnvelope>> {
+        let encoded = Self::encode_uc_name(full_name);
+        let path = format!("/api/2.1/unity-catalog/effective-permissions/table/{encoded}");
+        async {
+            let response = self
+                .send_get_with_retry("get effective permissions", &path)
+                .await?;
+
+            if response.status().is_success() {
+                let envelope: UCPermissionsEnvelope =
+                    response.json().await.context(ConnectionSnafu)?;
+                Ok(Some(envelope))
+            } else if response.status().as_u16() == 404 {
+                Ok(None)
+            } else {
+                UnexpectedStatusCodeSnafu {
+                    status: response.status(),
+                }
+                .fail()
+            }
+        }
+        .instrument(tracing::info_span!(
+            target: "task_history",
+            "uc_get_effective_permissions",
+            input = full_name,
+        ))
+        .await
     }
 
     fn get_req(&self, path: &str) -> reqwest::RequestBuilder {
@@ -286,9 +373,75 @@ impl UnityCatalog {
     }
 
     async fn send_get_with_retry(&self, operation: &str, path: &str) -> Result<reqwest::Response> {
-        send_request_with_retry("Unity Catalog", operation, || self.get_req(path))
-            .await
-            .context(ConnectionSnafu)
+        send_request_with_retry_and_concurrency_limit(
+            "Unity Catalog",
+            operation,
+            || self.get_req(path),
+            &RetryConfig {
+                concurrency_limit: self.request_semaphore.as_deref(),
+                ..RetryConfig::default()
+            },
+        )
+        .await
+        .context(ConnectionSnafu)
+    }
+
+    /// Percent-encodes each dot-separated segment of a UC name individually.
+    ///
+    /// UC table names are `catalog.schema.table` where dots are separators.
+    /// Each segment is encoded but dots are preserved so the API receives
+    /// the correct path structure.
+    fn encode_uc_name(name: &str) -> String {
+        name.split('.')
+            .map(|segment| {
+                percent_encoding::utf8_percent_encode(segment, percent_encoding::NON_ALPHANUMERIC)
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    /// Runs an advisory permission check and logs the result.
+    ///
+    /// This never blocks initialization or filters tables — it only produces
+    /// diagnostic log output so operators can identify likely access issues
+    /// before queries hit Databricks at runtime.
+    pub async fn log_advisory_permission_check(&self, table_name: &str, context: &str) {
+        match self.get_effective_permissions(table_name).await {
+            Ok(Some(perms)) => {
+                if perms.has_read_permission() {
+                    tracing::debug!(
+                        table = %table_name,
+                        principals = ?perms.principals(),
+                        "Unity Catalog permission check passed"
+                    );
+                } else {
+                    tracing::warn!(
+                        table = %table_name,
+                        "Unity Catalog effective-permissions did not report a read-compatible privilege during {context}; proceeding and deferring to Databricks query-time validation"
+                    );
+                    tracing::debug!(
+                        table = %table_name,
+                        principals = ?perms.principals(),
+                        privileges = ?perms.all_privileges(),
+                        "Permission denial details"
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    table = %table_name,
+                    "Table not found when checking permissions; proceeding"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    table = %table_name,
+                    error = %e,
+                    "Failed to check Unity Catalog permissions; proceeding without validation"
+                );
+            }
+        }
     }
 }
 
@@ -312,6 +465,82 @@ pub struct UCTable {
     pub columns: Vec<UCColumn>,
     #[serde(default)]
     pub storage_location: Option<String>,
+}
+
+impl UCTable {
+    /// Returns the fully qualified name of the table: `catalog.schema.table`.
+    #[must_use]
+    pub fn full_name(&self) -> String {
+        format!("{}.{}.{}", self.catalog_name, self.schema_name, self.name)
+    }
+
+    /// Returns the parsed [`UCTableType`] for this table.
+    #[must_use]
+    pub fn parsed_table_type(&self) -> UCTableType {
+        UCTableType::from(self.table_type.as_str())
+    }
+
+    /// Returns `true` if the table type is supported for direct querying
+    /// through the SQL Warehouse or Spark Connect connectors.
+    ///
+    /// `VIEW` and `STREAMING_TABLE` types are not supported.
+    #[must_use]
+    pub fn is_queryable(&self) -> bool {
+        self.parsed_table_type().is_queryable()
+    }
+
+    /// Returns `true` when the table should be rejected up front if UC does
+    /// not report a read-compatible privilege.
+    #[must_use]
+    pub fn requires_read_permission_validation(&self) -> bool {
+        self.parsed_table_type()
+            .requires_read_permission_validation()
+    }
+}
+
+/// Databricks Unity Catalog table types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UCTableType {
+    Managed,
+    External,
+    Foreign,
+    View,
+    MaterializedView,
+    StreamingTable,
+    /// An unrecognised value from the API.
+    Unknown,
+}
+
+impl UCTableType {
+    /// Returns `true` if tables of this type can be queried directly.
+    #[must_use]
+    pub const fn is_queryable(self) -> bool {
+        matches!(
+            self,
+            Self::Managed | Self::External | Self::Foreign | Self::MaterializedView
+        )
+    }
+
+    /// Returns `true` when UC effective-permissions is authoritative enough to
+    /// reject access up front.
+    #[must_use]
+    pub const fn requires_read_permission_validation(self) -> bool {
+        !matches!(self, Self::Foreign)
+    }
+}
+
+impl From<&str> for UCTableType {
+    fn from(s: &str) -> Self {
+        match s {
+            "MANAGED" => Self::Managed,
+            "EXTERNAL" => Self::External,
+            "FOREIGN" => Self::Foreign,
+            "VIEW" => Self::View,
+            "MATERIALIZED_VIEW" => Self::MaterializedView,
+            "STREAMING_TABLE" => Self::StreamingTable,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -341,4 +570,323 @@ pub struct UCSchemaEnvelope {
 pub struct UCSchema {
     pub name: String,
     pub catalog_name: String,
+}
+
+// ============================================================================
+// Permissions
+// ============================================================================
+
+/// Response from `/api/2.1/unity-catalog/effective-permissions/table/{full_name}`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UCPermissionsEnvelope {
+    #[serde(default)]
+    pub privilege_assignments: Vec<UCPrivilegeAssignment>,
+}
+
+/// A single privilege assignment returned by the UC permissions endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UCPrivilegeAssignment {
+    pub principal: String,
+    #[serde(default)]
+    pub privileges: Vec<UCPrivilege>,
+}
+
+/// A single privilege entry.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UCPrivilege {
+    pub privilege: String,
+}
+
+/// The subset of UC privileges relevant to read operations.
+const READ_PRIVILEGES: &[&str] = &[
+    "SELECT",
+    "ALL_PRIVILEGES",
+    "ALL PRIVILEGES",
+    "OWNER",
+    "OWNERSHIP",
+];
+
+impl UCPermissionsEnvelope {
+    /// Returns `true` if the current caller has a read-compatible privilege
+    /// (`SELECT` or `ALL_PRIVILEGES`).
+    ///
+    /// This checks the response from the UC **effective-permissions** endpoint,
+    /// which already scopes results to the authenticated principal.
+    #[must_use]
+    pub fn has_read_permission(&self) -> bool {
+        self.privilege_assignments.iter().any(|pa| {
+            pa.privileges
+                .iter()
+                .any(|p| READ_PRIVILEGES.contains(&p.privilege.as_str()))
+        })
+    }
+
+    /// Returns the principal identifiers from the privilege assignments.
+    #[must_use]
+    pub fn principals(&self) -> Vec<&str> {
+        self.privilege_assignments
+            .iter()
+            .map(|pa| pa.principal.as_str())
+            .collect()
+    }
+
+    /// Returns all privilege names across all principal assignments.
+    #[must_use]
+    pub fn all_privileges(&self) -> Vec<&str> {
+        self.privilege_assignments
+            .iter()
+            .flat_map(|pa| pa.privileges.iter().map(|p| p.privilege.as_str()))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        UCColumn, UCPermissionsEnvelope, UCPrivilege, UCPrivilegeAssignment, UCTable, UCTableType,
+    };
+
+    fn make_table(table_type: &str) -> UCTable {
+        UCTable {
+            name: "table".to_string(),
+            catalog_name: "catalog".to_string(),
+            schema_name: "schema".to_string(),
+            table_type: table_type.to_string(),
+            data_source_format: "DELTA".to_string(),
+            columns: Vec::<UCColumn>::new(),
+            storage_location: None,
+        }
+    }
+
+    fn make_permissions(privileges: &[&str]) -> UCPermissionsEnvelope {
+        UCPermissionsEnvelope {
+            privilege_assignments: vec![UCPrivilegeAssignment {
+                principal: "test_user".to_string(),
+                privileges: privileges
+                    .iter()
+                    .map(|p| UCPrivilege {
+                        privilege: (*p).to_string(),
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // UCTableType parsing
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_uc_table_type_from_string() {
+        assert_eq!(UCTableType::from("MANAGED"), UCTableType::Managed);
+        assert_eq!(UCTableType::from("EXTERNAL"), UCTableType::External);
+        assert_eq!(UCTableType::from("FOREIGN"), UCTableType::Foreign);
+        assert_eq!(UCTableType::from("VIEW"), UCTableType::View);
+        assert_eq!(
+            UCTableType::from("MATERIALIZED_VIEW"),
+            UCTableType::MaterializedView
+        );
+        assert_eq!(
+            UCTableType::from("STREAMING_TABLE"),
+            UCTableType::StreamingTable
+        );
+        assert_eq!(UCTableType::from("SOMETHING_NEW"), UCTableType::Unknown);
+        assert_eq!(UCTableType::from(""), UCTableType::Unknown);
+    }
+
+    // ----------------------------------------------------------------
+    // is_queryable
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_queryable_table_types() {
+        assert!(make_table("MANAGED").is_queryable());
+        assert!(make_table("EXTERNAL").is_queryable());
+        assert!(make_table("FOREIGN").is_queryable());
+        assert!(make_table("MATERIALIZED_VIEW").is_queryable());
+    }
+
+    #[test]
+    fn test_non_queryable_table_types() {
+        assert!(!make_table("VIEW").is_queryable());
+        assert!(!make_table("STREAMING_TABLE").is_queryable());
+        assert!(!make_table("UNKNOWN_TYPE").is_queryable());
+    }
+
+    // ----------------------------------------------------------------
+    // requires_read_permission_validation
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_foreign_tables_skip_strict_permission_validation() {
+        let table = make_table("FOREIGN");
+
+        assert!(table.is_queryable());
+        assert!(!table.requires_read_permission_validation());
+    }
+
+    #[test]
+    fn test_managed_tables_keep_permission_validation() {
+        let table = make_table("MANAGED");
+
+        assert!(table.is_queryable());
+        assert!(table.requires_read_permission_validation());
+    }
+
+    #[test]
+    fn test_external_tables_keep_permission_validation() {
+        assert!(make_table("EXTERNAL").requires_read_permission_validation());
+    }
+
+    #[test]
+    fn test_materialized_view_keeps_permission_validation() {
+        assert!(make_table("MATERIALIZED_VIEW").requires_read_permission_validation());
+    }
+
+    #[test]
+    fn test_non_queryable_types_still_require_permission_validation() {
+        assert!(make_table("VIEW").requires_read_permission_validation());
+        assert!(make_table("STREAMING_TABLE").requires_read_permission_validation());
+    }
+
+    // ----------------------------------------------------------------
+    // UCPermissionsEnvelope::has_read_permission
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_has_read_permission_with_select() {
+        assert!(make_permissions(&["SELECT"]).has_read_permission());
+    }
+
+    #[test]
+    fn test_has_read_permission_with_all_privileges() {
+        assert!(make_permissions(&["ALL_PRIVILEGES"]).has_read_permission());
+    }
+
+    #[test]
+    fn test_has_read_permission_with_all_privileges_space() {
+        assert!(make_permissions(&["ALL PRIVILEGES"]).has_read_permission());
+    }
+
+    #[test]
+    fn test_has_read_permission_with_owner() {
+        assert!(make_permissions(&["OWNER"]).has_read_permission());
+    }
+
+    #[test]
+    fn test_has_read_permission_with_ownership() {
+        assert!(make_permissions(&["OWNERSHIP"]).has_read_permission());
+    }
+
+    #[test]
+    fn test_no_read_permission_with_only_modify() {
+        assert!(!make_permissions(&["MODIFY"]).has_read_permission());
+    }
+
+    #[test]
+    fn test_no_read_permission_with_only_create() {
+        assert!(!make_permissions(&["CREATE"]).has_read_permission());
+    }
+
+    #[test]
+    fn test_no_read_permission_empty_assignments() {
+        let perms = UCPermissionsEnvelope {
+            privilege_assignments: vec![],
+        };
+        assert!(!perms.has_read_permission());
+    }
+
+    #[test]
+    fn test_no_read_permission_empty_privileges() {
+        let perms = UCPermissionsEnvelope {
+            privilege_assignments: vec![UCPrivilegeAssignment {
+                principal: "test_user".to_string(),
+                privileges: vec![],
+            }],
+        };
+        assert!(!perms.has_read_permission());
+    }
+
+    #[test]
+    fn test_has_read_permission_mixed_privileges() {
+        assert!(make_permissions(&["MODIFY", "CREATE", "SELECT"]).has_read_permission());
+    }
+
+    #[test]
+    fn test_has_read_permission_multiple_principals() {
+        let perms = UCPermissionsEnvelope {
+            privilege_assignments: vec![
+                UCPrivilegeAssignment {
+                    principal: "user_no_access".to_string(),
+                    privileges: vec![UCPrivilege {
+                        privilege: "MODIFY".to_string(),
+                    }],
+                },
+                UCPrivilegeAssignment {
+                    principal: "user_with_access".to_string(),
+                    privileges: vec![UCPrivilege {
+                        privilege: "SELECT".to_string(),
+                    }],
+                },
+            ],
+        };
+        assert!(perms.has_read_permission());
+    }
+
+    // ----------------------------------------------------------------
+    // UCTable::full_name
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_full_name() {
+        let table = make_table("MANAGED");
+        assert_eq!(table.full_name(), "catalog.schema.table");
+    }
+
+    // ----------------------------------------------------------------
+    // UCPermissionsEnvelope helpers
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_principals_returns_all_principal_names() {
+        let perms = UCPermissionsEnvelope {
+            privilege_assignments: vec![
+                UCPrivilegeAssignment {
+                    principal: "alice".to_string(),
+                    privileges: vec![],
+                },
+                UCPrivilegeAssignment {
+                    principal: "bob".to_string(),
+                    privileges: vec![],
+                },
+            ],
+        };
+        assert_eq!(perms.principals(), vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn test_all_privileges_returns_flattened_privileges() {
+        let perms = UCPermissionsEnvelope {
+            privilege_assignments: vec![
+                UCPrivilegeAssignment {
+                    principal: "alice".to_string(),
+                    privileges: vec![
+                        UCPrivilege {
+                            privilege: "SELECT".to_string(),
+                        },
+                        UCPrivilege {
+                            privilege: "MODIFY".to_string(),
+                        },
+                    ],
+                },
+                UCPrivilegeAssignment {
+                    principal: "bob".to_string(),
+                    privileges: vec![UCPrivilege {
+                        privilege: "CREATE".to_string(),
+                    }],
+                },
+            ],
+        };
+        assert_eq!(perms.all_privileges(), vec!["SELECT", "MODIFY", "CREATE"]);
+    }
 }

@@ -56,10 +56,17 @@ limitations under the License.
 pub mod catalog;
 pub mod catalog_provider;
 pub mod cayenne_catalog;
+#[cfg(feature = "partition-table-provider")]
+pub mod ddl;
+#[cfg(feature = "partition-table-provider")]
+pub use ddl::CayenneDdlHandler;
 pub mod metadata;
 pub mod metastore;
 pub mod optimizer_rules;
+#[cfg(feature = "partition-table-provider")]
+pub(crate) mod partition_creator;
 pub mod provider;
+pub(crate) mod schema;
 
 pub use catalog::MetadataCatalog;
 pub use catalog_provider::{
@@ -72,3 +79,4 @@ pub use provider::{
     CayenneContext, CayenneStagedAppend, CayenneTableProvider, CayenneTableProviderBuilder,
     TimeRetentionFilterBuilder,
 };
+pub use schema::transform_schema_for_vortex;

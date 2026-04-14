@@ -24,7 +24,7 @@ use snafu::prelude::*;
 
 use crate::cluster::partition::metadata::PartitionValue;
 
-use super::metadata::{PartitionMetadata, TablePartitionMetadata};
+use super::metadata::{PartitionMetadata, TablePartitionMetadata, normalized_table_name};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -116,7 +116,7 @@ impl PartitionStore {
         &self,
         table: &TableReference,
     ) -> Result<Option<TablePartitionMetadata>> {
-        let key = table.to_string();
+        let key = normalized_table_name(table);
         self.state
             .get(&key)
             .await
@@ -129,7 +129,7 @@ impl PartitionStore {
         &self,
         table: &TableReference,
     ) -> Option<TablePartitionMetadata> {
-        let key = table.to_string();
+        let key = normalized_table_name(table);
         self.state.get_cached(&key)
     }
 
@@ -145,10 +145,9 @@ impl PartitionStore {
         if self.get_cached_table_metadata(table).is_some() {
             return Ok(false);
         }
-        let key = table.to_string();
+        let key = normalized_table_name(table);
         let now_ms = now_ms()?;
-        let metadata =
-            TablePartitionMetadata::new(table.to_string(), now_ms, partition_expressions);
+        let metadata = TablePartitionMetadata::new(table, now_ms, partition_expressions);
 
         match self
             .state
@@ -172,12 +171,12 @@ impl PartitionStore {
         partition_values: Vec<HashMap<String, String>>,
         partition_expressions: Vec<String>,
     ) -> Result<()> {
-        let key = table.to_string();
         let now_ms = now_ms()?;
 
-        let mut metadata = self.get_table_metadata(table).await?.unwrap_or_else(|| {
-            TablePartitionMetadata::new(table.to_string(), now_ms, partition_expressions)
-        });
+        let mut metadata = self
+            .get_table_metadata(table)
+            .await?
+            .unwrap_or_else(|| TablePartitionMetadata::new(table, now_ms, partition_expressions));
 
         metadata.partitions = partition_values
             .into_iter()
@@ -185,7 +184,7 @@ impl PartitionStore {
             .collect();
         metadata.updated_at = now_ms;
 
-        self.write_metadata(&key, metadata).await
+        self.write_metadata(table, metadata).await
     }
 
     /// Allocates unassigned partitions to an executor.
@@ -197,7 +196,7 @@ impl PartitionStore {
         executor_id: &str,
         limit: usize,
     ) -> Result<AllocationResult> {
-        let key = table.to_string();
+        let key = normalized_table_name(table);
         let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
             .max_retries(Some(5))
             .build();
@@ -245,7 +244,7 @@ impl PartitionStore {
 
             metadata.updated_at = now_ms;
 
-            match self.write_metadata(&key, metadata).await {
+            match self.write_metadata(table, metadata).await {
                 Ok(()) => return Ok(result),
                 Err(Error::ConcurrentModification { .. }) => {
                     if let Some(delay) = backoff.next_duration() {
@@ -266,7 +265,7 @@ impl PartitionStore {
         partition_value: &PartitionValue,
         executor_id: &str,
     ) -> Result<()> {
-        let key = table.to_string();
+        let key = normalized_table_name(table);
         let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
             .max_retries(Some(5))
             .build();
@@ -296,7 +295,7 @@ impl PartitionStore {
 
             metadata.updated_at = now_ms;
 
-            match self.write_metadata(&key, metadata).await {
+            match self.write_metadata(table, metadata).await {
                 Ok(()) => return Ok(()),
                 Err(Error::ConcurrentModification { .. }) => {
                     if let Some(delay) = backoff.next_duration() {
@@ -338,7 +337,7 @@ impl PartitionStore {
             return Ok(());
         }
 
-        let key = table.to_string();
+        let key = normalized_table_name(table);
         let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
             .max_retries(Some(5))
             .build();
@@ -377,7 +376,7 @@ impl PartitionStore {
 
             metadata.updated_at = now_ms;
 
-            match self.write_metadata(&key, metadata).await {
+            match self.write_metadata(table, metadata).await {
                 Ok(()) => return Ok(()),
                 Err(Error::ConcurrentModification { .. }) => {
                     if let Some(delay) = backoff.next_duration() {
@@ -417,11 +416,10 @@ impl PartitionStore {
 
         let now_ms = now_ms()?;
         let mut target_metadata = source_metadata;
-        target_metadata.table_name = target_table.to_string();
+        target_metadata.table_name = normalized_table_name(target_table);
         target_metadata.updated_at = now_ms;
 
-        let target_key = target_table.to_string();
-        self.write_metadata(&target_key, target_metadata).await?;
+        self.write_metadata(target_table, target_metadata).await?;
 
         if assigned_count == 0 {
             Ok(CopyAssignmentsResult::NoAssignments)
@@ -435,20 +433,18 @@ impl PartitionStore {
     /// Write metadata using `insert_or_update` with conflict handling.
     pub(crate) async fn write_metadata(
         &self,
-        key: &str,
+        table: &TableReference,
         metadata: TablePartitionMetadata,
     ) -> Result<()> {
+        let key = normalized_table_name(table);
         match self
             .state
-            .insert_or_update(key, &metadata)
+            .insert_or_update(&key, &metadata)
             .await
-            .context(MetadataAccessSnafu {
-                table: key.to_string(),
-            })? {
+            .context(MetadataAccessSnafu { table: key.clone() })?
+        {
             WriteResult::Inserted | WriteResult::Updated => Ok(()),
-            WriteResult::Conflict { .. } => Err(Error::ConcurrentModification {
-                table: key.to_string(),
-            }),
+            WriteResult::Conflict { .. } => Err(Error::ConcurrentModification { table: key }),
         }
     }
 }
@@ -464,6 +460,7 @@ fn now_ms() -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
     use object_store::memory::InMemory;
 
     fn in_memory_store() -> PartitionStore {
@@ -692,7 +689,7 @@ mod tests {
             .expect("should get")
             .expect("should exist");
 
-        assert_eq!(target_meta.table_name, target.to_string());
+        assert_eq!(target_meta.table_name, normalized_table_name(&target));
         assert_eq!(
             target_meta.partition_expressions,
             vec!["region".to_string()]
@@ -752,11 +749,94 @@ mod tests {
             .expect("should get")
             .expect("should exist");
 
-        assert_eq!(target_meta.table_name, target.to_string());
+        assert_eq!(target_meta.table_name, normalized_table_name(&target));
         assert_eq!(
             target_meta.partition_expressions,
             vec!["region".to_string()]
         );
         assert_eq!(target_meta.partitions.len(), 1);
+    }
+
+    #[test]
+    fn table_key_normalizes_bare_partial_full() {
+        let bare = TableReference::bare("my_table");
+        let partial = TableReference::partial(SPICE_DEFAULT_SCHEMA, "my_table");
+        let full = TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "my_table");
+
+        assert_eq!(
+            normalized_table_name(&bare),
+            normalized_table_name(&full),
+            "bare and full should produce the same key"
+        );
+        assert_eq!(
+            normalized_table_name(&partial),
+            normalized_table_name(&full),
+            "partial and full should produce the same key"
+        );
+        assert_eq!(
+            normalized_table_name(&bare),
+            normalized_table_name(&partial),
+            "bare and partial should produce the same key"
+        );
+    }
+
+    #[test]
+    fn table_key_distinguishes_different_tables() {
+        let a = TableReference::bare("table_a");
+        let b = TableReference::bare("table_b");
+        assert_ne!(normalized_table_name(&a), normalized_table_name(&b));
+    }
+
+    #[test]
+    fn table_key_distinguishes_different_schemas() {
+        let default_schema = TableReference::bare("my_table");
+        let other_schema = TableReference::partial("other_schema", "my_table");
+        assert_ne!(
+            normalized_table_name(&default_schema),
+            normalized_table_name(&other_schema)
+        );
+    }
+
+    #[tokio::test]
+    async fn fully_qualified_and_bare_resolve_to_same_partition() {
+        let pm = test_manager();
+        let bare = TableReference::bare("my_table");
+        let full = TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "my_table");
+
+        // Initialize with bare name
+        pm.initialize_metadata(&bare, vec!["org_id".to_string()])
+            .await
+            .expect("should initialize");
+
+        // Set partitions using bare name
+        let pv = HashMap::from([("org_id".to_string(), "test_org_name".to_string())]);
+        pm.set_unassigned_partitions(&bare, vec![pv], vec![])
+            .await
+            .expect("should set partitions");
+
+        // Look up using fully qualified name — should find the same metadata
+        let meta_via_full = pm
+            .get_table_metadata(&full)
+            .await
+            .expect("should get")
+            .expect("fully qualified lookup should find metadata stored with bare name");
+
+        assert_eq!(meta_via_full.partitions.len(), 1);
+
+        // Assign using fully qualified name
+        let partition_value: PartitionValue =
+            HashMap::from([("org_id".to_string(), "test_org_name".to_string())]);
+        pm.assign_partition(&full, &partition_value, "executor-1")
+            .await
+            .expect("should assign via fully qualified ref");
+
+        // Verify assignment is visible via bare name
+        let meta_via_bare = pm
+            .get_table_metadata(&bare)
+            .await
+            .expect("should get")
+            .expect("bare lookup should see assignment made with fully qualified name");
+
+        assert!(meta_via_bare.partitions[0].is_assigned_to("executor-1"));
     }
 }

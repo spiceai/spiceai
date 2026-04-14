@@ -30,9 +30,9 @@ use crate::{
         to_tonic_err,
         util::{attach_cache_metadata, set_flightsql_protocol},
     },
-    timing::TimedStream,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
+use telemetry::timing::TimedStream;
 
 /// Get a `FlightInfo` for executing a SQL query.
 pub(crate) async fn get_flight_info(

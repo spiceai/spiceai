@@ -16,6 +16,8 @@ use std::{future::Future, sync::Arc};
 use snafu::prelude::*;
 use tokio::{runtime::Handle, sync::Notify};
 
+pub mod cancellable_task;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(transparent)]
