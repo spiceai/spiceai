@@ -168,13 +168,20 @@ pub struct DatabricksMetrics {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("This operation is not supported by the Databricks SQL Warehouse connector. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "This operation is not supported by the Databricks SQL Warehouse connector. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     NotImplemented,
 
-    #[snafu(display("Failed to initialize the Databricks SQL Warehouse HTTP client: {}", format_reqwest_error_chain(source)))]
+    #[snafu(display(
+        "Failed to initialize the Databricks SQL Warehouse HTTP client: {}",
+        format_reqwest_error_chain(source)
+    ))]
     ClientBuildFailed { source: reqwest::Error },
 
-    #[snafu(display("Unsupported Databricks data type '{ty}'. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks"))]
+    #[snafu(display(
+        "Unsupported Databricks data type '{ty}'. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks"
+    ))]
     UnsupportedType { ty: String },
 
     #[snafu(display(
@@ -200,13 +207,19 @@ pub enum Error {
     ))]
     InvalidWarehouseState { state: String },
 
-    #[snafu(display("Databricks SQL Warehouse returned an unexpected statement state: '{state}'. Verify the warehouse is operational, or report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Databricks SQL Warehouse returned an unexpected statement state: '{state}'. Verify the warehouse is operational, or report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnexpectedStatementState { state: String },
 
-    #[snafu(display("The Databricks SQL query was canceled. This may be due to a timeout or manual cancellation. Verify the warehouse is running and try again."))]
+    #[snafu(display(
+        "The Databricks SQL query was canceled. This may be due to a timeout or manual cancellation. Verify the warehouse is running and try again."
+    ))]
     QueryCanceled,
 
-    #[snafu(display("The Databricks SQL query is still running and exceeded the maximum poll attempts. Increase `databricks_max_statement_retries` or simplify the query."))]
+    #[snafu(display(
+        "The Databricks SQL query is still running and exceeded the maximum poll attempts. Increase `databricks_max_statement_retries` or simplify the query."
+    ))]
     QueryStillRunning,
 
     #[snafu(display(
@@ -229,16 +242,26 @@ pub enum Error {
         existing: usize,
     },
 
-    #[snafu(display("Failed to send request to Databricks SQL Warehouse: {}", format_reqwest_error_chain(source)))]
+    #[snafu(display(
+        "Failed to send request to Databricks SQL Warehouse: {}",
+        format_reqwest_error_chain(source)
+    ))]
     HttpRequestFailed { source: reqwest::Error },
 
-    #[snafu(display("Failed to parse response from Databricks SQL Warehouse: {}", format_reqwest_error_chain(source)))]
+    #[snafu(display(
+        "Failed to parse response from Databricks SQL Warehouse: {}",
+        format_reqwest_error_chain(source)
+    ))]
     JsonParsingFailed { source: reqwest::Error },
 
-    #[snafu(display("Databricks SQL Warehouse response is missing expected field '{field}'. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Databricks SQL Warehouse response is missing expected field '{field}'. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     MissingJsonField { field: String },
 
-    #[snafu(display("Databricks SQL Warehouse response contains an invalid array for field '{field}'. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Databricks SQL Warehouse response contains an invalid array for field '{field}'. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     InvalidJsonArray { field: String },
 
     #[snafu(display("Failed to deserialize Databricks SQL Warehouse result link: {source}"))]
@@ -247,7 +270,10 @@ pub enum Error {
     #[snafu(display("Failed to read Arrow data from Databricks SQL Warehouse: {source}"))]
     ArrowStreamReadFailed { source: arrow::error::ArrowError },
 
-    #[snafu(display("Failed to load the dataset (databricks): {}", format_datafusion_error(source)))]
+    #[snafu(display(
+        "Failed to load the dataset (databricks): {}",
+        format_datafusion_error(source)
+    ))]
     TableProviderCreationFailed { source: DataFusionError },
 
     #[snafu(display("Failed to initialize the dataset (databricks): {source}"))]
@@ -255,7 +281,9 @@ pub enum Error {
         source: datafusion_table_providers::sql::sql_provider_datafusion::Error,
     },
 
-    #[snafu(display("A fully-qualified table path (catalog.schema.table) is required for Databricks: {reason}. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks"))]
+    #[snafu(display(
+        "A fully-qualified table path (catalog.schema.table) is required for Databricks: {reason}. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks"
+    ))]
     FullyQualifiedPath { reason: String },
 
     #[snafu(display("Failed to parse Databricks datatype: {reason}"))]
@@ -2899,7 +2927,9 @@ mod tests {
         let msg = err.to_string();
 
         assert!(
-            msg.contains("Failed to send request to Databricks SQL Warehouse: error sending request for url"),
+            msg.contains(
+                "Failed to send request to Databricks SQL Warehouse: error sending request for url"
+            ),
             "error should include the reqwest request message: {msg}"
         );
         assert!(

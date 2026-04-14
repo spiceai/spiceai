@@ -15966,7 +15966,6 @@ dependencies = [
  "dataformat-json",
  "datafusion",
  "datafusion-datasource",
- "datafusion-ddl",
  "datafusion-expr",
  "datafusion-federation",
  "datafusion-functions-json",
