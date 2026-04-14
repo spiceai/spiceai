@@ -16,6 +16,8 @@ limitations under the License.
 
 #[cfg(feature = "duckdb")]
 mod json_nested_fields;
+#[cfg(feature = "duckdb")]
+mod view_hot_reload;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
