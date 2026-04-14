@@ -1025,7 +1025,13 @@ impl DataFusion {
             table_reference,
         )
         .await?
-        .map(|s| s.trim_start_matches('(').trim_end_matches(')').to_string());
+        .map(|s| {
+            if s.starts_with('(') && s.ends_with(')') {
+                s[1..s.len() - 1].to_string()
+            } else {
+                s
+            }
+        });
 
         Ok(partition_expr)
     }
