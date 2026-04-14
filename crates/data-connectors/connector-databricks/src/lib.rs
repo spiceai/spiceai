@@ -97,7 +97,7 @@ pub enum Error {
     UnableToConstructDatabricksSqlWarehouse { source: sql_warehouse::Error },
 
     #[snafu(display(
-        "Invalid `mode` value: '{value}'. Use 'delta_lake' or 'spark_connect'. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        "Invalid `mode` value: '{value}'. Valid modes are 'sql_warehouse', 'delta_lake', and 'spark_connect'. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     InvalidMode { value: String },
 
@@ -107,12 +107,12 @@ pub enum Error {
     InvalidConfiguration { message: String },
 
     #[snafu(display(
-        "Failed to build Databricks connector: required component '{missing_component}' is missing. An unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
+        "Failed to build Databricks connector. An unexpected internal error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToBuild { missing_component: String },
 
     #[snafu(display(
-        "Failed to obtain Databricks service principal token for machine-to-machine authentication. {source}"
+        "Failed to obtain Databricks authentication token. {source} Verify the service principal credentials are correctly configured. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     UnableToGetToken {
         source: Box<dyn std::error::Error + Send + Sync>,

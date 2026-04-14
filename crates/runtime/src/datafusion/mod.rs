@@ -113,6 +113,7 @@ pub mod builder;
 #[cfg(not(windows))]
 pub mod cayenne_ddl;
 pub mod composed_catalog;
+pub mod ddl;
 pub mod dialect;
 pub mod error;
 pub mod filter_converter;
@@ -540,7 +541,7 @@ pub struct DataFusion {
     /// Catalogs that allow DDL operations (CREATE TABLE, DROP TABLE, etc.)
     ddl_enabled_catalogs: Arc<RwLock<HashSet<String>>>,
     /// Shared store for DDL extensions from `CREATE TABLE` statements.
-    ddl_extension_store: datafusion_ddl::SharedDdlExtensionStore,
+    ddl_extension_store: ddl::acceleration_options::SharedDdlExtensionStore,
     /// Shared weak self-reference, populated after `Arc::new(DataFusion)`.
     /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
@@ -571,8 +572,6 @@ pub struct DataFusion {
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
     /// Executor registry for distributed write forwarding (scheduler mode only).
     pub executor_registry: Option<Arc<ExecutorRegistry>>,
-    #[cfg(not(windows))]
-    pub(crate) cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
 }
 
 impl std::fmt::Debug for DataFusion {
@@ -905,7 +904,7 @@ impl DataFusion {
     /// `CREATE TABLE` statements (e.g. `WITH (acceleration.*, dataset.*)` or
     /// `PARTITION BY`), which are then consumed by catalog-specific analyzer rules.
     #[must_use]
-    pub fn ddl_extension_store(&self) -> &datafusion_ddl::SharedDdlExtensionStore {
+    pub fn ddl_extension_store(&self) -> &ddl::acceleration_options::SharedDdlExtensionStore {
         &self.ddl_extension_store
     }
 
@@ -1019,15 +1018,8 @@ impl DataFusion {
     ) -> Result<Option<String>, DataFusionError> {
         let catalog_name = table_reference.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
         let catalog = ctx.catalog(catalog_name);
-        let partition_expr = resolve_table_partition_expr(
-            catalog.as_deref(),
-            Some(executor_registry),
-            table_reference,
-        )
-        .await?
-        .map(|s| s.trim_start_matches('(').trim_end_matches(')').to_string());
-
-        Ok(partition_expr)
+        resolve_table_partition_expr(catalog.as_deref(), Some(executor_registry), table_reference)
+            .await
     }
 
     /// Parses a SQL expression string into a `DataFusion` `Expr`, using the schema of the given table reference for resolution.
@@ -2729,7 +2721,6 @@ impl DataFusion {
             cluster_role: self.cluster_config.effective_role(),
             ddl_extension_store: Arc::clone(&self.ddl_extension_store),
             executor_registry: self.executor_registry.clone(),
-            ddl_handler: self.cayenne_ddl_handler.clone(),
         };
 
         planner::create_logical_plan(sql, session, &ctx).await

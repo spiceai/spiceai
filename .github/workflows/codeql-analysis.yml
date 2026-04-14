@@ -19,8 +19,6 @@ jobs:
   analyze:
     name: Analyze
     runs-on: self-hosted
-    env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
     permissions:
       actions: read
       contents: read
@@ -39,7 +37,7 @@ jobs:
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set up spiceio
-        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        if: runner.os == 'macOS' && secrets.UNAS_SMB_PASS != ''
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@18e298c86831c6969a0ff16ee827fe2fd816df7d # v0.5.1
         with:
