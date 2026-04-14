@@ -873,11 +873,33 @@ fn classify_table_provider_error(
         };
     }
 
+    if is_permission_denied_in_chain(&*source) {
+        return DataConnectorError::InsufficientPermissions {
+            dataconnector: "databricks".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            source,
+        };
+    }
+
     DataConnectorError::UnableToGetReadProvider {
         dataconnector: "databricks".to_string(),
         connector_component: ConnectorComponent::from(dataset),
         source,
     }
+}
+
+/// Walks the error chain looking for permission-denied signals from the
+/// `discover_schema` path (e.g. `PERMISSION_DENIED` on `DESCRIBE TABLE`).
+fn is_permission_denied_in_chain(source: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(source);
+    while let Some(err) = current {
+        let msg = err.to_string();
+        if msg.contains("Access denied") || msg.contains("PERMISSION_DENIED") {
+            return true;
+        }
+        current = err.source();
+    }
+    false
 }
 
 fn databricks_invalid_configuration_message(
