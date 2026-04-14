@@ -12,10 +12,10 @@ expression: "normalize_chat_completion_response(response, true)"
         "tool_calls": [
           {
             "function": {
-              "arguments": "{\"query\":\"{\\\"table\\\":\\\"spice.public.taxi_trips\\\"}\"}",
+              "arguments": "{\"query\":\"!table\"}",
               "name": "describe"
             },
-            "id": "call-0edea482-f8d1-4a66-a24b-e8d8b49f0685",
+            "id": "call-2c87b647-1e0d-415c-9def-6fc9035f1d32",
             "type": "function"
           }
         ]
