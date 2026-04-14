@@ -23,7 +23,6 @@ use std::sync::{Arc, LazyLock};
 use async_trait::async_trait;
 use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
-use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::TableProviderFilterPushDown;
