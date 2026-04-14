@@ -27,9 +27,7 @@ use datafusion::{
     datasource::TableType,
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{
-        BinaryExpr, Operator, TableProviderFilterPushDown, dml::InsertOp, expr::InList,
-    },
+    logical_expr::{BinaryExpr, Operator, TableProviderFilterPushDown, dml::InsertOp},
     physical_expr::{OrderingRequirements, PhysicalSortExpr},
     physical_plan::{
         DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr, PlanProperties,
@@ -122,26 +120,23 @@ impl PartitionTableProvider {
     }
 
     /// Returns `true` if the filter exclusively compares partition expressions to
-    /// literal values. Such filters are fully resolved by partition pruning and do
-    /// **not** need to be re-evaluated per-row as data filters.
+    /// literal values using equality, and `prune_partition` can fully resolve the
+    /// filter via partition metadata alone.
     ///
-    /// Examples that return `true`:
-    /// - `bucket(50, org_id) = '5'`
-    /// - `bucket(50, org_id) = '5' OR bucket(50, org_id) = '13'`
-    /// - `bucket(50, org_id) IN ('5', '13')`
+    /// Only the shapes that `prune_partition` handles exactly are accepted:
+    /// - Single equality: `partition_expr = literal`
+    /// - OR-chains of equalities: `partition_expr = lit1 OR partition_expr = lit2`
+    /// - AND of partition-expression equalities across different expressions
     ///
-    /// Examples that return `false`:
-    /// - `org_id = 100`  (base column, not the partition expression itself)
-    /// - `bucket(50, org_id) = '5' OR status = 'active'`  (non-partition column involved)
+    /// Shapes that are NOT accepted (because `prune_partition` cannot fully
+    /// resolve them for transform partition expressions like `bucket()`):
+    /// - Inequalities: `partition_expr != lit`, `partition_expr > lit`, etc.
+    /// - `InList`: `partition_expr IN (lit1, lit2)` or `NOT IN`
+    /// - Base-column filters: `org_id = 100`
     fn is_partition_expression_filter(filter: &Expr, partition_exprs: &[PartitionedBy]) -> bool {
         match filter {
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
-                Operator::Eq
-                | Operator::NotEq
-                | Operator::Gt
-                | Operator::GtEq
-                | Operator::Lt
-                | Operator::LtEq => {
+                Operator::Eq => {
                     let is_partition_expr_vs_literal = |a: &Expr, b: &Expr| -> bool {
                         partition_exprs.iter().any(|p| a == &p.expression)
                             && matches!(b, Expr::Literal(..))
@@ -155,12 +150,6 @@ impl PartitionTableProvider {
                 }
                 _ => false,
             },
-            Expr::InList(InList { expr, list, .. }) => {
-                partition_exprs
-                    .iter()
-                    .any(|p| expr.as_ref() == &p.expression)
-                    && list.iter().all(|e| matches!(e, Expr::Literal(..)))
-            }
             _ => false,
         }
     }
