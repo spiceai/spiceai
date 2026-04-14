@@ -1087,7 +1087,10 @@ mod tests {
             updated_at: 1000,
             partition_expressions: vec!["date".to_string()],
         };
-        store.write_metadata(table, metadata).await.expect("write");
+        store
+            .write_metadata(&table_ref, metadata)
+            .await
+            .expect("write");
         store.refresh().await.expect("refresh");
     }
 
