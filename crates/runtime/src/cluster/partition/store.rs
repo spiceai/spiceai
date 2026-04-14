@@ -799,7 +799,7 @@ mod tests {
 
     #[tokio::test]
     async fn fully_qualified_and_bare_resolve_to_same_partition() {
-        let pm = test_manager();
+        let pm = test_store();
         let bare = TableReference::bare("my_table");
         let full = TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "my_table");
 
