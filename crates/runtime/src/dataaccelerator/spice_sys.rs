@@ -218,7 +218,10 @@ pub enum OpenOption {
 
 async fn acceleration_connection(
     source: &dyn AccelerationSource,
-    #[cfg_attr(not(any(feature = "duckdb", feature = "sqlite")), expect(unused_variables))]
+    #[cfg_attr(
+        not(any(feature = "duckdb", feature = "sqlite")),
+        expect(unused_variables)
+    )]
     open_option: OpenOption,
 ) -> Result<AccelerationConnection> {
     let acceleration_settings = source.acceleration().context(AccelerationNotEnabledSnafu)?;
