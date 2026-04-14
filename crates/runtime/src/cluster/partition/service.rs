@@ -494,10 +494,7 @@ async fn add_partitions_with_retry(
         }
 
         metadata.updated_at = now;
-        match partition_store
-            .write_metadata(&table.to_string(), metadata)
-            .await
-        {
+        match partition_store.write_metadata(table, metadata).await {
             Ok(()) => {
                 tracing::debug!(table = %table, count = partition_values.len(), "Added new partitions to metadata");
                 return Ok(());
@@ -592,10 +589,7 @@ async fn remove_partitions_with_cleanup(
 
         metadata.updated_at = now_ms();
 
-        match partition_store
-            .write_metadata(&table.to_string(), metadata)
-            .await
-        {
+        match partition_store.write_metadata(table, metadata).await {
             Ok(()) => {
                 tracing::debug!(table = %table, count = partition_values.len(), "Removed stale partitions");
                 break;
