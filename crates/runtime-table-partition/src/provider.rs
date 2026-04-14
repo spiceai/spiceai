@@ -490,12 +490,10 @@ impl PartitionedDeletionSink {
 impl DeletionSink for PartitionedDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let mut total_deleted = 0u64;
+        let session_ctx = datafusion::execution::context::SessionContext::new();
+        let state = session_ctx.state();
 
         for partition in &self.partitions {
-            // Create a simple session state for executing the deletion
-            let session_ctx = datafusion::execution::context::SessionContext::new();
-            let state = session_ctx.state();
-
             // Execute deletion on this partition using native TableProvider::delete_from
             let plan = partition
                 .table_provider
@@ -551,11 +549,10 @@ impl PartitionedUpdateSink {
 impl DeletionSink for PartitionedUpdateSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let mut total_updated = 0u64;
+        let session_ctx = datafusion::execution::context::SessionContext::new();
+        let state = session_ctx.state();
 
         for partition in &self.partitions {
-            let session_ctx = datafusion::execution::context::SessionContext::new();
-            let state = session_ctx.state();
-
             let plan = partition
                 .table_provider
                 .update(&state, self.assignments.clone(), self.filters.clone())

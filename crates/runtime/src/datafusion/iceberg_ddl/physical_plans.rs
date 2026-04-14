@@ -548,11 +548,8 @@ impl ExecutionPlan for IcebergCreateTableExec {
                                 table_name.clone(),
                                 provider,
                             );
-                        schema_provider.register_table(
-                            table_name.clone(),
-                            Arc::new(deletion_provider)
-                                as Arc<dyn datafusion::datasource::TableProvider>,
-                        )?;
+                        schema_provider
+                            .register_table(table_name.clone(), Arc::new(deletion_provider))?;
                         message = format!("Table '{table_name}' already exists");
                     }
 

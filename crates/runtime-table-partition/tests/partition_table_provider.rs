@@ -1917,8 +1917,8 @@ async fn test_deletion_table_provider_empty_partitions() -> Result<(), Box<dyn s
 // Additional Edge Case Tests for PartitionTableProvider
 // ============================================================================
 
-/// Test that a partition provider without deletion support logs a warning and continues
-/// (non-deletable partition creator that returns regular `MemTable` without `delete_from`)
+/// Test partition behavior with a creator that returns a plain `MemTable`.
+/// `MemTable` supports `delete_from` with empty filters as a no-op (0 rows deleted).
 #[derive(Debug)]
 struct NonDeletablePartitionCreator {
     schema: SchemaRef,
@@ -1957,7 +1957,7 @@ impl PartitionCreator for NonDeletablePartitionCreator {
             MemTable::try_new(Arc::clone(&self.schema), vec![vec![empty_batch]])
                 .map_err(|e| creator::Error::CreatePartition { source: e.into() })?,
         );
-        // Return MemTable directly without wrapping - doesn't support deletion
+        // Return MemTable directly — supports delete_from (empty filters = no-op)
         Ok(Partition {
             partition_values: vec![partition_value],
             table_provider: mem_table,
