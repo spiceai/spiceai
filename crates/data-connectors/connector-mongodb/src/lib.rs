@@ -172,18 +172,18 @@ impl DataConnectorFactory for MongoDBFactory {
                 if let Some(ref h) = host
                     && is_srv_host(h)
                 {
-                        if !srv_provided {
-                            params
-                                .parameters
-                                .insert("srv".to_string(), "true".to_string().into());
-                        }
+                    if !srv_provided {
+                        params
+                            .parameters
+                            .insert("srv".to_string(), "true".to_string().into());
+                    }
 
-                        if params.parameters.get("port").ok().is_some() {
-                            tracing::warn!(
-                                "The 'port' parameter is ignored for SRV host '{h}' on the {component}. mongodb+srv:// uses DNS SRV records for host/port discovery.",
-                                component = params.component
-                            );
-                        }
+                    if params.parameters.get("port").ok().is_some() {
+                        tracing::warn!(
+                            "The 'port' parameter is ignored for SRV host '{h}' on the {component}. mongodb+srv:// uses DNS SRV records for host/port discovery.",
+                            component = params.component
+                        );
+                    }
                 }
             }
 
