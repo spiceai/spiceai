@@ -154,15 +154,11 @@ pub async fn discover_schema(
     //    the other probe produced an `Ok` schema. The fallback's metadata
     //    would be unusable at query time (e.g. foreign table on a Classic
     //    SQL warehouse).
-    if matches!(&metadata_result, SchemaProbeResult::Permanent(_)) {
-        if let SchemaProbeResult::Permanent(err) = metadata_result {
-            return Err(err);
-        }
+    if let SchemaProbeResult::Permanent(err) = metadata_result {
+        return Err(err);
     }
-    if matches!(&direct_result, SchemaProbeResult::Permanent(_)) {
-        if let SchemaProbeResult::Permanent(err) = direct_result {
-            return Err(err);
-        }
+    if let SchemaProbeResult::Permanent(err) = direct_result {
+        return Err(err);
     }
 
     // 3. direct_probe returns AccessDenied → permanent error (can't query the table)

@@ -714,7 +714,7 @@ impl SqlWarehouseApi {
                     message,
                 }))
             }
-            Ok(WarehouseType::Pro) | Ok(WarehouseType::Serverless) => {
+            Ok(WarehouseType::Pro | WarehouseType::Serverless) => {
                 SchemaProbeResult::Failed(Box::new(original))
             }
             Ok(WarehouseType::Unknown) => {
