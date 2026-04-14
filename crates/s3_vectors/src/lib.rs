@@ -360,7 +360,7 @@ impl S3Vectors for Client {
             };
 
             let nt = next_token.clone();
-            let output = self
+            let result = self
                 .client
                 .query_vectors()
                 .set_vector_bucket_name(input.vector_bucket_name.clone())
@@ -389,7 +389,36 @@ impl S3Vectors for Client {
                 })
                 .interceptor(interceptor)
                 .send()
-                .await?;
+                .await;
+
+            let output = match result {
+                Ok(output) => output,
+                Err(e) if next_token.is_none() => {
+                    // First request failed — the account may not support topK > page size.
+                    // Fall back to a single request capped at the page size.
+                    if matches!(
+                        &e,
+                        SdkError::ServiceError(se)
+                            if matches!(se.err(), QueryVectorsError::ValidationException(_))
+                    ) {
+                        return self
+                            .client
+                            .query_vectors()
+                            .set_vector_bucket_name(input.vector_bucket_name.clone())
+                            .set_index_name(input.index_name.clone())
+                            .set_index_arn(input.index_arn.clone())
+                            .set_query_vector(input.query_vector.clone())
+                            .top_k(QUERY_VECTORS_PAGE_SIZE)
+                            .set_return_distance(input.return_distance)
+                            .set_return_metadata(input.return_metadata)
+                            .set_filter(input.filter.clone())
+                            .send()
+                            .await;
+                    }
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            };
 
             distance_metric = distance_metric.or(output.distance_metric);
             all_vectors.extend(output.vectors);
