@@ -16750,6 +16750,7 @@ dependencies = [
  "aws-sdk-s3vectors",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
+ "serde_json",
  "tokio",
 ]
 

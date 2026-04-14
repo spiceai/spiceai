@@ -14,6 +14,7 @@ aws-config.workspace = true
 aws-sdk-s3vectors.workspace = true
 aws-smithy-runtime-api.workspace = true
 aws-smithy-types.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
