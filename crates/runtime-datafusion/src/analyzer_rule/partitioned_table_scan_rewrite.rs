@@ -203,26 +203,13 @@ impl AnalyzerRule for PartitionedTableScanRewrite {
                 )));
             }
 
-            // Consume the vec so each Arc has a unique owner, allowing
-            // Arc::unwrap_or_clone to move out without a deep clone.
-            let mut sub_scans_iter = sub_scans.into_iter();
-            let first_scan = Arc::unwrap_or_clone(
-                sub_scans_iter
-                    .next()
-                    .unwrap_or_else(|| unreachable!("sub_scans is non-empty; checked above")),
-            );
-            let sub_scans: Vec<_> = sub_scans_iter.collect();
+            let result = LogicalPlanBuilder::new(LogicalPlan::Union(Union {
+                inputs: sub_scans,
+                schema: Arc::clone(plan.schema()),
+            }))
+            .alias(scan.table_name.clone())?
+            .build()?;
 
-            // Single partition: no Union needed, just return the sub-scan directly.
-            if sub_scans.is_empty() {
-                return Ok(Transformed::yes(first_scan));
-            }
-
-            let mut builder = LogicalPlanBuilder::from(first_scan);
-            for scan in sub_scans {
-                builder = builder.union(Arc::unwrap_or_clone(scan))?;
-            }
-            let result = builder.alias(scan.table_name.clone())?.build()?;
             rewrite_occurred = true;
             Ok(Transformed::yes(result))
         })
