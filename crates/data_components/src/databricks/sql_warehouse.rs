@@ -265,6 +265,17 @@ pub enum Error {
         "Failed to execute the query. {message} Verify the query is valid, or report a bug at: https://github.com/spiceai/spiceai/issues"
     ))]
     QueryFailure { message: String },
+
+    #[snafu(display(
+        "The dataset '{dataset_name}' appears to be a Lakehouse Federation foreign table, \
+         which is not supported on Classic SQL warehouses. \
+         Switch `databricks_sql_warehouse_id` to a Pro or Serverless warehouse. \
+         Databricks error: {message}"
+    ))]
+    ForeignTableOnClassicWarehouse {
+        dataset_name: String,
+        message: String,
+    },
 }
 
 fn format_reqwest_error_chain(error: &reqwest::Error) -> String {
@@ -283,6 +294,16 @@ fn format_reqwest_error_chain(error: &reqwest::Error) -> String {
     }
 
     message
+}
+
+/// Databricks SQL warehouse compute type. Lakehouse Federation foreign
+/// tables are only supported on `Pro` and `Serverless` warehouses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarehouseType {
+    Classic,
+    Pro,
+    Serverless,
+    Unknown,
 }
 
 /// Main struct for interacting with Databricks SQL Warehouse
@@ -579,8 +600,14 @@ impl SqlWarehouseApi {
                 permissions,
             )
             .await
-            .map_err(|e| Error::QueryFailure {
-                message: e.to_string(),
+            .map_err(|e| match e.downcast::<Error>() {
+                // Preserve the specific `ForeignTableOnClassicWarehouse`
+                // error (and any other typed Databricks error) when it
+                // bubbles up — wrapping loses the actionable diagnosis.
+                Ok(err) => *err,
+                Err(other) => Error::QueryFailure {
+                    message: other.to_string(),
+                },
             })?;
 
             result.log_warnings(table);
@@ -605,7 +632,43 @@ impl SqlWarehouseApi {
         match self.get_schema_from_information_schema(&token, table).await {
             Ok(schema) => SchemaProbeResult::Ok(schema),
             Err(e) if is_access_denied_error(&e) => SchemaProbeResult::AccessDenied(e.to_string()),
+            Err(e) if is_unsupported_data_source_error(&e) => {
+                self.classify_unsupported_data_source(&token, table, e)
+                    .await
+            }
             Err(e) => SchemaProbeResult::Failed(Box::new(e)),
+        }
+    }
+
+    /// Resolves an `UNSUPPORTED_DATA_SOURCE` schema-probe error into either a
+    /// specific `ForeignTableOnClassicWarehouse` diagnosis or a generic
+    /// `Failed` result, based on the warehouse type.
+    ///
+    /// On Classic warehouses this returns [`SchemaProbeResult::Permanent`] so
+    /// `discover_schema` surfaces the actionable error immediately without
+    /// falling back to `DESCRIBE TABLE` metadata that would never be usable
+    /// at query time.
+    async fn classify_unsupported_data_source(
+        &self,
+        token: &str,
+        table: &TableReference,
+        original: Error,
+    ) -> SchemaProbeResult {
+        match self.get_warehouse_type(token).await {
+            Ok(WarehouseType::Classic) => {
+                SchemaProbeResult::Permanent(Box::new(Error::ForeignTableOnClassicWarehouse {
+                    dataset_name: table.to_string(),
+                    message: original.to_string(),
+                }))
+            }
+            Ok(_) => SchemaProbeResult::Failed(Box::new(original)),
+            Err(lookup_err) => {
+                tracing::warn!(
+                    table = %table,
+                    "Failed to query warehouse type to diagnose UNSUPPORTED_DATA_SOURCE: {lookup_err}"
+                );
+                SchemaProbeResult::Failed(Box::new(original))
+            }
         }
     }
 
@@ -625,6 +688,11 @@ impl SqlWarehouseApi {
             Err(e) if is_access_denied_error(&e) => {
                 return SchemaProbeResult::AccessDenied(e.to_string());
             }
+            Err(e) if is_unsupported_data_source_error(&e) => {
+                return self
+                    .classify_unsupported_data_source(&token, table, e)
+                    .await;
+            }
             Err(e) => return SchemaProbeResult::Failed(Box::new(e)),
         };
         let response = match self.wait_for_statement_completion(&token, response).await {
@@ -632,11 +700,20 @@ impl SqlWarehouseApi {
             Err(e) if is_access_denied_error(&e) => {
                 return SchemaProbeResult::AccessDenied(e.to_string());
             }
+            Err(e) if is_unsupported_data_source_error(&e) => {
+                return self
+                    .classify_unsupported_data_source(&token, table, e)
+                    .await;
+            }
             Err(e) => return SchemaProbeResult::Failed(Box::new(e)),
         };
         match schema_from_describe_json(&response, &table.to_string()) {
             Ok(schema) => SchemaProbeResult::Ok(schema),
             Err(e) if is_access_denied_error(&e) => SchemaProbeResult::AccessDenied(e.to_string()),
+            Err(e) if is_unsupported_data_source_error(&e) => {
+                self.classify_unsupported_data_source(&token, table, e)
+                    .await
+            }
             Err(e) => SchemaProbeResult::Failed(Box::new(e)),
         }
     }
@@ -769,6 +846,49 @@ impl SqlWarehouseApi {
             warehouse_id = %self.sql_warehouse_id,
         ))
         .await
+    }
+
+    /// Queries the Databricks REST API for this warehouse's type.
+    ///
+    /// Uses `GET /api/2.0/sql/warehouses/{id}`. The response contains
+    /// `warehouse_type` (`"CLASSIC"` or `"PRO"`) and
+    /// `enable_serverless_compute` (bool). Serverless is a variant of `PRO`.
+    async fn get_warehouse_type(&self, token: &str) -> Result<WarehouseType, Error> {
+        self.check_permanently_disabled()?;
+        let url = format!(
+            "{}/api/2.0/sql/warehouses/{}",
+            self.base_url, self.sql_warehouse_id
+        );
+        let response = send_request_with_retry_and_concurrency_limit(
+            "Databricks SQL Warehouse",
+            "get warehouse details",
+            || self.client.get(&url).bearer_auth(token),
+            &self.retry_config(),
+        )
+        .await
+        .context(HttpRequestFailedSnafu)?;
+        let value: Value = response
+            .error_for_status()
+            .context(HttpRequestFailedSnafu)?
+            .json()
+            .await
+            .context(JsonParsingFailedSnafu)?;
+
+        let warehouse_type = value
+            .get("warehouse_type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let serverless = value
+            .get("enable_serverless_compute")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        Ok(match (warehouse_type, serverless) {
+            ("PRO", true) => WarehouseType::Serverless,
+            ("PRO", false) => WarehouseType::Pro,
+            ("CLASSIC", _) => WarehouseType::Classic,
+            _ => WarehouseType::Unknown,
+        })
     }
 
     async fn get_sql_statement_status(
@@ -1143,6 +1263,16 @@ fn is_access_denied_error(err: &Error) -> bool {
                 || message.contains("does not have")
                 || message.contains("permission denied")
         }
+        _ => false,
+    }
+}
+
+/// Returns `true` if the error indicates the table is backed by a data
+/// source unsupported by the SQL warehouse. This is the signature of a
+/// Lakehouse Federation foreign table queried from a Classic warehouse.
+fn is_unsupported_data_source_error(err: &Error) -> bool {
+    match err {
+        Error::QueryFailure { message } => message.contains("UNSUPPORTED_DATA_SOURCE"),
         _ => false,
     }
 }

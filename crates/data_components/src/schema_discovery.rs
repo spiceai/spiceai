@@ -68,6 +68,12 @@ pub enum SchemaProbeResult {
     AccessDenied(String),
     /// Query failed for a non-permission reason.
     Failed(Box<dyn std::error::Error + Send + Sync>),
+    /// The probe uncovered a permanent, provider-specific configuration
+    /// failure (e.g. Lakehouse Federation foreign table on a Classic SQL
+    /// warehouse). [`discover_schema`] surfaces this error immediately
+    /// without attempting fallback, because the fallback's metadata would
+    /// be unusable at query time.
+    Permanent(Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Warnings emitted during schema discovery.
@@ -112,6 +118,8 @@ impl SchemaDiscoveryResult {
 /// | permissions | direct_probe | metadata_probe | Outcome |
 /// |-------------|-------------|----------------|---------|
 /// | Denied      | *           | *              | permanent error |
+/// | *           | Permanent   | *              | permanent error (probe-provided) |
+/// | *           | *           | Permanent      | permanent error (probe-provided) |
 /// | *           | AccessDenied| *              | permanent error |
 /// | *           | *           | Ok             | use metadata schema |
 /// | *           | Ok          | Failed/Denied  | warn + use direct schema |
@@ -142,17 +150,32 @@ pub async fn discover_schema(
         });
     }
 
-    // 2. direct_probe returns AccessDenied → permanent error (can't query the table)
+    // 2. Either probe returned `Permanent` → surface it immediately, even if
+    //    the other probe produced an `Ok` schema. The fallback's metadata
+    //    would be unusable at query time (e.g. foreign table on a Classic
+    //    SQL warehouse).
+    if matches!(&metadata_result, SchemaProbeResult::Permanent(_)) {
+        if let SchemaProbeResult::Permanent(err) = metadata_result {
+            return Err(err);
+        }
+    }
+    if matches!(&direct_result, SchemaProbeResult::Permanent(_)) {
+        if let SchemaProbeResult::Permanent(err) = direct_result {
+            return Err(err);
+        }
+    }
+
+    // 3. direct_probe returns AccessDenied → permanent error (can't query the table)
     if let SchemaProbeResult::AccessDenied(reason) = &direct_result {
         return Err(format!("Access denied for table '{table_name}': {reason}").into());
     }
 
-    // 3. metadata_probe succeeds → use it
+    // 4. metadata_probe succeeds → use it
     if let SchemaProbeResult::Ok(schema) = metadata_result {
         return Ok(SchemaDiscoveryResult { schema, warnings });
     }
 
-    // 4. metadata_probe failed, direct_probe succeeds → warn + use direct
+    // 5. metadata_probe failed, direct_probe succeeds → warn + use direct
     if let SchemaProbeResult::Ok(schema) = direct_result {
         let reason = match &metadata_result {
             SchemaProbeResult::AccessDenied(msg) => {
@@ -161,7 +184,9 @@ pub async fn discover_schema(
             SchemaProbeResult::Failed(err) => {
                 format!("metadata schema probe failed: {err}")
             }
-            SchemaProbeResult::Ok(_) => unreachable!("handled above"),
+            SchemaProbeResult::Ok(_) | SchemaProbeResult::Permanent(_) => {
+                unreachable!("handled above")
+            }
         };
         warnings.push(SchemaDiscoveryWarning::MetadataFallback {
             reason,
@@ -170,11 +195,11 @@ pub async fn discover_schema(
         return Ok(SchemaDiscoveryResult { schema, warnings });
     }
 
-    // 5. Both probes failed → propagate the most informative error
+    // 6. Both probes failed → propagate the most informative error
     // Prefer the direct probe error since it's the fallback path
     match direct_result {
         SchemaProbeResult::Failed(e) => Err(e),
-        // AccessDenied already handled above; Ok already handled above
+        // AccessDenied and Permanent already handled above; Ok already handled above
         _ => Err(format!("Failed to discover schema for table '{table_name}'").into()),
     }
 }

@@ -841,11 +841,7 @@ impl DataConnector for Databricks {
         self.read_provider
             .table_provider(table_reference)
             .await
-            .map_err(|source| DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "databricks".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source,
-            })
+            .map_err(|source| classify_table_provider_error(dataset, source))
     }
 
     fn initialization(&self) -> ComponentInitialization {
@@ -858,6 +854,37 @@ impl DataConnector for Databricks {
                 metrics: Arc::clone(m),
             }) as Arc<dyn MetricsProvider>
         })
+    }
+}
+
+/// Classifies a table-provider error, promoting Databricks-specific
+/// configuration failures (e.g. foreign tables on Classic SQL warehouses)
+/// into permanent, non-retriable errors so the runtime surfaces them
+/// immediately instead of retrying indefinitely.
+fn classify_table_provider_error(
+    dataset: &Dataset,
+    source: Box<dyn std::error::Error + Send + Sync>,
+) -> DataConnectorError {
+    // Walk the error chain looking for signals of a permanent failure.
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&*source);
+    while let Some(err) = current {
+        let msg = err.to_string();
+        if msg.contains("Lakehouse Federation foreign table")
+            && msg.contains("Classic SQL warehouses")
+        {
+            return DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "databricks".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: msg,
+            };
+        }
+        current = err.source();
+    }
+
+    DataConnectorError::UnableToGetReadProvider {
+        dataconnector: "databricks".to_string(),
+        connector_component: ConnectorComponent::from(dataset),
+        source,
     }
 }
 
