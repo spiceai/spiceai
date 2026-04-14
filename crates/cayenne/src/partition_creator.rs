@@ -21,7 +21,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
-use data_components::delete::DeletionTableProviderAdapter;
 use datafusion::common::DFSchema;
 use datafusion::common::arrow::datatypes::SchemaRef;
 use datafusion::datasource::TableProvider;
@@ -260,11 +259,9 @@ impl PartitionCreator for CayennePartitionCreator {
             .boxed()
             .context(creator::CreatePartitionSnafu)?;
 
-        let adapted_table: Arc<dyn TableProvider> =
-            Arc::new(DeletionTableProviderAdapter::new(Arc::new(cayenne_table)));
         Ok(Partition {
             partition_values,
-            table_provider: adapted_table,
+            table_provider: Arc::new(cayenne_table),
         })
     }
 
@@ -321,11 +318,9 @@ impl PartitionCreator for CayennePartitionCreator {
                 .boxed()
                 .context(creator::InferringPartitionsSnafu)?;
 
-            let adapted_table: Arc<dyn TableProvider> =
-                Arc::new(DeletionTableProviderAdapter::new(Arc::new(cayenne_table)));
             result.push(Partition {
                 partition_values,
-                table_provider: adapted_table,
+                table_provider: Arc::new(cayenne_table),
             });
         }
 
