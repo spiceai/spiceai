@@ -354,41 +354,6 @@ impl DataFusionBuilder {
             panic!("Unable to register Spark functions: {e}");
         }
 
-        let ctx = SessionContext::new_with_state(state);
-
-        // Add partitioned table scan rewrite rules for distributed query execution.
-        // Must be added after context creation so the SessionContext (with UDFs) is
-        // available for parsing partition expression strings into Exprs.
-        if let Some(executor_registry) = &self.executor_registry {
-            use crate::cluster::FederatedPartitionProvider;
-
-            // Accelerated tables
-            ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
-                Arc::clone(executor_registry) as Arc<dyn TablePartitionProvider>,
-                &ctx,
-            )));
-
-            // Federated tables (e.g. Cayenne)
-            ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
-                Arc::new(FederatedPartitionProvider::from_registry(executor_registry))
-                    as Arc<dyn TablePartitionProvider>,
-                &ctx,
-            )));
-        }
-        for rule in AnalyzerRulesBuilder::default().build() {
-            ctx.add_analyzer_rule(rule);
-        }
-        for rule in self.additional_analyzer_rules {
-            ctx.add_analyzer_rule(rule);
-        }
-
-        // Add cache invalidation optimizer rule if caching is enabled
-        if let Some(caching) = &self.caching {
-            ctx.add_optimizer_rule(Arc::new(CacheInvalidationOptimizerRule::new(
-                Arc::downgrade(caching),
-            )));
-        }
-
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
         let runtime_schema = SpiceSchemaProvider::new();
@@ -434,6 +399,14 @@ impl DataFusionBuilder {
             }
         }
 
+        let ctx = SessionContext::new_with_state(state);
+
+        // Add cache invalidation optimizer rule if caching is enabled
+        if let Some(caching) = &self.caching {
+            ctx.add_optimizer_rule(Arc::new(CacheInvalidationOptimizerRule::new(
+                Arc::downgrade(caching),
+            )));
+        }
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
         // Enable URL-based table resolution (e.g., SELECT * FROM 's3://bucket/data.parquet')
@@ -458,10 +431,12 @@ impl DataFusionBuilder {
             datafusion_ddl::new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
 
         let cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>> =
-            // Rules only for distributed query
+            // How we handle Cayenne DDL depends if its single node vs distributed.
             if let Some(executor_registry) = &self.executor_registry {
                 use crate::cluster::FederatedPartitionProvider;
 
+
+                // Rules only for distributed query
                 // Accelerated tables
                 ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
                     Arc::clone(executor_registry) as Arc<dyn TablePartitionProvider>,
@@ -496,7 +471,6 @@ impl DataFusionBuilder {
                 }
             };
 
-        // How we handle Cayenne DDL depends if its single node vs distributed.
         if let Some(ref cayenne_ddl_handler) = cayenne_ddl_handler {
             ctx.add_analyzer_rule(Arc::new(datafusion_ddl::DdlAnalyzerRule::new(
                 ctx.state().catalog_list(),
@@ -506,6 +480,14 @@ impl DataFusionBuilder {
                 SPICE_DEFAULT_SCHEMA,
                 SPICE_DEFAULT_CATALOG,
             )));
+        }
+
+        // Purposelly after `PartitionedTableScanRewrite` to allow expansion across partitions/executors.
+        for rule in AnalyzerRulesBuilder::default().build() {
+            ctx.add_analyzer_rule(rule);
+        }
+        for rule in self.additional_analyzer_rules {
+            ctx.add_analyzer_rule(rule);
         }
 
         // Iceberg DDL analyzer rule.

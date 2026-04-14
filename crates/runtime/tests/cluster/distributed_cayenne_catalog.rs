@@ -352,6 +352,10 @@ async fn ddl_lifecycle_bulk_update(harness: &ClusterHarness) -> Result<(), anyho
 
     // Alice(31→41), Charlie(35→45); Bob(25), Diana(28), Eve(22) unchanged.
     let select_bulk = "SELECT id, name, age FROM tcat.myschema.users ORDER BY id";
+    assert_explain_snapshot!(
+        "ddl_select_all_after_bulk_update",
+        explain_to_string(&harness.explain(select_bulk).await?)
+    );
     let batches = harness.query(select_bulk).await?;
     assert_batches_eq!(
         &[

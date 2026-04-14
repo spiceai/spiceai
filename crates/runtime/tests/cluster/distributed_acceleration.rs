@@ -217,10 +217,12 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
                     "id",
                 ))
                 .with_runtime(SpicepodRuntime {
-                    scheduler: Some(make_named_scheduler_config_with_executors(
-                        "test_distributed_acceleration_multi_executor",
-                        2,
-                    )),
+                    scheduler: Some(
+                        make_named_scheduler_config_with_max_partitions_per_executor(
+                            "test_distributed_acceleration_multi_executor",
+                            2,
+                        ),
+                    ),
                     ..SpicepodRuntime::default()
                 })
                 .build();
@@ -830,10 +832,10 @@ fn make_memory_accelerated_dataset(
 /// A UUID suffix ensures each test run starts with clean state, avoiding stale
 /// partition assignments from previous runs routing queries to dead executors.
 fn make_named_scheduler_config(test_name: &str) -> SchedulerConfig {
-    make_named_scheduler_config_with_executors(test_name, 10)
+    make_named_scheduler_config_with_max_partitions_per_executor(test_name, 10)
 }
 
-fn make_named_scheduler_config_with_executors(
+fn make_named_scheduler_config_with_max_partitions_per_executor(
     test_name: &str,
     max_partitions_per_executor: usize,
 ) -> SchedulerConfig {
