@@ -75,14 +75,45 @@ Unsupported table types are:
 - **Catalog connector path**: Silently skipped during catalog discovery with a debug-level log message.
 - **Data connector path**: Rejected with a `DataConnectorError::InvalidConfigurationNoSource` error (message: "Unsupported Unity Catalog table type ...") when a fully-qualified table reference (`catalog.schema.table`) is used and the table exists in Unity Catalog.
 
+### Schema Discovery (Parallel Probes)
+
+When registering a dataset, the connector discovers the table schema by running two independent probes **in parallel** via `tokio::join!`:
+
+1. **Metadata probe** — Queries `information_schema.columns` for column names, data types, and nullability. This is the preferred source because it reports explicit `IS_NULLABLE` values.
+2. **Direct probe** — Runs `DESCRIBE TABLE` for column names and data types. Nullability defaults to `true` (nullable) because `DESCRIBE TABLE` does not report it.
+
+The schema probe results are evaluated using a deterministic decision matrix:
+
+| Metadata Probe      | Direct Probe | Outcome                                                  |
+| ------------------- | ------------ | -------------------------------------------------------- |
+| OK                  | OK           | Use metadata schema (preferred — has nullability)        |
+| OK                  | AccessDenied | **Permanent error** — table cannot be queried at runtime |
+| AccessDenied/Failed | OK           | **Warning** + use direct schema (fallback)               |
+| AccessDenied        | AccessDenied | **Permanent error**                                      |
+| Failed              | Failed       | Propagate error                                          |
+
+When a Unity Catalog client is available, read access is validated separately by the `validate_uc_table` pre-check **before** schema discovery runs. Explicit UC permission denials block dataset initialization (preventing thundering herd requests to the SQL Warehouse). Ambiguous results (API unreachable, table not found) are advisory — Databricks query-time validation is the fallback.
+
+Key design decisions:
+
+- **HTTP 403 ≠ SQL access denied**: An HTTP 403 from the SQL Statements API indicates an infrastructure auth problem (bad token, no warehouse access). It is NOT classified as a SQL-level table permission denial. Only SQL query failures containing `INSUFFICIENT_PERMISSIONS`, `ACCESS_DENIED`, `PERMISSION_DENIED`, `does not have`, or `permission denied` are classified as access denied.
+- **Parallel execution**: Both probes always run even if one could short-circuit, to minimize total latency. The probes are lightweight SQL statements.
+- **Token per probe**: Each probe independently calls `get_token()` since they execute concurrently.
+
+The `MetadataFallback` warning includes the specific reason (access denied vs. query failure) so operators can distinguish between permission gaps and unsupported data sources.
+
 ### Permission Checking
 
-Before creating a table provider, the connector calls the UC Effective Permissions API (`GET /api/2.1/unity-catalog/effective-permissions/table/{full_name}`) to verify the current principal has a read-compatible privilege on the table. The following privileges are treated as granting read access: `SELECT`, `ALL_PRIVILEGES`, `ALL PRIVILEGES`, `OWNER`, and `OWNERSHIP`.
+The UC Effective Permissions API (`GET /api/2.1/unity-catalog/effective-permissions/table/{full_name}`) runs as the third parallel probe during schema discovery. The following privileges are treated as granting read access: `SELECT`, `ALL_PRIVILEGES`, `ALL PRIVILEGES`, `OWNER`, and `OWNERSHIP`.
 
-- **Catalog connector path**: Tables without read permissions are skipped during discovery with a debug-level log.
-- **Data connector path**: Returns an `InsufficientPermissions` error when a fully-qualified table reference is used.
-- **Foreign tables**: `FOREIGN` tables skip the strict UC table-level permission precheck because Lakehouse Federation access can be valid even when the effective-permissions endpoint does not report a table-level read privilege. Access is still enforced by Databricks when the query runs.
-- **Graceful degradation**: If the UC API is unreachable, the connector logs a warning and proceeds without validation. If the table is not found in UC, the connector proceeds without validation with a debug-level log (the table may not be a UC-managed table).
+- **Catalog connector path**: Tables without read permissions are skipped during discovery with a warning-level log. Ambiguous cases (API unreachable, table not found) proceed with a debug-level log.
+- **Data connector path**: Permissions are **advisory** (non-strict) because the table type is unknown at the standalone dataset level. Foreign tables must not be blocked by UC permissions since Lakehouse Federation access can be valid even when the effective-permissions endpoint does not report a table-level read privilege.
+- **Foreign tables**: `FOREIGN` tables always bypass strict UC permission validation. Access is enforced by Databricks at query time.
+- **Graceful degradation**: If the UC API is unreachable, the connector logs a warning and proceeds without validation. If the table is not found in UC, the connector proceeds with a debug-level log. Principals and privileges from the UC response are logged at debug level only — they are not included in user-facing error messages.
+
+### Generic Schema Discovery Trait
+
+The parallel schema discovery logic is implemented in a generic `schema_discovery` module (`DatasetPermissions` trait + `discover_schema` function) that is not Databricks-specific. The same pattern is used by the Snowflake connector (`information_schema.columns` + `SHOW COLUMNS IN <table>`) and can be adopted by other connectors that support multiple schema introspection paths.
 
 ## Task History Instrumentation
 
@@ -206,6 +237,7 @@ The SQL Warehouse connector uses a **virtual connection pool** rather than a tra
 - The shared `reqwest::Client` handles TCP connection pooling internally (idle timeout: 300s, keepalive: 60s, max idle per host: 16).
 - Concurrency is controlled by a `tokio::Semaphore`, not by limiting pool size.
 - Pool creation failure can only occur if the HTTP client builder fails. Connection acquisition (`connect()`) is effectively infallible.
+- Each connection carries an `Arc<dyn DatasetPermissions>` cloned from the pool, so `get_schema` can run the permissions probe alongside the schema probes without requiring the caller to pass permissions explicitly.
 
 ### Token Management
 
