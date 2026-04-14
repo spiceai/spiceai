@@ -236,6 +236,14 @@ mod tests {
         }
     }
 
+    fn failed_probe(message: &str) -> SchemaProbeResult {
+        SchemaProbeResult::Failed(message.to_string().into())
+    }
+
+    fn permanent_probe(message: &str) -> SchemaProbeResult {
+        SchemaProbeResult::Permanent(message.to_string().into())
+    }
+
     // ── Matrix test 1: All OK → prefer metadata schema ──
 
     #[tokio::test]
@@ -312,6 +320,74 @@ mod tests {
         assert!(
             err.to_string().contains("Access denied"),
             "error should mention access denied: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_permanent_overrides_direct_ok() {
+        let result = discover_schema(
+            "catalog.schema.table",
+            async { permanent_probe("metadata permanent failure") },
+            async { SchemaProbeResult::Ok(direct_schema()) },
+            &MockPermissions(PermissionCheckResult::Allowed),
+        )
+        .await;
+
+        let err = result.expect_err("should surface metadata permanent error");
+        assert!(
+            err.to_string().contains("metadata permanent failure"),
+            "error should preserve the permanent metadata failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metadata_permanent_overrides_direct_access_denied() {
+        let result = discover_schema(
+            "catalog.schema.table",
+            async { permanent_probe("metadata permanent failure") },
+            async { SchemaProbeResult::AccessDenied("table denied".into()) },
+            &MockPermissions(PermissionCheckResult::Allowed),
+        )
+        .await;
+
+        let err = result.expect_err("should surface metadata permanent error");
+        assert!(
+            err.to_string().contains("metadata permanent failure"),
+            "error should preserve the permanent metadata failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_direct_permanent_overrides_metadata_ok() {
+        let result = discover_schema(
+            "catalog.schema.table",
+            async { SchemaProbeResult::Ok(metadata_schema()) },
+            async { permanent_probe("direct permanent failure") },
+            &MockPermissions(PermissionCheckResult::Allowed),
+        )
+        .await;
+
+        let err = result.expect_err("should surface direct permanent error");
+        assert!(
+            err.to_string().contains("direct permanent failure"),
+            "error should preserve the direct permanent failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_direct_permanent_overrides_metadata_failed() {
+        let result = discover_schema(
+            "catalog.schema.table",
+            async { failed_probe("info_schema error") },
+            async { permanent_probe("direct permanent failure") },
+            &MockPermissions(PermissionCheckResult::Allowed),
+        )
+        .await;
+
+        let err = result.expect_err("should surface direct permanent error");
+        assert!(
+            err.to_string().contains("direct permanent failure"),
+            "error should preserve the direct permanent failure: {err}"
         );
     }
 
