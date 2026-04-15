@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc};
 use crate::search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc};
@@ -91,8 +91,7 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     }
 }
 
-/// Create a [`FunctionSupport`] with all spice specific functions as unsupported for federation.
-pub fn deny_spice_specific_functions() -> FunctionSupport {
+static DENY_SPICE_SPECIFIC_FUNCTIONS: LazyLock<FunctionSupport> = LazyLock::new(|| {
     let builtin = [
         "rand",
         BUCKET_SCALAR_UDF_NAME,
@@ -115,6 +114,12 @@ pub fn deny_spice_specific_functions() -> FunctionSupport {
         None,
         None,
     )
+});
+
+/// Return the cached [`FunctionSupport`] that denies Spice-specific functions for federation.
+#[must_use]
+pub fn deny_spice_specific_functions() -> &'static FunctionSupport {
+    &DENY_SPICE_SPECIFIC_FUNCTIONS
 }
 
 fn json_functions() -> Vec<String> {
@@ -127,4 +132,74 @@ fn json_functions() -> Vec<String> {
         .filter(|&k| !existing.contains(k))
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::logical_expr::expr::ScalarFunction;
+    use datafusion::prelude::{Expr, lit};
+    use datafusion_functions_json::udfs::{
+        json_as_text_udf, json_contains_udf, json_get_bool_udf, json_get_float_udf,
+        json_get_int_udf, json_get_json_udf, json_get_str_udf, json_get_udf, json_length_udf,
+    };
+
+    use super::*;
+
+    /// Helper to create a scalar function expression for testing function support.
+    fn make_json_expr(udf: Arc<datafusion::logical_expr::ScalarUDF>) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(udf, vec![lit("{}"), lit("key")]))
+    }
+
+    fn spice_udf(
+        impl_: impl Into<datafusion::logical_expr::ScalarUDF>,
+    ) -> Arc<datafusion::logical_expr::ScalarUDF> {
+        Arc::new(impl_.into())
+    }
+
+    #[test]
+    fn deny_list_blocks_json_functions() {
+        let support = deny_spice_specific_functions();
+
+        let json_udfs = vec![
+            json_get_udf(),
+            json_get_str_udf(),
+            json_get_int_udf(),
+            json_get_float_udf(),
+            json_get_bool_udf(),
+            json_get_json_udf(),
+            json_as_text_udf(),
+            json_contains_udf(),
+            json_length_udf(),
+        ];
+
+        for udf in json_udfs {
+            let name = udf.name().to_string();
+            let expr = make_json_expr(udf);
+            assert!(
+                !support.supports(&expr),
+                "{name} should be denied by deny_spice_specific_functions"
+            );
+        }
+    }
+
+    #[test]
+    fn deny_list_blocks_spice_builtins() {
+        let support = deny_spice_specific_functions();
+
+        let spice_udfs: Vec<Arc<datafusion::logical_expr::ScalarUDF>> = vec![
+            spice_udf(CosineDistance::new()),
+            spice_udf(Bucket::new()),
+            spice_udf(Truncate::new()),
+            Arc::new(INSTANCE.clone()),
+        ];
+
+        for udf in spice_udfs {
+            let name = udf.name().to_string();
+            let expr = make_json_expr(udf);
+            assert!(
+                !support.supports(&expr),
+                "{name} should be denied by deny_spice_specific_functions"
+            );
+        }
+    }
 }

@@ -16,8 +16,9 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::{Runtime, metrics, status, timing::TimeMeasurement, worker::try_construct_worker};
+use crate::{Runtime, metrics, status, worker::try_construct_worker};
 use opentelemetry::KeyValue;
+use telemetry::timing::TimeMeasurement;
 
 impl Runtime {
     #[cfg(feature = "models")]
