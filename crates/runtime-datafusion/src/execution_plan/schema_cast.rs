@@ -238,16 +238,18 @@ impl ExecutionPlan for SchemaCastScanExec {
 
     // Allow optimizer to push limits through to inputs
     fn supports_limit_pushdown(&self) -> bool {
-        // TODO: https://github.com/spiceai/spiceai/issues/7892
-        false
+        self.input.supports_limit_pushdown()
     }
 
-    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        None
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let target_schema = Arc::clone(&self.target_schema);
+        self.input.with_fetch(limit).map(|plan| {
+            Arc::new(SchemaCastScanExec::new(plan, target_schema)) as Arc<dyn ExecutionPlan>
+        })
     }
 
     fn fetch(&self) -> Option<usize> {
-        None
+        self.input.fetch()
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -285,9 +287,13 @@ impl ExecutionPlan for SchemaCastScanExec {
 
     fn try_pushdown_sort(
         &self,
-        _order: &[PhysicalSortExpr],
+        order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>, DataFusionError> {
-        Ok(SortOrderPushdownResult::Unsupported)
+        let target_schema = Arc::clone(&self.target_schema);
+        let result = self.input.try_pushdown_sort(order)?;
+        Ok(result.map(|plan| {
+            Arc::new(SchemaCastScanExec::new(plan, target_schema)) as Arc<dyn ExecutionPlan>
+        }))
     }
 }
 

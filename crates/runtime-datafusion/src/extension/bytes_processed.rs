@@ -338,15 +338,23 @@ impl ExecutionPlan for BytesProcessedExec {
 
     // Allow optimizer to push limits through to inputs
     fn supports_limit_pushdown(&self) -> bool {
-        true
+        self.input_exec.supports_limit_pushdown()
     }
 
-    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        None
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let emit_bytes_callback = Arc::clone(&self.emit_bytes_callback);
+        let fallback = self.fallback_to_new_context;
+        self.input_exec.with_fetch(limit).map(|plan| {
+            let mut exec = BytesProcessedExec::new(plan, emit_bytes_callback);
+            if fallback {
+                exec = exec.fallback_to_new_context();
+            }
+            Arc::new(exec) as Arc<dyn ExecutionPlan>
+        })
     }
 
     fn fetch(&self) -> Option<usize> {
-        None
+        self.input_exec.fetch()
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -384,9 +392,18 @@ impl ExecutionPlan for BytesProcessedExec {
 
     fn try_pushdown_sort(
         &self,
-        _order: &[PhysicalSortExpr],
+        order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>, DataFusionError> {
-        Ok(SortOrderPushdownResult::Unsupported)
+        let emit_bytes_callback = Arc::clone(&self.emit_bytes_callback);
+        let fallback = self.fallback_to_new_context;
+        let result = self.input_exec.try_pushdown_sort(order)?;
+        Ok(result.map(|plan| {
+            let mut exec = BytesProcessedExec::new(plan, emit_bytes_callback);
+            if fallback {
+                exec = exec.fallback_to_new_context();
+            }
+            Arc::new(exec) as Arc<dyn ExecutionPlan>
+        }))
     }
 }
 

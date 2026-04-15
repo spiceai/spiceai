@@ -46,10 +46,10 @@ use datafusion::{
     error::{DataFusionError, Result as DataFusionResult},
     execution::TaskContext,
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
-    physical_expr::EquivalenceProperties,
+    physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr, expressions::Column},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
-        SendableRecordBatchStream,
+        SendableRecordBatchStream, SortOrderPushdownResult,
         execution_plan::{Boundedness, EmissionType},
         metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time},
         project_schema,
@@ -427,6 +427,7 @@ pub struct FlightSqlExec {
     client: FlightSqlClient,
     filters: Vec<Expr>,
     limit: Option<usize>,
+    sort_exprs: Vec<PhysicalSortExpr>,
     properties: PlanProperties,
     cookie_store: Arc<CookieStore>,
     metrics: ExecutionPlanMetricsSet,
@@ -449,6 +450,7 @@ impl FlightSqlExec {
             client,
             filters: filters.to_vec(),
             limit,
+            sort_exprs: Vec::new(),
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
@@ -530,8 +532,33 @@ impl FlightSqlExec {
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))
         };
+        let order_expr = if self.sort_exprs.is_empty() {
+            String::new()
+        } else {
+            // All sort expressions are validated as Column references in try_pushdown_sort
+            let sort_terms: Vec<String> = self
+                .sort_exprs
+                .iter()
+                .filter_map(|sort| {
+                    let col = sort.expr.as_any().downcast_ref::<Column>()?;
+                    let dir = if sort.options.descending {
+                        "DESC"
+                    } else {
+                        "ASC"
+                    };
+                    let nulls = if sort.options.nulls_first {
+                        "NULLS FIRST"
+                    } else {
+                        "NULLS LAST"
+                    };
+                    Some(format!("{} {dir} {nulls}", quote_identifier(col.name())))
+                })
+                .collect();
+            format!("ORDER BY {}", sort_terms.join(", "))
+        };
+
         Ok(format!(
-            "SELECT {columns} FROM {table_reference} {where_expr} {limit_expr}",
+            "SELECT {columns} FROM {table_reference} {where_expr} {order_expr} {limit_expr}",
             table_reference = self.table_reference.to_quoted_string(),
         ))
     }
@@ -577,6 +604,45 @@ impl ExecutionPlan for FlightSqlExec {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        for sort_expr in order {
+            if sort_expr.expr.as_any().downcast_ref::<Column>().is_none() {
+                return Ok(SortOrderPushdownResult::Unsupported);
+            }
+        }
+
+        let sort_exprs = order.to_vec();
+        let mut eq_properties =
+            EquivalenceProperties::new(Arc::clone(&self.projected_schema));
+        if let Some(ordering) = LexOrdering::new(sort_exprs.clone()) {
+            eq_properties.add_orderings([ordering]);
+        }
+
+        let new_plan = FlightSqlExec {
+            projected_schema: Arc::clone(&self.projected_schema),
+            table_reference: self.table_reference.clone(),
+            client: self.client.clone(),
+            filters: self.filters.clone(),
+            limit: self.limit,
+            sort_exprs,
+            properties: PlanProperties::new(
+                eq_properties,
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            ),
+            cookie_store: Arc::clone(&self.cookie_store),
+            metrics: ExecutionPlanMetricsSet::new(),
+        };
+
+        Ok(SortOrderPushdownResult::Exact {
+            inner: Arc::new(new_plan),
+        })
     }
 
     fn execute(

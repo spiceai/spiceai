@@ -180,25 +180,7 @@ impl TableProvider for SqlServerTableProvider {
         let mut results = Vec::with_capacity(filters.len());
 
         for filter in filters {
-            match filter {
-                Expr::BinaryExpr(binary_expr) => match binary_expr.op {
-                    Operator::Eq
-                    | Operator::Lt
-                    | Operator::LtEq
-                    | Operator::Gt
-                    | Operator::GtEq => {
-                        if is_time_related_expr(&binary_expr.left)
-                            || is_time_related_expr(&binary_expr.right)
-                        {
-                            results.push(TableProviderFilterPushDown::Unsupported);
-                        } else {
-                            results.push(TableProviderFilterPushDown::Exact);
-                        }
-                    }
-                    _ => results.push(TableProviderFilterPushDown::Unsupported),
-                },
-                _ => results.push(TableProviderFilterPushDown::Unsupported),
-            }
+            results.push(classify_mssql_filter(filter));
         }
         Ok(results)
     }
@@ -236,6 +218,52 @@ pub fn project_schema(
         None => Arc::clone(schema),
     };
     Ok(schema)
+}
+
+fn classify_mssql_filter(filter: &Expr) -> TableProviderFilterPushDown {
+    match filter {
+        Expr::BinaryExpr(binary_expr) => match binary_expr.op {
+            Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq => {
+                if is_time_related_expr(&binary_expr.left)
+                    || is_time_related_expr(&binary_expr.right)
+                {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                }
+            }
+            Operator::And | Operator::Or => TableProviderFilterPushDown::Inexact,
+            _ => TableProviderFilterPushDown::Unsupported,
+        },
+        Expr::Not(_) | Expr::IsNull(_) | Expr::IsNotNull(_) | Expr::Like(_) => {
+            TableProviderFilterPushDown::Inexact
+        }
+        Expr::Between(between) => {
+            if is_time_related_expr(&between.expr)
+                || is_time_related_expr(&between.low)
+                || is_time_related_expr(&between.high)
+            {
+                TableProviderFilterPushDown::Unsupported
+            } else {
+                TableProviderFilterPushDown::Inexact
+            }
+        }
+        Expr::InList(in_list) => {
+            if is_time_related_expr(&in_list.expr)
+                || in_list.list.iter().any(|e| is_time_related_expr(e))
+            {
+                TableProviderFilterPushDown::Unsupported
+            } else {
+                TableProviderFilterPushDown::Inexact
+            }
+        }
+        _ => TableProviderFilterPushDown::Unsupported,
+    }
 }
 
 fn is_time_related_expr(expr: &Expr) -> bool {
