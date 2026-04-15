@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{AuthVerdict, HttpAuth};
+use crate::{AuthRequestContext, AuthVerdict, HttpAuth};
 use axum::{
     body::Body,
     http::StatusCode,
@@ -74,7 +74,19 @@ where
             let (parts, body) = req.into_parts();
 
             match auth_verifier.http_verify(&parts) {
-                Ok(AuthVerdict::Allow(_)) => inner.call(Request::from_parts(parts, body)).await,
+                Ok(AuthVerdict::Allow(principal)) => {
+                    let req = Request::from_parts(parts, body);
+                    if let Some(Err(e)) = req
+                        .extensions()
+                        .get::<Arc<dyn AuthRequestContext + Send + Sync>>()
+                        .map(|ctx| ctx.set_auth_principal(principal))
+                    {
+                        tracing::error!(
+                            "Failed to associate authentication information with the HTTP request: {e}"
+                        );
+                    }
+                    inner.call(req).await
+                }
                 Ok(AuthVerdict::Deny) => Ok(unauthorized_response()),
                 Err(e) => {
                     tracing::error!("{e}");

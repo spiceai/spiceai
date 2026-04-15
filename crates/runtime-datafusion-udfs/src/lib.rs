@@ -22,4 +22,8 @@ pub mod cosine_distance;
 pub mod digest_many;
 #[cfg(feature = "models")]
 pub mod embed;
+pub mod org;
+pub mod role;
+pub mod session_property;
 pub mod truncate;
+pub mod user;

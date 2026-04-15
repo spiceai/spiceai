@@ -29,6 +29,7 @@ use crate::http::v1::{
     Format,
     datasets::{DatasetFilter, DatasetQueryParams},
 };
+use runtime_auth::AuthRequestContext;
 use runtime_request_context::{Protocol, RequestContext};
 
 #[cfg(feature = "mcp")]
@@ -409,6 +410,13 @@ async fn track_metrics(
     let response = Arc::clone(&request_context)
         .scope(async move {
             request_context.load_extensions().await;
+            // Insert AuthRequestContext into request extensions so the auth middleware
+            // can store the authenticated principal (mirrors the Flight pattern).
+            let mut req = req;
+            req.extensions_mut()
+                .insert::<Arc<dyn AuthRequestContext + Send + Sync>>(
+                    Arc::clone(&request_context) as Arc<dyn AuthRequestContext + Send + Sync>
+                );
             next.run(req).await
         })
         .await;

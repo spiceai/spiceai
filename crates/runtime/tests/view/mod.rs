@@ -22,6 +22,8 @@ use runtime::{
     component::view::ViewBuilder,
     dataaccelerator::spice_sys::{OpenOption, dataset_checkpoint::DatasetCheckpoint},
 };
+use runtime_auth::{AuthPrincipal, AuthRequestContext};
+use runtime_request_context::{Protocol, RequestContext};
 use spicepod::acceleration::{Acceleration, Mode, RefreshMode, ZeroResultsAction};
 use spicepod::component::{dataset::Dataset, view::View};
 use std::sync::Arc;
@@ -848,6 +850,144 @@ async fn test_accelerated_view_on_zero_results_use_source() -> Result<(), anyhow
 
             rt.shutdown().await;
 
+            Ok(())
+        })
+        .await
+}
+
+/// A test auth principal that returns a configurable username.
+struct TestPrincipal {
+    name: &'static str,
+}
+
+impl AuthPrincipal for TestPrincipal {
+    fn username(&self) -> &str {
+        self.name
+    }
+    fn groups(&self) -> &[&str] {
+        &[]
+    }
+}
+
+/// Verify that `USER()` inside a view is evaluated per-query (not at view
+/// creation time), so `WHERE owner = USER()` dynamically filters rows based
+/// on the caller's identity -- the foundation for view-based RBAC.
+#[tokio::test]
+async fn test_view_user_udf_rbac_filtering() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let test_csv = "id,owner,data\n1,alice,secret_a\n2,bob,secret_b\n3,alice,another_a\n4,charlie,secret_c";
+            std::fs::write("./test_rbac_view.csv", test_csv).expect("write file");
+
+            let dataset = Dataset::new("file:./test_rbac_view.csv", "documents");
+
+            let mut view = View::new("my_documents".to_string());
+            view.sql = Some("SELECT * FROM documents WHERE owner = current_user_id()".to_string());
+
+            let app = app::AppBuilder::new("test_view_user_udf_rbac")
+                .with_dataset(dataset)
+                .with_view(view)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let cloned_rt = Arc::clone(&rt);
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+
+            // Query as "alice" — should see rows 1 and 3
+            let alice_ctx = Arc::new(RequestContext::builder(Protocol::Http).build());
+            alice_ctx
+                .set_auth_principal(Arc::new(TestPrincipal { name: "alice" }))
+                .expect("set alice principal");
+            let batches = alice_ctx
+                .scope(async {
+                    rt.datafusion()
+                        .query_builder("SELECT id, data FROM my_documents ORDER BY id")
+                        .build()
+                        .run()
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))?
+                        .data
+                        .try_collect::<Vec<RecordBatch>>()
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))
+                })
+                .await?;
+            let alice_result = arrow::util::pretty::pretty_format_batches(&batches)?.to_string();
+            assert!(
+                alice_result.contains("secret_a") && alice_result.contains("another_a"),
+                "alice should see her rows, got: {alice_result}"
+            );
+            assert!(
+                !alice_result.contains("secret_b") && !alice_result.contains("secret_c"),
+                "alice should NOT see bob/charlie rows, got: {alice_result}"
+            );
+
+            // Query as "bob" — should see only row 2
+            let bob_ctx = Arc::new(RequestContext::builder(Protocol::Http).build());
+            bob_ctx
+                .set_auth_principal(Arc::new(TestPrincipal { name: "bob" }))
+                .expect("set bob principal");
+            let batches = bob_ctx
+                .scope(async {
+                    rt.datafusion()
+                        .query_builder("SELECT id, data FROM my_documents ORDER BY id")
+                        .build()
+                        .run()
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))?
+                        .data
+                        .try_collect::<Vec<RecordBatch>>()
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))
+                })
+                .await?;
+            let bob_result = arrow::util::pretty::pretty_format_batches(&batches)?.to_string();
+            assert!(
+                bob_result.contains("secret_b"),
+                "bob should see his row, got: {bob_result}"
+            );
+            assert!(
+                !bob_result.contains("secret_a") && !bob_result.contains("secret_c"),
+                "bob should NOT see alice/charlie rows, got: {bob_result}"
+            );
+
+            // Query as "anonymous" (no principal) — should see no rows
+            let anon_ctx = Arc::new(RequestContext::builder(Protocol::Http).build());
+            let batches = anon_ctx
+                .scope(async {
+                    rt.datafusion()
+                        .query_builder("SELECT id, data FROM my_documents ORDER BY id")
+                        .build()
+                        .run()
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))?
+                        .data
+                        .try_collect::<Vec<RecordBatch>>()
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))
+                })
+                .await?;
+            let anon_result = arrow::util::pretty::pretty_format_batches(&batches)?.to_string();
+            assert!(
+                !anon_result.contains("secret_a")
+                    && !anon_result.contains("secret_b")
+                    && !anon_result.contains("secret_c"),
+                "anonymous should see no rows, got: {anon_result}"
+            );
+
+            rt.shutdown().await;
+            std::fs::remove_file("./test_rbac_view.csv").ok();
             Ok(())
         })
         .await

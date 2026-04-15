@@ -15,8 +15,11 @@ limitations under the License.
 */
 
 pub mod api_key;
+pub mod composite;
 pub mod error;
+pub mod identity;
 pub mod layer;
+pub mod oidc;
 mod traits;
 
 pub use traits::*;
