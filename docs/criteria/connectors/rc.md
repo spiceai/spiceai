@@ -8,31 +8,31 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 
 | Connector                        | RC Quality | DRI Sign-off |
 | -------------------------------- | ---------- | ------------ |
-| Clickhouse                       | ➖         |              |
-| Databricks (mode: delta_lake)    | ✅         | @Sevenannn   |
-| Databricks (mode: spark_connect) | ➖         |              |
-| Delta Lake                       | ✅         | @Sevenannn   |
-| Dremio                           | ✅         | @Sevenannn   |
-| DuckDB                           | ✅         | @peasee      |
-| DynamoDB                         | ✅         | @krinart     |
-| File                             | ✅         | @Sevenannn   |
-| FlightSQL                        | ➖         |              |
-| FTP/SFTP                         | ➖         |              |
-| GraphQL                          | ✅         | @peasee      |
-| GitHub                           | ✅         | @peasee      |
-| HTTP/HTTPS                       | ➖         |              |
-| IMAP                             | ➖         |              |
-| Localpod                         | ➖         |              |
-| MS SQL                           | ➖         |              |
-| MySQL                            | ✅         | @peasee      |
-| ODBC                             | ➖         |              |
-| PostgreSQL                       | ✅         | @Sevenannn   |
-| Sharepoint                       | ➖         |              |
-| Snowflake                        | ➖         |              |
-| Spice.ai Cloud Platform          | ✅         | @peasee      |
-| S3                               | ✅         | @Sevenannn   |
-| Azure BlobFS                     | ➖         |              |
-| Spark                            | ➖         |              |
+| Clickhouse                       | ➖          |              |
+| Databricks (mode: delta_lake)    | ✅          | @Sevenannn   |
+| Databricks (mode: spark_connect) | ➖          |              |
+| Delta Lake                       | ✅          | @Sevenannn   |
+| Dremio                           | ✅          | @Sevenannn   |
+| DuckDB                           | ✅          | @peasee      |
+| DynamoDB                         | ✅          | @krinart     |
+| File                             | ✅          | @Sevenannn   |
+| FlightSQL                        | ➖          |              |
+| FTP/SFTP                         | ➖          |              |
+| GraphQL                          | ✅          | @peasee      |
+| GitHub                           | ✅          | @peasee      |
+| HTTP/HTTPS                       | ➖          |              |
+| IMAP                             | ➖          |              |
+| Localpod                         | ➖          |              |
+| MS SQL                           | ➖          |              |
+| MySQL                            | ✅          | @peasee      |
+| ODBC                             | ➖          |              |
+| PostgreSQL                       | ✅          | @Sevenannn   |
+| Sharepoint                       | ➖          |              |
+| Snowflake                        | ➖          |              |
+| Spice.ai Cloud Platform          | ✅          | @peasee      |
+| S3                               | ✅          | @Sevenannn   |
+| Azure BlobFS                     | ➖          |              |
+| Spark                            | ➖          |              |
 
 ## RC Release Criteria
 
@@ -45,30 +45,30 @@ This table defines the required features and/or tests for each connector:
 
 | Connector                        | [TPC-H (Scale)][tpch] | [TPC-DS (Scale)][tpcds] | [Federation][fed] | [Data Correctness][data] | [Streaming][stream] | [Schema Inference][schema] |
 | -------------------------------- | --------------------- | ----------------------- | ----------------- | ------------------------ | ------------------- | -------------------------- |
-| Clickhouse                       | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
-| Databricks (mode: delta_lake)    | ✅ (1)                | ✅ (1)                  | ☑️                | ✅                       | ✅                  | ✅                         |
-| Databricks (mode: spark_connect) | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
-| Delta Lake                       | ✅ (1)                | ✅ (1)                  | ☑️                | ✅                       | ✅                  | ✅                         |
-| Dremio                           | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
-| DuckDB                           | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
-| File                             | ✅ (1)                | ✅ (1)                  | ➖                | ➖                       | ✅                  | ☑️                         |
-| FTP/SFTP                         | ➖                    | ➖                      | ➖                | ➖                       | ➖                  | ☑️                         |
-| GraphQL                          | ➖                    | ➖                      | ➖                | ➖                       | ➖                  | ☑️                         |
-| GitHub                           | ➖                    | ➖                      | ☑️                | ➖                       | ➖                  | ☑️                         |
-| HTTP/HTTPS                       | ✅ (1)                | ✅ (1)                  | ➖                | ➖                       | ➖                  | ☑️                         |
-| IMAP                             | ➖                    | ➖                      | ☑️                | ✅                       | ✅                  | ☑️                         |
-| Iceberg                          | ✅ (1)                | ✅ (1)                  | ☑️                | ✅                       | ✅                  | ✅                         |
-| MS SQL                           | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
-| MySQL                            | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
-| ODBC                             | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
-| PostgreSQL                       | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
-| Sharepoint                       | ➖                    | ➖                      | ☑️                | ➖                       | ➖                  | ☑️                         |
-| Snowflake                        | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
-| Spice.AI Cloud Platform          | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
-| S3                               | ✅ (1)                | ✅ (1)                  | ☑️                | ➖                       | ✅                  | ☑️                         |
-| Azure BlobFS                     | ✅ (1)                | ✅ (1)                  | ☑️                | ➖                       | ✅                  | ☑️                         |
-| Spark                            | ✅ (1)                | ✅ (1)                  | ✅                | ✅                       | ✅                  | ✅                         |
-| DynamoDB                         | ✅ (1)                | ➖                      | ☑️                | ✅                       | ✅                  | ✅                         |
+| Clickhouse                       | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
+| Databricks (mode: delta_lake)    | ✅ (1)                 | ✅ (1)                   | ☑️                 | ✅                        | ✅                   | ✅                          |
+| Databricks (mode: spark_connect) | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
+| Delta Lake                       | ✅ (1)                 | ✅ (1)                   | ☑️                 | ✅                        | ✅                   | ✅                          |
+| Dremio                           | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
+| DuckDB                           | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
+| File                             | ✅ (1)                 | ✅ (1)                   | ➖                 | ➖                        | ✅                   | ☑️                          |
+| FTP/SFTP                         | ➖                     | ➖                       | ➖                 | ➖                        | ➖                   | ☑️                          |
+| GraphQL                          | ➖                     | ➖                       | ➖                 | ➖                        | ➖                   | ☑️                          |
+| GitHub                           | ➖                     | ➖                       | ☑️                 | ➖                        | ➖                   | ☑️                          |
+| HTTP/HTTPS                       | ✅ (1)                 | ✅ (1)                   | ➖                 | ➖                        | ➖                   | ☑️                          |
+| IMAP                             | ➖                     | ➖                       | ☑️                 | ✅                        | ✅                   | ☑️                          |
+| Iceberg                          | ✅ (1)                 | ✅ (1)                   | ☑️                 | ✅                        | ✅                   | ✅                          |
+| MS SQL                           | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
+| MySQL                            | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
+| ODBC                             | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
+| PostgreSQL                       | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
+| Sharepoint                       | ➖                     | ➖                       | ☑️                 | ➖                        | ➖                   | ☑️                          |
+| Snowflake                        | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
+| Spice.AI Cloud Platform          | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
+| S3                               | ✅ (1)                 | ✅ (1)                   | ☑️                 | ➖                        | ✅                   | ☑️                          |
+| Azure BlobFS                     | ✅ (1)                 | ✅ (1)                   | ☑️                 | ➖                        | ✅                   | ☑️                          |
+| Spark                            | ✅ (1)                 | ✅ (1)                   | ✅                 | ✅                        | ✅                   | ✅                          |
+| DynamoDB                         | ✅ (1)                 | ➖                       | ☑️                 | ✅                        | ✅                   | ✅                          |
 
 [tpch]: #tpc-h
 [tpcds]: #tpc-ds
@@ -86,6 +86,16 @@ The RC release criteria expand on and require that all [Beta release criteria](.
 - [ ] All [Beta release criteria](./beta.md) pass for this connector.
 - [ ] For exceptions where a [Core Connector Data Type](../definitions.md) is not supported, print a warning and ignore the column instead of crashing or failing the query.
 - [ ] All known [Major Bugs](../definitions.md) are resolved.
+
+#### Connection Resilience
+
+Connectors must implement safeguards to prevent thundering herd issues and ensure graceful behavior under load or when the upstream source is degraded:
+
+- [ ] **Concurrency limiting**: The connector limits the number of concurrent in-flight requests to the upstream source (e.g. via a semaphore). The limit must be configurable via a spicepod parameter (e.g. `max_concurrent_requests`).
+- [ ] **Retry limiting**: HTTP or RPC retries for transient failures (e.g. 429, 5xx, timeouts) are bounded with a configurable maximum (e.g. `http_max_retries`). Retries must use backoff (exponential or fibonacci) and respect upstream `Retry-After` headers when present.
+- [ ] **Permanent error detection**: Non-retryable errors (e.g. 401 Unauthorized, 403 Forbidden, 404 Not Found) are detected and the connector enters a permanent error state to prevent further requests from being issued. This must be configurable via a spicepod parameter (e.g. `disable_on_permanent_error`).
+- [ ] **Connection pooling or request budgeting**: For connectors that maintain persistent connections or sessions, the pool size or maximum concurrent sessions must be configurable. For HTTP-based connectors, the request concurrency semaphore fulfills this requirement.
+- [ ] **In-flight request observability**: The connector exposes an in-flight request metric through the runtime metrics endpoint (for example, a component-level gauge such as `inflight_operations`) so concurrent upstream load can be observed.
 
 #### Documentation
 

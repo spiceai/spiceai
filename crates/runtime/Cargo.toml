@@ -98,7 +98,7 @@ object_store_occ = { path = "../object_store_occ" }
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-prometheus.workspace = true
-opentelemetry-proto = { version = "0.31", features = [
+opentelemetry-proto = { version = "0.31", default-features = false, features = [
     "gen-tonic-messages",
     "gen-tonic",
     "metrics",

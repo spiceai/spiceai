@@ -24,6 +24,7 @@ use crate::component::dataset::{ReadyState, TimeFormat};
 use crate::dataaccelerator::{BootstrapStatus, get_primary_keys_from_constraints};
 use crate::datafusion::error::{SpiceExternalError, format_datafusion_error};
 use crate::datafusion::is_spice_internal_dataset;
+use crate::datafusion::udf::deny_spice_specific_functions;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use ::cache::Caching;
@@ -775,16 +776,11 @@ impl Builder {
 
         let (refresh_handle, refresh_trigger) =
             if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
-                // Accelerated tables aren't accelerated on the scheduler. Don't mark
-                // the dataset as Ready yet. Register it as Initializing so it is
-                // tracked by the runtime status system and blocks /v1/ready until
-                // executors report their status back to the scheduler and
-                // evaluate_dataset_readiness promotes the distributed dataset to
-                // Ready.
-                self.runtime_status
-                    .update_dataset(&self.dataset_name, status::ComponentStatus::Initializing);
+                // Accelerated tables aren't accelerated on scheduler. Immediately ready.
                 // Set refresh_trigger to None because the receiver will be dropped
                 // (refresher.start() is not called), making the channel dead.
+                self.runtime_status
+                    .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
                 // Notify immediately so schedule creation doesn't block waiting for
                 // a refresh that will never happen locally on the scheduler.
                 on_complete_notification.notify_waiters();
@@ -1168,7 +1164,18 @@ impl TableProvider for AcceleratedTable {
         }
 
         match self.zero_results_action {
-            ZeroResultsAction::ReturnEmpty => self.accelerator.supports_filters_pushdown(filters),
+            ZeroResultsAction::ReturnEmpty => {
+                let mut results = self.accelerator.supports_filters_pushdown(filters)?;
+                let function_support = deny_spice_specific_functions();
+                for (i, filter) in filters.iter().enumerate() {
+                    if !matches!(results[i], TableProviderFilterPushDown::Unsupported)
+                        && !function_support.supports(filter)
+                    {
+                        results[i] = TableProviderFilterPushDown::Unsupported;
+                    }
+                }
+                Ok(results)
+            }
             ZeroResultsAction::UseSource => {
                 Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
             }

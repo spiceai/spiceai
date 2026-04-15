@@ -75,7 +75,7 @@ jobs:
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         id: setup-matrix
         with:
           script: |
@@ -254,7 +254,7 @@ jobs:
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         run: ./spiced --version
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -287,7 +287,7 @@ jobs:
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc')
         run: ./spiced --version
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc')
         with:
           name: spiced_odbc_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -320,7 +320,7 @@ jobs:
         if: matrix.target.target_os == 'darwin'
         run: ./spiced --version
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: matrix.target.target_os == 'darwin'
         with:
           name: spiced_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -353,13 +353,13 @@ jobs:
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         run: ./spice.exe version
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}

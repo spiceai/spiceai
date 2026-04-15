@@ -25,8 +25,9 @@ use tonic::{
     metadata::{MetadataMap, MetadataValue},
 };
 
-use crate::{datafusion::request_context_extension::get_current_datafusion, timing::TimedStream};
+use crate::datafusion::request_context_extension::get_current_datafusion;
 use runtime_auth::layer::flight as flight_auth;
+use telemetry::timing::TimedStream;
 
 use super::{SessionStore, metrics::track_flight_request};
 

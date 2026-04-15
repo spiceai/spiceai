@@ -21,7 +21,7 @@ use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use chrono::{SecondsFormat, TimeZone, Utc, offset::LocalResult};
-use commits::CommitsTableArgs;
+use commits::{CommitsTableArgs, CommitsTableProvider};
 use data_components::graphql::client::UnnestBehavior;
 use data_components::{
     github::{self, GithubFilesTableProvider, GithubRestClient},
@@ -29,7 +29,7 @@ use data_components::{
         self, FilterPushdownResult, GraphQLContext,
         builder::GraphQLClientBuilder,
         client::{GraphQLClient, GraphQLQuery, PaginationParameters},
-        provider::GraphQLTableProviderBuilder,
+        provider::{GraphQLTableProvider, GraphQLTableProviderBuilder},
     },
     rate_limit::RateLimiter,
 };
@@ -440,6 +440,17 @@ impl Github {
         context: Option<Arc<dyn GraphQLContext>>,
         health_check_query_string: String,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        self.build_gql_table_provider(table_args, context, health_check_query_string)
+            .await
+            .map(|provider| Arc::new(provider) as Arc<dyn TableProvider>)
+    }
+
+    async fn build_gql_table_provider(
+        &self,
+        table_args: Arc<dyn GitHubTableArgs>,
+        context: Option<Arc<dyn GraphQLContext>>,
+        health_check_query_string: String,
+    ) -> super::DataConnectorResult<GraphQLTableProvider> {
         let connector_component_name = format!("{}", table_args.get_component());
         let graphql_values = table_args.get_graphql_values();
         let client = self.create_graphql_client(&table_args).await.context(
@@ -472,7 +483,7 @@ impl Github {
             .build(graphql_values.query.as_ref())
             .await
         {
-            Ok(provider) => return Ok(Arc::new(provider) as Arc<dyn TableProvider>),
+            Ok(provider) => return Ok(provider),
             Err(e) => e,
         };
 
@@ -501,7 +512,6 @@ impl Github {
 
             return fallback_builder
                 .build_without_validation(graphql_values.query.as_ref())
-                .map(|provider| Arc::new(provider) as Arc<dyn TableProvider>)
                 .map_err(|e| DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "github".to_string(),
                     connector_component: table_args.get_component(),
@@ -598,6 +608,48 @@ impl Github {
                 }
             })?,
         ))
+    }
+
+    async fn create_commits_table_provider(
+        &self,
+        owner: &str,
+        repo: &str,
+        requested_ref: Option<&str>,
+        dataset: &Dataset,
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        let table_args = Arc::new(CommitsTableArgs {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            requested_ref: requested_ref.map(ToString::to_string),
+            component: ConnectorComponent::from(dataset),
+        });
+
+        let gql_table_args = Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>;
+        let gql_context = Arc::clone(&table_args) as Arc<dyn GraphQLContext>;
+
+        let delegate_provider = self
+            .build_gql_table_provider(
+                Arc::clone(&gql_table_args),
+                Some(gql_context),
+                Github::get_health_check_for_owner_and_repo(owner, repo),
+            )
+            .await?;
+        let client = delegate_provider.client();
+        let delegate = Arc::new(delegate_provider) as Arc<dyn TableProvider>;
+
+        let rest_client =
+            self.create_rest_client()
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "github".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                })?;
+
+        Ok(Arc::new(CommitsTableProvider::new(
+            delegate,
+            client,
+            rest_client,
+            table_args,
+        )) as Arc<dyn TableProvider>)
     }
 }
 
@@ -1033,17 +1085,11 @@ impl DataConnector for Github {
             }
             ("commits", Some(repo)) => {
                 warn_if_provided(pull_request_specific_params, "commits", &component);
-
-                let table_args = Arc::new(CommitsTableArgs {
-                    owner: parsed.owner.to_string(),
-                    repo: repo.to_string(),
-                    requested_ref: parsed.remaining.clone(),
-                    component,
-                });
-                self.create_gql_table_provider(
-                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
-                    Some(table_args),
-                    Github::get_health_check_for_owner_and_repo(parsed.owner, repo)
+                self.create_commits_table_provider(
+                    parsed.owner,
+                    repo,
+                    parsed.remaining.as_deref(),
+                    dataset,
                 )
                 .await
             }

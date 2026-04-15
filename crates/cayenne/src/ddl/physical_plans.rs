@@ -52,6 +52,7 @@ use crate::provider::CayenneTableProvider;
 use data_components::delete::DeletionTableProviderAdapter;
 use runtime_table_partition::provider::PartitionTableProvider;
 
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn ddl_result_schema() -> SchemaRef {
@@ -631,7 +632,6 @@ async fn execute_merge(
             extract_dml_count(&delete_batches)
         }
     };
-
     // Verify the delete count matches the expected number of rows.
     if delete_count != total_rows as u64 {
         return Err(DataFusionError::Execution(format!(
