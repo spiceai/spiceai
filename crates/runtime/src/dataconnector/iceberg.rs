@@ -23,11 +23,14 @@ use async_trait::async_trait;
 use aws_sdk_credential_bridge::S3CredentialProvider;
 use data_components::iceberg::catalog::hadoop::{HadoopCatalogBuilder, MetadataMode};
 use datafusion::catalog::TableProvider;
-use iceberg::{Catalog, NamespaceIdent, TableIdent, io::StorageFactory};
+use iceberg::{Catalog, TableIdent, io::StorageFactory};
 use iceberg_datafusion::IcebergTableProvider;
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use secrecy::ExposeSecret;
 use util::concat_arrays;
+
+#[cfg(feature = "iceberg-write")]
+use iceberg::NamespaceIdent;
 
 use super::DataConnectorFactory;
 use crate::{
@@ -299,6 +302,7 @@ impl IcebergDataConnector {
             })?;
 
         // Load the specific table
+        #[cfg(feature = "iceberg-write")]
         let table_name_str = table_name.clone();
         let table_identifier = TableIdent::new(namespace.name().clone(), table_name);
 

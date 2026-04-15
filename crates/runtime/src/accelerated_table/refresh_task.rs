@@ -32,7 +32,6 @@ use crate::datafusion::managed_runtime::{self, ManagedRuntimeError};
 use crate::datafusion::refresh_sql;
 use crate::federated_table::FederatedTable;
 use crate::metrics::telemetry::track_bytes_processed;
-use crate::timing::MultiTimeMeasurement;
 use crate::{
     component::dataset::acceleration::RefreshMode,
     dataconnector::get_data,
@@ -85,6 +84,7 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicI64;
 use std::time::{Duration, UNIX_EPOCH};
 use std::{cmp::Ordering, sync::Arc, time::SystemTime};
+use telemetry::timing::MultiTimeMeasurement;
 use tokio::{
     runtime::Handle,
     sync::{Mutex, RwLock, Semaphore, oneshot},

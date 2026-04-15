@@ -25,10 +25,10 @@ use arrow_flight::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::{
-    flight::{Service, metrics, record_batches_to_flight_stream, util::set_flightsql_protocol},
-    timing::TimedStream,
+use crate::flight::{
+    Service, metrics, record_batches_to_flight_stream, util::set_flightsql_protocol,
 };
+use telemetry::timing::TimedStream;
 
 pub(crate) async fn get_flight_info(
     query: &sql::CommandGetPrimaryKeys,

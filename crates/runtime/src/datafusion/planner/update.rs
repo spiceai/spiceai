@@ -28,9 +28,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{Extension, LogicalPlan};
 use datafusion_expr::DmlStatement;
 
-use crate::datafusion::cayenne_ddl::analyzer_rule::{
-    extract_filter_sql, extract_update_assignments,
-};
+use crate::datafusion::cayenne_ddl::dml_planner::{extract_filter_sql, extract_update_assignments};
 use crate::datafusion::cayenne_ddl::logical_nodes::DistributedCayenneUpdateNode;
 
 /// Wrap a `DataFusion` `DmlStatement` (UPDATE) into a distributed Cayenne

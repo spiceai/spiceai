@@ -26,6 +26,7 @@ pub mod hardware;
 pub mod meter;
 pub mod noop;
 pub mod reader;
+pub mod timing;
 
 // As recommended by the OpenTelemetry Semantic Conventions:
 // https://opentelemetry.io/docs/specs/semconv/database/database-metrics/#metric-dbclientresponsereturned_rows

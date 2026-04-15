@@ -60,6 +60,12 @@ const CHECKPOINT_TABLE_NAME: &str = "spice_sys_dataset_checkpoint";
 ))]
 const SCHEMA_MIGRATION_01_STMT: &str =
     "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS schema_json TEXT";
+#[cfg(any(
+    feature = "sqlite",
+    feature = "duckdb",
+    feature = "postgres-accel",
+    feature = "turso"
+))]
 const REFRESH_SQL_MIGRATION_STMT: &str =
     "ALTER TABLE spice_sys_dataset_checkpoint ADD COLUMN IF NOT EXISTS refresh_sql TEXT";
 
@@ -108,6 +114,7 @@ impl DatasetCheckpointer for DatasetCheckpoint {
 pub struct DatasetCheckpoint {
     dataset_name: String,
     acceleration_connection: AccelerationConnection,
+    #[cfg_attr(not(feature = "duckdb"), expect(dead_code))]
     snapshot_behavior: SnapshotBehavior,
 }
 
@@ -272,6 +279,15 @@ impl DatasetCheckpoint {
         }
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "postgres-accel",
+            feature = "turso"
+        )),
+        expect(unused_variables)
+    )]
     pub async fn checkpoint(&self, schema: &SchemaRef, refresh_sql: Option<&str>) -> Result<()> {
         match &self.acceleration_connection {
             #[cfg(feature = "duckdb")]
