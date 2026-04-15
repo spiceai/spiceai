@@ -230,8 +230,7 @@ impl ExecutionPlan for SqlServerExecPlan {
         }
 
         let sort_exprs = order.to_vec();
-        let mut eq_properties =
-            EquivalenceProperties::new(Arc::clone(&self.projected_schema));
+        let mut eq_properties = EquivalenceProperties::new(Arc::clone(&self.projected_schema));
         if let Some(ordering) = LexOrdering::new(sort_exprs.clone()) {
             eq_properties.add_orderings([ordering]);
         }

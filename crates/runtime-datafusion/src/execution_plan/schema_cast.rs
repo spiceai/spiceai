@@ -86,8 +86,12 @@ impl SchemaCastScanExec {
             .with_metadata(schema.metadata().clone()),
         );
 
-        // Create equivalence properties with the actual output schema
-        let eq_properties = EquivalenceProperties::new(Arc::clone(&output_schema));
+        // Create equivalence properties with the actual output schema,
+        // propagating orderings from the input since schema casting preserves row order.
+        let mut eq_properties = EquivalenceProperties::new(Arc::clone(&output_schema));
+        for ordering in input.properties().output_ordering().into_iter() {
+            eq_properties.add_orderings([ordering.clone()]);
+        }
         let emission_type = input.pipeline_behavior();
         let boundedness = input.boundedness();
         let properties = PlanProperties::new(
@@ -163,7 +167,7 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        vec![false; self.children().len()]
+        vec![true; self.children().len()]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {

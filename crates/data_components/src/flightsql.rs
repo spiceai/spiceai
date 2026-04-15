@@ -107,6 +107,9 @@ pub enum Error {
         "Failed to detect table '{table_name}' schema (flightsql). Ensure the table exists and try again."
     ))]
     UnableToRetrieveSchema { table_name: String },
+
+    #[snafu(display("Invalid sort expression in sort pushdown: expected Column, got {expr}"))]
+    InvalidSortExpression { expr: String },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -535,12 +538,15 @@ impl FlightSqlExec {
         let order_expr = if self.sort_exprs.is_empty() {
             String::new()
         } else {
-            // All sort expressions are validated as Column references in try_pushdown_sort
             let sort_terms: Vec<String> = self
                 .sort_exprs
                 .iter()
-                .filter_map(|sort| {
-                    let col = sort.expr.as_any().downcast_ref::<Column>()?;
+                .map(|sort| {
+                    let col = sort.expr.as_any().downcast_ref::<Column>().context(
+                        InvalidSortExpressionSnafu {
+                            expr: format!("{:?}", sort.expr),
+                        },
+                    )?;
                     let dir = if sort.options.descending {
                         "DESC"
                     } else {
@@ -551,9 +557,9 @@ impl FlightSqlExec {
                     } else {
                         "NULLS LAST"
                     };
-                    Some(format!("{} {dir} {nulls}", quote_identifier(col.name())))
+                    Ok(format!("{} {dir} {nulls}", quote_identifier(col.name())))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             format!("ORDER BY {}", sort_terms.join(", "))
         };
 
@@ -617,8 +623,7 @@ impl ExecutionPlan for FlightSqlExec {
         }
 
         let sort_exprs = order.to_vec();
-        let mut eq_properties =
-            EquivalenceProperties::new(Arc::clone(&self.projected_schema));
+        let mut eq_properties = EquivalenceProperties::new(Arc::clone(&self.projected_schema));
         if let Some(ordering) = LexOrdering::new(sort_exprs.clone()) {
             eq_properties.add_orderings([ordering]);
         }
@@ -838,7 +843,10 @@ mod tests {
         FlightInfo, Location, PollInfo, PutResult, SchemaResult, Ticket,
     };
     use bytes::Bytes;
-    use datafusion::{execution::TaskContext, physical_plan::ExecutionPlan, sql::TableReference};
+    use datafusion::{
+        execution::TaskContext, physical_expr::PhysicalSortExpr, physical_plan::ExecutionPlan,
+        sql::TableReference,
+    };
     use flight_client::cookie::{CookieService, CookieStore};
     use futures::{StreamExt, TryStreamExt};
     use std::net::SocketAddr;
@@ -1088,6 +1096,26 @@ mod tests {
         .expect("exec should build")
     }
 
+    fn build_exec_multi_col(
+        client: FlightSqlClient,
+        cookie_store: Arc<CookieStore>,
+    ) -> FlightSqlExec {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        FlightSqlExec::new(
+            None,
+            &schema,
+            &TableReference::bare("test_table"),
+            client,
+            &[],
+            None,
+            cookie_store,
+        )
+        .expect("exec should build")
+    }
+
     #[tokio::test]
     async fn flight_sql_exec_metrics_recorded_for_empty_stream() {
         let cookie_seen = Arc::new(AtomicBool::new(false));
@@ -1149,6 +1177,127 @@ mod tests {
         let metrics = exec.metrics().expect("metrics should exist");
         assert!(has_metric(&metrics, "first_batch_time"));
         assert!(has_metric(&metrics, "fetch_time"));
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn try_pushdown_sort_returns_unsupported_for_non_column_expr() {
+        use datafusion::common::ScalarValue;
+        use datafusion::physical_expr::expressions::Literal;
+        use datafusion::physical_plan::SortOrderPushdownResult;
+
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let server = TestServer::start(Arc::clone(&cookie_seen), DoGetMode::Empty).await;
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{}", server.addr))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+
+        let exec = build_exec(client, Arc::clone(&cookie_store));
+        let sort_expr = PhysicalSortExpr {
+            expr: Arc::new(Literal::new(ScalarValue::Int64(Some(1)))),
+            options: Default::default(),
+        };
+        let result = exec
+            .try_pushdown_sort(&[sort_expr])
+            .expect("try_pushdown_sort should not error");
+        assert!(
+            matches!(result, SortOrderPushdownResult::Unsupported),
+            "expected Unsupported for non-column sort expression"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn try_pushdown_sort_returns_exact_for_column_expr() {
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_plan::SortOrderPushdownResult;
+
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let server = TestServer::start(Arc::clone(&cookie_seen), DoGetMode::Empty).await;
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{}", server.addr))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+
+        let exec = build_exec_multi_col(client, Arc::clone(&cookie_store));
+        let sort_expr = PhysicalSortExpr {
+            expr: Arc::new(Column::new("a", 0)),
+            options: Default::default(),
+        };
+        let result = exec
+            .try_pushdown_sort(&[sort_expr])
+            .expect("try_pushdown_sort should not error");
+        assert!(
+            matches!(result, SortOrderPushdownResult::Exact { .. }),
+            "expected Exact for column sort expression"
+        );
+
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sql_includes_order_by_after_sort_pushdown() {
+        use arrow::compute::SortOptions;
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_plan::SortOrderPushdownResult;
+
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let server = TestServer::start(Arc::clone(&cookie_seen), DoGetMode::Empty).await;
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{}", server.addr))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+
+        let exec = build_exec_multi_col(client, Arc::clone(&cookie_store));
+        let sort_exprs = vec![
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("a", 0)),
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            },
+            PhysicalSortExpr {
+                expr: Arc::new(Column::new("b", 1)),
+                options: SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                },
+            },
+        ];
+        let result = exec
+            .try_pushdown_sort(&sort_exprs)
+            .expect("try_pushdown_sort should not error");
+        let SortOrderPushdownResult::Exact { inner } = result else {
+            panic!("expected Exact result from try_pushdown_sort");
+        };
+        let pushed_exec = inner
+            .as_any()
+            .downcast_ref::<FlightSqlExec>()
+            .expect("inner should be FlightSqlExec");
+        let sql = pushed_exec.sql().expect("sql should succeed");
+        assert!(
+            sql.contains("ORDER BY a ASC NULLS FIRST, b DESC NULLS LAST"),
+            "expected ORDER BY clause in SQL, got: {sql}"
+        );
 
         server.shutdown().await;
     }

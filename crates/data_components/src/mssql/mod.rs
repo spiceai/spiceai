@@ -237,11 +237,33 @@ fn classify_mssql_filter(filter: &Expr) -> TableProviderFilterPushDown {
                     TableProviderFilterPushDown::Inexact
                 }
             }
-            Operator::And | Operator::Or => TableProviderFilterPushDown::Inexact,
+            Operator::And | Operator::Or => {
+                let left = classify_mssql_filter(&binary_expr.left);
+                let right = classify_mssql_filter(&binary_expr.right);
+                if left == TableProviderFilterPushDown::Unsupported
+                    || right == TableProviderFilterPushDown::Unsupported
+                {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                }
+            }
             _ => TableProviderFilterPushDown::Unsupported,
         },
-        Expr::Not(_) | Expr::IsNull(_) | Expr::IsNotNull(_) | Expr::Like(_) => {
-            TableProviderFilterPushDown::Inexact
+        Expr::Not(inner) => classify_mssql_filter(inner),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            if is_time_related_expr(inner) {
+                TableProviderFilterPushDown::Unsupported
+            } else {
+                TableProviderFilterPushDown::Inexact
+            }
+        }
+        Expr::Like(like) => {
+            if is_time_related_expr(&like.expr) {
+                TableProviderFilterPushDown::Unsupported
+            } else {
+                TableProviderFilterPushDown::Inexact
+            }
         }
         Expr::Between(between) => {
             if is_time_related_expr(&between.expr)
