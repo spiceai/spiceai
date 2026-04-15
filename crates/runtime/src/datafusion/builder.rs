@@ -482,7 +482,7 @@ impl DataFusionBuilder {
             )));
         }
 
-        // Purposelly after `PartitionedTableScanRewrite` to allow expansion across partitions/executors.
+        // Add these analyzer rules after `PartitionedTableScanRewrite` to allow expansion across partitions/executors.
         for rule in AnalyzerRulesBuilder::default().build() {
             ctx.add_analyzer_rule(rule);
         }
