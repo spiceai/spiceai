@@ -401,6 +401,115 @@ async fn duckdb_regexp() -> Result<(), String> {
 }
 
 #[tokio::test]
+async fn duckdb_json_functions() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let sample_csv_contents = include_str!("../test_data/json_data.csv");
+            let temp_file = NamedTempFile::new().expect("Should create temp file");
+            std::fs::write(temp_file.path(), sample_csv_contents)
+                .expect("failed to write sample file");
+
+            let app = AppBuilder::new("duckdb_json_test")
+                .with_dataset(make_duckdb_acceleration_dataset(
+                    "json_test",
+                    "csv",
+                    &format!("'{}'", temp_file.path().display()),
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let cases = vec![
+                (
+                    "test_json_get_str",
+                    "SELECT json_get_str(data, 'name') AS name FROM json_test ORDER BY id",
+                ),
+                (
+                    "test_json_get_int",
+                    "SELECT json_get_int(data, 'age') AS age FROM json_test ORDER BY id",
+                ),
+                (
+                    "test_json_get_float",
+                    "SELECT json_get_float(data, 'score') AS score FROM json_test ORDER BY id",
+                ),
+                (
+                    "test_json_get_bool",
+                    "SELECT json_get_bool(data, 'active') AS active FROM json_test ORDER BY id",
+                ),
+                (
+                    "test_json_contains",
+                    "SELECT json_contains(data, 'name') AS has_name FROM json_test ORDER BY id",
+                ),
+                (
+                    "test_json_as_text",
+                    "SELECT json_as_text(data, 'name') AS name_text FROM json_test ORDER BY id",
+                ),
+                (
+                    "test_json_length",
+                    "SELECT json_length(data, 'tags') AS tag_count FROM json_test ORDER BY id",
+                ),
+                (
+                    "test_json_get_str_in_filter",
+                    "SELECT id FROM json_test WHERE json_get_str(data, 'name') = 'alice'",
+                ),
+            ];
+
+            for (name, query) in cases {
+                let result: Vec<RecordBatch> = rt
+                    .datafusion()
+                    .query_builder(query)
+                    .build()
+                    .run()
+                    .await
+                    .expect("query is successful")
+                    .data
+                    .try_collect()
+                    .await
+                    .expect("collects results");
+
+                let pretty = arrow::util::pretty::pretty_format_batches(&result)
+                    .map_err(|e| anyhow::Error::msg(e.to_string()))
+                    .expect("Should format batches");
+                insta::assert_snapshot!(format!("{name}_results"), pretty);
+
+                let explain_plan = rt
+                    .datafusion()
+                    .query_builder(&format!("EXPLAIN {query}"))
+                    .build()
+                    .run()
+                    .await
+                    .map_err(|e| format!("explain plan for `{query}` failed: {e}"))?
+                    .data
+                    .try_collect::<Vec<RecordBatch>>()
+                    .await
+                    .map_err(|e| format!("explain plan for `{query}` execution failed: {e}"))?;
+                let pretty = arrow::util::pretty::pretty_format_batches(&explain_plan)
+                    .map_err(|e| anyhow::Error::msg(e.to_string()))
+                    .expect("Should format batches");
+                insta::assert_snapshot!(format!("{name}_explain"), pretty);
+            }
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
 async fn test_duckdb_settings_persist() -> Result<(), String> {
     use spicepod::param::Params;
     use std::collections::HashMap;

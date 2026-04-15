@@ -17,10 +17,10 @@ use prost::Message;
 use std::fmt::{self, Display, Formatter};
 use tonic::{Request, Response, Status};
 
-use crate::{
-    flight::{Service, async_actions, flightsql::prepared_statement_query, metrics, to_tonic_err},
-    timing::TimedStream,
+use crate::flight::{
+    Service, async_actions, flightsql::prepared_statement_query, metrics, to_tonic_err,
 };
+use telemetry::timing::TimedStream;
 
 use arrow_flight::{
     Action, ActionType as FlightActionType,

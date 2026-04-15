@@ -25,13 +25,11 @@ use arrow_flight::{
 use datafusion::datasource::TableType;
 use tonic::{Request, Response, Status};
 
-use crate::{
-    flight::{
-        Service, flightsql::get_tables, metrics, record_batches_to_flight_stream, to_tonic_err,
-        util::set_flightsql_protocol,
-    },
-    timing::TimedStream,
+use crate::flight::{
+    Service, flightsql::get_tables, metrics, record_batches_to_flight_stream, to_tonic_err,
+    util::set_flightsql_protocol,
 };
+use telemetry::timing::TimedStream;
 
 pub(crate) async fn get_flight_info(
     query: sql::CommandGetTableTypes,

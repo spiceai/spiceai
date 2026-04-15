@@ -150,12 +150,12 @@ jobs:
           ./spiced --version
           ./spice version
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiced_linux_x86_64
           path: spiced_linux_x86_64.tar.gz
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spice_linux_x86_64
           path: spice_linux_x86_64.tar.gz
@@ -224,12 +224,12 @@ jobs:
           ./spiced --version
           ./spice version
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiced_linux_aarch64
           path: spiced_linux_aarch64.tar.gz
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spice_linux_aarch64
           path: spice_linux_aarch64.tar.gz
@@ -297,12 +297,12 @@ jobs:
           ./spiced --version
           ./spice version
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiced_darwin_aarch64
           path: spiced_darwin_aarch64.tar.gz
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spice_darwin_aarch64
           path: spice_darwin_aarch64.tar.gz
@@ -359,7 +359,7 @@ jobs:
             image=moby/buildkit:latest
 
       - name: Build ARM64 Docker image
-        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: .
           file: Dockerfile.local
@@ -369,7 +369,7 @@ jobs:
           cache-to: type=gha,scope=build-docker-arm64,mode=max
 
       - name: Upload ARM64 Docker image
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: images-arm64
           path: /tmp/image-arm64-default.tar
@@ -404,7 +404,7 @@ jobs:
             image=moby/buildkit:latest
 
       - name: Build AMD64 Docker image
-        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: .
           file: Dockerfile.local
@@ -414,7 +414,7 @@ jobs:
           cache-to: type=gha,scope=build-docker-amd64,mode=max
 
       - name: Upload AMD64 Docker image
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: images-amd64
           path: /tmp/image-amd64-default.tar
