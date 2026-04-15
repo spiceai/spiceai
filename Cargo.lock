@@ -3498,7 +3498,7 @@ dependencies = [
  "datafusion-ddl",
  "datafusion-execution",
  "datafusion-expr",
- "datafusion-federation",
+ "datafusion-federation 0.4.2 (git+https://github.com/spiceai/datafusion-federation.git?rev=3de8e208c25970566105f431ca162fa394040d57)",
  "datafusion-functions",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
@@ -4067,7 +4067,7 @@ dependencies = [
  "async-trait",
  "data_components",
  "datafusion",
- "datafusion-federation",
+ "datafusion-federation 0.4.2 (git+https://github.com/spiceai/datafusion-federation.git?rev=3de8e208c25970566105f431ca162fa394040d57)",
  "flight_client",
  "linkme",
  "ns_lookup",
@@ -5267,7 +5267,7 @@ dependencies = [
  "dataformat-json",
  "datafusion",
  "datafusion-datasource",
- "datafusion-federation",
+ "datafusion-federation 0.4.2 (git+https://github.com/spiceai/datafusion-federation.git?rev=3de8e208c25970566105f431ca162fa394040d57)",
  "datafusion-table-providers",
  "db_connection_pool",
  "delta_kernel",
@@ -5691,6 +5691,19 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.4.2"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=3de8e208c25970566105f431ca162fa394040d57#3de8e208c25970566105f431ca162fa394040d57"
+dependencies = [
+ "arrow-json",
+ "async-stream",
+ "async-trait",
+ "datafusion",
+ "futures",
+ "tracing",
+]
+
+[[package]]
+name = "datafusion-federation"
+version = "0.4.2"
 source = "git+https://github.com/spiceai/datafusion-federation.git?rev=bda2122883a184ab8e23b2af2728fefc6631f21a#bda2122883a184ab8e23b2af2728fefc6631f21a"
 dependencies = [
  "arrow-json",
@@ -5881,7 +5894,7 @@ dependencies = [
  "datafusion",
  "datafusion-datasource",
  "datafusion-expr",
- "datafusion-federation",
+ "datafusion-federation 0.4.2 (git+https://github.com/spiceai/datafusion-federation.git?rev=3de8e208c25970566105f431ca162fa394040d57)",
  "datafusion-table-providers",
  "duckdb",
  "flight_client",
@@ -6146,7 +6159,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "datafusion",
- "datafusion-federation",
+ "datafusion-federation 0.4.2 (git+https://github.com/spiceai/datafusion-federation.git?rev=bda2122883a184ab8e23b2af2728fefc6631f21a)",
  "datafusion-physical-expr",
  "duckdb",
  "dyn-clone",
@@ -15978,7 +15991,7 @@ dependencies = [
  "datafusion-datasource",
  "datafusion-ddl",
  "datafusion-expr",
- "datafusion-federation",
+ "datafusion-federation 0.4.2 (git+https://github.com/spiceai/datafusion-federation.git?rev=3de8e208c25970566105f431ca162fa394040d57)",
  "datafusion-functions-json",
  "datafusion-optimizer-rules",
  "datafusion-proto",
@@ -16203,7 +16216,7 @@ dependencies = [
  "datafusion",
  "datafusion-catalog",
  "datafusion-datasource",
- "datafusion-federation",
+ "datafusion-federation 0.4.2 (git+https://github.com/spiceai/datafusion-federation.git?rev=3de8e208c25970566105f431ca162fa394040d57)",
  "datafusion-optimizer-rules",
  "futures",
  "globset",
