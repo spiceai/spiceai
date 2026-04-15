@@ -5630,6 +5630,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-dml"
+version = "2.0.0-unstable"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "datafusion",
+]
+
+[[package]]
 name = "datafusion-doc"
 version = "52.5.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=c434c7b5a4e1ddb3137f1cea8da1006c514ae889#c434c7b5a4e1ddb3137f1cea8da1006c514ae889"
