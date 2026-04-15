@@ -21,7 +21,9 @@ use crate::{component::dataset::Dataset, dataaccelerator::spice_sys::OpenOption}
 mod duckdb;
 
 pub struct CachingEngineSys {
+    #[cfg_attr(not(feature = "duckdb"), expect(dead_code))]
     dataset_name: String,
+    #[cfg_attr(not(feature = "duckdb"), expect(dead_code))]
     acceleration_connection: AccelerationConnection,
 }
 

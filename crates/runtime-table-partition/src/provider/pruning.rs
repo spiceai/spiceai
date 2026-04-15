@@ -82,6 +82,41 @@ fn collect_conditions(
     }
 }
 
+/// Collects literal values from OR/AND chains where each condition compares
+/// a partition expression to a literal.  For example, given `bucket(3, user_id) = 0
+/// OR bucket(3, user_id) = 1`, returns `Some(vec![0, 1])` when
+/// `partition_by` is `bucket(3, user_id)`.
+fn collect_partition_expr_conditions(
+    expr: &Expr,
+    combining_op: Operator,
+    condition_op: Operator,
+    partition_by: &Expr,
+) -> Option<Vec<ScalarValue>> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == combining_op => {
+            let left_result =
+                collect_partition_expr_conditions(left, combining_op, condition_op, partition_by);
+            let right_result =
+                collect_partition_expr_conditions(right, combining_op, condition_op, partition_by);
+            match (left_result, right_result) {
+                (Some(mut left_lits), Some(right_lits)) => {
+                    left_lits.extend(right_lits);
+                    Some(left_lits)
+                }
+                _ => None,
+            }
+        }
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == condition_op => {
+            match (left.as_ref(), right.as_ref()) {
+                (expr, Expr::Literal(lit, _)) if expr == partition_by => Some(vec![lit.clone()]),
+                (Expr::Literal(lit, _), expr) if expr == partition_by => Some(vec![lit.clone()]),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Transforms `partition_by` expression by replacing column with `filter_value` and evaluates it.
 fn transform_and_evaluate(
     partition_by: &Expr,
@@ -324,6 +359,18 @@ pub(crate) fn prune_partition(
                                     return Ok(true);
                                 }
                             }
+                        } else if let Some(literals) =
+                            // OR-chain of partition expression = literal:
+                            // e.g. bucket(50, org_id) = '5' OR bucket(50, org_id) = '13'
+                            collect_partition_expr_conditions(
+                                filter,
+                                Operator::Or,
+                                Operator::Eq,
+                                partition_by,
+                            )
+                            && !literals.iter().any(|lit| partition_value == lit)
+                        {
+                            return Ok(true);
                         }
                     }
                 }
