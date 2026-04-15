@@ -462,6 +462,8 @@ jobs:
       - name: Upload benchmark snapshots to branch
         if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
         run: |
+          git fetch --unshallow || true
+
           # if the spiced commit is set, use that as the branch ID
           if [ -n "${{ github.event.inputs.spiced_commit || '' }}" ]; then
             BRANCH_ID=${{ github.event.inputs.spiced_commit }}
