@@ -713,8 +713,8 @@ async fn provision_spice_cloud_app(
     eprintln!("[stdio] RUNNER secret set");
 
     // Apply custom image configuration if any image-related overrides are provided.
-    // This sets the app's registry/image/image_tag/update_channel before creating the deployment,
-    // so the deployment picks up the custom image instead of the default.
+    // This updates the app's image_tag/update_channel before creating the deployment,
+    // so the deployment picks up the requested image version instead of the default.
     let has_custom_image = args.image_tag.is_some() || args.channel.is_some();
 
     if has_custom_image {
