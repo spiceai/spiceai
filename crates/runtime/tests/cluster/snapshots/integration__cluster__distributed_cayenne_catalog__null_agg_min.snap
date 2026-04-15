@@ -3,16 +3,17 @@ source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
 expression: __plan
 snapshot_kind: text
 ---
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                             |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Federated                                                                                                                                        |
-|               |  Projection: min(ncat.ns.metrics.value)                                                                                                          |
-|               |   Aggregate: groupBy=[[]], aggr=[[min(ncat.ns.metrics.value)]]                                                                                   |
-|               |     TableScan: ncat.ns.metrics projection=[value]                                                                                                |
-| physical_plan | SchemaCastScanExec                                                                                                                               |
-|               |   CooperativeExec                                                                                                                                |
-|               |     BytesProcessedExec                                                                                                                           |
-|               |       VirtualExecutionPlan name=flightsql compute_context=endpoint=[endpoint] base_sql=SELECT min("metrics"."value") FROM ncat.ns."metrics" |
-|               |                                                                                                                                                  |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                          |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                                     |
+|               |  Projection: min(ncat.ns.metrics.value)                                                                                                                       |
+|               |   Aggregate: groupBy=[[]], aggr=[[min(ncat.ns.metrics.value)]]                                                                                                |
+|               |     SubqueryAlias: ncat.ns.metrics                                                                                                                            |
+|               |       TableScan: ncat.ns.metrics projection=[value]                                                                                                           |
+| physical_plan | SchemaCastScanExec                                                                                                                                            |
+|               |   CooperativeExec                                                                                                                                             |
+|               |     BytesProcessedExec                                                                                                                                        |
+|               |       VirtualExecutionPlan name=flightsql compute_context=endpoint=[endpoint] base_sql=SELECT min("metrics"."value") FROM ncat.ns."metrics" AS "metrics" |
+|               |                                                                                                                                                               |
++---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------+

@@ -3,14 +3,18 @@ source: crates/runtime/tests/cluster/distributed_acceleration.rs
 expression: plan_fmt
 snapshot_kind: text
 ---
-+---------------+----------------------------------------------------------------------------+
-| plan_type     | plan                                                                       |
-+---------------+----------------------------------------------------------------------------+
-| logical_plan  | Sort: test_data.id ASC NULLS LAST                                          |
-|               |   TableScan: test_data projection=[id, name, age, city, score]             |
-| physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]        |
-|               |   CooperativeExec                                                          |
-|               |     BytesProcessedExec                                                     |
-|               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data   |
-|               |                                                                            |
-+---------------+----------------------------------------------------------------------------+
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                                                                 |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                                                                                                                            |
+|               |  Sort: test_data.id ASC NULLS LAST                                                                                                                                                                                                                   |
+|               |   Projection: test_data.id, test_data.name, test_data.age, test_data.city, test_data.score                                                                                                                                                           |
+|               |     SubqueryAlias: test_data                                                                                                                                                                                                                         |
+|               |       TableScan: test_data projection=[id, name, age, city, score]                                                                                                                                                                                   |
+| physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                                                                                  |
+|               |   SchemaCastScanExec                                                                                                                                                                                                                                 |
+|               |     CooperativeExec                                                                                                                                                                                                                                  |
+|               |       BytesProcessedExec                                                                                                                                                                                                                             |
+|               |         VirtualExecutionPlan name=flightsql compute_context=endpoint=[endpoint] base_sql=SELECT test_data.id, test_data."name", test_data.age, test_data.city, test_data.score FROM test_data AS test_data ORDER BY test_data.id ASC NULLS LAST |
+|               |                                                                                                                                                                                                                                                      |
++---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
