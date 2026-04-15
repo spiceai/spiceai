@@ -18,8 +18,8 @@ limitations under the License.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
 use super::metadata::{
-    ColumnStats, CreateTableOptions, DeleteFile, FileColumnStats, InlinedData, InlinedDelete,
-    PartitionMetadata, TableMetadata,
+    CreateTableOptions, DeleteFile, InlinedData, InlinedDelete, PartitionMetadata, TableMetadata,
+    TableStatistics,
 };
 use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
@@ -1264,225 +1264,49 @@ impl MetadataCatalog for CayenneCatalog {
             })
     }
 
-    async fn upsert_column_stats(&self, stats: &[ColumnStats]) -> CatalogResult<()> {
-        const COLUMN_STATS_PARAMS_PER_ROW: usize = 6;
-        const BATCH_SIZE: usize = 999 / COLUMN_STATS_PARAMS_PER_ROW; // 166
-
-        for chunk in stats.chunks(BATCH_SIZE) {
-            let placeholders: Vec<String> = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, _)| {
-                    let base = i * COLUMN_STATS_PARAMS_PER_ROW;
-                    format!(
-                        "(?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
-                        base + 1,
-                        base + 2,
-                        base + 3,
-                        base + 4,
-                        base + 5,
-                        base + 6,
-                    )
-                })
-                .collect();
-
-            let sql = format!(
-                "INSERT OR REPLACE INTO cayenne_column_stats \
-                 (table_id, column_name, min_value, max_value, null_count, row_count) \
-                 VALUES {}",
-                placeholders.join(", ")
-            );
-
-            let mut params = Vec::with_capacity(chunk.len() * COLUMN_STATS_PARAMS_PER_ROW);
-            for stat in chunk {
-                params.push(MetastoreValue::Text(stat.table_id.clone()));
-                params.push(MetastoreValue::Text(stat.column_name.clone()));
-                params.push(stat.min_value.clone().into());
-                params.push(stat.max_value.clone().into());
-                params.push(stat.null_count.into());
-                params.push(stat.row_count.into());
-            }
-
-            self.metastore
-                .execute_helper(ExecuteParams { sql: &sql, params })
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn get_column_stats(&self, table_id: &str) -> CatalogResult<Vec<ColumnStats>> {
-        self.metastore
-            .query_helper(
-                QueryParams {
-                    sql: r"
-                    SELECT table_id, column_name, min_value, max_value, null_count, row_count
-                    FROM cayenne_column_stats
-                    WHERE table_id = ?1
-                    ORDER BY column_name
-                    ",
-                    params: vec![MetastoreValue::Text(table_id.to_string())],
-                },
-                |row| {
-                    Ok(ColumnStats {
-                        table_id: row.get_string(0)?,
-                        column_name: row.get_string(1)?,
-                        min_value: row.get_optional_string(2)?,
-                        max_value: row.get_optional_string(3)?,
-                        null_count: row.get_optional_i64(4)?,
-                        row_count: row.get_optional_i64(5)?,
-                    })
-                },
-            )
-            .await
-    }
-
-    async fn clear_column_stats(&self, table_id: &str) -> CatalogResult<()> {
+    async fn upsert_table_statistics(&self, stats: &TableStatistics) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_column_stats WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.to_string())],
+                sql: "INSERT OR REPLACE INTO cayenne_table_statistics \
+                      (table_id, statistics_blob, num_rows) \
+                      VALUES (?1, ?2, ?3)",
+                params: vec![
+                    MetastoreValue::Text(stats.table_id.clone()),
+                    MetastoreValue::Blob(stats.statistics_blob.clone()),
+                    MetastoreValue::Integer(stats.num_rows),
+                ],
             })
             .await
     }
 
-    async fn upsert_file_column_stats(&self, stats: &[FileColumnStats]) -> CatalogResult<()> {
-        const PARAMS_PER_ROW: usize = 7;
-        const BATCH_SIZE: usize = 999 / PARAMS_PER_ROW; // 142
-
-        for chunk in stats.chunks(BATCH_SIZE) {
-            let placeholders: Vec<String> = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, _)| {
-                    let base = i * PARAMS_PER_ROW;
-                    format!(
-                        "(?{}, ?{}, ?{}, ?{}, ?{}, ?{}, ?{})",
-                        base + 1,
-                        base + 2,
-                        base + 3,
-                        base + 4,
-                        base + 5,
-                        base + 6,
-                        base + 7,
-                    )
-                })
-                .collect();
-
-            let sql = format!(
-                "INSERT OR REPLACE INTO cayenne_file_column_stats \
-                 (table_id, file_path, column_name, min_value, max_value, null_count, row_count) \
-                 VALUES {}",
-                placeholders.join(", ")
-            );
-
-            let mut params = Vec::with_capacity(chunk.len() * PARAMS_PER_ROW);
-            for stat in chunk {
-                params.push(MetastoreValue::Text(stat.table_id.clone()));
-                params.push(MetastoreValue::Text(stat.file_path.clone()));
-                params.push(MetastoreValue::Text(stat.column_name.clone()));
-                params.push(stat.min_value.clone().into());
-                params.push(stat.max_value.clone().into());
-                params.push(stat.null_count.into());
-                params.push(stat.row_count.into());
-            }
-
-            self.metastore
-                .execute_helper(ExecuteParams { sql: &sql, params })
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn get_file_column_stats(&self, table_id: &str) -> CatalogResult<Vec<FileColumnStats>> {
-        self.metastore
+    async fn get_table_statistics(&self, table_id: &str) -> CatalogResult<Option<TableStatistics>> {
+        let results = self
+            .metastore
             .query_helper(
                 QueryParams {
                     sql: r"
-                    SELECT table_id, file_path, column_name, min_value, max_value, null_count, row_count
-                    FROM cayenne_file_column_stats
+                    SELECT table_id, statistics_blob, num_rows
+                    FROM cayenne_table_statistics
                     WHERE table_id = ?1
-                    ORDER BY file_path, column_name
                     ",
                     params: vec![MetastoreValue::Text(table_id.to_string())],
                 },
                 |row| {
-                    Ok(FileColumnStats {
+                    Ok(TableStatistics {
                         table_id: row.get_string(0)?,
-                        file_path: row.get_string(1)?,
-                        column_name: row.get_string(2)?,
-                        min_value: row.get_optional_string(3)?,
-                        max_value: row.get_optional_string(4)?,
-                        null_count: row.get_optional_i64(5)?,
-                        row_count: row.get_optional_i64(6)?,
+                        statistics_blob: row.get_blob(1)?,
+                        num_rows: row.get_i64(2)?,
                     })
                 },
             )
-            .await
+            .await?;
+        Ok(results.into_iter().next())
     }
 
-    async fn get_file_column_stats_for_file(
-        &self,
-        table_id: &str,
-        file_path: &str,
-    ) -> CatalogResult<Vec<FileColumnStats>> {
-        self.metastore
-            .query_helper(
-                QueryParams {
-                    sql: r"
-                    SELECT table_id, file_path, column_name, min_value, max_value, null_count, row_count
-                    FROM cayenne_file_column_stats
-                    WHERE table_id = ?1 AND file_path = ?2
-                    ORDER BY column_name
-                    ",
-                    params: vec![
-                        MetastoreValue::Text(table_id.to_string()),
-                        MetastoreValue::Text(file_path.to_string()),
-                    ],
-                },
-                |row| {
-                    Ok(FileColumnStats {
-                        table_id: row.get_string(0)?,
-                        file_path: row.get_string(1)?,
-                        column_name: row.get_string(2)?,
-                        min_value: row.get_optional_string(3)?,
-                        max_value: row.get_optional_string(4)?,
-                        null_count: row.get_optional_i64(5)?,
-                        row_count: row.get_optional_i64(6)?,
-                    })
-                },
-            )
-            .await
-    }
-
-    async fn remove_file_column_stats(
-        &self,
-        table_id: &str,
-        file_paths: &[String],
-    ) -> CatalogResult<()> {
-        if file_paths.is_empty() {
-            return Ok(());
-        }
-        // Build placeholders for IN clause: ?2, ?3, ?4, ...
-        let placeholders: Vec<String> = (2..=file_paths.len() + 1)
-            .map(|i| format!("?{i}"))
-            .collect();
-        let sql = format!(
-            "DELETE FROM cayenne_file_column_stats WHERE table_id = ?1 AND file_path IN ({})",
-            placeholders.join(", ")
-        );
-        let mut params = vec![MetastoreValue::Text(table_id.to_string())];
-        for path in file_paths {
-            params.push(MetastoreValue::Text(path.clone()));
-        }
-        self.metastore
-            .execute_helper(ExecuteParams { sql: &sql, params })
-            .await
-    }
-
-    async fn clear_file_column_stats(&self, table_id: &str) -> CatalogResult<()> {
+    async fn clear_table_statistics(&self, table_id: &str) -> CatalogResult<()> {
         self.metastore
             .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_file_column_stats WHERE table_id = ?1",
+                sql: "DELETE FROM cayenne_table_statistics WHERE table_id = ?1",
                 params: vec![MetastoreValue::Text(table_id.to_string())],
             })
             .await
@@ -1723,31 +1547,19 @@ impl MetadataCatalog for CayenneCatalog {
                 source: Box::new(e),
             })?;
 
-        // 5. Delete column stats
+        // 5. Delete table statistics
         self.metastore
             .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_column_stats WHERE table_id = ?1",
+                sql: "DELETE FROM cayenne_table_statistics WHERE table_id = ?1",
                 params: vec![MetastoreValue::Text(table_id.clone())],
             })
             .await
             .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete column stats.".to_string(),
+                message: "Failed to delete table statistics.".to_string(),
                 source: Box::new(e),
             })?;
 
-        // 6. Delete file column stats
-        self.metastore
-            .execute_helper(ExecuteParams {
-                sql: "DELETE FROM cayenne_file_column_stats WHERE table_id = ?1",
-                params: vec![MetastoreValue::Text(table_id.clone())],
-            })
-            .await
-            .map_err(|e| CatalogError::InvalidOperation {
-                message: "Failed to delete file column stats.".to_string(),
-                source: Box::new(e),
-            })?;
-
-        // 7. Delete inlined data
+        // 6. Delete inlined data
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "DELETE FROM cayenne_inlined_data WHERE table_id = ?1",

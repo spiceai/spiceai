@@ -256,39 +256,18 @@ impl SqliteMetastore {
         )
     ";
 
-    /// Schema for the `cayenne_column_stats` table.
+    /// Schema for the `cayenne_table_statistics` table.
     ///
-    /// Stores table-level aggregate statistics per column: min, max, null count,
-    /// and total row count. Used by the query optimizer for join ordering,
-    /// aggregation strategies, and partition pruning.
-    const COLUMN_STATS_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS cayenne_column_stats (
-            table_id TEXT NOT NULL,
-            column_name TEXT NOT NULL,
-            min_value TEXT,
-            max_value TEXT,
-            null_count BIGINT,
-            row_count BIGINT,
-            PRIMARY KEY (table_id, column_name),
-            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
-        )
-    ";
-
-    /// Schema for the `cayenne_file_column_stats` table.
-    ///
-    /// Stores per-file, per-column statistics (min, max, null count, row count).
-    /// Used for file-level scan pruning: files whose min/max ranges don't overlap
-    /// with filter predicates can be skipped entirely.
-    const FILE_COLUMN_STATS_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS cayenne_file_column_stats (
-            table_id TEXT NOT NULL,
-            file_path TEXT NOT NULL,
-            column_name TEXT NOT NULL,
-            min_value TEXT,
-            max_value TEXT,
-            null_count BIGINT,
-            row_count BIGINT,
-            PRIMARY KEY (table_id, file_path, column_name),
+    /// Stores table-level aggregate statistics as a serialized Vortex `FileStatistics`
+    /// flatbuffer blob. One row per table containing per-column stats (min, max,
+    /// null count, sum, etc.) aggregated across all files. Used by the query optimizer
+    /// for join ordering, aggregation strategies, partition pruning, and distributed
+    /// query planning without needing to access the underlying Vortex files.
+    const TABLE_STATISTICS_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_table_statistics (
+            table_id TEXT NOT NULL PRIMARY KEY,
+            statistics_blob BLOB NOT NULL,
+            num_rows BIGINT NOT NULL DEFAULT 0,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
@@ -436,15 +415,14 @@ impl MetastoreBackend for SqliteMetastore {
             .call(|conn| {
                 // Create tables in a transaction
                 conn.execute_batch(&format!(
-                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
+                    "{}; {}; {}; {}; {}; {}; {}; {}; {};",
                     Self::TABLE_TABLE_DDL,
                     Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                     Self::DELETE_FILE_TABLE_DDL,
                     Self::PARTITION_TABLE_DDL,
                     Self::INSERT_RECORD_TABLE_DDL,
                     Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
-                    Self::COLUMN_STATS_TABLE_DDL,
-                    Self::FILE_COLUMN_STATS_TABLE_DDL,
+                    Self::TABLE_STATISTICS_DDL,
                     Self::INLINED_DATA_TABLE_DDL,
                     Self::INLINED_DELETE_TABLE_DDL
                 ))?;

@@ -226,31 +226,12 @@ impl TursoMetastore {
         )
     ";
 
-    /// Schema for the `cayenne_column_stats` table.
-    const COLUMN_STATS_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS cayenne_column_stats (
-            table_id TEXT NOT NULL,
-            column_name TEXT NOT NULL,
-            min_value TEXT,
-            max_value TEXT,
-            null_count BIGINT,
-            row_count BIGINT,
-            PRIMARY KEY (table_id, column_name),
-            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
-        )
-    ";
-
-    /// Schema for the `cayenne_file_column_stats` table.
-    const FILE_COLUMN_STATS_TABLE_DDL: &'static str = r"
-        CREATE TABLE IF NOT EXISTS cayenne_file_column_stats (
-            table_id TEXT NOT NULL,
-            file_path TEXT NOT NULL,
-            column_name TEXT NOT NULL,
-            min_value TEXT,
-            max_value TEXT,
-            null_count BIGINT,
-            row_count BIGINT,
-            PRIMARY KEY (table_id, file_path, column_name),
+    /// Schema for the `cayenne_table_statistics` table.
+    const TABLE_STATISTICS_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_table_statistics (
+            table_id TEXT NOT NULL PRIMARY KEY,
+            statistics_blob BLOB NOT NULL,
+            num_rows BIGINT NOT NULL DEFAULT 0,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         )
     ";
@@ -400,15 +381,14 @@ impl MetastoreBackend for TursoMetastore {
 
         // Create tables
         let schema_sql = format!(
-            "{}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
+            "{}; {}; {}; {}; {}; {}; {}; {}; {};",
             Self::TABLE_TABLE_DDL,
             Self::TABLE_NAME_UNIQUE_INDEX_DDL,
             Self::DELETE_FILE_TABLE_DDL,
             Self::PARTITION_TABLE_DDL,
             Self::INSERT_RECORD_TABLE_DDL,
             Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
-            Self::COLUMN_STATS_TABLE_DDL,
-            Self::FILE_COLUMN_STATS_TABLE_DDL,
+            Self::TABLE_STATISTICS_DDL,
             Self::INLINED_DATA_TABLE_DDL,
             Self::INLINED_DELETE_TABLE_DDL
         );

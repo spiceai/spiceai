@@ -21,8 +21,8 @@ limitations under the License.
 //! (`SQLite`, `PostgreSQL`, etc.).
 
 use super::metadata::{
-    ColumnStats, CreateTableOptions, DeleteFile, FileColumnStats, InlinedData, InlinedDelete,
-    PartitionMetadata, TableMetadata,
+    CreateTableOptions, DeleteFile, InlinedData, InlinedDelete, PartitionMetadata, TableMetadata,
+    TableStatistics,
 };
 use async_trait::async_trait;
 use snafu::Snafu;
@@ -348,44 +348,17 @@ pub trait MetadataCatalog: Send + Sync {
     /// Get all partitions for a table.
     async fn get_partitions(&self, table_id: &str) -> CatalogResult<Vec<PartitionMetadata>>;
 
-    /// Upsert table-level column statistics.
+    /// Upsert table-level aggregate statistics.
     ///
-    /// Replaces existing stats for the given table and columns.
-    /// Uses INSERT OR REPLACE to atomically update.
-    async fn upsert_column_stats(&self, stats: &[ColumnStats]) -> CatalogResult<()>;
+    /// Replaces existing stats for the given table. The statistics blob contains
+    /// a serialized Vortex `FileStatistics` flatbuffer with per-column stats.
+    async fn upsert_table_statistics(&self, stats: &TableStatistics) -> CatalogResult<()>;
 
-    /// Get all table-level column statistics for a table.
-    async fn get_column_stats(&self, table_id: &str) -> CatalogResult<Vec<ColumnStats>>;
+    /// Get table-level aggregate statistics for a table.
+    async fn get_table_statistics(&self, table_id: &str) -> CatalogResult<Option<TableStatistics>>;
 
-    /// Clear all table-level column statistics for a table.
-    async fn clear_column_stats(&self, table_id: &str) -> CatalogResult<()>;
-
-    /// Upsert file-level column statistics.
-    ///
-    /// Replaces existing stats for the given table, file, and columns.
-    async fn upsert_file_column_stats(&self, stats: &[FileColumnStats]) -> CatalogResult<()>;
-
-    /// Get all file-level column statistics for a table.
-    async fn get_file_column_stats(&self, table_id: &str) -> CatalogResult<Vec<FileColumnStats>>;
-
-    /// Get file-level column statistics for a specific file.
-    async fn get_file_column_stats_for_file(
-        &self,
-        table_id: &str,
-        file_path: &str,
-    ) -> CatalogResult<Vec<FileColumnStats>>;
-
-    /// Remove file-level column statistics for specific files.
-    ///
-    /// Called after compaction or file deletion to remove stale stats.
-    async fn remove_file_column_stats(
-        &self,
-        table_id: &str,
-        file_paths: &[String],
-    ) -> CatalogResult<()>;
-
-    /// Clear all file-level column statistics for a table.
-    async fn clear_file_column_stats(&self, table_id: &str) -> CatalogResult<()>;
+    /// Clear table-level aggregate statistics for a table.
+    async fn clear_table_statistics(&self, table_id: &str) -> CatalogResult<()>;
 
     // ── Inlined data (data inlining for small writes) ──────────────────
 

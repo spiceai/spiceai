@@ -80,36 +80,51 @@ use super::vortex_format::DeletionFilteringVortexFormat;
 /// Maps serialized primary key bytes to their maximum delete sequence number.
 type DeletedRowKeysMap = HashMap<Box<[u8]>, i64>;
 
-/// Accumulates per-column statistics (min, max, null count, row count) across
-/// multiple `RecordBatch`es during a write operation.
+/// Accumulates per-column statistics across multiple `RecordBatch`es during a write.
+///
+/// Builds Vortex [`StatsSet`] objects per column (min, max, null count) and tracks
+/// the total row count. After the write completes, call [`to_file_statistics`] to
+/// produce a serialized Vortex `FileStatistics` blob for metastore persistence.
 ///
 /// Thread-safe: guarded by `Mutex` when shared across stream tasks.
-/// After the write completes, call [`to_column_stats`] to produce
-/// `ColumnStats` entries for metastore persistence.
+///
+/// [`StatsSet`]: vortex::array::stats::StatsSet
 #[derive(Debug)]
 pub(crate) struct ColumnStatsAccumulator {
-    /// Per-column accumulated state: (`min_value`, `max_value`, `null_count`, `row_count`)
-    columns: std::sync::Mutex<Vec<PerColumnAcc>>,
-    /// Column names from the schema
-    column_names: Vec<String>,
-}
-
-#[derive(Debug, Default, Clone)]
-struct PerColumnAcc {
-    min_value: Option<datafusion_common::ScalarValue>,
-    max_value: Option<datafusion_common::ScalarValue>,
-    null_count: i64,
-    row_count: i64,
+    /// Per-column accumulated stats as Vortex `StatsSet`
+    columns: std::sync::Mutex<Vec<vortex::array::stats::StatsSet>>,
+    /// Column dtypes (Vortex types, derived from Arrow schema)
+    dtypes: Vec<vortex::dtype::DType>,
+    /// Total accumulated row count across all batches
+    row_count: std::sync::atomic::AtomicI64,
+    /// Arrow schema for serialization
+    schema: arrow_schema::Schema,
 }
 
 impl ColumnStatsAccumulator {
     /// Create a new accumulator for the given schema.
     pub(crate) fn new(schema: &arrow_schema::Schema) -> Self {
-        let column_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
-        let columns = vec![PerColumnAcc::default(); column_names.len()];
+        let num_cols = schema.fields().len();
+        let columns = vec![vortex::array::stats::StatsSet::default(); num_cols];
+        let dtypes: Vec<vortex::dtype::DType> = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                vortex::dtype::DType::from_arrow((
+                    f.data_type(),
+                    if f.is_nullable() {
+                        vortex::dtype::Nullability::Nullable
+                    } else {
+                        vortex::dtype::Nullability::NonNullable
+                    },
+                ))
+            })
+            .collect();
         Self {
             columns: std::sync::Mutex::new(columns),
-            column_names,
+            dtypes,
+            row_count: std::sync::atomic::AtomicI64::new(0),
+            schema: schema.clone(),
         }
     }
 
@@ -120,116 +135,121 @@ impl ColumnStatsAccumulator {
             return;
         };
 
+        let num_rows = batch.num_rows();
+        self.row_count.fetch_add(
+            i64::try_from(num_rows).unwrap_or(i64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         for (i, col) in batch.columns().iter().enumerate() {
-            if i >= cols.len() {
-                continue;
-            }
-            let acc = &mut cols[i];
-            let num_rows = col.len();
-            acc.row_count = acc
-                .row_count
-                .saturating_add(i64::try_from(num_rows).unwrap_or(i64::MAX));
-            acc.null_count = acc
-                .null_count
-                .saturating_add(i64::try_from(col.null_count()).unwrap_or(0));
-
-            if col.is_empty() || col.null_count() == col.len() {
+            if i >= cols.len() || i >= self.dtypes.len() {
                 continue;
             }
 
-            // O(n) linear scan to find min/max using `ScalarValue` comparison.
-            // NaN values are skipped entirely (including as seed values) so that
-            // stats remain deterministic and comparable.
-            let mut batch_min: Option<datafusion_common::ScalarValue> = None;
-            let mut batch_max: Option<datafusion_common::ScalarValue> = None;
+            // Build a StatsSet for this batch's column
+            let batch_stats =
+                crate::stats::column_stats_to_stats_set(&Self::compute_column_stats(col));
 
-            for row_idx in 0..col.len() {
-                if col.is_null(row_idx) {
-                    continue;
-                }
-                let Ok(value) =
-                    datafusion_common::ScalarValue::try_from_array(col.as_ref(), row_idx)
-                else {
-                    continue; // unsupported type for this row
-                };
-
-                // Skip NaN: a NaN seed would poison all subsequent comparisons
-                // because partial_cmp(NaN, x) always returns None.
-                if value.partial_cmp(&value) != Some(std::cmp::Ordering::Equal) {
-                    continue;
-                }
-
-                batch_min = Some(match batch_min {
-                    None => value.clone(),
-                    Some(existing) => {
-                        if value.partial_cmp(&existing) == Some(std::cmp::Ordering::Less) {
-                            value.clone()
-                        } else {
-                            existing
-                        }
-                    }
-                });
-                batch_max = Some(match batch_max {
-                    None => value,
-                    Some(existing) => {
-                        if value.partial_cmp(&existing) == Some(std::cmp::Ordering::Greater) {
-                            value
-                        } else {
-                            existing
-                        }
-                    }
-                });
-            }
-
-            if let Some(bmin) = batch_min {
-                acc.min_value = Some(match &acc.min_value {
-                    None => bmin,
-                    Some(existing) => {
-                        if bmin.partial_cmp(existing) == Some(std::cmp::Ordering::Less) {
-                            bmin
-                        } else {
-                            existing.clone()
-                        }
-                    }
-                });
-            }
-            if let Some(bmax) = batch_max {
-                acc.max_value = Some(match &acc.max_value {
-                    None => bmax,
-                    Some(existing) => {
-                        if bmax.partial_cmp(existing) == Some(std::cmp::Ordering::Greater) {
-                            bmax
-                        } else {
-                            existing.clone()
-                        }
-                    }
-                });
-            }
+            // Merge into the accumulated stats using unordered merge
+            let existing = std::mem::take(&mut cols[i]);
+            cols[i] = existing.merge_unordered(&batch_stats.as_typed_ref(&self.dtypes[i]));
         }
     }
 
-    /// Convert accumulated stats to `ColumnStats` entries for persistence.
-    pub(crate) fn to_column_stats(&self, table_id: &str) -> Vec<crate::metadata::ColumnStats> {
+    /// Compute DataFusion `ColumnStatistics` from a single Arrow column.
+    fn compute_column_stats(col: &dyn arrow::array::Array) -> datafusion_common::ColumnStatistics {
+        use datafusion_common::stats::Precision;
+
+        let null_count = Precision::Exact(col.null_count());
+
+        if col.is_empty() || col.null_count() == col.len() {
+            return datafusion_common::ColumnStatistics {
+                null_count,
+                min_value: Precision::Absent,
+                max_value: Precision::Absent,
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+                byte_size: Precision::Absent,
+            };
+        }
+
+        // O(n) linear scan to find min/max using `ScalarValue` comparison.
+        // NaN values are skipped entirely so stats remain deterministic.
+        let mut batch_min: Option<datafusion_common::ScalarValue> = None;
+        let mut batch_max: Option<datafusion_common::ScalarValue> = None;
+
+        for row_idx in 0..col.len() {
+            if col.is_null(row_idx) {
+                continue;
+            }
+            let Ok(value) = datafusion_common::ScalarValue::try_from_array(col, row_idx) else {
+                continue;
+            };
+
+            // Skip NaN: partial_cmp(NaN, x) always returns None
+            if value.partial_cmp(&value) != Some(std::cmp::Ordering::Equal) {
+                continue;
+            }
+
+            batch_min = Some(match batch_min {
+                None => value.clone(),
+                Some(existing) => {
+                    if value.partial_cmp(&existing) == Some(std::cmp::Ordering::Less) {
+                        value.clone()
+                    } else {
+                        existing
+                    }
+                }
+            });
+            batch_max = Some(match batch_max {
+                None => value,
+                Some(existing) => {
+                    if value.partial_cmp(&existing) == Some(std::cmp::Ordering::Greater) {
+                        value
+                    } else {
+                        existing
+                    }
+                }
+            });
+        }
+
+        datafusion_common::ColumnStatistics {
+            null_count,
+            min_value: batch_min.map(Precision::Exact).unwrap_or(Precision::Absent),
+            max_value: batch_max.map(Precision::Exact).unwrap_or(Precision::Absent),
+            sum_value: Precision::Absent,
+            distinct_count: Precision::Absent,
+            byte_size: Precision::Absent,
+        }
+    }
+
+    /// Get the total accumulated row count.
+    pub(crate) fn row_count(&self) -> i64 {
+        self.row_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Convert accumulated stats to a serialized Vortex `FileStatistics` blob.
+    ///
+    /// Returns `None` if no rows were accumulated or serialization fails.
+    pub(crate) fn to_file_statistics_blob(&self) -> Option<Vec<u8>> {
+        if self.row_count() == 0 {
+            return None;
+        }
         let Ok(cols) = self.columns.lock() else {
             tracing::warn!(
-                "ColumnStatsAccumulator: mutex poisoned in to_column_stats(), returning empty"
+                "ColumnStatsAccumulator: mutex poisoned in to_file_statistics_blob(), returning None"
             );
-            return Vec::new();
+            return None;
         };
 
-        self.column_names
-            .iter()
-            .zip(cols.iter())
-            .filter(|(_, acc)| acc.row_count > 0)
-            .map(|(name, acc)| crate::metadata::ColumnStats {
-                table_id: table_id.to_string(),
-                column_name: name.clone(),
-                min_value: acc.min_value.as_ref().map(std::string::ToString::to_string),
-                max_value: acc.max_value.as_ref().map(std::string::ToString::to_string),
-                null_count: Some(acc.null_count),
-                row_count: Some(acc.row_count),
-            })
-            .collect()
+        let file_stats = crate::stats::build_file_statistics(cols.clone(), &self.schema);
+        match crate::stats::serialize_file_statistics(&file_stats) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                tracing::warn!("Failed to serialize file statistics: {e}");
+                None
+            }
+        }
     }
 }
 
@@ -3359,22 +3379,27 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Persist table-level column statistics from accumulated write stats.
+    /// Persist table-level aggregate statistics from accumulated write stats.
     ///
-    /// Takes a `ColumnStatsAccumulator` populated during writes and persists
-    /// the accumulated stats as `cayenne_column_stats` entries. This makes
-    /// statistics available for distributed query planning without re-reading
+    /// Takes a `ColumnStatsAccumulator` populated during writes and persists the
+    /// accumulated stats as a Vortex `FileStatistics` blob in the metastore. This
+    /// makes statistics available for distributed query planning without re-reading
     /// file footers.
     ///
     /// Best-effort: logs a warning and continues if stats persistence fails,
     /// since stats are an optimization and not critical for correctness.
     pub(crate) async fn persist_table_stats(&self, accumulator: &ColumnStatsAccumulator) {
-        let stats = accumulator.to_column_stats(&self.table_metadata.table_id);
-        if stats.is_empty() {
+        let Some(blob) = accumulator.to_file_statistics_blob() else {
             return;
-        }
+        };
 
-        if let Err(e) = self.catalog.upsert_column_stats(&stats).await {
+        let stats = crate::metadata::TableStatistics {
+            table_id: self.table_metadata.table_id.clone(),
+            statistics_blob: blob,
+            num_rows: accumulator.row_count(),
+        };
+
+        if let Err(e) = self.catalog.upsert_table_statistics(&stats).await {
             tracing::warn!(
                 "Failed to persist table stats for {}: {e}",
                 self.table_metadata.table_name

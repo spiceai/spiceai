@@ -552,10 +552,10 @@ fn bench_inlined_data(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark column stats upsert operations (batched multi-row INSERT).
-fn bench_column_stats_upsert(c: &mut Criterion) {
+/// Benchmark table statistics upsert operations (single BLOB per table).
+fn bench_table_statistics_upsert(c: &mut Criterion) {
     let rt = Runtime::new().expect("Failed to create runtime");
-    let mut group = c.benchmark_group("column_stats_upsert");
+    let mut group = c.benchmark_group("table_statistics_upsert");
 
     let cayenne_init_sql = r"
         CREATE TABLE IF NOT EXISTS cayenne_table (
@@ -571,26 +571,22 @@ fn bench_column_stats_upsert(c: &mut Criterion) {
             vortex_config_json TEXT,
             current_sequence_number BIGINT NOT NULL DEFAULT 0
         );
-        CREATE TABLE IF NOT EXISTS cayenne_column_stats (
-            table_id TEXT NOT NULL,
-            column_name TEXT NOT NULL,
-            min_value TEXT,
-            max_value TEXT,
-            null_count BIGINT,
-            row_count BIGINT,
-            PRIMARY KEY (table_id, column_name),
+        CREATE TABLE IF NOT EXISTS cayenne_table_statistics (
+            table_id TEXT NOT NULL PRIMARY KEY,
+            statistics_blob BLOB NOT NULL,
+            num_rows BIGINT NOT NULL DEFAULT 0,
             FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
         );
         INSERT OR IGNORE INTO cayenne_table (table_id, table_name, path, path_is_relative, schema_json)
             VALUES ('bench-table-id', 'bench_table', '/tmp/bench', 0, '{}');
     ";
 
-    let column_counts = vec![10, 50, 100];
-    for num_columns in column_counts {
+    let blob_sizes = vec![256, 1024, 4096];
+    for blob_size in blob_sizes {
         group.bench_with_input(
-            BenchmarkId::new("sqlite_upsert", num_columns),
-            &num_columns,
-            |b, &cols| {
+            BenchmarkId::new("sqlite_upsert", blob_size),
+            &blob_size,
+            |b, &size| {
                 let setup = rt.block_on(async {
                     let (metastore, temp_dir) = get_sqlite_metastore();
                     metastore
@@ -600,26 +596,21 @@ fn bench_column_stats_upsert(c: &mut Criterion) {
                     (metastore, temp_dir)
                 });
 
+                let blob = vec![0u8; size];
                 b.iter(|| {
                     rt.block_on(async {
-                        for i in 0..cols {
-                            let col_name = format!("col_{i}");
-                            setup
-                                .0
-                                .execute(ExecuteParams {
-                                    sql: "INSERT OR REPLACE INTO cayenne_column_stats (table_id, column_name, min_value, max_value, null_count, row_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                                    params: vec![
-                                        MetastoreValue::Text("bench-table-id".to_string()),
-                                        MetastoreValue::Text(col_name),
-                                        MetastoreValue::Text("0".to_string()),
-                                        MetastoreValue::Text("1000".to_string()),
-                                        MetastoreValue::Integer(0),
-                                        MetastoreValue::Integer(10000),
-                                    ],
-                                })
-                                .await
-                                .expect("Failed to upsert stats");
-                        }
+                        setup
+                            .0
+                            .execute(ExecuteParams {
+                                sql: "INSERT OR REPLACE INTO cayenne_table_statistics (table_id, statistics_blob, num_rows) VALUES (?1, ?2, ?3)",
+                                params: vec![
+                                    MetastoreValue::Text("bench-table-id".to_string()),
+                                    MetastoreValue::Blob(blob.clone()),
+                                    MetastoreValue::Integer(10000),
+                                ],
+                            })
+                            .await
+                            .expect("Failed to upsert stats");
                         black_box(());
                     });
                 });
@@ -638,6 +629,6 @@ criterion_group!(
     bench_query_single,
     bench_query_batch,
     bench_inlined_data,
-    bench_column_stats_upsert
+    bench_table_statistics_upsert
 );
 criterion_main!(benches);

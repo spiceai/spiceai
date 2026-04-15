@@ -107,27 +107,8 @@ pub const EXPECTED_TABLES: &[ExpectedTable] = &[
         columns: &["table_id", "snapshot_id", "sequence_number"],
     },
     ExpectedTable {
-        name: "cayenne_column_stats",
-        columns: &[
-            "table_id",
-            "column_name",
-            "min_value",
-            "max_value",
-            "null_count",
-            "row_count",
-        ],
-    },
-    ExpectedTable {
-        name: "cayenne_file_column_stats",
-        columns: &[
-            "table_id",
-            "file_path",
-            "column_name",
-            "min_value",
-            "max_value",
-            "null_count",
-            "row_count",
-        ],
+        name: "cayenne_table_statistics",
+        columns: &["table_id", "statistics_blob", "num_rows"],
     },
     ExpectedTable {
         name: "cayenne_inlined_data",

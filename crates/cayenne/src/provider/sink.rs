@@ -577,17 +577,6 @@ impl CayenneDataSink {
                 self.table.table_name()
             );
         }
-        if let Err(e) = self
-            .table
-            .catalog()
-            .clear_file_column_stats(self.table.table_id())
-            .await
-        {
-            tracing::warn!(
-                "Failed to clear stale file column stats after overwrite for table {}: {e}",
-                self.table.table_name()
-            );
-        }
         self.table.persist_table_stats(&write_stats_acc).await;
 
         Ok(total_rows)

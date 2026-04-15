@@ -303,48 +303,26 @@ pub struct CreateTableOptions {
     pub vortex_config: VortexConfig,
 }
 
-/// Table-level aggregate statistics for a single column.
+/// Table-level aggregate statistics stored as a serialized Vortex [`FileStatistics`] blob.
 ///
-/// Stores min/max values (serialized as strings for cross-type compatibility),
-/// null count, and total row count. Used by the query optimizer to make
-/// informed decisions about join ordering, aggregation strategies, and pruning.
+/// Stores per-column statistics (min, max, null count, sum, etc.) aggregated across
+/// all files in the table. Uses Vortex's native statistics format for zero-conversion
+/// overhead and compatibility with the Vortex file footer statistics.
+///
+/// Used by the query optimizer for join ordering, aggregation strategies, and
+/// partition pruning — especially in distributed query planning where a remote
+/// node needs table stats without access to the underlying Vortex files.
+///
+/// [`FileStatistics`]: vortex::file::FileStatistics
 #[derive(Debug, Clone)]
-pub struct ColumnStats {
+pub struct TableStatistics {
     /// Table this stats entry belongs to (`UUIDv7`)
     pub table_id: String,
-    /// Name of the column
-    pub column_name: String,
-    /// Minimum value (serialized as string), `None` if all values are null
-    pub min_value: Option<String>,
-    /// Maximum value (serialized as string), `None` if all values are null
-    pub max_value: Option<String>,
-    /// Number of null values in this column across all files
-    pub null_count: Option<i64>,
-    /// Total number of rows in the table (same for all columns)
-    pub row_count: Option<i64>,
-}
-
-/// Per-file, per-column statistics for scan pruning.
-///
-/// Stores min/max/`null_count`/`row_count` for each column in each data file.
-/// Used for file-level scan pruning: files whose min/max ranges don't
-/// overlap with filter predicates can be skipped entirely.
-#[derive(Debug, Clone)]
-pub struct FileColumnStats {
-    /// Table this stats entry belongs to (`UUIDv7`)
-    pub table_id: String,
-    /// Path to the data file (snapshot-relative)
-    pub file_path: String,
-    /// Name of the column
-    pub column_name: String,
-    /// Minimum value in this column for this file (serialized as string)
-    pub min_value: Option<String>,
-    /// Maximum value in this column for this file (serialized as string)
-    pub max_value: Option<String>,
-    /// Number of null values in this column for this file
-    pub null_count: Option<i64>,
-    /// Number of rows in this file
-    pub row_count: Option<i64>,
+    /// Serialized Vortex `FileStatistics` flatbuffer bytes containing per-column
+    /// stats (min, max, null count, sum, NaN count, is_constant, etc.)
+    pub statistics_blob: Vec<u8>,
+    /// Total number of rows in the table across all files
+    pub num_rows: i64,
 }
 
 /// A small batch of insert data inlined directly in the metastore.

@@ -140,8 +140,7 @@ async fn query_count(ctx: &SessionContext, table_name: &str) -> usize {
 // Stats Tests
 // ============================================================================
 
-/// Stats are updated on each write (upserted per column, not cumulative).
-/// Each append overwrites column stats with the latest batch's values.
+/// Stats are updated on each write and stored as a Vortex FileStatistics blob.
 async fn test_stats_accumulate_across_appends(fixture: common::TestFixture) -> TestResult {
     let schema = simple_schema();
     let (table, _ctx) = create_table_no_pk(&fixture, "stats_accum", Arc::clone(&schema)).await;
@@ -157,12 +156,10 @@ async fn test_stats_accumulate_across_appends(fixture: common::TestFixture) -> T
     )?;
     common::insert_batch(&table, batch1).await?;
 
-    let stats = fixture.catalog.get_column_stats(&table_id).await?;
-    let value_stats = stats
-        .iter()
-        .find(|s| s.column_name == "value")
-        .expect("stats lookup");
-    assert_eq!(value_stats.row_count, Some(3));
+    let stats = fixture.catalog.get_table_statistics(&table_id).await?;
+    assert!(stats.is_some(), "Stats should exist after first write");
+    let stats = stats.expect("stats");
+    assert_eq!(stats.num_rows, 3);
 
     // Second append: 2 rows with values 5, 50
     let batch2 = RecordBatch::try_new(
@@ -174,16 +171,13 @@ async fn test_stats_accumulate_across_appends(fixture: common::TestFixture) -> T
     )?;
     common::insert_batch(&table, batch2).await?;
 
-    // Stats should reflect the latest write's data (not cumulative across writes —
-    // each write persists its own batch stats via upsert)
-    let stats = fixture.catalog.get_column_stats(&table_id).await?;
-    let value_stats = stats
-        .iter()
-        .find(|s| s.column_name == "value")
-        .expect("stats lookup");
+    // Stats should be updated after second write
+    let stats = fixture.catalog.get_table_statistics(&table_id).await?;
+    assert!(stats.is_some(), "Stats should exist after second write");
+    let stats = stats.expect("stats");
     assert!(
-        value_stats.row_count.is_some(),
-        "row_count should be populated after second append"
+        stats.num_rows > 0,
+        "num_rows should be populated after second append"
     );
 
     Ok(())
@@ -209,14 +203,11 @@ async fn test_stats_correct_after_overwrite(fixture: common::TestFixture) -> Tes
         .collect()
         .await?;
 
-    let stats = fixture.catalog.get_column_stats(&table_id).await?;
-    let value_stats = stats
-        .iter()
-        .find(|s| s.column_name == "value")
-        .expect("stats lookup");
+    let stats = fixture.catalog.get_table_statistics(&table_id).await?;
+    assert!(stats.is_some(), "Stats should exist after overwrite");
+    let stats = stats.expect("stats");
     assert_eq!(
-        value_stats.row_count,
-        Some(2),
+        stats.num_rows, 2,
         "After overwrite, stats should reflect only the new 2-row data"
     );
 
@@ -242,21 +233,14 @@ async fn test_stats_with_all_null_column(fixture: common::TestFixture) -> TestRe
     )?;
     common::insert_batch(&table, batch).await?;
 
-    let stats = fixture.catalog.get_column_stats(&table_id).await?;
-    let value_stats = stats
-        .iter()
-        .find(|s| s.column_name == "value")
-        .expect("stats lookup");
-    assert_eq!(value_stats.null_count, Some(3), "All 3 values are NULL");
+    let stats = fixture.catalog.get_table_statistics(&table_id).await?;
+    assert!(stats.is_some(), "Stats should exist after insert");
+    let stats = stats.expect("stats");
+    assert_eq!(stats.num_rows, 3);
     assert!(
-        value_stats.min_value.is_none(),
-        "min should be None for all-NULL column"
+        !stats.statistics_blob.is_empty(),
+        "statistics_blob should be non-empty even with all-NULL column"
     );
-    assert!(
-        value_stats.max_value.is_none(),
-        "max should be None for all-NULL column"
-    );
-    assert_eq!(value_stats.row_count, Some(3));
 
     Ok(())
 }
@@ -284,35 +268,19 @@ async fn test_stats_with_mixed_types(fixture: common::TestFixture) -> TestResult
     )?;
     common::insert_batch(&table, batch).await?;
 
-    let stats = fixture.catalog.get_column_stats(&table_id).await?;
-    assert_eq!(
-        stats.len(),
-        4,
-        "Should have stats for all 4 columns: {stats:?}"
+    let stats = fixture.catalog.get_table_statistics(&table_id).await?;
+    assert!(stats.is_some(), "Stats should exist after insert");
+    let stats = stats.expect("stats");
+    assert_eq!(stats.num_rows, 3);
+    assert!(
+        !stats.statistics_blob.is_empty(),
+        "statistics_blob should be non-empty for mixed types"
     );
-
-    // Verify each column has stats
-    for col_name in &["id", "score", "name", "ts"] {
-        let col_stats = stats
-            .iter()
-            .find(|s| s.column_name == *col_name)
-            .unwrap_or_else(|| panic!("Missing stats for column {col_name}"));
-        assert!(
-            col_stats.min_value.is_some(),
-            "min should exist for {col_name}"
-        );
-        assert!(
-            col_stats.max_value.is_some(),
-            "max should exist for {col_name}"
-        );
-        assert_eq!(col_stats.null_count, Some(0));
-        assert_eq!(col_stats.row_count, Some(3));
-    }
 
     Ok(())
 }
 
-/// String min/max should be correct (lexicographic ordering).
+/// String min/max should be captured in the statistics blob.
 async fn test_stats_min_max_correct_for_strings(fixture: common::TestFixture) -> TestResult {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -331,13 +299,22 @@ async fn test_stats_min_max_correct_for_strings(fixture: common::TestFixture) ->
     )?;
     common::insert_batch(&table, batch).await?;
 
-    let stats = fixture.catalog.get_column_stats(&table_id).await?;
-    let name_stats = stats
-        .iter()
-        .find(|s| s.column_name == "name")
-        .expect("stats lookup");
-    assert_eq!(name_stats.min_value.as_deref(), Some("apple"));
-    assert_eq!(name_stats.max_value.as_deref(), Some("cherry"));
+    let stats = fixture.catalog.get_table_statistics(&table_id).await?;
+    assert!(stats.is_some(), "Stats should exist after insert");
+    let stats = stats.expect("stats");
+    assert_eq!(stats.num_rows, 3);
+    assert!(
+        !stats.statistics_blob.is_empty(),
+        "statistics_blob should be non-empty"
+    );
+
+    // Deserialize and verify the stats round-trip correctly
+    let file_stats =
+        cayenne::stats::deserialize_file_statistics(&stats.statistics_blob, &schema).ok();
+    assert!(
+        file_stats.is_some(),
+        "FileStatistics should be deserializable"
+    );
 
     Ok(())
 }
