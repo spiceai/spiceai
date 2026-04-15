@@ -30,8 +30,8 @@ use datafusion::{
     error::DataFusionError,
     execution::SessionState,
     logical_expr::{
-        EmptyRelation, Expr, FetchType, Filter, Limit, LogicalPlan, LogicalPlanBuilder, Projection,
-        SkipType, Sort, SubqueryAlias, TableScan, Union, lit,
+        EmptyRelation, Expr, FetchType, Limit, LogicalPlan, LogicalPlanBuilder, SkipType, Sort,
+        TableScan, Union, lit,
     },
     optimizer::AnalyzerRule,
     prelude::SessionContext,
@@ -257,27 +257,25 @@ fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, D
     };
 
     // Walk through Projection, SubqueryAlias, and Filter nodes to find the Union.
-    // Projection and SubqueryAlias are "transparent" nodes that don't affect sort
-    // order or cardinality and are re-wrapped around the Union.
-    // Filter nodes are collected separately and pushed into each union leg so that
-    // federation can unparse the complete `Sort(TopK) -> Filter -> TableScan` query
-    // for each executor.
+    // These nodes are not dropped: they are cloned into each union leg *before*
+    // per-leg TopK sort. This is required for qualified expressions like `p.name`
+    // and projection aliases used by ORDER BY.
     let mut current = sort.input.as_ref();
-    let mut intermediates: Vec<&LogicalPlan> = Vec::new();
-    let mut filter_predicates: Vec<Expr> = Vec::new();
+    let mut between_sort_and_union: Vec<LogicalPlan> = Vec::new();
     let union_plan = loop {
         match current {
             LogicalPlan::Union(u) => break u,
-            LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. })
-            | LogicalPlan::Projection(Projection { input, .. }) => {
-                intermediates.push(current);
-                current = input.as_ref();
+            LogicalPlan::SubqueryAlias(sa) => {
+                between_sort_and_union.push(LogicalPlan::SubqueryAlias(sa.clone()));
+                current = sa.input.as_ref();
             }
-            LogicalPlan::Filter(Filter {
-                predicate, input, ..
-            }) => {
-                filter_predicates.push(predicate.clone());
-                current = input.as_ref();
+            LogicalPlan::Projection(p) => {
+                between_sort_and_union.push(LogicalPlan::Projection(p.clone()));
+                current = p.input.as_ref();
+            }
+            LogicalPlan::Filter(f) => {
+                between_sort_and_union.push(LogicalPlan::Filter(f.clone()));
+                current = f.input.as_ref();
             }
             _ => return Ok(Transformed::no(LogicalPlan::Limit(limit))),
         }
@@ -299,10 +297,21 @@ fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, D
         .map(|input| {
             let mut leg = Arc::clone(input);
 
-            // Push filter predicates into each union leg so federation can unparse
-            // the full query (including WHERE) for each executor.
-            if let Some(filter) = filter_predicates.clone().into_iter().reduce(Expr::and) {
-                leg = Arc::new(LogicalPlanBuilder::from(leg).filter(filter)?.build()?);
+            // Rebuild the exact subtree that used to sit between Sort and Union,
+            // but with this specific union leg as the leaf input.
+            for node in between_sort_and_union.iter().rev() {
+                leg = Arc::new(match node {
+                    LogicalPlan::SubqueryAlias(sa) => LogicalPlanBuilder::from(leg)
+                        .alias(sa.alias.clone())?
+                        .build()?,
+                    LogicalPlan::Projection(p) => LogicalPlanBuilder::from(leg)
+                        .project(p.expr.clone())?
+                        .build()?,
+                    LogicalPlan::Filter(f) => LogicalPlanBuilder::from(leg)
+                        .filter(f.predicate.clone())?
+                        .build()?,
+                    _ => unreachable!("only Projection, SubqueryAlias, and Filter are collected"),
+                });
             }
 
             Ok(Arc::new(LogicalPlan::Sort(Sort {
@@ -313,24 +322,12 @@ fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, D
         })
         .collect::<Result<Vec<_>, DataFusionError>>()?;
 
-    // Rebuild: Union → intermediates (Sort↔Union) → Sort → above_sort intermediates → Limit.
+    // Rebuild: Union(per-leg Sort(TopK over reconstructed leg subtree))
+    // -> original outer Sort -> [Projection|SubqueryAlias]* -> Limit.
     let mut result = LogicalPlan::Union(Union {
         inputs: new_inputs,
-        schema: Arc::clone(&union_plan.schema),
+        schema: Arc::clone(sort.input.schema()),
     });
-
-    // Re-wrap intermediate nodes between Sort and Union in reverse (innermost-first) order.
-    for node in intermediates.into_iter().rev() {
-        result = match node {
-            LogicalPlan::SubqueryAlias(sa) => LogicalPlanBuilder::from(result)
-                .alias(sa.alias.clone())?
-                .build()?,
-            LogicalPlan::Projection(p) => LogicalPlanBuilder::from(result)
-                .project(p.expr.clone())?
-                .build()?,
-            _ => unreachable!("only Projection and SubqueryAlias are collected"),
-        };
-    }
 
     // Re-add the Sort node.
     result = LogicalPlan::Sort(Sort {
@@ -814,6 +811,54 @@ mod tests {
                     Filter: test_table.partition_id > Int32(0)
                       TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
         "#);
+    }
+
+    #[test]
+    fn test_limit_sort_pushdown_preserves_qualified_alias_columns() {
+        let schema = test_schema();
+        let ctx = SessionContext::new();
+        let rule = make_rule(&schema, &ctx);
+
+        // Build a query shape like:
+        // SELECT p.name
+        // FROM test_table AS p
+        // WHERE p.partition_id > 0
+        // ORDER BY p.name
+        // LIMIT 3
+        //
+        // This ensures qualified references (`p.name`) remain valid after TopK
+        // pushdown into union legs.
+        let scan = make_table_scan(&schema);
+        let plan = LogicalPlanBuilder::from(scan)
+            .alias("p")
+            .expect("alias failed")
+            .filter(col("p.partition_id").gt(lit(0)))
+            .expect("filter failed")
+            .project(vec![col("p.name")])
+            .expect("project failed")
+            .sort(vec![SortExpr::new(col("p.name"), true, false)])
+            .expect("sort failed")
+            .limit(0, Some(3))
+            .expect("limit failed")
+            .build()
+            .expect("build failed");
+
+        let result = rule
+            .analyze(plan, &ConfigOptions::default())
+            .expect("analyze failed");
+
+        let plan_str = result.display_indent().to_string();
+
+        assert!(
+            plan_str.contains("Sort: p.name ASC NULLS LAST, fetch=3"),
+            "expected TopK sort with qualified alias in each union leg, got:\n{plan_str}"
+        );
+
+        assert_eq!(
+            plan_str.matches("SubqueryAlias: p").count(),
+            2,
+            "expected each union leg to preserve alias 'p', got:\n{plan_str}"
+        );
     }
 
     #[test]
