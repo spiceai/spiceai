@@ -24,8 +24,9 @@ limitations under the License.
 //! - [`DistributedCayenneDmlExtensionPlanner`] handles distributed DML
 //!   extension nodes (`DistributedCayenneDelete/Update/Insert/Merge`).
 //!
-//! This overlay is optional by operation: handlers can opt out and allow
-//! standard `DataFusion` DML execution to proceed.
+//! This overlay is optional by operation: handlers can override only the
+//! operations they need while inheriting default `DataFusion` DML behavior
+//! for the rest.
 
 pub mod dml_planner;
 pub mod handler;

@@ -24,7 +24,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{Expr, dml::InsertOp};
 use datafusion::physical_plan::ExecutionPlan;
@@ -80,9 +80,8 @@ pub struct MergeParams {
 /// stateless [`crate::DmlExtensionPlanner`].
 ///
 /// This trait models DML as an **optional overlay** over `DataFusion`'s
-/// default DML machinery. Implementors return `Ok(Some(plan))` when they want
-/// to intercept/augment execution for an operation, or `Ok(None)` to opt out
-/// and let default planning/execution proceed.
+/// default DML operations. Default implementations, when present, are equal
+/// to the DML operations that would occur to the associated [`TableProvider`].
 ///
 /// Any returned plan should follow the standard DML output contract: a
 /// single-row result with a non-null `count: UInt64` column.
@@ -91,54 +90,74 @@ pub trait CatalogDmlHandler: fmt::Debug + Send + Sync {
     /// Short identifier used for diagnostics (e.g. `"cayenne"`).
     fn name(&self) -> &'static str;
 
-    /// Build an overlay [`ExecutionPlan`] for `DELETE`.
+    /// Build a custom [`ExecutionPlan`] for `DELETE`.
     ///
     /// `physical_inputs` are the already-planned children from `DataFusion`
     /// (for example, filtered table scans for distributed forwarding paths).
-    ///
-    /// Default implementation opts out (`Ok(None)`).
     async fn delete_exec(
         &self,
-        _params: DeleteParams,
+        params: DeleteParams,
         _physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
-        _session_state: &SessionState,
-    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-        Ok(None)
+        session_state: &SessionState,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        resolve_table_provider(session_state, &params.table_name)
+            .await?
+            .delete_from(session_state, params.filters)
+            .await
     }
 
-    /// Build an overlay [`ExecutionPlan`] for `UPDATE`.
-    ///
-    /// Default implementation opts out (`Ok(None)`).
+    /// Build a custom [`ExecutionPlan`] for `UPDATE`.
     async fn update_exec(
         &self,
-        _params: UpdateParams,
+        params: UpdateParams,
         _physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
-        _session_state: &SessionState,
-    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-        Ok(None)
+        session_state: &SessionState,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        resolve_table_provider(session_state, &params.table_name)
+            .await?
+            .update(session_state, params.assignments, params.filters)
+            .await
     }
 
-    /// Build an overlay [`ExecutionPlan`] for `INSERT`.
-    ///
-    /// Default implementation opts out (`Ok(None)`).
+    /// Build a custom [`ExecutionPlan`] for `INSERT`.
     async fn insert_exec(
         &self,
-        _params: InsertParams,
-        _physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
-        _session_state: &SessionState,
-    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-        Ok(None)
+        params: InsertParams,
+        physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
+        session_state: &SessionState,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let Some(input) = physical_inputs.first() else {
+            return Err(DataFusionError::Internal(
+                "DML INSERT extension node requires exactly one physical input".to_string(),
+            ));
+        };
+
+        resolve_table_provider(session_state, &params.table_name)
+            .await?
+            .insert_into(session_state, Arc::clone(input), params.insert_op)
+            .await
     }
 
-    /// Build an overlay [`ExecutionPlan`] for `MERGE`.
-    ///
-    /// Default implementation opts out (`Ok(None)`).
+    /// Build a custom [`ExecutionPlan`] for `MERGE`.
     async fn merge_exec(
         &self,
         _params: MergeParams,
         _physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
         _session_state: &SessionState,
-    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-        Ok(None)
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Err(DataFusionError::Plan(
+            "MERGE DML extension node was not handled and has no default fallback".to_string(),
+        ))
     }
+}
+
+async fn resolve_table_provider(
+    session_state: &SessionState,
+    table_name: &datafusion::sql::TableReference,
+) -> DFResult<Arc<dyn datafusion::datasource::TableProvider>> {
+    session_state
+        .schema_for_ref(table_name.clone())?
+        .table(table_name.table())
+        .await?
+        .ok_or_else(|| DataFusionError::Plan(format!("Table '{table_name}' not found")))
 }

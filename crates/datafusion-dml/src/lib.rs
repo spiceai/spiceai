@@ -28,9 +28,9 @@ limitations under the License.
 //! This mirrors the `datafusion-ddl` abstraction, but for DML operations
 //! (`DELETE`, `UPDATE`, `INSERT`, `MERGE`).
 //!
-//! The handler API is an optional overlay over default `DataFusion` DML: a
-//! handler can opt into interception (`Some(plan)`) or opt out (`None`) per
-//! operation.
+//! The handler API is an optional overlay over default `DataFusion` DML:
+//! handlers may override only the operations they need, while relying on trait
+//! defaults for standard behavior.
 //!
 //! The API follows core DataFusion DML conventions:
 //! - typed predicates/assignments (`Expr`) rather than SQL strings,

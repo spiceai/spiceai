@@ -37,8 +37,8 @@ use super::physical_plans::CayenneMergeExec;
 /// Catalog DML handler for local (single-node) Cayenne operations.
 ///
 /// This handler intentionally overlays only `MERGE`. Other DML operations
-/// opt out (via the default `CatalogDmlHandler` implementations) and continue
-/// through standard `DataFusion` DML machinery.
+/// use the default `CatalogDmlHandler` implementations, which delegate to
+/// standard `DataFusion` DML machinery.
 #[derive(Debug)]
 pub struct CayenneDmlHandler {
     default_catalog: &'static str,
@@ -68,7 +68,7 @@ impl CatalogDmlHandler for CayenneDmlHandler {
         params: MergeParams,
         physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
         session_state: &datafusion::execution::SessionState,
-    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let Some(join_physical) = physical_inputs.first() else {
             return Err(DataFusionError::Internal(
                 "Local MERGE requires exactly one physical input".to_string(),
@@ -93,12 +93,12 @@ impl CatalogDmlHandler for CayenneDmlHandler {
             .map(|(target, _)| target.clone())
             .collect();
 
-        Ok(Some(Arc::new(CayenneMergeExec::new(
+        Ok(Arc::new(CayenneMergeExec::new(
             Arc::clone(join_physical),
             target_provider,
             session_state.clone(),
             target_key_columns,
-        ))))
+        )))
     }
 }
 
@@ -143,6 +143,7 @@ impl ExtensionPlanner for CayenneDmlExtensionPlanner {
         self.handler
             .merge_exec(params, vec![join_physical], session_state)
             .await
+            .map(Some)
     }
 }
 

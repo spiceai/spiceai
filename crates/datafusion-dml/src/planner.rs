@@ -33,8 +33,9 @@ use crate::node::{DmlExtensionNode, DmlNodeOp};
 /// that node. Because the handler is carried by the node itself, one planner
 /// instance can serve all registered catalog handlers.
 ///
-/// If the handler opts out (`Ok(None)`), this planner also returns `Ok(None)`
-/// so another extension planner (or caller-level fallback logic) can proceed.
+/// This planner expects a concrete DML execution plan from the selected
+/// handler operation. Handlers can rely on trait defaults for operations they
+/// do not override.
 #[derive(Debug, Default)]
 pub struct DmlExtensionPlanner;
 
@@ -46,37 +47,21 @@ impl ExtensionPlanner for DmlExtensionPlanner {
         node: &dyn UserDefinedLogicalNode,
         _logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        session_state: &SessionState,
+        state: &SessionState,
     ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
-        let Some(dml_node) = node.as_any().downcast_ref::<DmlExtensionNode>() else {
+        let Some(DmlExtensionNode { op, handler, .. }) =
+            node.as_any().downcast_ref::<DmlExtensionNode>()
+        else {
             return Ok(None);
         };
 
-        match &dml_node.op {
-            DmlNodeOp::Delete(params) => {
-                dml_node
-                    .handler
-                    .delete_exec(params.clone(), physical_inputs.to_vec(), session_state)
-                    .await
-            }
-            DmlNodeOp::Update(params) => {
-                dml_node
-                    .handler
-                    .update_exec(params.clone(), physical_inputs.to_vec(), session_state)
-                    .await
-            }
-            DmlNodeOp::Insert(params) => {
-                dml_node
-                    .handler
-                    .insert_exec(params.clone(), physical_inputs.to_vec(), session_state)
-                    .await
-            }
-            DmlNodeOp::Merge(params) => {
-                dml_node
-                    .handler
-                    .merge_exec(*params.clone(), physical_inputs.to_vec(), session_state)
-                    .await
-            }
+        match op.clone() {
+            DmlNodeOp::Delete(p) => handler.delete_exec(p, physical_inputs.to_vec(), state),
+            DmlNodeOp::Update(p) => handler.update_exec(p, physical_inputs.to_vec(), state),
+            DmlNodeOp::Insert(p) => handler.insert_exec(p, physical_inputs.to_vec(), state),
+            DmlNodeOp::Merge(p) => handler.merge_exec(*p, physical_inputs.to_vec(), state),
         }
+        .await
+        .map(Some)
     }
 }

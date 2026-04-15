@@ -26,8 +26,8 @@ limitations under the License.
 //!   executor nodes. Only registered when an [`ExecutorRegistry`] is present.
 //!
 //! The handler layer follows the optional-overlay contract from
-//! `datafusion-dml`: each operation may return `Some(exec)` to intercept, or
-//! `None` to opt out and let standard `DataFusion` behavior run.
+//! `datafusion-dml`: handlers override only operations that need custom
+//! behavior and inherit trait defaults for standard `DataFusion` execution.
 
 use std::sync::Arc;
 
@@ -156,7 +156,7 @@ impl CatalogDmlHandler for DistributedCayenneDmlHandler {
         params: DeleteParams,
         physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
         _session_state: &SessionState,
-    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let Some(input) = physical_inputs.first() else {
             return Err(DataFusionError::Internal(
                 "Distributed DELETE requires exactly one physical input".to_string(),
@@ -165,12 +165,12 @@ impl CatalogDmlHandler for DistributedCayenneDmlHandler {
 
         let filter_sql = filters_to_sql(&params.filters)?;
 
-        Ok(Some(Arc::new(DistributedCayenneDeleteExec::new(
+        Ok(Arc::new(DistributedCayenneDeleteExec::new(
             params.table_name,
             Arc::clone(&self.executor_registry),
             filter_sql,
             Arc::clone(input),
-        ))))
+        )))
     }
 
     async fn update_exec(
@@ -178,7 +178,7 @@ impl CatalogDmlHandler for DistributedCayenneDmlHandler {
         params: UpdateParams,
         physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
         _session_state: &SessionState,
-    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let Some(input) = physical_inputs.first() else {
             return Err(DataFusionError::Internal(
                 "Distributed UPDATE requires exactly one physical input".to_string(),
@@ -195,13 +195,13 @@ impl CatalogDmlHandler for DistributedCayenneDmlHandler {
         let filter_sql = filters_to_sql(&params.filters)?;
         let assignments_sql = assignments_to_sql(&params.assignments)?;
 
-        Ok(Some(Arc::new(DistributedCayenneUpdateExec::new(
+        Ok(Arc::new(DistributedCayenneUpdateExec::new(
             params.table_name,
             Arc::clone(&self.executor_registry),
             filter_sql,
             assignments_sql,
             Arc::clone(input),
-        ))))
+        )))
     }
 
     async fn insert_exec(
@@ -209,7 +209,7 @@ impl CatalogDmlHandler for DistributedCayenneDmlHandler {
         params: InsertParams,
         physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
         session_state: &SessionState,
-    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
         if params.insert_op != InsertOp::Append {
             return Err(DataFusionError::Plan(format!(
                 "Unsupported distributed insert op: {}",
@@ -233,13 +233,13 @@ impl CatalogDmlHandler for DistributedCayenneDmlHandler {
             session_state.clone(),
         ));
 
-        Ok(Some(Arc::new(DistributedCayenneInsertExec::new(
+        Ok(Arc::new(DistributedCayenneInsertExec::new(
             params.table_name,
             Arc::clone(&self.executor_registry),
             ctx,
             io_runtime,
             Arc::clone(input),
-        ))))
+        )))
     }
 
     async fn merge_exec(
@@ -247,7 +247,7 @@ impl CatalogDmlHandler for DistributedCayenneDmlHandler {
         params: MergeParams,
         _physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
         session_state: &SessionState,
-    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let original_sql = params.original_sql.ok_or_else(|| {
             DataFusionError::Plan(
                 "Distributed MERGE requires original SQL text for forwarding".to_string(),
@@ -258,14 +258,14 @@ impl CatalogDmlHandler for DistributedCayenneDmlHandler {
             session_state.clone(),
         ));
 
-        Ok(Some(Arc::new(DistributedCayenneMergeExec::new(
+        Ok(Arc::new(DistributedCayenneMergeExec::new(
             params.target_table,
             params.source_table,
             params.on_keys,
             original_sql,
             Arc::clone(&self.executor_registry),
             ctx,
-        ))))
+        )))
     }
 }
 
@@ -306,54 +306,70 @@ impl ExtensionPlanner for DistributedCayenneDmlExtensionPlanner {
         session_state: &SessionState,
     ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
         if let Some(delete) = node.as_any().downcast_ref::<DistributedCayenneDeleteNode>() {
-            let params = DeleteParams {
-                table_name: delete.table_name.clone(),
-                filters: delete.filters.clone(),
-            };
             return self
                 .handler
-                .delete_exec(params, physical_inputs.to_vec(), session_state)
-                .await;
+                .delete_exec(
+                    DeleteParams {
+                        table_name: delete.table_name.clone(),
+                        filters: delete.filters.clone(),
+                    },
+                    physical_inputs.to_vec(),
+                    session_state,
+                )
+                .await
+                .map(Some);
         }
 
         if let Some(update) = node.as_any().downcast_ref::<DistributedCayenneUpdateNode>() {
-            let params = UpdateParams {
-                table_name: update.table_name.clone(),
-                filters: update.filters.clone(),
-                assignments: update.assignments.clone(),
-            };
             return self
                 .handler
-                .update_exec(params, physical_inputs.to_vec(), session_state)
-                .await;
+                .update_exec(
+                    UpdateParams {
+                        table_name: update.table_name.clone(),
+                        filters: update.filters.clone(),
+                        assignments: update.assignments.clone(),
+                    },
+                    physical_inputs.to_vec(),
+                    session_state,
+                )
+                .await
+                .map(Some);
         }
 
         if let Some(insert) = node.as_any().downcast_ref::<DistributedCayenneInsertNode>() {
-            let params = InsertParams {
-                table_name: insert.table_name.clone(),
-                insert_op: insert.insert_op,
-            };
             return self
                 .handler
-                .insert_exec(params, physical_inputs.to_vec(), session_state)
-                .await;
+                .insert_exec(
+                    InsertParams {
+                        table_name: insert.table_name.clone(),
+                        insert_op: insert.insert_op,
+                    },
+                    physical_inputs.to_vec(),
+                    session_state,
+                )
+                .await
+                .map(Some);
         }
 
         if let Some(merge) = node.as_any().downcast_ref::<DistributedCayenneMergeNode>() {
-            let params = MergeParams {
-                target_table: merge.target_table.clone(),
-                source_table: merge.source_table.clone(),
-                target_qualifier: merge.target_qualifier.clone(),
-                source_qualifier: merge.source_qualifier.clone(),
-                on_keys: merge.on_keys.clone(),
-                // Distributed execution forwards original SQL directly.
-                assignments: Vec::new(),
-                original_sql: Some(merge.original_sql.clone()),
-            };
             return self
                 .handler
-                .merge_exec(params, physical_inputs.to_vec(), session_state)
-                .await;
+                .merge_exec(
+                    MergeParams {
+                        target_table: merge.target_table.clone(),
+                        source_table: merge.source_table.clone(),
+                        target_qualifier: merge.target_qualifier.clone(),
+                        source_qualifier: merge.source_qualifier.clone(),
+                        on_keys: merge.on_keys.clone(),
+                        // Distributed execution forwards original SQL directly.
+                        assignments: Vec::new(),
+                        original_sql: Some(merge.original_sql.clone()),
+                    },
+                    physical_inputs.to_vec(),
+                    session_state,
+                )
+                .await
+                .map(Some);
         }
 
         Ok(None)
