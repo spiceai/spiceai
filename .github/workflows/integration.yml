@@ -197,6 +197,7 @@ jobs:
     needs: [build, check_changes]
     permissions:
       contents: write
+      id-token: write
     runs-on: spiceai-dev-runners
     strategy:
       fail-fast: false

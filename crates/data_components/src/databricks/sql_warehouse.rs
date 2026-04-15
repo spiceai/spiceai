@@ -3583,7 +3583,7 @@ mod tests {
 
         let msg = err.to_string();
         assert!(
-            msg.contains("Switch `sql_warehouse_id` to a Pro or Serverless warehouse"),
+            msg.contains("Switch `databricks_sql_warehouse_id` to a Pro or Serverless warehouse"),
             "error should reference the correct connector parameter: {msg}"
         );
         assert!(
