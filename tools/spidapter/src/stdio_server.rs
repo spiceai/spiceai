@@ -715,15 +715,12 @@ async fn provision_spice_cloud_app(
     // Apply custom image configuration if any image-related overrides are provided.
     // This sets the app's registry/image/image_tag/update_channel before creating the deployment,
     // so the deployment picks up the custom image instead of the default.
-    let has_custom_image = args.image_registry.is_some()
-        || args.image_name.is_some()
-        || args.image_tag.is_some()
-        || args.channel.is_some();
+    let has_custom_image = args.image_tag.is_some() || args.channel.is_some();
 
     if has_custom_image {
         eprintln!(
-            "[stdio] Applying custom image config: registry={:?}, image={:?}, tag={:?}, channel={:?}",
-            args.image_registry, args.image_name, args.image_tag, args.channel
+            "[stdio] Applying custom image config: tag={:?}, channel={:?}",
+            args.image_tag, args.channel
         );
         cloud
             .update_app(
