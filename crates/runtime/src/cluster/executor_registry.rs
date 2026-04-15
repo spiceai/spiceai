@@ -468,6 +468,9 @@ impl TablePartitionProvider for ExecutorRegistry {
             table,
             schema,
         )
+        .into_iter()
+        .map(|(provider, _)| (provider, vec![])) // Executors only materialize data for their assigned partitions; bucket filters are redundant and expensive to evaluate per-row.
+        .collect()
     }
 }
 

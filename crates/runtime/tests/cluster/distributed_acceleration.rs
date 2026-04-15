@@ -254,14 +254,13 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
                 plan_fmt.contains("VirtualExecutionPlan name=flightsql"),
                 "plan should use FlightSqlExec for distributed execution \n {plan_fmt}"
             );
-            // All 4 bucket values should appear in partition filters
-            for bucket in &["'0'", "'1'", "'2'", "'3'"] {
-                let expected_filter = format!("bucket(4, test_data.id) = {bucket}");
-                assert!(
-                    plan_fmt.contains(&expected_filter),
-                    "'{expected_filter}' should appear in partition filters \n {plan_fmt}"
-                );
-            }
+            // Partition values are no longer injected as bucket filters because
+            // executors only materialise data for their assigned partitions.
+            // Verify that no redundant bucket filters appear in the plan.
+            assert!(
+                !plan_fmt.contains("bucket("),
+                "plan should not contain bucket filters; executors already own only their assigned data"
+            );
 
             let rows = harness.query(select_all_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
@@ -578,24 +577,12 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                 plan_fmt.contains("TableScan: categories"),
                 "plan should contain categories"
             );
-            // All 4 bucket values should appear for each table
-            for bucket in &["'0'", "'1'", "'2'", "'3'"] {
-                assert!(
-                    plan_fmt.contains("FROM test_data WHERE"),
-                    "plan should contain test_data partition filter"
-                );
-                assert!(
-                    plan_fmt.contains("FROM categories WHERE"),
-                    "plan should contain categories partition filter"
-                );
-                assert!(
-                    plan_fmt
-                        .matches(&format!("bucket(4, \"id\") = {bucket}"))
-                        .count()
-                        >= 2,
-                    "bucket {bucket} should appear in both test_data and categories filters"
-                );
-            }
+            // Partition values are no longer injected as bucket filters because
+            // executors only materialise data for their assigned partitions.
+            assert!(
+                !plan_fmt.contains("bucket("),
+                "plan should not contain bucket filters; executors already own only their assigned data"
+            );
             // Verify distributed execution operators
             assert!(
                 plan_fmt.contains("VirtualExecutionPlan name=flightsql"),
