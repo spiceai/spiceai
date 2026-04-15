@@ -365,8 +365,11 @@ impl DatabricksU2MTokenProvider {
 // Token Provider Helper Functions
 // ============================================================================
 
+#[cfg(feature = "databricks")]
 use crate::parameters::Parameters;
+#[cfg(feature = "databricks")]
 use token_provider::StaticTokenProvider;
+#[cfg(feature = "databricks")]
 use token_provider::registry::TokenProviderRegistry;
 
 /// Build auth credentials from parameters.
