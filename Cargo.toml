@@ -86,8 +86,8 @@ rust-version = "1.93.1"
 version = "2.0.0-unstable"
 
 [workspace.dependencies]
-adbc_core = "0.21.0"
-adbc_driver_manager = "0.21.0"
+adbc_core = "0.23"
+adbc_driver_manager = "0.23"
 ahash = "0.8.12"
 anyhow = "1.0.102"
 arrow = { version = "57.0.0", features = ["prettyprint"] }
