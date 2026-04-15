@@ -1183,6 +1183,7 @@ mod tests {
 
     #[tokio::test]
     async fn try_pushdown_sort_returns_unsupported_for_non_column_expr() {
+        use arrow::compute::SortOptions;
         use datafusion::common::ScalarValue;
         use datafusion::physical_expr::expressions::Literal;
         use datafusion::physical_plan::SortOrderPushdownResult;
@@ -1202,7 +1203,7 @@ mod tests {
         let exec = build_exec(client, Arc::clone(&cookie_store));
         let sort_expr = PhysicalSortExpr {
             expr: Arc::new(Literal::new(ScalarValue::Int64(Some(1)))),
-            options: Default::default(),
+            options: SortOptions::default(),
         };
         let result = exec
             .try_pushdown_sort(&[sort_expr])
@@ -1217,6 +1218,7 @@ mod tests {
 
     #[tokio::test]
     async fn try_pushdown_sort_returns_exact_for_column_expr() {
+        use arrow::compute::SortOptions;
         use datafusion::physical_expr::expressions::Column;
         use datafusion::physical_plan::SortOrderPushdownResult;
 
@@ -1235,7 +1237,7 @@ mod tests {
         let exec = build_exec_multi_col(client, Arc::clone(&cookie_store));
         let sort_expr = PhysicalSortExpr {
             expr: Arc::new(Column::new("a", 0)),
-            options: Default::default(),
+            options: SortOptions::default(),
         };
         let result = exec
             .try_pushdown_sort(&[sort_expr])

@@ -276,8 +276,7 @@ fn classify_mssql_filter(filter: &Expr) -> TableProviderFilterPushDown {
             }
         }
         Expr::InList(in_list) => {
-            if is_time_related_expr(&in_list.expr)
-                || in_list.list.iter().any(|e| is_time_related_expr(e))
+            if is_time_related_expr(&in_list.expr) || in_list.list.iter().any(is_time_related_expr)
             {
                 TableProviderFilterPushDown::Unsupported
             } else {
