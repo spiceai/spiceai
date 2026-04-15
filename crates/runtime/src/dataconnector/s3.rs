@@ -200,20 +200,26 @@ impl DataConnectorFactory for S3Factory {
                 // Skip AWS SDK initialization - use explicit auth method directly
             } else {
                 let iam_role_source = params.parameters.get("iam_role_source").expose().ok();
-                match iam_role_source {
-                    Some("metadata" | "env") => {
-                        // Restricted IAM role source - build a custom config instead
-                        // of using the global SDK config. The object store registry
-                        // will handle the restricted source when building credentials.
-                    }
-                    _ => {
-                        // Initialize global AWS SDK for default credential chain.
-                        if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
-                        {
-                            tracing::warn!(
-                                "Unable to initialize AWS credentials for S3 connector: {err}"
-                            );
-                        }
+                if let Some("metadata" | "env") = iam_role_source {
+                    // Restricted IAM role source - build a custom config instead
+                    // of using the global SDK config. The object store registry
+                    // will handle the restricted source when building credentials.
+                } else {
+                    let region = params
+                        .parameters
+                        .get("region")
+                        .expose()
+                        .ok()
+                        .map(ToString::to_string);
+                    // Initialize global AWS SDK for default credential chain.
+                    if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config_with_region(
+                        region.as_deref(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            "Unable to initialize AWS credentials for S3 connector: {err}"
+                        );
                     }
                 }
             }

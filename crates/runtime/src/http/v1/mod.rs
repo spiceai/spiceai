@@ -39,7 +39,10 @@ use std::sync::Arc;
 
 use crate::{
     component::dataset::Dataset,
-    datafusion::{DataFusion, query::QueryBuilder},
+    datafusion::{
+        DataFusion,
+        query::{QueryBuilder, write_to_json_string, write_to_json_value},
+    },
     status::ComponentStatus,
 };
 use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
@@ -341,15 +344,7 @@ fn status_to_x_cache_value(results_cache_status: CacheStatus) -> Option<HeaderVa
 
 /// Converts a vector of `RecordBatch` to a JSON string.
 fn arrow_to_json(data: &[RecordBatch]) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let buf = Vec::new();
-    let mut writer = arrow_json::ArrayWriter::new(buf);
-
-    writer
-        .write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())
-        .boxed()?;
-    writer.finish().boxed()?;
-
-    String::from_utf8(writer.into_inner()).boxed()
+    write_to_json_string(data)
 }
 
 /// Converts a vector of `RecordBatch` to a CSV string.
@@ -377,16 +372,6 @@ fn arrow_to_vnd_sql_json_v1(
     data: &[RecordBatch],
     meta: ResponseMetadata,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let buf = Vec::new();
-    let mut writer = arrow_json::ArrayWriter::new(buf);
-
-    // Convert manually instead of reusing arrow_to_json
-    // to avoid an extra serialization-deserialization cycle
-    writer
-        .write_batches(data.iter().collect::<Vec<&RecordBatch>>().as_slice())
-        .boxed()?;
-    writer.finish().boxed()?;
-
     // Calculate total row count across all batches
     let row_count = data.iter().map(RecordBatch::num_rows).sum::<usize>();
 
@@ -400,7 +385,7 @@ fn arrow_to_vnd_sql_json_v1(
     let mut result = json!({
         "row_count": row_count,
         "schema": schema_json,
-        "data": serde_json::from_slice::<serde_json::Value>(&writer.into_inner()).boxed()?,
+        "data": write_to_json_value(data)?,
     });
 
     if let Some(sql) = meta.sql {
