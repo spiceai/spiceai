@@ -5702,6 +5702,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-flightsql"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "arrow-ipc",
+ "arrow-schema",
+ "arrow_tools",
+ "async-stream",
+ "bytes",
+ "datafusion",
+ "futures",
+ "http 1.4.0",
+ "moka",
+ "postcard",
+ "prost 0.14.3",
+ "serde",
+ "snafu",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "util",
+ "uuid 1.21.0",
+]
+
+[[package]]
 name = "datafusion-functions"
 version = "52.5.0"
 source = "git+https://github.com/spiceai/datafusion.git?rev=c434c7b5a4e1ddb3137f1cea8da1006c514ae889#c434c7b5a4e1ddb3137f1cea8da1006c514ae889"
