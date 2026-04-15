@@ -3,7 +3,7 @@
 # The enterprise version is ent_build_and_release.yml
 # This file is kept only to prevent merge conflicts with upstream.
 # ============================================================================
-name: "build_and_release (upstream - disabled)"
+name: 'build_and_release (upstream - disabled)'
 
 on: [workflow_dispatch]
 
