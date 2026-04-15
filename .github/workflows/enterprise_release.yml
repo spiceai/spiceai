@@ -68,7 +68,7 @@ jobs:
           echo "release_branch=$BRANCH" >> $GITHUB_OUTPUT
 
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ steps.validate.outputs.release_branch }}
           fetch-depth: 0
@@ -151,7 +151,7 @@ jobs:
             required: false
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ needs.validate-inputs.outputs.release_branch }}
 
@@ -205,7 +205,7 @@ jobs:
             type: schema
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ needs.validate-inputs.outputs.release_branch }}
           fetch-depth: 0
@@ -220,7 +220,7 @@ jobs:
 
       - name: Upload changelog artifact
         if: matrix.artifact.type == 'changelog'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: changelog
           path: |
@@ -240,7 +240,7 @@ jobs:
 
       - name: Upload schema artifact
         if: matrix.artifact.type == 'schema'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: json-schema
           path: .schema/spicepod.schema.json
@@ -291,12 +291,12 @@ jobs:
       release_url: ${{ steps.create-release.outputs.url }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ needs.validate-inputs.outputs.release_branch }}
 
       - name: Download changelog artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: changelog
           path: docs/release_notes/
@@ -335,7 +335,7 @@ jobs:
             workflow: ent_build_and_release_cuda.yml
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ needs.validate-inputs.outputs.release_branch }}
 
@@ -372,7 +372,7 @@ jobs:
       docker_run_id: ${{ steps.trigger.outputs.run_id }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ needs.validate-inputs.outputs.release_branch }}
 
@@ -498,7 +498,7 @@ jobs:
       name: aws-marketplace
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ needs.validate-inputs.outputs.release_branch }}
 
@@ -540,7 +540,7 @@ jobs:
       name: release-finalization
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ needs.validate-inputs.outputs.release_branch }}
 

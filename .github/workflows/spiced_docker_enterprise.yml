@@ -117,11 +117,11 @@ jobs:
         if: ${{ needs.setup.outputs.run_amd64 != 'true' }}
         run: echo "Skipping AMD64 image build per workflow configuration."
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           driver-opts: |
             image=moby/buildkit:latest
@@ -135,7 +135,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_amd64 == 'true' }}
       - &build-amd64-image
         name: Package AMD64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
           file: Dockerfile-release.enterprise
@@ -160,7 +160,7 @@ jobs:
       - *build-amd64-image
 
       - name: Upload AMD64 artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: images-amd64
           path: /tmp/image-amd64-*.tar
@@ -173,7 +173,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 != 'true' }}
         run: echo "Skipping ARM64 image build per workflow configuration."
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: Install docker
@@ -199,7 +199,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           driver-opts: |
             image=moby/buildkit:latest
@@ -213,7 +213,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_arm64 == 'true' }}
       - &build-arm64-image
         name: Package ARM64 ${{ env.IMAGE_TAG }} image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
           file: Dockerfile-release.enterprise
@@ -238,7 +238,7 @@ jobs:
       - *build-arm64-image
 
       - name: Upload ARM64 artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: images-arm64
           path: /tmp/image-arm64-*.tar
@@ -256,11 +256,11 @@ jobs:
         if: ${{ needs.setup.outputs.run_cuda != 'true' }}
         run: echo "Skipping CUDA image build per workflow configuration."
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           driver-opts: |
             image=moby/buildkit:latest
@@ -274,7 +274,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Package CUDA models image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
           file: Dockerfile-cuda-release.enterprise
@@ -291,7 +291,7 @@ jobs:
         if: ${{ needs.setup.outputs.run_cuda == 'true' }}
 
       - name: Upload CUDA artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: images-amd64-cuda
           path: /tmp/images-amd64-cuda.tar
@@ -309,14 +309,14 @@ jobs:
     steps:
       - name: Download AMD64 artifacts
         if: needs.setup.outputs.run_amd64 == 'true'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: images-amd64
           path: /tmp
 
       - name: Download ARM64 artifacts
         if: needs.setup.outputs.run_arm64 == 'true'
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: images-arm64
           path: /tmp
@@ -326,7 +326,7 @@ jobs:
           ls -l /tmp
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Start local registry
         run: |
@@ -334,7 +334,7 @@ jobs:
 
       - name: Login to GitHub Package Registry
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
@@ -395,7 +395,7 @@ jobs:
           done
 
       - name: Get spicehq scoped GitHub access token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
         id: github-app-token
         with:
           app-id: ${{ secrets.SPICEHQ_INTERNAL_GITHUB_APP_ID }}
@@ -428,7 +428,7 @@ jobs:
       PUBLISH: ${{ needs.setup.outputs.publish }}
     steps:
       - name: Download CUDA artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: images-amd64-cuda
           path: /tmp
@@ -438,7 +438,7 @@ jobs:
           ls -l /tmp
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Start local registry
         run: |
@@ -446,7 +446,7 @@ jobs:
 
       - name: Login to GitHub Package Registry
         if: needs.setup.outputs.publish == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
