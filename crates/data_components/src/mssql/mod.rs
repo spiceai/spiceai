@@ -74,6 +74,11 @@ pub enum Error {
     FailedToDowncastBuilder { mssql_type: String },
 
     #[snafu(display(
+        "Failed to convert SQL Server timestamp {v} to Arrow nanosecond timestamp: value is outside the supported range (~1677-2262)"
+    ))]
+    FailedToConvertTimestampToNanos { v: String },
+
+    #[snafu(display(
         "Failed to generate SQL for SQL Server query: {}",
         format_datafusion_error(source)
     ))]
