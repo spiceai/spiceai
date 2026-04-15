@@ -1638,13 +1638,12 @@ mod tests {
     async fn test_classify_table_provider_error_matches_typed_foreign_table_error_in_chain() {
         let dataset =
             make_dataset("databricks:catalog.schema.foreign_table", "foreign_table").await;
-        let source: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::other(
-            sql_warehouse::Error::ForeignTableOnClassicWarehouse {
+        let source: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(sql_warehouse::Error::ForeignTableOnClassicWarehouse {
                 dataset_name: "catalog.schema.foreign_table".to_string(),
                 message: "[UNSUPPORTED_DATA_SOURCE] foreign tables require Pro or Serverless"
                     .to_string(),
-            },
-        ));
+            });
 
         let err = classify_table_provider_error(&dataset, source);
 

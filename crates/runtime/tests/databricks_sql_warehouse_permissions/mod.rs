@@ -14,25 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Integration tests for Databricks SQL Warehouse permissions and warehouse-type
-//! interactions, mirroring the nine cases exercised by
-//! `data/test-app-databricks/spicepod.yaml`.
+//! Integration tests for Databricks SQL Warehouse schema discovery across
+//! different permission levels and warehouse types.
 //!
-//! **Required environment variables** (all must be non-empty):
-//!   - `TEST_DATABRICKS_HOST`
-//!   - `TEST_DATABRICKS_PRO_WAREHOUSE_ID`        — a Pro/Serverless warehouse
-//!   - `TEST_DATABRICKS_CLASSIC_WAREHOUSE_ID`    — a Classic warehouse
+//! All Pro-warehouse cases (1–8) load in a **single Runtime** so the
+//! warehouse only needs to wake once. The Classic-warehouse case (9) runs
+//! separately because it uses a different warehouse + auth.
+//!
+//! **Required environment variables:**
+//!   - `TEST_DATABRICKS_PERMISSIONS_HOST`
+//!   - `TEST_DATABRICKS_PRO_WAREHOUSE_ID`
+//!   - `TEST_DATABRICKS_CLASSIC_WAREHOUSE_ID`
 //!   - `TEST_DATABRICKS_SP_WITH_INFOSCHEMA_CLIENT_ID`
 //!   - `TEST_DATABRICKS_SP_WITH_INFOSCHEMA_CLIENT_SECRET`
 //!   - `TEST_DATABRICKS_SP_WITHOUT_INFOSCHEMA_CLIENT_ID`
 //!   - `TEST_DATABRICKS_SP_WITHOUT_INFOSCHEMA_CLIENT_SECRET`
-//!   - `TEST_DATABRICKS_TOKEN_CLASSIC`           — PAT with access to the Classic warehouse
-//!
-//! The test catalog/schema layout expected in the Databricks workspace:
-//!   - `test_scp_permissions.test_scp.table_case1`          — UC managed table
-//!   - `test_scp_permissions.test_scp.table_case2`          — UC managed table
-//!   - `neon_pg_foreign_viktor.public.test_schema_repro`    — Lakehouse Federation foreign table
-//!   - `neon_pg_foreign_viktor.public.test_schema_repro_2`  — Lakehouse Federation foreign table
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,81 +43,64 @@ use crate::{
     utils::{register_test_connectors, test_request_context},
 };
 
-const LOAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// 15 minutes — enough for a cold warehouse to wake up + run queries.
+const LOAD_TIMEOUT: Duration = Duration::from_secs(900);
 
 #[expect(clippy::expect_used)]
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"))
 }
 
-#[derive(Clone, Copy)]
-enum Sp {
-    WithInfoSchema,
-    WithoutInfoSchema,
-}
-
-#[derive(Clone, Copy)]
-enum Warehouse {
-    Pro,
-    Classic,
-}
-
-#[derive(Clone, Copy)]
-enum Auth {
-    ServicePrincipal(Sp),
-    /// PAT token — used for the Classic-warehouse foreign-table case.
-    TokenClassic,
-}
-
-fn make_params(auth: Auth, warehouse: Warehouse) -> Params {
-    let endpoint = env("TEST_DATABRICKS_HOST");
-    let sql_warehouse_id = match warehouse {
-        Warehouse::Pro => env("TEST_DATABRICKS_PRO_WAREHOUSE_ID"),
-        Warehouse::Classic => env("TEST_DATABRICKS_CLASSIC_WAREHOUSE_ID"),
+fn make_sp_dataset(path: &str, name: &str, with_infoschema: bool) -> Dataset {
+    let endpoint = env("TEST_DATABRICKS_PERMISSIONS_HOST");
+    let warehouse_id = env("TEST_DATABRICKS_PRO_WAREHOUSE_ID");
+    let (client_id, client_secret) = if with_infoschema {
+        (
+            env("TEST_DATABRICKS_SP_WITH_INFOSCHEMA_CLIENT_ID"),
+            env("TEST_DATABRICKS_SP_WITH_INFOSCHEMA_CLIENT_SECRET"),
+        )
+    } else {
+        (
+            env("TEST_DATABRICKS_SP_WITHOUT_INFOSCHEMA_CLIENT_ID"),
+            env("TEST_DATABRICKS_SP_WITHOUT_INFOSCHEMA_CLIENT_SECRET"),
+        )
     };
 
-    let mut params = vec![
-        ("mode".to_string(), "sql_warehouse".to_string()),
-        ("databricks_endpoint".to_string(), endpoint),
-        ("databricks_sql_warehouse_id".to_string(), sql_warehouse_id),
-        ("client_timeout".to_string(), "120s".to_string()),
-    ];
-
-    match auth {
-        Auth::ServicePrincipal(Sp::WithInfoSchema) => {
-            params.push((
-                "databricks_client_id".to_string(),
-                env("TEST_DATABRICKS_SP_WITH_INFOSCHEMA_CLIENT_ID"),
-            ));
-            params.push((
-                "databricks_client_secret".to_string(),
-                env("TEST_DATABRICKS_SP_WITH_INFOSCHEMA_CLIENT_SECRET"),
-            ));
-        }
-        Auth::ServicePrincipal(Sp::WithoutInfoSchema) => {
-            params.push((
-                "databricks_client_id".to_string(),
-                env("TEST_DATABRICKS_SP_WITHOUT_INFOSCHEMA_CLIENT_ID"),
-            ));
-            params.push((
-                "databricks_client_secret".to_string(),
-                env("TEST_DATABRICKS_SP_WITHOUT_INFOSCHEMA_CLIENT_SECRET"),
-            ));
-        }
-        Auth::TokenClassic => {
-            params.push((
-                "databricks_token".to_string(),
-                env("TEST_DATABRICKS_TOKEN_CLASSIC"),
-            ));
-        }
-    }
-
-    Params::from_string_map(params.into_iter().collect())
+    let mut dataset = Dataset::new(format!("databricks:{path}"), name.to_string());
+    dataset.params = Some(Params::from_string_map(
+        vec![
+            ("mode".to_string(), "sql_warehouse".to_string()),
+            ("databricks_endpoint".to_string(), endpoint),
+            ("databricks_sql_warehouse_id".to_string(), warehouse_id),
+            ("databricks_client_id".to_string(), client_id),
+            ("databricks_client_secret".to_string(), client_secret),
+            ("client_timeout".to_string(), "120s".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    dataset
 }
 
-fn make_dataset(path: &str, name: &str, auth: Auth, warehouse: Warehouse) -> Dataset {
+fn make_classic_dataset(path: &str, name: &str) -> Dataset {
+    let endpoint = env("TEST_DATABRICKS_PERMISSIONS_HOST");
+    let warehouse_id = env("TEST_DATABRICKS_CLASSIC_WAREHOUSE_ID");
+    let client_id = env("TEST_DATABRICKS_SP_WITH_INFOSCHEMA_CLIENT_ID");
+    let client_secret = env("TEST_DATABRICKS_SP_WITH_INFOSCHEMA_CLIENT_SECRET");
+
     let mut dataset = Dataset::new(format!("databricks:{path}"), name.to_string());
-    dataset.params = Some(make_params(auth, warehouse));
+    dataset.params = Some(Params::from_string_map(
+        vec![
+            ("mode".to_string(), "sql_warehouse".to_string()),
+            ("databricks_endpoint".to_string(), endpoint),
+            ("databricks_sql_warehouse_id".to_string(), warehouse_id),
+            ("databricks_client_id".to_string(), client_id),
+            ("databricks_client_secret".to_string(), client_secret),
+            ("client_timeout".to_string(), "120s".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    ));
     dataset
 }
 
@@ -166,16 +145,28 @@ fn assert_error(rt: &Runtime, name: &str, expected_substring: Option<&str>) {
     }
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ── Pro warehouse: all 8 permission cases in one Runtime ───────────────────
 
-async fn run_single_dataset_test<F>(
-    test_name: &str,
-    dataset: Dataset,
-    check: F,
-) -> Result<(), anyhow::Error>
-where
-    F: FnOnce(&Runtime),
-{
+/// Cases 1–8: UC-native and foreign tables with varying service principal
+/// permissions, all using the Pro SQL warehouse. Loads all datasets in a
+/// single Runtime so the warehouse only wakes once.
+///
+/// | Case | Table type | SP              | Expected |
+/// |------|-----------|-----------------|----------|
+/// | 1    | UC-native | with_infoschema | Ready    |
+/// | 2    | UC-native | with_infoschema (no table access) | Error |
+/// | 3    | UC-native | without_infoschema | Ready (DESCRIBE fallback) |
+/// | 4    | UC-native | without_infoschema (no table access) | Error |
+/// | 5    | Foreign   | with_infoschema | Ready    |
+/// | 6    | Foreign   | with_infoschema (no table access) | Error |
+/// | 7    | Foreign   | without_infoschema | Ready (DESCRIBE fallback) |
+/// | 8    | Foreign   | without_infoschema (no table access) | Error |
+#[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
+async fn databricks_permissions_pro_warehouse() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
     let _ = rustls::crypto::CryptoProvider::install_default(
@@ -183,182 +174,80 @@ where
     );
 
     test_request_context()
-        .scope(async move {
-            let app = AppBuilder::new(test_name).with_dataset(dataset).build();
+        .scope(async {
+            let app = AppBuilder::new("databricks_permissions_pro")
+                // Case 1: UC-native, full access
+                .with_dataset(make_sp_dataset(
+                    "test_scp_permissions.test_scp.table_case1",
+                    "uc_native_full_access",
+                    true,
+                ))
+                // Case 2: UC-native, infoschema but no table access
+                .with_dataset(make_sp_dataset(
+                    "test_scp_permissions.test_scp.table_case2",
+                    "uc_native_infoschema_only",
+                    true,
+                ))
+                // Case 3: UC-native, table but no infoschema access
+                .with_dataset(make_sp_dataset(
+                    "test_scp_permissions.test_scp.table_case1",
+                    "uc_native_table_only",
+                    false,
+                ))
+                // Case 4: UC-native, no access
+                .with_dataset(make_sp_dataset(
+                    "test_scp_permissions.test_scp.table_case2",
+                    "uc_native_no_access",
+                    false,
+                ))
+                // Case 5: Foreign, full access
+                .with_dataset(make_sp_dataset(
+                    "neon_pg_foreign_viktor.public.test_schema_repro",
+                    "foreign_full_access",
+                    true,
+                ))
+                // Case 6: Foreign, infoschema but no table access
+                .with_dataset(make_sp_dataset(
+                    "neon_pg_foreign_viktor.public.test_schema_repro_2",
+                    "foreign_infoschema_only",
+                    true,
+                ))
+                // Case 7: Foreign, table but no infoschema access
+                .with_dataset(make_sp_dataset(
+                    "neon_pg_foreign_viktor.public.test_schema_repro",
+                    "foreign_table_only",
+                    false,
+                ))
+                // Case 8: Foreign, no access
+                .with_dataset(make_sp_dataset(
+                    "neon_pg_foreign_viktor.public.test_schema_repro_2",
+                    "foreign_no_access",
+                    false,
+                ))
+                .build();
+
             configure_test_datafusion();
             let rt = Runtime::builder().with_app(app).build().await;
             load_with_timeout(&rt).await?;
-            check(&rt);
+
+            // Cases that should succeed
+            assert_ready(&rt, "uc_native_full_access"); // Case 1
+            assert_ready(&rt, "uc_native_table_only"); // Case 3
+            assert_ready(&rt, "foreign_full_access"); // Case 5
+            assert_ready(&rt, "foreign_table_only"); // Case 7
+
+            // Cases that should fail
+            assert_error(&rt, "uc_native_infoschema_only", None); // Case 2
+            assert_error(&rt, "uc_native_no_access", None); // Case 4
+            assert_error(&rt, "foreign_infoschema_only", None); // Case 6
+            assert_error(&rt, "foreign_no_access", None); // Case 8
+
             Ok(())
         })
         .await
 }
 
-// ── UC-Native tests ────────────────────────────────────────────────────────
-
-/// Case 1: UC-native table, SP with both info_schema and table access → Ready.
-#[tokio::test]
-#[cfg_attr(
-    not(feature = "extended_tests"),
-    ignore = "Extended test - run with --features extended_tests"
-)]
-async fn uc_native_full_access() -> Result<(), anyhow::Error> {
-    run_single_dataset_test(
-        "databricks_permissions_uc_native_full_access",
-        make_dataset(
-            "test_scp_permissions.test_scp.table_case1",
-            "uc_native_full_access",
-            Auth::ServicePrincipal(Sp::WithInfoSchema),
-            Warehouse::Pro,
-        ),
-        |rt| assert_ready(rt, "uc_native_full_access"),
-    )
-    .await
-}
-
-/// Case 2: UC-native table, SP has info_schema access but NOT table access → Error.
-#[tokio::test]
-#[cfg_attr(
-    not(feature = "extended_tests"),
-    ignore = "Extended test - run with --features extended_tests"
-)]
-async fn uc_native_infoschema_access_without_table_access() -> Result<(), anyhow::Error> {
-    run_single_dataset_test(
-        "databricks_permissions_uc_native_infoschema_only",
-        make_dataset(
-            "test_scp_permissions.test_scp.table_case2",
-            "uc_native_infoschema_only",
-            Auth::ServicePrincipal(Sp::WithInfoSchema),
-            Warehouse::Pro,
-        ),
-        |rt| assert_error(rt, "uc_native_infoschema_only", None),
-    )
-    .await
-}
-
-/// Case 3: UC-native table, SP has table access but NOT info_schema access → Ready (fallback to DESCRIBE TABLE).
-#[tokio::test]
-#[cfg_attr(
-    not(feature = "extended_tests"),
-    ignore = "Extended test - run with --features extended_tests"
-)]
-async fn uc_native_table_access_without_infoschema_access() -> Result<(), anyhow::Error> {
-    run_single_dataset_test(
-        "databricks_permissions_uc_native_table_only",
-        make_dataset(
-            "test_scp_permissions.test_scp.table_case1",
-            "uc_native_table_only",
-            Auth::ServicePrincipal(Sp::WithoutInfoSchema),
-            Warehouse::Pro,
-        ),
-        |rt| assert_ready(rt, "uc_native_table_only"),
-    )
-    .await
-}
-
-/// Case 4: UC-native table, SP has no access → Error.
-#[tokio::test]
-#[cfg_attr(
-    not(feature = "extended_tests"),
-    ignore = "Extended test - run with --features extended_tests"
-)]
-async fn uc_native_no_access() -> Result<(), anyhow::Error> {
-    run_single_dataset_test(
-        "databricks_permissions_uc_native_no_access",
-        make_dataset(
-            "test_scp_permissions.test_scp.table_case2",
-            "uc_native_no_access",
-            Auth::ServicePrincipal(Sp::WithoutInfoSchema),
-            Warehouse::Pro,
-        ),
-        |rt| assert_error(rt, "uc_native_no_access", None),
-    )
-    .await
-}
-
-// ── Foreign (Lakehouse Federation) tests ───────────────────────────────────
-
-/// Case 5: Foreign table, SP with both info_schema and table access → Ready.
-#[tokio::test]
-#[cfg_attr(
-    not(feature = "extended_tests"),
-    ignore = "Extended test - run with --features extended_tests"
-)]
-async fn foreign_full_access() -> Result<(), anyhow::Error> {
-    run_single_dataset_test(
-        "databricks_permissions_foreign_full_access",
-        make_dataset(
-            "neon_pg_foreign_viktor.public.test_schema_repro",
-            "foreign_full_access",
-            Auth::ServicePrincipal(Sp::WithInfoSchema),
-            Warehouse::Pro,
-        ),
-        |rt| assert_ready(rt, "foreign_full_access"),
-    )
-    .await
-}
-
-/// Case 6: Foreign table, SP has info_schema access but NOT table access → Error.
-#[tokio::test]
-#[cfg_attr(
-    not(feature = "extended_tests"),
-    ignore = "Extended test - run with --features extended_tests"
-)]
-async fn foreign_infoschema_access_without_table_access() -> Result<(), anyhow::Error> {
-    run_single_dataset_test(
-        "databricks_permissions_foreign_infoschema_only",
-        make_dataset(
-            "neon_pg_foreign_viktor.public.test_schema_repro_2",
-            "foreign_infoschema_only",
-            Auth::ServicePrincipal(Sp::WithInfoSchema),
-            Warehouse::Pro,
-        ),
-        |rt| assert_error(rt, "foreign_infoschema_only", None),
-    )
-    .await
-}
-
-/// Case 7: Foreign table, SP has table access but NOT info_schema access → Ready (fallback).
-#[tokio::test]
-#[cfg_attr(
-    not(feature = "extended_tests"),
-    ignore = "Extended test - run with --features extended_tests"
-)]
-async fn foreign_table_access_without_infoschema_access() -> Result<(), anyhow::Error> {
-    run_single_dataset_test(
-        "databricks_permissions_foreign_table_only",
-        make_dataset(
-            "neon_pg_foreign_viktor.public.test_schema_repro",
-            "foreign_table_only",
-            Auth::ServicePrincipal(Sp::WithoutInfoSchema),
-            Warehouse::Pro,
-        ),
-        |rt| assert_ready(rt, "foreign_table_only"),
-    )
-    .await
-}
-
-/// Case 8: Foreign table, SP has no access → Error.
-#[tokio::test]
-#[cfg_attr(
-    not(feature = "extended_tests"),
-    ignore = "Extended test - run with --features extended_tests"
-)]
-async fn foreign_no_access() -> Result<(), anyhow::Error> {
-    run_single_dataset_test(
-        "databricks_permissions_foreign_no_access",
-        make_dataset(
-            "neon_pg_foreign_viktor.public.test_schema_repro_2",
-            "foreign_no_access",
-            Auth::ServicePrincipal(Sp::WithoutInfoSchema),
-            Warehouse::Pro,
-        ),
-        |rt| assert_error(rt, "foreign_no_access", None),
-    )
-    .await
-}
-
-// ── Classic warehouse + foreign table ──────────────────────────────────────
+// ── Classic warehouse: foreign table error detection ───────────────────────
 
 /// Case 9: Foreign table on a Classic SQL warehouse → Error with actionable
 /// message mentioning "Lakehouse Federation foreign table".
@@ -367,22 +256,33 @@ async fn foreign_no_access() -> Result<(), anyhow::Error> {
     not(feature = "extended_tests"),
     ignore = "Extended test - run with --features extended_tests"
 )]
-async fn foreign_on_classic_warehouse_surfaces_clear_error() -> Result<(), anyhow::Error> {
-    run_single_dataset_test(
-        "databricks_permissions_foreign_on_classic",
-        make_dataset(
-            "neon_pg_foreign_viktor.public.test_schema_repro",
-            "foreign_on_classic",
-            Auth::TokenClassic,
-            Warehouse::Classic,
-        ),
-        |rt| {
+async fn databricks_permissions_classic_foreign_table() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
+
+    test_request_context()
+        .scope(async {
+            let app = AppBuilder::new("databricks_permissions_classic_foreign")
+                .with_dataset(make_classic_dataset(
+                    "neon_pg_foreign_viktor.public.test_schema_repro",
+                    "foreign_on_classic",
+                ))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            load_with_timeout(&rt).await?;
+
             assert_error(
-                rt,
+                &rt,
                 "foreign_on_classic",
                 Some("Lakehouse Federation foreign table"),
             );
-        },
-    )
-    .await
+
+            Ok(())
+        })
+        .await
 }
