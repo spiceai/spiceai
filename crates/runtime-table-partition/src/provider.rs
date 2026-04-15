@@ -27,7 +27,7 @@ use datafusion::{
     datasource::TableType,
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{TableProviderFilterPushDown, dml::InsertOp},
+    logical_expr::{BinaryExpr, Operator, TableProviderFilterPushDown, dml::InsertOp},
     physical_expr::{OrderingRequirements, PhysicalSortExpr},
     physical_plan::{
         DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr, PlanProperties,
@@ -117,6 +117,41 @@ impl PartitionTableProvider {
             Ok(TreeNodeRecursion::Continue)
         });
         contains
+    }
+
+    /// Returns `true` if the filter exclusively compares partition expressions to
+    /// literal values using equality, and `prune_partition` can fully resolve the
+    /// filter via partition metadata alone.
+    ///
+    /// Only the shapes that `prune_partition` handles exactly are accepted:
+    /// - Single equality: `partition_expr = literal`
+    /// - OR-chains of equalities: `partition_expr = lit1 OR partition_expr = lit2`
+    /// - AND of partition-expression equalities across different expressions
+    ///
+    /// Shapes that are NOT accepted (because `prune_partition` cannot fully
+    /// resolve them for transform partition expressions like `bucket()`):
+    /// - Inequalities: `partition_expr != lit`, `partition_expr > lit`, etc.
+    /// - `InList`: `partition_expr IN (lit1, lit2)` or `NOT IN`
+    /// - Base-column filters: `org_id = 100`
+    fn is_partition_expression_filter(filter: &Expr, partition_exprs: &[PartitionedBy]) -> bool {
+        match filter {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
+                Operator::Eq => {
+                    let is_partition_expr_vs_literal = |a: &Expr, b: &Expr| -> bool {
+                        partition_exprs.iter().any(|p| a == &p.expression)
+                            && matches!(b, Expr::Literal(..))
+                    };
+                    is_partition_expr_vs_literal(left, right)
+                        || is_partition_expr_vs_literal(right, left)
+                }
+                Operator::Or | Operator::And => {
+                    Self::is_partition_expression_filter(left, partition_exprs)
+                        && Self::is_partition_expression_filter(right, partition_exprs)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     /// Creates a new [`PartitionTableProvider`] that partitions the data using
@@ -275,7 +310,22 @@ impl TableProvider for PartitionTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        self.creator.supports_filters_pushdown(filters)
+        let creator_results = self.creator.supports_filters_pushdown(filters)?;
+
+        Ok(filters
+            .iter()
+            .zip(creator_results)
+            .map(|(filter, creator_result)| {
+                // Filters that directly compare a partition expression to literals
+                // (e.g. bucket(50, org_id) = '5') are fully resolved by partition
+                // pruning — no row-level FilterExec is needed.
+                if Self::is_partition_expression_filter(filter, &self.partition_by) {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    creator_result
+                }
+            })
+            .collect())
     }
 
     async fn scan(
@@ -345,13 +395,21 @@ impl TableProvider for PartitionTableProvider {
         let data_filters: Vec<_> = filters
             .iter()
             .zip(filter_columns_cache.iter())
-            .filter(|(_filter, filter_cols)| {
+            .filter(|(filter, filter_cols)| {
                 // If this filter references only a simple partition column, exclude it
                 if filter_cols.len() == 1
                     && let Some(col) = filter_cols.iter().next()
                     && simple_partition_cols.contains(col)
                 {
                     return false; // Exclude from data filters
+                }
+                // Exclude filters that directly compare a partition expression to
+                // literal values (e.g. bucket(50, org_id) = '5' OR bucket(50, org_id) = '13').
+                // Partition pruning already guarantees only matching partitions are
+                // scanned, so re-evaluating the transform per-row is redundant and
+                // can be extremely expensive for large datasets.
+                if Self::is_partition_expression_filter(filter, &self.partition_by) {
+                    return false;
                 }
                 // For all other cases (transform expressions, multiple columns, etc.), keep as data filter
                 true
@@ -1264,5 +1322,403 @@ mod tests {
         // The actual data filtering verification would require executing the plan
         // and checking the results, which is beyond the scope of a unit test.
         // Integration tests should verify that the correct data is returned.
+    }
+
+    /// A wrapper around [`MemTable`] that records what filters are passed to
+    /// its `scan` method, used to verify that partition-expression filters are
+    /// NOT redundantly forwarded as data filters.
+    #[derive(Debug)]
+    struct FilterTrackingProvider {
+        inner: MemTable,
+        recorded_filters: Arc<std::sync::Mutex<Vec<Vec<Expr>>>>,
+    }
+
+    impl FilterTrackingProvider {
+        fn new(inner: MemTable, tracker: Arc<std::sync::Mutex<Vec<Vec<Expr>>>>) -> Self {
+            Self {
+                inner,
+                recorded_filters: tracker,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TableProvider for FilterTrackingProvider {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn schema(&self) -> SchemaRef {
+            self.inner.schema()
+        }
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+            self.recorded_filters
+                .lock()
+                .expect("lock poisoned")
+                .push(filters.to_vec());
+            self.inner.scan(state, projection, filters, limit).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bucket_partition_expr_filter_not_passed_as_data_filter() {
+        // Regression test: when a filter directly compares the partition expression
+        // to a literal (e.g. `bucket(3, user_id) = 0`), it must NOT be forwarded
+        // as a data filter to partition scans.  Doing so forces an expensive
+        // per-row hash evaluation that is redundant after partition pruning.
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("user_id", DataType::Int32, false),
+        ]));
+
+        let batch0 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+            ],
+        )
+        .expect("failed to create batch");
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 4])),
+                Arc::new(Int32Array::from(vec![15, 25])),
+            ],
+        )
+        .expect("failed to create batch");
+
+        let tracker: Arc<std::sync::Mutex<Vec<Vec<Expr>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let partitions_data: Vec<(ScalarValue, Arc<dyn TableProvider>)> = vec![
+            (
+                ScalarValue::Int32(Some(0)),
+                Arc::new(FilterTrackingProvider::new(
+                    MemTable::try_new(Arc::clone(&schema), vec![vec![batch0]])
+                        .expect("failed to create MemTable"),
+                    Arc::clone(&tracker),
+                )),
+            ),
+            (
+                ScalarValue::Int32(Some(1)),
+                Arc::new(FilterTrackingProvider::new(
+                    MemTable::try_new(Arc::clone(&schema), vec![vec![batch1]])
+                        .expect("failed to create MemTable"),
+                    Arc::clone(&tracker),
+                )),
+            ),
+        ];
+
+        let creator = Arc::new(MockCreator {
+            partitions_data: Arc::new(RwLock::new(partitions_data)),
+        });
+
+        let bucket_udf = Arc::new(ScalarUDF::new_from_impl(
+            runtime_datafusion_udfs::bucket::Bucket::new(),
+        ));
+        let partition_expr = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::clone(&bucket_udf),
+            args: vec![lit(10i32), col("user_id")],
+        });
+
+        let partition_by = PartitionedBy {
+            name: "bucket_10_user_id".to_string(),
+            expression: partition_expr.clone(),
+        };
+
+        let provider =
+            PartitionTableProvider::new(creator, vec![partition_by], Arc::clone(&schema))
+                .await
+                .expect("failed to create provider");
+
+        // Filter: bucket(10, user_id) = 0  — a partition-expression filter
+        let filters = vec![partition_expr.eq(lit(0i32))];
+
+        let session_state = datafusion::execution::context::SessionContext::new().state();
+        let _plan = provider
+            .scan(&session_state, None, &filters, None)
+            .await
+            .expect("scan failed");
+
+        // Only one partition should have been scanned (pruning works)
+        let recorded = tracker.lock().expect("lock poisoned");
+        assert_eq!(
+            recorded.len(),
+            1,
+            "Expected exactly 1 partition scanned, got {}",
+            recorded.len()
+        );
+
+        // The partition scan should receive NO filters — the bucket expression
+        // filter is fully resolved by pruning and must not be a data filter.
+        assert!(
+            recorded[0].is_empty(),
+            "Expected no data filters passed to partition scan, but got: {:?}",
+            recorded[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bucket_partition_or_chain_not_passed_as_data_filter() {
+        // Regression test: an OR-chain of bucket partition expression equalities
+        // (e.g. `bucket(3, user_id) = 0 OR bucket(3, user_id) = 1`) must NOT be
+        // forwarded as a data filter.
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("user_id", DataType::Int32, false),
+        ]));
+
+        let batch0 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![10])),
+            ],
+        )
+        .expect("failed to create batch");
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![2])),
+                Arc::new(Int32Array::from(vec![20])),
+            ],
+        )
+        .expect("failed to create batch");
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![3])),
+                Arc::new(Int32Array::from(vec![30])),
+            ],
+        )
+        .expect("failed to create batch");
+
+        let tracker: Arc<std::sync::Mutex<Vec<Vec<Expr>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let partitions_data: Vec<(ScalarValue, Arc<dyn TableProvider>)> = vec![
+            (
+                ScalarValue::Int32(Some(0)),
+                Arc::new(FilterTrackingProvider::new(
+                    MemTable::try_new(Arc::clone(&schema), vec![vec![batch0]])
+                        .expect("failed to create MemTable"),
+                    Arc::clone(&tracker),
+                )),
+            ),
+            (
+                ScalarValue::Int32(Some(1)),
+                Arc::new(FilterTrackingProvider::new(
+                    MemTable::try_new(Arc::clone(&schema), vec![vec![batch1]])
+                        .expect("failed to create MemTable"),
+                    Arc::clone(&tracker),
+                )),
+            ),
+            (
+                ScalarValue::Int32(Some(2)),
+                Arc::new(FilterTrackingProvider::new(
+                    MemTable::try_new(Arc::clone(&schema), vec![vec![batch2]])
+                        .expect("failed to create MemTable"),
+                    Arc::clone(&tracker),
+                )),
+            ),
+        ];
+
+        let creator = Arc::new(MockCreator {
+            partitions_data: Arc::new(RwLock::new(partitions_data)),
+        });
+
+        let bucket_udf = Arc::new(ScalarUDF::new_from_impl(
+            runtime_datafusion_udfs::bucket::Bucket::new(),
+        ));
+        let partition_expr = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::clone(&bucket_udf),
+            args: vec![lit(3i32), col("user_id")],
+        });
+
+        let partition_by = PartitionedBy {
+            name: "bucket_3_user_id".to_string(),
+            expression: partition_expr.clone(),
+        };
+
+        let provider =
+            PartitionTableProvider::new(creator, vec![partition_by], Arc::clone(&schema))
+                .await
+                .expect("failed to create provider");
+
+        // Filter: bucket(3, user_id) = 0 OR bucket(3, user_id) = 1
+        let filters = vec![
+            partition_expr
+                .clone()
+                .eq(lit(0i32))
+                .or(partition_expr.eq(lit(1i32))),
+        ];
+
+        let session_state = datafusion::execution::context::SessionContext::new().state();
+        let _plan = provider
+            .scan(&session_state, None, &filters, None)
+            .await
+            .expect("scan failed");
+
+        // 2 partitions should match (0 and 1), partition 2 pruned.
+        let recorded = tracker.lock().expect("lock poisoned");
+        assert_eq!(
+            recorded.len(),
+            2,
+            "Expected 2 partitions scanned, got {}",
+            recorded.len()
+        );
+
+        // Neither scanned partition should receive the bucket filter as a data filter
+        for (idx, filters) in recorded.iter().enumerate() {
+            assert!(
+                filters.is_empty(),
+                "Partition {idx}: expected no data filters, got: {filters:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_base_column_filter_still_passed_as_data_filter_for_bucket_partition() {
+        // Correctness test: when the filter is on the base column (e.g. user_id = 100)
+        // and the partition is bucket(3, user_id), the filter MUST still be forwarded
+        // as a data filter — multiple user_ids can hash to the same bucket.
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("user_id", DataType::Int32, false),
+        ]));
+
+        let tracker: Arc<std::sync::Mutex<Vec<Vec<Expr>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Create partitions for all possible bucket values (0, 1, 2) so `user_id = 100`
+        // is guaranteed to match one regardless of which bucket the hash maps to.
+        let mut partitions_data: Vec<(ScalarValue, Arc<dyn TableProvider>)> = Vec::new();
+        for bucket_val in 0..3i32 {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from(vec![bucket_val + 1])),
+                    Arc::new(Int32Array::from(vec![100 + bucket_val])),
+                ],
+            )
+            .expect("failed to create batch");
+
+            partitions_data.push((
+                ScalarValue::Int32(Some(bucket_val)),
+                Arc::new(FilterTrackingProvider::new(
+                    MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                        .expect("failed to create MemTable"),
+                    Arc::clone(&tracker),
+                )),
+            ));
+        }
+
+        let creator = Arc::new(MockCreator {
+            partitions_data: Arc::new(RwLock::new(partitions_data)),
+        });
+
+        let bucket_udf = Arc::new(ScalarUDF::new_from_impl(
+            runtime_datafusion_udfs::bucket::Bucket::new(),
+        ));
+        let partition_expr = Expr::ScalarFunction(ScalarFunction {
+            func: bucket_udf,
+            args: vec![lit(3i32), col("user_id")],
+        });
+
+        let partition_by = PartitionedBy {
+            name: "bucket_3_user_id".to_string(),
+            expression: partition_expr,
+        };
+
+        let provider =
+            PartitionTableProvider::new(creator, vec![partition_by], Arc::clone(&schema))
+                .await
+                .expect("failed to create provider");
+
+        // Filter: user_id = 100 — base column, NOT partition expression
+        let filters = vec![col("user_id").eq(lit(100i32))];
+
+        let session_state = datafusion::execution::context::SessionContext::new().state();
+        let _plan = provider
+            .scan(&session_state, None, &filters, None)
+            .await
+            .expect("scan failed");
+
+        let recorded = tracker.lock().expect("lock poisoned");
+        // At least one partition scanned
+        assert!(
+            !recorded.is_empty(),
+            "Expected at least one partition to be scanned"
+        );
+
+        // The data filter `user_id = 100` MUST be present (correctness requirement)
+        for (idx, filters) in recorded.iter().enumerate() {
+            assert!(
+                !filters.is_empty(),
+                "Partition {idx}: expected data filter user_id=100 to be passed through",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_supports_filters_pushdown_exact_for_partition_expr_filter() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("user_id", DataType::Int32, false),
+        ]));
+
+        let creator = Arc::new(MockCreator {
+            partitions_data: Arc::new(RwLock::new(vec![])),
+        });
+
+        let bucket_udf = Arc::new(ScalarUDF::new_from_impl(
+            runtime_datafusion_udfs::bucket::Bucket::new(),
+        ));
+        let partition_expr = Expr::ScalarFunction(ScalarFunction {
+            func: bucket_udf,
+            args: vec![lit(3i32), col("user_id")],
+        });
+
+        let partition_by = PartitionedBy {
+            name: "bucket_3_user_id".to_string(),
+            expression: partition_expr.clone(),
+        };
+
+        let provider =
+            PartitionTableProvider::new(creator, vec![partition_by], Arc::clone(&schema))
+                .await
+                .expect("failed to create provider");
+
+        // Partition expression filter → Exact
+        let partition_filter = partition_expr.eq(lit(0i32));
+        // Base column filter → Inexact (delegated to creator)
+        let base_filter = col("user_id").eq(lit(100i32));
+
+        let results = provider
+            .supports_filters_pushdown(&[&partition_filter, &base_filter])
+            .expect("supports_filters_pushdown failed");
+
+        assert_eq!(
+            results[0],
+            TableProviderFilterPushDown::Exact,
+            "Partition expression filter should be Exact"
+        );
+        assert_eq!(
+            results[1],
+            TableProviderFilterPushDown::Inexact,
+            "Base column filter should be Inexact (delegated to creator)"
+        );
     }
 }

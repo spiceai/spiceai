@@ -1,0 +1,9 @@
+---
+source: crates/runtime-table-partition/tests/partition_table_provider.rs
+expression: explain_plan
+---
+AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
+  CoalescePartitionsExec
+    AggregateExec: mode=Partial, gby=[], aggr=[count(Int64(1))]
+      RepartitionExec: partitioning=RoundRobinBatch(32), input_partitions=1
+        PartitionMemTableExec: partition_values=[Int64(0)]
