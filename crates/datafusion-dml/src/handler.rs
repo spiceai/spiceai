@@ -79,45 +79,66 @@ pub struct MergeParams {
 /// Handlers are paired with [`crate::DmlExtensionNode`] and the shared,
 /// stateless [`crate::DmlExtensionPlanner`].
 ///
-/// All returned plans should follow the standard DML output contract: a
+/// This trait models DML as an **optional overlay** over `DataFusion`'s
+/// default DML machinery. Implementors return `Ok(Some(plan))` when they want
+/// to intercept/augment execution for an operation, or `Ok(None)` to opt out
+/// and let default planning/execution proceed.
+///
+/// Any returned plan should follow the standard DML output contract: a
 /// single-row result with a non-null `count: UInt64` column.
 #[async_trait]
 pub trait CatalogDmlHandler: fmt::Debug + Send + Sync {
     /// Short identifier used for diagnostics (e.g. `"cayenne"`).
     fn name(&self) -> &'static str;
 
-    /// Build an [`ExecutionPlan`] for `DELETE`.
+    /// Build an overlay [`ExecutionPlan`] for `DELETE`.
     ///
     /// `physical_inputs` are the already-planned children from `DataFusion`
     /// (for example, filtered table scans for distributed forwarding paths).
+    ///
+    /// Default implementation opts out (`Ok(None)`).
     async fn delete_exec(
         &self,
-        params: DeleteParams,
-        physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
-        session_state: &SessionState,
-    ) -> DFResult<Arc<dyn ExecutionPlan>>;
+        _params: DeleteParams,
+        _physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
+        _session_state: &SessionState,
+    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
+    }
 
-    /// Build an [`ExecutionPlan`] for `UPDATE`.
+    /// Build an overlay [`ExecutionPlan`] for `UPDATE`.
+    ///
+    /// Default implementation opts out (`Ok(None)`).
     async fn update_exec(
         &self,
-        params: UpdateParams,
-        physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
-        session_state: &SessionState,
-    ) -> DFResult<Arc<dyn ExecutionPlan>>;
+        _params: UpdateParams,
+        _physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
+        _session_state: &SessionState,
+    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
+    }
 
-    /// Build an [`ExecutionPlan`] for `INSERT`.
+    /// Build an overlay [`ExecutionPlan`] for `INSERT`.
+    ///
+    /// Default implementation opts out (`Ok(None)`).
     async fn insert_exec(
         &self,
-        params: InsertParams,
-        physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
-        session_state: &SessionState,
-    ) -> DFResult<Arc<dyn ExecutionPlan>>;
+        _params: InsertParams,
+        _physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
+        _session_state: &SessionState,
+    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
+    }
 
-    /// Build an [`ExecutionPlan`] for `MERGE`.
+    /// Build an overlay [`ExecutionPlan`] for `MERGE`.
+    ///
+    /// Default implementation opts out (`Ok(None)`).
     async fn merge_exec(
         &self,
-        params: MergeParams,
-        physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
-        session_state: &SessionState,
-    ) -> DFResult<Arc<dyn ExecutionPlan>>;
+        _params: MergeParams,
+        _physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
+        _session_state: &SessionState,
+    ) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+        Ok(None)
+    }
 }

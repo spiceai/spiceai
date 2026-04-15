@@ -32,6 +32,9 @@ use crate::node::{DmlExtensionNode, DmlNodeOp};
 /// Matches any [`DmlExtensionNode`] and delegates to the handler embedded in
 /// that node. Because the handler is carried by the node itself, one planner
 /// instance can serve all registered catalog handlers.
+///
+/// If the handler opts out (`Ok(None)`), this planner also returns `Ok(None)`
+/// so another extension planner (or caller-level fallback logic) can proceed.
 #[derive(Debug, Default)]
 pub struct DmlExtensionPlanner;
 
@@ -49,35 +52,31 @@ impl ExtensionPlanner for DmlExtensionPlanner {
             return Ok(None);
         };
 
-        let physical_inputs = physical_inputs.to_vec();
-
-        let exec = match &dml_node.op {
+        match &dml_node.op {
             DmlNodeOp::Delete(params) => {
                 dml_node
                     .handler
-                    .delete_exec(params.clone(), physical_inputs, session_state)
-                    .await?
+                    .delete_exec(params.clone(), physical_inputs.to_vec(), session_state)
+                    .await
             }
             DmlNodeOp::Update(params) => {
                 dml_node
                     .handler
-                    .update_exec(params.clone(), physical_inputs, session_state)
-                    .await?
+                    .update_exec(params.clone(), physical_inputs.to_vec(), session_state)
+                    .await
             }
             DmlNodeOp::Insert(params) => {
                 dml_node
                     .handler
-                    .insert_exec(params.clone(), physical_inputs, session_state)
-                    .await?
+                    .insert_exec(params.clone(), physical_inputs.to_vec(), session_state)
+                    .await
             }
             DmlNodeOp::Merge(params) => {
                 dml_node
                     .handler
-                    .merge_exec(*params.clone(), physical_inputs, session_state)
-                    .await?
+                    .merge_exec(*params.clone(), physical_inputs.to_vec(), session_state)
+                    .await
             }
-        };
-
-        Ok(Some(exec))
+        }
     }
 }
