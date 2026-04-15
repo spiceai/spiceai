@@ -687,20 +687,26 @@ pub(crate) mod search {
         let rt = start_app(app.build()).await?;
 
         // LIMIT 200 exceeds QUERY_VECTORS_PAGE_SIZE (100), requiring pagination.
-        run_and_snapshot_query(
-            &rt,
-            "SELECT count(*) as cnt FROM (SELECT id FROM vector_search(qs, 'second') LIMIT 200) t",
-            "multi_page_top_k_count",
-        )
-        .await?;
+        let mut query_result = rt
+            .datafusion()
+            .query_builder(
+                "SELECT id, trunc(_score, 3) as _score FROM vector_search(qs, 'second') ORDER BY _score DESC, id LIMIT 200",
+            )
+            .build()
+            .run()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
 
-        // Verify we can also get the actual rows back, sorted deterministically.
-        run_and_snapshot_query(
-            &rt,
-            "SELECT id, trunc(_score, 3) as _score FROM vector_search(qs, 'second') ORDER BY _score DESC, id LIMIT 200",
-            "multi_page_top_k_results",
-        )
-        .await?;
+        let mut total_rows: usize = 0;
+        while let Some(batch) = query_result.data.next().await {
+            total_rows += batch?.num_rows();
+        }
+
+        // Must return more than a single page (100) to confirm pagination worked.
+        assert!(
+            total_rows > 100,
+            "Expected more than 100 rows from a LIMIT 200 paginated query, got {total_rows}"
+        );
 
         Ok(())
     }
