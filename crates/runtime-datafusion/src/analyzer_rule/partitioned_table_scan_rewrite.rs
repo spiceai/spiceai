@@ -260,13 +260,19 @@ fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, D
     // These nodes are not dropped: they are cloned into each union leg *before*
     // per-leg TopK sort. This is required for qualified expressions like `p.name`
     // and projection aliases used by ORDER BY.
+    //
+    // We also preserve any SubqueryAlias wrappers directly above the rebuilt Union
+    // so outer qualified refs (e.g. `taxi_trips.col`) remain resolvable after
+    // federation rewrites replace union legs with Federated nodes.
     let mut current = sort.input.as_ref();
     let mut between_sort_and_union: Vec<LogicalPlan> = Vec::new();
+    let mut union_level_aliases: Vec<TableReference> = Vec::new();
     let union_plan = loop {
         match current {
             LogicalPlan::Union(u) => break u,
             LogicalPlan::SubqueryAlias(sa) => {
                 between_sort_and_union.push(LogicalPlan::SubqueryAlias(sa.clone()));
+                union_level_aliases.push(sa.alias.clone());
                 current = sa.input.as_ref();
             }
             LogicalPlan::Projection(p) => {
@@ -323,11 +329,18 @@ fn push_sort_topk_into_union(limit: Limit) -> Result<Transformed<LogicalPlan>, D
         .collect::<Result<Vec<_>, DataFusionError>>()?;
 
     // Rebuild: Union(per-leg Sort(TopK over reconstructed leg subtree))
-    // -> original outer Sort -> [Projection|SubqueryAlias]* -> Limit.
+    // -> [preserved SubqueryAlias wrappers] -> original outer Sort
+    // -> [Projection|SubqueryAlias]* -> Limit.
     let mut result = LogicalPlan::Union(Union {
         inputs: new_inputs,
         schema: Arc::clone(sort.input.schema()),
     });
+
+    // Preserve SubqueryAlias wrappers that originally sat between Sort and Union.
+    // This keeps qualified refs above the Union resolvable.
+    for alias in union_level_aliases.into_iter().rev() {
+        result = LogicalPlanBuilder::from(result).alias(alias)?.build()?;
+    }
 
     // Re-add the Sort node.
     result = LogicalPlan::Sort(Sort {
