@@ -22,6 +22,10 @@ runs:
         echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
         echo "SCCACHE_CONF=${HOME}/.config/sccache/config" >> $GITHUB_ENV
 
+    - name: Configure apt mirrors (Linux)
+      if: runner.os == 'Linux' && inputs.minio_endpoint != ''
+      uses: ./.github/actions/configure-apt
+
     - name: Set up sccache (Linux)
       if: runner.os == 'Linux' && inputs.minio_endpoint != ''
       shell: bash
