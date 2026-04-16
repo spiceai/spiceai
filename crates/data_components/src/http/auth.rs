@@ -399,8 +399,10 @@ async fn read_bounded_error_body(mut response: reqwest::Response) -> String {
                     break;
                 }
             }
-            Ok(None) => break,
-            Err(_) => break,
+            // End of body (Ok(None)) or a network error mid-stream (Err(_))
+            // both stop the read with whatever we have so far — an error
+            // diagnostic from the token endpoint is best-effort by design.
+            Ok(None) | Err(_) => break,
         }
     }
     let text = String::from_utf8_lossy(&raw);
