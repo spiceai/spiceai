@@ -460,14 +460,20 @@ mod tests {
         ]);
         // HTTP exporter with headers should build successfully
         let result = create_http_exporter("http://localhost:4318/v1/metrics", &headers);
-        assert!(result.is_ok(), "HTTP exporter with headers should build: {result:?}");
+        assert!(
+            result.is_ok(),
+            "HTTP exporter with headers should build: {result:?}"
+        );
     }
 
     #[test]
     fn test_create_http_exporter_without_headers() {
         let headers = HashMap::new();
         let result = create_http_exporter("http://localhost:4318/v1/metrics", &headers);
-        assert!(result.is_ok(), "HTTP exporter without headers should build: {result:?}");
+        assert!(
+            result.is_ok(),
+            "HTTP exporter without headers should build: {result:?}"
+        );
     }
 
     #[test]
@@ -477,27 +483,37 @@ mod tests {
             ("x-custom-header".to_string(), "value".to_string()),
         ]);
         let result = create_grpc_exporter("http://localhost:4317", &headers);
-        assert!(result.is_ok(), "gRPC exporter with valid headers should build: {result:?}");
+        assert!(
+            result.is_ok(),
+            "gRPC exporter with valid headers should build: {result:?}"
+        );
     }
 
     #[test]
     fn test_create_grpc_exporter_without_headers() {
         let headers = HashMap::new();
         let result = create_grpc_exporter("http://localhost:4317", &headers);
-        assert!(result.is_ok(), "gRPC exporter without headers should build: {result:?}");
+        assert!(
+            result.is_ok(),
+            "gRPC exporter without headers should build: {result:?}"
+        );
     }
 
     #[test]
     fn test_create_grpc_exporter_rejects_invalid_metadata_key() {
         // gRPC metadata keys must be lowercase ASCII
-        let headers = HashMap::from([
-            ("Invalid Key With Spaces".to_string(), "value".to_string()),
-        ]);
+        let headers = HashMap::from([("Invalid Key With Spaces".to_string(), "value".to_string())]);
         let result = create_grpc_exporter("http://localhost:4317", &headers);
         assert!(result.is_err());
         let err = result.expect_err("should fail with invalid metadata key");
         let msg = err.to_string();
-        assert!(msg.contains("Invalid gRPC metadata key"), "Error should mention invalid key: {msg}");
-        assert!(msg.contains("lowercase ASCII"), "Error should hint about lowercase ASCII: {msg}");
+        assert!(
+            msg.contains("Invalid gRPC metadata key"),
+            "Error should mention invalid key: {msg}"
+        );
+        assert!(
+            msg.contains("lowercase ASCII"),
+            "Error should hint about lowercase ASCII: {msg}"
+        );
     }
 }
