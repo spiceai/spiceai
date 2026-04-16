@@ -9,8 +9,10 @@ runs:
       uses: ./.github/actions/configure-apt
 
     - name: Install Databricks ODBC driver
+      if: runner.os == 'Linux'
       shell: bash
       run: |
+        sudo apt-get update
         sudo apt-get install unixodbc unixodbc-dev unzip libsasl2-modules-gssapi-mit -y
         wget https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/odbc/2.8.2/SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
         unzip SimbaSparkODBC-2.8.2.1013-Debian-64bit.zip
@@ -25,6 +27,7 @@ runs:
         sudo cp /tmp/odbcinst.ini /etc/odbcinst.ini
 
     - name: Install Athena ODBC driver
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         sudo apt-get install alien -y

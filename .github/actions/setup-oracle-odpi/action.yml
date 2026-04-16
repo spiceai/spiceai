@@ -8,6 +8,7 @@ runs:
       uses: ./.github/actions/configure-apt
 
     - name: Install Oracle Instant Client
+      if: runner.os == 'Linux'
       shell: bash
       run: |
         sudo apt-get update

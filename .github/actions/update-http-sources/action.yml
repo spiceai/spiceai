@@ -11,7 +11,15 @@ runs:
       uses: ./.github/actions/configure-apt
 
     - name: Use HTTPS in apt sources
+      if: runner.os == 'Linux'
       shell: bash
       run: |
-        sudo sed -i 's|http://|https://|g' /etc/apt/sources.list
+        # Classic sources.list (pre-noble / when present)
+        if [ -f /etc/apt/sources.list ]; then
+          sudo sed -i 's|http://|https://|g' /etc/apt/sources.list
+        fi
+        # deb822 format used by Ubuntu 24.04+ (noble)
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+          sudo sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources
+        fi
         sudo apt-get update
