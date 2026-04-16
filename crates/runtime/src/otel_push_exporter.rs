@@ -476,8 +476,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_create_grpc_exporter_with_valid_headers() {
+    #[tokio::test]
+    async fn test_create_grpc_exporter_with_valid_headers() {
         let headers = HashMap::from([
             ("api-key".to_string(), "test-key".to_string()),
             ("x-custom-header".to_string(), "value".to_string()),
@@ -489,8 +489,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_create_grpc_exporter_without_headers() {
+    #[tokio::test]
+    async fn test_create_grpc_exporter_without_headers() {
         let headers = HashMap::new();
         let result = create_grpc_exporter("http://localhost:4317", &headers);
         assert!(
