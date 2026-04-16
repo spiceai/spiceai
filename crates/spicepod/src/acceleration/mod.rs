@@ -313,6 +313,10 @@ pub struct Acceleration {
         serialize_with = "serialize_partition_by",
         deserialize_with = "deserialize_partition_by"
     )]
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(with = "Vec<crate::partitioning::PartitionedBySchema>")
+    )]
     pub partition_by: Vec<PartitionedBy>,
 
     /// Enables snapshots for this dataset, requires the top-level config `snapshots` to be defined.

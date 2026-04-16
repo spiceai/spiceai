@@ -38,6 +38,10 @@ pub struct VectorStore {
         skip_serializing_if = "Vec::is_empty",
         deserialize_with = "deserialize_partition_by"
     )]
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(with = "Vec<crate::partitioning::PartitionedBySchema>")
+    )]
     pub partition_by: Vec<PartitionedBy>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]

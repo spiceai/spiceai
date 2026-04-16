@@ -26,6 +26,23 @@ pub struct PartitionedBy {
     pub expression: String,
 }
 
+/// Schema-only helper that describes the accepted YAML/JSON shapes for a
+/// `partition_by` list item: either a plain expression string
+/// (e.g. `"YEAR(created_at)"` or `"bucket(10, user_id)"`) or a single-entry
+/// object mapping a partition name to an expression
+/// (e.g. `{ year: "YEAR(created_at)" }`).
+///
+/// This type is only used to generate an accurate JSON schema for the custom
+/// `deserialize_partition_by` deserializer; it is not used at runtime.
+#[cfg(feature = "schemars")]
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+pub enum PartitionedBySchema {
+    Expression(String),
+    Named(std::collections::HashMap<String, String>),
+}
+
 pub fn deserialize_partition_by<'de, D>(deserializer: D) -> Result<Vec<PartitionedBy>, D::Error>
 where
     D: Deserializer<'de>,
