@@ -24,6 +24,7 @@ use cache::CacheProvider;
 use cache::result::embeddings::CachedEmbeddingResult;
 use model2vec_rs::model::StaticModel;
 use std::fmt::{Debug, Formatter};
+use std::io::{Error as IoError, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use util::home_dir::home_dir;
@@ -137,8 +138,14 @@ fn looks_like_local_model_path(name: &str) -> bool {
 fn local_model_path(name: &str) -> Result<Option<PathBuf>, super::embeddings::Error> {
     if let Some(home_relative_path) = name.strip_prefix("~/").or_else(|| name.strip_prefix("~\\")) {
         let Some(home_dir) = home_dir() else {
-            return Err(LocalModelPathDoesNotExist {
-                path: name.to_string(),
+            return Err(FailedToInstantiateEmbeddingModel {
+                source: IoError::new(
+                    ErrorKind::NotFound,
+                    format!(
+                        "Unable to resolve home directory while expanding local model path '{name}'"
+                    ),
+                )
+                .into(),
             });
         };
 
@@ -246,7 +253,7 @@ mod tests {
     use async_openai::types::embeddings::EmbeddingInput;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::looks_like_local_model_path;
+    use super::{home_dir, local_model_path, looks_like_local_model_path};
 
     #[test]
     fn detects_local_model_paths() {
@@ -277,7 +284,7 @@ mod tests {
             .expect_err("missing local model path should fail before Hugging Face lookup");
 
         assert!(
-            matches!(err, Error::LocalModelPathDoesNotExist { path } if path == missing_path),
+            matches!(err, Error::LocalModelPathDoesNotExist { ref path } if path == &missing_path),
             "unexpected error: {err}"
         );
     }
