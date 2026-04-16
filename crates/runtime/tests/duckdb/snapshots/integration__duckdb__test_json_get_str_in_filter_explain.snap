@@ -13,6 +13,6 @@ expression: pretty
 |               |     SchemaCastScanExec                                                 |
 |               |       CooperativeExec                                                  |
 |               |         BytesProcessedExec                                             |
-|               |           DuckSqlExec sql= SELECT "id", "data" FROM json_test          |
+|               |           DuckSqlExec sql= SELECT "id", "data" FROM "json_test"        |
 |               |                                                                        |
 +---------------+------------------------------------------------------------------------+
