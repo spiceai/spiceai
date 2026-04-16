@@ -54,11 +54,7 @@ const FIELD_ALIASES: &[(&str, &str, &str)] = &[
     ("access", "mode", "#/$defs/AccessMode"),
     // `#[serde(alias = "eviction_policy")] pub caching_policy: CachingPolicy`
     // on `CacheConfig`, `SQLResultsCacheConfig`, and `ResultsCache`.
-    (
-        "caching_policy",
-        "eviction_policy",
-        "#/$defs/CachingPolicy",
-    ),
+    ("caching_policy", "eviction_policy", "#/$defs/CachingPolicy"),
 ];
 
 /// Recursively walks the schema and, for every `properties` object that has a

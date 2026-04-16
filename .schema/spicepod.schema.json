@@ -2592,10 +2592,13 @@
           "type": "string"
         },
         {
+          "description": "A single-entry mapping `{ name: expression }`. The deserializer only\naccepts objects with exactly one entry, so constrain the schema to\n`minProperties = 1` / `maxProperties = 1` to catch invalid configs.",
           "type": "object",
           "additionalProperties": {
             "type": "string"
-          }
+          },
+          "minProperties": 1,
+          "maxProperties": 1
         }
       ]
     },
