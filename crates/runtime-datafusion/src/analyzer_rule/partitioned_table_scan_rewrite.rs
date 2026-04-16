@@ -890,7 +890,7 @@ mod tests {
 
         assert_eq!(
             plan_str.matches("SubqueryAlias: p").count(),
-            2,
+            3, // each leg, then one above union.
             "expected each union leg to preserve alias 'p', got:\n{plan_str}"
         );
     }
