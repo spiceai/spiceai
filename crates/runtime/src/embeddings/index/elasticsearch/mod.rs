@@ -68,28 +68,39 @@ pub async fn try_from_table(
     secrets: Arc<RwLock<Secrets>>,
 ) -> Result<ElasticsearchIndex, Box<dyn std::error::Error + Send + Sync>> {
     let inner_schema = inner_table_provider.schema();
-    let primary_keys: Vec<String> = config
-        .row_ids
-        .clone()
-        .unwrap_or_else(|| get_primary_keys(inner_table_provider).unwrap_or_default());
+    let primary_keys: Vec<String> = match config.row_ids.clone() {
+        Some(row_ids) => row_ids,
+        None => get_primary_keys(inner_table_provider)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
+    };
+
+    if primary_keys.is_empty() {
+        return Err(Box::<dyn std::error::Error + Send + Sync>::from(format!(
+            "Failed to resolve primary key columns for dataset {ds_name}: no primary key columns were configured or derived."
+        )));
+    }
 
     // Normalize LargeUtf8 → Utf8 for primary key fields: the Elasticsearch HTTP client
     // always returns string data as Arrow Utf8 (StringArray), so the schema must match.
     let primary_key: Vec<_> = primary_keys
         .iter()
-        .filter_map(|c| {
-            let (_, f) = inner_schema.column_with_name(c.as_str())?;
+        .map(|c| {
+            let (_, f) = inner_schema.column_with_name(c.as_str()).ok_or_else(|| {
+                Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                    "Failed to configure primary key for dataset {ds_name}: column '{c}' does not exist in the dataset schema."
+                ))
+            })?;
             if f.data_type() == &DataType::LargeUtf8 {
-                Some(arrow_schema::Field::new(
+                Ok(arrow_schema::Field::new(
                     f.name(),
                     DataType::Utf8,
                     f.is_nullable(),
                 ))
             } else {
-                Some(f.clone())
+                Ok(f.clone())
             }
         })
-        .collect();
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()?;
 
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
 
