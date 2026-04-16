@@ -21,6 +21,10 @@ use crate::dataconnector::listing::{
     LISTING_TABLE_PARAMETERS, ListingTableConnector, build_fragments,
 };
 
+use data_components::http::auth::{
+    ClientAuthMethod, HttpAuthenticator, RefreshTokenAuth, RefreshTokenConfig,
+};
+use secrecy::SecretString;
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -522,8 +526,94 @@ impl Https {
             })
     }
 
+    /// Parse OAuth2 refresh-token parameters.
+    ///
+    /// Returns `Ok(None)` when no auth is configured. Returns an error when
+    /// the auth configuration is incomplete or inconsistent (e.g. a refresh
+    /// token without a token URL).
+    fn resolve_refresh_token_auth(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<Option<(RefreshTokenConfig, SecretString)>> {
+        let token_url = self
+            .params
+            .get("auth_token_url")
+            .expose()
+            .ok()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        let refresh_token = self.params.get("auth_refresh_token").ok();
+
+        match (token_url, refresh_token) {
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "https".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: "'auth_token_url' is set but 'auth_refresh_token' is missing. Provide a refresh token to use OAuth2 auth.".to_string(),
+            }),
+            (None, Some(_)) => Err(DataConnectorError::InvalidConfigurationNoSource {
+                dataconnector: "https".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                message: "'auth_refresh_token' is set but 'auth_token_url' is missing. Provide the OAuth2 token endpoint URL.".to_string(),
+            }),
+            (Some(token_url), Some(refresh_token)) => {
+                let client_id = self
+                    .params
+                    .get("auth_client_id")
+                    .expose()
+                    .ok()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string);
+                let client_secret = self.params.get("auth_client_secret").ok().cloned();
+
+                if client_secret.is_some() && client_id.is_none() {
+                    return Err(DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "https".to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message: "'auth_client_secret' is set but 'auth_client_id' is missing."
+                            .to_string(),
+                    });
+                }
+
+                let scopes = self
+                    .params
+                    .get("auth_scopes")
+                    .expose()
+                    .ok()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string);
+
+                let client_auth = match self.params.get("auth_client_auth").expose().ok() {
+                    Some(v) => ClientAuthMethod::parse(v).map_err(|bad| {
+                        DataConnectorError::InvalidConfigurationNoSource {
+                            dataconnector: "https".to_string(),
+                            connector_component: ConnectorComponent::from(dataset),
+                            message: format!(
+                                "'auth_client_auth' must be 'basic' or 'body', got '{bad}'"
+                            ),
+                        }
+                    })?,
+                    None => ClientAuthMethod::default(),
+                };
+
+                Ok(Some((
+                    RefreshTokenConfig {
+                        token_url: token_url.to_string(),
+                        client_id,
+                        client_secret,
+                        scopes,
+                        client_auth,
+                    },
+                    refresh_token.clone(),
+                )))
+            }
+        }
+    }
+
     /// Create HTTP table provider for JSON API endpoints
-    fn create_http_table_provider(
+    async fn create_http_table_provider(
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
@@ -573,6 +663,18 @@ impl Https {
             connector_component: ConnectorComponent::from(dataset),
             source: e.into(),
         })?;
+
+        if let Some((auth_config, refresh_token)) = self.resolve_refresh_token_auth(dataset)? {
+            let auth = RefreshTokenAuth::try_new(auth_config, refresh_token)
+                .await
+                .map_err(|e| DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: Box::new(e),
+                })?;
+            let auth: Arc<dyn HttpAuthenticator> = Arc::new(auth);
+            provider = provider.with_auth(auth);
+        }
 
         provider = Self::apply_allowed_paths(dataset, provider, allowed_paths)?;
 
@@ -663,7 +765,7 @@ impl DataConnector for Https {
         }
 
         // For JSON API endpoints and other formats, use HttpTableProvider
-        self.create_http_table_provider(dataset)
+        self.create_http_table_provider(dataset).await
     }
 
     fn initialization_for_dataset(&self, dataset: &Dataset) -> ComponentInitialization {
@@ -753,6 +855,19 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .description("Query parameter template for client-driven pagination. Supports {offset}, {limit}, and {page} variables. Example: 'offset={offset}&limit={limit}'. Requires pagination_page_size."),
         ParameterSpec::runtime("pagination_page_size")
             .description("Number of items per page for query-parameter pagination. Must be a positive integer greater than 0. Used to expand {limit} in pagination_query_params and to detect the last page (fewer results than page_size = done)."),
+        ParameterSpec::runtime("auth_token_url")
+            .description("OAuth2 token endpoint URL. When set together with auth_refresh_token, the connector exchanges the refresh token for short-lived access tokens (RFC 6749 §6) and attaches 'Authorization: Bearer <token>' to all data requests. Applies to JSON API endpoints only."),
+        ParameterSpec::component("auth_refresh_token").secret()
+            .description("OAuth2 refresh token exchanged against auth_token_url to obtain access tokens. Required when auth_token_url is set."),
+        ParameterSpec::component("auth_client_id").secret()
+            .description("OAuth2 client_id presented to the token endpoint. Required for confidential clients; optional for public clients."),
+        ParameterSpec::component("auth_client_secret").secret()
+            .description("OAuth2 client_secret presented to the token endpoint. Required when the client is confidential."),
+        ParameterSpec::runtime("auth_scopes")
+            .description("Space-separated OAuth2 scopes requested when refreshing the access token (e.g. 'read:data offline_access'). Optional."),
+        ParameterSpec::runtime("auth_client_auth")
+            .description("How client credentials are sent to the token endpoint: 'basic' (HTTP Basic header, default per RFC 6749 §2.3.1) or 'body' (client_id/client_secret in the form body).")
+            .one_of(&["basic", "body"]),
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters
@@ -901,13 +1016,21 @@ mod tests {
     use tokio::sync::RwLock;
 
     async fn test_connector(file_format: Option<&str>) -> Https {
+        let extra: Vec<(&str, &str)> = match file_format {
+            Some(f) => vec![("file_format", f)],
+            None => Vec::new(),
+        };
+        test_connector_with(&extra).await
+    }
+
+    async fn test_connector_with(extra: &[(&str, &str)]) -> Https {
         let mut params: Vec<(String, SecretString)> = vec![
             ("client_timeout".to_string(), "1".to_string().into()),
             ("connect_timeout".to_string(), "1".to_string().into()),
         ];
 
-        if let Some(file_format) = file_format {
-            params.push(("file_format".to_string(), file_format.to_string().into()));
+        for (k, v) in extra {
+            params.push(((*k).to_string(), (*v).to_string().into()));
         }
 
         let params = Parameters::try_new(
@@ -1019,4 +1142,111 @@ mod tests {
 
         assert_invalid_url_error(error);
     }
+
+    #[tokio::test]
+    async fn resolve_refresh_token_auth_returns_none_when_unset() {
+        let connector = test_connector(None).await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let result = connector
+            .resolve_refresh_token_auth(&dataset)
+            .expect("no auth params should yield Ok(None)");
+        assert!(
+            result.is_none(),
+            "expected None when no auth params are configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_refresh_token_auth_rejects_refresh_token_without_url() {
+        let connector =
+            test_connector_with(&[("http_auth_refresh_token", "rt-only")]).await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let error = connector
+            .resolve_refresh_token_auth(&dataset)
+            .expect_err("refresh token without token URL should be rejected");
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("auth_token_url"),
+                    "expected error to mention auth_token_url, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_refresh_token_auth_rejects_url_without_refresh_token() {
+        let connector = test_connector_with(&[(
+            "auth_token_url",
+            "https://example.com/oauth/token",
+        )])
+        .await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let error = connector
+            .resolve_refresh_token_auth(&dataset)
+            .expect_err("token URL without refresh token should be rejected");
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("auth_refresh_token"),
+                    "expected error to mention auth_refresh_token, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_refresh_token_auth_rejects_secret_without_client_id() {
+        let connector = test_connector_with(&[
+            ("auth_token_url", "https://example.com/oauth/token"),
+            ("http_auth_refresh_token", "rt"),
+            ("http_auth_client_secret", "csec"),
+        ])
+        .await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let error = connector
+            .resolve_refresh_token_auth(&dataset)
+            .expect_err("client_secret without client_id should be rejected");
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("auth_client_id"),
+                    "expected error to mention auth_client_id, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_refresh_token_auth_parses_full_config() {
+        let connector = test_connector_with(&[
+            ("auth_token_url", "https://example.com/oauth/token"),
+            ("http_auth_refresh_token", "rt-seed"),
+            ("http_auth_client_id", "cid"),
+            ("http_auth_client_secret", "csec"),
+            ("auth_scopes", "read:data offline_access"),
+            ("auth_client_auth", "body"),
+        ])
+        .await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let (config, _refresh_token) = connector
+            .resolve_refresh_token_auth(&dataset)
+            .expect("full config should parse")
+            .expect("expected Some(config) when auth params are set");
+
+        assert_eq!(config.token_url, "https://example.com/oauth/token");
+        assert_eq!(config.client_id.as_deref(), Some("cid"));
+        assert!(config.client_secret.is_some());
+        assert_eq!(config.scopes.as_deref(), Some("read:data offline_access"));
+        assert_eq!(config.client_auth, ClientAuthMethod::Body);
+    }
+
 }
