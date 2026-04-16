@@ -2,14 +2,13 @@
 source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
 expression: plan
 ---
-+---------------+-----------------------------------------------------------------------+
-| plan_type     | plan                                                                  |
-+---------------+-----------------------------------------------------------------------+
-| logical_plan  | Sort: scat.finance.records.id ASC NULLS LAST                          |
-|               |   TableScan: scat.finance.records projection=[id, amount]             |
-| physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]   |
-|               |   CooperativeExec                                                     |
-|               |     BytesProcessedExec                                                |
-|               |       FlightSqlExec sql=SELECT id, amount FROM scat.finance.records   |
-|               |                                                                       |
-+---------------+-----------------------------------------------------------------------+
++---------------+----------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                         |
++---------------+----------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: scat.finance.records.id ASC NULLS LAST                                                 |
+|               |   TableScan: scat.finance.records projection=[id, amount]                                    |
+| physical_plan | CooperativeExec                                                                              |
+|               |   BytesProcessedExec                                                                         |
+|               |     FlightSqlExec sql=SELECT id, amount FROM scat.finance.records ORDER BY id ASC NULLS LAST |
+|               |                                                                                              |
++---------------+----------------------------------------------------------------------------------------------+
