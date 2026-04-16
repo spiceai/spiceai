@@ -53,9 +53,6 @@ pub static S3_VECTOR_DISTANCE_NAME: &str = "distance";
 /// Maximum topK results retrievable by a `QueryVector` operation.
 pub use s3_vectors::QUERY_VECTORS_MAX_TOPK as S3_VECTOR_MAX_TOPK;
 
-/// Maximum number of results returned per page in a `QueryVectors` API call.
-pub use s3_vectors::QUERY_VECTORS_PAGE_SIZE as S3_VECTOR_PAGE_SIZE;
-
 /// Maximum number of keys per `GetVectors` API call. <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
 pub static GET_VECTORS_MAX_KEYS: usize = 100;
 
@@ -128,10 +125,9 @@ impl TableProvider for S3VectorsQueryTable {
                 S3_VECTOR_MAX_TOPK
             }
             Some(Ok(l)) => l,
-            // Conversion failed (limit > i32::MAX) — clamp to max
-            Some(Err(_)) => S3_VECTOR_MAX_TOPK,
-            // No limit specified — default to one page of results
-            None => S3_VECTOR_PAGE_SIZE,
+            // Conversion failed (limit > i32::MAX) — clamp to max. No limit
+            // specified — default to the API maximum.
+            Some(Err(_)) | None => S3_VECTOR_MAX_TOPK,
         };
         return Ok(Arc::new(S3VectorsQueryExec::new(
             &self.table,
@@ -828,12 +824,7 @@ mod tests {
 
     #[test]
     fn test_s3_vector_max_topk_value() {
-        assert_eq!(S3_VECTOR_MAX_TOPK, 10_000);
-    }
-
-    #[test]
-    fn test_s3_vector_page_size_value() {
-        assert_eq!(S3_VECTOR_PAGE_SIZE, 100);
+        assert_eq!(S3_VECTOR_MAX_TOPK, 100);
     }
 
     #[test]
@@ -897,7 +888,7 @@ mod tests {
 
         let session_state = SessionContext::new().state();
 
-        // Test with limit exceeding S3_VECTOR_MAX_TOPK (10_000)
+        // Test with limit exceeding S3_VECTOR_MAX_TOPK (100)
         // The scan should clamp the limit to S3_VECTOR_MAX_TOPK
         let plan = query_table
             .scan(&session_state, None, &[], Some(20_000))
@@ -910,7 +901,7 @@ mod tests {
             .downcast_ref::<S3VectorsQueryExec>()
             .expect("should be S3VectorsQueryExec");
 
-        // The limit should be clamped to S3_VECTOR_MAX_TOPK (10_000)
+        // The limit should be clamped to S3_VECTOR_MAX_TOPK (100)
         assert_eq!(exec.limit, S3_VECTOR_MAX_TOPK);
     }
 
@@ -1040,7 +1031,7 @@ mod tests {
 
         let session_state = SessionContext::new().state();
 
-        // Test with no limit - should default to one page (S3_VECTOR_PAGE_SIZE)
+        // Test with no limit - should default to the API maximum (S3_VECTOR_MAX_TOPK)
         let plan = query_table
             .scan(&session_state, None, &[], None)
             .await
@@ -1052,8 +1043,8 @@ mod tests {
             .downcast_ref::<S3VectorsQueryExec>()
             .expect("should be S3VectorsQueryExec");
 
-        // The limit should be S3_VECTOR_PAGE_SIZE (100)
-        assert_eq!(exec.limit, S3_VECTOR_PAGE_SIZE);
+        // The limit should be S3_VECTOR_MAX_TOPK (100)
+        assert_eq!(exec.limit, S3_VECTOR_MAX_TOPK);
     }
 
     #[test]
@@ -1228,37 +1219,17 @@ mod tests {
             .limit
     }
 
-    #[test]
-    fn test_page_size_less_than_max_topk() {
-        assert!(
-            S3_VECTOR_PAGE_SIZE < S3_VECTOR_MAX_TOPK,
-            "S3_VECTOR_PAGE_SIZE ({S3_VECTOR_PAGE_SIZE}) must be less than S3_VECTOR_MAX_TOPK ({S3_VECTOR_MAX_TOPK})",
-        );
-    }
-
-    #[tokio::test]
-    async fn test_limit_exactly_at_page_size() {
-        let query_table = make_query_table(Arc::new(MockClient::new()));
-        assert_eq!(scan_limit(&query_table, Some(100)).await, 100);
-    }
-
-    #[tokio::test]
-    async fn test_limit_one_above_page_size() {
-        let query_table = make_query_table(Arc::new(MockClient::new()));
-        assert_eq!(scan_limit(&query_table, Some(101)).await, 101);
-    }
-
     #[tokio::test]
     async fn test_limit_exactly_at_max_topk() {
         let query_table = make_query_table(Arc::new(MockClient::new()));
-        assert_eq!(scan_limit(&query_table, Some(10_000)).await, 10_000);
+        assert_eq!(scan_limit(&query_table, Some(100)).await, 100);
     }
 
     #[tokio::test]
     async fn test_limit_one_above_max_topk() {
         let query_table = make_query_table(Arc::new(MockClient::new()));
         assert_eq!(
-            scan_limit(&query_table, Some(10_001)).await,
+            scan_limit(&query_table, Some(101)).await,
             S3_VECTOR_MAX_TOPK
         );
     }
@@ -1296,10 +1267,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_limit_multi_page_boundary() {
+    async fn test_limit_above_max_topk_clamps() {
         let query_table = make_query_table(Arc::new(MockClient::new()));
-        // Exact multiple of page size (e.g. 500 = 5 pages)
-        assert_eq!(scan_limit(&query_table, Some(500)).await, 500);
+        // A request well above the cap clamps to S3_VECTOR_MAX_TOPK.
+        assert_eq!(
+            scan_limit(&query_table, Some(500)).await,
+            S3_VECTOR_MAX_TOPK
+        );
     }
 
     #[test]

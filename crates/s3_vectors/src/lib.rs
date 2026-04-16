@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::{Arc, Mutex};
-
 use async_trait::async_trait;
 use aws_config::SdkConfig;
 
@@ -63,44 +61,10 @@ pub use aws_smithy_types::{DateTime, Document, Number, error::operation::BuildEr
 pub static LIST_VECTORS_MAX_RESULTS: usize = 500;
 pub static PUT_VECTORS_MAX_ITEMS: usize = 500;
 
-/// Maximum number of results returned per page in a `QueryVectors` API call.
-pub static QUERY_VECTORS_PAGE_SIZE: i32 = 100;
-
-/// Maximum topK value for a paginated `QueryVectors` request.
-pub static QUERY_VECTORS_MAX_TOPK: i32 = 10_000;
-
-/// Interceptor that captures the `nextToken` from the `QueryVectors` response body.
-#[derive(Debug)]
-struct CaptureNextToken {
-    captured: Arc<Mutex<Option<String>>>,
-}
-
-impl aws_smithy_runtime_api::client::interceptors::Intercept for CaptureNextToken {
-    fn name(&self) -> &'static str {
-        "CaptureNextToken"
-    }
-
-    fn modify_before_deserialization(
-        &self,
-        context: &mut aws_smithy_runtime_api::client::interceptors::context::BeforeDeserializationInterceptorContextMut<'_>,
-        _runtime_components: &aws_smithy_runtime_api::client::runtime_components::RuntimeComponents,
-        _cfg: &mut aws_smithy_types::config_bag::ConfigBag,
-    ) -> Result<(), aws_smithy_runtime_api::box_error::BoxError> {
-        let body = context.response().body();
-        if let Some(bytes) = body.bytes()
-            && let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes)
-        {
-            let token = json
-                .get("nextToken")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            if let Ok(mut guard) = self.captured.lock() {
-                *guard = token;
-            }
-        }
-        Ok(())
-    }
-}
+/// Maximum topK value for a `QueryVectors` API call. The AWS S3 Vectors
+/// `QueryVectors` operation does not support pagination, so this is also the
+/// maximum number of results that can be returned in a single call.
+pub static QUERY_VECTORS_MAX_TOPK: i32 = 100;
 
 /// Wrapper for `aws_sdk_s3vectors::Client` that implements the `S3Vectors` trait
 #[derive(Debug)]
@@ -332,131 +296,21 @@ impl S3Vectors for Client {
     ) -> Result<QueryVectorsOutput, SdkError<QueryVectorsError>> {
         let top_k = input
             .top_k
-            .unwrap_or(QUERY_VECTORS_PAGE_SIZE)
+            .unwrap_or(QUERY_VECTORS_MAX_TOPK)
             .clamp(1, QUERY_VECTORS_MAX_TOPK);
 
-        if top_k <= QUERY_VECTORS_PAGE_SIZE {
-            return self
-                .client
-                .query_vectors()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_index_name(input.index_name.clone())
-                .set_index_arn(input.index_arn.clone())
-                .set_query_vector(input.query_vector.clone())
-                .top_k(top_k)
-                .set_return_distance(input.return_distance)
-                .set_return_metadata(input.return_metadata)
-                .set_filter(input.filter.clone())
-                .send()
-                .await;
-        }
-
-        // Paginated query: collect results across multiple pages
-        let mut all_vectors = Vec::new();
-        let mut next_token: Option<String> = None;
-        let mut distance_metric = None;
-
-        loop {
-            let captured = Arc::new(Mutex::new(None::<String>));
-            let interceptor = CaptureNextToken {
-                captured: Arc::clone(&captured),
-            };
-
-            let remaining = i32::try_from(
-                usize::try_from(top_k)
-                    .unwrap_or(usize::MAX)
-                    .saturating_sub(all_vectors.len()),
-            )
-            .unwrap_or(QUERY_VECTORS_PAGE_SIZE);
-            let page_top_k = remaining.min(QUERY_VECTORS_PAGE_SIZE);
-
-            let nt = next_token.clone();
-            let result = self
-                .client
-                .query_vectors()
-                .set_vector_bucket_name(input.vector_bucket_name.clone())
-                .set_index_name(input.index_name.clone())
-                .set_index_arn(input.index_arn.clone())
-                .set_query_vector(input.query_vector.clone())
-                .top_k(page_top_k)
-                .set_return_distance(input.return_distance)
-                .set_return_metadata(input.return_metadata)
-                .set_filter(input.filter.clone())
-                .customize()
-                .mutate_request(move |req| {
-                    if let Some(ref token) = nt
-                        && let Some(body_bytes) = req.body().bytes()
-                        && let Ok(mut json) =
-                            serde_json::from_slice::<serde_json::Value>(body_bytes)
-                    {
-                        json["nextToken"] = serde_json::Value::String(token.clone());
-                        if let Ok(new_body) = serde_json::to_vec(&json) {
-                            let content_length = new_body.len();
-                            *req.body_mut() = aws_smithy_types::body::SdkBody::from(new_body);
-                            req.headers_mut()
-                                .insert("content-length", content_length.to_string());
-                        }
-                    }
-                })
-                .interceptor(interceptor)
-                .send()
-                .await;
-
-            let output = match result {
-                Ok(output) => output,
-                Err(e) if next_token.is_none() => {
-                    // First request failed — the account may not support topK > page size.
-                    // Fall back to a single request capped at the page size.
-                    if matches!(
-                        &e,
-                        SdkError::ServiceError(se)
-                            if matches!(se.err(), QueryVectorsError::ValidationException(_))
-                    ) {
-                        return self
-                            .client
-                            .query_vectors()
-                            .set_vector_bucket_name(input.vector_bucket_name.clone())
-                            .set_index_name(input.index_name.clone())
-                            .set_index_arn(input.index_arn.clone())
-                            .set_query_vector(input.query_vector.clone())
-                            .top_k(QUERY_VECTORS_PAGE_SIZE)
-                            .set_return_distance(input.return_distance)
-                            .set_return_metadata(input.return_metadata)
-                            .set_filter(input.filter.clone())
-                            .send()
-                            .await;
-                    }
-                    return Err(e);
-                }
-                Err(e) => return Err(e),
-            };
-
-            distance_metric = distance_metric.or(output.distance_metric);
-            all_vectors.extend(output.vectors);
-
-            let response_token = captured
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-
-            let top_k_usize = usize::try_from(top_k).unwrap_or(usize::MAX);
-            let is_done = all_vectors.len() >= top_k_usize
-                || response_token.as_ref().is_none_or(String::is_empty)
-                || response_token == next_token;
-            if is_done {
-                break;
-            }
-            next_token = response_token;
-        }
-
-        let top_k_usize = usize::try_from(top_k).unwrap_or(usize::MAX);
-        all_vectors.truncate(top_k_usize);
-
-        QueryVectorsOutput::builder()
-            .set_vectors(Some(all_vectors))
-            .set_distance_metric(distance_metric)
-            .build()
-            .map_err(SdkError::construction_failure)
+        self.client
+            .query_vectors()
+            .set_vector_bucket_name(input.vector_bucket_name.clone())
+            .set_index_name(input.index_name.clone())
+            .set_index_arn(input.index_arn.clone())
+            .set_query_vector(input.query_vector.clone())
+            .top_k(top_k)
+            .set_return_distance(input.return_distance)
+            .set_return_metadata(input.return_metadata)
+            .set_filter(input.filter.clone())
+            .send()
+            .await
     }
 }
 
@@ -557,275 +411,8 @@ pub mod tests {
     use super::*;
 
     #[test]
-    fn test_query_vectors_page_size_constant() {
-        assert_eq!(QUERY_VECTORS_PAGE_SIZE, 100);
-    }
-
-    #[test]
     fn test_query_vectors_max_topk_constant() {
-        assert_eq!(QUERY_VECTORS_MAX_TOPK, 10_000);
-    }
-
-    #[test]
-    fn test_page_size_divides_max_topk() {
-        // Max topK should be a multiple of page size for clean pagination
-        assert_eq!(
-            QUERY_VECTORS_MAX_TOPK % QUERY_VECTORS_PAGE_SIZE,
-            0,
-            "QUERY_VECTORS_MAX_TOPK should be a multiple of QUERY_VECTORS_PAGE_SIZE"
-        );
-    }
-
-    #[test]
-    fn test_page_size_less_than_max_topk() {
-        assert!(
-            QUERY_VECTORS_PAGE_SIZE < QUERY_VECTORS_MAX_TOPK,
-            "QUERY_VECTORS_PAGE_SIZE must be less than QUERY_VECTORS_MAX_TOPK"
-        );
-    }
-
-    #[test]
-    fn test_capture_next_token_with_token() {
-        use aws_smithy_runtime_api::client::interceptors::Intercept;
-        use aws_smithy_runtime_api::http::StatusCode;
-
-        let captured = Arc::new(Mutex::new(None::<String>));
-        let interceptor = CaptureNextToken {
-            captured: Arc::clone(&captured),
-        };
-
-        // Simulate a response body with nextToken
-        let body_json = serde_json::json!({
-            "vectors": [],
-            "nextToken": "abc123"
-        });
-        let body_bytes = serde_json::to_vec(&body_json).expect("serialize");
-        let response = aws_smithy_runtime_api::client::orchestrator::HttpResponse::new(
-            StatusCode::try_from(200).expect("200"),
-            aws_smithy_types::body::SdkBody::from(body_bytes),
-        );
-
-        // Build an interceptor context to test
-        let mut context =
-            aws_smithy_runtime_api::client::interceptors::context::InterceptorContext::new(
-                aws_smithy_runtime_api::client::interceptors::context::Input::doesnt_matter(),
-            );
-        context.set_request(aws_smithy_runtime_api::client::orchestrator::HttpRequest::empty());
-        context.set_response(response);
-
-        let mut cfg = aws_smithy_types::config_bag::ConfigBag::base();
-        let rc = aws_smithy_runtime_api::client::runtime_components::RuntimeComponentsBuilder::for_tests()
-            .build()
-            .expect("build runtime components");
-
-        let mut ctx_mut = aws_smithy_runtime_api::client::interceptors::context::BeforeDeserializationInterceptorContextMut::from(&mut context);
-        interceptor
-            .modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg)
-            .expect("interceptor should succeed for valid nextToken");
-
-        let token = captured.lock().expect("lock").clone();
-        assert_eq!(token, Some("abc123".to_string()));
-    }
-
-    #[test]
-    fn test_capture_next_token_without_token() {
-        use aws_smithy_runtime_api::client::interceptors::Intercept;
-        use aws_smithy_runtime_api::http::StatusCode;
-
-        let captured = Arc::new(Mutex::new(None::<String>));
-        let interceptor = CaptureNextToken {
-            captured: Arc::clone(&captured),
-        };
-
-        // Response body without nextToken (last page)
-        let body_json = serde_json::json!({
-            "vectors": [{"key": "v1"}]
-        });
-        let body_bytes = serde_json::to_vec(&body_json).expect("serialize");
-        let response = aws_smithy_runtime_api::client::orchestrator::HttpResponse::new(
-            StatusCode::try_from(200).expect("200"),
-            aws_smithy_types::body::SdkBody::from(body_bytes),
-        );
-
-        let mut context =
-            aws_smithy_runtime_api::client::interceptors::context::InterceptorContext::new(
-                aws_smithy_runtime_api::client::interceptors::context::Input::doesnt_matter(),
-            );
-        context.set_request(aws_smithy_runtime_api::client::orchestrator::HttpRequest::empty());
-        context.set_response(response);
-
-        let mut cfg = aws_smithy_types::config_bag::ConfigBag::base();
-        let rc = aws_smithy_runtime_api::client::runtime_components::RuntimeComponentsBuilder::for_tests()
-            .build()
-            .expect("build runtime components");
-
-        let mut ctx_mut = aws_smithy_runtime_api::client::interceptors::context::BeforeDeserializationInterceptorContextMut::from(&mut context);
-        interceptor
-            .modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg)
-            .expect("interceptor should succeed without nextToken");
-
-        let token = captured.lock().expect("lock").clone();
-        assert_eq!(token, None);
-    }
-
-    #[test]
-    fn test_capture_next_token_with_null_token() {
-        use aws_smithy_runtime_api::client::interceptors::Intercept;
-        use aws_smithy_runtime_api::http::StatusCode;
-
-        let captured = Arc::new(Mutex::new(None::<String>));
-        let interceptor = CaptureNextToken {
-            captured: Arc::clone(&captured),
-        };
-
-        // nextToken is present but null
-        let body_json = serde_json::json!({
-            "vectors": [],
-            "nextToken": null
-        });
-        let body_bytes = serde_json::to_vec(&body_json).expect("serialize");
-        let response = aws_smithy_runtime_api::client::orchestrator::HttpResponse::new(
-            StatusCode::try_from(200).expect("200"),
-            aws_smithy_types::body::SdkBody::from(body_bytes),
-        );
-
-        let mut context =
-            aws_smithy_runtime_api::client::interceptors::context::InterceptorContext::new(
-                aws_smithy_runtime_api::client::interceptors::context::Input::doesnt_matter(),
-            );
-        context.set_request(aws_smithy_runtime_api::client::orchestrator::HttpRequest::empty());
-        context.set_response(response);
-
-        let mut cfg = aws_smithy_types::config_bag::ConfigBag::base();
-        let rc = aws_smithy_runtime_api::client::runtime_components::RuntimeComponentsBuilder::for_tests()
-            .build()
-            .expect("build runtime components");
-
-        let mut ctx_mut = aws_smithy_runtime_api::client::interceptors::context::BeforeDeserializationInterceptorContextMut::from(&mut context);
-        interceptor
-            .modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg)
-            .expect("interceptor should succeed with null nextToken");
-
-        // null is not a string, so as_str() returns None
-        let token = captured.lock().expect("lock").clone();
-        assert_eq!(token, None);
-    }
-
-    #[test]
-    fn test_capture_next_token_with_empty_body() {
-        use aws_smithy_runtime_api::client::interceptors::Intercept;
-        use aws_smithy_runtime_api::http::StatusCode;
-
-        let captured = Arc::new(Mutex::new(None::<String>));
-        let interceptor = CaptureNextToken {
-            captured: Arc::clone(&captured),
-        };
-
-        // Empty body — should not panic
-        let response = aws_smithy_runtime_api::client::orchestrator::HttpResponse::new(
-            StatusCode::try_from(200).expect("200"),
-            aws_smithy_types::body::SdkBody::empty(),
-        );
-
-        let mut context =
-            aws_smithy_runtime_api::client::interceptors::context::InterceptorContext::new(
-                aws_smithy_runtime_api::client::interceptors::context::Input::doesnt_matter(),
-            );
-        context.set_request(aws_smithy_runtime_api::client::orchestrator::HttpRequest::empty());
-        context.set_response(response);
-
-        let mut cfg = aws_smithy_types::config_bag::ConfigBag::base();
-        let rc = aws_smithy_runtime_api::client::runtime_components::RuntimeComponentsBuilder::for_tests()
-            .build()
-            .expect("build runtime components");
-
-        let mut ctx_mut = aws_smithy_runtime_api::client::interceptors::context::BeforeDeserializationInterceptorContextMut::from(&mut context);
-        interceptor
-            .modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg)
-            .expect("interceptor should succeed with empty body");
-
-        let token = captured.lock().expect("lock").clone();
-        assert_eq!(token, None);
-    }
-
-    #[test]
-    fn test_capture_next_token_with_invalid_json() {
-        use aws_smithy_runtime_api::client::interceptors::Intercept;
-        use aws_smithy_runtime_api::http::StatusCode;
-
-        let captured = Arc::new(Mutex::new(None::<String>));
-        let interceptor = CaptureNextToken {
-            captured: Arc::clone(&captured),
-        };
-
-        // Invalid JSON body — should not panic, should leave captured as None
-        let response = aws_smithy_runtime_api::client::orchestrator::HttpResponse::new(
-            StatusCode::try_from(200).expect("200"),
-            aws_smithy_types::body::SdkBody::from("not valid json"),
-        );
-
-        let mut context =
-            aws_smithy_runtime_api::client::interceptors::context::InterceptorContext::new(
-                aws_smithy_runtime_api::client::interceptors::context::Input::doesnt_matter(),
-            );
-        context.set_request(aws_smithy_runtime_api::client::orchestrator::HttpRequest::empty());
-        context.set_response(response);
-
-        let mut cfg = aws_smithy_types::config_bag::ConfigBag::base();
-        let rc = aws_smithy_runtime_api::client::runtime_components::RuntimeComponentsBuilder::for_tests()
-            .build()
-            .expect("build runtime components");
-
-        let mut ctx_mut = aws_smithy_runtime_api::client::interceptors::context::BeforeDeserializationInterceptorContextMut::from(&mut context);
-        interceptor
-            .modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg)
-            .expect("interceptor should succeed with invalid JSON");
-
-        let token = captured.lock().expect("lock").clone();
-        assert_eq!(token, None);
-    }
-
-    #[test]
-    fn test_capture_next_token_with_empty_string_token() {
-        use aws_smithy_runtime_api::client::interceptors::Intercept;
-        use aws_smithy_runtime_api::http::StatusCode;
-
-        let captured = Arc::new(Mutex::new(None::<String>));
-        let interceptor = CaptureNextToken {
-            captured: Arc::clone(&captured),
-        };
-
-        // nextToken is an empty string
-        let body_json = serde_json::json!({
-            "vectors": [],
-            "nextToken": ""
-        });
-        let body_bytes = serde_json::to_vec(&body_json).expect("serialize");
-        let response = aws_smithy_runtime_api::client::orchestrator::HttpResponse::new(
-            StatusCode::try_from(200).expect("200"),
-            aws_smithy_types::body::SdkBody::from(body_bytes),
-        );
-
-        let mut context =
-            aws_smithy_runtime_api::client::interceptors::context::InterceptorContext::new(
-                aws_smithy_runtime_api::client::interceptors::context::Input::doesnt_matter(),
-            );
-        context.set_request(aws_smithy_runtime_api::client::orchestrator::HttpRequest::empty());
-        context.set_response(response);
-
-        let mut cfg = aws_smithy_types::config_bag::ConfigBag::base();
-        let rc = aws_smithy_runtime_api::client::runtime_components::RuntimeComponentsBuilder::for_tests()
-            .build()
-            .expect("build runtime components");
-
-        let mut ctx_mut = aws_smithy_runtime_api::client::interceptors::context::BeforeDeserializationInterceptorContextMut::from(&mut context);
-        interceptor
-            .modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg)
-            .expect("interceptor should succeed with empty string nextToken");
-
-        // Empty string is still a valid string — should be captured as Some("")
-        let token = captured.lock().expect("lock").clone();
-        assert_eq!(token, Some(String::new()));
+        assert_eq!(QUERY_VECTORS_MAX_TOPK, 100);
     }
 
     #[tokio::test]

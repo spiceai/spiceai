@@ -663,54 +663,6 @@ pub(crate) mod search {
         .await
     }
 
-    /// Verifies that requesting more results than `QUERY_VECTORS_PAGE_SIZE` (100) works
-    /// correctly by triggering paginated queries under the hood.
-    #[tokio::test]
-    async fn multi_page_top_k() -> Result<(), anyhow::Error> {
-        let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
-
-        let mut app = AppBuilder::new("search_app").with_embedding(get_model_to_vec_embeddings(
-            "minishlab/potion-base-2M",
-            "potion-base-2M",
-        ));
-
-        let mut ds = get_mega_science_dataset(
-            Some("qs"),
-            None,
-            Some(Column::new("answer").with_embedding(
-                ColumnLevelEmbeddingConfig::model("potion-base-2M").with_row_id("id"),
-            )),
-        );
-        ds.vectors = Some(init_vector_store("spice-ci-tests-s3-vectors-multi-page", true).await?);
-        app = app.with_dataset(ds);
-
-        let rt = start_app(app.build()).await?;
-
-        // LIMIT 200 exceeds QUERY_VECTORS_PAGE_SIZE (100), requiring pagination.
-        let mut query_result = rt
-            .datafusion()
-            .query_builder(
-                "SELECT id, trunc(_score, 3) as _score FROM vector_search(qs, 'second') ORDER BY _score DESC, id LIMIT 200",
-            )
-            .build()
-            .run()
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-
-        let mut total_rows: usize = 0;
-        while let Some(batch) = query_result.data.next().await {
-            total_rows += batch?.num_rows();
-        }
-
-        // Must return exactly the requested LIMIT to confirm pagination and limit enforcement.
-        assert_eq!(
-            total_rows, 200,
-            "Expected exactly 200 rows from a LIMIT 200 paginated query, got {total_rows}"
-        );
-
-        Ok(())
-    }
-
     #[tokio::test]
     async fn s3_vectors_filters_pushdown() -> Result<(), anyhow::Error> {
         let _tracing = crate::init_tracing(DEFAULT_TRACING_MODELS);
