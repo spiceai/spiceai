@@ -1415,7 +1415,9 @@ impl GraphQLClient {
             let should_close = close_connection.swap(false, Ordering::Relaxed);
             let close_conn = Arc::clone(&close_connection);
             let page_size_override_current = {
-                let guard = page_size_override.lock().unwrap_or_else(|e| e.into_inner());
+                let guard = page_size_override
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 *guard
             };
             let page_size_override_ref = Arc::clone(&page_size_override);
@@ -1442,7 +1444,7 @@ impl GraphQLClient {
                                 // the first gateway error, then reverse-Fib.
                                 let mut guard = page_size_override_ref
                                     .lock()
-                                    .unwrap_or_else(|e| e.into_inner());
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 let current = guard.unwrap_or_else(|| {
                                     query
                                         .pagination_parameters
