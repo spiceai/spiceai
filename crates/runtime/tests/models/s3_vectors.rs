@@ -702,10 +702,10 @@ pub(crate) mod search {
             total_rows += batch?.num_rows();
         }
 
-        // Must return more than a single page (100) to confirm pagination worked.
+        // Must return at least the full LIMIT to confirm pagination worked across pages.
         assert!(
-            total_rows > 100,
-            "Expected more than 100 rows from a LIMIT 200 paginated query, got {total_rows}"
+            total_rows >= 200,
+            "Expected at least 200 rows from a LIMIT 200 paginated query, got {total_rows}"
         );
 
         Ok(())

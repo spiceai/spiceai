@@ -333,7 +333,7 @@ impl S3Vectors for Client {
         let top_k = input
             .top_k
             .unwrap_or(QUERY_VECTORS_PAGE_SIZE)
-            .min(QUERY_VECTORS_MAX_TOPK);
+            .clamp(1, QUERY_VECTORS_MAX_TOPK);
 
         if top_k <= QUERY_VECTORS_PAGE_SIZE {
             return self
