@@ -51,10 +51,10 @@ use tracing::{Instrument, info_span};
 pub static S3_VECTOR_DISTANCE_NAME: &str = "distance";
 
 /// Maximum topK results retrievable by a `QueryVector` operation.
-pub static S3_VECTOR_MAX_TOPK: i32 = 10_000;
+pub use s3_vectors::QUERY_VECTORS_MAX_TOPK as S3_VECTOR_MAX_TOPK;
 
 /// Maximum number of results returned per page in a `QueryVectors` API call.
-pub static S3_VECTOR_PAGE_SIZE: i32 = 100;
+pub use s3_vectors::QUERY_VECTORS_PAGE_SIZE as S3_VECTOR_PAGE_SIZE;
 
 /// Maximum number of keys per `GetVectors` API call. <https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-limitations.html>
 pub static GET_VECTORS_MAX_KEYS: usize = 100;
