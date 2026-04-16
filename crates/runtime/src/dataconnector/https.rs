@@ -728,9 +728,10 @@ impl Https {
             // Fail fast if the user also set an Authorization custom header:
             // reqwest would append ours after theirs and send two Authorization
             // values, which most servers will reject in non-obvious ways.
-            if provider.custom_headers().contains_key(
-                reqwest::header::AUTHORIZATION,
-            ) {
+            if provider
+                .custom_headers()
+                .contains_key(reqwest::header::AUTHORIZATION)
+            {
                 return Err(DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "https".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
