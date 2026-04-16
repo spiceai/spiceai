@@ -2146,7 +2146,7 @@
           ]
         },
         "params": {
-          "description": "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine' (default: arrow). Available engines: arrow, arrow, duckdb, turso, cayenne, duckdb, duckdb, postgres, sqlite.",
+          "description": "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine' (default: arrow). Available engines: arrow, cayenne, duckdb, postgres, sqlite, turso.",
           "anyOf": [
             {
               "$ref": "#/$defs/Params"

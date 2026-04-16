@@ -37,7 +37,6 @@ pub struct PartitionedBy {
 #[cfg(feature = "schemars")]
 #[derive(JsonSchema)]
 #[serde(untagged)]
-#[allow(dead_code)]
 pub enum PartitionedBySchema {
     Expression(String),
     /// A single-entry mapping `{ name: expression }`. The deserializer only
@@ -158,5 +157,64 @@ partition_by:
         assert_eq!(result.partition_by[2].name, "day");
         assert_eq!(result.partition_by[2].expression, "DAY(created_at)");
         Ok(())
+    }
+
+    /// Guards against regressions in the generated JSON schema for
+    /// `PartitionedBySchema`: it must describe both a plain expression string
+    /// and a single-entry `{name: expr}` object (with `minProperties = 1` /
+    /// `maxProperties = 1`).
+    #[cfg(feature = "schemars")]
+    #[test]
+    fn partition_by_schema_shapes() {
+        use schemars::schema_for;
+
+        let schema = schema_for!(PartitionedBySchema);
+        let value = serde_json::to_value(&schema).expect("serialize schema");
+
+        let any_of = value
+            .get("anyOf")
+            .and_then(|v| v.as_array())
+            .expect("PartitionedBySchema must generate an anyOf of the accepted shapes");
+        assert_eq!(
+            any_of.len(),
+            2,
+            "PartitionedBySchema should have two accepted shapes (string | single-entry map)"
+        );
+
+        // Shape 1: plain expression string.
+        assert!(
+            any_of
+                .iter()
+                .any(|v| v.get("type").and_then(|t| t.as_str()) == Some("string")),
+            "PartitionedBySchema must accept a plain string expression"
+        );
+
+        // Shape 2: single-entry object mapping name -> expression.
+        let named = any_of
+            .iter()
+            .find(|v| v.get("type").and_then(|t| t.as_str()) == Some("object"))
+            .expect("PartitionedBySchema must accept an object shape");
+        assert_eq!(
+            named
+                .get("minProperties")
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "named partition mapping must require at least one entry"
+        );
+        assert_eq!(
+            named
+                .get("maxProperties")
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "named partition mapping must allow at most one entry"
+        );
+        assert_eq!(
+            named
+                .get("additionalProperties")
+                .and_then(|v| v.get("type"))
+                .and_then(|t| t.as_str()),
+            Some("string"),
+            "named partition mapping values must be strings"
+        );
     }
 }
