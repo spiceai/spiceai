@@ -1,6 +1,6 @@
 version: v1beta1
 kind: Spicepod
-name: elasticsearch-basic
+name: elasticsearch-federated-basic
 
 datasets:
   - from: elasticsearch:test_products

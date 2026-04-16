@@ -327,22 +327,36 @@ fn build_dense_vector_array(
     field_name: &str,
     dim: i32,
 ) -> Result<ArrayRef, DataFusionError> {
-    let mut flat_values: Vec<f32> = Vec::with_capacity(hits.len() * dim as usize);
+    let dim_usize = dim as usize;
+    let mut flat_values: Vec<f32> = Vec::with_capacity(hits.len() * dim_usize);
+    let mut null_mask: Vec<bool> = Vec::with_capacity(hits.len());
 
     for hit in hits {
         if let Some(arr) = extract_field(&hit.source, field_name).and_then(|v| v.as_array()) {
-            for val in arr.iter().take(dim as usize) {
-                flat_values.push(val.as_f64().unwrap_or(0.0) as f32);
+            if arr.len() != dim_usize {
+                return Err(DataFusionError::Execution(format!(
+                    "dense_vector field '{field_name}' has {len} elements, expected {dim_usize}",
+                    len = arr.len(),
+                )));
             }
-            // Pad if shorter than expected.
-            let remaining = dim as usize - arr.len().min(dim as usize);
-            flat_values.extend(std::iter::repeat_n(0.0f32, remaining));
+            for val in arr {
+                let f = val.as_f64().ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "dense_vector field '{field_name}' contains a non-numeric element"
+                    ))
+                })? as f32;
+                flat_values.push(f);
+            }
+            null_mask.push(true);
         } else {
-            flat_values.extend(std::iter::repeat_n(0.0f32, dim as usize));
+            // Missing vector -> NULL row; fill placeholder values.
+            flat_values.extend(std::iter::repeat_n(0.0f32, dim_usize));
+            null_mask.push(false);
         }
     }
 
     let values_array = Arc::new(Float32Array::from(flat_values)) as ArrayRef;
+    let nulls = arrow::buffer::NullBuffer::from(null_mask);
     let list_array = arrow::array::FixedSizeListArray::try_new(
         Arc::new(arrow::datatypes::Field::new(
             "item",
@@ -351,7 +365,7 @@ fn build_dense_vector_array(
         )),
         dim,
         values_array,
-        None,
+        Some(nulls),
     )
     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
 
