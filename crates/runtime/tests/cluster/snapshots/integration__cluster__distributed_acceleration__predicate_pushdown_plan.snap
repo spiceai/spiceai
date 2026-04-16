@@ -2,18 +2,18 @@
 source: crates/runtime/tests/cluster/distributed_acceleration.rs
 expression: plan_fmt
 ---
-+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                                                                           |
-+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: test_data.id ASC NULLS LAST                                                                                                                                                                              |
-|               |   Filter: test_data.score > Int64(85)                                                                                                                                                                          |
-|               |     TableScan: test_data projection=[id, name, score], partial_filters=[bucket(Int64(3), id) = Utf8("0") OR bucket(Int64(3), id) = Utf8("1") OR bucket(Int64(3), id) = Utf8("2"), test_data.score > Int64(85)] |
-| physical_plan | SortPreservingMergeExec: [id@0 ASC NULLS LAST]                                                                                                                                                                 |
-|               |   SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]                                                                                                                                           |
-|               |     FilterExec: score@2 > 85                                                                                                                                                                                   |
-|               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                                                                                                                     |
-|               |         CooperativeExec                                                                                                                                                                                        |
-|               |           BytesProcessedExec                                                                                                                                                                                   |
-|               |             FlightSqlExec sql=SELECT id, name, score FROM test_data WHERE ((((bucket(3, "id") = '0') OR (bucket(3, "id") = '1')) OR (bucket(3, "id") = '2'))) AND (("score" > 85))                             |
-|               |                                                                                                                                                                                                                |
-+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                 |
++---------------+------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: test_data.id ASC NULLS LAST                                                                    |
+|               |   Filter: test_data.score > Int64(85)                                                                |
+|               |     TableScan: test_data projection=[id, name, score], partial_filters=[test_data.score > Int64(85)] |
+| physical_plan | SortPreservingMergeExec: [id@0 ASC NULLS LAST]                                                       |
+|               |   SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[true]                                 |
+|               |     FilterExec: score@2 > 85                                                                         |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                           |
+|               |         CooperativeExec                                                                              |
+|               |           BytesProcessedExec                                                                         |
+|               |             FlightSqlExec sql=SELECT id, name, score FROM test_data WHERE (("score" > 85))           |
+|               |                                                                                                      |
++---------------+------------------------------------------------------------------------------------------------------+

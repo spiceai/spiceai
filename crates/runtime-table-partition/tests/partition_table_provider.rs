@@ -2677,3 +2677,265 @@ async fn test_update_with_multiple_assignments() -> Result<(), Box<dyn std::erro
 
     Ok(())
 }
+
+/// Regression test: `SELECT COUNT(1) FROM table` with bucket partition expression
+/// filters must not pass bucket filters as data filters to partition scans.
+///
+/// Before the fix, an OR-chain like `bucket(4, id) = 0 OR bucket(4, id) = 1`
+/// was forwarded as a data filter, forcing a per-row hash computation across
+/// every row in the scanned partitions.  For large datasets this made simple
+/// aggregation queries take minutes instead of sub-second.
+#[tokio::test]
+async fn test_count_with_bucket_partition_expression_filter()
+-> Result<(), Box<dyn std::error::Error>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
+
+    let partition_by = vec![PartitionedBy {
+        name: "bucket_id".to_string(),
+        expression: Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
+            args: vec![lit(4i64), col("id")],
+        }),
+    }];
+
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_udf(bucket::Bucket::new().into());
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert data spanning all 4 buckets
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+            ])),
+            Arc::new(StringArray::from(vec![
+                "a", "b", "a", "b", "a", "b", "a", "b", "a", "b", "a", "b",
+            ])),
+            Arc::new(Int64Array::from(vec![
+                10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120,
+            ])),
+        ],
+    )?;
+    let df = ctx.read_batch(batch)?;
+    df.write_table("test_table", DataFrameWriteOptions::new())
+        .await?;
+
+    // Verify total COUNT matches
+    let total_result = ctx
+        .sql("SELECT COUNT(1) AS c FROM test_table")
+        .await?
+        .collect()
+        .await?;
+    let total_count = total_result[0]
+        .column_by_name("c")
+        .expect("column c")
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64Array")
+        .value(0);
+    assert_eq!(total_count, 12, "Total count mismatch");
+
+    // Query with a single bucket partition expression filter
+    let single_bucket_result = ctx
+        .sql("SELECT COUNT(1) AS c FROM test_table WHERE bucket(4, id) = 0")
+        .await?
+        .collect()
+        .await?;
+    let single_count = single_bucket_result[0]
+        .column_by_name("c")
+        .expect("column c")
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64Array")
+        .value(0);
+    assert!(single_count > 0, "Expected at least 1 row in bucket 0");
+    assert!(
+        single_count < 12,
+        "Expected fewer than all rows in bucket 0"
+    );
+
+    // Verify plan for single bucket filter: no FilterExec wrapping the partition scan
+    let single_plan = ctx
+        .sql("SELECT COUNT(1) FROM test_table WHERE bucket(4, id) = 0")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let plan_str = datafusion::physical_plan::displayable(single_plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(
+        !plan_str.contains("FilterExec"),
+        "Plan should not contain FilterExec for partition expression filter.\nPlan:\n{plan_str}"
+    );
+
+    // Query with OR-chain of bucket partition expression filters (the production scenario)
+    let or_chain_result = ctx
+        .sql("SELECT COUNT(1) AS c FROM test_table WHERE bucket(4, id) = 0 OR bucket(4, id) = 1")
+        .await?
+        .collect()
+        .await?;
+    let or_count = or_chain_result[0]
+        .column_by_name("c")
+        .expect("column c")
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64Array")
+        .value(0);
+    assert!(or_count > 0, "Expected rows in buckets 0+1");
+
+    // Verify plan for OR-chain: no FilterExec wrapping the partition scan
+    let or_plan = ctx
+        .sql("SELECT COUNT(1) FROM test_table WHERE bucket(4, id) = 0 OR bucket(4, id) = 1")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let or_plan_str = datafusion::physical_plan::displayable(or_plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(
+        !or_plan_str.contains("FilterExec"),
+        "OR-chain plan should not contain FilterExec for partition expression filters.\nPlan:\n{or_plan_str}"
+    );
+
+    // Verify data correctness: counts from all individual buckets must sum to total
+    let mut bucket_sum: i64 = 0;
+    for bucket_val in 0..4 {
+        let result = ctx
+            .sql(&format!(
+                "SELECT COUNT(1) AS c FROM test_table WHERE bucket(4, id) = {bucket_val}"
+            ))
+            .await?
+            .collect()
+            .await?;
+        bucket_sum += result[0]
+            .column_by_name("c")
+            .expect("column c")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64Array")
+            .value(0);
+    }
+    assert_eq!(
+        bucket_sum, total_count,
+        "Sum of individual bucket counts must equal total count"
+    );
+
+    // Verify that base-column filters ARE still applied (correctness check):
+    // When using `id = 5`, the bucket filter is NOT a partition expression filter
+    // so the filter MUST be passed through as a data filter
+    let base_plan = ctx
+        .sql("SELECT COUNT(1) FROM test_table WHERE id = 5")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let base_plan_str = datafusion::physical_plan::displayable(base_plan.as_ref())
+        .indent(true)
+        .to_string();
+    // The PartitionMemTableExec shows the filters that were passed to it
+    assert!(
+        base_plan_str.contains("id = Int64(5)"),
+        "Base-column filter must be forwarded as data filter.\nPlan:\n{base_plan_str}"
+    );
+
+    Ok(())
+}
+
+/// Test that bucket partition expression filters produce correct physical plans
+/// via EXPLAIN snapshot.
+#[tokio::test]
+async fn test_bucket_partition_expr_filter_plan_snapshot() -> Result<(), Box<dyn std::error::Error>>
+{
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+
+    let creator = Arc::new(TestPartitionCreator::new(Arc::clone(&schema)));
+
+    let partition_by = vec![PartitionedBy {
+        name: "bucket_id".to_string(),
+        expression: Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(ScalarUDF::new_from_impl(bucket::Bucket::new())),
+            args: vec![lit(4i64), col("id")],
+        }),
+    }];
+
+    let table_provider = PartitionTableProvider::new(
+        Arc::clone(&creator) as Arc<dyn PartitionCreator>,
+        partition_by,
+        Arc::clone(&schema),
+    )
+    .await?;
+
+    let ctx = SessionContext::new();
+    ctx.register_udf(bucket::Bucket::new().into());
+    ctx.register_table("test_table", Arc::new(table_provider))?;
+
+    // Insert data
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8])),
+            Arc::new(StringArray::from(vec![
+                "a", "b", "a", "b", "a", "b", "a", "b",
+            ])),
+            Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50, 60, 70, 80])),
+        ],
+    )?;
+    let df = ctx.read_batch(batch)?;
+    df.write_table("test_table", DataFrameWriteOptions::new())
+        .await?;
+
+    // Single bucket expression filter: bucket(4, id) = 0
+    let df = ctx
+        .sql("SELECT COUNT(1) FROM test_table WHERE bucket(4, id) = 0")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    insta::assert_snapshot!("bucket_expr_count_single", explain_plan);
+
+    // OR-chain bucket expression filter: bucket(4, id) = 0 OR bucket(4, id) = 1
+    let df = ctx
+        .sql("SELECT COUNT(1) FROM test_table WHERE bucket(4, id) = 0 OR bucket(4, id) = 1")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let mut explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    let mut lines: Vec<&str> = explain_plan.lines().collect();
+    // Sort partition lines to make test deterministic
+    if lines.len() > 2 {
+        lines[2..].sort_unstable();
+    }
+    explain_plan = lines.join("\n") + "\n";
+    insta::assert_snapshot!("bucket_expr_count_or_chain", explain_plan);
+
+    // Mixed: bucket expression filter + base column data filter
+    let df = ctx
+        .sql("SELECT COUNT(1) FROM test_table WHERE bucket(4, id) = 0 AND value > 20")
+        .await?;
+    let physical_plan = df.create_physical_plan().await?;
+    let explain_plan = datafusion::physical_plan::displayable(physical_plan.as_ref())
+        .indent(true)
+        .to_string();
+    insta::assert_snapshot!("bucket_expr_count_with_data_filter", explain_plan);
+
+    Ok(())
+}

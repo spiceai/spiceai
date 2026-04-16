@@ -91,7 +91,7 @@ fn build_repl_config(ctx: &RuntimeContext, args: &SqlArgs) -> repl::ReplConfig {
         .map_or_else(
             || {
                 if let Some(region) = ctx.cloud_region() {
-                    format!("https://{region}-flight.spiceai.io")
+                    format!("https://{region}-prod-aws-flight.spiceai.io")
                 } else {
                     "http://localhost:50051".to_string()
                 }
