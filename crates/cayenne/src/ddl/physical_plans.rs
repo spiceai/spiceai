@@ -611,26 +611,22 @@ async fn execute_merge(
     // matched key tuples and probe each file's rows with O(1) lookups. This
     // replaces the O(N) filter expression that the legacy path builds and
     // evaluates against every chunk of every file.
-    let delete_count = match try_key_probe_delete(
-        &target_provider,
-        &normalized_batches,
-        &target_key_columns,
-    )
-    .await?
-    {
-        Some(count) => count,
-        None => {
-            // Legacy path: build filter expression and push through delete_from.
-            let delete_filter =
-                build_delete_filter(&normalized_batches, &target_key_columns)?;
-            let delete_plan = target_provider
-                .delete_from(&session_state, vec![delete_filter])
-                .await?;
-            let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
-            let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
-            extract_dml_count(&delete_batches)
-        }
-    };
+    let delete_count =
+        match try_key_probe_delete(&target_provider, &normalized_batches, &target_key_columns)
+            .await?
+        {
+            Some(count) => count,
+            None => {
+                // Legacy path: build filter expression and push through delete_from.
+                let delete_filter = build_delete_filter(&normalized_batches, &target_key_columns)?;
+                let delete_plan = target_provider
+                    .delete_from(&session_state, vec![delete_filter])
+                    .await?;
+                let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
+                let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
+                extract_dml_count(&delete_batches)
+            }
+        };
 
     // Verify the delete count matches the expected number of rows.
     if delete_count != total_rows as u64 {
@@ -912,10 +908,7 @@ async fn try_key_probe_delete(
     // Case 3: PartitionTableProvider wrapping per-partition Cayenne providers.
     // All partitions share the same table metadata and deletion strategy, so
     // checking the first partition is sufficient to decide the fast path.
-    if let Some(partitioned) = provider
-        .as_any()
-        .downcast_ref::<PartitionTableProvider>()
-    {
+    if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
         let providers = partitioned.partition_table_providers().await;
         let first_is_position_based = providers
             .first()

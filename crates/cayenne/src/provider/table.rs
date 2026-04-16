@@ -4273,11 +4273,16 @@ impl CayenneTableProvider {
 
     /// Delete rows by hash-probing key columns against a set of matched keys.
     ///
-    /// Fast path for `MERGE INTO` on PositionBased tables. Bypasses filter
+    /// Fast path for `MERGE INTO` on `PositionBased` tables. Bypasses filter
     /// construction and the O(N) filter-per-file evaluation. Instead, scans
     /// each file and performs O(1) `HashSet` lookups per row.
     ///
     /// Acquires the write lock to prevent concurrent writes/refreshes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the listing table lock cannot be read or if the
+    /// underlying position-based deletion scan/persist operation fails.
     pub async fn delete_matched_rows_by_key_probe(
         &self,
         matched_keys: std::collections::HashSet<Vec<datafusion_common::ScalarValue>>,
@@ -4325,6 +4330,7 @@ impl CayenneTableProvider {
     }
 
     /// Returns `true` if this table uses the `PositionBased` deletion strategy.
+    #[must_use]
     pub fn is_position_based(&self) -> bool {
         self.pk_deletion_strategy.is_position_based()
     }

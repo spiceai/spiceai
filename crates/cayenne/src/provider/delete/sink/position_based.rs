@@ -203,7 +203,7 @@ impl CayenneDeletionSink {
 
     /// Delete rows by hash-probing key columns against a set of matched keys.
     ///
-    /// This is the fast path for `MERGE INTO` on PositionBased tables. Instead of
+    /// This is the fast path for `MERGE INTO` on `PositionBased` tables. Instead of
     /// building an O(N) filter expression and pushing it into every file scan, this
     /// method scans each file once and performs an O(1) `HashSet` lookup per row.
     ///
@@ -264,7 +264,6 @@ impl CayenneDeletionSink {
                     let vortex_session = vortex_session.clone();
                     let object_store = Arc::clone(&object_store);
                     let matched_keys = &matched_keys;
-                    let key_columns = key_columns;
                     scan_futures.push(async move {
                         let result = self
                             .scan_file_for_key_matches(
@@ -455,7 +454,7 @@ impl CayenneDeletionSink {
     /// filter-based path evaluates O(N) comparisons per chunk.
     ///
     /// The scan reads **all columns** (no projection) because Vortex's `with_projection`
-    /// API takes a single `Expression` and may not support mixed data+row_idx projections.
+    /// API takes a single `Expression` and may not support mixed `data+row_idx` projections.
     /// No `Selection::ExcludeRoaring` is applied — the manual row counter gives exact
     /// file-local positions. Already-deleted rows that happen to match are harmless:
     /// `persist_position_based_deletions` merges with existing bitmaps via `RoaringBitmap`.
@@ -532,12 +531,15 @@ impl CayenneDeletionSink {
             let key_indices: Vec<usize> = key_columns
                 .iter()
                 .map(|col_name| {
-                    batch.schema().index_of(col_name).map_err(|_| Error::Internal {
-                        table: table_name.clone(),
-                        message: format!(
-                            "Key column '{col_name}' not found in Vortex file schema"
-                        ),
-                    })
+                    batch
+                        .schema()
+                        .index_of(col_name)
+                        .map_err(|_| Error::Internal {
+                            table: table_name.clone(),
+                            message: format!(
+                                "Key column '{col_name}' not found in Vortex file schema"
+                            ),
+                        })
                 })
                 .collect::<crate::provider::Result<Vec<_>>>()?;
 
@@ -545,14 +547,11 @@ impl CayenneDeletionSink {
                 let key: Vec<datafusion_common::ScalarValue> = key_indices
                     .iter()
                     .map(|&idx| {
-                        datafusion_common::ScalarValue::try_from_array(
-                            batch.column(idx),
-                            row_idx,
-                        )
-                        .map_err(|e| Error::Internal {
-                            table: table_name.clone(),
-                            message: format!("Failed to extract key value: {e}"),
-                        })
+                        datafusion_common::ScalarValue::try_from_array(batch.column(idx), row_idx)
+                            .map_err(|e| Error::Internal {
+                                table: table_name.clone(),
+                                message: format!("Failed to extract key value: {e}"),
+                            })
                     })
                     .collect::<crate::provider::Result<Vec<_>>>()?;
 
