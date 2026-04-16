@@ -757,8 +757,10 @@ struct OauthServerState {
     /// `access-` and a monotonic counter, so each refresh produces a
     /// distinct token.
     issued_access_tokens: Arc<tokio::sync::Mutex<Vec<String>>>,
-    /// Refresh tokens considered valid. We seed one entry and rotate on each
-    /// exchange so we can tell whether the connector is honoring rotation.
+    /// Refresh tokens considered valid. We seed one entry and append newly
+    /// issued refresh tokens on each exchange; previously issued refresh
+    /// tokens remain valid for the duration of the test server (we never
+    /// invalidate them), which keeps the test stub simple.
     valid_refresh_tokens: Arc<tokio::sync::Mutex<Vec<String>>>,
     token_requests: Arc<AtomicUsize>,
     data_requests: Arc<AtomicUsize>,

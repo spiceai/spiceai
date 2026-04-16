@@ -725,6 +725,23 @@ impl Https {
         })?;
 
         if let Some((auth_config, refresh_token)) = self.resolve_refresh_token_auth(dataset)? {
+            // Fail fast if the user also set an Authorization custom header:
+            // reqwest would append ours after theirs and send two Authorization
+            // values, which most servers will reject in non-obvious ways.
+            if provider.custom_headers().contains_key(
+                reqwest::header::AUTHORIZATION,
+            ) {
+                return Err(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: "https".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "OAuth2 auth is configured (via '{}') but an 'Authorization' header is also set in '{}'. Remove one of them.",
+                        self.params.user_param("auth_refresh_token"),
+                        self.params.user_param("http_headers"),
+                    ),
+                });
+            }
+
             let auth = RefreshTokenAuth::try_new(auth_config, refresh_token)
                 .await
                 .map_err(|e| Self::map_auth_error(dataset, e))?;

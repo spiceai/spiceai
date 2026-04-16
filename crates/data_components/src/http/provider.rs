@@ -480,6 +480,12 @@ impl HttpTableProvider {
         self
     }
 
+    /// Read-only access to the currently configured custom headers.
+    #[must_use]
+    pub fn custom_headers(&self) -> &HeaderMap {
+        &self.custom_headers
+    }
+
     /// Attach an [`HttpAuthenticator`](super::auth::HttpAuthenticator) that decorates
     /// every outgoing data request (e.g. to apply a bearer token refreshed in the
     /// background by [`RefreshTokenAuth`](super::auth::RefreshTokenAuth)).

@@ -69,7 +69,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "OAuth2 token URL must use HTTPS (or http://localhost for testing). Got: {url}"
+        "OAuth2 token URL must use HTTPS (or http://localhost or a loopback address for testing). Got: {url}"
     ))]
     InsecureTokenUrl { url: String },
 
