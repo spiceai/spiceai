@@ -10,9 +10,8 @@ expression: plan
 |               |     TableScan: tcat.myschema.users projection=[id, name, age]                                                    |
 | physical_plan | ProjectionExec: expr=[id@0 as id, CAST(name@1 AS LargeUtf8) as name, age@2 as age]                               |
 |               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1, maintains_sort_order=true                |
-|               |     SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                          |
-|               |       CooperativeExec                                                                                            |
-|               |         BytesProcessedExec                                                                                       |
-|               |           FlightSqlExec sql=SELECT id, name, age FROM tcat.myschema.users                                        |
+|               |     CooperativeExec                                                                                              |
+|               |       BytesProcessedExec                                                                                         |
+|               |         FlightSqlExec sql=SELECT id, name, age FROM tcat.myschema.users ORDER BY id ASC NULLS LAST               |
 |               |                                                                                                                  |
 +---------------+------------------------------------------------------------------------------------------------------------------+
