@@ -127,5 +127,3 @@ fn build_repl_config(ctx: &RuntimeContext, args: &SqlArgs) -> repl::ReplConfig {
         custom_headers: args.custom_headers.clone(),
     }
 }
-
-
