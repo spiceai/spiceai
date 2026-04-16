@@ -98,7 +98,11 @@ pub async fn try_from_table(
     );
 
     let es_index = string_from_params(&params, "index").map_or_else(
-        || format!("{}-{}-{}", ds_name, column, config.model).replace('_', "-"),
+        || {
+            format!("{}-{}-{}", ds_name, column, config.model)
+                .to_lowercase()
+                .replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "-")
+        },
         ToString::to_string,
     );
 

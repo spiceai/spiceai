@@ -215,8 +215,11 @@ impl ElasticsearchIndex {
 
 /// Elasticsearch-backed full-text search index.
 ///
-/// Uses Elasticsearch's native BM25 full-text search capabilities,
-/// compatible with the `text_search` UDTF and `rrf` hybrid search.
+/// Uses Elasticsearch's native BM25 full-text search capabilities.
+///
+/// Note: This index type is not yet wired into the `text_search` UDTF or `rrf`
+/// discovery paths. It is currently used only when constructing search providers
+/// directly (e.g. via the vector engine integration).
 #[derive(Debug, Clone)]
 pub struct ElasticsearchTextIndex {
     /// The Elasticsearch client.

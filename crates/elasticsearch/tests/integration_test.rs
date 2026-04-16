@@ -143,6 +143,7 @@ async fn index_test_docs(client: &Client, index: &str) {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Elasticsearch instance"]
 async fn test_get_mapping() {
     let client = Client::new(&es_url(), None, None).expect("client");
     wait_for_es().await;
@@ -165,6 +166,7 @@ async fn test_get_mapping() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Elasticsearch instance"]
 async fn test_search_match_all() {
     let client = Client::new(&es_url(), None, None).expect("client");
     wait_for_es().await;
@@ -184,6 +186,7 @@ async fn test_search_match_all() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Elasticsearch instance"]
 async fn test_search_text_match() {
     let client = Client::new(&es_url(), None, None).expect("client");
     wait_for_es().await;
@@ -206,6 +209,7 @@ async fn test_search_text_match() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Elasticsearch instance"]
 async fn test_knn_search() {
     let client = Client::new(&es_url(), None, None).expect("client");
     wait_for_es().await;
@@ -232,6 +236,7 @@ async fn test_knn_search() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Elasticsearch instance"]
 async fn test_index_document_and_retrieve() {
     let client = Client::new(&es_url(), None, None).expect("client");
     wait_for_es().await;
@@ -269,6 +274,7 @@ async fn test_index_document_and_retrieve() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Elasticsearch instance"]
 async fn test_multi_match_query() {
     let client = Client::new(&es_url(), None, None).expect("client");
     wait_for_es().await;
@@ -291,6 +297,7 @@ async fn test_multi_match_query() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Elasticsearch instance"]
 async fn test_error_on_missing_index() {
     let client = Client::new(&es_url(), None, None).expect("client");
     wait_for_es().await;

@@ -148,6 +148,7 @@ async fn setup_test_index(index: &str) -> Arc<dyn Elasticsearch> {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Elasticsearch instance"]
 async fn test_schema_from_mapping() {
     let client = Client::new(&es_url(), None, None).expect("client");
     wait_for_es().await;
@@ -183,6 +184,7 @@ async fn test_schema_from_mapping() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Elasticsearch instance"]
 async fn test_query_table_scan() {
     let index = "test_dc_query_table";
     let client = setup_test_index(index).await;
@@ -215,6 +217,7 @@ async fn test_query_table_scan() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Elasticsearch instance"]
 async fn test_query_table_with_limit() {
     let index = "test_dc_query_limit";
     let client = setup_test_index(index).await;
@@ -241,6 +244,7 @@ async fn test_query_table_with_limit() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Elasticsearch instance"]
 async fn test_knn_table_search() {
     let index = "test_dc_knn";
     let client = setup_test_index(index).await;
@@ -288,6 +292,7 @@ async fn test_knn_table_search() {
 }
 
 #[tokio::test]
+#[ignore = "requires a running Elasticsearch instance"]
 async fn test_text_search_table() {
     let index = "test_dc_text_search";
     let client = setup_test_index(index).await;
