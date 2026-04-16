@@ -384,8 +384,8 @@ pub enum DataConnectorError {
 
 impl DataConnectorError {
     /// Returns `true` if this error is transient and the operation may succeed
-    /// on retry. Configuration errors, permission errors, and unsupported
-    /// type/table errors are permanent and should not be retried.
+    /// on retry. Configuration errors, unsupported type/table errors, and
+    /// permission errors are permanent and should not be retried.
     #[must_use]
     pub fn is_retriable(&self) -> bool {
         !matches!(
@@ -396,6 +396,7 @@ impl DataConnectorError {
                 | Self::InvalidConnectorType { .. }
                 | Self::InvalidGlobPattern { .. }
                 | Self::InvalidTableName { .. }
+                | Self::InsufficientPermissions { .. }
                 | Self::UnableToConnectInvalidHostOrPort { .. }
                 | Self::UnableToConnectInvalidUsernameOrPassword { .. }
                 | Self::UnableToConnectTlsError { .. }
@@ -403,7 +404,6 @@ impl DataConnectorError {
                 | Self::UnsupportedDataType { .. }
                 | Self::OdbcNotInstalled { .. }
                 | Self::UseOfProtectedKeyword { .. }
-                | Self::InsufficientPermissions { .. }
         )
     }
 }

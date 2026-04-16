@@ -136,7 +136,7 @@ impl DuckDBAccelerator {
                         .with_setting(Box::new(settings::IndexScanMaxCount))
                         .with_setting(Box::new(settings::TimeZone)),
                 )
-                .with_function_support(deny_spice_specific_functions()),
+                .with_function_support(deny_spice_specific_functions().clone()),
         }
     }
 

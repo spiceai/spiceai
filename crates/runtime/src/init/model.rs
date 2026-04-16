@@ -18,7 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     Runtime, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE,
-    model::provider_models::get_available_models_hint, status, timing::TimeMeasurement,
+    model::provider_models::get_available_models_hint, status,
 };
 use app::App;
 use model_components::model::Model;
@@ -26,6 +26,7 @@ use opentelemetry::KeyValue;
 use runtime_secrets::get_params_with_secrets;
 use snafu::prelude::*;
 use spicepod::component::model::{Model as SpicepodModel, ModelSource, ModelType};
+use telemetry::timing::TimeMeasurement;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

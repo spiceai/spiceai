@@ -90,37 +90,40 @@ const INTERNAL_COMPONENTS: &[&str] = &[
 ];
 
 const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off,delta_kernel::listed_log_files=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off,tower::buffer=off,h2::codec=off";
-const OFF_UNLESS_VERY_VERBOSE_FILTERS: &str = "datafusion_datasource::source=off,datafusion_optimizer::utils=off,datafusion_optimizer::optimizer=off,datafusion::physical_planner=off";
+const OFF_UNLESS_VERY_VERBOSE_FILTERS: &str = "datafusion_datasource::source=off,datafusion_optimizer::utils=off,datafusion_optimizer::optimizer=off,datafusion::physical_planner=off,opentelemetry=warn,tantivy=warn";
 
 fn specific_env_filter(filter: &str) -> String {
     format!("{OFF_FILTERS},{filter}")
 }
 
+fn env_filter_string(v: &LogVerbosity) -> String {
+    fn internal_components(level: &str) -> String {
+        INTERNAL_COMPONENTS
+            .iter()
+            .map(|component| format!("{component}={level}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    match v {
+        LogVerbosity::Default => format!(
+            "{},{OFF_FILTERS},{OFF_UNLESS_VERY_VERBOSE_FILTERS},WARN",
+            internal_components("INFO")
+        ),
+        LogVerbosity::Verbose => format!(
+            "{},{OFF_FILTERS},{OFF_UNLESS_VERY_VERBOSE_FILTERS},INFO",
+            internal_components("DEBUG")
+        ),
+        LogVerbosity::VeryVerbose => {
+            format!("{},{OFF_FILTERS},DEBUG", internal_components("TRACE"))
+        }
+        LogVerbosity::Specific(filter) => specific_env_filter(filter),
+    }
+}
+
 impl From<LogVerbosity> for EnvFilter {
     fn from(v: LogVerbosity) -> Self {
-        fn internal_components(level: &str) -> String {
-            INTERNAL_COMPONENTS
-                .iter()
-                .map(|component| format!("{component}={level}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        }
-
-        match v {
-            LogVerbosity::Default => EnvFilter::new(format!(
-                "{},{OFF_FILTERS},{OFF_UNLESS_VERY_VERBOSE_FILTERS},WARN",
-                internal_components("INFO")
-            )),
-            LogVerbosity::Verbose => EnvFilter::new(format!(
-                "{},{OFF_FILTERS},{OFF_UNLESS_VERY_VERBOSE_FILTERS},INFO",
-                internal_components("DEBUG")
-            )),
-            LogVerbosity::VeryVerbose => EnvFilter::new(format!(
-                "{},{OFF_FILTERS},DEBUG",
-                internal_components("TRACE")
-            )),
-            LogVerbosity::Specific(filter) => EnvFilter::new(specific_env_filter(&filter)),
-        }
+        EnvFilter::new(env_filter_string(&v))
     }
 }
 
@@ -489,5 +492,19 @@ mod tests {
     #[test]
     fn specific_filter_keeps_off_filters() {
         assert_eq!(specific_env_filter("trace"), format!("{OFF_FILTERS},trace"));
+    }
+
+    #[test]
+    fn verbose_filter_suppresses_opentelemetry_info() {
+        assert!(env_filter_string(&LogVerbosity::Default).contains("opentelemetry=warn"));
+        assert!(env_filter_string(&LogVerbosity::Verbose).contains("opentelemetry=warn"));
+        assert!(!env_filter_string(&LogVerbosity::VeryVerbose).contains("opentelemetry=warn"));
+    }
+
+    #[test]
+    fn filters_tantivy_to_error() {
+        assert!(env_filter_string(&LogVerbosity::Default).contains("tantivy=warn"));
+        assert!(env_filter_string(&LogVerbosity::Verbose).contains("tantivy=warn"));
+        assert!(!env_filter_string(&LogVerbosity::VeryVerbose).contains("tantivy=warn"));
     }
 }
