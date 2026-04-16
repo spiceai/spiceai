@@ -544,17 +544,28 @@ impl Https {
             .filter(|v| !v.is_empty());
         let refresh_token = self.params.get("auth_refresh_token").ok();
 
+        // User-facing parameter names (runtime params are unprefixed,
+        // component/secret params are prefixed with "http_").
+        let url_name = self.params.user_param("auth_token_url");
+        let refresh_name = self.params.user_param("auth_refresh_token");
+        let client_id_name = self.params.user_param("auth_client_id");
+        let client_secret_name = self.params.user_param("auth_client_secret");
+
         match (token_url, refresh_token) {
             (None, None) => Ok(None),
             (Some(_), None) => Err(DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "https".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                message: "'auth_token_url' is set but 'auth_refresh_token' is missing. Provide a refresh token to use OAuth2 auth.".to_string(),
+                message: format!(
+                    "'{url_name}' is set but '{refresh_name}' is missing. Provide a refresh token to use OAuth2 auth."
+                ),
             }),
             (None, Some(_)) => Err(DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "https".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                message: "'auth_refresh_token' is set but 'auth_token_url' is missing. Provide the OAuth2 token endpoint URL.".to_string(),
+                message: format!(
+                    "'{refresh_name}' is set but '{url_name}' is missing. Provide the OAuth2 token endpoint URL."
+                ),
             }),
             (Some(token_url), Some(refresh_token)) => {
                 let client_id = self
@@ -571,8 +582,9 @@ impl Https {
                     return Err(DataConnectorError::InvalidConfigurationNoSource {
                         dataconnector: "https".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
-                        message: "'auth_client_secret' is set but 'auth_client_id' is missing."
-                            .to_string(),
+                        message: format!(
+                            "'{client_secret_name}' is set but '{client_id_name}' is missing."
+                        ),
                     });
                 }
 
@@ -585,13 +597,14 @@ impl Https {
                     .filter(|v| !v.is_empty())
                     .map(str::to_string);
 
+                let client_auth_name = self.params.user_param("auth_client_auth");
                 let client_auth = match self.params.get("auth_client_auth").expose().ok() {
                     Some(v) => ClientAuthMethod::parse(v).map_err(|bad| {
                         DataConnectorError::InvalidConfigurationNoSource {
                             dataconnector: "https".to_string(),
                             connector_component: ConnectorComponent::from(dataset),
                             message: format!(
-                                "'auth_client_auth' must be 'basic' or 'body', got '{bad}'"
+                                "'{client_auth_name}' must be 'basic' or 'body', got '{bad}'"
                             ),
                         }
                     })?,
@@ -1172,6 +1185,10 @@ mod tests {
                     message.contains("auth_token_url"),
                     "expected error to mention auth_token_url, got: {message}"
                 );
+                assert!(
+                    message.contains("http_auth_refresh_token"),
+                    "error should reference the prefixed user-facing name, got: {message}"
+                );
             }
             other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
         }
@@ -1192,8 +1209,8 @@ mod tests {
         match error {
             DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
                 assert!(
-                    message.contains("auth_refresh_token"),
-                    "expected error to mention auth_refresh_token, got: {message}"
+                    message.contains("http_auth_refresh_token"),
+                    "expected error to mention http_auth_refresh_token, got: {message}"
                 );
             }
             other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
@@ -1216,8 +1233,12 @@ mod tests {
         match error {
             DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
                 assert!(
-                    message.contains("auth_client_id"),
-                    "expected error to mention auth_client_id, got: {message}"
+                    message.contains("http_auth_client_id"),
+                    "expected error to mention http_auth_client_id, got: {message}"
+                );
+                assert!(
+                    message.contains("http_auth_client_secret"),
+                    "expected error to mention http_auth_client_secret, got: {message}"
                 );
             }
             other => panic!("expected InvalidConfigurationNoSource, got: {other}"),

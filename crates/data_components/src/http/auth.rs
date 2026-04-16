@@ -27,7 +27,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::{Client, ClientBuilder, RequestBuilder};
+use reqwest::{
+    Client, ClientBuilder, RequestBuilder,
+    header::{AUTHORIZATION, HeaderValue},
+};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use snafu::prelude::*;
@@ -51,6 +54,11 @@ const DEFAULT_TOKEN_LIFETIME_SECS: u64 = 3600;
 
 /// Upper bound on background-refresh backoff after an error.
 const MAX_REFRESH_BACKOFF_SECS: u64 = 300;
+
+/// Cap on how much of the token endpoint's error body is echoed into logs and
+/// `Error::TokenEndpointStatus`. Prevents accidentally surfacing large or
+/// multi-line payloads (which may embed sensitive details) into callers.
+const MAX_ERROR_BODY_BYTES: usize = 512;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -80,6 +88,14 @@ pub enum Error {
 
     #[snafu(display("Failed to parse OAuth2 token response: {source}"))]
     InvalidTokenResponse { source: reqwest::Error },
+
+    #[snafu(display(
+        "OAuth2 token endpoint returned unsupported token_type '{token_type}'; only 'Bearer' is supported."
+    ))]
+    UnsupportedTokenType { token_type: String },
+
+    #[snafu(display("OAuth2 access token is not a valid HTTP header value: {source}"))]
+    InvalidAccessToken { source: reqwest::header::InvalidHeaderValue },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -133,7 +149,7 @@ pub struct RefreshTokenConfig {
 /// expires.
 pub struct RefreshTokenAuth {
     token_url: String,
-    rx: watch::Receiver<SecretString>,
+    rx: watch::Receiver<HeaderValue>,
     _handle: Arc<JoinHandle<()>>,
 }
 
@@ -160,7 +176,8 @@ impl RefreshTokenAuth {
 
         let initial = exchange_refresh_token(&client, &config, &refresh_token).await?;
 
-        let (tx, rx) = watch::channel(initial.access_token);
+        let header = bearer_header_value(&initial.access_token)?;
+        let (tx, rx) = watch::channel(header);
         let expires_in = initial.expires_in.unwrap_or(DEFAULT_TOKEN_LIFETIME_SECS);
         let current_refresh = initial.refresh_token.unwrap_or(refresh_token);
 
@@ -179,24 +196,25 @@ impl RefreshTokenAuth {
         })
     }
 
-    /// Current access token. Primarily useful for tests.
+    /// Current `Authorization: Bearer …` header value. Primarily useful for tests.
     #[must_use]
-    pub fn current_access_token(&self) -> SecretString {
+    pub fn current_bearer_value(&self) -> HeaderValue {
         self.rx.borrow().clone()
-    }
-
-    /// Subscribe to access-token updates.
-    #[must_use]
-    pub fn subscribe(&self) -> watch::Receiver<SecretString> {
-        self.rx.clone()
     }
 }
 
 impl HttpAuthenticator for RefreshTokenAuth {
     fn apply(&self, builder: RequestBuilder) -> RequestBuilder {
-        let token = self.rx.borrow().expose_secret().to_string();
-        builder.bearer_auth(token)
+        builder.header(AUTHORIZATION, self.rx.borrow().clone())
     }
+}
+
+/// Build a sensitive `Authorization: Bearer <token>` header value.
+fn bearer_header_value(access_token: &SecretString) -> Result<HeaderValue> {
+    let raw = format!("Bearer {}", access_token.expose_secret());
+    let mut header = HeaderValue::from_str(&raw).context(InvalidAccessTokenSnafu)?;
+    header.set_sensitive(true);
+    Ok(header)
 }
 
 async fn refresh_loop(
@@ -204,7 +222,7 @@ async fn refresh_loop(
     config: RefreshTokenConfig,
     mut current_refresh: SecretString,
     initial_expires_in: u64,
-    tx: watch::Sender<SecretString>,
+    tx: watch::Sender<HeaderValue>,
 ) {
     let mut next_wait = next_refresh_wait(initial_expires_in);
     let mut backoff = FibonacciBackoffBuilder::new()
@@ -212,21 +230,33 @@ async fn refresh_loop(
         .build();
 
     loop {
-        sleep(next_wait).await;
-
-        if tx.is_closed() {
-            break;
+        tokio::select! {
+            () = sleep(next_wait) => {}
+            () = tx.closed() => break,
         }
 
         match exchange_refresh_token(&client, &config, &current_refresh).await {
             Ok(resp) => {
                 backoff.reset();
                 let expires_in = resp.expires_in.unwrap_or(DEFAULT_TOKEN_LIFETIME_SECS);
+                let header = match bearer_header_value(&resp.access_token) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::error!(
+                            "OAuth2 refresh from {} returned an access token that is not a valid HTTP header value: {e}. Keeping the previous token and retrying.",
+                            config.token_url
+                        );
+                        next_wait = backoff
+                            .next_duration()
+                            .unwrap_or(Duration::from_secs(MAX_REFRESH_BACKOFF_SECS));
+                        continue;
+                    }
+                };
                 tracing::debug!(
                     "OAuth2 access token refreshed from {}; expires in {expires_in}s",
                     config.token_url
                 );
-                if tx.send(resp.access_token).is_err() {
+                if tx.send(header).is_err() {
                     break;
                 }
                 if let Some(new_refresh) = resp.refresh_token {
@@ -299,6 +329,8 @@ struct RawTokenResponse {
     refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<u64>,
+    #[serde(default)]
+    token_type: Option<String>,
 }
 
 async fn exchange_refresh_token(
@@ -319,7 +351,7 @@ async fn exchange_refresh_token(
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
+        let body = sanitize_error_body(response.text().await.unwrap_or_default());
         return Err(Error::TokenEndpointStatus {
             url: config.token_url.clone(),
             status,
@@ -328,11 +360,43 @@ async fn exchange_refresh_token(
     }
 
     let raw: RawTokenResponse = response.json().await.context(InvalidTokenResponseSnafu)?;
+
+    if let Some(token_type) = raw.token_type.as_deref()
+        && !token_type.eq_ignore_ascii_case("bearer")
+    {
+        return Err(Error::UnsupportedTokenType {
+            token_type: token_type.to_string(),
+        });
+    }
+
     Ok(TokenResponse {
         access_token: SecretString::from(raw.access_token),
         refresh_token: raw.refresh_token.map(SecretString::from),
         expires_in: raw.expires_in,
     })
+}
+
+/// Trim/flatten an arbitrary error response body for safe inclusion in logs and
+/// [`Error::TokenEndpointStatus`]. Keeps at most [`MAX_ERROR_BODY_BYTES`]
+/// characters (byte-bounded but char-aligned), replaces whitespace with spaces,
+/// and appends an ellipsis marker when truncated.
+fn sanitize_error_body(body: String) -> String {
+    let mut out = String::with_capacity(body.len().min(MAX_ERROR_BODY_BYTES));
+    let mut truncated = false;
+    for ch in body.chars() {
+        // Collapse any whitespace (including newlines/tabs/CR) to a single space
+        // so the error string stays a single line in logs.
+        let mapped = if ch.is_whitespace() { ' ' } else { ch };
+        if out.len() + mapped.len_utf8() > MAX_ERROR_BODY_BYTES {
+            truncated = true;
+            break;
+        }
+        out.push(mapped);
+    }
+    if truncated {
+        out.push_str("…<truncated>");
+    }
+    out
 }
 
 fn build_token_request(
@@ -687,7 +751,9 @@ mod tests {
         .await
         .expect("RefreshTokenAuth::try_new should succeed");
 
-        assert_eq!(auth.current_access_token().expose_secret(), "initial-access");
+        let current = auth.current_bearer_value();
+        assert_eq!(current.to_str().unwrap_or(""), "Bearer initial-access");
+        assert!(current.is_sensitive(), "bearer header must be marked sensitive");
 
         let client = Client::new();
         let builder = client.get("http://example.com/data");
@@ -701,5 +767,142 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         assert_eq!(header, "Bearer initial-access");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exchange_rejects_non_bearer_token_type() {
+        let (url, _count, _captured) = start_mock_server(vec![MockResponse::ok(json!({
+            "access_token": "at",
+            "token_type": "MAC",
+            "expires_in": 3600
+        }))])
+        .await;
+
+        let client = build_token_client().expect("build token client");
+        let config = RefreshTokenConfig {
+            token_url: format!("{url}/oauth/token"),
+            client_id: None,
+            client_secret: None,
+            scopes: None,
+            client_auth: ClientAuthMethod::Basic,
+        };
+
+        let err = exchange_refresh_token(&client, &config, &SecretString::from("rt"))
+            .await
+            .expect_err("non-Bearer token_type should be rejected");
+
+        match err {
+            Error::UnsupportedTokenType { token_type } => {
+                assert_eq!(token_type, "MAC");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn sanitize_error_body_collapses_whitespace_and_truncates() {
+        let out = sanitize_error_body("line1\nline2\tfield".to_string());
+        assert_eq!(out, "line1 line2 field");
+
+        let long = "a".repeat(MAX_ERROR_BODY_BYTES + 64);
+        let out = sanitize_error_body(long);
+        assert!(out.ends_with("…<truncated>"), "got: {out}");
+        let content_len = out.trim_end_matches("…<truncated>").len();
+        assert!(
+            content_len <= MAX_ERROR_BODY_BYTES,
+            "body content exceeded cap: {content_len}"
+        );
+    }
+
+    /// Drives the background refresh loop long enough to verify that after
+    /// `expires_in` elapses, the connector re-hits the token endpoint *using
+    /// the refresh token that was rotated in on the previous response*, not
+    /// the seed token.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_loop_uses_rotated_refresh_token() {
+        // Server responses: first exchange rotates seed->refresh-v1, second
+        // exchange rotates refresh-v1->refresh-v2. Both issue successive
+        // access tokens so we can observe the rotation took effect.
+        //
+        // `expires_in` is set to `TOKEN_REFRESH_BUFFER_SECS + 1` so the
+        // background loop wakes up ~1s after the initial exchange.
+        let expires_in = TOKEN_REFRESH_BUFFER_SECS + 1;
+        let (url, count, captured) = start_mock_server(vec![
+            MockResponse::ok(json!({
+                "access_token": "access-v1",
+                "refresh_token": "refresh-v1",
+                "expires_in": expires_in,
+            })),
+            MockResponse::ok(json!({
+                "access_token": "access-v2",
+                "refresh_token": "refresh-v2",
+                "expires_in": expires_in,
+            })),
+        ])
+        .await;
+
+        let auth = RefreshTokenAuth::try_new(
+            RefreshTokenConfig {
+                token_url: format!("{url}/oauth/token"),
+                client_id: None,
+                client_secret: None,
+                scopes: None,
+                client_auth: ClientAuthMethod::Basic,
+            },
+            SecretString::from("seed-refresh"),
+        )
+        .await
+        .expect("initial exchange should succeed");
+
+        assert_eq!(
+            auth.current_bearer_value().to_str().unwrap_or(""),
+            "Bearer access-v1"
+        );
+
+        // Wait up to 5s (real time) for the background loop to fire the
+        // second refresh. The loop is scheduled ~1s out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if count.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "background refresh did not fire within 5s (requests={})",
+                    count.load(Ordering::SeqCst)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Second request should carry the rotated refresh token from the
+        // first response, not the seed.
+        let requests = captured.lock().await;
+        assert_eq!(requests.len(), 2, "expected two token requests");
+        let second = &requests[1];
+        assert!(
+            second.contains("refresh_token=refresh-v1"),
+            "second refresh did not use the rotated token: {second}"
+        );
+        assert!(
+            !second.contains("refresh_token=seed-refresh"),
+            "second refresh incorrectly reused the seed token: {second}"
+        );
+        drop(requests);
+
+        // Give the watch channel a moment to propagate the new access token.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if auth.current_bearer_value().to_str().unwrap_or("") == "Bearer access-v2" {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "access token did not rotate to v2 in time; current={:?}",
+                    auth.current_bearer_value()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
