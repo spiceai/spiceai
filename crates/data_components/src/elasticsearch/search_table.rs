@@ -100,15 +100,16 @@ impl TableProvider for ElasticsearchKnnTable {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let effective_k = limit.unwrap_or(self.k);
         let projected_schema = project_schema(&self.schema, projection)?;
         Ok(Arc::new(ElasticsearchKnnExec {
             client: Arc::clone(&self.client),
             index: self.index.clone(),
             vector_field: self.vector_field.clone(),
             query_vector: self.query_vector.clone(),
-            k: self.k,
+            k: effective_k,
             schema: Arc::clone(&self.schema),
             source_schema: Arc::clone(&self.source_schema),
             projected_schema,
@@ -307,15 +308,16 @@ impl TableProvider for ElasticsearchTextSearchTable {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let effective_limit = limit.unwrap_or(self.limit);
         let projected_schema = project_schema(&self.schema, projection)?;
         Ok(Arc::new(ElasticsearchTextSearchExec {
             client: Arc::clone(&self.client),
             index: self.index.clone(),
             search_fields: self.search_fields.clone(),
             query_text: self.query_text.clone(),
-            limit: self.limit,
+            limit: effective_limit,
             schema: Arc::clone(&self.schema),
             source_schema: Arc::clone(&self.source_schema),
             projected_schema,
