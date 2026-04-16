@@ -11,6 +11,7 @@ version.workspace = true
 arrow = { workspace = true }
 arrow_tools = { path = "../arrow_tools" }
 datafusion-ddl = { path = "../datafusion-ddl" }
+datafusion-dml = { path = "../datafusion-dml" }
 regex = "1.12.3"
 arrow-flight = { workspace = true }
 arrow-ipc = { workspace = true }

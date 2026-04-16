@@ -168,13 +168,20 @@ pub struct DatabricksMetrics {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("This Databricks SQL Warehouse operation is not implemented"))]
+    #[snafu(display(
+        "This operation is not supported by the Databricks SQL Warehouse connector. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     NotImplemented,
 
-    #[snafu(display("HTTP client build failed: {}", format_reqwest_error_chain(source)))]
+    #[snafu(display(
+        "Failed to initialize the Databricks SQL Warehouse HTTP client: {}",
+        format_reqwest_error_chain(source)
+    ))]
     ClientBuildFailed { source: reqwest::Error },
 
-    #[snafu(display("Databricks datatype {ty} not supported"))]
+    #[snafu(display(
+        "Unsupported Databricks data type '{ty}'. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks"
+    ))]
     UnsupportedType { ty: String },
 
     #[snafu(display(
@@ -200,13 +207,19 @@ pub enum Error {
     ))]
     InvalidWarehouseState { state: String },
 
-    #[snafu(display("Unexpected Statement execution state: '{state}'."))]
+    #[snafu(display(
+        "Databricks SQL Warehouse returned an unexpected statement state: '{state}'. Verify the warehouse is operational, or report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnexpectedStatementState { state: String },
 
-    #[snafu(display("Query canceled or timed out (state: 'CANCELED')."))]
+    #[snafu(display(
+        "The Databricks SQL query was canceled. This may be due to a timeout or manual cancellation. Verify the warehouse is running and try again."
+    ))]
     QueryCanceled,
 
-    #[snafu(display("Long-running operations are not supported (state: 'RUNNING')."))]
+    #[snafu(display(
+        "The Databricks SQL query is still running and exceeded the maximum poll attempts. Increase `databricks_max_statement_retries` or simplify the query."
+    ))]
     QueryStillRunning,
 
     #[snafu(display(
@@ -229,33 +242,48 @@ pub enum Error {
         existing: usize,
     },
 
-    #[snafu(display("HTTP request failed: {}", format_reqwest_error_chain(source)))]
+    #[snafu(display(
+        "Failed to send request to Databricks SQL Warehouse: {}",
+        format_reqwest_error_chain(source)
+    ))]
     HttpRequestFailed { source: reqwest::Error },
 
-    #[snafu(display("JSON parsing failed: {}", format_reqwest_error_chain(source)))]
+    #[snafu(display(
+        "Failed to parse response from Databricks SQL Warehouse: {}",
+        format_reqwest_error_chain(source)
+    ))]
     JsonParsingFailed { source: reqwest::Error },
 
-    #[snafu(display("Missing JSON field: {field}"))]
+    #[snafu(display(
+        "Databricks SQL Warehouse response is missing expected field '{field}'. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     MissingJsonField { field: String },
 
-    #[snafu(display("Invalid JSON array: {field}"))]
+    #[snafu(display(
+        "Databricks SQL Warehouse response contains an invalid array for field '{field}'. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     InvalidJsonArray { field: String },
 
-    #[snafu(display("Failed to deserialize external link: {source}"))]
+    #[snafu(display("Failed to deserialize Databricks SQL Warehouse result link: {source}"))]
     DeserializeExternalLinkFailed { source: serde_json::Error },
 
-    #[snafu(display("Failed to read Arrow stream: {source}"))]
+    #[snafu(display("Failed to read Arrow data from Databricks SQL Warehouse: {source}"))]
     ArrowStreamReadFailed { source: arrow::error::ArrowError },
 
-    #[snafu(display("Failed to create table provider: {}", format_datafusion_error(source)))]
+    #[snafu(display(
+        "Failed to load the dataset (databricks): {}",
+        format_datafusion_error(source)
+    ))]
     TableProviderCreationFailed { source: DataFusionError },
 
-    #[snafu(display("Failed to initialize SQL table: {source}"))]
+    #[snafu(display("Failed to initialize the dataset (databricks): {source}"))]
     SqlTableInitializationFailed {
         source: datafusion_table_providers::sql::sql_provider_datafusion::Error,
     },
 
-    #[snafu(display("A fully-qualified path is required: {reason}"))]
+    #[snafu(display(
+        "A fully-qualified table path (catalog.schema.table) is required for Databricks: {reason}. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks"
+    ))]
     FullyQualifiedPath { reason: String },
 
     #[snafu(display("Failed to parse Databricks datatype: {reason}"))]
@@ -265,6 +293,30 @@ pub enum Error {
         "Failed to execute the query. {message} Verify the query is valid, or report a bug at: https://github.com/spiceai/spiceai/issues"
     ))]
     QueryFailure { message: String },
+
+    #[snafu(display(
+        "The dataset '{dataset_name}' appears to be a Lakehouse Federation foreign table, \
+         which is not supported on Classic SQL warehouses. \
+         Switch `databricks_sql_warehouse_id` to a Pro or Serverless warehouse. \
+         Databricks error: {message}"
+    ))]
+    ForeignTableOnClassicWarehouse {
+        dataset_name: String,
+        message: String,
+    },
+
+    #[snafu(display(
+        "The dataset '{dataset_name}' returned `UNSUPPORTED_DATA_SOURCE` from Databricks SQL Warehouse, \
+         and Spice could not determine whether the configured warehouse can query it ({warehouse_lookup_error}). \
+         Failing safely rather than returning a schema that may not be queryable. \
+         If this dataset is a Lakehouse Federation foreign table, switch `databricks_sql_warehouse_id` to a Pro or Serverless warehouse. \
+         Databricks error: {message}"
+    ))]
+    UnsupportedDataSource {
+        dataset_name: String,
+        message: String,
+        warehouse_lookup_error: String,
+    },
 }
 
 fn format_reqwest_error_chain(error: &reqwest::Error) -> String {
@@ -283,6 +335,23 @@ fn format_reqwest_error_chain(error: &reqwest::Error) -> String {
     }
 
     message
+}
+
+fn databricks_server_message(error: &Error) -> String {
+    match error {
+        Error::QueryFailure { message } => message.clone(),
+        _ => error.to_string(),
+    }
+}
+
+/// Databricks SQL warehouse compute type. Lakehouse Federation foreign
+/// tables are only supported on `Pro` and `Serverless` warehouses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WarehouseType {
+    Classic,
+    Pro,
+    Serverless,
+    Unknown,
 }
 
 /// Main struct for interacting with Databricks SQL Warehouse
@@ -579,8 +648,14 @@ impl SqlWarehouseApi {
                 permissions,
             )
             .await
-            .map_err(|e| Error::QueryFailure {
-                message: e.to_string(),
+            .map_err(|e| match e.downcast::<Error>() {
+                // Preserve the specific `ForeignTableOnClassicWarehouse`
+                // error (and any other typed Databricks error) when it
+                // bubbles up — wrapping loses the actionable diagnosis.
+                Ok(err) => *err,
+                Err(other) => Error::QueryFailure {
+                    message: other.to_string(),
+                },
             })?;
 
             result.log_warnings(table);
@@ -605,7 +680,66 @@ impl SqlWarehouseApi {
         match self.get_schema_from_information_schema(&token, table).await {
             Ok(schema) => SchemaProbeResult::Ok(schema),
             Err(e) if is_access_denied_error(&e) => SchemaProbeResult::AccessDenied(e.to_string()),
+            Err(e) if is_unsupported_data_source_error(&e) => {
+                self.classify_unsupported_data_source(&token, table, e)
+                    .await
+            }
             Err(e) => SchemaProbeResult::Failed(Box::new(e)),
+        }
+    }
+
+    /// Resolves an `UNSUPPORTED_DATA_SOURCE` schema-probe error into either a
+    /// specific `ForeignTableOnClassicWarehouse` diagnosis, a safe permanent
+    /// `UnsupportedDataSource` error when the warehouse type cannot be
+    /// determined, or a generic `Failed` result when the warehouse is known
+    /// to be non-Classic and the `DESCRIBE TABLE` fallback remains viable.
+    ///
+    /// On Classic warehouses this returns [`SchemaProbeResult::Permanent`] so
+    /// `discover_schema` surfaces the actionable error immediately without
+    /// falling back to `DESCRIBE TABLE` metadata that would never be usable
+    /// at query time.
+    async fn classify_unsupported_data_source(
+        &self,
+        token: &str,
+        table: &TableReference,
+        original: Error,
+    ) -> SchemaProbeResult {
+        let dataset_name = table.to_string();
+        let message = databricks_server_message(&original);
+
+        match self.get_warehouse_type(token).await {
+            Ok(WarehouseType::Classic) => {
+                SchemaProbeResult::Permanent(Box::new(Error::ForeignTableOnClassicWarehouse {
+                    dataset_name,
+                    message,
+                }))
+            }
+            Ok(WarehouseType::Pro | WarehouseType::Serverless) => {
+                SchemaProbeResult::Failed(Box::new(original))
+            }
+            Ok(WarehouseType::Unknown) => {
+                tracing::warn!(
+                    table = %table,
+                    "Databricks returned an unknown warehouse type while diagnosing UNSUPPORTED_DATA_SOURCE; failing safely"
+                );
+                SchemaProbeResult::Permanent(Box::new(Error::UnsupportedDataSource {
+                    dataset_name,
+                    message,
+                    warehouse_lookup_error: "Databricks returned an unknown warehouse type"
+                        .to_string(),
+                }))
+            }
+            Err(lookup_err) => {
+                tracing::warn!(
+                    table = %table,
+                    "Failed to query warehouse type to diagnose UNSUPPORTED_DATA_SOURCE: {lookup_err}"
+                );
+                SchemaProbeResult::Permanent(Box::new(Error::UnsupportedDataSource {
+                    dataset_name,
+                    message,
+                    warehouse_lookup_error: lookup_err.to_string(),
+                }))
+            }
         }
     }
 
@@ -625,6 +759,11 @@ impl SqlWarehouseApi {
             Err(e) if is_access_denied_error(&e) => {
                 return SchemaProbeResult::AccessDenied(e.to_string());
             }
+            Err(e) if is_unsupported_data_source_error(&e) => {
+                return self
+                    .classify_unsupported_data_source(&token, table, e)
+                    .await;
+            }
             Err(e) => return SchemaProbeResult::Failed(Box::new(e)),
         };
         let response = match self.wait_for_statement_completion(&token, response).await {
@@ -632,11 +771,20 @@ impl SqlWarehouseApi {
             Err(e) if is_access_denied_error(&e) => {
                 return SchemaProbeResult::AccessDenied(e.to_string());
             }
+            Err(e) if is_unsupported_data_source_error(&e) => {
+                return self
+                    .classify_unsupported_data_source(&token, table, e)
+                    .await;
+            }
             Err(e) => return SchemaProbeResult::Failed(Box::new(e)),
         };
         match schema_from_describe_json(&response, &table.to_string()) {
             Ok(schema) => SchemaProbeResult::Ok(schema),
             Err(e) if is_access_denied_error(&e) => SchemaProbeResult::AccessDenied(e.to_string()),
+            Err(e) if is_unsupported_data_source_error(&e) => {
+                self.classify_unsupported_data_source(&token, table, e)
+                    .await
+            }
             Err(e) => SchemaProbeResult::Failed(Box::new(e)),
         }
     }
@@ -769,6 +917,50 @@ impl SqlWarehouseApi {
             warehouse_id = %self.sql_warehouse_id,
         ))
         .await
+    }
+
+    /// Queries the Databricks REST API for this warehouse's type.
+    ///
+    /// Uses `GET /api/2.0/sql/warehouses/{id}`. The response contains
+    /// `warehouse_type` (`"CLASSIC"` or `"PRO"`) and
+    /// `enable_serverless_compute` (bool). Serverless is a variant of `PRO`.
+    async fn get_warehouse_type(&self, token: &str) -> Result<WarehouseType, Error> {
+        self.check_permanently_disabled()?;
+        let url = format!(
+            "{}/api/2.0/sql/warehouses/{}",
+            self.base_url, self.sql_warehouse_id
+        );
+        let response = send_request_with_retry_and_concurrency_limit(
+            "Databricks SQL Warehouse",
+            "get warehouse details",
+            || self.client.get(&url).bearer_auth(token),
+            &self.retry_config(),
+        )
+        .await
+        .context(HttpRequestFailedSnafu)?;
+        let value: Value = self
+            .check_permanent_http_error(response)
+            .error_for_status()
+            .context(HttpRequestFailedSnafu)?
+            .json()
+            .await
+            .context(JsonParsingFailedSnafu)?;
+
+        let warehouse_type = value
+            .get("warehouse_type")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let serverless = value
+            .get("enable_serverless_compute")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        Ok(match (warehouse_type, serverless) {
+            ("PRO", true) => WarehouseType::Serverless,
+            ("PRO", false) => WarehouseType::Pro,
+            ("CLASSIC", _) => WarehouseType::Classic,
+            _ => WarehouseType::Unknown,
+        })
     }
 
     async fn get_sql_statement_status(
@@ -1143,6 +1335,16 @@ fn is_access_denied_error(err: &Error) -> bool {
                 || message.contains("does not have")
                 || message.contains("permission denied")
         }
+        _ => false,
+    }
+}
+
+/// Returns `true` if the error indicates the table is backed by a data
+/// source unsupported by the SQL warehouse. This is the signature of a
+/// Lakehouse Federation foreign table queried from a Classic warehouse.
+fn is_unsupported_data_source_error(err: &Error) -> bool {
+    match err {
+        Error::QueryFailure { message } => message.contains("UNSUPPORTED_DATA_SOURCE"),
         _ => false,
     }
 }
@@ -2076,6 +2278,16 @@ mod tests {
         body: String,
     }
 
+    impl MockHttpResponse {
+        fn json(status_line: &'static str, body: impl Into<String>) -> Self {
+            Self {
+                status_line,
+                headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                body: body.into(),
+            }
+        }
+    }
+
     async fn start_mock_http_server(
         responses: Vec<MockHttpResponse>,
         default_response: MockHttpResponse,
@@ -2745,6 +2957,60 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_get_warehouse_type_disables_on_permanent_http_errors() {
+        use std::sync::atomic::Ordering;
+
+        let (port, requests) = start_mock_http_server(
+            vec![MockHttpResponse {
+                status_line: "403 Forbidden",
+                headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                body: json!({"error": "forbidden"}).to_string(),
+            }],
+            MockHttpResponse {
+                status_line: "200 OK",
+                headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+                body: json!({"warehouse_type": "PRO", "enable_serverless_compute": false})
+                    .to_string(),
+            },
+        )
+        .await;
+
+        let api = create_test_api(port);
+
+        let err = api
+            .get_warehouse_type("token")
+            .await
+            .expect_err("403 should fail the warehouse lookup");
+        assert!(
+            matches!(err, Error::HttpRequestFailed { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            api.metrics.permanently_disabled.load(Ordering::Relaxed),
+            "connector should be disabled after a permanent warehouse lookup failure"
+        );
+        assert_eq!(
+            api.metrics.permanent_errors_total.load(Ordering::Relaxed),
+            1,
+            "permanent error counter should increment after a permanent warehouse lookup failure"
+        );
+
+        let second_err = api
+            .get_warehouse_type("token")
+            .await
+            .expect_err("subsequent warehouse lookups should fail fast after disable");
+        assert!(
+            matches!(second_err, Error::PermanentlyDisabled),
+            "unexpected error: {second_err}"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "disabled connector should not issue additional warehouse lookup requests"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_http_request_failed_displays_source_chain() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2769,7 +3035,9 @@ mod tests {
         let msg = err.to_string();
 
         assert!(
-            msg.contains("HTTP request failed: error sending request for url"),
+            msg.contains(
+                "Failed to send request to Databricks SQL Warehouse: error sending request for url"
+            ),
             "error should include the reqwest request message: {msg}"
         );
         assert!(
@@ -2869,6 +3137,102 @@ mod tests {
                         body.len(),
                         body
                     );
+                    let _ = stream.write_all(http_response.as_bytes()).await;
+                });
+            }
+        });
+
+        port
+    }
+
+    async fn start_schema_discovery_mock_server(
+        info_schema_responses: Vec<MockHttpResponse>,
+        describe_responses: Vec<MockHttpResponse>,
+        warehouse_responses: Vec<MockHttpResponse>,
+    ) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("should bind to a port");
+        let port = listener
+            .local_addr()
+            .expect("should have an address")
+            .port();
+        let info_responses = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from(
+            info_schema_responses,
+        )));
+        let describe_responses = Arc::new(tokio::sync::Mutex::new(
+            std::collections::VecDeque::from(describe_responses),
+        ));
+        let warehouse_responses = Arc::new(tokio::sync::Mutex::new(
+            std::collections::VecDeque::from(warehouse_responses),
+        ));
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let info_responses = Arc::clone(&info_responses);
+                let describe_responses = Arc::clone(&describe_responses);
+                let warehouse_responses = Arc::clone(&warehouse_responses);
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+
+                    let response = if request.starts_with("GET /api/2.0/sql/warehouses/") {
+                        warehouse_responses
+                            .lock()
+                            .await
+                            .pop_front()
+                            .unwrap_or_else(|| {
+                                MockHttpResponse::json(
+                                    "500 Internal Server Error",
+                                    json!({"error": "missing warehouse mock response"}).to_string(),
+                                )
+                            })
+                    } else if request.contains("information_schema") {
+                        info_responses.lock().await.pop_front().unwrap_or_else(|| {
+                            MockHttpResponse::json(
+                                "500 Internal Server Error",
+                                json!({"error": "missing information_schema mock response"})
+                                    .to_string(),
+                            )
+                        })
+                    } else if request.contains("DESCRIBE TABLE") {
+                        describe_responses
+                            .lock()
+                            .await
+                            .pop_front()
+                            .unwrap_or_else(|| {
+                                MockHttpResponse::json(
+                                    "500 Internal Server Error",
+                                    json!({"error": "missing DESCRIBE TABLE mock response"})
+                                        .to_string(),
+                                )
+                            })
+                    } else {
+                        MockHttpResponse::json(
+                            "500 Internal Server Error",
+                            json!({"error": "unexpected mock request"}).to_string(),
+                        )
+                    };
+
+                    let mut http_response = format!(
+                        "HTTP/1.1 {}\r\nContent-Length: {}\r\n",
+                        response.status_line,
+                        response.body.len()
+                    );
+                    for (header_name, header_value) in response.headers {
+                        let _ = std::fmt::Write::write_fmt(
+                            &mut http_response,
+                            format_args!("{header_name}: {header_value}\r\n"),
+                        );
+                    }
+                    http_response.push_str("\r\n");
+                    http_response.push_str(&response.body);
+
                     let _ = stream.write_all(http_response.as_bytes()).await;
                 });
             }
@@ -3114,12 +3478,11 @@ mod tests {
         assert_eq!(schema.fields().len(), 2);
     }
 
-    /// Regression test: tables backed by unsupported data sources (e.g.
-    /// Lakehouse Federation foreign tables) cause `information_schema`
-    /// queries to fail with `UNSUPPORTED_DATA_SOURCE`. The schema fetch
-    /// must fall back to `DESCRIBE TABLE` instead of surfacing the error.
+    /// Regression test: foreign tables on Pro warehouses still need to fall
+    /// back to `DESCRIBE TABLE` when `information_schema` returns
+    /// `UNSUPPORTED_DATA_SOURCE`.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn test_get_schema_falls_back_to_describe_on_unsupported_data_source() {
+    async fn test_get_schema_falls_back_to_describe_on_unsupported_data_source_for_pro_warehouse() {
         let unsupported_response = json!({
             "status": {
                 "state": "FAILED",
@@ -3141,7 +3504,21 @@ mod tests {
             }
         });
 
-        let port = start_routing_mock_server(vec![unsupported_response], describe_response).await;
+        let port = start_schema_discovery_mock_server(
+            vec![MockHttpResponse::json(
+                "200 OK",
+                unsupported_response.to_string(),
+            )],
+            vec![MockHttpResponse::json(
+                "200 OK",
+                describe_response.to_string(),
+            )],
+            vec![MockHttpResponse::json(
+                "200 OK",
+                json!({"warehouse_type": "PRO", "enable_serverless_compute": false}).to_string(),
+            )],
+        )
+        .await;
         let api = create_test_api(port);
         let table = TableReference::full("catalog", "schema", "foreign_table");
 
@@ -3152,6 +3529,131 @@ mod tests {
         assert_eq!(schema.fields().len(), 2);
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(1).name(), "name");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_get_schema_surfaces_foreign_table_on_classic_without_wrapping_query_failure() {
+        let unsupported_response = json!({
+            "status": {
+                "state": "FAILED",
+                "error": {
+                    "message": "[UNSUPPORTED_DATA_SOURCE] The input query contains unsupported data source(s). SQLSTATE: 0A000"
+                }
+            },
+            "statement_id": "stmt-1"
+        });
+        let describe_response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "stmt-2",
+            "result": {
+                "data_array": [
+                    ["id", "int", ""],
+                    ["name", "string", ""]
+                ]
+            }
+        });
+
+        let port = start_schema_discovery_mock_server(
+            vec![MockHttpResponse::json(
+                "200 OK",
+                unsupported_response.to_string(),
+            )],
+            vec![MockHttpResponse::json(
+                "200 OK",
+                describe_response.to_string(),
+            )],
+            vec![MockHttpResponse::json(
+                "200 OK",
+                json!({"warehouse_type": "CLASSIC", "enable_serverless_compute": false})
+                    .to_string(),
+            )],
+        )
+        .await;
+        let api = create_test_api(port);
+        let table = TableReference::full("catalog", "schema", "foreign_table");
+
+        let err = api
+            .get_schema(&table, &NoPermissionsCheck)
+            .await
+            .expect_err("Classic warehouses should surface a permanent foreign-table error");
+        assert!(
+            matches!(&err, Error::ForeignTableOnClassicWarehouse { dataset_name, .. } if dataset_name == "catalog.schema.foreign_table"),
+            "unexpected error: {err}"
+        );
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Switch `databricks_sql_warehouse_id` to a Pro or Serverless warehouse"),
+            "error should reference the correct connector parameter: {msg}"
+        );
+        assert!(
+            msg.contains("[UNSUPPORTED_DATA_SOURCE]"),
+            "error should preserve the Databricks server message: {msg}"
+        );
+        assert!(
+            !msg.contains("Verify the query is valid"),
+            "error should not wrap the generic QueryFailure guidance: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_get_schema_fails_safely_when_warehouse_type_lookup_fails() {
+        let unsupported_response = json!({
+            "status": {
+                "state": "FAILED",
+                "error": {
+                    "message": "[UNSUPPORTED_DATA_SOURCE] The input query contains unsupported data source(s). SQLSTATE: 0A000"
+                }
+            },
+            "statement_id": "stmt-1"
+        });
+        let describe_response = json!({
+            "status": { "state": "SUCCEEDED" },
+            "statement_id": "stmt-2",
+            "result": {
+                "data_array": [
+                    ["id", "int", ""],
+                    ["name", "string", ""]
+                ]
+            }
+        });
+
+        let port = start_schema_discovery_mock_server(
+            vec![MockHttpResponse::json(
+                "200 OK",
+                unsupported_response.to_string(),
+            )],
+            vec![MockHttpResponse::json(
+                "200 OK",
+                describe_response.to_string(),
+            )],
+            vec![MockHttpResponse::json(
+                "403 Forbidden",
+                json!({"error": "forbidden"}).to_string(),
+            )],
+        )
+        .await;
+        let api = create_test_api(port);
+        let table = TableReference::full("catalog", "schema", "foreign_table");
+
+        let err = api
+            .get_schema(&table, &NoPermissionsCheck)
+            .await
+            .expect_err("warehouse lookup failures should fail safe on UNSUPPORTED_DATA_SOURCE");
+        assert!(
+            matches!(&err, Error::UnsupportedDataSource { dataset_name, .. } if dataset_name == "catalog.schema.foreign_table"),
+            "unexpected error: {err}"
+        );
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Failing safely rather than returning a schema that may not be queryable"),
+            "error should explain the fail-safe behavior: {msg}"
+        );
+        assert!(
+            msg.contains("[UNSUPPORTED_DATA_SOURCE]"),
+            "error should preserve the Databricks server message: {msg}"
+        );
     }
 
     // ── Parallel schema discovery integration tests ──
