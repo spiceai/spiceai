@@ -3496,6 +3496,7 @@ dependencies = [
  "datafusion-common",
  "datafusion-datasource",
  "datafusion-ddl",
+ "datafusion-dml",
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-federation",
@@ -5627,6 +5628,15 @@ dependencies = [
  "async-trait",
  "datafusion",
  "spicepod",
+]
+
+[[package]]
+name = "datafusion-dml"
+version = "2.0.0-unstable"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "datafusion",
 ]
 
 [[package]]
@@ -16004,6 +16014,7 @@ dependencies = [
  "datafusion",
  "datafusion-datasource",
  "datafusion-ddl",
+ "datafusion-dml",
  "datafusion-expr",
  "datafusion-federation",
  "datafusion-functions-json",
