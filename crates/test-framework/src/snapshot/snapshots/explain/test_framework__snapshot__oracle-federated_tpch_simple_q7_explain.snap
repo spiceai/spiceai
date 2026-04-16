@@ -13,6 +13,6 @@ description: "Query: tpch_simple_q7"
 |               |   GlobalLimitExec: skip=0, fetch=10                                                           |
 |               |     CooperativeExec                                                                           |
 |               |       BytesProcessedExec                                                                      |
-|               |         OracleExec sql=SELECT "O_ORDERKEY" FROM "TPCH_SF1"."ORDERS"  FETCH FIRST 10 ROWS ONLY |
+|               |         OracleExec sql=SELECT "O_ORDERKEY" FROM "TPCH_SF1"."ORDERS" FETCH FIRST 10 ROWS ONLY  |
 |               |                                                                                               |
 +---------------+-----------------------------------------------------------------------------------------------+
