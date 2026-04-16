@@ -220,7 +220,7 @@ impl ExecutionPlan for ElasticsearchKnnExec {
                     field: vector_field,
                     query_vector,
                     k,
-                    num_candidates: k * 2,
+                    num_candidates: k.saturating_mul(2),
                 }),
                 size: Some(k),
                 ..Default::default()

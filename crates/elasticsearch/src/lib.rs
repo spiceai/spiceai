@@ -279,9 +279,13 @@ impl Client {
 async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
     if resp.status().is_client_error() || resp.status().is_server_error() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .replace(['\n', '\r'], " ");
         return Err(Error::ElasticsearchError {
-            message: format!("HTTP {status}: {body}"),
+            message: format!("HTTP {status}: {}", body.trim()),
         });
     }
     Ok(resp)
