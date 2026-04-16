@@ -10,9 +10,8 @@ expression: plan
 |               |     TableScan: scat.hr.records projection=[id, employee]                                          |
 | physical_plan | ProjectionExec: expr=[id@0 as id, CAST(employee@1 AS LargeUtf8) as employee]                      |
 |               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1, maintains_sort_order=true |
-|               |     SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                           |
-|               |       CooperativeExec                                                                             |
-|               |         BytesProcessedExec                                                                        |
-|               |           FlightSqlExec sql=SELECT id, employee FROM scat.hr.records                              |
+|               |     CooperativeExec                                                                               |
+|               |       BytesProcessedExec                                                                          |
+|               |         FlightSqlExec sql=SELECT id, employee FROM scat.hr.records ORDER BY id ASC NULLS LAST     |
 |               |                                                                                                   |
 +---------------+---------------------------------------------------------------------------------------------------+
