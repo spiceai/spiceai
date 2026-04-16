@@ -221,7 +221,8 @@ pub struct OtelExporterConfig {
     pub metrics: Vec<String>,
 
     /// Optional headers to send with each export request.
-    /// For HTTP: sent as HTTP headers. For gRPC: sent as metadata entries.
+    /// For HTTP: sent as HTTP headers. For gRPC: sent as metadata entries
+    /// (keys must be lowercase ASCII, e.g. use `authorization` not `Authorization`).
     /// Values support secret replacement syntax (e.g., `${secrets:api_key}`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,

@@ -561,7 +561,7 @@ pub async fn run(args: Args) -> Result<()> {
             &rt.datafusion(),
             metrics_registry.clone(),
             otel_config,
-            &resolved_otel_headers,
+            resolved_otel_headers,
             metrics_reader,
         )
         .context(UnableToInitializeMetricsSnafu)?;
@@ -687,7 +687,7 @@ fn init_metrics(
     df: &Arc<DataFusion>,
     registry: prometheus::Registry,
     otel_config: Option<&app::spicepod::component::runtime::OtelExporterConfig>,
-    resolved_otel_headers: &std::collections::HashMap<String, String>,
+    resolved_otel_headers: std::collections::HashMap<String, String>,
     metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let resource = Resource::builder().build();
@@ -763,7 +763,7 @@ fn init_cluster_metrics_only(metrics_reader: runtime::metrics_reader::MetricsRea
 /// Creates an OTEL periodic reader from the spicepod config
 fn create_otel_reader(
     config: &app::spicepod::component::runtime::OtelExporterConfig,
-    resolved_headers: &std::collections::HashMap<String, String>,
+    resolved_headers: std::collections::HashMap<String, String>,
 ) -> Result<runtime::otel_push_exporter::OtelPeriodicReader, runtime::otel_push_exporter::Error> {
     runtime::otel_push_exporter::create_otel_periodic_reader(config, resolved_headers)
 }
