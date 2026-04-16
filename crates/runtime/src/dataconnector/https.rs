@@ -526,7 +526,7 @@ impl Https {
             })
     }
 
-    /// Parse OAuth2 refresh-token parameters.
+    /// Parse `OAuth2` refresh-token parameters.
     ///
     /// Returns `Ok(None)` when no auth is configured. Returns an error when
     /// the auth configuration is incomplete or inconsistent (e.g. a refresh
@@ -655,14 +655,15 @@ impl Https {
                 connector_component: component,
                 source: Box::new(err),
             },
-            AuthErr::TokenEndpointStatus { status, .. } if matches!(status, 400 | 401 | 403) => {
-                DataConnectorError::InvalidConfiguration {
-                    dataconnector,
-                    message: err.to_string(),
-                    connector_component: component,
-                    source: Box::new(err),
-                }
-            }
+            AuthErr::TokenEndpointStatus {
+                status: 400 | 401 | 403,
+                ..
+            } => DataConnectorError::InvalidConfiguration {
+                dataconnector,
+                message: err.to_string(),
+                connector_component: component,
+                source: Box::new(err),
+            },
             _ => DataConnectorError::UnableToConnectInternal {
                 dataconnector,
                 connector_component: component,
