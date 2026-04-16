@@ -107,7 +107,9 @@ pub async fn try_from_table(
         || {
             format!("{}-{}-{}", ds_name, column, config.model)
                 .to_lowercase()
-                .replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "-")
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+                .collect()
         },
         ToString::to_string,
     );
@@ -151,23 +153,39 @@ pub async fn try_from_table(
     //   - LargeUtf8 → Utf8  (ES always returns StringArray / Utf8)
     //   - FixedSizeList inner field → named "item", non-null Float32
     //     (build_dense_vector_array always uses Field::new("item", Float32, false))
+    // Also, if the base table does not have the vector field (common when ES is the vector store),
+    // explicitly append it so knn_hits_to_batch can extract it from ES _source.
+    let mut source_fields: Vec<arrow_schema::FieldRef> = inner_schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let normalized_type = normalize_es_data_type(f.data_type());
+            if &normalized_type == f.data_type() {
+                Arc::clone(f)
+            } else {
+                Arc::new(arrow_schema::Field::new(
+                    f.name(),
+                    normalized_type,
+                    f.is_nullable(),
+                ))
+            }
+        })
+        .collect();
+
+    // Append vector_field if not already present in the base schema.
+    if inner_schema.field_with_name(&vector_field).is_err() {
+        source_fields.push(Arc::new(arrow_schema::Field::new(
+            &vector_field,
+            DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", DataType::Float32, false)),
+                dims,
+            ),
+            true,
+        )));
+    }
+
     let source_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
-        inner_schema
-            .fields()
-            .iter()
-            .map(|f| {
-                let normalized_type = normalize_es_data_type(f.data_type());
-                if &normalized_type == f.data_type() {
-                    Arc::clone(f)
-                } else {
-                    Arc::new(arrow_schema::Field::new(
-                        f.name(),
-                        normalized_type,
-                        f.is_nullable(),
-                    ))
-                }
-            })
-            .collect::<Vec<_>>(),
+        source_fields,
         inner_schema.metadata().clone(),
     ));
 

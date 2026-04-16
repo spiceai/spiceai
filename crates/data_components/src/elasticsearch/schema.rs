@@ -83,8 +83,20 @@ fn es_type_to_arrow(mapping: &FieldMapping) -> DataType {
         Some("binary") => DataType::Utf8, // ES binary fields are base64-encoded strings in JSON.
         Some("ip") => DataType::Utf8,
         Some("dense_vector") => {
-            let dims = mapping.dims.unwrap_or(128) as i32;
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), dims)
+            // dims is required for dense_vector in Elasticsearch. If missing or out of i32 range,
+            // fall back to Utf8 rather than guessing a wrong dimension.
+            if let Some(dims) = mapping
+                .dims
+                .and_then(|d| i32::try_from(d).ok())
+                .filter(|&d| d > 0)
+            {
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, false)),
+                    dims,
+                )
+            } else {
+                DataType::Utf8 // Unknown dims: store raw JSON representation.
+            }
         }
         Some("object") => DataType::Utf8, // Serialized JSON
         _ => DataType::Utf8,              // Fallback
