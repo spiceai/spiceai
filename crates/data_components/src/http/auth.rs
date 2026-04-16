@@ -407,11 +407,20 @@ async fn read_bounded_error_body(mut response: reqwest::Response) -> String {
     sanitize_error_body(&text)
 }
 
-/// Trim/flatten an arbitrary error response body for safe inclusion in logs and
-/// [`Error::TokenEndpointStatus`]. Keeps at most [`MAX_ERROR_BODY_BYTES`]
-/// characters (byte-bounded but char-aligned), replaces whitespace with spaces,
-/// and appends an ellipsis marker when truncated.
+/// Marker appended to the returned string when the body was truncated. The
+/// content budget below is reduced by this marker's length so the final
+/// returned string is never larger than [`MAX_ERROR_BODY_BYTES`].
+const TRUNCATION_MARKER: &str = "…<truncated>";
+
+/// Trim/flatten an arbitrary error response body for safe inclusion in logs
+/// and [`Error::TokenEndpointStatus`]. Guarantees the returned string is at
+/// most [`MAX_ERROR_BODY_BYTES`] bytes *including* the truncation marker;
+/// replaces whitespace with spaces so the result stays single-line.
 fn sanitize_error_body(body: &str) -> String {
+    // Reserve room for the truncation marker so a truncated result still fits
+    // inside MAX_ERROR_BODY_BYTES. MAX_ERROR_BODY_BYTES is large relative to
+    // the marker, so the subtraction can't wrap.
+    const CONTENT_BUDGET: usize = MAX_ERROR_BODY_BYTES - TRUNCATION_MARKER.len();
     let mut out = String::with_capacity(body.len().min(MAX_ERROR_BODY_BYTES));
     let mut truncated = false;
     for ch in body.chars() {
@@ -419,15 +428,16 @@ fn sanitize_error_body(body: &str) -> String {
         // regular space so the error string stays a single line in logs. Runs
         // of whitespace are preserved as runs of spaces rather than collapsed.
         let mapped = if ch.is_whitespace() { ' ' } else { ch };
-        if out.len() + mapped.len_utf8() > MAX_ERROR_BODY_BYTES {
+        if out.len() + mapped.len_utf8() > CONTENT_BUDGET {
             truncated = true;
             break;
         }
         out.push(mapped);
     }
     if truncated {
-        out.push_str("…<truncated>");
+        out.push_str(TRUNCATION_MARKER);
     }
+    debug_assert!(out.len() <= MAX_ERROR_BODY_BYTES);
     out
 }
 
@@ -842,11 +852,13 @@ mod tests {
 
         let long = "a".repeat(MAX_ERROR_BODY_BYTES + 64);
         let out = sanitize_error_body(&long);
-        assert!(out.ends_with("…<truncated>"), "got: {out}");
-        let content_len = out.trim_end_matches("…<truncated>").len();
+        assert!(out.ends_with(TRUNCATION_MARKER), "got: {out}");
+        // The total returned string (content + truncation marker) must fit
+        // inside the cap, not just the content portion.
         assert!(
-            content_len <= MAX_ERROR_BODY_BYTES,
-            "body content exceeded cap: {content_len}"
+            out.len() <= MAX_ERROR_BODY_BYTES,
+            "sanitized body exceeded total cap: {} bytes",
+            out.len(),
         );
     }
 
