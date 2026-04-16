@@ -19,17 +19,19 @@ limitations under the License.
 //! Provides serialization/deserialization of Vortex [`FileStatistics`] and
 //! conversion between DataFusion [`ColumnStatistics`] and Vortex [`StatsSet`].
 
+use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow_schema::Schema;
 use datafusion_common::stats::Precision;
 use datafusion_common::{ColumnStatistics, ScalarValue, Statistics};
 use vortex::array::stats::StatsSet;
+use vortex::dtype::arrow::FromArrowType;
 use vortex::dtype::{DType, Nullability};
 use vortex::error::VortexResult;
 use vortex::expr::stats::{Precision as VortexPrecision, Stat};
 use vortex::file::FileStatistics;
-use vortex::flatbuffers::{WriteFlatBufferExt, footer as fb};
+use vortex::flatbuffers::WriteFlatBufferExt;
 use vortex::scalar::Scalar;
 
 /// Convert a DataFusion [`ScalarValue`] to a Vortex [`vortex::scalar::ScalarValue`].
@@ -113,7 +115,9 @@ fn scalar_to_df(scalar: &Scalar) -> Option<ScalarValue> {
 }
 
 /// Convert a Vortex [`VortexPrecision`] to a DataFusion [`Precision`].
-fn vortex_precision_to_df<T>(p: VortexPrecision<T>) -> Precision<T> {
+fn vortex_precision_to_df<T: Debug + Clone + PartialEq + Eq + PartialOrd>(
+    p: VortexPrecision<T>,
+) -> Precision<T> {
     match p {
         VortexPrecision::Exact(v) => Precision::Exact(v),
         VortexPrecision::Inexact(v) => Precision::Inexact(v),
@@ -229,7 +233,7 @@ pub(crate) fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<
 /// The `schema` is used to derive Vortex [`DType`]s for proper scalar deserialization.
 pub fn deserialize_file_statistics(bytes: &[u8], schema: &Schema) -> VortexResult<FileStatistics> {
     let struct_dtype = vortex_struct_dtype_from_schema(schema);
-    let fb_stats = flatbuffers::root::<fb::FileStatistics>(bytes)?;
+    let fb_stats = flatbuffers::root::<vortex::flatbuffers::footer::FileStatistics>(bytes)?;
     FileStatistics::from_flatbuffer(&fb_stats, &struct_dtype)
 }
 

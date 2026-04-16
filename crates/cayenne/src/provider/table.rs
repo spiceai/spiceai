@@ -71,6 +71,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tokio::task;
+use vortex::dtype::arrow::FromArrowType;
 use vortex_datafusion::VortexFormat;
 
 use super::context::CayenneContext;
@@ -152,7 +153,7 @@ impl ColumnStatsAccumulator {
 
             // Merge into the accumulated stats using unordered merge
             let existing = std::mem::take(&mut cols[i]);
-            cols[i] = existing.merge_unordered(&batch_stats.as_typed_ref(&self.dtypes[i]));
+            cols[i] = existing.merge_unordered(&batch_stats, &self.dtypes[i]);
         }
     }
 

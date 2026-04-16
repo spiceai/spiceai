@@ -213,4 +213,3 @@ async fn test_stats_cleared_on_drop_table(
 
     Ok(())
 }
-    ]));
