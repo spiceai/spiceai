@@ -384,8 +384,9 @@ fn sanitize_error_body(body: &str) -> String {
     let mut out = String::with_capacity(body.len().min(MAX_ERROR_BODY_BYTES));
     let mut truncated = false;
     for ch in body.chars() {
-        // Collapse any whitespace (including newlines/tabs/CR) to a single space
-        // so the error string stays a single line in logs.
+        // Replace any whitespace character (including newlines/tabs/CR) with a
+        // regular space so the error string stays a single line in logs. Runs
+        // of whitespace are preserved as runs of spaces rather than collapsed.
         let mapped = if ch.is_whitespace() { ' ' } else { ch };
         if out.len() + mapped.len_utf8() > MAX_ERROR_BODY_BYTES {
             truncated = true;

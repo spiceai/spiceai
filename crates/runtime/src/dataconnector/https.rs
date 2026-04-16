@@ -634,9 +634,10 @@ impl Https {
 
     /// Classify a [`data_components::http::auth::Error`] as either an invalid-
     /// configuration problem (so the user knows to fix their spicepod) or a
-    /// connection / runtime problem. Bad URLs, bad URL schemes, and rejected
-    /// credentials (400/401/403 from the token endpoint) are configuration
-    /// issues; transport / 5xx / parse errors are connection-level issues.
+    /// connection / runtime problem. Bad URLs, bad URL schemes, and definitive
+    /// credential rejections (400/401/403 from the token endpoint) are
+    /// configuration issues; transport, 5xx, 408/429 (transient), and parse
+    /// errors are connection-level.
     fn map_auth_error(
         dataset: &Dataset,
         err: data_components::http::auth::Error,
@@ -654,7 +655,7 @@ impl Https {
                 connector_component: component,
                 source: Box::new(err),
             },
-            AuthErr::TokenEndpointStatus { status, .. } if (400..500).contains(&status) => {
+            AuthErr::TokenEndpointStatus { status, .. } if matches!(status, 400 | 401 | 403) => {
                 DataConnectorError::InvalidConfiguration {
                     dataconnector,
                     message: err.to_string(),
@@ -910,13 +911,13 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::runtime("pagination_page_size")
             .description("Number of items per page for query-parameter pagination. Must be a positive integer greater than 0. Used to expand {limit} in pagination_query_params and to detect the last page (fewer results than page_size = done)."),
         ParameterSpec::runtime("auth_token_url")
-            .description("OAuth2 token endpoint URL. When set together with auth_refresh_token, the connector exchanges the refresh token for short-lived access tokens (RFC 6749 §6) and attaches 'Authorization: Bearer <token>' to all data requests. Applies to JSON API endpoints only."),
+            .description("OAuth2 token endpoint URL. When set together with http_auth_refresh_token, the connector exchanges the refresh token for short-lived access tokens (RFC 6749 §6) and attaches 'Authorization: Bearer <token>' to all data requests. Applies to JSON API endpoints only."),
         ParameterSpec::component("auth_refresh_token").secret()
             .description("OAuth2 refresh token exchanged against auth_token_url to obtain access tokens. Required when auth_token_url is set."),
         ParameterSpec::component("auth_client_id").secret()
-            .description("OAuth2 client_id presented to the token endpoint. Required for confidential clients; optional for public clients."),
+            .description("OAuth2 client_id presented to the token endpoint. Required for confidential clients; optional for public clients. Paired with http_auth_client_secret."),
         ParameterSpec::component("auth_client_secret").secret()
-            .description("OAuth2 client_secret presented to the token endpoint. Required when the client is confidential."),
+            .description("OAuth2 client_secret presented to the token endpoint. Required when the client is confidential; must be set together with http_auth_client_id."),
         ParameterSpec::runtime("auth_scopes")
             .description("Space-separated OAuth2 scopes requested when refreshing the access token (e.g. 'read:data offline_access'). Optional."),
         ParameterSpec::runtime("auth_client_auth")

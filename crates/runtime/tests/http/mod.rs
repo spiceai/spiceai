@@ -1003,7 +1003,7 @@ async fn test_http_oauth2_refresh_token_auth() -> Result<(), String> {
         .await
 }
 
-/// A missing `auth_token_url` alongside a configured `auth_refresh_token`
+/// A missing `auth_token_url` alongside a configured `http_auth_refresh_token`
 /// should be rejected at dataset registration instead of silently proceeding
 /// without auth.
 #[tokio::test]
@@ -1033,10 +1033,10 @@ async fn test_http_oauth2_rejects_partial_configuration() -> Result<(), String> 
             let rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
 
-            // The dataset should fail to load because auth_refresh_token requires
-            // auth_token_url. load_components completes even when individual
-            // datasets fail, so inspect the query path to confirm the failure
-            // surfaced.
+            // The dataset should fail to load because http_auth_refresh_token
+            // requires auth_token_url. load_components completes even when
+            // individual datasets fail, so inspect the query path to confirm
+            // the failure surfaced.
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                     return Err("Timed out waiting for component load to complete".to_string());
