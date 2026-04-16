@@ -18,7 +18,7 @@ limitations under the License.
 //!
 //! The module exposes an [`HttpAuthenticator`] trait that [`crate::http::provider::HttpTableProvider`]
 //! uses to decorate outgoing requests. The main implementation is
-//! [`RefreshTokenAuth`], which implements the OAuth2 refresh-token grant
+//! [`RefreshTokenAuth`], which implements the `OAuth2` refresh-token grant
 //! (RFC 6749 §6): it exchanges a long-lived refresh token for short-lived
 //! access tokens against a configured token endpoint and refreshes them in
 //! the background before they expire.
@@ -111,7 +111,7 @@ pub trait HttpAuthenticator: Send + Sync + fmt::Debug {
     fn apply(&self, builder: RequestBuilder) -> RequestBuilder;
 }
 
-/// How client credentials are conveyed to the OAuth2 token endpoint
+/// How client credentials are conveyed to the `OAuth2` token endpoint
 /// (RFC 6749 §2.3.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ClientAuthMethod {
@@ -136,7 +136,7 @@ impl ClientAuthMethod {
     }
 }
 
-/// Static configuration for the OAuth2 refresh-token grant.
+/// Static configuration for the `OAuth2` refresh-token grant.
 #[derive(Clone, Debug)]
 pub struct RefreshTokenConfig {
     pub token_url: String,
@@ -351,7 +351,7 @@ async fn exchange_refresh_token(
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
-        let body = sanitize_error_body(response.text().await.unwrap_or_default());
+        let body = sanitize_error_body(&response.text().await.unwrap_or_default());
         return Err(Error::TokenEndpointStatus {
             url: config.token_url.clone(),
             status,
@@ -380,7 +380,7 @@ async fn exchange_refresh_token(
 /// [`Error::TokenEndpointStatus`]. Keeps at most [`MAX_ERROR_BODY_BYTES`]
 /// characters (byte-bounded but char-aligned), replaces whitespace with spaces,
 /// and appends an ellipsis marker when truncated.
-fn sanitize_error_body(body: String) -> String {
+fn sanitize_error_body(body: &str) -> String {
     let mut out = String::with_capacity(body.len().min(MAX_ERROR_BODY_BYTES));
     let mut truncated = false;
     for ch in body.chars() {
@@ -464,14 +464,14 @@ mod tests {
     }
 
     impl MockResponse {
-        fn ok(body: serde_json::Value) -> Self {
+        fn ok(body: &serde_json::Value) -> Self {
             Self {
                 status: "200 OK",
                 body: body.to_string(),
             }
         }
 
-        fn status(status: &'static str, body: serde_json::Value) -> Self {
+        fn status(status: &'static str, body: &serde_json::Value) -> Self {
             Self {
                 status,
                 body: body.to_string(),
@@ -612,7 +612,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn exchange_refresh_token_sends_expected_form_and_basic_auth() {
-        let (url, count, captured) = start_mock_server(vec![MockResponse::ok(json!({
+        let (url, count, captured) = start_mock_server(vec![MockResponse::ok(&json!({
             "access_token": "new-access",
             "refresh_token": "rotated-refresh",
             "expires_in": 600,
@@ -668,7 +668,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn exchange_refresh_token_sends_client_credentials_in_body() {
-        let (url, _count, captured) = start_mock_server(vec![MockResponse::ok(json!({
+        let (url, _count, captured) = start_mock_server(vec![MockResponse::ok(&json!({
             "access_token": "at",
             "expires_in": 3600
         }))])
@@ -707,7 +707,7 @@ mod tests {
     async fn exchange_refresh_token_surfaces_non_success_body() {
         let (url, _count, _captured) = start_mock_server(vec![MockResponse::status(
             "400 Bad Request",
-            json!({"error": "invalid_grant"}),
+            &json!({"error": "invalid_grant"}),
         )])
         .await;
 
@@ -735,7 +735,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn refresh_token_auth_applies_bearer_header() {
-        let (url, _count, _captured) = start_mock_server(vec![MockResponse::ok(json!({
+        let (url, _count, _captured) = start_mock_server(vec![MockResponse::ok(&json!({
             "access_token": "initial-access",
             "expires_in": 3600
         }))])
@@ -775,7 +775,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn exchange_rejects_non_bearer_token_type() {
-        let (url, _count, _captured) = start_mock_server(vec![MockResponse::ok(json!({
+        let (url, _count, _captured) = start_mock_server(vec![MockResponse::ok(&json!({
             "access_token": "at",
             "token_type": "MAC",
             "expires_in": 3600
@@ -805,11 +805,11 @@ mod tests {
 
     #[test]
     fn sanitize_error_body_collapses_whitespace_and_truncates() {
-        let out = sanitize_error_body("line1\nline2\tfield".to_string());
+        let out = sanitize_error_body("line1\nline2\tfield");
         assert_eq!(out, "line1 line2 field");
 
         let long = "a".repeat(MAX_ERROR_BODY_BYTES + 64);
-        let out = sanitize_error_body(long);
+        let out = sanitize_error_body(&long);
         assert!(out.ends_with("…<truncated>"), "got: {out}");
         let content_len = out.trim_end_matches("…<truncated>").len();
         assert!(
@@ -832,12 +832,12 @@ mod tests {
         // background loop wakes up ~1s after the initial exchange.
         let expires_in = TOKEN_REFRESH_BUFFER_SECS + 1;
         let (url, count, captured) = start_mock_server(vec![
-            MockResponse::ok(json!({
+            MockResponse::ok(&json!({
                 "access_token": "access-v1",
                 "refresh_token": "refresh-v1",
                 "expires_in": expires_in,
             })),
-            MockResponse::ok(json!({
+            MockResponse::ok(&json!({
                 "access_token": "access-v2",
                 "refresh_token": "refresh-v2",
                 "expires_in": expires_in,
@@ -870,12 +870,11 @@ mod tests {
             if count.load(Ordering::SeqCst) >= 2 {
                 break;
             }
-            if std::time::Instant::now() >= deadline {
-                panic!(
-                    "background refresh did not fire within 5s (requests={})",
-                    count.load(Ordering::SeqCst)
-                );
-            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background refresh did not fire within 5s (requests={})",
+                count.load(Ordering::SeqCst)
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
@@ -900,12 +899,11 @@ mod tests {
             if auth.current_bearer_value().to_str().unwrap_or("") == "Bearer access-v2" {
                 break;
             }
-            if std::time::Instant::now() >= deadline {
-                panic!(
-                    "access token did not rotate to v2 in time; current={:?}",
-                    auth.current_bearer_value()
-                );
-            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "access token did not rotate to v2 in time; current={:?}",
+                auth.current_bearer_value()
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
