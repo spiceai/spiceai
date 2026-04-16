@@ -97,7 +97,7 @@ pub enum Error {
     UnableToConstructDatabricksSqlWarehouse { source: sql_warehouse::Error },
 
     #[snafu(display(
-        "Invalid `mode` value: '{value}'. Use 'delta_lake' or 'spark_connect'. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        "Invalid `mode` value: '{value}'. Valid modes are 'sql_warehouse', 'delta_lake', and 'spark_connect'. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     InvalidMode { value: String },
 
@@ -107,12 +107,12 @@ pub enum Error {
     InvalidConfiguration { message: String },
 
     #[snafu(display(
-        "Failed to build Databricks connector: required component '{missing_component}' is missing. An unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
+        "Failed to build Databricks connector. An unexpected internal error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToBuild { missing_component: String },
 
     #[snafu(display(
-        "Failed to obtain Databricks service principal token for machine-to-machine authentication. {source}"
+        "Failed to obtain Databricks authentication token. {source} Verify the service principal credentials are correctly configured. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     UnableToGetToken {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -841,11 +841,7 @@ impl DataConnector for Databricks {
         self.read_provider
             .table_provider(table_reference)
             .await
-            .map_err(|source| DataConnectorError::UnableToGetReadProvider {
-                dataconnector: "databricks".to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source,
-            })
+            .map_err(|source| classify_table_provider_error(dataset, source))
     }
 
     fn initialization(&self) -> ComponentInitialization {
@@ -859,6 +855,71 @@ impl DataConnector for Databricks {
             }) as Arc<dyn MetricsProvider>
         })
     }
+}
+
+/// Classifies a table-provider error, promoting Databricks-specific
+/// configuration failures (e.g. foreign tables on Classic SQL warehouses)
+/// into permanent, non-retriable errors so the runtime surfaces them
+/// immediately instead of retrying indefinitely.
+fn classify_table_provider_error(
+    dataset: &Dataset,
+    source: Box<dyn std::error::Error + Send + Sync>,
+) -> DataConnectorError {
+    if let Some(message) = databricks_invalid_configuration_message(&*source) {
+        return DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "databricks".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message,
+        };
+    }
+
+    if is_permission_denied_in_chain(&*source) {
+        return DataConnectorError::InsufficientPermissions {
+            dataconnector: "databricks".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            source,
+        };
+    }
+
+    DataConnectorError::UnableToGetReadProvider {
+        dataconnector: "databricks".to_string(),
+        connector_component: ConnectorComponent::from(dataset),
+        source,
+    }
+}
+
+/// Walks the error chain looking for permission-denied signals from the
+/// `discover_schema` path (e.g. `PERMISSION_DENIED` on `DESCRIBE TABLE`).
+fn is_permission_denied_in_chain(source: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(source);
+    while let Some(err) = current {
+        let msg = err.to_string();
+        if msg.contains("Access denied") || msg.contains("PERMISSION_DENIED") {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
+fn databricks_invalid_configuration_message(
+    source: &(dyn std::error::Error + 'static),
+) -> Option<String> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(source);
+    while let Some(err) = current {
+        if let Some(error) = err.downcast_ref::<sql_warehouse::Error>() {
+            match error {
+                sql_warehouse::Error::ForeignTableOnClassicWarehouse { .. }
+                | sql_warehouse::Error::UnsupportedDataSource { .. } => {
+                    return Some(error.to_string());
+                }
+                _ => {}
+            }
+        }
+        current = err.source();
+    }
+
+    None
 }
 
 // ============================================================================
@@ -1571,6 +1632,46 @@ mod tests {
             requests.load(Ordering::SeqCst),
             captured_requests,
         )
+    }
+
+    #[tokio::test]
+    async fn test_classify_table_provider_error_matches_typed_foreign_table_error_in_chain() {
+        let dataset =
+            make_dataset("databricks:catalog.schema.foreign_table", "foreign_table").await;
+        let source: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(sql_warehouse::Error::ForeignTableOnClassicWarehouse {
+                dataset_name: "catalog.schema.foreign_table".to_string(),
+                message: "[UNSUPPORTED_DATA_SOURCE] foreign tables require Pro or Serverless"
+                    .to_string(),
+            });
+
+        let err = classify_table_provider_error(&dataset, source);
+
+        match err {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("Lakehouse Federation foreign table"),
+                    "expected the typed Databricks error message: {message}"
+                );
+            }
+            other => panic!("unexpected error classification: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_classify_table_provider_error_does_not_match_plain_text_only() {
+        let dataset =
+            make_dataset("databricks:catalog.schema.foreign_table", "foreign_table").await;
+        let source: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::other(
+            "Lakehouse Federation foreign table is unsupported on Classic SQL warehouses",
+        ));
+
+        let err = classify_table_provider_error(&dataset, source);
+
+        assert!(
+            matches!(err, DataConnectorError::UnableToGetReadProvider { .. }),
+            "plain text matches should not be promoted without the typed Databricks error"
+        );
     }
 
     fn assert_request_seen(captured_requests: &[String], path_fragment: &str) {
