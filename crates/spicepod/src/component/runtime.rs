@@ -219,6 +219,12 @@ pub struct OtelExporterConfig {
     /// If not specified or empty, all metrics are exported.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metrics: Vec<String>,
+
+    /// Optional headers to send with each export request.
+    /// For HTTP: sent as HTTP headers. For gRPC: sent as metadata entries.
+    /// Values support secret replacement syntax (e.g., `${secrets:api_key}`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub headers: HashMap<String, String>,
 }
 
 impl OtelExporterConfig {
@@ -1479,6 +1485,7 @@ mod tests {
             endpoint: "otel-collector".to_string(),
             push_interval: "30s".to_string(),
             metrics: vec![],
+            headers: HashMap::new(),
         };
         let duration = config
             .push_interval_duration()
@@ -1490,6 +1497,7 @@ mod tests {
             endpoint: "otel-collector".to_string(),
             push_interval: "5m".to_string(),
             metrics: vec![],
+            headers: HashMap::new(),
         };
         let duration = config_minutes
             .push_interval_duration()
@@ -1501,6 +1509,7 @@ mod tests {
             endpoint: "otel-collector".to_string(),
             push_interval: "1h".to_string(),
             metrics: vec![],
+            headers: HashMap::new(),
         };
         let duration = config_hours
             .push_interval_duration()
@@ -1513,6 +1522,7 @@ mod tests {
             endpoint: "otel-collector".to_string(),
             push_interval: "500ms".to_string(),
             metrics: vec![],
+            headers: HashMap::new(),
         };
         let duration = config_ms
             .push_interval_duration()
@@ -1527,6 +1537,7 @@ mod tests {
             endpoint: "otel-collector".to_string(),
             push_interval: "0s".to_string(),
             metrics: vec![],
+            headers: HashMap::new(),
         };
         let result = config.push_interval_duration();
         assert!(result.is_err());
@@ -1543,6 +1554,7 @@ mod tests {
             endpoint: "otel-collector".to_string(),
             push_interval: "invalid".to_string(),
             metrics: vec![],
+            headers: HashMap::new(),
         };
         let result = config.push_interval_duration();
         let _ = result.expect_err("Expected an error for invalid push_interval");
@@ -1566,6 +1578,7 @@ mod tests {
             endpoint: "otel-collector".to_string(),
             push_interval: "60s".to_string(),
             metrics: vec![],
+            headers: HashMap::new(),
         };
         assert!(!grpc_bare.is_http());
 
@@ -1575,6 +1588,7 @@ mod tests {
             endpoint: "otel-collector:4317".to_string(),
             push_interval: "60s".to_string(),
             metrics: vec![],
+            headers: HashMap::new(),
         };
         assert!(!grpc_port.is_http());
 
@@ -1584,6 +1598,7 @@ mod tests {
             endpoint: "http://localhost:4318".to_string(),
             push_interval: "60s".to_string(),
             metrics: vec![],
+            headers: HashMap::new(),
         };
         assert!(http_scheme.is_http());
 
@@ -1593,6 +1608,7 @@ mod tests {
             endpoint: "https://otel.example.com:4318".to_string(),
             push_interval: "60s".to_string(),
             metrics: vec![],
+            headers: HashMap::new(),
         };
         assert!(https_config.is_http());
 
@@ -1602,6 +1618,7 @@ mod tests {
             endpoint: "http://localhost:4318/v1/metrics".to_string(),
             push_interval: "60s".to_string(),
             metrics: vec![],
+            headers: HashMap::new(),
         };
         assert!(http_path.is_http());
     }
@@ -1614,6 +1631,7 @@ mod tests {
             endpoint: "otel-collector".to_string(),
             push_interval: "60s".to_string(),
             metrics: vec![],
+            headers: HashMap::new(),
         };
         assert_eq!(bare.grpc_endpoint(), "http://otel-collector:4317");
 
@@ -1623,6 +1641,7 @@ mod tests {
             endpoint: "otel-collector:9090".to_string(),
             push_interval: "60s".to_string(),
             metrics: vec![],
+            headers: HashMap::new(),
         };
         assert_eq!(with_port.grpc_endpoint(), "http://otel-collector:9090");
 
@@ -1632,6 +1651,7 @@ mod tests {
             endpoint: "localhost:4317".to_string(),
             push_interval: "60s".to_string(),
             metrics: vec![],
+            headers: HashMap::new(),
         };
         assert_eq!(localhost.grpc_endpoint(), "http://localhost:4317");
     }
@@ -1742,6 +1762,79 @@ mod tests {
             .expect("otel_exporter should be present");
         assert_eq!(otel_config.endpoint, "otel-collector:4317");
         assert_eq!(otel_config.push_interval, "45s");
+    }
+
+    #[test]
+    fn test_otel_exporter_with_headers() {
+        let yaml = r#"
+            telemetry:
+                otel_exporter:
+                    endpoint: https://otel.datadoghq.com/v1/metrics
+                    push_interval: 30s
+                    headers:
+                        DD-API-KEY: my-api-key
+                        X-Custom-Header: custom-value
+        "#;
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let otel_config = runtime
+            .telemetry
+            .otel_exporter
+            .expect("otel_exporter should be present");
+        assert_eq!(
+            otel_config.endpoint,
+            "https://otel.datadoghq.com/v1/metrics"
+        );
+        assert!(otel_config.is_http());
+        assert_eq!(otel_config.headers.len(), 2);
+        assert_eq!(
+            otel_config.headers.get("DD-API-KEY"),
+            Some(&"my-api-key".to_string())
+        );
+        assert_eq!(
+            otel_config.headers.get("X-Custom-Header"),
+            Some(&"custom-value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_otel_exporter_headers_default_empty() {
+        let yaml = r"
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector:4317
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let otel_config = runtime
+            .telemetry
+            .otel_exporter
+            .expect("otel_exporter should be present");
+        assert!(otel_config.headers.is_empty());
+    }
+
+    #[test]
+    fn test_otel_exporter_with_secret_template_in_headers() {
+        let yaml = r"
+            telemetry:
+                otel_exporter:
+                    endpoint: https://otel.datadoghq.com/v1/metrics
+                    headers:
+                        DD-API-KEY: ${secrets:dd_api_key}
+                        Authorization: Basic ${secrets:grafana_auth}
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let otel_config = runtime
+            .telemetry
+            .otel_exporter
+            .expect("otel_exporter should be present");
+        assert_eq!(otel_config.headers.len(), 2);
+        assert_eq!(
+            otel_config.headers.get("DD-API-KEY"),
+            Some(&"${secrets:dd_api_key}".to_string())
+        );
+        assert_eq!(
+            otel_config.headers.get("Authorization"),
+            Some(&"Basic ${secrets:grafana_auth}".to_string())
+        );
     }
 
     #[test]

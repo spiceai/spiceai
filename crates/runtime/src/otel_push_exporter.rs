@@ -31,9 +31,14 @@ limitations under the License.
 //! are exported. This is implemented via a [`FilteringExporter`] wrapper that filters
 //! metrics before passing them to the underlying OTEL exporter.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
-use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig, WithHttpConfig};
+use opentelemetry_otlp::{
+    MetricExporter, Protocol, WithExportConfig, WithHttpConfig, WithTonicConfig,
+};
 use opentelemetry_sdk::{
     metrics::{
         Temporality, data::ResourceMetrics, exporter::PushMetricExporter,
@@ -179,15 +184,17 @@ pub use spicepod::component::runtime::OtelExporterConfig;
 ///
 /// ```ignore
 /// use runtime::otel_push_exporter::{create_otel_periodic_reader, OtelExporterConfig};
+/// use std::collections::HashMap;
 ///
 /// let config = OtelExporterConfig {
 ///     enabled: true,
 ///     endpoint: "otel-collector:4317".to_string(),
 ///     push_interval: "30s".to_string(),
 ///     metrics: vec![],
+///     headers: HashMap::new(),
 /// };
 ///
-/// let otel_reader = create_otel_periodic_reader(&config)?;
+/// let otel_reader = create_otel_periodic_reader(&config, &HashMap::new())?;
 ///
 /// let provider = SdkMeterProvider::builder()
 ///     .with_reader(prometheus_exporter)
@@ -195,7 +202,10 @@ pub use spicepod::component::runtime::OtelExporterConfig;
 ///     .with_reader(otel_reader)  // Add OTEL push reader
 ///     .build();
 /// ```
-pub fn create_otel_periodic_reader(config: &OtelExporterConfig) -> Result<OtelPeriodicReader> {
+pub fn create_otel_periodic_reader(
+    config: &OtelExporterConfig,
+    resolved_headers: &HashMap<String, String>,
+) -> Result<OtelPeriodicReader> {
     let push_interval =
         config
             .push_interval_duration()
@@ -209,13 +219,14 @@ pub fn create_otel_periodic_reader(config: &OtelExporterConfig) -> Result<OtelPe
         protocol = protocol,
         push_interval_secs = push_interval.as_secs(),
         metrics_filter = ?config.metrics,
+        num_headers = resolved_headers.len(),
         "Creating OTEL metrics periodic reader"
     );
 
     let inner_exporter = if config.is_http() {
-        create_http_exporter(&config.endpoint)?
+        create_http_exporter(&config.endpoint, resolved_headers)?
     } else {
-        create_grpc_exporter(&config.grpc_endpoint())?
+        create_grpc_exporter(&config.grpc_endpoint(), resolved_headers)?
     };
 
     // Wrap with filtering exporter
@@ -228,18 +239,40 @@ pub fn create_otel_periodic_reader(config: &OtelExporterConfig) -> Result<OtelPe
     Ok(reader)
 }
 
-fn create_grpc_exporter(endpoint: &str) -> Result<MetricExporter> {
-    MetricExporter::builder()
+fn create_grpc_exporter(
+    endpoint: &str,
+    headers: &HashMap<String, String>,
+) -> Result<MetricExporter> {
+    let mut builder = MetricExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
-        .with_protocol(Protocol::Grpc)
-        .build()
-        .map_err(|e| Error::ExporterCreationFailed {
-            message: e.to_string(),
-        })
+        .with_protocol(Protocol::Grpc);
+
+    if !headers.is_empty() {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        for (key, value) in headers {
+            let key = key
+                .parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>()
+                .map_err(|e| Error::ExporterCreationFailed {
+                    message: format!("Invalid gRPC metadata key '{key}': {e}"),
+                })?;
+            let value = value.parse().map_err(|e| Error::ExporterCreationFailed {
+                message: format!("Invalid gRPC metadata value: {e}"),
+            })?;
+            metadata.insert(key, value);
+        }
+        builder = builder.with_metadata(metadata);
+    }
+
+    builder.build().map_err(|e| Error::ExporterCreationFailed {
+        message: e.to_string(),
+    })
 }
 
-fn create_http_exporter(endpoint: &str) -> Result<MetricExporter> {
+fn create_http_exporter(
+    endpoint: &str,
+    headers: &HashMap<String, String>,
+) -> Result<MetricExporter> {
     // For HTTP, the endpoint should include the /v1/metrics path
     let full_endpoint = if endpoint.ends_with("/v1/metrics") {
         endpoint.to_string()
@@ -255,15 +288,19 @@ fn create_http_exporter(endpoint: &str) -> Result<MetricExporter> {
             message: format!("Failed to build OTEL HTTP client: {e}"),
         })?;
 
-    MetricExporter::builder()
+    let mut builder = MetricExporter::builder()
         .with_http()
         .with_http_client(http_client)
         .with_endpoint(full_endpoint)
-        .with_protocol(Protocol::HttpBinary)
-        .build()
-        .map_err(|e| Error::ExporterCreationFailed {
-            message: e.to_string(),
-        })
+        .with_protocol(Protocol::HttpBinary);
+
+    if !headers.is_empty() {
+        builder = builder.with_headers(headers.clone());
+    }
+
+    builder.build().map_err(|e| Error::ExporterCreationFailed {
+        message: e.to_string(),
+    })
 }
 
 #[cfg(test)]

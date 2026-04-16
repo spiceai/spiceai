@@ -39,6 +39,7 @@ use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
+use runtime::secrets::ExposeSecret;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use runtime_async::ManagedTokioRuntime;
@@ -539,10 +540,28 @@ pub async fn run(args: Args) -> Result<()> {
             .and_then(|c| c.otel_exporter.as_ref())
             .filter(|c| c.enabled);
 
+        // Resolve secrets in OTEL exporter headers before initializing metrics
+        let resolved_otel_headers = if let Some(config) = otel_config {
+            let mut resolved = std::collections::HashMap::new();
+            let secrets = rt.secrets();
+            let secrets_guard = secrets.read().await;
+            for (key, value) in &config.headers {
+                let resolved_value = secrets_guard
+                    .inject_secrets(key, runtime::secrets::ParamStr(value.as_ref()))
+                    .await;
+                resolved.insert(key.clone(), resolved_value.expose_secret().to_string());
+            }
+            drop(secrets_guard);
+            resolved
+        } else {
+            std::collections::HashMap::new()
+        };
+
         init_metrics(
             &rt.datafusion(),
             metrics_registry.clone(),
             otel_config,
+            &resolved_otel_headers,
             metrics_reader,
         )
         .context(UnableToInitializeMetricsSnafu)?;
@@ -668,6 +687,7 @@ fn init_metrics(
     df: &Arc<DataFusion>,
     registry: prometheus::Registry,
     otel_config: Option<&app::spicepod::component::runtime::OtelExporterConfig>,
+    resolved_otel_headers: &std::collections::HashMap<String, String>,
     metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let resource = Resource::builder().build();
@@ -701,7 +721,7 @@ fn init_metrics(
 
     // Add OTEL push exporter if configured
     if let Some(config) = otel_config {
-        match create_otel_reader(config) {
+        match create_otel_reader(config, resolved_otel_headers) {
             Ok(otel_reader) => {
                 provider_builder = provider_builder.with_reader(otel_reader);
                 let protocol = if config.is_http() { "http" } else { "grpc" };
@@ -743,8 +763,9 @@ fn init_cluster_metrics_only(metrics_reader: runtime::metrics_reader::MetricsRea
 /// Creates an OTEL periodic reader from the spicepod config
 fn create_otel_reader(
     config: &app::spicepod::component::runtime::OtelExporterConfig,
+    resolved_headers: &std::collections::HashMap<String, String>,
 ) -> Result<runtime::otel_push_exporter::OtelPeriodicReader, runtime::otel_push_exporter::Error> {
-    runtime::otel_push_exporter::create_otel_periodic_reader(config)
+    runtime::otel_push_exporter::create_otel_periodic_reader(config, resolved_headers)
 }
 
 async fn start_anonymous_telemetry(
