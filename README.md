@@ -3,7 +3,7 @@
 </p>
 <div align="center">
 
-[![CodeQL](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml)
+[![CodeQL](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml?query=branch%3Atrunk+event%3Apush)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Slack](https://img.shields.io/badge/Slack-Join%20Us-4A154B?logo=slack)](https://spiceai.org/slack)
 [![Follow on X](https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x)](https://x.com/intent/follow?screen_name=spice_ai)
