@@ -41,8 +41,7 @@ use runtime_secrets::{Secrets, get_params_with_secrets};
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("endpoint")
-        .description("Elasticsearch cluster URL (e.g., https://localhost:9200).")
-        .secret(),
+        .description("Elasticsearch cluster URL (e.g., https://localhost:9200)."),
     ParameterSpec::component("user")
         .description("Username for Elasticsearch authentication.")
         .secret(),

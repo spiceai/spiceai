@@ -71,8 +71,7 @@ impl ElasticsearchFactory {
 
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("endpoint")
-        .description("Elasticsearch cluster URL (e.g., https://localhost:9200). Required.")
-        .secret(),
+        .description("Elasticsearch cluster URL (e.g., https://localhost:9200). Required."),
     ParameterSpec::component("user")
         .description("Username for Elasticsearch authentication.")
         .secret(),

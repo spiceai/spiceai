@@ -103,6 +103,12 @@ impl TableProvider for ElasticsearchKnnTable {
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let effective_k = limit.unwrap_or(self.k);
+        if effective_k == 0 {
+            let projected_schema = project_schema(&self.schema, projection)?;
+            return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+                projected_schema,
+            )));
+        }
         let projected_schema = project_schema(&self.schema, projection)?;
         Ok(Arc::new(ElasticsearchKnnExec {
             client: Arc::clone(&self.client),
@@ -208,6 +214,7 @@ impl ExecutionPlan for ElasticsearchKnnExec {
                 ));
             }
 
+            let vector_field_for_alias = vector_field.clone();
             let req = SearchRequest {
                 knn: Some(KnnQuery {
                     field: vector_field,
@@ -224,7 +231,21 @@ impl ExecutionPlan for ElasticsearchKnnExec {
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            let batch = knn_hits_to_batch(&response.hits.hits, &schema, &source_schema)?;
+            // Build alias: find the embedding column in the output schema (FixedSizeList type)
+            // and map it from the ES vector_field name.
+            let alias_pair = schema
+                .fields()
+                .iter()
+                .find(|f| matches!(f.data_type(), DataType::FixedSizeList(_, _)))
+                .filter(|f| f.name() != &vector_field_for_alias)
+                .map(|f| (vector_field_for_alias.clone(), f.name().clone()));
+
+            let batch = knn_hits_to_batch(
+                &response.hits.hits,
+                &schema,
+                &source_schema,
+                alias_pair.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+            )?;
 
             if let Some(proj) = &projection {
                 Ok(batch.project(proj)?)
@@ -241,10 +262,14 @@ impl ExecutionPlan for ElasticsearchKnnExec {
 }
 
 /// Convert kNN search hits to a [`RecordBatch`] with primary key fields and `_score`.
+///
+/// `vector_field_alias` maps the ES `vector_field` name to the output schema's
+/// embedding column name so extraction from `_source` succeeds even when names differ.
 fn knn_hits_to_batch(
     hits: &[elasticsearch::Hit],
     output_schema: &SchemaRef,
     source_schema: &SchemaRef,
+    vector_field_alias: Option<(&str, &str)>,
 ) -> Result<RecordBatch, DataFusionError> {
     let num_rows = hits.len();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
@@ -261,6 +286,18 @@ fn knn_hits_to_batch(
             columns.push(Arc::new(StringArray::from(ids)) as ArrayRef);
         } else if let Ok(col_idx) = source_batch.schema().index_of(field.name()) {
             columns.push(Arc::clone(source_batch.column(col_idx)));
+        } else if let Some((es_field, output_name)) = vector_field_alias {
+            // When the output schema expects a derived name (e.g. "col_embedding")
+            // but ES stores it under the configured vector_field, alias it.
+            if field.name() == output_name {
+                if let Ok(col_idx) = source_batch.schema().index_of(es_field) {
+                    columns.push(Arc::clone(source_batch.column(col_idx)));
+                } else {
+                    columns.push(arrow::array::new_null_array(field.data_type(), num_rows));
+                }
+            } else {
+                columns.push(arrow::array::new_null_array(field.data_type(), num_rows));
+            }
         } else {
             // Field not in source; fill with nulls.
             columns.push(arrow::array::new_null_array(field.data_type(), num_rows));
@@ -311,6 +348,12 @@ impl TableProvider for ElasticsearchTextSearchTable {
         limit: Option<usize>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let effective_limit = limit.unwrap_or(self.limit);
+        if effective_limit == 0 {
+            let projected_schema = project_schema(&self.schema, projection)?;
+            return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+                projected_schema,
+            )));
+        }
         let projected_schema = project_schema(&self.schema, projection)?;
         Ok(Arc::new(ElasticsearchTextSearchExec {
             client: Arc::clone(&self.client),
@@ -414,7 +457,7 @@ impl ExecutionPlan for ElasticsearchTextSearchExec {
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            let batch = knn_hits_to_batch(&response.hits.hits, &schema, &source_schema)?;
+            let batch = knn_hits_to_batch(&response.hits.hits, &schema, &source_schema, None)?;
 
             if let Some(proj) = &projection {
                 Ok(batch.project(proj)?)
