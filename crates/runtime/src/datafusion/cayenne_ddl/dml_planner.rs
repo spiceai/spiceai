@@ -157,7 +157,7 @@ impl CatalogDmlHandler for DistributedCayenneDmlHandler {
         physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
         _session_state: &SessionState,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let Some(input) = physical_inputs.first() else {
+        let [input] = physical_inputs.as_slice() else {
             return Err(DataFusionError::Internal(
                 "Distributed DELETE requires exactly one physical input".to_string(),
             ));
@@ -179,7 +179,7 @@ impl CatalogDmlHandler for DistributedCayenneDmlHandler {
         physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
         _session_state: &SessionState,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let Some(input) = physical_inputs.first() else {
+        let [input] = physical_inputs.as_slice() else {
             return Err(DataFusionError::Internal(
                 "Distributed UPDATE requires exactly one physical input".to_string(),
             ));
@@ -217,7 +217,7 @@ impl CatalogDmlHandler for DistributedCayenneDmlHandler {
             )));
         }
 
-        let Some(input) = physical_inputs.first() else {
+        let [input] = physical_inputs.as_slice() else {
             return Err(DataFusionError::Internal(
                 "Distributed INSERT requires exactly one physical input".to_string(),
             ));

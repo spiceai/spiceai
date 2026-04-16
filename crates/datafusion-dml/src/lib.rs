@@ -32,7 +32,7 @@ limitations under the License.
 //! handlers may override only the operations they need, while relying on trait
 //! defaults for standard behavior.
 //!
-//! The API follows core DataFusion DML conventions:
+//! The API follows core `DataFusion` DML conventions:
 //! - typed predicates/assignments (`Expr`) rather than SQL strings,
 //! - explicit insert semantics via [`datafusion::logical_expr::dml::InsertOp`],
 //! - standard DML output schema (`count: UInt64`).

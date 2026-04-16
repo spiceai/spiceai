@@ -126,7 +126,7 @@ pub trait CatalogDmlHandler: fmt::Debug + Send + Sync {
         physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
         session_state: &SessionState,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let Some(input) = physical_inputs.first() else {
+        let [input] = physical_inputs.as_slice() else {
             return Err(DataFusionError::Internal(
                 "DML INSERT extension node requires exactly one physical input".to_string(),
             ));

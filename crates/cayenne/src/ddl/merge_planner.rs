@@ -69,7 +69,7 @@ impl CatalogDmlHandler for CayenneDmlHandler {
         physical_inputs: Vec<Arc<dyn ExecutionPlan>>,
         session_state: &datafusion::execution::SessionState,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let Some(join_physical) = physical_inputs.first() else {
+        let [join_physical] = physical_inputs.as_slice() else {
             return Err(DataFusionError::Internal(
                 "Local MERGE requires exactly one physical input".to_string(),
             ));
