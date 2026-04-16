@@ -250,17 +250,17 @@ fn create_grpc_exporter(
 
     if !headers.is_empty() {
         let mut metadata = tonic::metadata::MetadataMap::new();
-        for (key, value) in headers {
-            let key_str = key.as_str();
-            let key = key_str
+        for (key_str, value) in headers {
+            let key_str = key_str.as_str();
+            let metadata_key = key_str
                 .parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>()
                 .map_err(|e| Error::ExporterCreationFailed {
                     message: format!("Invalid gRPC metadata key '{key_str}': {e}. gRPC metadata keys must be lowercase ASCII"),
                 })?;
-            let value = value.parse().map_err(|e| Error::ExporterCreationFailed {
+            let metadata_value = value.parse().map_err(|e| Error::ExporterCreationFailed {
                 message: format!("Invalid gRPC metadata value for '{key_str}': {e}"),
             })?;
-            metadata.insert(key, value);
+            metadata.insert(metadata_key, metadata_value);
         }
         builder = builder.with_metadata(metadata);
     }
@@ -476,8 +476,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_create_grpc_exporter_with_valid_headers() {
+    #[test]
+    fn test_create_grpc_exporter_with_valid_headers() {
+        // tonic requires a tokio runtime to be available during exporter construction
+        let _rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        let _guard = _rt.enter();
         let headers = HashMap::from([
             ("api-key".to_string(), "test-key".to_string()),
             ("x-custom-header".to_string(), "value".to_string()),
@@ -489,8 +492,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_create_grpc_exporter_without_headers() {
+    #[test]
+    fn test_create_grpc_exporter_without_headers() {
+        let _rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        let _guard = _rt.enter();
         let headers = HashMap::new();
         let result = create_grpc_exporter("http://localhost:4317", &headers);
         assert!(
