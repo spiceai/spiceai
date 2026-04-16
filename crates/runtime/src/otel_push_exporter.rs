@@ -251,13 +251,14 @@ fn create_grpc_exporter(
     if !headers.is_empty() {
         let mut metadata = tonic::metadata::MetadataMap::new();
         for (key, value) in headers {
-            let key = key
+            let key_str = key.as_str();
+            let key = key_str
                 .parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>()
                 .map_err(|e| Error::ExporterCreationFailed {
-                    message: format!("Invalid gRPC metadata key '{key}': {e}"),
+                    message: format!("Invalid gRPC metadata key '{key_str}': {e}. gRPC metadata keys must be lowercase ASCII"),
                 })?;
             let value = value.parse().map_err(|e| Error::ExporterCreationFailed {
-                message: format!("Invalid gRPC metadata value: {e}"),
+                message: format!("Invalid gRPC metadata value for '{key_str}': {e}"),
             })?;
             metadata.insert(key, value);
         }
@@ -447,5 +448,56 @@ mod tests {
 
         // Should have no metrics left since none matched
         assert!(!any_match);
+    }
+
+    // Tests for header support
+
+    #[test]
+    fn test_create_http_exporter_with_headers() {
+        let headers = HashMap::from([
+            ("DD-API-KEY".to_string(), "test-key".to_string()),
+            ("X-Custom".to_string(), "value".to_string()),
+        ]);
+        // HTTP exporter with headers should build successfully
+        let result = create_http_exporter("http://localhost:4318/v1/metrics", &headers);
+        assert!(result.is_ok(), "HTTP exporter with headers should build: {result:?}");
+    }
+
+    #[test]
+    fn test_create_http_exporter_without_headers() {
+        let headers = HashMap::new();
+        let result = create_http_exporter("http://localhost:4318/v1/metrics", &headers);
+        assert!(result.is_ok(), "HTTP exporter without headers should build: {result:?}");
+    }
+
+    #[test]
+    fn test_create_grpc_exporter_with_valid_headers() {
+        let headers = HashMap::from([
+            ("api-key".to_string(), "test-key".to_string()),
+            ("x-custom-header".to_string(), "value".to_string()),
+        ]);
+        let result = create_grpc_exporter("http://localhost:4317", &headers);
+        assert!(result.is_ok(), "gRPC exporter with valid headers should build: {result:?}");
+    }
+
+    #[test]
+    fn test_create_grpc_exporter_without_headers() {
+        let headers = HashMap::new();
+        let result = create_grpc_exporter("http://localhost:4317", &headers);
+        assert!(result.is_ok(), "gRPC exporter without headers should build: {result:?}");
+    }
+
+    #[test]
+    fn test_create_grpc_exporter_rejects_invalid_metadata_key() {
+        // gRPC metadata keys must be lowercase ASCII
+        let headers = HashMap::from([
+            ("Invalid Key With Spaces".to_string(), "value".to_string()),
+        ]);
+        let result = create_grpc_exporter("http://localhost:4317", &headers);
+        assert!(result.is_err());
+        let err = result.expect_err("should fail with invalid metadata key");
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid gRPC metadata key"), "Error should mention invalid key: {msg}");
+        assert!(msg.contains("lowercase ASCII"), "Error should hint about lowercase ASCII: {msg}");
     }
 }
