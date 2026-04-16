@@ -3,6 +3,10 @@ description: 'Install Oracle ODPI-C'
 runs:
   using: 'composite'
   steps:
+    - name: Configure apt mirrors (Linux)
+      if: runner.os == 'Linux'
+      uses: ./.github/actions/configure-apt
+
     - name: Install Oracle Instant Client
       shell: bash
       run: |

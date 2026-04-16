@@ -6,6 +6,10 @@ description: 'composite action'
 runs:
   using: 'composite'
   steps:
+    - name: Configure apt mirrors (Linux)
+      if: runner.os == 'Linux'
+      uses: ./.github/actions/configure-apt
+
     - name: Use HTTPS in apt sources
       shell: bash
       run: |
