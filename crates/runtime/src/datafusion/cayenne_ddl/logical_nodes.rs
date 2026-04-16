@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::DFSchemaRef;
-use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
+use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore, dml::InsertOp};
 use datafusion::sql::TableReference;
 
 // ── DistributedCayenneDeleteNode ──────────────────────────────────────────────
@@ -40,7 +40,7 @@ pub struct DistributedCayenneDeleteNode {
     pub table_name: TableReference,
     pub input: Arc<LogicalPlan>,
     pub output_schema: DFSchemaRef,
-    pub filter_sql: Option<String>,
+    pub filters: Vec<Expr>,
 }
 
 impl DistributedCayenneDeleteNode {
@@ -49,13 +49,13 @@ impl DistributedCayenneDeleteNode {
         table_name: TableReference,
         input: Arc<LogicalPlan>,
         output_schema: DFSchemaRef,
-        filter_sql: Option<String>,
+        filters: Vec<Expr>,
     ) -> Self {
         Self {
             table_name,
             input,
             output_schema,
-            filter_sql,
+            filters,
         }
     }
 }
@@ -65,7 +65,7 @@ impl Hash for DistributedCayenneDeleteNode {
         self.table_name.hash(state);
         self.input.hash(state);
         self.output_schema.hash(state);
-        self.filter_sql.hash(state);
+        self.filters.hash(state);
     }
 }
 impl PartialEq for DistributedCayenneDeleteNode {
@@ -73,7 +73,7 @@ impl PartialEq for DistributedCayenneDeleteNode {
         self.table_name == other.table_name
             && self.input == other.input
             && self.output_schema == other.output_schema
-            && self.filter_sql == other.filter_sql
+            && self.filters == other.filters
     }
 }
 impl Eq for DistributedCayenneDeleteNode {}
@@ -115,7 +115,7 @@ impl UserDefinedLogicalNodeCore for DistributedCayenneDeleteNode {
             table_name: self.table_name.clone(),
             input: Arc::new(input),
             output_schema: DFSchemaRef::clone(&self.output_schema),
-            filter_sql: self.filter_sql.clone(),
+            filters: self.filters.clone(),
         })
     }
 }
@@ -128,8 +128,8 @@ pub struct DistributedCayenneUpdateNode {
     pub table_name: TableReference,
     pub input: Arc<LogicalPlan>,
     pub output_schema: DFSchemaRef,
-    pub filter_sql: Option<String>,
-    pub assignments_sql: Vec<(String, String)>,
+    pub filters: Vec<Expr>,
+    pub assignments: Vec<(String, Expr)>,
 }
 
 impl DistributedCayenneUpdateNode {
@@ -138,15 +138,15 @@ impl DistributedCayenneUpdateNode {
         table_name: TableReference,
         input: Arc<LogicalPlan>,
         output_schema: DFSchemaRef,
-        filter_sql: Option<String>,
-        assignments_sql: Vec<(String, String)>,
+        filters: Vec<Expr>,
+        assignments: Vec<(String, Expr)>,
     ) -> Self {
         Self {
             table_name,
             input,
             output_schema,
-            filter_sql,
-            assignments_sql,
+            filters,
+            assignments,
         }
     }
 }
@@ -156,8 +156,8 @@ impl Hash for DistributedCayenneUpdateNode {
         self.table_name.hash(state);
         self.input.hash(state);
         self.output_schema.hash(state);
-        self.filter_sql.hash(state);
-        self.assignments_sql.hash(state);
+        self.filters.hash(state);
+        self.assignments.hash(state);
     }
 }
 impl PartialEq for DistributedCayenneUpdateNode {
@@ -165,8 +165,8 @@ impl PartialEq for DistributedCayenneUpdateNode {
         self.table_name == other.table_name
             && self.input == other.input
             && self.output_schema == other.output_schema
-            && self.filter_sql == other.filter_sql
-            && self.assignments_sql == other.assignments_sql
+            && self.filters == other.filters
+            && self.assignments == other.assignments
     }
 }
 impl Eq for DistributedCayenneUpdateNode {}
@@ -208,8 +208,8 @@ impl UserDefinedLogicalNodeCore for DistributedCayenneUpdateNode {
             table_name: self.table_name.clone(),
             input: Arc::new(input),
             output_schema: DFSchemaRef::clone(&self.output_schema),
-            filter_sql: self.filter_sql.clone(),
-            assignments_sql: self.assignments_sql.clone(),
+            filters: self.filters.clone(),
+            assignments: self.assignments.clone(),
         })
     }
 }
@@ -222,6 +222,7 @@ pub struct DistributedCayenneInsertNode {
     pub table_name: TableReference,
     pub input: Arc<LogicalPlan>,
     pub output_schema: DFSchemaRef,
+    pub insert_op: InsertOp,
 }
 
 impl DistributedCayenneInsertNode {
@@ -230,11 +231,13 @@ impl DistributedCayenneInsertNode {
         table_name: TableReference,
         input: Arc<LogicalPlan>,
         output_schema: DFSchemaRef,
+        insert_op: InsertOp,
     ) -> Self {
         Self {
             table_name,
             input,
             output_schema,
+            insert_op,
         }
     }
 }
@@ -244,6 +247,7 @@ impl Hash for DistributedCayenneInsertNode {
         self.table_name.hash(state);
         self.input.hash(state);
         self.output_schema.hash(state);
+        self.insert_op.hash(state);
     }
 }
 impl PartialEq for DistributedCayenneInsertNode {
@@ -251,6 +255,7 @@ impl PartialEq for DistributedCayenneInsertNode {
         self.table_name == other.table_name
             && self.input == other.input
             && self.output_schema == other.output_schema
+            && self.insert_op == other.insert_op
     }
 }
 impl Eq for DistributedCayenneInsertNode {}
@@ -292,6 +297,7 @@ impl UserDefinedLogicalNodeCore for DistributedCayenneInsertNode {
             table_name: self.table_name.clone(),
             input: Arc::new(input),
             output_schema: DFSchemaRef::clone(&self.output_schema),
+            insert_op: self.insert_op,
         })
     }
 }
