@@ -818,7 +818,11 @@ async fn oauth_token_handler(
     let rotated = format!("refresh-{n}");
 
     state.issued_access_tokens.lock().await.push(access.clone());
-    state.valid_refresh_tokens.lock().await.push(rotated.clone());
+    state
+        .valid_refresh_tokens
+        .lock()
+        .await
+        .push(rotated.clone());
 
     let body = serde_json::json!({
         "access_token": access,
@@ -828,11 +832,7 @@ async fn oauth_token_handler(
     })
     .to_string();
 
-    (
-        StatusCode::OK,
-        [("content-type", "application/json")],
-        body,
-    )
+    (StatusCode::OK, [("content-type", "application/json")], body)
 }
 
 async fn oauth_secure_handler(
@@ -940,10 +940,7 @@ async fn test_http_oauth2_refresh_token_auth() -> Result<(), String> {
                     "http_auth_refresh_token".to_string(),
                     "seed-refresh".to_string(),
                 ),
-                (
-                    "http_auth_client_id".to_string(),
-                    "test-client".to_string(),
-                ),
+                ("http_auth_client_id".to_string(), "test-client".to_string()),
                 (
                     "http_auth_client_secret".to_string(),
                     "test-secret".to_string(),

@@ -95,7 +95,9 @@ pub enum Error {
     UnsupportedTokenType { token_type: String },
 
     #[snafu(display("OAuth2 access token is not a valid HTTP header value: {source}"))]
-    InvalidAccessToken { source: reqwest::header::InvalidHeaderValue },
+    InvalidAccessToken {
+        source: reqwest::header::InvalidHeaderValue,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -338,11 +340,9 @@ async fn exchange_refresh_token(
     config: &RefreshTokenConfig,
     refresh_token: &SecretString,
 ) -> Result<TokenResponse> {
-    let response = send_request_with_retry(
-        "HTTP connector OAuth2",
-        "refresh access token",
-        || build_token_request(client, config, refresh_token),
-    )
+    let response = send_request_with_retry("HTTP connector OAuth2", "refresh access token", || {
+        build_token_request(client, config, refresh_token)
+    })
     .await
     .map_err(|e| Error::TokenRequest {
         url: config.token_url.clone(),
@@ -574,7 +574,10 @@ mod tests {
 
     #[test]
     fn parse_client_auth_method() {
-        assert_eq!(ClientAuthMethod::parse("basic"), Ok(ClientAuthMethod::Basic));
+        assert_eq!(
+            ClientAuthMethod::parse("basic"),
+            Ok(ClientAuthMethod::Basic)
+        );
         assert_eq!(ClientAuthMethod::parse("BODY"), Ok(ClientAuthMethod::Body));
         assert!(ClientAuthMethod::parse("none").is_err());
     }
@@ -753,14 +756,15 @@ mod tests {
 
         let current = auth.current_bearer_value();
         assert_eq!(current.to_str().unwrap_or(""), "Bearer initial-access");
-        assert!(current.is_sensitive(), "bearer header must be marked sensitive");
+        assert!(
+            current.is_sensitive(),
+            "bearer header must be marked sensitive"
+        );
 
         let client = Client::new();
-        let builder = client.get("http://example.com/data");
-        let built = auth
-            .apply(builder)
-            .build()
-            .expect("request should build");
+        // Never actually sent — we just inspect the built request's headers.
+        let builder = client.get("https://example.invalid/data");
+        let built = auth.apply(builder).build().expect("request should build");
         let header = built
             .headers()
             .get("Authorization")

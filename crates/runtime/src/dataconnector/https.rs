@@ -1213,8 +1213,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_refresh_token_auth_rejects_refresh_token_without_url() {
-        let connector =
-            test_connector_with(&[("http_auth_refresh_token", "rt-only")]).await;
+        let connector = test_connector_with(&[("http_auth_refresh_token", "rt-only")]).await;
         let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
 
         let error = connector
@@ -1237,11 +1236,8 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_refresh_token_auth_rejects_url_without_refresh_token() {
-        let connector = test_connector_with(&[(
-            "auth_token_url",
-            "https://example.com/oauth/token",
-        )])
-        .await;
+        let connector =
+            test_connector_with(&[("auth_token_url", "https://example.com/oauth/token")]).await;
         let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
 
         let error = connector
@@ -1310,5 +1306,4 @@ mod tests {
         assert_eq!(config.scopes.as_deref(), Some("read:data offline_access"));
         assert_eq!(config.client_auth, ClientAuthMethod::Body);
     }
-
 }
