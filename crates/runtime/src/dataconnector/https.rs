@@ -24,7 +24,7 @@ use crate::dataconnector::listing::{
 use data_components::http::auth::{
     ClientAuthMethod, HttpAuthenticator, RefreshTokenAuth, RefreshTokenConfig,
 };
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -542,14 +542,15 @@ impl Https {
             .ok()
             .map(str::trim)
             .filter(|v| !v.is_empty());
-        let refresh_token = self.params.get("auth_refresh_token").ok();
 
-        // User-facing parameter names (runtime params are unprefixed,
-        // component/secret params are prefixed with "http_").
-        let url_name = self.params.user_param("auth_token_url");
-        let refresh_name = self.params.user_param("auth_refresh_token");
-        let client_id_name = self.params.user_param("auth_client_id");
-        let client_secret_name = self.params.user_param("auth_client_secret");
+        // Treat a blank/whitespace-only refresh token as unset — avoids failing
+        // at the token endpoint with "invalid_grant" when the real problem is a
+        // misconfigured (empty) secret.
+        let refresh_token = self
+            .params
+            .get("auth_refresh_token")
+            .ok()
+            .filter(|s| !s.expose_secret().trim().is_empty());
 
         match (token_url, refresh_token) {
             (None, None) => Ok(None),
@@ -557,14 +558,18 @@ impl Https {
                 dataconnector: "https".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
                 message: format!(
-                    "'{url_name}' is set but '{refresh_name}' is missing. Provide a refresh token to use OAuth2 auth."
+                    "'{}' is set but '{}' is missing or empty. Provide a refresh token to use OAuth2 auth.",
+                    self.params.user_param("auth_token_url"),
+                    self.params.user_param("auth_refresh_token"),
                 ),
             }),
             (None, Some(_)) => Err(DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: "https".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
                 message: format!(
-                    "'{refresh_name}' is set but '{url_name}' is missing. Provide the OAuth2 token endpoint URL."
+                    "'{}' is set but '{}' is missing. Provide the OAuth2 token endpoint URL.",
+                    self.params.user_param("auth_refresh_token"),
+                    self.params.user_param("auth_token_url"),
                 ),
             }),
             (Some(token_url), Some(refresh_token)) => {
@@ -576,14 +581,16 @@ impl Https {
                     .map(str::trim)
                     .filter(|v| !v.is_empty())
                     .map(str::to_string);
-                let client_secret = self.params.get("auth_client_secret").ok().cloned();
+                let client_credential = self.params.get("auth_client_secret").ok().cloned();
 
-                if client_secret.is_some() && client_id.is_none() {
+                if client_credential.is_some() && client_id.is_none() {
                     return Err(DataConnectorError::InvalidConfigurationNoSource {
                         dataconnector: "https".to_string(),
                         connector_component: ConnectorComponent::from(dataset),
                         message: format!(
-                            "'{client_secret_name}' is set but '{client_id_name}' is missing."
+                            "'{}' is set but '{}' is missing.",
+                            self.params.user_param("auth_client_secret"),
+                            self.params.user_param("auth_client_id"),
                         ),
                     });
                 }
@@ -597,14 +604,14 @@ impl Https {
                     .filter(|v| !v.is_empty())
                     .map(str::to_string);
 
-                let client_auth_name = self.params.user_param("auth_client_auth");
                 let client_auth = match self.params.get("auth_client_auth").expose().ok() {
                     Some(v) => ClientAuthMethod::parse(v).map_err(|bad| {
                         DataConnectorError::InvalidConfigurationNoSource {
                             dataconnector: "https".to_string(),
                             connector_component: ConnectorComponent::from(dataset),
                             message: format!(
-                                "'{client_auth_name}' must be 'basic' or 'body', got '{bad}'"
+                                "'{}' must be 'basic' or 'body', got '{bad}'",
+                                self.params.user_param("auth_client_auth"),
                             ),
                         }
                     })?,
@@ -615,13 +622,51 @@ impl Https {
                     RefreshTokenConfig {
                         token_url: token_url.to_string(),
                         client_id,
-                        client_secret,
+                        client_secret: client_credential,
                         scopes,
                         client_auth,
                     },
                     refresh_token.clone(),
                 )))
             }
+        }
+    }
+
+    /// Classify a [`data_components::http::auth::Error`] as either an invalid-
+    /// configuration problem (so the user knows to fix their spicepod) or a
+    /// connection / runtime problem. Bad URLs, bad URL schemes, and rejected
+    /// credentials (400/401/403 from the token endpoint) are configuration
+    /// issues; transport / 5xx / parse errors are connection-level issues.
+    fn map_auth_error(
+        dataset: &Dataset,
+        err: data_components::http::auth::Error,
+    ) -> DataConnectorError {
+        use data_components::http::auth::Error as AuthErr;
+        let component = ConnectorComponent::from(dataset);
+        let dataconnector = "https".to_string();
+
+        match err {
+            AuthErr::InvalidTokenUrl { .. }
+            | AuthErr::InsecureTokenUrl { .. }
+            | AuthErr::UnsupportedTokenType { .. } => DataConnectorError::InvalidConfiguration {
+                dataconnector,
+                message: err.to_string(),
+                connector_component: component,
+                source: Box::new(err),
+            },
+            AuthErr::TokenEndpointStatus { status, .. } if (400..500).contains(&status) => {
+                DataConnectorError::InvalidConfiguration {
+                    dataconnector,
+                    message: err.to_string(),
+                    connector_component: component,
+                    source: Box::new(err),
+                }
+            }
+            _ => DataConnectorError::UnableToConnectInternal {
+                dataconnector,
+                connector_component: component,
+                source: Box::new(err),
+            },
         }
     }
 
@@ -680,11 +725,7 @@ impl Https {
         if let Some((auth_config, refresh_token)) = self.resolve_refresh_token_auth(dataset)? {
             let auth = RefreshTokenAuth::try_new(auth_config, refresh_token)
                 .await
-                .map_err(|e| DataConnectorError::UnableToConnectInternal {
-                    dataconnector: "https".to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: Box::new(e),
-                })?;
+                .map_err(|e| Self::map_auth_error(dataset, e))?;
             let auth: Arc<dyn HttpAuthenticator> = Arc::new(auth);
             provider = provider.with_auth(auth);
         }

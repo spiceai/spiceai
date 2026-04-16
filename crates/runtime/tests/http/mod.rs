@@ -22,7 +22,7 @@ mod view_hot_reload;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -756,24 +756,24 @@ struct OauthServerState {
     /// Access tokens that should be considered valid. Prefixed with
     /// `access-` and a monotonic counter, so each refresh produces a
     /// distinct token.
-    issued_access_tokens: Arc<Mutex<Vec<String>>>,
+    issued_access_tokens: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Refresh tokens considered valid. We seed one entry and rotate on each
     /// exchange so we can tell whether the connector is honoring rotation.
-    valid_refresh_tokens: Arc<Mutex<Vec<String>>>,
+    valid_refresh_tokens: Arc<tokio::sync::Mutex<Vec<String>>>,
     token_requests: Arc<AtomicUsize>,
     data_requests: Arc<AtomicUsize>,
-    last_auth_header: Arc<Mutex<Option<String>>>,
+    last_auth_header: Arc<tokio::sync::Mutex<Option<String>>>,
     refresh_counter: Arc<AtomicUsize>,
 }
 
 impl OauthServerState {
     fn with_seed_refresh(seed: &str) -> Self {
         Self {
-            issued_access_tokens: Arc::new(Mutex::new(Vec::new())),
-            valid_refresh_tokens: Arc::new(Mutex::new(vec![seed.to_string()])),
+            issued_access_tokens: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            valid_refresh_tokens: Arc::new(tokio::sync::Mutex::new(vec![seed.to_string()])),
             token_requests: Arc::new(AtomicUsize::new(0)),
             data_requests: Arc::new(AtomicUsize::new(0)),
-            last_auth_header: Arc::new(Mutex::new(None)),
+            last_auth_header: Arc::new(tokio::sync::Mutex::new(None)),
             refresh_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -802,7 +802,7 @@ async fn oauth_token_handler(
     };
 
     let valid = {
-        let guard = state.valid_refresh_tokens.lock().expect("refresh lock");
+        let guard = state.valid_refresh_tokens.lock().await;
         guard.iter().any(|t| t == presented)
     };
     if !valid {
@@ -817,16 +817,8 @@ async fn oauth_token_handler(
     let access = format!("access-{n}");
     let rotated = format!("refresh-{n}");
 
-    state
-        .issued_access_tokens
-        .lock()
-        .expect("access lock")
-        .push(access.clone());
-    state
-        .valid_refresh_tokens
-        .lock()
-        .expect("refresh lock")
-        .push(rotated.clone());
+    state.issued_access_tokens.lock().await.push(access.clone());
+    state.valid_refresh_tokens.lock().await.push(rotated.clone());
 
     let body = serde_json::json!({
         "access_token": access,
@@ -853,7 +845,7 @@ async fn oauth_secure_handler(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    *state.last_auth_header.lock().expect("header lock") = auth_value.clone();
+    *state.last_auth_header.lock().await = auth_value.clone();
 
     let Some(auth) = auth_value else {
         return (
@@ -874,7 +866,7 @@ async fn oauth_secure_handler(
     let known = state
         .issued_access_tokens
         .lock()
-        .expect("access lock")
+        .await
         .iter()
         .any(|t| t == token);
 
@@ -916,7 +908,7 @@ async fn start_oauth_http_server(
                 rx.await.ok();
             })
             .await
-            .unwrap_or_default();
+            .expect("OAuth test server failed while serving requests");
     });
 
     Ok((tx, addr))
@@ -1000,11 +992,7 @@ async fn test_http_oauth2_refresh_token_auth() -> Result<(), String> {
                 "expected at least one data request to /api/secure"
             );
 
-            let last_auth = state
-                .last_auth_header
-                .lock()
-                .expect("header lock")
-                .clone();
+            let last_auth = state.last_auth_header.lock().await.clone();
             assert_eq!(
                 last_auth.as_deref(),
                 Some("Bearer access-1"),
