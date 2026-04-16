@@ -1261,7 +1261,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_limit_just_below_page_size() {
+    async fn test_limit_just_below_max_topk() {
         let query_table = make_query_table(Arc::new(MockClient::new()));
         assert_eq!(scan_limit(&query_table, Some(99)).await, 99);
     }
