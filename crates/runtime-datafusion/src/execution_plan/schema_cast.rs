@@ -87,27 +87,34 @@ impl SchemaCastScanExec {
             .with_metadata(schema.metadata().clone()),
         );
 
-        // Propagate input ordering only when all ordered columns have the same data type
-        // in both the input and output schemas. Type casts are not universally monotonic
-        // (e.g., Utf8→numeric, float NaN handling), so we only propagate ordering when
-        // no type change occurs for the ordered columns.
+        // Propagate input ordering only when all ordered columns exist in the output
+        // schema with the same data type. Column indices are remapped by name because
+        // the output schema may reorder columns relative to the input. Type casts are
+        // not universally monotonic (e.g., Utf8→numeric, float NaN handling), so we
+        // only propagate ordering when no type change occurs for the ordered columns.
         let mut eq_properties = EquivalenceProperties::new(Arc::clone(&output_schema));
         if let Some(ordering) = input.properties().output_ordering() {
-            let ordering_safe = ordering.iter().all(|sort_expr| {
-                sort_expr
-                    .expr
-                    .as_any()
-                    .downcast_ref::<Column>()
-                    .is_some_and(|col| {
-                        let idx = col.index();
-                        idx < input_schema.fields().len()
-                            && idx < output_schema.fields().len()
-                            && input_schema.field(idx).data_type()
-                                == output_schema.field(idx).data_type()
+            let remapped: Option<Vec<PhysicalSortExpr>> = ordering
+                .iter()
+                .map(|sort_expr| {
+                    let col = sort_expr.expr.as_any().downcast_ref::<Column>()?;
+                    let input_idx = col.index();
+                    if input_idx >= input_schema.fields().len() {
+                        return None;
+                    }
+                    let col_name = input_schema.field(input_idx).name();
+                    let (output_idx, output_field) = output_schema.column_with_name(col_name)?;
+                    if input_schema.field(input_idx).data_type() != output_field.data_type() {
+                        return None;
+                    }
+                    Some(PhysicalSortExpr {
+                        expr: Arc::new(Column::new(col_name, output_idx)),
+                        options: sort_expr.options,
                     })
-            });
-            if ordering_safe {
-                eq_properties.add_orderings([ordering.clone()]);
+                })
+                .collect();
+            if let Some(new_ordering) = remapped {
+                eq_properties.add_orderings([new_ordering]);
             }
         }
         let emission_type = input.pipeline_behavior();
@@ -378,7 +385,10 @@ impl TableProvider for EnsureSchema {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::physical_expr::LexOrdering;
     use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::expressions::col as physical_col;
+    use datafusion::physical_plan::sorts::sort::SortExec;
 
     fn input_schema_with_extra_column() -> SchemaRef {
         // Input has 3 columns including an internal "fetched_at" column
@@ -491,5 +501,104 @@ mod tests {
             0,
             "Schema should have 0 fields for empty projection"
         );
+    }
+
+    #[test]
+    fn test_ordering_propagated_when_types_match() {
+        // When the ordered column has the same type in input and output, ordering
+        // should be propagated.
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let empty = Arc::new(EmptyExec::new(Arc::clone(&input_schema)));
+        let lex_ordering = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(physical_col("id", &input_schema).expect("col id")).asc(),
+        ])
+        .expect("lex ordering");
+        let sorted_input: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, empty));
+
+        let schema_cast = SchemaCastScanExec::new(sorted_input, target_schema);
+
+        assert!(
+            schema_cast.properties().output_ordering().is_some(),
+            "Ordering should be propagated when types match"
+        );
+    }
+
+    #[test]
+    fn test_ordering_not_propagated_when_types_differ() {
+        // When the ordered column undergoes a type cast, ordering should NOT be
+        // propagated since the cast may not be monotonic.
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false), // Utf8 -> Int64 (not monotonic)
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let empty = Arc::new(EmptyExec::new(Arc::clone(&input_schema)));
+        let lex_ordering = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(physical_col("id", &input_schema).expect("col id")).asc(),
+        ])
+        .expect("lex ordering");
+        let sorted_input: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, empty));
+
+        let schema_cast = SchemaCastScanExec::new(sorted_input, target_schema);
+
+        assert!(
+            schema_cast.properties().output_ordering().is_none(),
+            "Ordering should NOT be propagated when types differ"
+        );
+    }
+
+    #[test]
+    fn test_ordering_remaps_indices_when_schema_reorders_columns() {
+        // When the target schema reorders columns, the ordering column indices
+        // should be remapped to the output schema positions.
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),   // index 0 in input
+            Field::new("b", DataType::Utf8, true),     // index 1 in input
+            Field::new("c", DataType::Float64, false), // index 2 in input
+        ]));
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("c", DataType::Float64, false), // was index 2, now index 0
+            Field::new("a", DataType::Int64, false),   // was index 0, now index 1
+            Field::new("b", DataType::Utf8, true),     // was index 1, now index 2
+        ]));
+
+        let empty = Arc::new(EmptyExec::new(Arc::clone(&input_schema)));
+        // Sort on "a" which is at index 0 in input
+        let lex_ordering = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(physical_col("a", &input_schema).expect("col a")).asc(),
+        ])
+        .expect("lex ordering");
+        let sorted_input: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(lex_ordering, empty));
+
+        let schema_cast = SchemaCastScanExec::new(sorted_input, target_schema);
+
+        let output_ordering = schema_cast
+            .properties()
+            .output_ordering()
+            .expect("ordering should be propagated");
+        let sort_expr = &output_ordering[0];
+        let col = sort_expr
+            .expr
+            .as_any()
+            .downcast_ref::<Column>()
+            .expect("should be Column expr");
+        assert_eq!(
+            col.index(),
+            1,
+            "Column 'a' should be remapped to index 1 in the output schema"
+        );
+        assert_eq!(col.name(), "a");
     }
 }
