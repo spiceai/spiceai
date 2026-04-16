@@ -156,10 +156,24 @@ impl OracleExecPlan {
             String::new()
         };
 
-        Ok(format!(
-            "SELECT {columns} FROM {table_reference} {where_expr} {order_expr} {limit_expr}",
+        let mut sql = format!(
+            "SELECT {columns} FROM {table_reference}",
             table_reference = self.table_reference.to_quoted_string()
-        ))
+        );
+        if !where_expr.is_empty() {
+            sql.push(' ');
+            sql.push_str(&where_expr);
+        }
+        if !order_expr.is_empty() {
+            sql.push(' ');
+            sql.push_str(&order_expr);
+        }
+        if !limit_expr.is_empty() {
+            sql.push(' ');
+            sql.push_str(&limit_expr);
+        }
+
+        Ok(sql)
     }
 }
 

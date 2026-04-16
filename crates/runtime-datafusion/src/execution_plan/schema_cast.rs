@@ -86,11 +86,13 @@ impl SchemaCastScanExec {
             .with_metadata(schema.metadata().clone()),
         );
 
-        // Create equivalence properties with the actual output schema.
-        // Do not propagate input orderings here: this wrapper can change data types
-        // and projected columns, so the input ordering may no longer be valid for
-        // the output schema.
-        let eq_properties = EquivalenceProperties::new(Arc::clone(&output_schema));
+        // Propagate input ordering: SchemaCastScanExec only casts data types without
+        // reordering, dropping, or renaming columns. Sort expressions reference columns
+        // by index which is preserved, and numeric/string type casts preserve sort order.
+        let mut eq_properties = EquivalenceProperties::new(Arc::clone(&output_schema));
+        if let Some(ordering) = input.properties().output_ordering() {
+            eq_properties.add_orderings([ordering.clone()]);
+        }
         let emission_type = input.pipeline_behavior();
         let boundedness = input.boundedness();
         let properties = PlanProperties::new(

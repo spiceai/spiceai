@@ -164,10 +164,20 @@ impl SqlServerExecPlan {
             format!("ORDER BY {}", sort_terms?.join(", "))
         };
 
-        Ok(format!(
-            "SELECT {top_expr}{columns} FROM {table_reference} {where_expr} {order_expr}",
+        let mut sql = format!(
+            "SELECT {top_expr}{columns} FROM {table_reference}",
             table_reference = self.table_reference.to_quoted_string()
-        ))
+        );
+        if !where_expr.is_empty() {
+            sql.push(' ');
+            sql.push_str(&where_expr);
+        }
+        if !order_expr.is_empty() {
+            sql.push(' ');
+            sql.push_str(&order_expr);
+        }
+
+        Ok(sql)
     }
 }
 
