@@ -185,13 +185,10 @@ impl ElasticsearchIndex {
             })
             .collect();
 
-        let plan = LogicalPlanBuilder::scan(
-            "base",
-            Arc::new(DefaultTableSource::new(table)),
-            None,
-        )?
-        .project(projections)?
-        .build()?;
+        let plan =
+            LogicalPlanBuilder::scan("base", Arc::new(DefaultTableSource::new(table)), None)?
+                .project(projections)?
+                .build()?;
 
         Ok(Arc::new(ViewTable::new(plan, None)))
     }

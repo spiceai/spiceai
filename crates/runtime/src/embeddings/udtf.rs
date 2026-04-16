@@ -419,14 +419,13 @@ impl VectorSearchTableFunc {
         #[cfg(feature = "elasticsearch")]
         let _normalized_tbl_storage: Arc<dyn TableProvider>;
         #[cfg(feature = "elasticsearch")]
-        let tbl: &Arc<dyn TableProvider> = if let Some(es_index) =
-            vector_index.as_any().downcast_ref::<ElasticsearchIndex>()
-        {
-            _normalized_tbl_storage = es_index.normalize_source_table(Arc::clone(tbl))?;
-            &_normalized_tbl_storage
-        } else {
-            tbl
-        };
+        let tbl: &Arc<dyn TableProvider> =
+            if let Some(es_index) = vector_index.as_any().downcast_ref::<ElasticsearchIndex>() {
+                _normalized_tbl_storage = es_index.normalize_source_table(Arc::clone(tbl))?;
+                &_normalized_tbl_storage
+            } else {
+                tbl
+            };
 
         Ok(Some(Arc::new(
             SearchQueryProvider::try_from_index(

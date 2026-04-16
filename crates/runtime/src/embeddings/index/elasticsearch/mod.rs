@@ -80,7 +80,11 @@ pub async fn try_from_table(
         .filter_map(|c| {
             let (_, f) = inner_schema.column_with_name(c.as_str())?;
             if f.data_type() == &DataType::LargeUtf8 {
-                Some(arrow_schema::Field::new(f.name(), DataType::Utf8, f.is_nullable()))
+                Some(arrow_schema::Field::new(
+                    f.name(),
+                    DataType::Utf8,
+                    f.is_nullable(),
+                ))
             } else {
                 Some(f.clone())
             }
@@ -108,7 +112,13 @@ pub async fn try_from_table(
             format!("{}-{}-{}", ds_name, column, config.model)
                 .to_lowercase()
                 .chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
                 .collect()
         },
         ToString::to_string,
