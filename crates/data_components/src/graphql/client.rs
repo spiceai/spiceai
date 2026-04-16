@@ -326,10 +326,15 @@ impl PaginationParameters {
         // Apply the page size override (if any) BEFORE the user-visible limit so we
         // never ask for more rows per page than `page_size_override`, even when the
         // caller's remaining `limit` is larger.
+        //
+        // Clamp to a minimum of 1: GitHub GraphQL (and essentially every other
+        // connection-style API) rejects `first: 0` / `last: 0`, and letting a
+        // zero override flow through to the query would be a worse failure mode
+        // than fetching one extra row.
         let effective_limit = match (limit, page_size_override) {
-            (Some(l), Some(p)) => Some(std::cmp::min(l, p)),
-            (Some(l), None) => Some(l),
-            (None, Some(p)) => Some(p),
+            (Some(l), Some(p)) => Some(std::cmp::max(std::cmp::min(l, p), 1)),
+            (Some(l), None) => Some(std::cmp::max(l, 1)),
+            (None, Some(p)) => Some(std::cmp::max(p, 1)),
             (None, None) => None,
         };
 

@@ -228,13 +228,26 @@ impl PullRequestTableArgs {
     /// Upper bound on the number of review threads fetched per PR.
     const REVIEW_THREADS_PER_PR: u32 = 20;
 
-    /// Inner connection sizes baked into `base_requested_nodes()`.
-    /// Kept as a constant so `estimated_node_count` and the base query cannot
-    /// drift out of sync.
+    /// Conservative upper bound on the number of nodes contributed by a
+    /// single PR's non-comment fields. Kept as a constant so
+    /// `estimated_node_count` and the base query cannot drift out of sync.
+    ///
+    /// Includes:
+    /// - 1 root PR node
+    /// - 100 `labels` nodes
+    /// - 25 `commits` nodes (hashes)
+    /// - 100 `assignees` nodes
+    /// - 3 wrapper/object nodes the GraphQL node counter charges for:
+    ///   `reviews`, `comments_count_wrapper`, `author`
+    ///
+    /// When review threads are enabled this count does NOT include the
+    /// `reviewThreads` nodes themselves — those are added in
+    /// `estimated_node_count` along with their nested comments.
     const BASE_INNER_NODE_COUNT: u32 = 1 /* root PR */
         + 100 /* labels */
         + 25 /* commits */
-        + 100 /* assignees */;
+        + 100 /* assignees */
+        + 3 /* reviews + comments_count_wrapper + author wrapper objects */;
 
     /// Returns the outer `first:` page size for the pull request connection.
     ///
@@ -250,21 +263,28 @@ impl PullRequestTableArgs {
         }
     }
 
-    /// Approximate upper bound on the number of nodes a single page of this
+    /// Conservative upper bound on the number of nodes a single page of this
     /// query will request from GitHub. Used to validate that a caller-supplied
     /// configuration (most notably a high `max_comments_fetched`) cannot push
     /// the query over GitHub's 500,000 node hard limit.
+    ///
+    /// The estimate intentionally over-counts rather than under-counts:
+    /// when review threads are enabled it charges for `REVIEW_THREADS_PER_PR`
+    /// thread nodes *plus* `REVIEW_THREADS_PER_PR × max_comments_fetched`
+    /// comment nodes, and always includes the full `BASE_INNER_NODE_COUNT`.
     ///
     /// Returns `outer_page_size × (base_inner + per_PR_comment_expansion)`.
     fn estimated_node_count(&self) -> u32 {
         let per_pr_comment_nodes: u32 = match self.include_comments {
             PullRequestCommentType::None => 0,
-            PullRequestCommentType::Review => {
-                Self::REVIEW_THREADS_PER_PR.saturating_mul(self.max_comments_fetched)
-            }
+            PullRequestCommentType::Review => Self::REVIEW_THREADS_PER_PR.saturating_add(
+                Self::REVIEW_THREADS_PER_PR.saturating_mul(self.max_comments_fetched),
+            ),
             PullRequestCommentType::Discussion => self.max_comments_fetched,
             PullRequestCommentType::All => Self::REVIEW_THREADS_PER_PR
-                .saturating_mul(self.max_comments_fetched)
+                .saturating_add(
+                    Self::REVIEW_THREADS_PER_PR.saturating_mul(self.max_comments_fetched),
+                )
                 .saturating_add(self.max_comments_fetched),
         };
 
@@ -538,19 +558,27 @@ mod tests {
     use crate::dataconnector::ConnectorComponent;
     use crate::dataconnector::github::GitHubQueryMode;
     use app::AppBuilder;
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
 
-    fn mock_component() -> ConnectorComponent {
-        let app = AppBuilder::new("test").build();
-        let runtime = tokio::runtime::Runtime::new().expect("to create tokio runtime");
-        let spice_runtime = runtime.block_on(async { RuntimeBuilder::new().build().await });
-        let dataset = DatasetBuilder::try_new("github".to_string(), "test.pulls")
-            .expect("to create dataset builder")
-            .with_app(Arc::new(app))
-            .with_runtime(Arc::new(spice_runtime))
-            .build()
-            .expect("to create dataset");
-        ConnectorComponent::from(&dataset)
+    /// Building a `ConnectorComponent` requires a full runtime + app
+    /// construction. Cache a single shared instance so the unit tests don't
+    /// spin up a tokio runtime per invocation.
+    fn shared_component() -> ConnectorComponent {
+        static COMPONENT: OnceLock<ConnectorComponent> = OnceLock::new();
+        COMPONENT
+            .get_or_init(|| {
+                let app = AppBuilder::new("test").build();
+                let runtime = tokio::runtime::Runtime::new().expect("to create tokio runtime");
+                let spice_runtime = runtime.block_on(async { RuntimeBuilder::new().build().await });
+                let dataset = DatasetBuilder::try_new("github".to_string(), "test.pulls")
+                    .expect("to create dataset builder")
+                    .with_app(Arc::new(app))
+                    .with_runtime(Arc::new(spice_runtime))
+                    .build()
+                    .expect("to create dataset");
+                ConnectorComponent::from(&dataset)
+            })
+            .clone()
     }
 
     fn args(include: PullRequestCommentType, max_comments: u32) -> PullRequestTableArgs {
@@ -558,7 +586,7 @@ mod tests {
             owner: "spiceai".to_string(),
             repo: "spiceai".to_string(),
             query_mode: GitHubQueryMode::Auto,
-            component: mock_component(),
+            component: shared_component(),
             include_comments: include,
             max_comments_fetched: max_comments,
         }
@@ -586,8 +614,10 @@ mod tests {
     fn node_limit_passes_for_sane_defaults() {
         let a = args(PullRequestCommentType::All, 25);
         let estimated = a.estimated_node_count();
-        // 25 × (1 + 100 + 25 + 100 + 20×25 + 25) = 25 × 751 = 18_775
-        assert_eq!(estimated, 18_775);
+        // outer=25, base_inner=229 (1+100+25+100+3), per-PR comments for All:
+        // 20 thread nodes + 20×25 review comments + 25 discussion = 545
+        // total = 25 × (229 + 545) = 25 × 774 = 19_350
+        assert_eq!(estimated, 19_350);
         a.check_node_limit().expect("defaults must fit under 500K");
     }
 
