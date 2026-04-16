@@ -170,7 +170,13 @@ pub use spicepod::component::runtime::OtelExporterConfig;
 ///
 /// # Arguments
 ///
-/// * `config` - The exporter configuration including endpoint, push interval, and metric filters
+/// * `config` - The exporter configuration (endpoint, push interval, metric filters).
+///   Note: `config.headers` is **not** read by this function; the caller is responsible
+///   for resolving any parameter references in `config.headers` (e.g. via the secrets
+///   subsystem) and passing the already-resolved header map as `resolved_headers`.
+/// * `resolved_headers` - Fully-resolved headers to attach to every exported metrics
+///   request. For HTTP these are sent as HTTP headers; for gRPC they are sent as
+///   metadata entries (keys must be lowercase ASCII).
 ///
 /// # Returns
 ///
