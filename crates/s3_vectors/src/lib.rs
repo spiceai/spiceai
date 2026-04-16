@@ -619,8 +619,9 @@ pub mod tests {
             .expect("build runtime components");
 
         let mut ctx_mut = aws_smithy_runtime_api::client::interceptors::context::BeforeDeserializationInterceptorContextMut::from(&mut context);
-        let result = interceptor.modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg);
-        assert!(result.is_ok());
+        interceptor
+            .modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg)
+            .expect("interceptor should succeed for valid nextToken");
 
         let token = captured.lock().expect("lock").clone();
         assert_eq!(token, Some("abc123".to_string()));
@@ -659,8 +660,9 @@ pub mod tests {
             .expect("build runtime components");
 
         let mut ctx_mut = aws_smithy_runtime_api::client::interceptors::context::BeforeDeserializationInterceptorContextMut::from(&mut context);
-        let result = interceptor.modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg);
-        assert!(result.is_ok());
+        interceptor
+            .modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg)
+            .expect("interceptor should succeed without nextToken");
 
         let token = captured.lock().expect("lock").clone();
         assert_eq!(token, None);
@@ -700,8 +702,9 @@ pub mod tests {
             .expect("build runtime components");
 
         let mut ctx_mut = aws_smithy_runtime_api::client::interceptors::context::BeforeDeserializationInterceptorContextMut::from(&mut context);
-        let result = interceptor.modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg);
-        assert!(result.is_ok());
+        interceptor
+            .modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg)
+            .expect("interceptor should succeed with null nextToken");
 
         // null is not a string, so as_str() returns None
         let token = captured.lock().expect("lock").clone();
@@ -737,8 +740,9 @@ pub mod tests {
             .expect("build runtime components");
 
         let mut ctx_mut = aws_smithy_runtime_api::client::interceptors::context::BeforeDeserializationInterceptorContextMut::from(&mut context);
-        let result = interceptor.modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg);
-        assert!(result.is_ok());
+        interceptor
+            .modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg)
+            .expect("interceptor should succeed with empty body");
 
         let token = captured.lock().expect("lock").clone();
         assert_eq!(token, None);
@@ -773,8 +777,9 @@ pub mod tests {
             .expect("build runtime components");
 
         let mut ctx_mut = aws_smithy_runtime_api::client::interceptors::context::BeforeDeserializationInterceptorContextMut::from(&mut context);
-        let result = interceptor.modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg);
-        assert!(result.is_ok());
+        interceptor
+            .modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg)
+            .expect("interceptor should succeed with invalid JSON");
 
         let token = captured.lock().expect("lock").clone();
         assert_eq!(token, None);
@@ -814,8 +819,9 @@ pub mod tests {
             .expect("build runtime components");
 
         let mut ctx_mut = aws_smithy_runtime_api::client::interceptors::context::BeforeDeserializationInterceptorContextMut::from(&mut context);
-        let result = interceptor.modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg);
-        assert!(result.is_ok());
+        interceptor
+            .modify_before_deserialization(&mut ctx_mut, &rc, &mut cfg)
+            .expect("interceptor should succeed with empty string nextToken");
 
         // Empty string is still a valid string — should be captured as Some("")
         let token = captured.lock().expect("lock").clone();
