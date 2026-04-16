@@ -515,13 +515,14 @@ mod tests {
         insta::assert_snapshot!(result.display_indent(), @r#"
         Limit: skip=0, fetch=5
           Sort: test_table.id ASC NULLS LAST
-            Union
-              Sort: test_table.id ASC NULLS LAST, fetch=5
-                SubqueryAlias: test_table
-                  TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-              Sort: test_table.id ASC NULLS LAST, fetch=5
-                SubqueryAlias: test_table
-                  TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+            SubqueryAlias: test_table
+              Union
+                Sort: test_table.id ASC NULLS LAST, fetch=5
+                  SubqueryAlias: test_table
+                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+                Sort: test_table.id ASC NULLS LAST, fetch=5
+                  SubqueryAlias: test_table
+                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
         "#);
     }
 
@@ -548,13 +549,14 @@ mod tests {
         insta::assert_snapshot!(result.display_indent(), @r#"
         Limit: skip=10, fetch=5
           Sort: test_table.id ASC NULLS LAST
-            Union
-              Sort: test_table.id ASC NULLS LAST, fetch=15
-                SubqueryAlias: test_table
-                  TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-              Sort: test_table.id ASC NULLS LAST, fetch=15
-                SubqueryAlias: test_table
-                  TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+            SubqueryAlias: test_table
+              Union
+                Sort: test_table.id ASC NULLS LAST, fetch=15
+                  SubqueryAlias: test_table
+                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+                Sort: test_table.id ASC NULLS LAST, fetch=15
+                  SubqueryAlias: test_table
+                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
         "#);
     }
 
@@ -583,15 +585,16 @@ mod tests {
         insta::assert_snapshot!(result.display_indent(), @r#"
         Limit: skip=0, fetch=5
           Sort: test_table.id ASC NULLS LAST
-            Union
-              Sort: test_table.id ASC NULLS LAST, fetch=5
-                Projection: test_table.id, test_table.name
-                  SubqueryAlias: test_table
-                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-              Sort: test_table.id ASC NULLS LAST, fetch=5
-                Projection: test_table.id, test_table.name
-                  SubqueryAlias: test_table
-                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+            SubqueryAlias: test_table
+              Union
+                Sort: test_table.id ASC NULLS LAST, fetch=5
+                  Projection: test_table.id, test_table.name
+                    SubqueryAlias: test_table
+                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+                Sort: test_table.id ASC NULLS LAST, fetch=5
+                  Projection: test_table.id, test_table.name
+                    SubqueryAlias: test_table
+                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
         "#);
     }
 
@@ -631,13 +634,14 @@ mod tests {
         Limit: skip=0, fetch=3
           Projection: test_table.id, test_table.name
             Sort: test_table.partition_id DESC NULLS FIRST
-              Union
-                Sort: test_table.partition_id DESC NULLS FIRST, fetch=3
-                  SubqueryAlias: test_table
-                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-                Sort: test_table.partition_id DESC NULLS FIRST, fetch=3
-                  SubqueryAlias: test_table
-                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+              SubqueryAlias: test_table
+                Union
+                  Sort: test_table.partition_id DESC NULLS FIRST, fetch=3
+                    SubqueryAlias: test_table
+                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+                  Sort: test_table.partition_id DESC NULLS FIRST, fetch=3
+                    SubqueryAlias: test_table
+                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
         "#);
     }
 
@@ -670,15 +674,16 @@ mod tests {
         Limit: skip=0, fetch=5
           Projection: test_table.id
             Sort: test_table.name ASC NULLS LAST
-              Union
-                Sort: test_table.name ASC NULLS LAST, fetch=5
-                  Projection: test_table.id, test_table.name
-                    SubqueryAlias: test_table
-                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-                Sort: test_table.name ASC NULLS LAST, fetch=5
-                  Projection: test_table.id, test_table.name
-                    SubqueryAlias: test_table
-                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+              SubqueryAlias: test_table
+                Union
+                  Sort: test_table.name ASC NULLS LAST, fetch=5
+                    Projection: test_table.id, test_table.name
+                      SubqueryAlias: test_table
+                        TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+                  Sort: test_table.name ASC NULLS LAST, fetch=5
+                    Projection: test_table.id, test_table.name
+                      SubqueryAlias: test_table
+                        TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
         "#);
     }
 
@@ -710,13 +715,14 @@ mod tests {
         Limit: skip=5, fetch=3
           Projection: test_table.id, test_table.name
             Sort: test_table.partition_id DESC NULLS FIRST
-              Union
-                Sort: test_table.partition_id DESC NULLS FIRST, fetch=8
-                  SubqueryAlias: test_table
-                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-                Sort: test_table.partition_id DESC NULLS FIRST, fetch=8
-                  SubqueryAlias: test_table
-                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+              SubqueryAlias: test_table
+                Union
+                  Sort: test_table.partition_id DESC NULLS FIRST, fetch=8
+                    SubqueryAlias: test_table
+                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+                  Sort: test_table.partition_id DESC NULLS FIRST, fetch=8
+                    SubqueryAlias: test_table
+                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
         "#);
     }
 
@@ -746,15 +752,16 @@ mod tests {
         insta::assert_snapshot!(result.display_indent(), @r#"
         Limit: skip=0, fetch=5
           Sort: test_table.id ASC NULLS LAST
-            Union
-              Sort: test_table.id ASC NULLS LAST, fetch=5
-                Filter: test_table.name != Utf8("x")
-                  SubqueryAlias: test_table
-                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-              Sort: test_table.id ASC NULLS LAST, fetch=5
-                Filter: test_table.name != Utf8("x")
-                  SubqueryAlias: test_table
-                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+            SubqueryAlias: test_table
+              Union
+                Sort: test_table.id ASC NULLS LAST, fetch=5
+                  Filter: test_table.name != Utf8("x")
+                    SubqueryAlias: test_table
+                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+                Sort: test_table.id ASC NULLS LAST, fetch=5
+                  Filter: test_table.name != Utf8("x")
+                    SubqueryAlias: test_table
+                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
         "#);
     }
 
@@ -784,15 +791,16 @@ mod tests {
         insta::assert_snapshot!(result.display_indent(), @r#"
         Limit: skip=10, fetch=5
           Sort: test_table.id ASC NULLS LAST
-            Union
-              Sort: test_table.id ASC NULLS LAST, fetch=15
-                Filter: test_table.name != Utf8("x")
-                  SubqueryAlias: test_table
-                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-              Sort: test_table.id ASC NULLS LAST, fetch=15
-                Filter: test_table.name != Utf8("x")
-                  SubqueryAlias: test_table
-                    TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+            SubqueryAlias: test_table
+              Union
+                Sort: test_table.id ASC NULLS LAST, fetch=15
+                  Filter: test_table.name != Utf8("x")
+                    SubqueryAlias: test_table
+                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+                Sort: test_table.id ASC NULLS LAST, fetch=15
+                  Filter: test_table.name != Utf8("x")
+                    SubqueryAlias: test_table
+                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
         "#);
     }
 
@@ -824,17 +832,18 @@ mod tests {
         insta::assert_snapshot!(result.display_indent(), @r#"
         Limit: skip=0, fetch=5
           Sort: test_table.id ASC NULLS LAST
-            Union
-              Sort: test_table.id ASC NULLS LAST, fetch=5
-                Projection: test_table.id, test_table.name
-                  Filter: test_table.partition_id > Int32(0)
-                    SubqueryAlias: test_table
-                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
-              Sort: test_table.id ASC NULLS LAST, fetch=5
-                Projection: test_table.id, test_table.name
-                  Filter: test_table.partition_id > Int32(0)
-                    SubqueryAlias: test_table
-                      TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
+            SubqueryAlias: test_table
+              Union
+                Sort: test_table.id ASC NULLS LAST, fetch=5
+                  Projection: test_table.id, test_table.name
+                    Filter: test_table.partition_id > Int32(0)
+                      SubqueryAlias: test_table
+                        TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+                Sort: test_table.id ASC NULLS LAST, fetch=5
+                  Projection: test_table.id, test_table.name
+                    Filter: test_table.partition_id > Int32(0)
+                      SubqueryAlias: test_table
+                        TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]
         "#);
     }
 
