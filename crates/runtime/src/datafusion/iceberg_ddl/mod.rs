@@ -14,22 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Iceberg DDL support: analyzer rule, logical nodes, extension planner,
-//! and physical execution plans for `CREATE TABLE` / `DROP TABLE` on
-//! Iceberg-backed catalogs.
+//! Iceberg DDL support: handler, physical execution plans for
+//! `CREATE TABLE` / `DROP TABLE` / `CREATE SCHEMA` on Iceberg-backed catalogs.
 //!
-//! Generic DDL infrastructure (option parsing, extension store)
-//! lives in [`super::ddl`]. This module re-exports it for backwards compatibility.
+//! DDL interception is handled by `datafusion_ddl::DdlAnalyzerRule` paired with
+//! [`IcebergDdlHandler`].  Physical plans live in [`physical_plans`].
 
-pub mod analyzer_rule;
-pub mod logical_nodes;
+pub mod handler;
 pub mod physical_plans;
-pub mod planner;
 
-/// Re-export generic DDL acceleration options from [`super::ddl::acceleration_options`].
+pub use handler::IcebergDdlHandler;
+
+/// Re-exported DDL option types for use within `iceberg_ddl`.
 pub mod acceleration_options {
-    pub use crate::datafusion::ddl::acceleration_options::*;
+    pub use datafusion_ddl::{
+        CreateTableStatementExtension, DatasetOptions, DdlExtensionStore, SharedDdlExtensionStore,
+        new_shared_store, parse_acceleration_options, parse_dataset_options,
+        parse_ddl_table_options,
+    };
 }
+
+// Re-exported for the physical plans.
+pub use acceleration_options::DatasetOptions;
 
 use std::sync::{Arc, OnceLock, Weak};
 
