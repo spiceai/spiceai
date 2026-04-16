@@ -362,6 +362,14 @@ impl S3Vectors for Client {
                 captured: Arc::clone(&captured),
             };
 
+            let remaining = i32::try_from(
+                usize::try_from(top_k)
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(all_vectors.len()),
+            )
+            .unwrap_or(QUERY_VECTORS_PAGE_SIZE);
+            let page_top_k = remaining.min(QUERY_VECTORS_PAGE_SIZE);
+
             let nt = next_token.clone();
             let result = self
                 .client
@@ -370,7 +378,7 @@ impl S3Vectors for Client {
                 .set_index_name(input.index_name.clone())
                 .set_index_arn(input.index_arn.clone())
                 .set_query_vector(input.query_vector.clone())
-                .top_k(top_k)
+                .top_k(page_top_k)
                 .set_return_distance(input.return_distance)
                 .set_return_metadata(input.return_metadata)
                 .set_filter(input.filter.clone())
