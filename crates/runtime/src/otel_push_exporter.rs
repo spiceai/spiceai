@@ -202,6 +202,10 @@ pub use spicepod::component::runtime::OtelExporterConfig;
 ///     .with_reader(otel_reader)  // Add OTEL push reader
 ///     .build();
 /// ```
+#[expect(
+    clippy::implicit_hasher,
+    reason = "public API accepts the standard HashMap; callers pass std::collections::HashMap<String, String>"
+)]
 pub fn create_otel_periodic_reader(
     config: &OtelExporterConfig,
     resolved_headers: HashMap<String, String>,
