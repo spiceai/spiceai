@@ -90,7 +90,7 @@ const INTERNAL_COMPONENTS: &[&str] = &[
 ];
 
 const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off,delta_kernel::listed_log_files=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off,tower::buffer=off,h2::codec=off";
-const OFF_UNLESS_VERY_VERBOSE_FILTERS: &str = "datafusion_datasource::source=off,datafusion_optimizer::utils=off,datafusion_optimizer::optimizer=off,datafusion::physical_planner=off,opentelemetry=warn";
+const OFF_UNLESS_VERY_VERBOSE_FILTERS: &str = "datafusion_datasource::source=off,datafusion_optimizer::utils=off,datafusion_optimizer::optimizer=off,datafusion::physical_planner=off,opentelemetry=warn,tantivy=warn";
 
 fn specific_env_filter(filter: &str) -> String {
     format!("{OFF_FILTERS},{filter}")
@@ -499,5 +499,12 @@ mod tests {
         assert!(env_filter_string(&LogVerbosity::Default).contains("opentelemetry=warn"));
         assert!(env_filter_string(&LogVerbosity::Verbose).contains("opentelemetry=warn"));
         assert!(!env_filter_string(&LogVerbosity::VeryVerbose).contains("opentelemetry=warn"));
+    }
+
+    #[test]
+    fn filters_tantivy_to_error() {
+        assert!(env_filter_string(&LogVerbosity::Default).contains("tantivy=warn"));
+        assert!(env_filter_string(&LogVerbosity::Verbose).contains("tantivy=warn"));
+        assert!(!env_filter_string(&LogVerbosity::VeryVerbose).contains("tantivy=warn"));
     }
 }
