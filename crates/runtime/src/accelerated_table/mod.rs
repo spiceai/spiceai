@@ -24,6 +24,7 @@ use crate::component::dataset::{ReadyState, TimeFormat};
 use crate::dataaccelerator::{BootstrapStatus, get_primary_keys_from_constraints};
 use crate::datafusion::error::{SpiceExternalError, format_datafusion_error};
 use crate::datafusion::is_spice_internal_dataset;
+use crate::datafusion::udf::deny_spice_specific_functions;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use ::cache::Caching;
@@ -1163,7 +1164,18 @@ impl TableProvider for AcceleratedTable {
         }
 
         match self.zero_results_action {
-            ZeroResultsAction::ReturnEmpty => self.accelerator.supports_filters_pushdown(filters),
+            ZeroResultsAction::ReturnEmpty => {
+                let mut results = self.accelerator.supports_filters_pushdown(filters)?;
+                let function_support = deny_spice_specific_functions();
+                for (i, filter) in filters.iter().enumerate() {
+                    if !matches!(results[i], TableProviderFilterPushDown::Unsupported)
+                        && !function_support.supports(filter)
+                    {
+                        results[i] = TableProviderFilterPushDown::Unsupported;
+                    }
+                }
+                Ok(results)
+            }
             ZeroResultsAction::UseSource => {
                 Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
             }

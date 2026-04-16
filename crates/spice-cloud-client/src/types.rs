@@ -129,10 +129,6 @@ pub struct UpdateAppRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replicas: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub registry: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub image_tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub update_channel: Option<String>,

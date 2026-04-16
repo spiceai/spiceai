@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,8 +21,10 @@ use std::{
 };
 
 use futures::Stream;
-use opentelemetry::{KeyValue, metrics::Histogram};
+use opentelemetry::metrics::Histogram;
 use pin_project::pin_project;
+
+use crate::KeyValue;
 
 /// Measures the time in milliseconds it takes to execute a block of code and records it in a histogram metric.
 pub struct TimeMeasurement {
