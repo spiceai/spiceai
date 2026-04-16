@@ -80,7 +80,7 @@ fn es_type_to_arrow(mapping: &FieldMapping) -> DataType {
         Some("float" | "half_float" | "scaled_float") => DataType::Float32,
         Some("boolean") => DataType::Boolean,
         Some("date" | "date_nanos") => DataType::Utf8, // Keep as string; ES dates are flexible.
-        Some("binary") => DataType::Binary,
+        Some("binary") => DataType::Utf8, // ES binary fields are base64-encoded strings in JSON.
         Some("ip") => DataType::Utf8,
         Some("dense_vector") => {
             let dims = mapping.dims.unwrap_or(128) as i32;
