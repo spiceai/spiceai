@@ -22,11 +22,7 @@ use crate::{
     component::view::{View, ViewBuilder},
     metrics,
     secrets::Secrets,
-    status,
-    topological_ordering::{
-        construct_effected_in_topological_order, construct_topological_ordering,
-    },
-    view, warn_spaced,
+    status, view, warn_spaced,
 };
 use app::App;
 use datafusion::sql::{TableReference, parser::DFParser, sqlparser::dialect::PostgreSqlDialect};
@@ -35,6 +31,9 @@ use futures::stream::StreamExt;
 use itertools::Itertools;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
+use util::topological_ordering::{
+    construct_effected_in_topological_order, construct_topological_ordering,
+};
 
 /// Represents a validated view with its parsed dependencies
 pub(crate) struct ValidatedView {
@@ -378,6 +377,11 @@ impl Runtime {
                 return;
             }
         }
+
+        // Removing a view may cause cached LogicalPlans that reference it
+        // to be obsolete, so we invalidate them.
+        self.df.clear_cached_plans().await;
+
         tracing::info!("Unloaded view {}", name);
     }
 

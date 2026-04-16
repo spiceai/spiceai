@@ -38,7 +38,7 @@ use s3_vectors::{
 use tracing::info_span;
 use tracing_futures::Instrument;
 
-use crate::timing::TimeMeasurement;
+use telemetry::timing::TimeMeasurement;
 
 use std::collections::HashMap;
 use std::sync::Arc;

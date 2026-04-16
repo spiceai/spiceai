@@ -728,16 +728,25 @@ fn values_to_change_batch<'a>(
         .collect::<Vec<_>>()
         .join("\n");
 
-    // Convert JSON string to Arrow record batch (ReaderBuilder handles NDJSON)
-    let rb = ReaderBuilder::new(Arc::clone(schema))
+    // Convert JSON string to Arrow record batches (ReaderBuilder handles NDJSON).
+    // The reader produces batches of up to batch_size rows. Collect all and concatenate
+    // to avoid silently dropping rows beyond the first batch.
+    let reader = ReaderBuilder::new(Arc::clone(schema))
         .build(std::io::Cursor::new(json_str.as_bytes()))
-        .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?
-        .next()
-        .transpose()
-        .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?
-        .ok_or_else(|| {
-            cdc::StreamError::Arrow("No record batch found in JSON message".to_string())
-        })?;
+        .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
+
+    let batches: Vec<_> = reader
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
+
+    if batches.is_empty() {
+        return Err(cdc::StreamError::Arrow(
+            "No record batch found in JSON message".to_string(),
+        ));
+    }
+
+    let rb = arrow::compute::concat_batches(schema, &batches)
+        .map_err(|e| cdc::StreamError::Arrow(e.to_string()))?;
 
     cdc::wrap_data_as_change_batch(schema, &rb)
         .map_err(|e| cdc::StreamError::SerdeJsonError(e.to_string()))
@@ -919,5 +928,60 @@ mod tests {
         assert!(result.is_ok());
         let batch = result.expect("batch");
         assert_eq!(batch.record.num_rows(), 1000);
+    }
+
+    /// Verifies that batches larger than the Arrow JSON reader's default batch size
+    /// (1024 rows) are fully preserved. Before the fix, `.next()` only returned the
+    /// first 1024-row batch and silently dropped the rest.
+    #[test]
+    fn test_batch_exceeding_default_reader_size() {
+        let schema = test_schema();
+        let values: Vec<Value> = (0..3000)
+            .map(|i| json!({"id": i, "name": format!("user_{}", i)}))
+            .collect();
+
+        let result = values_to_change_batch(values.iter(), None, &schema);
+
+        assert!(result.is_ok());
+        let batch = result.expect("batch");
+        assert_eq!(
+            batch.record.num_rows(),
+            3000,
+            "All 3000 rows should be preserved (was previously capped at 1024)"
+        );
+    }
+
+    /// Verifies that exactly 1024 rows works (boundary of the default batch size).
+    #[test]
+    fn test_batch_at_default_reader_boundary() {
+        let schema = test_schema();
+        let values: Vec<Value> = (0..1024)
+            .map(|i| json!({"id": i, "name": format!("user_{}", i)}))
+            .collect();
+
+        let result = values_to_change_batch(values.iter(), None, &schema);
+
+        assert!(result.is_ok());
+        let batch = result.expect("batch");
+        assert_eq!(batch.record.num_rows(), 1024);
+    }
+
+    /// Verifies that 1025 rows (one over the boundary) are all preserved.
+    #[test]
+    fn test_batch_one_over_default_reader_boundary() {
+        let schema = test_schema();
+        let values: Vec<Value> = (0..1025)
+            .map(|i| json!({"id": i, "name": format!("user_{}", i)}))
+            .collect();
+
+        let result = values_to_change_batch(values.iter(), None, &schema);
+
+        assert!(result.is_ok());
+        let batch = result.expect("batch");
+        assert_eq!(
+            batch.record.num_rows(),
+            1025,
+            "1025 rows should not be truncated to 1024"
+        );
     }
 }
