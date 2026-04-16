@@ -87,10 +87,7 @@ use {
 };
 
 #[cfg(feature = "s3_vectors")]
-use {
-    search::index::chunking::ChunkedSearchIndex,
-    search::index::s3_vectors::S3Vector,
-};
+use {search::index::chunking::ChunkedSearchIndex, search::index::s3_vectors::S3Vector};
 
 #[cfg(feature = "elasticsearch")]
 use search::index::elasticsearch::ElasticsearchIndex;
@@ -385,9 +382,7 @@ impl VectorSearchTableFunc {
 
         #[cfg(feature = "elasticsearch")]
         {
-            if let Some((es_indexes, _)) =
-                find_index_in_table_provider::<ElasticsearchIndex>(tbl)
-            {
+            if let Some((es_indexes, _)) = find_index_in_table_provider::<ElasticsearchIndex>(tbl) {
                 vector_indexes.extend(
                     es_indexes
                         .into_iter()
