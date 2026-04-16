@@ -198,9 +198,12 @@ impl RefreshTokenAuth {
         })
     }
 
-    /// Current `Authorization: Bearer …` header value. Primarily useful for tests.
+    /// Current `Authorization: Bearer …` header value. Test-only helper so
+    /// downstream callers can't accidentally log or otherwise exfiltrate the
+    /// bearer token via this API.
+    #[cfg(test)]
     #[must_use]
-    pub fn current_bearer_value(&self) -> HeaderValue {
+    pub(crate) fn current_bearer_value(&self) -> HeaderValue {
         self.rx.borrow().clone()
     }
 }
@@ -833,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_error_body_collapses_whitespace_and_truncates() {
+    fn sanitize_error_body_replaces_whitespace_and_truncates() {
         let out = sanitize_error_body("line1\nline2\tfield");
         assert_eq!(out, "line1 line2 field");
 
