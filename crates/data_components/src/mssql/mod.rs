@@ -234,7 +234,7 @@ fn classify_mssql_filter(filter: &Expr) -> TableProviderFilterPushDown {
                 {
                     TableProviderFilterPushDown::Unsupported
                 } else {
-                    TableProviderFilterPushDown::Inexact
+                    TableProviderFilterPushDown::Exact
                 }
             }
             Operator::And | Operator::Or => {

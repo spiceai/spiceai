@@ -37,7 +37,8 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
-    PhysicalExpr, PlanProperties, SortOrderPushdownResult, expressions::PhysicalSortExpr,
+    PhysicalExpr, PlanProperties, SortOrderPushdownResult,
+    expressions::{Column, PhysicalSortExpr},
 };
 use futures::StreamExt;
 use std::any::Any;
@@ -86,12 +87,28 @@ impl SchemaCastScanExec {
             .with_metadata(schema.metadata().clone()),
         );
 
-        // Propagate input ordering: SchemaCastScanExec only casts data types without
-        // reordering, dropping, or renaming columns. Sort expressions reference columns
-        // by index which is preserved, and numeric/string type casts preserve sort order.
+        // Propagate input ordering only when all ordered columns have the same data type
+        // in both the input and output schemas. Type casts are not universally monotonic
+        // (e.g., Utf8→numeric, float NaN handling), so we only propagate ordering when
+        // no type change occurs for the ordered columns.
         let mut eq_properties = EquivalenceProperties::new(Arc::clone(&output_schema));
         if let Some(ordering) = input.properties().output_ordering() {
-            eq_properties.add_orderings([ordering.clone()]);
+            let ordering_safe = ordering.iter().all(|sort_expr| {
+                sort_expr
+                    .expr
+                    .as_any()
+                    .downcast_ref::<Column>()
+                    .is_some_and(|col| {
+                        let idx = col.index();
+                        idx < input_schema.fields().len()
+                            && idx < output_schema.fields().len()
+                            && input_schema.field(idx).data_type()
+                                == output_schema.field(idx).data_type()
+                    })
+            });
+            if ordering_safe {
+                eq_properties.add_orderings([ordering.clone()]);
+            }
         }
         let emission_type = input.pipeline_behavior();
         let boundedness = input.boundedness();
