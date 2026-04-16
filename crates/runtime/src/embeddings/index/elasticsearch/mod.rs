@@ -21,6 +21,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use arrow_schema::DataType;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use elasticsearch::{Client, Elasticsearch};
@@ -72,11 +73,21 @@ pub async fn try_from_table(
         .clone()
         .unwrap_or_else(|| get_primary_keys(inner_table_provider).unwrap_or_default());
 
+    // Normalize LargeUtf8 → Utf8 for primary key fields: the Elasticsearch HTTP client
+    // always returns string data as Arrow Utf8 (StringArray), so the schema must match.
     let primary_key: Vec<_> = primary_keys
         .iter()
         .filter_map(|c| {
             let (_, f) = inner_schema.column_with_name(c.as_str())?;
-            Some(f.clone())
+            if f.data_type() == &DataType::LargeUtf8 {
+                Some(arrow_schema::Field::new(
+                    f.name(),
+                    DataType::Utf8,
+                    f.is_nullable(),
+                ))
+            } else {
+                Some(f.clone())
+            }
         })
         .collect();
 
@@ -100,7 +111,15 @@ pub async fn try_from_table(
         || {
             format!("{}-{}-{}", ds_name, column, config.model)
                 .to_lowercase()
-                .replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "-")
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect()
         },
         ToString::to_string,
     );
@@ -109,12 +128,13 @@ pub async fn try_from_table(
         .map_or_else(|| format!("{column}_embedding"), ToString::to_string);
 
     // Determine text fields for full-text search from the dataset columns.
+    // Match both Utf8 and LargeUtf8 since accelerated tables may use LargeUtf8.
     let text_fields: Vec<String> = dataset_columns
         .iter()
         .filter(|c| {
             inner_schema
                 .field_with_name(&c.name)
-                .is_ok_and(|f| matches!(f.data_type(), arrow_schema::DataType::Utf8))
+                .is_ok_and(|f| matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8))
         })
         .map(|c| c.name.clone())
         .collect();
@@ -137,6 +157,48 @@ pub async fn try_from_table(
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
         as i32;
 
+    // Normalize the source schema to match what the Elasticsearch HTTP client actually produces.
+    // Accelerated tables (e.g. DuckDB) may store columns with types that differ from what ES
+    // returns, causing RecordBatch::try_new to fail when schemas are compared:
+    //   - LargeUtf8 → Utf8  (ES always returns StringArray / Utf8)
+    //   - FixedSizeList inner field → named "item", non-null Float32
+    //     (build_dense_vector_array always uses Field::new("item", Float32, false))
+    // Also, if the base table does not have the vector field (common when ES is the vector store),
+    // explicitly append it so knn_hits_to_batch can extract it from ES _source.
+    let mut source_fields: Vec<arrow_schema::FieldRef> = inner_schema
+        .fields()
+        .iter()
+        .map(|f| {
+            let normalized_type = normalize_es_data_type(f.data_type());
+            if &normalized_type == f.data_type() {
+                Arc::clone(f)
+            } else {
+                Arc::new(arrow_schema::Field::new(
+                    f.name(),
+                    normalized_type,
+                    f.is_nullable(),
+                ))
+            }
+        })
+        .collect();
+
+    // Append vector_field if not already present in the base schema.
+    if inner_schema.field_with_name(&vector_field).is_err() {
+        source_fields.push(Arc::new(arrow_schema::Field::new(
+            &vector_field,
+            DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", DataType::Float32, false)),
+                dims,
+            ),
+            true,
+        )));
+    }
+
+    let source_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+        source_fields,
+        inner_schema.metadata().clone(),
+    ));
+
     Ok(ElasticsearchIndex {
         client,
         es_index,
@@ -146,8 +208,24 @@ pub async fn try_from_table(
         primary_key,
         compute_query: model,
         dims,
-        source_schema: inner_schema,
+        source_schema,
     })
+}
+
+/// Normalize an Arrow [`DataType`] to match what the Elasticsearch HTTP client produces.
+///
+/// - `LargeUtf8` → `Utf8`: ES always deserializes strings as `StringArray` (Utf8).
+/// - `FixedSizeList` with any inner field → `FixedSizeList` with `Field::new("item", Float32, false)`:
+///   `build_dense_vector_array` always produces this exact inner field.
+fn normalize_es_data_type(dt: &DataType) -> DataType {
+    match dt {
+        DataType::LargeUtf8 => DataType::Utf8,
+        DataType::FixedSizeList(_, dim) => DataType::FixedSizeList(
+            Arc::new(arrow_schema::Field::new("item", DataType::Float32, false)),
+            *dim,
+        ),
+        other => other.clone(),
+    }
 }
 
 fn string_from_params<'a>(p: &'a Parameters, key: &str) -> Option<&'a str> {
