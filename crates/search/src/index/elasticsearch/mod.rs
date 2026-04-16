@@ -139,6 +139,64 @@ impl SearchIndex for ElasticsearchIndex {
     }
 }
 
+impl ElasticsearchIndex {
+    /// Wrap a [`TableProvider`] so that its schema matches what the Elasticsearch HTTP client
+    /// actually returns, by casting columns whose types differ between the accelerated store
+    /// (e.g. DuckDB uses `LargeUtf8`) and the ES JSON deserializer (always `Utf8`).
+    ///
+    /// This is used when building the `SearchQueryProvider` join so that join key types
+    /// are consistent between the kNN exec (left) and the base table scan (right).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusionError` if the `ViewTable` plan cannot be built.
+    pub fn normalize_source_table(
+        &self,
+        table: Arc<dyn TableProvider>,
+    ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+        use datafusion::datasource::ViewTable;
+        use datafusion::prelude::{Expr, cast, col};
+
+        let raw_schema = table.schema();
+        let normalized_schema = Arc::clone(&self.source_schema);
+
+        // If schemas already match, no wrapping needed.
+        if raw_schema == normalized_schema {
+            return Ok(table);
+        }
+
+        // Build a projection that casts columns whose types differ.
+        let projections: Vec<Expr> = raw_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let raw_type = f.data_type();
+                // Find the normalized type from source_schema (same field name).
+                let target_type = normalized_schema
+                    .field_with_name(f.name())
+                    .map(|nf| nf.data_type().clone())
+                    .unwrap_or_else(|_| raw_type.clone());
+
+                if &target_type == raw_type {
+                    col(f.name())
+                } else {
+                    cast(col(f.name()), target_type).alias(f.name())
+                }
+            })
+            .collect();
+
+        let plan = LogicalPlanBuilder::scan(
+            "base",
+            Arc::new(DefaultTableSource::new(table)),
+            None,
+        )?
+        .project(projections)?
+        .build()?;
+
+        Ok(Arc::new(ViewTable::new(plan, None)))
+    }
+}
+
 impl VectorIndex for ElasticsearchIndex {
     fn list_table_provider(&self) -> Result<LogicalPlan, DataFusionError> {
         // Elasticsearch doesn't support listing all vectors efficiently.
