@@ -24,22 +24,35 @@ limitations under the License.
 
 use std::sync::Arc;
 
+use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{Extension, LogicalPlan};
-use datafusion_expr::DmlStatement;
+use datafusion_expr::{DmlStatement, WriteOp};
 
 use crate::datafusion::cayenne_ddl::logical_nodes::DistributedCayenneInsertNode;
 
 /// Wrap a `DataFusion` `DmlStatement` (INSERT) into a distributed Cayenne
 /// extension node for forwarding to executor nodes.
 ///
+/// This rewrite is only used for scheduler-side distributed overlay paths.
+///
 /// This is only called in distributed (scheduler) mode. In local mode,
 /// the standard `DataFusion` plan is returned unchanged by the caller.
-pub(super) fn plan_distributed_insert(dml: &DmlStatement) -> LogicalPlan {
-    LogicalPlan::Extension(Extension {
+pub(super) fn plan_distributed_insert(
+    dml: &DmlStatement,
+) -> datafusion::error::Result<LogicalPlan> {
+    let WriteOp::Insert(insert_op) = dml.op else {
+        return Err(DataFusionError::Internal(format!(
+            "Expected WriteOp::Insert for distributed INSERT planning, got {:?}",
+            dml.op
+        )));
+    };
+
+    Ok(LogicalPlan::Extension(Extension {
         node: Arc::new(DistributedCayenneInsertNode::new(
             dml.table_name.clone(),
             Arc::clone(&dml.input),
             Arc::clone(&dml.output_schema),
+            insert_op,
         )),
-    })
+    }))
 }
