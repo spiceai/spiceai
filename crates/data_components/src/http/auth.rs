@@ -351,7 +351,7 @@ async fn exchange_refresh_token(
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
-        let body = sanitize_error_body(&response.text().await.unwrap_or_default());
+        let body = read_bounded_error_body(response).await;
         return Err(Error::TokenEndpointStatus {
             url: config.token_url.clone(),
             status,
@@ -374,6 +374,34 @@ async fn exchange_refresh_token(
         refresh_token: raw.refresh_token.map(SecretString::from),
         expires_in: raw.expires_in,
     })
+}
+
+/// Stream chunks from the token endpoint's error response, stopping as soon as
+/// we have enough bytes to fill [`MAX_ERROR_BODY_BYTES`] after sanitization.
+/// Prevents a misbehaving or malicious token endpoint from forcing us to buffer
+/// an unbounded body just so we can surface the first 512 bytes of it.
+async fn read_bounded_error_body(mut response: reqwest::Response) -> String {
+    // Cap the raw read at a small multiple of the sanitized cap to allow for
+    // UTF-8 completion and whitespace expansion, while still bounding memory.
+    const READ_CAP_BYTES: usize = MAX_ERROR_BODY_BYTES * 2;
+    let mut raw: Vec<u8> = Vec::new();
+    while raw.len() < READ_CAP_BYTES {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = READ_CAP_BYTES - raw.len();
+                if chunk.len() <= remaining {
+                    raw.extend_from_slice(&chunk);
+                } else {
+                    raw.extend_from_slice(&chunk[..remaining]);
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&raw);
+    sanitize_error_body(&text)
 }
 
 /// Trim/flatten an arbitrary error response body for safe inclusion in logs and
@@ -823,14 +851,21 @@ mod tests {
     /// `expires_in` elapses, the connector re-hits the token endpoint *using
     /// the refresh token that was rotated in on the previous response*, not
     /// the seed token.
+    ///
+    /// Note: we deliberately do not use `#[tokio::test(start_paused = true)]`
+    /// here. The test depends on real TCP I/O against a local axum mock
+    /// server, and reqwest's `connect_timeout` is driven by the tokio timer —
+    /// paused time races with the (real) TCP connect and fires the connect
+    /// timeout before the three-way handshake completes. Instead we use a
+    /// small `expires_in` so the refresh loop sleeps just ~1s.
     #[tokio::test(flavor = "current_thread")]
     async fn refresh_loop_uses_rotated_refresh_token() {
         // Server responses: first exchange rotates seed->refresh-v1, second
         // exchange rotates refresh-v1->refresh-v2. Both issue successive
         // access tokens so we can observe the rotation took effect.
         //
-        // `expires_in` is set to `TOKEN_REFRESH_BUFFER_SECS + 1` so the
-        // background loop wakes up ~1s after the initial exchange.
+        // `expires_in = TOKEN_REFRESH_BUFFER_SECS + 1` so the background loop
+        // wakes up ~1s after the initial exchange.
         let expires_in = TOKEN_REFRESH_BUFFER_SECS + 1;
         let (url, count, captured) = start_mock_server(vec![
             MockResponse::ok(&json!({
@@ -864,23 +899,32 @@ mod tests {
             "Bearer access-v1"
         );
 
-        // Wait up to 5s (real time) for the background loop to fire the
-        // second refresh. The loop is scheduled ~1s out.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if count.load(Ordering::SeqCst) >= 2 {
+        // Poll for the second exchange, bounded by a 5s deadline. Use
+        // `tokio::time::Instant` (not `std::time::Instant`) so this cooperates
+        // with any future move to simulated time without code churn.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if count.load(Ordering::SeqCst) >= 2
+                && auth.current_bearer_value().to_str().unwrap_or("") == "Bearer access-v2"
+            {
                 break;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "background refresh did not fire within 5s (requests={})",
-                count.load(Ordering::SeqCst)
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        // Second request should carry the rotated refresh token from the
-        // first response, not the seed.
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "background refresh did not fire a second exchange within 5s",
+        );
+        assert_eq!(
+            auth.current_bearer_value().to_str().unwrap_or(""),
+            "Bearer access-v2",
+            "watch channel did not propagate the rotated access token",
+        );
+
+        // Second request should carry the rotated refresh token from the first
+        // response, not the seed.
         let requests = captured.lock().await;
         assert_eq!(requests.len(), 2, "expected two token requests");
         let second = &requests[1];
@@ -892,20 +936,5 @@ mod tests {
             !second.contains("refresh_token=seed-refresh"),
             "second refresh incorrectly reused the seed token: {second}"
         );
-        drop(requests);
-
-        // Give the watch channel a moment to propagate the new access token.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            if auth.current_bearer_value().to_str().unwrap_or("") == "Bearer access-v2" {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "access token did not rotate to v2 in time; current={:?}",
-                auth.current_bearer_value()
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
     }
 }
