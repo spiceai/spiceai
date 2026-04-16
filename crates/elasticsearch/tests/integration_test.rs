@@ -30,7 +30,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
-use elasticsearch::{Client, Elasticsearch, SearchRequest};
+use elasticsearch::{Client, SearchRequest};
 
 fn es_url() -> String {
     std::env::var("ELASTICSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".to_string())
@@ -40,17 +40,14 @@ async fn wait_for_es() {
     let http = reqwest::Client::new();
     for i in 0..30 {
         if let Ok(resp) = http
-            .get(&format!("{}/_cluster/health", es_url()))
+            .get(format!("{}/_cluster/health", es_url()))
             .send()
             .await
+            && resp.status().is_success()
         {
-            if resp.status().is_success() {
-                return;
-            }
+            return;
         }
-        if i == 29 {
-            panic!("Elasticsearch not available at {}", es_url());
-        }
+        assert!(i != 29, "Elasticsearch not available at {}", es_url());
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
@@ -58,7 +55,7 @@ async fn wait_for_es() {
 async fn setup_test_index(index: &str) {
     // Delete if exists (ignore errors)
     let _ = reqwest::Client::new()
-        .delete(&format!("{}/{index}", es_url()))
+        .delete(format!("{}/{index}", es_url()))
         .send()
         .await;
 
@@ -81,7 +78,7 @@ async fn setup_test_index(index: &str) {
     });
 
     let resp = reqwest::Client::new()
-        .put(&format!("{}/{index}", es_url()))
+        .put(format!("{}/{index}", es_url()))
         .json(&mapping)
         .send()
         .await
@@ -137,7 +134,7 @@ async fn index_test_docs(client: &Client, index: &str) {
 
     // Refresh so docs are searchable immediately
     let _ = reqwest::Client::new()
-        .post(&format!("{}/{index}/_refresh", es_url()))
+        .post(format!("{}/{index}/_refresh", es_url()))
         .send()
         .await;
 }
@@ -259,7 +256,7 @@ async fn test_index_document_and_retrieve() {
 
     // Refresh
     let _ = reqwest::Client::new()
-        .post(&format!("{}/{index}/_refresh", es_url()))
+        .post(format!("{}/{index}/_refresh", es_url()))
         .send()
         .await;
 
@@ -303,5 +300,5 @@ async fn test_error_on_missing_index() {
     wait_for_es().await;
 
     let result = client.get_mapping("nonexistent_index_12345").await;
-    assert!(result.is_err());
+    result.expect_err("expected error for nonexistent index");
 }

@@ -66,7 +66,7 @@ fn collect_fields(
 }
 
 /// Map an Elasticsearch field type to an Arrow [`DataType`].
-#[expect(clippy::cast_possible_truncation, clippy::match_same_arms)]
+#[expect(clippy::match_same_arms)]
 fn es_type_to_arrow(mapping: &FieldMapping) -> DataType {
     match mapping.field_type.as_deref() {
         Some("text" | "keyword" | "wildcard" | "constant_keyword" | "match_only_text") => {
@@ -141,10 +141,12 @@ mod tests {
         let schema = mapping_to_schema(&properties);
         assert_eq!(schema.fields().len(), 3);
 
-        let count_field = schema.field_with_name("count").unwrap();
+        let count_field = schema.field_with_name("count").expect("count field");
         assert_eq!(count_field.data_type(), &DataType::Int32);
 
-        let embed_field = schema.field_with_name("embedding").unwrap();
+        let embed_field = schema
+            .field_with_name("embedding")
+            .expect("embedding field");
         assert!(matches!(
             embed_field.data_type(),
             DataType::FixedSizeList(_, 384)

@@ -45,17 +45,14 @@ async fn wait_for_es() {
     let http = reqwest::Client::new();
     for i in 0..30 {
         if let Ok(resp) = http
-            .get(&format!("{}/_cluster/health", es_url()))
+            .get(format!("{}/_cluster/health", es_url()))
             .send()
             .await
+            && resp.status().is_success()
         {
-            if resp.status().is_success() {
-                return;
-            }
+            return;
         }
-        if i == 29 {
-            panic!("Elasticsearch not available at {}", es_url());
-        }
+        assert!(i != 29, "Elasticsearch not available at {}", es_url());
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
@@ -66,7 +63,7 @@ async fn setup_test_index(index: &str) -> Arc<dyn Elasticsearch> {
 
     // Delete if exists
     let _ = reqwest::Client::new()
-        .delete(&format!("{}/{index}", es_url()))
+        .delete(format!("{}/{index}", es_url()))
         .send()
         .await;
 
@@ -89,7 +86,7 @@ async fn setup_test_index(index: &str) -> Arc<dyn Elasticsearch> {
     });
 
     let resp = reqwest::Client::new()
-        .put(&format!("{}/{index}", es_url()))
+        .put(format!("{}/{index}", es_url()))
         .json(&mapping)
         .send()
         .await
@@ -140,7 +137,7 @@ async fn setup_test_index(index: &str) -> Arc<dyn Elasticsearch> {
 
     // Refresh
     let _ = reqwest::Client::new()
-        .post(&format!("{}/{index}/_refresh", es_url()))
+        .post(format!("{}/{index}/_refresh", es_url()))
         .send()
         .await;
 
@@ -212,7 +209,10 @@ async fn test_query_table_scan() {
     assert!(display.contains("42"));
 
     // Check total row count
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let total_rows: usize = batches
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
     assert_eq!(total_rows, 3);
 }
 
@@ -239,7 +239,10 @@ async fn test_query_table_with_limit() {
         .await
         .expect("sql");
     let batches = df.collect().await.expect("collect");
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let total_rows: usize = batches
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
     assert_eq!(total_rows, 1);
 }
 
@@ -286,7 +289,7 @@ async fn test_knn_table_search() {
     let display = pretty_format_batches(&batches).expect("format").to_string();
     // Doc "2" has embedding [0.9, 0.8, 0.7] — closest match
     assert!(
-        display.contains("2"),
+        display.contains('2'),
         "Expected doc '2' in results: {display}"
     );
 }
@@ -327,12 +330,15 @@ async fn test_text_search_table() {
         .await
         .expect("sql");
     let batches = df.collect().await.expect("collect");
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let total_rows: usize = batches
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
     assert!(total_rows > 0, "Expected at least one text search result");
 
     let display = pretty_format_batches(&batches).expect("format").to_string();
     assert!(
-        display.contains("1"),
+        display.contains('1'),
         "Expected doc '1' (Rust Programming) in results: {display}"
     );
 }

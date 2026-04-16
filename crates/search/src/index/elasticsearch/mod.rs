@@ -174,8 +174,7 @@ impl ElasticsearchIndex {
                 // Find the normalized type from source_schema (same field name).
                 let target_type = normalized_schema
                     .field_with_name(f.name())
-                    .map(|nf| nf.data_type().clone())
-                    .unwrap_or_else(|_| raw_type.clone());
+                    .map_or_else(|_| raw_type.clone(), |nf| nf.data_type().clone());
 
                 if &target_type == raw_type {
                     col(f.name())
