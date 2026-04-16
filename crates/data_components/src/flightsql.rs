@@ -659,7 +659,13 @@ impl ExecutionPlan for FlightSqlExec {
             metrics: ExecutionPlanMetricsSet::new(),
         };
 
-        Ok(SortOrderPushdownResult::Exact {
+        // Return Inexact rather than Exact so DataFusion keeps the SortExec wrapper
+        // above us. Exact would replace the SortExec with `inner`, which loses the
+        // SortExec's embedded fetch (`ORDER BY ... LIMIT N` is represented as a
+        // single SortExec with fetch=N in DF 52). Keeping the SortExec preserves the
+        // fetch as a TopK applied to our already-sorted SQL output.
+        // We can use Exact once we use DF version which includes PR https://github.com/apache/datafusion/pull/21182
+        Ok(SortOrderPushdownResult::Inexact {
             inner: Arc::new(new_plan),
         })
     }
@@ -1231,7 +1237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_pushdown_sort_returns_exact_for_column_expr() {
+    async fn try_pushdown_sort_returns_inexact_for_column_expr() {
         use arrow::compute::SortOptions;
         use datafusion::physical_expr::expressions::Column;
         use datafusion::physical_plan::SortOrderPushdownResult;
@@ -1257,8 +1263,9 @@ mod tests {
             .try_pushdown_sort(&[sort_expr])
             .expect("try_pushdown_sort should not error");
         assert!(
-            matches!(result, SortOrderPushdownResult::Exact { .. }),
-            "expected Exact for column sort expression"
+            matches!(result, SortOrderPushdownResult::Inexact { .. }),
+            "expected Inexact for column sort expression \
+             (preserves SortExec wrapper so its fetch survives; see comment in try_pushdown_sort)"
         );
 
         server.shutdown().await;
@@ -1302,8 +1309,8 @@ mod tests {
         let result = exec
             .try_pushdown_sort(&sort_exprs)
             .expect("try_pushdown_sort should not error");
-        let SortOrderPushdownResult::Exact { inner } = result else {
-            panic!("expected Exact result from try_pushdown_sort");
+        let SortOrderPushdownResult::Inexact { inner } = result else {
+            panic!("expected Inexact result from try_pushdown_sort");
         };
         let pushed_exec = inner
             .as_any()

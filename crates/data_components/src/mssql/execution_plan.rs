@@ -297,14 +297,13 @@ impl ExecutionPlan for SqlServerExecPlan {
         };
 
         let inner = Arc::new(new_plan) as Arc<dyn ExecutionPlan>;
-        if nulls_match_native {
-            Ok(SortOrderPushdownResult::Exact { inner })
-        } else {
-            // MSSQL can't express NULLS FIRST/LAST, so the sort is pushed down
-            // for performance but DataFusion will add a verification sort for
-            // correct null ordering.
-            Ok(SortOrderPushdownResult::Inexact { inner })
-        }
+        // Return Inexact rather than Exact so DataFusion keeps the SortExec wrapper
+        // above us. Exact would replace the SortExec with `inner`, which loses the
+        // SortExec's embedded fetch (`ORDER BY ... LIMIT N` is represented as a
+        // single SortExec with fetch=N in DF 52). Keeping the SortExec preserves the
+        // fetch as a TopK applied to our already-sorted SQL output.
+        // We can use Exact once we use DF version which includes PR https://github.com/apache/datafusion/pull/21182
+        Ok(SortOrderPushdownResult::Inexact { inner })
     }
 
     fn execute(
