@@ -1767,7 +1767,7 @@ mod tests {
 
     #[test]
     fn test_otel_exporter_with_headers() {
-        let yaml = r#"
+        let yaml = r"
             telemetry:
                 otel_exporter:
                     endpoint: https://otel.datadoghq.com/v1/metrics
@@ -1775,7 +1775,7 @@ mod tests {
                     headers:
                         DD-API-KEY: my-api-key
                         X-Custom-Header: custom-value
-        "#;
+        ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         let otel_config = runtime
             .telemetry
