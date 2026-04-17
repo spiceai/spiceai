@@ -251,7 +251,7 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
                 "plan should contain Sort operator"
             );
             assert!(
-                plan_fmt.contains("VirtualExecutionPlan name=flightsql"),
+                plan_fmt.contains("FlightSqlExec"),
                 "plan should use FlightSqlExec for distributed execution \n {plan_fmt}"
             );
             // Partition values are no longer injected as bucket filters because
