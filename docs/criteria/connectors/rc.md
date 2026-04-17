@@ -13,6 +13,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | Clickhouse                       | ➖          |              |
 | Databricks (mode: delta_lake)    | ✅          | @Sevenannn   |
 | Databricks (mode: spark_connect) | ➖          |              |
+| Databricks (mode: sql_warehouse) | ➖          |              |
 | Debezium                         | ➖          |              |
 | Delta Lake                       | ✅          | @Sevenannn   |
 | Dremio                           | ✅          | @Sevenannn   |
@@ -62,6 +63,7 @@ This table defines the required features and/or tests for each connector:
 | Clickhouse                       | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
 | Databricks (mode: delta_lake)    | ✅ (1)                 | ✅ (1)                   | ☑️                 | ✅                        | ✅                   | ✅                          |
 | Databricks (mode: spark_connect) | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
+| Databricks (mode: sql_warehouse) | ➖                     | ➖                       | ✅                 | ✅                        | ✅                   | ✅                          |
 | Debezium                         | ➖                     | ➖                       | ➖                 | ➖                        | ✅                   | ☑️                          |
 | Delta Lake                       | ✅ (1)                 | ✅ (1)                   | ☑️                 | ✅                        | ✅                   | ✅                          |
 | Dremio                           | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
