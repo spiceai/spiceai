@@ -37,17 +37,28 @@ pub struct JwksCache {
     client: reqwest::Client,
 }
 
+/// The result of OIDC provider discovery.
+pub struct DiscoveryResult {
+    /// The canonical issuer identifier from the discovery document's `issuer` field.
+    /// Per the OIDC Discovery spec (Section 4.3), this MUST be identical to the
+    /// `iss` claim in tokens issued by this provider. Use this value — not the
+    /// user-configured `issuer_url` — for JWT `iss` validation.
+    pub issuer: String,
+}
+
 impl JwksCache {
     /// Create a new `JwksCache` by performing OIDC discovery and fetching the initial key set.
     ///
     /// 1. Fetches `{issuer_url}/.well-known/openid-configuration`
-    /// 2. Extracts the `jwks_uri`
+    /// 2. Extracts `issuer` and `jwks_uri` from the discovery document
     /// 3. Fetches the JWK set
+    ///
+    /// Returns the cache and a [`DiscoveryResult`] containing the canonical issuer.
     ///
     /// # Errors
     ///
     /// Returns an error if OIDC discovery or the initial JWKS key fetch fails.
-    pub async fn new(issuer_url: &str) -> Result<Self, Error> {
+    pub async fn new(issuer_url: &str) -> Result<(Self, DiscoveryResult), Error> {
         let client = reqwest::Client::builder()
             .connect_timeout(REQUEST_CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
@@ -59,14 +70,17 @@ impl JwksCache {
             issuer_url.trim_end_matches('/')
         );
 
-        let jwks_url = Self::discover_jwks_url(&client, &discovery_url).await?;
+        let (jwks_url, discovery) = Self::discover(&client, &discovery_url).await?;
         let keys = Self::fetch_keys_with_retry(&client, &jwks_url).await?;
 
-        Ok(Self {
-            keys: RwLock::new(Arc::new(keys)),
-            jwks_url,
-            client,
-        })
+        Ok((
+            Self {
+                keys: RwLock::new(Arc::new(keys)),
+                jwks_url,
+                client,
+            },
+            discovery,
+        ))
     }
 
     /// Returns a cheap `Arc` clone of the currently cached JWK keys.
@@ -104,10 +118,13 @@ impl JwksCache {
         })
     }
 
-    async fn discover_jwks_url(
+    /// Fetches the OIDC discovery document and extracts `issuer` and `jwks_uri`.
+    ///
+    /// Returns `(jwks_uri, DiscoveryResult)`.
+    async fn discover(
         client: &reqwest::Client,
         discovery_url: &str,
-    ) -> Result<String, Error> {
+    ) -> Result<(String, DiscoveryResult), Error> {
         let resp = client.get(discovery_url).send().await.map_err(|e| {
             Error::JwksDiscoveryFailed(format!(
                 "Failed to fetch OIDC discovery document from {discovery_url}: {e}"
@@ -125,14 +142,23 @@ impl JwksCache {
             Error::JwksDiscoveryFailed(format!("Failed to parse OIDC discovery document: {e}"))
         })?;
 
-        config["jwks_uri"]
+        let jwks_uri = config["jwks_uri"]
             .as_str()
             .map(ToString::to_string)
             .ok_or_else(|| {
                 Error::JwksDiscoveryFailed(
                     "OIDC discovery document missing 'jwks_uri' field".into(),
                 )
-            })
+            })?;
+
+        let issuer = config["issuer"]
+            .as_str()
+            .map(ToString::to_string)
+            .ok_or_else(|| {
+                Error::JwksDiscoveryFailed("OIDC discovery document missing 'issuer' field".into())
+            })?;
+
+        Ok((jwks_uri, DiscoveryResult { issuer }))
     }
 
     async fn fetch_keys(client: &reqwest::Client, jwks_url: &str) -> Result<Vec<Jwk>, Error> {

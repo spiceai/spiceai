@@ -25,7 +25,7 @@ use serde::Deserialize;
 use crate::error::Error;
 use crate::identity::IdentityContext;
 use crate::{AuthPrincipal, AuthVerdict, FlightBasicAuth, GrpcAuth, HttpAuth};
-use jwks::JwksCache;
+use jwks::{DiscoveryResult, JwksCache};
 
 /// Algorithms considered safe for OIDC JWT validation.
 /// We never trust the JWT header's `alg` directly — only these are accepted.
@@ -97,10 +97,11 @@ impl AuthPrincipal for OidcPrincipal {
 #[derive(Debug, Deserialize)]
 struct Claims {
     sub: String,
-    /// The groups claim is dynamic (configurable name), so we deserialize the
-    /// full token and extract it separately.
+    /// All remaining claims, collected for `session_property()` lookups.
+    /// Standard claims decoded into named fields (e.g. `sub`) are not captured
+    /// here by serde, so they must be inserted explicitly if needed.
     #[serde(flatten)]
-    extra: serde_json::Value,
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// Configurable claim mappings for extracting identity fields from JWT tokens.
@@ -154,19 +155,39 @@ impl OidcAuth {
         groups_claims: Vec<String>,
         claim_mappings: ClaimMappings,
     ) -> Result<Self, Error> {
-        // Normalize to avoid trailing-slash mismatches between discovery and `iss` validation.
-        let issuer_url = issuer_url.trim_end_matches('/').to_string();
+        let (
+            jwks_cache,
+            DiscoveryResult {
+                issuer: canonical_issuer,
+            },
+        ) = JwksCache::new(&issuer_url).await?;
 
-        let jwks_cache = Arc::new(JwksCache::new(&issuer_url).await?);
+        // Per OIDC Discovery spec Section 4.3, the `issuer` from the discovery document
+        // MUST be identical to the `iss` claim in tokens. Use the canonical issuer from
+        // the discovery doc — not the user-configured `issuer_url` — for validation.
+        // Warn if they differ (beyond a trailing slash) so the user can correct their
+        // config, but proceed with the canonical value.
+        if canonical_issuer != issuer_url.trim_end_matches('/') && canonical_issuer != issuer_url {
+            tracing::warn!(
+                configured = %issuer_url,
+                canonical = %canonical_issuer,
+                "Configured issuer_url does not exactly match the issuer from the OIDC discovery document. \
+                JWT iss validation will use the canonical issuer from the discovery document."
+            );
+        }
+
+        let jwks_cache = Arc::new(jwks_cache);
         let refresh_handle = Arc::clone(&jwks_cache).start_refresh_task();
 
-        // Pre-build validation config so we don't allocate HashSets/Vecs per request.
-        // The placeholder algorithm in `Validation::new` is immediately overridden.
+        // Pre-build validation config carrying audience and issuer so we don't
+        // re-parse them on every request. The algorithms field is intentionally
+        // left as a placeholder — it is overridden per-request in `validate_token`
+        // with the single algorithm from the JWT header.
         let mut validation = Validation::new(Algorithm::RS256);
         validation.algorithms = ALLOWED_ALGORITHMS.to_vec();
         let aud_refs: Vec<&str> = audience.iter().map(String::as_str).collect();
         validation.set_audience(&aud_refs);
-        validation.set_issuer(&[&issuer_url]);
+        validation.set_issuer(&[&canonical_issuer]);
 
         Ok(Self {
             jwks_cache,
@@ -210,12 +231,19 @@ impl OidcAuth {
             return AuthVerdict::Deny;
         }
 
+        // Build a per-request validation using only the token's own algorithm.
+        // jsonwebtoken requires all algorithms in `Validation::algorithms` to share
+        // the same key family as the `DecodingKey` — using a multi-family list
+        // (RSA + EC + OKP) causes `InvalidAlgorithm` even when the token's `alg` is valid.
+        let mut validation = self.validation.clone();
+        validation.algorithms = vec![header.alg];
+
         for jwk in matching_keys {
             let Ok(decoding_key) = DecodingKey::from_jwk(jwk) else {
                 continue;
             };
 
-            match decode::<Claims>(token, &decoding_key, &self.validation) {
+            match decode::<Claims>(token, &decoding_key, &validation) {
                 Ok(token_data) => {
                     let groups = self.extract_groups(&token_data.claims);
                     let identity = self.build_identity_context(&token_data.claims);
@@ -283,12 +311,12 @@ impl OidcAuth {
             }
         }
 
-        // Collect all extra claims into the generic claims map.
-        let all_claims = if let Some(obj) = claims.extra.as_object() {
-            obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-        } else {
-            std::collections::HashMap::new()
-        };
+        // `sub` is consumed by the named field above and absent from `extra`,
+        // so insert it explicitly for session_property('sub') lookups.
+        let mut all_claims = claims.extra.clone();
+        all_claims
+            .entry("sub".to_string())
+            .or_insert_with(|| serde_json::Value::String(claims.sub.clone()));
 
         IdentityContext::new(user_id)
             .with_org_id_opt(org_id)
