@@ -31,6 +31,7 @@ pub struct QueryBuilder<'a> {
     parameters: Option<ParamValues>,
     table_allowlist: Option<ResolvedTableAwareAllowlist>,
     query_id: Uuid,
+    read_only: bool,
 }
 
 impl<'a> QueryBuilder<'a> {
@@ -41,6 +42,7 @@ impl<'a> QueryBuilder<'a> {
             parameters: None,
             query_id: Uuid::new_v4(),
             table_allowlist: None,
+            read_only: false,
         }
     }
 
@@ -59,6 +61,21 @@ impl<'a> QueryBuilder<'a> {
     #[must_use]
     pub fn parameters(mut self, parameters: Option<ParamValues>) -> Self {
         self.parameters = parameters;
+        self
+    }
+
+    /// Enforce read-only SQL execution.
+    ///
+    /// When enabled, the planned query is additionally checked with
+    /// [`crate::datafusion::sql_validator::validate_sql_query_read_only`] and rejected if it
+    /// contains any DDL, DML, COPY, or non-prepared Statement nodes — regardless of
+    /// whether the target catalogs/datasets are individually marked writable.
+    ///
+    /// Used by surfaces that execute SQL on behalf of an LLM or unauthenticated caller
+    /// (the built-in `sql` tool, `/v1/nsql`).
+    #[must_use]
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
         self
     }
 
@@ -91,6 +108,7 @@ impl<'a> QueryBuilder<'a> {
                 table_allowlist: self.table_allowlist,
             },
             tracker,
+            read_only: self.read_only,
         }
     }
 }

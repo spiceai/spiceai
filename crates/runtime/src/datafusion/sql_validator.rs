@@ -215,6 +215,41 @@ fn validate_ddl_operation(
     )
 }
 
+/// Strict read-only validator.
+///
+/// Rejects any plan containing DDL, DML, COPY, or Statement nodes (except PREPARE / EXECUTE
+/// / DEALLOCATE, which do not themselves mutate state). Used by surfaces that must never
+/// perform writes regardless of per-catalog/per-dataset access configuration — notably the
+/// built-in `sql` tool and the LLM-generated SQL path in `/v1/nsql`.
+///
+/// # Returns
+/// * `Ok(())` if the plan contains only read operations.
+/// * `Err(DataFusionError)` if the plan contains any write or schema-mutating operation.
+pub fn validate_sql_query_read_only(plan: &LogicalPlan) -> Result<(), DataFusionError> {
+    plan.apply_with_subqueries(|node| match node {
+        LogicalPlan::Ddl(ddl) => plan_err!(
+            "DDL operation '{}' is not allowed in read-only SQL context.",
+            ddl.name()
+        ),
+        LogicalPlan::Dml(dml) => plan_err!(
+            "{} operations are not allowed in read-only SQL context.",
+            dml.name()
+        ),
+        LogicalPlan::Copy(_) => plan_err!("COPY operations are not allowed in read-only SQL context."),
+        LogicalPlan::Statement(stmt) => match stmt {
+            Statement::Prepare(_) | Statement::Execute(_) | Statement::Deallocate(_) => {
+                Ok(TreeNodeRecursion::Continue)
+            }
+            _ => plan_err!(
+                "Statement '{}' is not allowed in read-only SQL context.",
+                stmt.name()
+            ),
+        },
+        _ => Ok(TreeNodeRecursion::Continue),
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -834,5 +869,72 @@ mod tests {
             result.is_ok(),
             "INSERT should be allowed on table in writable default catalog"
         );
+    }
+
+    /// [`validate_sql_query_read_only`] must allow SELECT but reject every class of
+    /// write/schema-mutating plan, independent of per-catalog writability. This is the
+    /// contract that the built-in `sql` tool and `/v1/nsql` rely on to contain
+    /// LLM-generated SQL.
+    #[tokio::test]
+    async fn test_read_only_validator_allows_select() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("SELECT * FROM tbl_writable")
+            .await
+            .expect("plan should be created");
+
+        validate_sql_query_read_only(&plan).expect("SELECT must be allowed in read-only context");
+    }
+
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_insert_on_writable_dataset() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("INSERT INTO tbl_writable VALUES (1, 'foo', 42.0)")
+            .await
+            .expect("plan should be created");
+
+        let err = validate_sql_query_read_only(&plan)
+            .expect_err("INSERT must be rejected in read-only context");
+        assert!(
+            err.to_string().contains("read-only"),
+            "error should cite read-only context, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_delete_on_writable_dataset() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("DELETE FROM tbl_writable WHERE id = 1")
+            .await
+            .expect("plan should be created");
+
+        validate_sql_query_read_only(&plan)
+            .expect_err("DELETE must be rejected in read-only context");
+    }
+
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_ddl() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("DROP TABLE IF EXISTS tbl_writable")
+            .await
+            .expect("plan should be created");
+
+        validate_sql_query_read_only(&plan)
+            .expect_err("DDL must be rejected in read-only context");
     }
 }

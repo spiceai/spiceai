@@ -81,7 +81,9 @@ use super::{
 
 use super::managed_runtime;
 use crate::datafusion::{
-    DataFusion, query::cache::RequestCacheManager, sql_validator::validate_sql_query_operations,
+    DataFusion,
+    query::cache::RequestCacheManager,
+    sql_validator::{validate_sql_query_operations, validate_sql_query_read_only},
 };
 use managed_runtime::ManagedRuntimeError;
 use opentelemetry::KeyValue;
@@ -190,6 +192,11 @@ pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: QueryMethod,
     tracker: Option<QueryTracker>,
+    /// When true, the validator additionally rejects DDL / DML / COPY / Statement
+    /// plan nodes, regardless of per-catalog writability. Set via
+    /// [`QueryBuilder::read_only`]; used by `/v1/tools/sql` and `/v1/nsql` to contain
+    /// LLM-generated SQL.
+    read_only: bool,
 }
 
 macro_rules! handle_error {
@@ -388,6 +395,12 @@ impl Query {
         if let Err(e) = validate_sql_query_operations(&plan, &self.df) {
             let e = find_datafusion_root(e);
             return Err(Error::UnableToExecuteQuery { source: e });
+        }
+        if self.read_only {
+            if let Err(e) = validate_sql_query_read_only(&plan) {
+                let e = find_datafusion_root(e);
+                return Err(Error::UnableToExecuteQuery { source: e });
+            }
         }
 
         // Get the schema from the logical plan
@@ -609,6 +622,19 @@ impl Query {
                 };
 
                 if let Err(e) = validate_sql_query_operations(&plan, &ctx.df) {
+                    let e = find_datafusion_root(e);
+                    handle_error!(
+                        tracker,
+                        &request_context,
+                        ErrorCode::QueryPlanningError,
+                        e,
+                        UnableToExecuteQuery
+                    )
+                }
+
+                if ctx.read_only
+                    && let Err(e) = validate_sql_query_read_only(&plan)
+                {
                     let e = find_datafusion_root(e);
                     handle_error!(
                         tracker,
@@ -878,6 +904,7 @@ impl Query {
             df: Arc::clone(df),
             sql: QueryMethod::Plan(Box::new(plan.clone())),
             tracker: None,
+            read_only: false,
         }
     }
 
@@ -926,6 +953,13 @@ impl Query {
 
         // Verify the plan against the restricted options
         if let Err(e) = validate_sql_query_operations(&plan, &self.df) {
+            let e = find_datafusion_root(e);
+            self.handle_schema_error(&request_context, &e);
+            return Err(e);
+        }
+        if self.read_only
+            && let Err(e) = validate_sql_query_read_only(&plan)
+        {
             let e = find_datafusion_root(e);
             self.handle_schema_error(&request_context, &e);
             return Err(e);

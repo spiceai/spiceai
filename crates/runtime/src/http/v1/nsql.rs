@@ -438,9 +438,13 @@ pub(crate) async fn handle_nsql_query(
 
                 tracing::debug!("Running query:\n{cleaned_query}");
 
-                // Run the SQL with table allowlist enforcement
+                // Run the SQL with table allowlist enforcement. LLM-generated SQL is
+                // always executed in read-only mode: the runtime rejects any plan that
+                // contains DDL/DML/COPY/Statement regardless of per-catalog writability,
+                // which mitigates model-mediated SQL injection on `/v1/nsql`.
                 let query_result = {
-                    let mut builder = QueryBuilder::new(&cleaned_query, Arc::clone(&df));
+                    let mut builder = QueryBuilder::new(&cleaned_query, Arc::clone(&df))
+                        .read_only(true);
                     if let Some(ref allowlist) = table_allowlist_opt {
                         builder = builder.allow_tables(allowlist.clone());
                     }

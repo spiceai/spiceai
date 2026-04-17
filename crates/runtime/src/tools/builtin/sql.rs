@@ -41,6 +41,12 @@ pub struct SqlTool {
     df: Arc<DataFusion>,
 
     allowed_tables: Option<ResolvedTableAwareAllowlist>,
+    /// When true (the default), the tool rejects any DDL/DML/COPY/Statement plan at
+    /// execution time. This prevents LLM- or caller-supplied SQL from mutating data
+    /// via the `/v1/tools/sql` surface, even when a referenced catalog/dataset is
+    /// configured writable. Operators that need write access from a tool should
+    /// configure a distinct writable tool rather than flipping this flag.
+    read_only: bool,
 }
 
 impl SqlTool {
@@ -54,9 +60,22 @@ impl SqlTool {
         Self {
             df,
             name: name.unwrap_or("sql").to_string(),
-            description: description.unwrap_or("Run an SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: \"catalog\".\"schema\".\"table\". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix.").to_string(),
-            allowed_tables
+            description: description.unwrap_or("Run a read-only SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: \"catalog\".\"schema\".\"table\". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix. DDL and write statements (INSERT/UPDATE/DELETE/COPY/CREATE/DROP) are rejected.").to_string(),
+            allowed_tables,
+            read_only: true,
         }
+    }
+
+    /// Allow write statements (INSERT/UPDATE/DELETE/DDL). Defaults to off.
+    ///
+    /// This is an escape hatch for operators who have deliberately configured a
+    /// separate writable tool and understand that any LLM with tool-use access will
+    /// then be able to mutate the targeted catalog/dataset without per-call
+    /// confirmation. Leave the default in place unless that trade-off is acceptable.
+    #[must_use]
+    pub fn allow_writes(mut self) -> Self {
+        self.read_only = false;
+        self
     }
 }
 
@@ -79,7 +98,7 @@ impl SpiceModelTool for SqlTool {
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let req: SqlToolParams = serde_json::from_str(arg)?;
 
-            let mut query_builder = self.df.query_builder(&req.query);
+            let mut query_builder = self.df.query_builder(&req.query).read_only(self.read_only);
             if let Some(ref allowlist) = self.allowed_tables {
                 query_builder = query_builder.allow_tables(allowlist.clone());
             }
