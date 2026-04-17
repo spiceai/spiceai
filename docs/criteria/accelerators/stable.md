@@ -29,6 +29,7 @@ Stable quality accelerators should be able to run test packages derived from the
 - [TPC-H](https://www.tpc.org/TPC-H/)
 - [TPC-DS](https://www.tpc.org/TPC-DS/)
 - [ClickBench](https://github.com/ClickHouse/ClickBench)
+- [SpiceBench](https://github.com/spiceai/spicebench)
 
 Indexes are not required for test coverage, but can be introduced if required for tests to pass (e.g. due to performance characteristics, etc).
 
@@ -71,6 +72,13 @@ Indexes are not required for test coverage, but can be introduced if required fo
 - [ ] An end-to-end test is created using a refresh SQL that excludes results from the accelerator for the ClickBench dataset in all [Access Modes](../definitions.md). ClickBench queries should induce a zero results action, with `on_zero_results: use_source` behavior.
   - The test validates that for queries that would return results from the source that are excluded in the accelerator, that they correctly return results through the use of `on_zero_results`.
   - A connector that is currently Release Candidate quality or higher must be used as the acceleration source, to reduce the impact of connector-related issues.
+
+#### SpiceBench
+
+- [ ] A [SpiceBench](https://github.com/spiceai/spicebench) scenario runs end-to-end against the accelerator, covering concurrent ingestion, materialization, and query execution from a hybrid data lake + database topology.
+- [ ] The SpiceBench run completes with no [Major or Minor Bugs](../definitions.md) and without service unavailability.
+- [ ] Results are published to [SpiceBench.com](https://spicebench.com/) with run metadata (executor instance type, scale factor, scenario, table format) sufficient for reproduction.
+- [ ] Primary metric (`test_duration_ms`) and secondary metrics (query latency p99, ingestion throughput, resource efficiency) are reported.
 
 ### AI Workloads Support
 
