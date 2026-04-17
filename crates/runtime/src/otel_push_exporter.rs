@@ -489,8 +489,8 @@ mod tests {
     #[test]
     fn test_create_grpc_exporter_with_valid_headers() {
         // tonic requires a tokio runtime to be available during exporter construction
-        let _rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-        let _guard = _rt.enter();
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        let _guard = rt.enter();
         let headers = HashMap::from([
             ("api-key".to_string(), "test-key".to_string()),
             ("x-custom-header".to_string(), "value".to_string()),
@@ -504,8 +504,8 @@ mod tests {
 
     #[test]
     fn test_create_grpc_exporter_without_headers() {
-        let _rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-        let _guard = _rt.enter();
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        let _guard = rt.enter();
         let headers = HashMap::new();
         let result = create_grpc_exporter("http://localhost:4317", &headers);
         assert!(
@@ -517,8 +517,8 @@ mod tests {
     #[test]
     fn test_create_grpc_exporter_rejects_invalid_metadata_key() {
         // tonic requires a tokio runtime to be available during exporter construction
-        let _rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-        let _guard = _rt.enter();
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        let _guard = rt.enter();
         // gRPC metadata keys must be lowercase ASCII
         let headers = HashMap::from([("Invalid Key With Spaces".to_string(), "value".to_string())]);
         let result = create_grpc_exporter("http://localhost:4317", &headers);
