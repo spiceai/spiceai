@@ -359,7 +359,7 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
 }
 
 /// Test that `ORDER BY col LIMIT N` is pushed down into each executor's `FlightSqlExec`
-/// so each partition returns at most N rows (TopK)
+/// so each partition returns at most N rows (`TopK`)
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
 async fn test_distributed_acceleration_order_by_limit_pushdown() -> Result<(), anyhow::Error> {
