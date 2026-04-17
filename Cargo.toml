@@ -432,8 +432,7 @@ iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
 
 # candle-* crates are already redirected to the spiceai/candle fork via the
-# [patch.crates-io] block higher up in this file (which also carries a
-# local-path override for candle-flash-attn). Keeping those here would be
+# [patch.crates-io] block higher up in this file. Keeping those here would be
 # a duplicate-key error.
 
 # arrow-rs 57.2 with spice patches
