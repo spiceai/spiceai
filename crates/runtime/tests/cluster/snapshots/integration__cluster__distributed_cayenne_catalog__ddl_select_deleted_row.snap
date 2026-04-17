@@ -1,19 +1,14 @@
 ---
 source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
 expression: __plan
-snapshot_kind: text
 ---
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                               |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Federated                                                                                                                                                          |
-|               |  Projection: tcat.myschema.users.id                                                                                                                                |
-|               |   Filter: tcat.myschema.users.id = Int64(3)                                                                                                                        |
-|               |     SubqueryAlias: tcat.myschema.users                                                                                                                             |
-|               |       TableScan: tcat.myschema.users projection=[id]                                                                                                               |
-| physical_plan | SchemaCastScanExec                                                                                                                                                 |
-|               |   CooperativeExec                                                                                                                                                  |
-|               |     BytesProcessedExec                                                                                                                                             |
-|               |       VirtualExecutionPlan name=flightsql compute_context=endpoint=[endpoint] base_sql=SELECT users.id FROM tcat.myschema.users AS users WHERE (users.id = 3) |
-|               |                                                                                                                                                                    |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+----------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                               |
++---------------+----------------------------------------------------------------------------------------------------+
+| logical_plan  | SubqueryAlias: tcat.myschema.users                                                                 |
+|               |   TableScan: tcat.myschema.users projection=[id], full_filters=[tcat.myschema.users.id = Int64(3)] |
+| physical_plan | CooperativeExec                                                                                    |
+|               |   BytesProcessedExec                                                                               |
+|               |     FlightSqlExec sql=SELECT id FROM tcat.myschema.users WHERE (("id" = 3))                        |
+|               |                                                                                                    |
++---------------+----------------------------------------------------------------------------------------------------+

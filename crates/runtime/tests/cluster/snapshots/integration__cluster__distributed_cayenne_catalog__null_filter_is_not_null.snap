@@ -1,21 +1,15 @@
 ---
 source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
 expression: __plan
-snapshot_kind: text
 ---
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                                                                                           |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Federated                                                                                                                                                                                                                      |
-|               |  Sort: ncat.ns.metrics.id ASC NULLS LAST                                                                                                                                                                                       |
-|               |   Projection: ncat.ns.metrics.id                                                                                                                                                                                               |
-|               |     Filter: ncat.ns.metrics.value IS NOT NULL                                                                                                                                                                                  |
-|               |       SubqueryAlias: ncat.ns.metrics                                                                                                                                                                                           |
-|               |         TableScan: ncat.ns.metrics projection=[id, value]                                                                                                                                                                      |
-| physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                                                            |
-|               |   SchemaCastScanExec                                                                                                                                                                                                           |
-|               |     CooperativeExec                                                                                                                                                                                                            |
-|               |       BytesProcessedExec                                                                                                                                                                                                       |
-|               |         VirtualExecutionPlan name=flightsql compute_context=endpoint=[endpoint] base_sql=SELECT "metrics".id FROM ncat.ns."metrics" AS "metrics" WHERE "metrics"."value" IS NOT NULL ORDER BY "metrics".id ASC NULLS LAST |
-|               |                                                                                                                                                                                                                                |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+---------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                          |
++---------------+---------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: ncat.ns.metrics.id ASC NULLS LAST                                                                       |
+|               |   SubqueryAlias: ncat.ns.metrics                                                                              |
+|               |     TableScan: ncat.ns.metrics projection=[id], full_filters=[ncat.ns.metrics.value IS NOT NULL]              |
+| physical_plan | CooperativeExec                                                                                               |
+|               |   BytesProcessedExec                                                                                          |
+|               |     FlightSqlExec sql=SELECT id FROM ncat.ns.metrics WHERE (("value" IS NOT NULL)) ORDER BY id ASC NULLS LAST |
+|               |                                                                                                               |
++---------------+---------------------------------------------------------------------------------------------------------------+

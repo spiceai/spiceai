@@ -1,19 +1,17 @@
 ---
 source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
 expression: __plan
-snapshot_kind: text
 ---
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                                                                                |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Federated                                                                                                                                                                                                           |
-|               |  Projection: tcat.myschema.users.id, CAST(tcat.myschema.users.name AS LargeUtf8) AS name, tcat.myschema.users.age                                                                                                   |
-|               |   Filter: tcat.myschema.users.id = Int64(1)                                                                                                                                                                         |
-|               |     SubqueryAlias: tcat.myschema.users                                                                                                                                                                              |
-|               |       TableScan: tcat.myschema.users projection=[id, name, age]                                                                                                                                                     |
-| physical_plan | SchemaCastScanExec                                                                                                                                                                                                  |
-|               |   CooperativeExec                                                                                                                                                                                                   |
-|               |     BytesProcessedExec                                                                                                                                                                                              |
-|               |       VirtualExecutionPlan name=flightsql compute_context=endpoint=[endpoint] base_sql=SELECT users.id, CAST(users."name" AS TEXT) AS "name", users.age FROM tcat.myschema.users AS users WHERE (users.id = 1) |
-|               |                                                                                                                                                                                                                     |
-+---------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                             |
++---------------+------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: tcat.myschema.users.id, CAST(tcat.myschema.users.name AS LargeUtf8) AS name, tcat.myschema.users.age |
+|               |   SubqueryAlias: tcat.myschema.users                                                                             |
+|               |     TableScan: tcat.myschema.users projection=[id, name, age], full_filters=[tcat.myschema.users.id = Int64(1)]  |
+| physical_plan | ProjectionExec: expr=[id@0 as id, CAST(name@1 AS LargeUtf8) as name, age@2 as age]                               |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                           |
+|               |     CooperativeExec                                                                                              |
+|               |       BytesProcessedExec                                                                                         |
+|               |         FlightSqlExec sql=SELECT id, name, age FROM tcat.myschema.users WHERE (("id" = 1))                       |
+|               |                                                                                                                  |
++---------------+------------------------------------------------------------------------------------------------------------------+

@@ -1,19 +1,15 @@
 ---
 source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
 expression: __plan
-snapshot_kind: text
 ---
-+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                                                                  |
-+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Federated                                                                                                                                                                                             |
-|               |  Sort: scat.finance.records.id ASC NULLS LAST                                                                                                                                                         |
-|               |   Projection: scat.finance.records.id, scat.finance.records.amount                                                                                                                                    |
-|               |     SubqueryAlias: scat.finance.records                                                                                                                                                               |
-|               |       TableScan: scat.finance.records projection=[id, amount]                                                                                                                                         |
-| physical_plan | SchemaCastScanExec                                                                                                                                                                                    |
-|               |   CooperativeExec                                                                                                                                                                                     |
-|               |     BytesProcessedExec                                                                                                                                                                                |
-|               |       VirtualExecutionPlan name=flightsql compute_context=endpoint=[endpoint] base_sql=SELECT records.id, records.amount FROM scat.finance.records AS records ORDER BY records.id ASC NULLS LAST |
-|               |                                                                                                                                                                                                       |
-+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+----------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                         |
++---------------+----------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: scat.finance.records.id ASC NULLS LAST                                                 |
+|               |   SubqueryAlias: scat.finance.records                                                        |
+|               |     TableScan: scat.finance.records projection=[id, amount]                                  |
+| physical_plan | CooperativeExec                                                                              |
+|               |   BytesProcessedExec                                                                         |
+|               |     FlightSqlExec sql=SELECT id, amount FROM scat.finance.records ORDER BY id ASC NULLS LAST |
+|               |                                                                                              |
++---------------+----------------------------------------------------------------------------------------------+
