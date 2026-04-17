@@ -689,7 +689,7 @@ async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)
 /// Sinks and how they are turned on:
 /// - **Prometheus scrape** (`registry` is `Some`): enabled by passing
 ///   `--metrics <addr>` on the command line. Also attaches the `spice_metrics`
-///   periodic reader that writes runtime metrics into DataFusion for the local
+///   periodic reader that writes runtime metrics into `DataFusion` for the local
 ///   task-history / observability tables.
 /// - **Cluster on-demand OTLP** (`metrics_reader` is `Some`): enabled when
 ///   spiced runs as a cluster executor. The reader lets a scheduler pull
