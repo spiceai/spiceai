@@ -39,28 +39,52 @@ pub fn deserialize_partition_by<'de, D>(deserializer: D) -> Result<Vec<Partition
 where
     D: Deserializer<'de>,
 {
+    use serde::de::Error;
+
     let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
 
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(values.len());
 
-    for value in values {
+    for (idx, value) in values.into_iter().enumerate() {
         match value {
             serde_json::Value::String(expression) => {
                 let name = format!("expr{i}", i = result.len());
-                let partitioned_by = PartitionedBy { name, expression };
-                result.push(partitioned_by);
+                result.push(PartitionedBy { name, expression });
             }
             serde_json::Value::Object(map) => {
-                // case where {"year": "YEAR(created_at)"}
-                for (name, v) in map {
-                    if let serde_json::Value::String(expression) = v {
-                        let partitioned_by = PartitionedBy { name, expression };
-                        result.push(partitioned_by);
-                        break; // take first string and ignore others
-                    }
+                // Accepts only a single-entry `{name: expression_string}` mapping.
+                if map.len() != 1 {
+                    return Err(D::Error::custom(format!(
+                        "partition_by[{idx}]: named partition must be a single-entry mapping \
+                         of `name: expression_string`, found {} entries",
+                        map.len()
+                    )));
                 }
+                // Safe: len == 1.
+                let (name, v) = map.into_iter().next().ok_or_else(|| {
+                    D::Error::custom(format!("partition_by[{idx}]: unexpected empty mapping"))
+                })?;
+                let serde_json::Value::String(expression) = v else {
+                    return Err(D::Error::custom(format!(
+                        "partition_by[{idx}]: named partition value for `{name}` must be a string expression"
+                    )));
+                };
+                result.push(PartitionedBy { name, expression });
             }
-            _ => {}
+            other => {
+                return Err(D::Error::custom(format!(
+                    "partition_by[{idx}]: expected a string expression or a single-entry \
+                     `{{name: expression}}` mapping, found {}",
+                    match other {
+                        serde_json::Value::Null => "null",
+                        serde_json::Value::Bool(_) => "bool",
+                        serde_json::Value::Number(_) => "number",
+                        serde_json::Value::Array(_) => "array",
+                        // String/Object handled above.
+                        _ => "unsupported value",
+                    }
+                )));
+            }
         }
     }
 
@@ -146,6 +170,52 @@ partition_by:
         assert_eq!(result.partition_by[2].name, "day");
         assert_eq!(result.partition_by[2].expression, "DAY(created_at)");
         Ok(())
+    }
+
+    #[test]
+    fn deserialize_partition_by_rejects_multi_entry_map() {
+        let yaml = r#"
+partition_by:
+  - year: "YEAR(created_at)"
+    month: "MONTH(created_at)"
+"#;
+        let err = from_str::<Test>(yaml)
+            .err()
+            .expect("multi-entry mapping must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("single-entry mapping"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn deserialize_partition_by_rejects_non_string_value() {
+        let yaml = r#"
+partition_by:
+  - year: 2024
+"#;
+        let err = from_str::<Test>(yaml)
+            .err()
+            .expect("non-string expression must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("must be a string expression"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn deserialize_partition_by_rejects_scalar_items() {
+        let yaml = r#"
+partition_by:
+  - 42
+"#;
+        let err = from_str::<Test>(yaml)
+            .err()
+            .expect("non-string, non-object item must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected a string expression"),
+            "unexpected error: {msg}"
+        );
     }
 
     /// Guards against regressions in the generated JSON schema for

@@ -161,3 +161,121 @@ fn main() {
 
     eprintln!("Schema written to {output_filename}");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Helper that wraps a set of `properties` into a minimal object schema so
+    /// tests can exercise `inject_into_object` directly.
+    fn object_with_properties(properties: Value) -> Map<String, Value> {
+        let mut obj = Map::new();
+        obj.insert("type".to_string(), Value::String("object".to_string()));
+        obj.insert("properties".to_string(), properties);
+        obj
+    }
+
+    #[test]
+    fn injects_alias_when_ref_matches() {
+        let mut obj = object_with_properties(json!({
+            "access": { "$ref": "#/$defs/AccessMode" }
+        }));
+
+        inject_into_object(&mut obj);
+
+        let props = obj
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("properties present");
+        assert_eq!(
+            props.get("mode").and_then(|v| v.get("$ref")).and_then(Value::as_str),
+            Some("#/$defs/AccessMode"),
+            "alias `mode` should be injected with the same $ref as `access`"
+        );
+        assert!(
+            props.contains_key("access"),
+            "canonical property must be preserved"
+        );
+    }
+
+    #[test]
+    fn does_not_inject_when_ref_mismatches() {
+        // A different `access` field (not pointing at AccessMode) must not be rewritten.
+        let mut obj = object_with_properties(json!({
+            "access": { "$ref": "#/$defs/SomeOtherType" }
+        }));
+
+        inject_into_object(&mut obj);
+
+        let props = obj.get("properties").and_then(Value::as_object).expect("properties");
+        assert!(
+            !props.contains_key("mode"),
+            "alias must not be injected when $ref does not match the configured target"
+        );
+    }
+
+    #[test]
+    fn does_not_overwrite_existing_alias() {
+        let mut obj = object_with_properties(json!({
+            "access": { "$ref": "#/$defs/AccessMode" },
+            "mode": { "type": "string", "description": "pre-existing" }
+        }));
+
+        inject_into_object(&mut obj);
+
+        let props = obj.get("properties").and_then(Value::as_object).expect("properties");
+        let mode = props.get("mode").expect("mode preserved");
+        assert_eq!(
+            mode.get("description").and_then(Value::as_str),
+            Some("pre-existing"),
+            "existing alias property must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn injects_recursively_into_nested_definitions() {
+        // Simulates a schema with `$defs` that contain object schemas needing aliases.
+        let mut root = Map::new();
+        root.insert(
+            "$defs".to_string(),
+            json!({
+                "CacheConfig": {
+                    "type": "object",
+                    "properties": {
+                        "caching_policy": { "$ref": "#/$defs/CachingPolicy" }
+                    }
+                }
+            }),
+        );
+
+        inject_into_object(&mut root);
+
+        let defs = root.get("$defs").and_then(Value::as_object).expect("$defs");
+        let cache = defs
+            .get("CacheConfig")
+            .and_then(Value::as_object)
+            .expect("CacheConfig");
+        let props = cache.get("properties").and_then(Value::as_object).expect("properties");
+        assert!(
+            props.contains_key("eviction_policy"),
+            "nested alias must be injected recursively"
+        );
+    }
+
+    #[test]
+    fn noop_when_canonical_missing() {
+        let mut obj = object_with_properties(json!({
+            "unrelated": { "type": "string" }
+        }));
+        let before = Value::Object(obj.clone());
+
+        inject_into_object(&mut obj);
+
+        assert_eq!(
+            Value::Object(obj),
+            before,
+            "schema without any matching canonical fields must be unchanged"
+        );
+    }
+}

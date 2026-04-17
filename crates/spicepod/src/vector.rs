@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     param::Params,
-    partitioning::{PartitionedBy, deserialize_partition_by},
+    partitioning::{PartitionedBy, deserialize_partition_by, serialize_partition_by},
 };
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -35,11 +35,15 @@ pub struct VectorStore {
 
     /// Partition expressions used to organize vector data.
     ///
-    /// Each item must be a plain expression string,
-    /// for example `"YEAR(created_at)"` or `"bucket(100, user_id)"`.
+    /// Each item accepts either:
+    /// - a plain expression string, for example `"YEAR(created_at)"` or
+    ///   `"bucket(100, user_id)"`; or
+    /// - a single-entry mapping of a partition name to an expression, for
+    ///   example `{ year: "YEAR(created_at)" }`.
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_partition_by",
         deserialize_with = "deserialize_partition_by"
     )]
     #[cfg_attr(
