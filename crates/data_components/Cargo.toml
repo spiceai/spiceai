@@ -72,6 +72,7 @@ object_store = { workspace = true }
 opendal.workspace = true
 oracle = { version = "0.6", optional = true }
 percent-encoding.workspace = true
+pgwire-replication = { workspace = true, optional = true }
 rand.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
@@ -152,6 +153,10 @@ postgres = [
     "dep:tokio-postgres",
     "datafusion-table-providers/postgres",
     "datafusion-table-providers/postgres-federation",
+]
+postgres-replication = [
+    "postgres",
+    "dep:pgwire-replication",
 ]
 s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
 scylladb = ["dep:scylla", "datafusion-table-providers/federation"]

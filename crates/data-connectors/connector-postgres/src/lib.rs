@@ -19,9 +19,10 @@ limitations under the License.
 //! This crate provides the `PostgreSQL` connector implementation, allowing
 //! Spice.ai to connect to `PostgreSQL` databases as data sources.
 //!
-//! This connector is extracted from the runtime crate to enable faster
-//! incremental builds - changes to this connector only require rebuilding
-//! this crate, not the entire runtime.
+//! With the `postgres-replication` feature (on by default) the connector also
+//! exposes a direct WAL-based `ChangesStream`, letting users set
+//! `acceleration.refresh_mode: changes` on a Postgres dataset and get
+//! change-by-change replication into the local accelerator without Debezium.
 
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
@@ -44,6 +45,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+#[cfg(feature = "postgres-replication")]
+mod replication;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to create Postgres connection pool: {source}"))]
@@ -53,6 +57,8 @@ pub enum Error {
 /// `PostgreSQL` data connector.
 pub struct Postgres {
     postgres_factory: PostgresTableFactory,
+    #[cfg(feature = "postgres-replication")]
+    params: runtime::parameters::Parameters,
 }
 
 impl std::fmt::Debug for Postgres {
@@ -92,6 +98,34 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("connection_pool_size")
         .description("The maximum number of connections created in the connection pool.")
         .default("5"),
+    // --- Logical replication (postgres-replication feature) ---
+    ParameterSpec::component("replication_slot").description(
+        "Name of the Postgres replication slot to create/reuse for this dataset. \
+         Defaults to `spice_<dataset>_<instance-hash>`. Each Spice replica MUST have \
+         its own unique slot.",
+    ),
+    ParameterSpec::component("publication").description(
+        "Name of the Postgres publication to create/reuse for this dataset. \
+         Defaults to `spice_<dataset>_pub`. Shared across replicas.",
+    ),
+    ParameterSpec::component("replication_initial_snapshot")
+        .description(
+            "Whether to COPY the table's existing rows on first connection, before \
+             streaming WAL changes. Default: true.",
+        )
+        .default("true"),
+    ParameterSpec::component("replication_temporary_slot")
+        .description(
+            "If true, create a temporary replication slot that is dropped when the \
+             Spice process disconnects. Default: false (durable slot).",
+        )
+        .default("false"),
+    ParameterSpec::component("replication_status_interval")
+        .description(
+            "How often to send StandbyStatusUpdate to Postgres (e.g. '10s'). \
+             Default: 10s.",
+        )
+        .default("10s"),
 ];
 
 impl DataConnectorFactory for PostgresFactory {
@@ -111,6 +145,9 @@ impl DataConnectorFactory for PostgresFactory {
                 SecretBox::from(format!("Spice.ai {}", env!("CARGO_PKG_VERSION"))),
             );
 
+            #[cfg(feature = "postgres-replication")]
+            let params_for_replication = params.parameters.clone();
+
             match PostgresConnectionPool::new(param_map).await {
                 Ok(pool) => {
                     let unsupported_type_action = params
@@ -119,7 +156,11 @@ impl DataConnectorFactory for PostgresFactory {
                     let pool = pool.with_unsupported_type_action(unsupported_type_action);
 
                     let postgres_factory = PostgresTableFactory::new(Arc::new(pool));
-                    Ok(Arc::new(Postgres { postgres_factory }) as Arc<dyn DataConnector>)
+                    Ok(Arc::new(Postgres {
+                        postgres_factory,
+                        #[cfg(feature = "postgres-replication")]
+                        params: params_for_replication,
+                    }) as Arc<dyn DataConnector>)
                 }
                 Err(e) => match e {
                     postgrespool::Error::InvalidUsernameOrPassword { .. } => Err(
@@ -265,6 +306,26 @@ impl DataConnector for Postgres {
                 })
             }
         }
+    }
+
+    #[cfg(feature = "postgres-replication")]
+    fn supports_changes_stream(&self) -> bool {
+        true
+    }
+
+    #[cfg(feature = "postgres-replication")]
+    fn changes_stream(
+        &self,
+        federated_table: Arc<runtime::federated_table::FederatedTable>,
+        dataset: &Dataset,
+        _accelerated_table_provider: Arc<dyn TableProvider>,
+        _accelerator_write_mutex: Arc<tokio::sync::Mutex<()>>,
+    ) -> Option<data_components::cdc::ChangesStream> {
+        Some(replication::build_changes_stream(
+            &self.params,
+            dataset,
+            federated_table,
+        ))
     }
 }
 

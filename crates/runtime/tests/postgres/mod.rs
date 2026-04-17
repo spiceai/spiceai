@@ -29,6 +29,8 @@ use datafusion_table_providers::{
 use crate::{init_tracing, utils::test_request_context};
 
 pub mod common;
+#[cfg(feature = "postgres-replication")]
+pub mod replication;
 
 #[tokio::test]
 async fn test_postgres_types() -> Result<(), anyhow::Error> {
