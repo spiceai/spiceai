@@ -900,6 +900,19 @@ fn warn_if_provided(
     }
 }
 
+/// Default number of comments fetched per pull request when the user does
+/// not override `github_max_comments_fetched`.
+///
+/// Lowered from the previous hard cap of 75 to 25 to keep the GitHub GraphQL
+/// node count well under the 500,000 node hard limit for queries that enable
+/// `include_comments` (each PR page multiplies this by up to 20 review threads).
+///
+/// See: <https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#node-limit>
+const DEFAULT_MAX_COMMENTS_FETCHED: u32 = 25;
+
+/// Hard upper bound on `github_max_comments_fetched`. Values above this cap
+/// are clamped to protect against GitHub secondary rate limits and the 500,000
+/// node hard limit on a single GraphQL query.
 const MAX_COMMENTS_FETCHED: u32 = 75;
 
 // Organization-level resources (2 segments: owner/resource_type)
@@ -1058,7 +1071,7 @@ impl DataConnector for Github {
 
         match (parsed.resource_type, parsed.repo) {
             ("pulls", Some(repo)) => {
-                let max_comments_fetched = match max_comments_fetched.unwrap_or(MAX_COMMENTS_FETCHED) {
+                let max_comments_fetched = match max_comments_fetched.unwrap_or(DEFAULT_MAX_COMMENTS_FETCHED) {
                     value if value > MAX_COMMENTS_FETCHED => {
                         tracing::warn!(
                             "Due to GitHub API rate limits, the number of comments fetched for {component} per pull request is limited to {MAX_COMMENTS_FETCHED}."
@@ -1072,10 +1085,21 @@ impl DataConnector for Github {
                     owner: parsed.owner.to_string(),
                     repo: repo.to_string(),
                     query_mode,
-                    component,
+                    component: component.clone(),
                     include_comments: include_comments.unwrap_or(PullRequestCommentType::None),
                     max_comments_fetched,
                 });
+
+                // Validate that the computed query stays under GitHub's 500K
+                // node hard limit before we bother opening a connection.
+                table_args.check_node_limit().map_err(|message| {
+                    DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: "github".to_string(),
+                        connector_component: component.clone(),
+                        message,
+                    }
+                })?;
+
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
