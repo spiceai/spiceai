@@ -328,17 +328,14 @@ fn flight_sql_table_provider(
     table: &TableReference,
     schema: SchemaRef,
 ) -> Arc<dyn TableProvider> {
-    // Arc::new(
-    Arc::new(
-        FlightSQLTable::create_with_schema(
-            "flightsql",
-            executor_id,
-            client,
-            table.clone(),
-            schema,
-            Arc::new(CookieStore::new()),
-        ), // .create_federated_table_provider(),
-    ) as Arc<dyn TableProvider>
+    Arc::new(FlightSQLTable::create_with_schema(
+        "flightsql",
+        executor_id,
+        client,
+        table.clone(),
+        schema,
+        Arc::new(CookieStore::new()),
+    )) as Arc<dyn TableProvider>
 }
 
 /// Shared logic for `get_partitions` across accelerated and federated partition providers.
