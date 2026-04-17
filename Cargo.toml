@@ -140,12 +140,12 @@ bigdecimal = "0.4.7"
 blake3 = "1.5"
 byte-unit = "5.1.4"
 bytes = "1.10.0"
-candle = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-core" }
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0" }
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-kernels" }
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-metal-kernels" }
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-nn" }
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-transformers" }
+candle = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988", package = "candle-core" } # branch: spiceai-0.10.1
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988" } # branch: spiceai-0.10.1
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988", package = "candle-kernels" } # branch: spiceai-0.10.1
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988", package = "candle-metal-kernels" } # branch: spiceai-0.10.1
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988", package = "candle-nn" } # branch: spiceai-0.10.1
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988", package = "candle-transformers" } # branch: spiceai-0.10.1
 charset = "0.1.5"
 chrono = "0.4.44"
 clap = { version = "4.5.60", features = ["derive", "env"] }
@@ -420,12 +420,12 @@ iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev 
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
 
-# Override candle-core v0.8.x to use matching cudarc version 0.12.2 to satisfy candle-cublaslt requirement
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0" }                                          # spiceai-0.8.4-cudarc-0.12
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-kernels" }           # spiceai-0.8.4-cudarc-0.12
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0" }                                 # spiceai-0.8.4-cudarc-0.12
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-nn" }                     # spiceai-0.8.4-cudarc-0.12
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "afd4f323122d63f86cf819ad3dffe0fa796155a0", package = "candle-transformers" } # spiceai-0.8.4-cudarc-0.12
+# Override candle crates to the lock-step 0.10.1 upgrade branch
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988" } # spiceai-0.10.1
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988", package = "candle-kernels" } # spiceai-0.10.1
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988" } # spiceai-0.10.1
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988", package = "candle-nn" } # spiceai-0.10.1
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988", package = "candle-transformers" } # spiceai-0.10.1
 
 # arrow-rs 57.2 with spice patches
 arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "96190c47f7a1ab90af53800a2c6c2ba4e0726f74" }        # spiceai-57.2
