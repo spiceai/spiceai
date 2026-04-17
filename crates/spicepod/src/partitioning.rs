@@ -26,16 +26,11 @@ pub struct PartitionedBy {
     pub expression: String,
 }
 
-/// Schema-only helper for `partition_by` item shapes used in generated JSON
-/// schema. Not used at runtime.
 #[cfg(feature = "schemars")]
 #[derive(JsonSchema)]
 #[serde(untagged)]
 pub enum PartitionedBySchema {
     Expression(String),
-    /// A single-entry mapping `{ name: expression }`. The deserializer only
-    /// accepts objects with exactly one entry, so constrain the schema to
-    /// `minProperties = 1` / `maxProperties = 1` to catch invalid configs.
     #[schemars(extend("minProperties" = 1, "maxProperties" = 1))]
     Named(std::collections::HashMap<String, String>),
 }
