@@ -540,7 +540,7 @@ pub async fn run(args: Args) -> Result<()> {
         .filter(|c| c.enabled);
 
     let needs_metrics =
-        prometheus_registry.is_some() || otel_config.is_some() || executor_metrics_reader.is_some();
+        prometheus_registry.is_some() || otel_config.is_some() || metrics_reader.is_some();
 
     if needs_metrics {
         // Resolve secrets in OTEL exporter headers before initializing metrics
