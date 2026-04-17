@@ -112,8 +112,11 @@ pub struct ModelSourceSchema {
 /// This function iterates over the distributed slice of data connector registrations
 /// and extracts the name, prefix, and parameters from each connector factory.
 ///
-/// Results are sorted by name and de-duplicated to keep the generated schema
-/// stable across builds (distributed-slice iteration order is not guaranteed).
+/// Results are sorted by `(name, prefix)` and de-duplicated by `name` to keep
+/// the generated schema stable across builds (distributed-slice iteration order
+/// is not guaranteed). Sorting on `(name, prefix)` ensures that when multiple
+/// registrations map to the same display name, the entry with the
+/// lexicographically-smallest prefix is retained deterministically.
 #[must_use]
 pub fn collect_data_connectors() -> Vec<ConnectorSchema> {
     let mut connectors: Vec<ConnectorSchema> = DATA_CONNECTOR_REGISTRATIONS
@@ -127,7 +130,7 @@ pub fn collect_data_connectors() -> Vec<ConnectorSchema> {
             }
         })
         .collect();
-    connectors.sort_by(|a, b| a.name.cmp(&b.name));
+    connectors.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.prefix.cmp(b.prefix)));
     connectors.dedup_by(|a, b| a.name == b.name);
     connectors
 }
@@ -139,8 +142,9 @@ pub fn collect_data_connectors() -> Vec<ConnectorSchema> {
 ///
 /// Multiple registrations can share the same engine name (e.g. `duckdb` and
 /// `partitioned_duckdb` both register under `duckdb`), so results are sorted by
-/// name and de-duplicated to keep the generated schema stable and free of
-/// duplicate engine entries.
+/// `(name, prefix)` and de-duplicated by `name`. Sorting by `prefix` as a
+/// secondary key makes the surviving entry deterministic across builds, since
+/// distributed-slice iteration order is not guaranteed.
 #[must_use]
 pub fn collect_data_accelerators() -> Vec<ConnectorSchema> {
     let mut accelerators: Vec<ConnectorSchema> = DATA_ACCELERATOR_REGISTRATIONS
@@ -155,7 +159,7 @@ pub fn collect_data_accelerators() -> Vec<ConnectorSchema> {
             }
         })
         .collect();
-    accelerators.sort_by(|a, b| a.name.cmp(&b.name));
+    accelerators.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.prefix.cmp(b.prefix)));
     accelerators.dedup_by(|a, b| a.name == b.name);
     accelerators
 }

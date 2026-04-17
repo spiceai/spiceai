@@ -55,8 +55,7 @@ where
                 // Accepts only a single-entry `{name: expression_string}` mapping.
                 if map.len() != 1 {
                     return Err(D::Error::custom(format!(
-                        "partition_by[{idx}]: named partition must be a single-entry mapping \
-                         of `name: expression_string`, found {} entries",
+                        "partition_by[{idx}]: named partition must be a single-entry mapping of `name: expression_string`, found {} entries",
                         map.len()
                     )));
                 }
@@ -72,17 +71,16 @@ where
                 result.push(PartitionedBy { name, expression });
             }
             other => {
+                let kind = match other {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::Array(_) => "array",
+                    // String/Object handled above.
+                    _ => "unsupported value",
+                };
                 return Err(D::Error::custom(format!(
-                    "partition_by[{idx}]: expected a string expression or a single-entry \
-                     `{{name: expression}}` mapping, found {}",
-                    match other {
-                        serde_json::Value::Null => "null",
-                        serde_json::Value::Bool(_) => "bool",
-                        serde_json::Value::Number(_) => "number",
-                        serde_json::Value::Array(_) => "array",
-                        // String/Object handled above.
-                        _ => "unsupported value",
-                    }
+                    "partition_by[{idx}]: expected a string expression or a single-entry `{{name: expression}}` mapping, found {kind}"
                 )));
             }
         }
