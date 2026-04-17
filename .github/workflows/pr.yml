@@ -244,7 +244,7 @@ jobs:
           AWS_S3_USERNAME: ${{ secrets.AWS_S3_USERNAME }}
           AWS_S3_PASSWORD: ${{ secrets.AWS_S3_PASSWORD }}
           AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
           INSTA_UPDATE: ${{ github.event.inputs.update_snapshots || 'no' }}
 
