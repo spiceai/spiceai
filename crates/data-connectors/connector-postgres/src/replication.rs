@@ -83,6 +83,18 @@ pub fn build_changes_stream(
             declared_pks
         };
 
+        // refresh_mode: changes is useless without a PK — DELETE and UPDATE
+        // require one to route the change to a row. Fail fast with a clear
+        // message instead of erroring cryptically later in the refresh loop.
+        if primary_keys.is_empty() {
+            Err(StreamError::External(format!(
+                "postgres replication for dataset `{dataset_name}`: no primary key available. \
+                 Set `acceleration.primary_key` on the dataset (and a matching \
+                 `acceleration.on_conflict` entry) — `refresh_mode: changes` cannot route \
+                 UPDATE/DELETE events without one."
+            )))?;
+        }
+
         let input = ReplicationStreamInput {
             dataset_name: dataset_name.clone(),
             params: params_for_stream,

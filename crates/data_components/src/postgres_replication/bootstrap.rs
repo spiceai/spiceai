@@ -17,8 +17,11 @@ limitations under the License.
 //! Initial-snapshot loader.
 //!
 //! Emits `ChangeBatch`es with op="c" for every row of the source table, using a
-//! `REPEATABLE READ` transaction so the result is consistent relative to the
-//! slot's creation LSN. The last envelope flips `is_dataset_ready=true`.
+//! `REPEATABLE READ` transaction to provide a stable view for the snapshot
+//! scan. This does NOT imply exported-snapshot or slot-creation-LSN-consistent
+//! semantics across the snapshot/WAL boundary — see the module-level doc
+//! comment on [`super::start_replication_stream`]. The last envelope flips
+//! `is_dataset_ready=true`.
 
 use std::sync::{Arc, atomic::AtomicU64};
 
@@ -216,8 +219,11 @@ pub async fn snapshot_stream(
                 .map_err(super::err_to_stream)?;
             yield envelope_with_lsn(batch, Arc::clone(&confirmed_flush), 0, true);
         }
-        metrics.mark_bootstrap_complete();
 
+        // Wait for a successful COMMIT before marking bootstrap complete —
+        // if the commit fails (network drop, server restart), we don't want
+        // the `replication_bootstrap_complete` metric to flip, because it's
+        // watched as a readiness signal.
         client
             .simple_query("COMMIT")
             .await
@@ -225,6 +231,8 @@ pub async fn snapshot_stream(
             .map_err(super::err_to_stream)?;
         drop(client);
         let _ = conn_task.await;
+
+        metrics.mark_bootstrap_complete();
 
         tracing::info!(
             dataset = %dataset_name,

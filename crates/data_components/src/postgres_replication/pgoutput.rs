@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Decoder for the `pgoutput` logical replication protocol (Postgres 15+).
+//! Decoder for the `pgoutput` logical replication protocol (Postgres 10+).
 //!
 //! We implement the binary wire format directly since `pgwire-replication`
 //! only delivers raw `XLogData` bytes — it doesn't interpret pgoutput itself.

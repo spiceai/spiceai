@@ -75,11 +75,34 @@ impl SslMode {
     }
 }
 
+/// Postgres identifiers have a 63-byte cap (NAMEDATALEN - 1). We budget:
+///
+///   - 6 bytes `spice_`
+///   - up to `SLOT_DATASET_PORTION_MAX` / `PUB_DATASET_PORTION_MAX` of
+///     sanitized dataset name
+///   - 1 byte `_`
+///   - fixed 8-byte hash (slot) OR 3 bytes `pub` (publication)
+///
+/// which keeps the final identifier under the limit.
+const PG_IDENTIFIER_MAX_BYTES: usize = 63;
+const SLOT_PREFIX: &str = "spice_";
+const SLOT_HASH_LEN: usize = 8;
+/// Max sanitized-dataset bytes for a slot name: 63 − (6 + 1 + 8) = 48.
+const SLOT_DATASET_PORTION_MAX: usize =
+    PG_IDENTIFIER_MAX_BYTES - SLOT_PREFIX.len() - 1 - SLOT_HASH_LEN;
+/// Max sanitized-dataset bytes for a publication name: 63 − (6 + 1 + 3) = 53.
+const PUB_DATASET_PORTION_MAX: usize = PG_IDENTIFIER_MAX_BYTES - SLOT_PREFIX.len() - 1 - 3;
+
 /// Build a default slot name: `spice_{sanitized_dataset}_{instance_suffix}`.
 ///
 /// `instance_suffix` is an 8-char blake3-ish hash (actually `twox-hash` xxh3 for
 /// zero-dep reuse) of `SPICE_INSTANCE_ID` falling back to the machine hostname,
 /// so each replica gets a distinct, deterministic slot across restarts.
+///
+/// The sanitized dataset portion is truncated to keep the final identifier
+/// within Postgres' 63-byte limit. Truncation is collision-resistant in
+/// practice because the 8-char instance hash tail disambiguates replicas, but
+/// if you need exact names across replicas, set `pg_replication_slot` explicitly.
 #[must_use]
 pub fn default_slot_name(dataset_name: &str) -> String {
     let instance = std::env::var("SPICE_INSTANCE_ID")
@@ -87,13 +110,27 @@ pub fn default_slot_name(dataset_name: &str) -> String {
         .or_else(|| hostname::get().ok().and_then(|h| h.into_string().ok()))
         .unwrap_or_else(|| "unknown".to_string());
     let hash = xxh3_short_hash(&instance);
-    format!("spice_{}_{hash}", sanitize(dataset_name))
+    let dataset = truncate_to_bytes(&sanitize(dataset_name), SLOT_DATASET_PORTION_MAX);
+    format!("{SLOT_PREFIX}{dataset}_{hash}")
 }
 
 /// Default publication is shared across replicas: `spice_{dataset}_pub`.
+///
+/// Same truncation rules as [`default_slot_name`].
 #[must_use]
 pub fn default_publication_name(dataset_name: &str) -> String {
-    format!("spice_{}_pub", sanitize(dataset_name))
+    let dataset = truncate_to_bytes(&sanitize(dataset_name), PUB_DATASET_PORTION_MAX);
+    format!("{SLOT_PREFIX}{dataset}_pub")
+}
+
+/// Truncate an ASCII identifier to at most `max_bytes` bytes. Our `sanitize`
+/// output is pure ASCII so byte-truncation = char-truncation; safe.
+fn truncate_to_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        s.to_string()
+    } else {
+        s[..max_bytes].to_string()
+    }
 }
 
 /// Postgres identifiers must match `[a-z_][a-z0-9_]*` to avoid quoting.
@@ -189,5 +226,33 @@ mod tests {
             default_publication_name("public.orders"),
             "spice_public_orders_pub"
         );
+    }
+
+    #[test]
+    fn slot_name_is_truncated_to_postgres_limit() {
+        // 120-char dataset name → slot must still be ≤ 63 bytes.
+        let long = "a".repeat(120);
+        let slot = default_slot_name(&long);
+        assert!(
+            slot.len() <= PG_IDENTIFIER_MAX_BYTES,
+            "slot `{slot}` exceeds {PG_IDENTIFIER_MAX_BYTES} bytes: {}",
+            slot.len()
+        );
+        assert!(slot.starts_with(SLOT_PREFIX));
+        // Must still end in the instance hash (8 hex chars after final `_`).
+        let hash_part = slot.rsplit_once('_').expect("format has _").1;
+        assert_eq!(hash_part.len(), SLOT_HASH_LEN);
+    }
+
+    #[test]
+    fn publication_name_is_truncated_to_postgres_limit() {
+        let long = "b".repeat(120);
+        let pubname = default_publication_name(&long);
+        assert!(
+            pubname.len() <= PG_IDENTIFIER_MAX_BYTES,
+            "publication `{pubname}` exceeds {PG_IDENTIFIER_MAX_BYTES} bytes"
+        );
+        assert!(pubname.starts_with(SLOT_PREFIX));
+        assert!(pubname.ends_with("_pub"));
     }
 }
