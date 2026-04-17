@@ -1072,3 +1072,826 @@ async fn test_distributed_cayenne_null_handling_and_aggregations() -> Result<(),
         })
         .await
 }
+
+// =============================================================================
+// Test: Basic MERGE in cluster mode — scheduler forwards to executors
+// =============================================================================
+//
+// MERGE in cluster mode goes through `DistributedCayenneMergeExec`, which
+// forwards the original MERGE SQL verbatim to every executor via FlightSQL.
+// This is a separate codepath from the single-node path in
+// `cayenne_catalog_ddl/mod.rs`.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_distributed_cayenne_merge_basic() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let temp_dir = tempfile::tempdir()?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+
+            let catalog = make_cayenne_catalog(
+                "mcat",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let scheduler_app = AppBuilder::new("distributed_cayenne_merge_basic")
+                .with_catalog(catalog.clone())
+                .build();
+            let executor_app = AppBuilder::new("executor_merge_basic")
+                .with_catalog(catalog)
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(scheduler_app)
+                .executor_with_app(executor_app)
+                .start()
+                .await?;
+
+            run_with_harness(harness, |harness| {
+                Box::pin(async move {
+                    harness.wait_for_executors(Duration::from_secs(15)).await?;
+
+                    harness.query("CREATE SCHEMA mcat.s").await?;
+
+                    harness
+                        .query(
+                            "CREATE TABLE mcat.s.inventory (
+                                id BIGINT NOT NULL,
+                                name VARCHAR NOT NULL,
+                                qty BIGINT NOT NULL
+                            ) PARTITION BY id",
+                        )
+                        .await?;
+
+                    harness
+                        .query(
+                            "CREATE TABLE mcat.s.updates (
+                                id BIGINT NOT NULL,
+                                name VARCHAR NOT NULL,
+                                qty BIGINT NOT NULL
+                            ) PARTITION BY id",
+                        )
+                        .await?;
+
+                    harness
+                        .query(
+                            "INSERT INTO mcat.s.inventory VALUES
+                                (1, 'apple',  10),
+                                (2, 'banana', 20),
+                                (3, 'cherry', 30)",
+                        )
+                        .await?;
+
+                    harness
+                        .query(
+                            "INSERT INTO mcat.s.updates VALUES
+                                (1, 'apple',  50),
+                                (3, 'cherry', 100)",
+                        )
+                        .await?;
+
+                    wait_for_row_count(harness, "mcat.s.inventory", 3, Duration::from_secs(30))
+                        .await?;
+                    wait_for_row_count(harness, "mcat.s.updates", 2, Duration::from_secs(30))
+                        .await?;
+
+                    // Basic MERGE — update qty from source.
+                    harness
+                        .query(
+                            "MERGE INTO mcat.s.inventory AS t
+                             USING mcat.s.updates AS s
+                             ON t.id = s.id
+                             WHEN MATCHED THEN UPDATE SET qty = s.qty",
+                        )
+                        .await?;
+
+                    let select_after_merge =
+                        "SELECT id, name, qty FROM mcat.s.inventory ORDER BY id";
+                    let batches = harness.query(select_after_merge).await?;
+                    assert_batches_eq!(
+                        &[
+                            "+----+--------+-----+",
+                            "| id | name   | qty |",
+                            "+----+--------+-----+",
+                            "| 1  | apple  | 50  |",
+                            "| 2  | banana | 20  |",
+                            "| 3  | cherry | 100 |",
+                            "+----+--------+-----+",
+                        ],
+                        &batches
+                    );
+                    let plan = explain_to_string(&harness.explain(select_after_merge).await?);
+                    insta::assert_snapshot!("merge_basic_after", plan);
+
+                    // Row count unchanged.
+                    let count = scalar_i64(
+                        &harness
+                            .query("SELECT COUNT(*) FROM mcat.s.inventory")
+                            .await?,
+                    )?;
+                    assert_eq!(count, 3, "MERGE should not add or drop rows");
+
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .await
+}
+
+// =============================================================================
+// Test: MERGE with composite ON key — no cross-product in distributed mode
+// =============================================================================
+//
+// Regression test for the tuple-aware deletion issue (see the single-node
+// variant `cayenne_catalog_merge_composite_key_no_cross_product` at
+// `cayenne_catalog_ddl/mod.rs:1593`). With two composite key columns
+// (region, sku), if the matched rows are (US,A) and (EU,B), an independent
+// IN-list approach would corrupt (US,B) and (EU,A). The distributed path
+// must preserve unmatched rows the same way.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_distributed_cayenne_merge_composite_key_no_cross_product() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let temp_dir = tempfile::tempdir()?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+
+            let catalog = make_cayenne_catalog(
+                "mxp",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let scheduler_app = AppBuilder::new("distributed_cayenne_merge_xprod")
+                .with_catalog(catalog.clone())
+                .build();
+            let executor_app = AppBuilder::new("executor_merge_xprod")
+                .with_catalog(catalog)
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(scheduler_app)
+                .executor_with_app(executor_app)
+                .start()
+                .await?;
+
+            run_with_harness(harness, |harness| {
+                Box::pin(async move {
+                    harness.wait_for_executors(Duration::from_secs(15)).await?;
+
+                    harness.query("CREATE SCHEMA mxp.s").await?;
+
+                    harness
+                        .query(
+                            "CREATE TABLE mxp.s.inventory (
+                            region VARCHAR NOT NULL,
+                            sku VARCHAR NOT NULL,
+                            qty BIGINT NOT NULL
+                        ) PARTITION BY region",
+                        )
+                        .await?;
+
+                    harness
+                        .query(
+                            "CREATE TABLE mxp.s.updates (
+                            region VARCHAR NOT NULL,
+                            sku VARCHAR NOT NULL,
+                            qty BIGINT NOT NULL
+                        ) PARTITION BY region",
+                        )
+                        .await?;
+
+                    // All 4 (region,sku) combinations exist in target.
+                    harness
+                        .query(
+                            "INSERT INTO mxp.s.inventory VALUES
+                            ('US', 'A', 10),
+                            ('US', 'B', 20),
+                            ('EU', 'A', 30),
+                            ('EU', 'B', 40)",
+                        )
+                        .await?;
+
+                    // Source only updates the diagonal (US,A) and (EU,B).
+                    harness
+                        .query(
+                            "INSERT INTO mxp.s.updates VALUES
+                            ('US', 'A', 99),
+                            ('EU', 'B', 88)",
+                        )
+                        .await?;
+
+                    wait_for_row_count(harness, "mxp.s.inventory", 4, Duration::from_secs(30))
+                        .await?;
+                    wait_for_row_count(harness, "mxp.s.updates", 2, Duration::from_secs(30))
+                        .await?;
+
+                    harness
+                        .query(
+                            "MERGE INTO mxp.s.inventory AS t
+                         USING mxp.s.updates AS s
+                         ON t.region = s.region AND t.sku = s.sku
+                         WHEN MATCHED THEN UPDATE SET qty = s.qty",
+                        )
+                        .await?;
+
+                    let select_after =
+                        "SELECT region, sku, qty FROM mxp.s.inventory ORDER BY region, sku";
+                    let batches = harness.query(select_after).await?;
+
+                    // Only (US,A) and (EU,B) change; (US,B) and (EU,A) must be unchanged.
+                    assert_batches_eq!(
+                        &[
+                            "+--------+-----+-----+",
+                            "| region | sku | qty |",
+                            "+--------+-----+-----+",
+                            "| EU     | A   | 30  |",
+                            "| EU     | B   | 88  |",
+                            "| US     | A   | 99  |",
+                            "| US     | B   | 20  |",
+                            "+--------+-----+-----+",
+                        ],
+                        &batches
+                    );
+                    let plan = explain_to_string(&harness.explain(select_after).await?);
+                    insta::assert_snapshot!("merge_composite_no_cross_product_after", plan);
+
+                    let count = scalar_i64(
+                        &harness
+                            .query("SELECT COUNT(*) FROM mxp.s.inventory")
+                            .await?,
+                    )?;
+                    assert_eq!(count, 4, "no rows may be lost after composite-key MERGE");
+
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .await
+}
+
+// =============================================================================
+// Test: MERGE with zero matches in cluster mode — target unchanged
+// =============================================================================
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_distributed_cayenne_merge_zero_match() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let temp_dir = tempfile::tempdir()?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+
+            let catalog = make_cayenne_catalog(
+                "mzm",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let scheduler_app = AppBuilder::new("distributed_cayenne_merge_zero")
+                .with_catalog(catalog.clone())
+                .build();
+            let executor_app = AppBuilder::new("executor_merge_zero")
+                .with_catalog(catalog)
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(scheduler_app)
+                .executor_with_app(executor_app)
+                .start()
+                .await?;
+
+            run_with_harness(harness, |harness| {
+                Box::pin(async move {
+                    harness.wait_for_executors(Duration::from_secs(15)).await?;
+
+                    harness.query("CREATE SCHEMA mzm.s").await?;
+
+                    harness
+                        .query(
+                            "CREATE TABLE mzm.s.target (
+                                id BIGINT NOT NULL,
+                                val BIGINT NOT NULL
+                            ) PARTITION BY id",
+                        )
+                        .await?;
+
+                    harness
+                        .query(
+                            "CREATE TABLE mzm.s.source (
+                                id BIGINT NOT NULL,
+                                val BIGINT NOT NULL
+                            ) PARTITION BY id",
+                        )
+                        .await?;
+
+                    harness
+                        .query("INSERT INTO mzm.s.target VALUES (1, 10), (2, 20), (3, 30)")
+                        .await?;
+
+                    // Source has no IDs matching target — MERGE must be a no-op.
+                    harness
+                        .query("INSERT INTO mzm.s.source VALUES (99, 999)")
+                        .await?;
+
+                    wait_for_row_count(harness, "mzm.s.target", 3, Duration::from_secs(30)).await?;
+                    wait_for_row_count(harness, "mzm.s.source", 1, Duration::from_secs(30)).await?;
+
+                    harness
+                        .query(
+                            "MERGE INTO mzm.s.target AS t
+                             USING mzm.s.source AS s
+                             ON t.id = s.id
+                             WHEN MATCHED THEN UPDATE SET val = s.val",
+                        )
+                        .await?;
+
+                    let batches = harness
+                        .query("SELECT id, val FROM mzm.s.target ORDER BY id")
+                        .await?;
+                    assert_batches_eq!(
+                        &[
+                            "+----+-----+",
+                            "| id | val |",
+                            "+----+-----+",
+                            "| 1  | 10  |",
+                            "| 2  | 20  |",
+                            "| 3  | 30  |",
+                            "+----+-----+",
+                        ],
+                        &batches
+                    );
+
+                    let count =
+                        scalar_i64(&harness.query("SELECT COUNT(*) FROM mzm.s.target").await?)?;
+                    assert_eq!(count, 3, "zero-match MERGE must preserve row count");
+
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .await
+}
+
+// =============================================================================
+// Test: MERGE with duplicate source keys — error, target unchanged
+// =============================================================================
+//
+// If the source has multiple rows matching the same target row, MERGE must
+// error without losing data. Distributed variant of the single-node
+// `cayenne_catalog_merge_duplicate_source_keys_rejected` test.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_distributed_cayenne_merge_duplicate_source_keys_rejected() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let temp_dir = tempfile::tempdir()?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+
+            let catalog = make_cayenne_catalog(
+                "mdk",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let scheduler_app = AppBuilder::new("distributed_cayenne_merge_dupkey")
+                .with_catalog(catalog.clone())
+                .build();
+            let executor_app = AppBuilder::new("executor_merge_dupkey")
+                .with_catalog(catalog)
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(scheduler_app)
+                .executor_with_app(executor_app)
+                .start()
+                .await?;
+
+            run_with_harness(harness, |harness| Box::pin(async move {
+                harness.wait_for_executors(Duration::from_secs(15)).await?;
+
+                harness.query("CREATE SCHEMA mdk.s").await?;
+
+                harness
+                    .query(
+                        "CREATE TABLE mdk.s.target (
+                            id BIGINT NOT NULL,
+                            val BIGINT NOT NULL
+                        ) PARTITION BY id",
+                    )
+                    .await?;
+
+                harness
+                    .query(
+                        "CREATE TABLE mdk.s.source (
+                            id BIGINT NOT NULL,
+                            val BIGINT NOT NULL
+                        ) PARTITION BY id",
+                    )
+                    .await?;
+
+                harness
+                    .query("INSERT INTO mdk.s.target VALUES (1, 100)")
+                    .await?;
+
+                harness
+                    .query("INSERT INTO mdk.s.source VALUES (1, 200), (1, 300)")
+                    .await?;
+
+                wait_for_row_count(harness, "mdk.s.target", 1, Duration::from_secs(30)).await?;
+                wait_for_row_count(harness, "mdk.s.source", 2, Duration::from_secs(30)).await?;
+
+                let merge_result = harness
+                    .query(
+                        "MERGE INTO mdk.s.target AS t
+                         USING mdk.s.source AS s
+                         ON t.id = s.id
+                         WHEN MATCHED THEN UPDATE SET val = s.val",
+                    )
+                    .await;
+                assert!(
+                    merge_result.is_err(),
+                    "distributed MERGE with duplicate source keys must error; got: {merge_result:?}"
+                );
+
+                // Target row preserved after failed MERGE.
+                let count =
+                    scalar_i64(&harness.query("SELECT COUNT(*) FROM mdk.s.target").await?)?;
+                assert_eq!(count, 1, "target must still have 1 row after failed MERGE");
+
+                let batches = harness
+                    .query("SELECT id, val FROM mdk.s.target")
+                    .await?;
+                assert_batches_eq!(
+                    &[
+                        "+----+-----+",
+                        "| id | val |",
+                        "+----+-----+",
+                        "| 1  | 100 |",
+                        "+----+-----+",
+                    ],
+                    &batches
+                );
+
+                Ok(())
+            }))
+            .await
+        })
+        .await
+}
+
+// =============================================================================
+// Test: DML on a string-partitioned table in cluster mode
+// =============================================================================
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_distributed_cayenne_string_partition_dml() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let temp_dir = tempfile::tempdir()?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+
+            let catalog = make_cayenne_catalog(
+                "sp",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let scheduler_app = AppBuilder::new("distributed_cayenne_string_partition")
+                .with_catalog(catalog.clone())
+                .build();
+            let executor_app = AppBuilder::new("executor_string_partition")
+                .with_catalog(catalog)
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(scheduler_app)
+                .executor_with_app(executor_app)
+                .start()
+                .await?;
+
+            run_with_harness(harness, |harness| {
+                Box::pin(async move {
+                    harness.wait_for_executors(Duration::from_secs(15)).await?;
+
+                    harness.query("CREATE SCHEMA sp.s").await?;
+
+                    harness
+                        .query(
+                            "CREATE TABLE sp.s.events (
+                                region VARCHAR NOT NULL,
+                                id BIGINT NOT NULL,
+                                payload VARCHAR
+                            ) PARTITION BY region",
+                        )
+                        .await?;
+
+                    harness
+                        .query(
+                            "INSERT INTO sp.s.events VALUES
+                                ('US',   1, 'a'),
+                                ('US',   2, 'b'),
+                                ('EU',   3, 'c'),
+                                ('EU',   4, 'd'),
+                                ('APAC', 5, 'e')",
+                        )
+                        .await?;
+
+                    wait_for_row_count(harness, "sp.s.events", 5, Duration::from_secs(30)).await?;
+
+                    // UPDATE using the partition column in the filter.
+                    harness
+                        .query("UPDATE sp.s.events SET payload = 'X' WHERE region = 'US'")
+                        .await?;
+
+                    let select_all =
+                        "SELECT region, id, payload FROM sp.s.events ORDER BY region, id";
+                    let batches = harness.query(select_all).await?;
+                    assert_batches_eq!(
+                        &[
+                            "+--------+----+---------+",
+                            "| region | id | payload |",
+                            "+--------+----+---------+",
+                            "| APAC   | 5  | e       |",
+                            "| EU     | 3  | c       |",
+                            "| EU     | 4  | d       |",
+                            "| US     | 1  | X       |",
+                            "| US     | 2  | X       |",
+                            "+--------+----+---------+",
+                        ],
+                        &batches
+                    );
+                    let plan = explain_to_string(&harness.explain(select_all).await?);
+                    insta::assert_snapshot!("string_partition_after_update", plan);
+
+                    // DELETE an entire partition.
+                    harness
+                        .query("DELETE FROM sp.s.events WHERE region = 'EU'")
+                        .await?;
+
+                    let count =
+                        scalar_i64(&harness.query("SELECT COUNT(*) FROM sp.s.events").await?)?;
+                    assert_eq!(count, 3, "expected 3 rows after dropping EU partition");
+
+                    let batches = harness
+                        .query("SELECT region, id FROM sp.s.events ORDER BY region, id")
+                        .await?;
+                    assert_batches_eq!(
+                        &[
+                            "+--------+----+",
+                            "| region | id |",
+                            "+--------+----+",
+                            "| APAC   | 5  |",
+                            "| US     | 1  |",
+                            "| US     | 2  |",
+                            "+--------+----+",
+                        ],
+                        &batches
+                    );
+
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .await
+}
+
+// =============================================================================
+// Test: UPDATE/DELETE without WHERE in cluster mode
+// =============================================================================
+//
+// Distributed counterpart of `cayenne_catalog_ddl_dml_no_where`.
+// The table must have a PRIMARY KEY: the position-based deletion path doesn't
+// yet support no-predicate delete-all on PK-less Cayenne tables.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_distributed_cayenne_dml_no_where() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let temp_dir = tempfile::tempdir()?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+
+            let catalog = make_cayenne_catalog(
+                "nwd",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let scheduler_app = AppBuilder::new("distributed_cayenne_dml_no_where")
+                .with_catalog(catalog.clone())
+                .build();
+            let executor_app = AppBuilder::new("executor_dml_no_where")
+                .with_catalog(catalog)
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(scheduler_app)
+                .executor_with_app(executor_app)
+                .start()
+                .await?;
+
+            run_with_harness(harness, |harness| {
+                Box::pin(async move {
+                    harness.wait_for_executors(Duration::from_secs(15)).await?;
+
+                    harness.query("CREATE SCHEMA nwd.s").await?;
+                    harness
+                        .query(
+                            "CREATE TABLE nwd.s.t (
+                                id BIGINT NOT NULL,
+                                v BIGINT NOT NULL,
+                                PRIMARY KEY (id)
+                            ) PARTITION BY id",
+                        )
+                        .await?;
+
+                    harness
+                        .query("INSERT INTO nwd.s.t VALUES (1, 10), (2, 20), (3, 30)")
+                        .await?;
+                    wait_for_row_count(harness, "nwd.s.t", 3, Duration::from_secs(30)).await?;
+
+                    // UPDATE with no WHERE — touches every row.
+                    harness.query("UPDATE nwd.s.t SET v = 99").await?;
+
+                    let select_all = "SELECT id, v FROM nwd.s.t ORDER BY id";
+                    let batches = harness.query(select_all).await?;
+                    assert_batches_eq!(
+                        &[
+                            "+----+----+",
+                            "| id | v  |",
+                            "+----+----+",
+                            "| 1  | 99 |",
+                            "| 2  | 99 |",
+                            "| 3  | 99 |",
+                            "+----+----+",
+                        ],
+                        &batches
+                    );
+                    let plan = explain_to_string(&harness.explain(select_all).await?);
+                    insta::assert_snapshot!("dml_no_where_after_update", plan);
+
+                    // DELETE with no WHERE — empties the table.
+                    harness.query("DELETE FROM nwd.s.t").await?;
+                    let count = scalar_i64(&harness.query("SELECT COUNT(*) FROM nwd.s.t").await?)?;
+                    assert_eq!(count, 0, "DELETE FROM t (no WHERE) must empty the table");
+
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .await
+}
+
+// =============================================================================
+// Test: UPDATE/DELETE filter on non-partition column in cluster mode
+// =============================================================================
+//
+// Distributed counterpart of `cayenne_catalog_ddl_dml_non_partition_filter`.
+// Table is `PARTITION BY region`; the DML filter is on `sku`, which forces the
+// scheduler to forward the predicate to every partition/executor.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_distributed_cayenne_dml_non_partition_filter() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let temp_dir = tempfile::tempdir()?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+
+            let catalog = make_cayenne_catalog(
+                "npf",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let scheduler_app = AppBuilder::new("distributed_cayenne_dml_non_partition_filter")
+                .with_catalog(catalog.clone())
+                .build();
+            let executor_app = AppBuilder::new("executor_dml_non_partition_filter")
+                .with_catalog(catalog)
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(scheduler_app)
+                .executor_with_app(executor_app)
+                .start()
+                .await?;
+
+            run_with_harness(harness, |harness| {
+                Box::pin(async move {
+                    harness.wait_for_executors(Duration::from_secs(15)).await?;
+
+                    harness.query("CREATE SCHEMA npf.s").await?;
+                    harness
+                        .query(
+                            "CREATE TABLE npf.s.inv (
+                                region VARCHAR NOT NULL,
+                                sku VARCHAR NOT NULL,
+                                qty BIGINT NOT NULL
+                            ) PARTITION BY region",
+                        )
+                        .await?;
+
+                    harness
+                        .query(
+                            "INSERT INTO npf.s.inv VALUES
+                                ('US', 'A', 10),
+                                ('US', 'B', 20),
+                                ('EU', 'A', 30),
+                                ('EU', 'B', 40)",
+                        )
+                        .await?;
+                    wait_for_row_count(harness, "npf.s.inv", 4, Duration::from_secs(30)).await?;
+
+                    // UPDATE filtered on non-partition column `sku`.
+                    harness
+                        .query("UPDATE npf.s.inv SET qty = qty + 1 WHERE sku = 'A'")
+                        .await?;
+
+                    let select_after_update =
+                        "SELECT region, sku, qty FROM npf.s.inv ORDER BY region, sku";
+                    let batches = harness.query(select_after_update).await?;
+                    assert_batches_eq!(
+                        &[
+                            "+--------+-----+-----+",
+                            "| region | sku | qty |",
+                            "+--------+-----+-----+",
+                            "| EU     | A   | 31  |",
+                            "| EU     | B   | 40  |",
+                            "| US     | A   | 11  |",
+                            "| US     | B   | 20  |",
+                            "+--------+-----+-----+",
+                        ],
+                        &batches
+                    );
+                    let plan = explain_to_string(&harness.explain(select_after_update).await?);
+                    insta::assert_snapshot!("dml_non_partition_filter_after_update", plan);
+
+                    // DELETE filtered on non-partition column `sku`.
+                    harness
+                        .query("DELETE FROM npf.s.inv WHERE sku = 'B'")
+                        .await?;
+
+                    let batches = harness
+                        .query("SELECT region, sku, qty FROM npf.s.inv ORDER BY region, sku")
+                        .await?;
+                    assert_batches_eq!(
+                        &[
+                            "+--------+-----+-----+",
+                            "| region | sku | qty |",
+                            "+--------+-----+-----+",
+                            "| EU     | A   | 31  |",
+                            "| US     | A   | 11  |",
+                            "+--------+-----+-----+",
+                        ],
+                        &batches
+                    );
+
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .await
+}

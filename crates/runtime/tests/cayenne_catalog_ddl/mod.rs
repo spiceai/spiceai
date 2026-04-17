@@ -292,8 +292,6 @@ async fn cayenne_catalog_ddl_create_insert_update_delete() -> Result<(), String>
             // -----------------------------------------------------------------
             // Step 6: INSERT after deletes — verify correctness
             // -----------------------------------------------------------------
-            // Note: UPDATE support is not yet available for partitioned Cayenne
-            // tables (reverted in #10061). Steps 6-9 test INSERT/DELETE only.
             exec(
                 &rt,
                 "INSERT INTO test_cat.myschema.users VALUES
@@ -1821,6 +1819,500 @@ async fn cayenne_catalog_merge_duplicate_source_keys_rejected() -> Result<(), St
                     "+----+-----+",
                     "| 1  | 100 |",
                     "+----+-----+",
+                ],
+                &batches
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+// =============================================================================
+// Test: UPDATE — single-row, expression, NULL, multi-column, zero-match
+// =============================================================================
+//
+// Exercises the single-node `CayenneTableProvider::update` path. The cluster
+// variant in tests/cluster/distributed_cayenne_catalog.rs covers the scheduler
+// → executor forwarding path; this test covers the direct TableProvider::update
+// call.
+#[tokio::test]
+async fn cayenne_catalog_ddl_update() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            let catalog = make_cayenne_catalog(
+                "cat_upd",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let app = AppBuilder::new("cayenne_ddl_update")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
+                .with_runtime_config(Config::default().with_caching_disabled())
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err("Timeout waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check_with_timeout(&rt, Duration::from_secs(30)).await;
+
+            exec(&rt, "CREATE SCHEMA cat_upd.s").await?;
+            exec(
+                &rt,
+                "CREATE TABLE cat_upd.s.users (
+                    id BIGINT NOT NULL,
+                    name VARCHAR NOT NULL,
+                    email VARCHAR,
+                    age BIGINT,
+                    PRIMARY KEY (id)
+                ) PARTITION BY id",
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "INSERT INTO cat_upd.s.users VALUES
+                    (1, 'Alice',   'alice@example.com',   30),
+                    (2, 'Bob',     'bob@example.com',     25),
+                    (3, 'Charlie', 'charlie@example.com', 35),
+                    (4, 'Diana',   'diana@example.com',   28),
+                    (5, 'Eve',     'eve@example.com',     22)",
+            )
+            .await?;
+
+            // Single-row UPDATE.
+            exec(&rt, "UPDATE cat_upd.s.users SET age = 31 WHERE id = 1").await?;
+            let batches = run_query(&rt, "SELECT age FROM cat_upd.s.users WHERE id = 1").await?;
+            assert_batches_eq!(
+                &["+-----+", "| age |", "+-----+", "| 31  |", "+-----+",],
+                &batches
+            );
+
+            // Expression UPDATE — bump ages > 30 by 10.
+            exec(
+                &rt,
+                "UPDATE cat_upd.s.users SET age = age + 10 WHERE age > 30",
+            )
+            .await?;
+            let batches = run_query(&rt, "SELECT id, age FROM cat_upd.s.users ORDER BY id").await?;
+            // Alice(31→41), Charlie(35→45); Bob(25), Diana(28), Eve(22) unchanged.
+            assert_batches_eq!(
+                &[
+                    "+----+-----+",
+                    "| id | age |",
+                    "+----+-----+",
+                    "| 1  | 41  |",
+                    "| 2  | 25  |",
+                    "| 3  | 45  |",
+                    "| 4  | 28  |",
+                    "| 5  | 22  |",
+                    "+----+-----+",
+                ],
+                &batches
+            );
+
+            // Set column to NULL.
+            exec(&rt, "UPDATE cat_upd.s.users SET email = NULL WHERE id = 4").await?;
+            let batches = run_query(&rt, "SELECT email FROM cat_upd.s.users WHERE id = 4").await?;
+            assert_batches_eq!(
+                &[
+                    "+-------+",
+                    "| email |",
+                    "+-------+",
+                    "|       |",
+                    "+-------+",
+                ],
+                &batches
+            );
+
+            // Multi-column UPDATE.
+            exec(
+                &rt,
+                "UPDATE cat_upd.s.users SET name = 'Bobby', age = 99 WHERE id = 2",
+            )
+            .await?;
+            let batches = run_query(
+                &rt,
+                "SELECT id, name, age FROM cat_upd.s.users WHERE id = 2",
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+----+-------+-----+",
+                    "| id | name  | age |",
+                    "+----+-------+-----+",
+                    "| 2  | Bobby | 99  |",
+                    "+----+-------+-----+",
+                ],
+                &batches
+            );
+
+            // Zero-match UPDATE — no-op.
+            exec(&rt, "UPDATE cat_upd.s.users SET age = 0 WHERE id = 9999").await?;
+
+            // Row count unchanged throughout.
+            let count = query_scalar_i64(&rt, "SELECT COUNT(*) FROM cat_upd.s.users").await?;
+            assert_eq!(count, 5, "UPDATE must not change row count");
+
+            // Final state check — only touched rows changed.
+            let batches = run_query(
+                &rt,
+                "SELECT id, name, email, age FROM cat_upd.s.users ORDER BY id",
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+----+---------+---------------------+-----+",
+                    "| id | name    | email               | age |",
+                    "+----+---------+---------------------+-----+",
+                    "| 1  | Alice   | alice@example.com   | 41  |",
+                    "| 2  | Bobby   | bob@example.com     | 99  |",
+                    "| 3  | Charlie | charlie@example.com | 45  |",
+                    "| 4  | Diana   |                     | 28  |",
+                    "| 5  | Eve     | eve@example.com     | 22  |",
+                    "+----+---------+---------------------+-----+",
+                ],
+                &batches
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+// =============================================================================
+// Test: UPDATE/DELETE without a WHERE clause
+// =============================================================================
+//
+// Distinct SQL parse path from `WHERE true`.
+#[tokio::test]
+async fn cayenne_catalog_ddl_dml_no_where() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            let catalog = make_cayenne_catalog(
+                "cat_nw",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let app = AppBuilder::new("cayenne_ddl_dml_no_where")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
+                .with_runtime_config(Config::default().with_caching_disabled())
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err("Timeout waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check_with_timeout(&rt, Duration::from_secs(30)).await;
+
+            exec(&rt, "CREATE SCHEMA cat_nw.s").await?;
+            // PRIMARY KEY is required for delete-all / update-all on this branch:
+            // the position-based deletion path does not yet support no-predicate
+            // deletion without a PK (see CayenneTableProvider deletion sink).
+            exec(
+                &rt,
+                "CREATE TABLE cat_nw.s.t (
+                    id BIGINT NOT NULL,
+                    v BIGINT NOT NULL,
+                    PRIMARY KEY (id)
+                ) PARTITION BY id",
+            )
+            .await?;
+            exec(
+                &rt,
+                "INSERT INTO cat_nw.s.t VALUES (1, 10), (2, 20), (3, 30)",
+            )
+            .await?;
+
+            // UPDATE with no WHERE — should touch every row.
+            exec(&rt, "UPDATE cat_nw.s.t SET v = 99").await?;
+            let batches = run_query(&rt, "SELECT id, v FROM cat_nw.s.t ORDER BY id").await?;
+            assert_batches_eq!(
+                &[
+                    "+----+----+",
+                    "| id | v  |",
+                    "+----+----+",
+                    "| 1  | 99 |",
+                    "| 2  | 99 |",
+                    "| 3  | 99 |",
+                    "+----+----+",
+                ],
+                &batches
+            );
+
+            // DELETE with no WHERE — should empty the table.
+            exec(&rt, "DELETE FROM cat_nw.s.t").await?;
+            let count = query_scalar_i64(&rt, "SELECT COUNT(*) FROM cat_nw.s.t").await?;
+            assert_eq!(count, 0, "DELETE FROM t (no WHERE) must empty the table");
+
+            Ok(())
+        })
+        .await
+}
+
+// =============================================================================
+// Test: DML filter references non-partition column (forces full-partition scan)
+// =============================================================================
+//
+// All other DML tests filter on `id` where `PARTITION BY id` enables
+// partition pruning. This test uses `PARTITION BY region` and filters on
+// `sku` to exercise the no-pruning path.
+#[tokio::test]
+async fn cayenne_catalog_ddl_dml_non_partition_filter() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            let catalog = make_cayenne_catalog(
+                "cat_npf",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let app = AppBuilder::new("cayenne_ddl_non_partition_filter")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
+                .with_runtime_config(Config::default().with_caching_disabled())
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err("Timeout waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check_with_timeout(&rt, Duration::from_secs(30)).await;
+
+            exec(&rt, "CREATE SCHEMA cat_npf.s").await?;
+            exec(
+                &rt,
+                "CREATE TABLE cat_npf.s.inv (
+                    region VARCHAR NOT NULL,
+                    sku VARCHAR NOT NULL,
+                    qty BIGINT NOT NULL
+                ) PARTITION BY region",
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "INSERT INTO cat_npf.s.inv VALUES
+                    ('US', 'A', 10),
+                    ('US', 'B', 20),
+                    ('EU', 'A', 30),
+                    ('EU', 'B', 40)",
+            )
+            .await?;
+
+            // UPDATE filtering on non-partition column `sku`.
+            exec(
+                &rt,
+                "UPDATE cat_npf.s.inv SET qty = qty + 1 WHERE sku = 'A'",
+            )
+            .await?;
+            let batches = run_query(
+                &rt,
+                "SELECT region, sku, qty FROM cat_npf.s.inv ORDER BY region, sku",
+            )
+            .await?;
+            // Only rows where sku='A' should change; both partitions updated.
+            assert_batches_eq!(
+                &[
+                    "+--------+-----+-----+",
+                    "| region | sku | qty |",
+                    "+--------+-----+-----+",
+                    "| EU     | A   | 31  |",
+                    "| EU     | B   | 40  |",
+                    "| US     | A   | 11  |",
+                    "| US     | B   | 20  |",
+                    "+--------+-----+-----+",
+                ],
+                &batches
+            );
+
+            // DELETE filtering on non-partition column `sku`.
+            exec(&rt, "DELETE FROM cat_npf.s.inv WHERE sku = 'B'").await?;
+            let batches = run_query(
+                &rt,
+                "SELECT region, sku, qty FROM cat_npf.s.inv ORDER BY region, sku",
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+--------+-----+-----+",
+                    "| region | sku | qty |",
+                    "+--------+-----+-----+",
+                    "| EU     | A   | 31  |",
+                    "| US     | A   | 11  |",
+                    "+--------+-----+-----+",
+                ],
+                &batches
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+// =============================================================================
+// Test: DML on a table partitioned by a VARCHAR column
+// =============================================================================
+//
+// All other DML tests except the MERGE ones use `PARTITION BY id BIGINT`.
+// This test exercises INSERT/UPDATE/DELETE on a string-partitioned table.
+#[tokio::test]
+async fn cayenne_catalog_ddl_string_partition_dml() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            let catalog = make_cayenne_catalog(
+                "cat_strp",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let app = AppBuilder::new("cayenne_ddl_string_partition")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
+                .with_runtime_config(Config::default().with_caching_disabled())
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err("Timeout waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check_with_timeout(&rt, Duration::from_secs(30)).await;
+
+            exec(&rt, "CREATE SCHEMA cat_strp.s").await?;
+            exec(
+                &rt,
+                "CREATE TABLE cat_strp.s.events (
+                    region VARCHAR NOT NULL,
+                    id BIGINT NOT NULL,
+                    payload VARCHAR
+                ) PARTITION BY region",
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "INSERT INTO cat_strp.s.events VALUES
+                    ('US', 1, 'a'),
+                    ('US', 2, 'b'),
+                    ('EU', 3, 'c'),
+                    ('EU', 4, 'd'),
+                    ('APAC', 5, 'e')",
+            )
+            .await?;
+
+            // UPDATE using partition column in the filter.
+            exec(
+                &rt,
+                "UPDATE cat_strp.s.events SET payload = 'X' WHERE region = 'US'",
+            )
+            .await?;
+            let batches = run_query(
+                &rt,
+                "SELECT region, id, payload FROM cat_strp.s.events ORDER BY region, id",
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+--------+----+---------+",
+                    "| region | id | payload |",
+                    "+--------+----+---------+",
+                    "| APAC   | 5  | e       |",
+                    "| EU     | 3  | c       |",
+                    "| EU     | 4  | d       |",
+                    "| US     | 1  | X       |",
+                    "| US     | 2  | X       |",
+                    "+--------+----+---------+",
+                ],
+                &batches
+            );
+
+            // DELETE an entire partition worth of rows.
+            exec(&rt, "DELETE FROM cat_strp.s.events WHERE region = 'EU'").await?;
+            let count = query_scalar_i64(&rt, "SELECT COUNT(*) FROM cat_strp.s.events").await?;
+            assert_eq!(count, 3, "expected 3 rows after dropping EU partition");
+
+            let batches = run_query(
+                &rt,
+                "SELECT region, id FROM cat_strp.s.events ORDER BY region, id",
+            )
+            .await?;
+            assert_batches_eq!(
+                &[
+                    "+--------+----+",
+                    "| region | id |",
+                    "+--------+----+",
+                    "| APAC   | 5  |",
+                    "| US     | 1  |",
+                    "| US     | 2  |",
+                    "+--------+----+",
                 ],
                 &batches
             );
