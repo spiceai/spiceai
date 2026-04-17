@@ -8,12 +8,13 @@ All criteria must be met for the embedding component to be considered Stable.
 
 |     Embedding Type      | Stable Quality | DRI Sign-off |
 | ----------------------- | -------------- | ------------ |
+| AWS Bedrock             | ➖             |              |
+| Azure OpenAI            | ➖             |              |
+| Databricks              | ➖             |              |
 | File                    | ➖             |              |
 | Hugging Face            | ➖             |              |
-| Spice.ai Cloud Platform | ➖             |              |
 | OpenAI                  | ➖             |              |
-| Azure Openai            | ➖             |              |
-| xAI (Grok)              | ➖             |              |
+| Spice.ai Cloud Platform | ➖             |              |
 
 ## Stable Release Criteria
 - [ ] All [RC release criteria](./rc.md) pass.

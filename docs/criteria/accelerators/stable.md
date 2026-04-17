@@ -8,11 +8,11 @@ All criteria must be met for the accelerator to be considered Stable, with excep
 
 | Accelerator | Stable Quality | DRI Sign-off |
 | ----------- | -------------- | ------------ |
-| Arrow       | ✅            | @peasee      |
-| Cayenne     | ➖            |              |
-| DuckDB      | ✅            | @peasee      |
-| SQLite      | ➖            |              |
-| PostgreSQL  | ➖            |              |
+| Arrow       | ✅              | @peasee      |
+| Cayenne     | ➖              |              |
+| DuckDB      | ✅              | @peasee      |
+| SQLite      | ➖              |              |
+| PostgreSQL  | ➖              |              |
 
 ## Stable Release Criteria
 
@@ -41,7 +41,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
   - [ ] End-to-end tests should perform [Throughput Tests](../definitions.md) at the required [parallel query count](../definitions.md)
   - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric with a parallel query count of 1 to serve as a baseline metric.
   - [ ] [Throughput Metric](../definitions.md) is calculated and reported as a metric at the required [parallel query count](../definitions.md).
-  - [ ] Memory usage is collected at the end of the end-to-end test and reported as a metric on the overall connector.
+  - [ ] Memory usage is collected at the end of the end-to-end test and reported as a metric on the overall accelerator.
 
 #### TPC-DS
 
@@ -59,7 +59,7 @@ Indexes are not required for test coverage, but can be introduced if required fo
     - One or more [Red percentile measurements](../definitions.md#stop-light-percentile-measurements) are considered a test failure.
     - The service must not become unavailable for the entire duration of the test. A connection failure is considered a test failure.
     - Queries that have a 99th percentile execution time faster than 1000ms are excluded from this check, as they complete so fast that this check is not meaningful.
-  - [ ] Memory usage is collected at the end of the end-to-end test and reported as a metric on the overall connector.
+  - [ ] Memory usage is collected at the end of the end-to-end test and reported as a metric on the overall accelerator.
 
 #### ClickBench
 

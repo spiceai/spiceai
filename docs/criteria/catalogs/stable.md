@@ -8,8 +8,17 @@ All criteria must be met for the Catalog to be considered Stable, with exception
 
 | Catalog       | Stable Quality | DRI Sign-off |
 | ------------- | -------------- | ------------ |
+| ADBC          | ➖             |              |
+| Cayenne       | ➖             |              |
 | Databricks    | ➖             |              |
+| DuckLake      | ➖             |              |
+| Glue          | ➖             |              |
 | Iceberg       | ➖             |              |
+| MS SQL        | ➖             |              |
+| MySQL         | ➖             |              |
+| Oracle        | ➖             |              |
+| PostgreSQL    | ➖             |              |
+| Snowflake     | ➖             |              |
 | Spice.ai      | ➖             |              |
 | Unity Catalog | ✅             | @Sevenannn   |
 

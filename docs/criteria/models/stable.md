@@ -8,12 +8,16 @@ All criteria must be met for the model to be considered Stable.
 
 |     Model Type          | Stable Quality | DRI Sign-off |
 | ----------------------- | -------------- | ------------ |
-| File                    | ➖             |              |
-| Hugging Face            | ➖             |              |
-| Spice.ai Cloud Platform | ➖             |              |
-| OpenAI                  | ➖             |              |
-| Azure Openai            | ➖             |              |
 | Anthropic               | ➖             |              |
+| AWS Bedrock             | ➖             |              |
+| Azure OpenAI            | ➖             |              |
+| Databricks              | ➖             |              |
+| File                    | ➖             |              |
+| Google (Gemini)         | ➖             |              |
+| Hugging Face            | ➖             |              |
+| Nvidia NIM              | ➖             |              |
+| OpenAI                  | ➖             |              |
+| Spice.ai Cloud Platform | ➖             |              |
 | xAI (Grok)              | ➖             |              |
 
 ## Stable Release Criteria

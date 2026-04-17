@@ -8,31 +8,43 @@ All criteria must be met for the connector to be considered Stable, with excepti
 
 | Connector                        | Stable Quality | DRI Sign-off    |
 | -------------------------------- | -------------- | --------------- |
+| ADBC                             | ➖             |                 |
+| Azure BlobFS                     | ➖             |                 |
 | Clickhouse                       | ➖             |                 |
 | Databricks (mode: delta_lake)    | ✅             | @Sevenannn      |
 | Databricks (mode: spark_connect) | ➖             |                 |
+| Debezium                         | ➖             |                 |
 | Delta Lake                       | ✅             | @Sevenannn      |
 | Dremio                           | ✅             | @Sevenannn      |
 | DuckDB                           | ✅             | @peasee         |
+| DuckLake                         | ➖             |                 |
 | DynamoDB                         | ➖             |                 |
 | File                             | ✅             | @ewgenius       |
 | FlightSQL                        | ➖             |                 |
 | FTP/SFTP                         | ➖             |                 |
-| GraphQL                          | ➖             |                 |
+| GCS                              | ➖             |                 |
 | GitHub                           | ✅             | @phillipleblanc |
+| Glue                             | ➖             |                 |
+| GraphQL                          | ➖             |                 |
 | HTTP/HTTPS                       | ➖             |                 |
+| Iceberg                          | ➖             |                 |
 | IMAP                             | ➖             |                 |
+| Kafka                            | ➖             |                 |
 | Localpod                         | ➖             |                 |
+| MongoDB                          | ➖             |                 |
 | MS SQL                           | ➖             |                 |
 | MySQL                            | ✅             | @phillipleblanc |
+| NFS                              | ➖             |                 |
 | ODBC                             | ➖             |                 |
+| Oracle                           | ➖             |                 |
 | PostgreSQL                       | ✅             | @peasee         |
-| Sharepoint                       | ➖             |                 |
-| Snowflake                        | ➖             |                 |
-| Spice.ai Cloud Platform          | ✅             | @Sevenannn      |
 | S3                               | ✅             | @ewgenius       |
-| Azure BlobFS                     | ➖             |                 |
+| ScyllaDB                         | ➖             |                 |
+| Sharepoint                       | ➖             |                 |
+| SMB                              | ➖             |                 |
+| Snowflake                        | ➖             |                 |
 | Spark                            | ➖             |                 |
+| Spice.ai Cloud Platform          | ✅             | @Sevenannn      |
 
 ## Stable Release Criteria
 
@@ -43,31 +55,43 @@ These connectors are exempt from running the TPC derived test packages, and rely
 
 This table defines the required features and/or tests for each connector:
 
-| Connector                        | [TPC-H (Scale)][tpch] | [TPC-DS (Scale)][tpcds] | [Federation][fed] | [Data Correctness][data] | [Streaming][stream] | [Schema Detection][schema] |
+| Connector                        | [TPC-H (Scale)][tpch] | [TPC-DS (Scale)][tpcds] | [Federation][fed] | [Data Correctness][data] | [Streaming][stream] | [Schema Inference][schema] |
 | -------------------------------- | --------------------- | ----------------------- | ----------------- | ------------------------ | ------------------- | -------------------------- |
+| ADBC                             | ➖                    | ➖                      | ☑️                | ➖                       | ➖                  | ☑️                         |
+| Azure BlobFS                     | ✅ (5)                | ✅ (5)                  | ☑️                | ✅                       | ✅                  | ☑️                         |
 | Clickhouse                       | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
 | Databricks (mode: delta_lake)    | ✅ (5)                | ✅ (5)                  | ☑️                | ✅                       | ✅                  | ✅                         |
 | Databricks (mode: spark_connect) | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
+| Debezium                         | ➖                    | ➖                      | ➖                | ➖                       | ✅                  | ☑️                         |
 | Delta Lake                       | ✅ (5)                | ✅ (5)                  | ☑️                | ✅                       | ✅                  | ✅                         |
 | Dremio                           | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
 | DuckDB                           | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
+| DuckLake                         | ➖                    | ➖                      | ☑️                | ✅                       | ✅                  | ✅                         |
+| DynamoDB                         | ✅ (5)                | ➖                      | ☑️                | ✅                       | ✅                  | ✅                         |
 | File                             | ✅ (5)                | ✅ (5)                  | ➖                | ✅                       | ✅                  | ☑️                         |
 | FTP/SFTP                         | ➖                    | ➖                      | ➖                | ✅                       | ✅                  | ☑️                         |
-| GraphQL                          | ➖                    | ➖                      | ➖                | ✅                       | ✅                  | ☑️                         |
+| GCS                              | ✅ (5)                | ✅ (5)                  | ➖                | ✅                       | ✅                  | ☑️                         |
 | GitHub                           | ➖                    | ➖                      | ☑️                | ✅                       | ✅                  | ☑️                         |
+| Glue                             | ➖                    | ➖                      | ☑️                | ✅                       | ✅                  | ✅                         |
+| GraphQL                          | ➖                    | ➖                      | ➖                | ✅                       | ✅                  | ☑️                         |
 | HTTP/HTTPS                       | ✅ (5)                | ✅ (5)                  | ➖                | ✅                       | ✅                  | ☑️                         |
-| IMAP                             | ➖                    | ➖                      | ☑️                | ✅                       | ✅                  | ☑️                         |
 | Iceberg                          | ✅ (5)                | ✅ (5)                  | ☑️                | ✅                       | ✅                  | ✅                         |
+| IMAP                             | ➖                    | ➖                      | ☑️                | ✅                       | ✅                  | ☑️                         |
+| Kafka                            | ➖                    | ➖                      | ➖                | ✅                       | ✅                  | ☑️                         |
+| MongoDB                          | ➖                    | ➖                      | ➖                | ✅                       | ✅                  | ☑️                         |
 | MS SQL                           | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
 | MySQL                            | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
+| NFS                              | ➖                    | ➖                      | ➖                | ✅                       | ✅                  | ☑️                         |
 | ODBC                             | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
+| Oracle                           | ➖                    | ➖                      | ✅                | ✅                       | ✅                  | ✅                         |
 | PostgreSQL                       | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
-| Sharepoint                       | ➖                    | ➖                      | ☑️                | ✅                       | ✅                  | ☑️                         |
-| Snowflake                        | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
-| Spice.AI Cloud Platform          | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
 | S3                               | ✅ (5)                | ✅ (5)                  | ☑️                | ✅                       | ✅                  | ☑️                         |
-| Azure BlobFS                     | ✅ (5)                | ✅ (5)                  | ☑️                | ✅                       | ✅                  | ☑️                         |
+| ScyllaDB                         | ➖                    | ➖                      | ✅                | ✅                       | ✅                  | ✅                         |
+| Sharepoint                       | ➖                    | ➖                      | ☑️                | ✅                       | ✅                  | ☑️                         |
+| SMB                              | ➖                    | ➖                      | ➖                | ✅                       | ✅                  | ☑️                         |
+| Snowflake                        | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
 | Spark                            | ✅ (5)                | ✅ (5)                  | ✅                | ✅                       | ✅                  | ✅                         |
+| Spice.ai Cloud Platform          | ✅ (100)              | ✅ (100)                | ✅                | ✅                       | ✅                  | ✅                         |
 
 [tpch]: #tpc-h
 [tpcds]: #tpc-ds
