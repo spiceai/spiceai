@@ -47,13 +47,13 @@ mistralrs = { git = "https://github.com/spiceai/mistral.rs", rev = "9b4758762d6e
 mistralrs-core = { git = "https://github.com/spiceai/mistral.rs", rev = "9b4758762d6ebed08a42af7211c616ebc512c557", package = "mistralrs-core", optional = true } # branch: spiceai-0.8.0
 rand.workspace = true
 
-tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "88b7a84a2c2ad83707555183f8f18dd201897f12", features = [
+tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", optional = true, rev = "b958dca525baf54f8e9c72267aa1c5241f2aa9a2", features = [
     "candle",
 ] }
 
-tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "88b7a84a2c2ad83707555183f8f18dd201897f12", optional = true }
-tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "88b7a84a2c2ad83707555183f8f18dd201897f12", optional = true }
-tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "88b7a84a2c2ad83707555183f8f18dd201897f12", optional = true }
+tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "b958dca525baf54f8e9c72267aa1c5241f2aa9a2", optional = true }
+tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "b958dca525baf54f8e9c72267aa1c5241f2aa9a2", optional = true }
+tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "b958dca525baf54f8e9c72267aa1c5241f2aa9a2", optional = true }
 
 cudarc = { version = "0.12.2", optional = true, features = [
     "cuda-version-from-build-system",

@@ -140,12 +140,12 @@ bigdecimal = "0.4.7"
 blake3 = "1.5"
 byte-unit = "5.1.4"
 bytes = "1.10.0"
-candle = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988", package = "candle-core" } # branch: spiceai-0.10.1
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988" } # branch: spiceai-0.10.1
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988", package = "candle-kernels" } # branch: spiceai-0.10.1
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988", package = "candle-metal-kernels" } # branch: spiceai-0.10.1
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988", package = "candle-nn" } # branch: spiceai-0.10.1
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988", package = "candle-transformers" } # branch: spiceai-0.10.1
+candle = { git = "https://github.com/spiceai/candle.git", rev = "c87b9bc5ddfd4fdd4446ac7efae1566583ab1d55", package = "candle-core" } # branch: spiceai
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "c87b9bc5ddfd4fdd4446ac7efae1566583ab1d55" } # branch: spiceai
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "c87b9bc5ddfd4fdd4446ac7efae1566583ab1d55", package = "candle-kernels" } # branch: spiceai
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "c87b9bc5ddfd4fdd4446ac7efae1566583ab1d55", package = "candle-metal-kernels" } # branch: spiceai
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "c87b9bc5ddfd4fdd4446ac7efae1566583ab1d55", package = "candle-nn" } # branch: spiceai
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "c87b9bc5ddfd4fdd4446ac7efae1566583ab1d55", package = "candle-transformers" } # branch: spiceai
 charset = "0.1.5"
 chrono = "0.4.44"
 clap = { version = "4.5.60", features = ["derive", "env"] }
@@ -360,6 +360,17 @@ inherits = "dev"
 lto = "off"
 
 [patch.crates-io]
+# Redirect candle-core / kernels / nn / transformers to the spiceai fork;
+# this matches the git rev pinned in [workspace.dependencies] above.
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "c87b9bc5ddfd4fdd4446ac7efae1566583ab1d55" } # spiceai
+candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "c87b9bc5ddfd4fdd4446ac7efae1566583ab1d55" } # spiceai
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "c87b9bc5ddfd4fdd4446ac7efae1566583ab1d55" } # spiceai
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "c87b9bc5ddfd4fdd4446ac7efae1566583ab1d55" } # spiceai
+candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "c87b9bc5ddfd4fdd4446ac7efae1566583ab1d55" } # spiceai
+# candle-index-select-cu is crates.io-sourced by text-embeddings-inference;
+# point it at the spiceai fork's candle-0.10-compatible fallback shim.
+candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select-cu.git", rev = "397d733869484e21c61a6137f75489d0eca71f5f" } # spiceai
+
 datafusion = { git = "https://github.com/spiceai/datafusion.git", rev = "c434c7b5a4e1ddb3137f1cea8da1006c514ae889" }                       # spiceai-52.5
 datafusion-catalog = { git = "https://github.com/spiceai/datafusion.git", rev = "c434c7b5a4e1ddb3137f1cea8da1006c514ae889" }               # spiceai-52.5
 datafusion-catalog-listing = { git = "https://github.com/spiceai/datafusion.git", rev = "c434c7b5a4e1ddb3137f1cea8da1006c514ae889" }       # spiceai-52.5
@@ -420,12 +431,10 @@ iceberg_test_utils = { git = "https://github.com/spiceai/iceberg-rust.git", rev 
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
 
-# Override candle crates to the lock-step 0.10.1 upgrade branch
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988" } # spiceai-0.10.1
-candle-kernels = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988", package = "candle-kernels" } # spiceai-0.10.1
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988" } # spiceai-0.10.1
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988", package = "candle-nn" } # spiceai-0.10.1
-candle-transformers = { git = "https://github.com/spiceai/candle.git", rev = "fab4da8172a997bc6dfb4100a51a72d1a7a37988", package = "candle-transformers" } # spiceai-0.10.1
+# candle-* crates are already redirected to the spiceai/candle fork via the
+# [patch.crates-io] block higher up in this file (which also carries a
+# local-path override for candle-flash-attn). Keeping those here would be
+# a duplicate-key error.
 
 # arrow-rs 57.2 with spice patches
 arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "96190c47f7a1ab90af53800a2c6c2ba4e0726f74" }        # spiceai-57.2
