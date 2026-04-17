@@ -57,19 +57,28 @@ runs:
           sudo cp /etc/apt/sources.list.d/ubuntu.sources \
                   /etc/apt/sources.list.d/ubuntu.sources.bak
           # deb822 stanzas are separated by blank lines. For the archive
-          # stanza (matches archive.ubuntu.com; not security.ubuntu.com),
-          # replace the URIs line with the full space-separated mirror
-          # list so apt fails over through them in order.
+          # stanza (identified by archive.ubuntu.com; not security.ubuntu.com),
+          # replace the URIs line with the full space-separated mirror list so
+          # apt fails over through them in order.
+          # NOTE: match only on “archive.ubuntu.com” — the previous regex
+          # ([a-z]+\.)?archive\.ubuntu\.com caused mawk to greedily consume
+          # “archive.” into the optional group, leaving the rest unmatched.
           sudo awk -v mirrors="$ALL_MIRRORS" '
             BEGIN { RS = ""; ORS = "\n\n" }
             {
-              if ($0 ~ /URIs:[[:space:]]*https?:\/\/([a-z]+\.)?archive\.ubuntu\.com/) {
+              if ($0 ~ /archive\.ubuntu\.com/) {
                 sub(/URIs:[^\n]*/, "URIs: " mirrors)
               }
               print
             }
           ' /etc/apt/sources.list.d/ubuntu.sources.bak \
             | sudo tee /etc/apt/sources.list.d/ubuntu.sources > /dev/null
+          # Fail loudly if the substitution had no effect (archive.ubuntu.com
+          # still present means the awk condition did not match).
+          if grep -q 'archive\.ubuntu\.com' /etc/apt/sources.list.d/ubuntu.sources; then
+            echo "ERROR: configure-apt: archive.ubuntu.com still present in ubuntu.sources after mirror substitution" >&2
+            exit 1
+          fi
         fi
         if [ -f /etc/apt/sources.list ]; then
           sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
