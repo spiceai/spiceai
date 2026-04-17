@@ -328,16 +328,16 @@ fn flight_sql_table_provider(
     table: &TableReference,
     schema: SchemaRef,
 ) -> Arc<dyn TableProvider> {
+    // Arc::new(
     Arc::new(
-        Arc::new(FlightSQLTable::create_with_schema(
+        FlightSQLTable::create_with_schema(
             "flightsql",
             executor_id,
             client,
             table.clone(),
             schema,
             Arc::new(CookieStore::new()),
-        ))
-        .create_federated_table_provider(),
+        ), // .create_federated_table_provider(),
     ) as Arc<dyn TableProvider>
 }
 
