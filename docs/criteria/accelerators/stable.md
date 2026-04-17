@@ -79,4 +79,5 @@ Indexes are not required for test coverage, but can be introduced if required fo
 
 - [ ] Documentation includes all known issues/limitations for the accelerator.
 - [ ] Documentation includes any exceptions made to allow this accelerator to reach Stable quality (e.g. if a particular data type cannot be supported by the accelerator).
+- [ ] The accelerator has a Deployment Guide in [spiceai/docs](https://github.com/spiceai/docs) covering production deployment topology, configuration, sizing, and operational considerations (e.g. [Databricks Deployment Guide](https://spiceai.org/docs/next/components/data-connectors/databricks/deployment)).
 - [ ] The accelerator status is updated in the table of accelerators in [spiceai/docs](https://github.com/spiceai/docs).

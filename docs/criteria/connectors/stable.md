@@ -117,6 +117,7 @@ Documentation criteria should be re-checked on every release, to ensure the docu
 - [ ] Documentation includes all known issues/limitations for the connector.
 - [ ] Documentation includes any exceptions made to allow this connector to reach RC quality (e.g. if a particular data type cannot be supported by the connector).
 - [ ] The connector has an easy to follow cookbook recipe.
+- [ ] The connector has a Deployment Guide in [spiceai/docs](https://github.com/spiceai/docs) covering production deployment topology, configuration, secrets management, sizing, and operational considerations (e.g. [Databricks Deployment Guide](https://spiceai.org/docs/next/components/data-connectors/databricks/deployment)).
 - [ ] The connector status is updated in the table of connectors in [spiceai/docs](https://github.com/spiceai/docs).
 
 ### Conditional Criteria

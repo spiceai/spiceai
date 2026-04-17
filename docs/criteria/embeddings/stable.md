@@ -25,4 +25,5 @@ All criteria must be met for the embedding component to be considered Stable.
 - [ ] Documentation includes known limitations or issues for the embedding component.
 - [ ] Documentation includes any exceptions made for Stable quality.
 - [ ] The embedding component has an easy-to-follow cookbook.
+- [ ] The embedding component has a Deployment Guide in [spiceai/docs](https://github.com/spiceai/docs) covering production deployment, configuration, authentication, rate limits, and operational considerations (e.g. [Databricks Deployment Guide](https://spiceai.org/docs/next/components/data-connectors/databricks/deployment)).
 - [ ] The embedding component status is updated in the table of components in [spiceai/docs](https://github.com/spiceai/docs).

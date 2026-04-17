@@ -28,3 +28,4 @@ All criteria must be met for the model to be considered Stable.
 
 - [ ] All documentation meets RC criteria.
 - [ ] Documentation includes any exceptions made for Stable quality.
+- [ ] The model has a Deployment Guide in [spiceai/docs](https://github.com/spiceai/docs) covering production deployment, configuration, authentication, rate limits, and operational considerations (e.g. [Databricks Deployment Guide](https://spiceai.org/docs/next/components/data-connectors/databricks/deployment)).
