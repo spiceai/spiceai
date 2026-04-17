@@ -42,6 +42,22 @@ use crate::{
 
 use super::harness::ClusterHarness;
 
+/// Wrapper around [`insta::assert_snapshot!`] that redacts
+/// `127.0.0.1:<port>` addresses in physical-plan output so that
+/// snapshots are stable across runs.
+macro_rules! assert_explain_snapshot {
+    ($name:expr, $plan:expr) => {{
+        let __plan = $plan;
+        insta::with_settings!({
+            filters => vec![
+                (r"127\.0\.0\.1:\d+", "[endpoint]")
+            ]
+        }, {
+            insta::assert_snapshot!($name, __plan);
+        });
+    }};
+}
+
 /// CSV test data
 const TEST_DATA_CSV: &str = r"id,name,age,city,score
 1,John Doe,28,New York,85
@@ -143,13 +159,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
                 .expect("format explain")
                 .to_string();
 
-            insta::with_settings!({
-                filters => vec![
-                    (r"127\.0\.0\.1:\d+", "[endpoint]")
-                ]
-            }, {
-                insta::assert_snapshot!("bucket_partitioning_plan", plan_fmt);
-            });
+            assert_explain_snapshot!("bucket_partitioning_plan", plan_fmt);
 
             let rows = harness.query(select_all_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
@@ -163,13 +173,7 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
             let agg_plan_fmt = arrow::util::pretty::pretty_format_batches(&agg_plan)
                 .expect("format explain agg")
                 .to_string();
-            insta::with_settings!({
-                filters => vec![
-                    (r"127\.0\.0\.1:\d+", "[endpoint]")
-                ]
-            }, {
-                insta::assert_snapshot!("bucket_partitioning_agg_plan", agg_plan_fmt);
-            });
+            assert_explain_snapshot!("bucket_partitioning_agg_plan", agg_plan_fmt);
 
             let agg = harness.query(aggregation_sql).await?;
             let agg_fmt = arrow::util::pretty::pretty_format_batches(&agg).expect("format agg");
@@ -342,17 +346,104 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
             let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                 .expect("format explain")
                 .to_string();
-            insta::with_settings!({
-                filters => vec![
-                    (r"127\.0\.0\.1:\d+", "[endpoint]")
-                ]
-            }, {
-                insta::assert_snapshot!("predicate_pushdown_plan", plan_fmt);
-            });
+            assert_explain_snapshot!("predicate_pushdown_plan", plan_fmt);
 
             let rows = harness.query(filtered_sql).await?;
             let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
             insta::assert_snapshot!("predicate_pushdown_rows", rows_fmt);
+
+            harness.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// Test that `ORDER BY col LIMIT N` is pushed down into each executor's `FlightSqlExec`
+/// so each partition returns at most N rows (TopK)
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_distributed_acceleration_order_by_limit_pushdown() -> Result<(), anyhow::Error> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("runtime=debug,info"))
+        .with_ansi(true)
+        .try_init();
+
+    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
+        verify_env_secret_exists(env_var)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+
+    let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
+    let csv_path = csv_tempdir.path().join("test_data.csv");
+    tokio::fs::write(&csv_path, TEST_DATA_CSV)
+        .await
+        .expect("write test data");
+
+    test_request_context()
+        .scope(async {
+            configure_test_datafusion();
+            let app = AppBuilder::new("test_order_limit_pushdown")
+                .with_dataset(make_memory_accelerated_dataset(
+                    format!("file://{}", csv_path.display()),
+                    "test_data",
+                    4,
+                    "id",
+                ))
+                .with_runtime(SpicepodRuntime {
+                    scheduler: Some(
+                        make_named_scheduler_config_with_max_partitions_per_executor(
+                            "test_distributed_acceleration_order_by_limit_pushdown",
+                            2,
+                        ),
+                    ),
+                    ..SpicepodRuntime::default()
+                })
+                .build();
+
+            let harness = ClusterHarness::builder()
+                .scheduler(app)
+                .executors(2)
+                .start()
+                .await?;
+
+            sleep(Duration::from_secs(2)).await;
+            harness.wait_for_executors(Duration::from_secs(15)).await?;
+            wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
+
+            // --- ORDER BY score DESC LIMIT 3 ---
+            // Expected top-3 scores from TEST_DATA_CSV: Sarah Wilson=94, Jane Smith=92, Anna Garcia=90
+            let limit_sql = "SELECT id, name, score FROM test_data ORDER BY score DESC LIMIT 3";
+
+            let plan = harness.explain(limit_sql).await?;
+            let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
+                .expect("format explain")
+                .to_string();
+
+            assert_explain_snapshot!("order_by_limit_pushdown_plan", plan_fmt);
+
+            let rows = harness.query(limit_sql).await?;
+            let rows_fmt = arrow::util::pretty::pretty_format_batches(&rows).expect("format rows");
+            insta::assert_snapshot!("order_by_limit_pushdown_rows", rows_fmt);
+
+            // --- ORDER BY id ASC LIMIT 5 with predicate ---
+            // Combines predicate pushdown with limit pushdown.
+            // Rows with score > 80: ids 1(85), 2(92), 4(89), 6(94), 7(81), 8(88), 10(90) → 7 rows
+            // LIMIT 5 → first 5 by id: 1, 2, 4, 6, 7
+            let limit_pred_sql =
+                "SELECT id, name, score FROM test_data WHERE score > 80 ORDER BY id ASC LIMIT 5";
+
+            let pred_plan = harness.explain(limit_pred_sql).await?;
+            let pred_plan_fmt = arrow::util::pretty::pretty_format_batches(&pred_plan)
+                .expect("format explain")
+                .to_string();
+
+            assert_explain_snapshot!("order_by_limit_with_predicate_plan", pred_plan_fmt);
+
+            let pred_rows = harness.query(limit_pred_sql).await?;
+            let pred_rows_fmt =
+                arrow::util::pretty::pretty_format_batches(&pred_rows).expect("format rows");
+            insta::assert_snapshot!("order_by_limit_with_predicate_rows", pred_rows_fmt);
 
             harness.shutdown().await;
             Ok(())
