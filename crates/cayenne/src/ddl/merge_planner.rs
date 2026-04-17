@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use data_components::delete::DeletionTableProviderAdapter;
+use datafusion::catalog::TableProvider;
 use datafusion::datasource::provider_as_source;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::LogicalPlanBuilder;
@@ -33,6 +35,13 @@ use datafusion_dml::{CatalogDmlHandler, MergeParams};
 
 use super::logical_nodes::CayenneMergeNode;
 use super::physical_plans::CayenneMergeExec;
+use crate::provider::position_tracking::{
+    CAYENNE_FILE_PATH_COLUMN, CAYENNE_ROW_IDX_COLUMN, CayennePositionTrackingTable,
+};
+use crate::provider::table::CayenneTableProvider;
+
+#[cfg(feature = "partition-table-provider")]
+use runtime_table_partition::provider::PartitionTableProvider;
 
 /// Catalog DML handler for local (single-node) Cayenne operations.
 ///
@@ -180,12 +189,18 @@ async fn build_local_merge_input(
     let target_qualifier = merge.target_qualifier.as_str();
     let source_qualifier = merge.source_qualifier.as_str();
 
-    let target_scan = LogicalPlanBuilder::scan(
-        target_qualifier,
-        provider_as_source(Arc::clone(&target_provider)),
-        None,
-    )?
-    .build()?;
+    let use_position_tracking = is_position_based_cayenne(&target_provider).await;
+    let scan_provider: Arc<dyn TableProvider> = if use_position_tracking {
+        Arc::new(CayennePositionTrackingTable::try_new(Arc::clone(
+            &target_provider,
+        ))?)
+    } else {
+        Arc::clone(&target_provider)
+    };
+
+    let target_scan =
+        LogicalPlanBuilder::scan(target_qualifier, provider_as_source(scan_provider), None)?
+            .build()?;
     let source_scan = LogicalPlanBuilder::scan(
         source_qualifier,
         provider_as_source(Arc::clone(&source_provider)),
@@ -238,7 +253,7 @@ async fn build_local_merge_input(
         .map(|(column, expr)| (column.as_str(), expr))
         .collect();
 
-    let project_exprs: Vec<Expr> = target_schema
+    let mut project_exprs: Vec<Expr> = target_schema
         .fields()
         .iter()
         .map(|field| {
@@ -251,6 +266,23 @@ async fn build_local_merge_input(
             Ok(expr.alias(col_name))
         })
         .collect::<DFResult<Vec<_>>>()?;
+
+    if use_position_tracking {
+        project_exprs.push(
+            col(Column::new(
+                Some(target_qualifier.to_string()),
+                CAYENNE_FILE_PATH_COLUMN,
+            ))
+            .alias(CAYENNE_FILE_PATH_COLUMN),
+        );
+        project_exprs.push(
+            col(Column::new(
+                Some(target_qualifier.to_string()),
+                CAYENNE_ROW_IDX_COLUMN,
+            ))
+            .alias(CAYENNE_ROW_IDX_COLUMN),
+        );
+    }
 
     let projected = LogicalPlanBuilder::from(joined)
         .project(project_exprs)?
@@ -269,6 +301,71 @@ async fn build_local_merge_input(
     };
 
     Ok((params, join_physical))
+}
+
+async fn is_position_based_cayenne(provider: &Arc<dyn TableProvider>) -> bool {
+    if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>() {
+        return cayenne.is_position_based();
+    }
+
+    if let Some(adapter) = provider
+        .as_any()
+        .downcast_ref::<DeletionTableProviderAdapter>()
+    {
+        if let Some(cayenne) = adapter
+            .source()
+            .as_any()
+            .downcast_ref::<CayenneTableProvider>()
+        {
+            return cayenne.is_position_based();
+        }
+
+        #[cfg(feature = "partition-table-provider")]
+        if let Some(partitioned) = adapter
+            .source()
+            .as_any()
+            .downcast_ref::<PartitionTableProvider>()
+        {
+            return partitioned
+                .partition_table_providers()
+                .await
+                .first()
+                .and_then(unwrap_to_cayenne)
+                .is_some_and(CayenneTableProvider::is_position_based);
+        }
+
+        return false;
+    }
+
+    #[cfg(feature = "partition-table-provider")]
+    if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
+        return partitioned
+            .partition_table_providers()
+            .await
+            .first()
+            .and_then(unwrap_to_cayenne)
+            .is_some_and(CayenneTableProvider::is_position_based);
+    }
+
+    false
+}
+
+#[cfg(feature = "partition-table-provider")]
+fn unwrap_to_cayenne(provider: &Arc<dyn TableProvider>) -> Option<&CayenneTableProvider> {
+    provider
+        .as_any()
+        .downcast_ref::<CayenneTableProvider>()
+        .or_else(|| {
+            provider
+                .as_any()
+                .downcast_ref::<DeletionTableProviderAdapter>()
+                .and_then(|adapter| {
+                    adapter
+                        .source()
+                        .as_any()
+                        .downcast_ref::<CayenneTableProvider>()
+                })
+        })
 }
 
 async fn resolve_table(

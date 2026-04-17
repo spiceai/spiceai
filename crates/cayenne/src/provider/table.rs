@@ -4271,6 +4271,88 @@ impl CayenneTableProvider {
         )))
     }
 
+    /// Delete rows by pre-computed `(file_path, row_idx)` positions.
+    ///
+    /// Fast path for `MERGE INTO` on position-based tables. This bypasses
+    /// filter construction and the second full-table scan, and writes deletion
+    /// vectors directly using already-resolved file-local row positions.
+    pub async fn persist_position_deletions(
+        &self,
+        positions: HashMap<String, Vec<u64>>,
+    ) -> datafusion_common::Result<u64> {
+        if !self.pk_deletion_strategy.is_position_based() {
+            return Err(datafusion_common::DataFusionError::Internal(format!(
+                "persist_position_deletions called on non-position-based table '{}'",
+                self.table_metadata.table_name
+            )));
+        }
+
+        if positions.is_empty() {
+            return Ok(0);
+        }
+
+        let _write_guard = self.write_lock.lock().await;
+
+        // Filter to files currently present in this provider's listing table.
+        // This makes partition fan-out safe: each partition provider receives
+        // the full map but only persists entries for files it actually owns.
+        let ctx = self.create_session_context();
+        let listing_table = {
+            let guard = self.listing_table.read().map_err(|_| {
+                datafusion_common::DataFusionError::Internal(format!(
+                    "Failed to read listing table lock for '{}'",
+                    self.table_metadata.table_name
+                ))
+            })?;
+            Arc::clone(&guard)
+        };
+
+        let list_result = listing_table
+            .list_files_for_scan(&ctx.state(), &[], None)
+            .await?;
+
+        let known_files: HashSet<String> = list_result
+            .file_groups
+            .iter()
+            .flat_map(|group| group.iter())
+            .map(|file| file.path().to_string())
+            .collect();
+
+        let filtered_positions: HashMap<String, Vec<u64>> = positions
+            .into_iter()
+            .filter(|(file_path, row_ids)| !row_ids.is_empty() && known_files.contains(file_path))
+            .collect();
+
+        if filtered_positions.is_empty() {
+            return Ok(0);
+        }
+
+        // Position-based tables have no protected snapshots.
+        let sink = CayenneDeletionSink::new(
+            self.table_metadata.clone(),
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.listing_table),
+            Arc::clone(&self.table_metadata.schema),
+            &[],
+            self.pk_deletion_strategy.clone(),
+            self.pk_row_converter.as_ref().map(Arc::clone),
+            self.pk_column_indices.clone(),
+            Vec::new(),
+            Arc::clone(self.context.runtime_env()),
+            None, // write lock is already held above
+        );
+
+        sink.persist_position_based_deletions(filtered_positions)
+            .await
+            .map_err(|err| datafusion_common::DataFusionError::External(Box::new(err)))
+    }
+
+    /// Returns `true` if this table uses the position-based deletion strategy.
+    #[must_use]
+    pub fn is_position_based(&self) -> bool {
+        self.pk_deletion_strategy.is_position_based()
+    }
+
     /// Build listing tables for all protected snapshots.
     ///
     /// Returns a vec of `(snapshot_id, listing_table)` pairs.

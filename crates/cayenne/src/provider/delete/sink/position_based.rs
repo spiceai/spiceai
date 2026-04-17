@@ -339,7 +339,7 @@ impl CayenneDeletionSink {
     /// # Returns
     ///
     /// The total number of **newly** deleted rows (not counting already-deleted).
-    pub(super) async fn persist_position_based_deletions(
+    pub(crate) async fn persist_position_based_deletions(
         &self,
         row_ids: HashMap<String, Vec<u64>>,
     ) -> crate::provider::Result<u64> {
