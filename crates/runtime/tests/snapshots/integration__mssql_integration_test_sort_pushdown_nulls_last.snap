@@ -1,0 +1,14 @@
+---
+source: crates/runtime/tests/integration.rs
+description: "Query: SELECT col_long, col_varchar, col_decimal FROM test ORDER BY col_long DESC NULLS LAST LIMIT 2"
+---
++---------------+--------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                   |
++---------------+--------------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: test.col_long DESC NULLS LAST, fetch=2                                                           |
+|               |   TableScan: test projection=[col_long, col_varchar, col_decimal]                                      |
+| physical_plan | CooperativeExec                                                                                        |
+|               |   BytesProcessedExec                                                                                   |
+|               |     SqlServerExec sql=SELECT TOP 2 col_long, col_varchar, col_decimal FROM test ORDER BY col_long DESC |
+|               |                                                                                                        |
++---------------+--------------------------------------------------------------------------------------------------------+
