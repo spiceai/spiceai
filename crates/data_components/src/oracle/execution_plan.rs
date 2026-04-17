@@ -219,6 +219,26 @@ impl ExecutionPlan for OracleExecPlan {
         Ok(self)
     }
 
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.limit
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        Some(Arc::new(OracleExecPlan {
+            projected_schema: Arc::clone(&self.projected_schema),
+            table_reference: self.table_reference.clone(),
+            pool: Arc::clone(&self.pool),
+            filters: self.filters.clone(),
+            limit,
+            sort_exprs: self.sort_exprs.clone(),
+            properties: self.properties.clone(),
+        }))
+    }
+
     fn try_pushdown_sort(
         &self,
         order: &[PhysicalSortExpr],
