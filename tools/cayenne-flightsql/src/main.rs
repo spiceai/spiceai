@@ -36,11 +36,11 @@ struct Args {
     #[arg(long, env = "FLIGHTSQL_ADDR", default_value = "127.0.0.1:50051")]
     addr: std::net::SocketAddr,
 
-    /// DataFusion default catalog name (the Cayenne catalog will be registered under this name).
+    /// `DataFusion` default catalog name (the Cayenne catalog will be registered under this name).
     #[arg(long, env = "FLIGHTSQL_CATALOG", default_value = "cayenne")]
     catalog: String,
 
-    /// DataFusion default schema for unqualified table references.
+    /// `DataFusion` default schema for unqualified table references.
     #[arg(long, env = "FLIGHTSQL_DEFAULT_SCHEMA", default_value = "public")]
     default_schema: String,
 
@@ -56,7 +56,7 @@ struct Args {
     #[arg(long, env = "CAYENNE_DATA_DIR")]
     cayenne_data_dir: Option<String>,
 
-    /// Directory for Cayenne SQLite metadata files.
+    /// Directory for Cayenne `SQLite` metadata files.
     #[arg(long, env = "CAYENNE_METADATA_DIR")]
     cayenne_metadata_dir: Option<String>,
 
@@ -120,13 +120,18 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("cayenne_flightsql=info,datafusion_flightsql=info,info")
         .try_init()
-        .context(TracingInitSnafu)?;
+        .map_err(|source| Error::TracingInit { source })?;
 
     let mut session_config = SessionConfig::new()
         .with_information_schema(true)
         .with_create_default_catalog_and_schema(false);
-    session_config.options_mut().catalog.default_catalog = args.catalog.clone();
-    session_config.options_mut().catalog.default_schema = args.default_schema.clone();
+    {
+        let catalog_options = &mut session_config.options_mut().catalog;
+        catalog_options.default_catalog.clone_from(&args.catalog);
+        catalog_options
+            .default_schema
+            .clone_from(&args.default_schema);
+    }
 
     let ctx = Arc::new(SessionContext::new_with_config(session_config));
 
@@ -190,22 +195,35 @@ async fn main() -> Result<()> {
 
     tracing::info!(addr = %args.addr, "Starting Flight SQL service");
 
-    let server = Server::builder()
+    let server_result = Server::builder()
         .add_service(FlightSqlService::new(Arc::clone(&ctx)).into_server())
-        .serve_with_shutdown(args.addr, shutdown_signal())
+        .serve_with_shutdown(args.addr, util::shutdown_signal())
         .await;
 
     if let Some(task) = refresh_task {
         task.abort();
+        let Err(err) = task.await;
+        if !err.is_cancelled() {
+            tracing::warn!("Periodic refresh task terminated unexpectedly: {err}");
+        }
     }
 
-    server.context(FlightServerSnafu)?;
-
-    provider
+    let shutdown_result = provider
         .metadata_catalog()
         .shutdown()
         .await
-        .context(CatalogShutdownSnafu)?;
+        .context(CatalogShutdownSnafu);
+
+    if let Err(source) = server_result {
+        if let Err(err) = shutdown_result {
+            tracing::error!(
+                "Failed to shutdown Cayenne catalog cleanly after Flight SQL server error: {err}"
+            );
+        }
+        return Err(Error::FlightServer { source });
+    }
+
+    shutdown_result?;
 
     tracing::info!("Flight SQL service stopped");
     Ok(())
@@ -239,13 +257,6 @@ fn ensure_default_schema_exists(
     );
 
     Ok(())
-}
-
-async fn shutdown_signal() {
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => tracing::info!("Received Ctrl-C, shutting down"),
-        Err(err) => tracing::error!("Failed to listen for Ctrl-C: {err}"),
-    }
 }
 
 #[cfg(test)]
