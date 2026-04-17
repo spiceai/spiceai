@@ -1,21 +1,25 @@
 <p align="center">
   <img src="https://github.com/user-attachments/assets/13ff4c9d-d6a7-4c20-9408-45573c508c41" alt="spice oss logo" width="600"/>
 </p>
-<p align="center">
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml"><img src="https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push" alt="CodeQL"/></a>
-  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"/></a>
-  <a href="https://spiceai.org/slack"><img src="https://img.shields.io/badge/Slack-Join%20Us-4A154B?logo=slack" alt="Slack"/></a>
-  <a href="https://x.com/intent/follow?screen_name=spice_ai"><img src="https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x" alt="Follow on X"/></a>
-</p>
+<div align="center">
 
-<p align="center">
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - build" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_and_release.yml?branch=trunk" /></a>
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/spiced_docker_nightly.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - docker build" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/spiced_docker_nightly.yml?branch=trunk&label=docker%20build" /></a>
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/pr.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - unit tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/pr.yml?event=merge_group&label=unit%20tests" /></a>
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/integration.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - integration tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration.yml?branch=trunk&label=integration%20tests" /></a>
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/integration_models.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - integration tests (models)" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration_models.yml?branch=trunk&label=integration%20tests%20(models)" /></a>
-  <a href="https://github.com/spiceai/spiceai/actions/workflows/benchmarks.yml?branch=trunk"><img alt="GitHub Actions Workflow Status - benchmark tests" src="https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/testoperator_run_bench.yml?branch=trunk&label=benchmark%20tests" /></a>
-</p>
+[![CodeQL](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml/badge.svg?branch=trunk&event=push)](https://github.com/spiceai/spiceai/actions/workflows/codeql-analysis.yml?query=branch%3Atrunk+event%3Apush)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Slack](https://img.shields.io/badge/Slack-Join%20Us-4A154B?logo=slack)](https://spiceai.org/slack)
+[![Follow on X](https://img.shields.io/twitter/follow/spice_ai.svg?style=social&logo=x)](https://x.com/intent/follow?screen_name=spice_ai)
+
+</div>
+
+<div align="center">
+
+[![GitHub Actions Workflow Status - build](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_nightly.yml?branch=trunk&label=build)](https://github.com/spiceai/spiceai/actions/workflows/build_nightly.yml?query=branch%3Atrunk)
+[![GitHub Actions Workflow Status - docker build](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/spiced_docker_dev.yml?branch=trunk&label=docker%20build)](https://github.com/spiceai/spiceai/actions/workflows/spiced_docker_dev.yml?query=branch%3Atrunk)
+[![GitHub Actions Workflow Status - unit tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/build_and_release.yml?branch=trunk&label=unit%20tests)](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml?query=branch%3Atrunk)
+[![GitHub Actions Workflow Status - integration tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration.yml?branch=trunk&label=integration%20tests)](https://github.com/spiceai/spiceai/actions/workflows/integration.yml?query=branch%3Atrunk)
+[![GitHub Actions Workflow Status - integration tests (models)](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/integration_models.yml?branch=trunk&label=integration%20tests%20%28models%29)](https://github.com/spiceai/spiceai/actions/workflows/integration_models.yml?query=branch%3Atrunk)
+[![GitHub Actions Workflow Status - benchmark tests](https://img.shields.io/github/actions/workflow/status/spiceai/spiceai/testoperator_run_bench.yml?branch=trunk&label=benchmark%20tests)](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_bench.yml?query=branch%3Atrunk)
+
+</div>
 
 <p align="center">
   <a href="https://spiceai.org/docs">📄 Docs</a> | <a href="#%EF%B8%8F-quickstart-local-machine">⚡️ Quickstart</a> | <a href="https://github.com/spiceai/cookbook">🧑‍🍳 Cookbook</a>

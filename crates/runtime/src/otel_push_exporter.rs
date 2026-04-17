@@ -31,9 +31,14 @@ limitations under the License.
 //! are exported. This is implemented via a [`FilteringExporter`] wrapper that filters
 //! metrics before passing them to the underlying OTEL exporter.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
-use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig, WithHttpConfig};
+use opentelemetry_otlp::{
+    MetricExporter, Protocol, WithExportConfig, WithHttpConfig, WithTonicConfig,
+};
 use opentelemetry_sdk::{
     metrics::{
         Temporality, data::ResourceMetrics, exporter::PushMetricExporter,
@@ -165,7 +170,13 @@ pub use spicepod::component::runtime::OtelExporterConfig;
 ///
 /// # Arguments
 ///
-/// * `config` - The exporter configuration including endpoint, push interval, and metric filters
+/// * `config` - The exporter configuration (endpoint, push interval, metric filters).
+///   Note: `config.headers` is **not** read by this function; the caller is responsible
+///   for resolving any parameter references in `config.headers` (e.g. via the secrets
+///   subsystem) and passing the already-resolved header map as `resolved_headers`.
+/// * `resolved_headers` - Fully-resolved headers to attach to every exported metrics
+///   request. For HTTP these are sent as HTTP headers; for gRPC they are sent as
+///   metadata entries (keys must be lowercase ASCII).
 ///
 /// # Returns
 ///
@@ -179,15 +190,17 @@ pub use spicepod::component::runtime::OtelExporterConfig;
 ///
 /// ```ignore
 /// use runtime::otel_push_exporter::{create_otel_periodic_reader, OtelExporterConfig};
+/// use std::collections::HashMap;
 ///
 /// let config = OtelExporterConfig {
 ///     enabled: true,
 ///     endpoint: "otel-collector:4317".to_string(),
 ///     push_interval: "30s".to_string(),
 ///     metrics: vec![],
+///     headers: HashMap::new(),
 /// };
 ///
-/// let otel_reader = create_otel_periodic_reader(&config)?;
+/// let otel_reader = create_otel_periodic_reader(&config, HashMap::new())?;
 ///
 /// let provider = SdkMeterProvider::builder()
 ///     .with_reader(prometheus_exporter)
@@ -195,7 +208,14 @@ pub use spicepod::component::runtime::OtelExporterConfig;
 ///     .with_reader(otel_reader)  // Add OTEL push reader
 ///     .build();
 /// ```
-pub fn create_otel_periodic_reader(config: &OtelExporterConfig) -> Result<OtelPeriodicReader> {
+#[expect(
+    clippy::implicit_hasher,
+    reason = "public API accepts the standard HashMap; callers pass std::collections::HashMap<String, String>"
+)]
+pub fn create_otel_periodic_reader(
+    config: &OtelExporterConfig,
+    resolved_headers: HashMap<String, String>,
+) -> Result<OtelPeriodicReader> {
     let push_interval =
         config
             .push_interval_duration()
@@ -209,13 +229,14 @@ pub fn create_otel_periodic_reader(config: &OtelExporterConfig) -> Result<OtelPe
         protocol = protocol,
         push_interval_secs = push_interval.as_secs(),
         metrics_filter = ?config.metrics,
+        num_headers = resolved_headers.len(),
         "Creating OTEL metrics periodic reader"
     );
 
     let inner_exporter = if config.is_http() {
-        create_http_exporter(&config.endpoint)?
+        create_http_exporter(&config.endpoint, resolved_headers)?
     } else {
-        create_grpc_exporter(&config.grpc_endpoint())?
+        create_grpc_exporter(&config.grpc_endpoint(), &resolved_headers)?
     };
 
     // Wrap with filtering exporter
@@ -228,18 +249,41 @@ pub fn create_otel_periodic_reader(config: &OtelExporterConfig) -> Result<OtelPe
     Ok(reader)
 }
 
-fn create_grpc_exporter(endpoint: &str) -> Result<MetricExporter> {
-    MetricExporter::builder()
+fn create_grpc_exporter(
+    endpoint: &str,
+    headers: &HashMap<String, String>,
+) -> Result<MetricExporter> {
+    let mut builder = MetricExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
-        .with_protocol(Protocol::Grpc)
-        .build()
-        .map_err(|e| Error::ExporterCreationFailed {
-            message: e.to_string(),
-        })
+        .with_protocol(Protocol::Grpc);
+
+    if !headers.is_empty() {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        for (key_str, value) in headers {
+            let key_str = key_str.as_str();
+            let metadata_key = key_str
+                .parse::<tonic::metadata::MetadataKey<tonic::metadata::Ascii>>()
+                .map_err(|e| Error::ExporterCreationFailed {
+                    message: format!("Invalid gRPC metadata key '{key_str}': {e}. gRPC metadata keys must be lowercase ASCII"),
+                })?;
+            let metadata_value = value.parse().map_err(|e| Error::ExporterCreationFailed {
+                message: format!("Invalid gRPC metadata value for '{key_str}': {e}"),
+            })?;
+            metadata.insert(metadata_key, metadata_value);
+        }
+        builder = builder.with_metadata(metadata);
+    }
+
+    builder.build().map_err(|e| Error::ExporterCreationFailed {
+        message: e.to_string(),
+    })
 }
 
-fn create_http_exporter(endpoint: &str) -> Result<MetricExporter> {
+fn create_http_exporter(
+    endpoint: &str,
+    headers: HashMap<String, String>,
+) -> Result<MetricExporter> {
     // For HTTP, the endpoint should include the /v1/metrics path
     let full_endpoint = if endpoint.ends_with("/v1/metrics") {
         endpoint.to_string()
@@ -255,15 +299,19 @@ fn create_http_exporter(endpoint: &str) -> Result<MetricExporter> {
             message: format!("Failed to build OTEL HTTP client: {e}"),
         })?;
 
-    MetricExporter::builder()
+    let mut builder = MetricExporter::builder()
         .with_http()
         .with_http_client(http_client)
         .with_endpoint(full_endpoint)
-        .with_protocol(Protocol::HttpBinary)
-        .build()
-        .map_err(|e| Error::ExporterCreationFailed {
-            message: e.to_string(),
-        })
+        .with_protocol(Protocol::HttpBinary);
+
+    if !headers.is_empty() {
+        builder = builder.with_headers(headers);
+    }
+
+    builder.build().map_err(|e| Error::ExporterCreationFailed {
+        message: e.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -410,5 +458,80 @@ mod tests {
 
         // Should have no metrics left since none matched
         assert!(!any_match);
+    }
+
+    // Tests for header support
+
+    #[test]
+    fn test_create_http_exporter_with_headers() {
+        let headers = HashMap::from([
+            ("DD-API-KEY".to_string(), "test-key".to_string()),
+            ("X-Custom".to_string(), "value".to_string()),
+        ]);
+        // HTTP exporter with headers should build successfully
+        let result = create_http_exporter("http://localhost:4318/v1/metrics", headers);
+        assert!(
+            result.is_ok(),
+            "HTTP exporter with headers should build: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_http_exporter_without_headers() {
+        let headers = HashMap::new();
+        let result = create_http_exporter("http://localhost:4318/v1/metrics", headers);
+        assert!(
+            result.is_ok(),
+            "HTTP exporter without headers should build: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_grpc_exporter_with_valid_headers() {
+        // tonic requires a tokio runtime to be available during exporter construction
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        let _guard = rt.enter();
+        let headers = HashMap::from([
+            ("api-key".to_string(), "test-key".to_string()),
+            ("x-custom-header".to_string(), "value".to_string()),
+        ]);
+        let result = create_grpc_exporter("http://localhost:4317", &headers);
+        assert!(
+            result.is_ok(),
+            "gRPC exporter with valid headers should build: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_grpc_exporter_without_headers() {
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        let _guard = rt.enter();
+        let headers = HashMap::new();
+        let result = create_grpc_exporter("http://localhost:4317", &headers);
+        assert!(
+            result.is_ok(),
+            "gRPC exporter without headers should build: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_create_grpc_exporter_rejects_invalid_metadata_key() {
+        // tonic requires a tokio runtime to be available during exporter construction
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        let _guard = rt.enter();
+        // gRPC metadata keys must be lowercase ASCII
+        let headers = HashMap::from([("Invalid Key With Spaces".to_string(), "value".to_string())]);
+        let result = create_grpc_exporter("http://localhost:4317", &headers);
+        assert!(result.is_err());
+        let err = result.expect_err("should fail with invalid metadata key");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid gRPC metadata key"),
+            "Error should mention invalid key: {msg}"
+        );
+        assert!(
+            msg.contains("lowercase ASCII"),
+            "Error should hint about lowercase ASCII: {msg}"
+        );
     }
 }
