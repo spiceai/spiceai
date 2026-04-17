@@ -262,6 +262,46 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: cargo build -p testoperator --all-features --locked
 
+      - name: make install-dev
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+        run: make install-dev
+
+      - name: make install
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+        run: make install
+
+      - name: make install-cli
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+        run: make install-cli
+
+      - name: make install-runtime
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+        run: make install-runtime
+
+      - name: make install-odbc
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+        run: make install-odbc
+
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
