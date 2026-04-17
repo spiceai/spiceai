@@ -4293,9 +4293,9 @@ impl CayenneTableProvider {
 
         let _write_guard = self.write_lock.lock().await;
 
-        // Filter to files currently present in this provider's listing table.
-        // This makes partition fan-out safe: each partition provider receives
-        // the full map but only persists entries for files it actually owns.
+        // Validate and filter to files currently present in this provider's
+        // listing table. Unknown file paths are rejected to avoid partial
+        // delete commits on mismatched position maps.
         let ctx = self.create_session_context();
         let listing_table = {
             let guard = self.listing_table.read().map_err(|_| {
@@ -4318,10 +4318,30 @@ impl CayenneTableProvider {
             .map(|file| file.path().to_string())
             .collect();
 
-        let filtered_positions: HashMap<String, Vec<u64>> = positions
-            .into_iter()
-            .filter(|(file_path, row_ids)| !row_ids.is_empty() && known_files.contains(file_path))
-            .collect();
+        let mut unknown_files: Vec<String> = Vec::new();
+        let mut filtered_positions: HashMap<String, Vec<u64>> = HashMap::new();
+
+        for (file_path, row_ids) in positions {
+            if row_ids.is_empty() {
+                continue;
+            }
+
+            if known_files.contains(&file_path) {
+                filtered_positions.insert(file_path, row_ids);
+            } else {
+                unknown_files.push(file_path);
+            }
+        }
+
+        if !unknown_files.is_empty() {
+            unknown_files.sort_unstable();
+            unknown_files.dedup();
+            return Err(datafusion_common::DataFusionError::Execution(format!(
+                "Failed to apply MERGE position deletes for table {} (cayenne): Unknown source files in delete map: {}",
+                self.table_metadata.table_name,
+                unknown_files.join(", ")
+            )));
+        }
 
         if filtered_positions.is_empty() {
             return Ok(0);

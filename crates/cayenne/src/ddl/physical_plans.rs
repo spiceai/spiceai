@@ -598,7 +598,15 @@ async fn execute_merge(
     // Fast path: join output already carries source file path + row positions.
     // This is available for position-based Cayenne tables via the
     // CayennePositionTrackingTable wrapper in merge_planner.
-    let (normalized_batches, delete_count) = if has_position_columns(&updated_batches) {
+    //
+    // Safety guard: if the table has pending position-based deletions, row
+    // indices from the scan may no longer correspond to raw file-local
+    // positions. In that case, fall back to the legacy filter path.
+    let has_positions = has_position_columns(&updated_batches);
+    let use_position_fast_path =
+        has_positions && !has_pending_position_deletions_provider(&target_provider).await;
+
+    let (normalized_batches, delete_count) = if use_position_fast_path {
         let positions = extract_deletion_positions(&updated_batches)?;
 
         let stripped_batches = strip_position_columns(updated_batches, &target_schema)?;
@@ -607,13 +615,25 @@ async fn execute_merge(
         let delete_count = delete_by_positions(&target_provider, positions).await?;
         (stripped_batches, delete_count)
     } else {
+        if has_positions {
+            tracing::debug!(
+                "MERGE position-tracking fast path disabled at execution time; falling back to legacy delete path"
+            );
+        }
+
         // Legacy path: normalize output to match the target schema, validate
         // uniqueness, build a key filter, and push through delete_from.
-        let normalized_batches = updated_batches
-            .into_iter()
-            .map(|batch| arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema)))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(DataFusionError::from)?;
+        let normalized_batches = if has_positions {
+            strip_position_columns(updated_batches, &target_schema)?
+        } else {
+            updated_batches
+                .into_iter()
+                .map(|batch| {
+                    arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(DataFusionError::from)?
+        };
 
         validate_no_duplicate_target_keys(&normalized_batches, &target_key_columns)?;
 
@@ -742,6 +762,70 @@ fn strip_position_columns(
         .collect()
 }
 
+async fn has_pending_position_deletions_provider(provider: &Arc<dyn TableProvider>) -> bool {
+    if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>() {
+        if !cayenne.is_position_based() {
+            return false;
+        }
+        return match cayenne.has_pending_deletions() {
+            Ok(has_pending) => has_pending,
+            Err(err) => {
+                tracing::warn!(
+                    "MERGE position-tracking fast path disabled: failed to read deletion cache: {err}"
+                );
+                true
+            }
+        };
+    }
+
+    if let Some(adapter) = provider
+        .as_any()
+        .downcast_ref::<DeletionTableProviderAdapter>()
+    {
+        if let Some(cayenne) = adapter
+            .source()
+            .as_any()
+            .downcast_ref::<CayenneTableProvider>()
+        {
+            if !cayenne.is_position_based() {
+                return false;
+            }
+            return match cayenne.has_pending_deletions() {
+                Ok(has_pending) => has_pending,
+                Err(err) => {
+                    tracing::warn!(
+                        "MERGE position-tracking fast path disabled: failed to read deletion cache: {err}"
+                    );
+                    true
+                }
+            };
+        }
+
+        #[cfg(feature = "partition-table-provider")]
+        if adapter
+            .source()
+            .as_any()
+            .downcast_ref::<PartitionTableProvider>()
+            .is_some()
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    #[cfg(feature = "partition-table-provider")]
+    if provider
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .is_some()
+    {
+        return true;
+    }
+
+    false
+}
+
 async fn delete_by_positions(
     provider: &Arc<dyn TableProvider>,
     positions: HashMap<String, Vec<u64>>,
@@ -763,60 +847,35 @@ async fn delete_by_positions(
         }
 
         #[cfg(feature = "partition-table-provider")]
-        if let Some(partitioned) = adapter
+        if adapter
             .source()
             .as_any()
             .downcast_ref::<PartitionTableProvider>()
+            .is_some()
         {
-            let partition_providers = partitioned.partition_table_providers().await;
-            let mut total = 0u64;
-            for partition_provider in &partition_providers {
-                if let Some(cayenne) = unwrap_to_cayenne(partition_provider) {
-                    total += cayenne
-                        .persist_position_deletions(positions.clone())
-                        .await?;
-                }
-            }
-            return Ok(total);
+            return Err(DataFusionError::Internal(
+                "MERGE position-delete fast path dispatch reached a partitioned provider; legacy delete path should have been used"
+                    .to_string(),
+            ));
         }
     }
 
     #[cfg(feature = "partition-table-provider")]
-    if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
-        let partition_providers = partitioned.partition_table_providers().await;
-        let mut total = 0u64;
-        for partition_provider in &partition_providers {
-            if let Some(cayenne) = unwrap_to_cayenne(partition_provider) {
-                total += cayenne
-                    .persist_position_deletions(positions.clone())
-                    .await?;
-            }
-        }
-        return Ok(total);
+    if provider
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .is_some()
+    {
+        return Err(DataFusionError::Internal(
+            "MERGE position-delete fast path dispatch reached a partitioned provider; legacy delete path should have been used"
+                .to_string(),
+        ));
     }
 
     Err(DataFusionError::Internal(
-        "delete_by_positions: target provider does not support position-based Cayenne deletion"
+        "MERGE position-delete fast path dispatch failed: target provider does not support position-based Cayenne deletion"
             .to_string(),
     ))
-}
-
-#[cfg(feature = "partition-table-provider")]
-fn unwrap_to_cayenne(provider: &Arc<dyn TableProvider>) -> Option<&CayenneTableProvider> {
-    provider
-        .as_any()
-        .downcast_ref::<CayenneTableProvider>()
-        .or_else(|| {
-            provider
-                .as_any()
-                .downcast_ref::<DeletionTableProviderAdapter>()
-                .and_then(|adapter| {
-                    adapter
-                        .source()
-                        .as_any()
-                        .downcast_ref::<CayenneTableProvider>()
-                })
-        })
 }
 
 /// Extract the row count from DML output batches (e.g., from `delete_from` or `insert_into`).

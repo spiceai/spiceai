@@ -189,14 +189,8 @@ async fn build_local_merge_input(
     let target_qualifier = merge.target_qualifier.as_str();
     let source_qualifier = merge.source_qualifier.as_str();
 
-    let use_position_tracking = is_position_based_cayenne(&target_provider).await;
-    let scan_provider: Arc<dyn TableProvider> = if use_position_tracking {
-        Arc::new(CayennePositionTrackingTable::try_new(Arc::clone(
-            &target_provider,
-        ))?)
-    } else {
-        Arc::clone(&target_provider)
-    };
+    let (scan_provider, use_position_tracking) =
+        prepare_target_scan_provider(Arc::clone(&target_provider), session_state).await;
 
     let target_scan =
         LogicalPlanBuilder::scan(target_qualifier, provider_as_source(scan_provider), None)?
@@ -303,6 +297,43 @@ async fn build_local_merge_input(
     Ok((params, join_physical))
 }
 
+async fn prepare_target_scan_provider(
+    target_provider: Arc<dyn TableProvider>,
+    session_state: &datafusion::execution::SessionState,
+) -> (Arc<dyn TableProvider>, bool) {
+    if !is_position_based_cayenne(&target_provider).await {
+        return (target_provider, false);
+    }
+
+    if has_pending_position_deletions(&target_provider).await {
+        tracing::debug!(
+            "MERGE position-tracking fast path disabled: target table has pending position-based deletions"
+        );
+        return (target_provider, false);
+    }
+
+    let wrapper = match CayennePositionTrackingTable::try_new(Arc::clone(&target_provider)) {
+        Ok(wrapper) => wrapper,
+        Err(err) => {
+            tracing::debug!(
+                "MERGE position-tracking fast path disabled: failed to create wrapper; falling back to legacy delete path: {err}"
+            );
+            return (target_provider, false);
+        }
+    };
+
+    // Probe the wrapped scan once at planning time. If scan-shape assumptions
+    // are not met (e.g. non-single-file partitions), fall back safely.
+    if let Err(err) = wrapper.scan(session_state, None, &[], None).await {
+        tracing::debug!(
+            "MERGE position-tracking fast path disabled: scan probe failed; falling back to legacy delete path: {err}"
+        );
+        return (target_provider, false);
+    }
+
+    (Arc::new(wrapper), true)
+}
+
 async fn is_position_based_cayenne(provider: &Arc<dyn TableProvider>) -> bool {
     if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>() {
         return cayenne.is_position_based();
@@ -321,51 +352,96 @@ async fn is_position_based_cayenne(provider: &Arc<dyn TableProvider>) -> bool {
         }
 
         #[cfg(feature = "partition-table-provider")]
-        if let Some(partitioned) = adapter
+        if adapter
             .source()
             .as_any()
             .downcast_ref::<PartitionTableProvider>()
+            .is_some()
         {
-            return partitioned
-                .partition_table_providers()
-                .await
-                .first()
-                .and_then(unwrap_to_cayenne)
-                .is_some_and(CayenneTableProvider::is_position_based);
+            // Partitioned providers currently use the legacy MERGE delete path.
+            return false;
         }
 
         return false;
     }
 
     #[cfg(feature = "partition-table-provider")]
-    if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
-        return partitioned
-            .partition_table_providers()
-            .await
-            .first()
-            .and_then(unwrap_to_cayenne)
-            .is_some_and(CayenneTableProvider::is_position_based);
+    if provider
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .is_some()
+    {
+        // Partitioned providers currently use the legacy MERGE delete path.
+        return false;
     }
 
     false
 }
 
-#[cfg(feature = "partition-table-provider")]
-fn unwrap_to_cayenne(provider: &Arc<dyn TableProvider>) -> Option<&CayenneTableProvider> {
-    provider
+async fn has_pending_position_deletions(provider: &Arc<dyn TableProvider>) -> bool {
+    if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>() {
+        if !cayenne.is_position_based() {
+            return false;
+        }
+
+        return match cayenne.has_pending_deletions() {
+            Ok(has_pending) => has_pending,
+            Err(err) => {
+                tracing::warn!(
+                    "MERGE position-tracking fast path disabled: failed to read deletion cache: {err}"
+                );
+                true
+            }
+        };
+    }
+
+    if let Some(adapter) = provider
         .as_any()
-        .downcast_ref::<CayenneTableProvider>()
-        .or_else(|| {
-            provider
-                .as_any()
-                .downcast_ref::<DeletionTableProviderAdapter>()
-                .and_then(|adapter| {
-                    adapter
-                        .source()
-                        .as_any()
-                        .downcast_ref::<CayenneTableProvider>()
-                })
-        })
+        .downcast_ref::<DeletionTableProviderAdapter>()
+    {
+        if let Some(cayenne) = adapter
+            .source()
+            .as_any()
+            .downcast_ref::<CayenneTableProvider>()
+        {
+            if !cayenne.is_position_based() {
+                return false;
+            }
+
+            return match cayenne.has_pending_deletions() {
+                Ok(has_pending) => has_pending,
+                Err(err) => {
+                    tracing::warn!(
+                        "MERGE position-tracking fast path disabled: failed to read deletion cache: {err}"
+                    );
+                    true
+                }
+            };
+        }
+
+        #[cfg(feature = "partition-table-provider")]
+        if adapter
+            .source()
+            .as_any()
+            .downcast_ref::<PartitionTableProvider>()
+            .is_some()
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    #[cfg(feature = "partition-table-provider")]
+    if provider
+        .as_any()
+        .downcast_ref::<PartitionTableProvider>()
+        .is_some()
+    {
+        return true;
+    }
+
+    false
 }
 
 async fn resolve_table(

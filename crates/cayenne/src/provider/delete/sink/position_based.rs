@@ -349,6 +349,20 @@ impl CayenneDeletionSink {
             return Ok(0);
         }
 
+        // RoaringBitmap uses u32 row IDs. Fail safely if any file-local position
+        // exceeds the representable range instead of silently truncating.
+        let max_row_id = u64::from(u32::MAX);
+        for (file_path, ids) in &row_ids {
+            if let Some(&too_large_id) = ids.iter().find(|&&id| id > max_row_id) {
+                return Err(Error::DataValidation {
+                    table: table_name.clone(),
+                    message: format!(
+                        "Position-based deletion row index {too_large_id} for file '{file_path}' exceeds u32::MAX"
+                    ),
+                });
+            }
+        }
+
         // Get the position-based cache from the PkDeletionStrategy (only valid for PositionBased)
         let cached_deleted_row_ids = self
             .pk_deletion_strategy
@@ -423,7 +437,7 @@ impl CayenneDeletionSink {
                     .get(file_path)
                     .cloned()
                     .unwrap_or_default();
-                bitmap.extend(row_ids.iter().filter_map(|&id| u32::try_from(id).ok()));
+                bitmap.extend(row_ids.iter().map(|&id| id as u32));
                 (file_path.clone(), bitmap)
             })
             .collect();
