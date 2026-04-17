@@ -31,6 +31,8 @@ use crate::{init_tracing, utils::test_request_context};
 pub mod common;
 #[cfg(feature = "postgres-replication")]
 pub mod replication;
+#[cfg(all(feature = "postgres-replication", feature = "duckdb"))]
+pub mod replication_tpch;
 
 #[tokio::test]
 async fn test_postgres_types() -> Result<(), anyhow::Error> {
