@@ -27,6 +27,7 @@ pub mod client;
 pub mod config;
 pub mod metrics;
 pub mod pgoutput;
+pub mod resilience;
 pub mod slot;
 
 use std::sync::Arc;
@@ -188,25 +189,92 @@ async fn start_inner(
         None
     };
 
+    // When we skip bootstrap (slot resume or `initial_snapshot: false`), emit
+    // an immediate empty `is_dataset_ready=true` envelope so the runtime marks
+    // the dataset ready without having to wait for the first WAL change. On
+    // quiet sources that wait could be indefinite.
+    let skip_bootstrap_ready: Option<ChangesStream> = if bootstrap_stream.is_none() {
+        let envelope = build_ready_signal_envelope(&schema).map_err(|e| Error::SchemaMismatch {
+            message: e.to_string(),
+        })?;
+        Some(Box::pin(futures::stream::once(async move { Ok(envelope) })))
+    } else {
+        None
+    };
+
     // 3. Start the WAL stream.
     let wal_stream = client::start_wal_stream(client::WalStreamInput {
         params,
         slot_name: outcome.slot_name.clone(),
         publication_name: outcome.publication_name.clone(),
         start_lsn: outcome.consistent_lsn,
-        schema,
+        schema: Arc::clone(&schema),
         primary_keys,
         dataset_name,
-        is_dataset_ready_on_first_event: bootstrap_stream.is_none(),
+        // The dataset is already marked ready by `skip_bootstrap_ready` (if
+        // bootstrap was skipped) or by the final bootstrap envelope.
+        is_dataset_ready_on_first_event: false,
         confirmed_flush,
         metrics,
     })
     .await?;
 
-    Ok(match bootstrap_stream {
-        Some(boot) => Box::pin(boot.chain(wal_stream)),
-        None => wal_stream,
+    Ok(match (bootstrap_stream, skip_bootstrap_ready) {
+        (Some(boot), _) => Box::pin(boot.chain(wal_stream)),
+        (None, Some(ready)) => Box::pin(ready.chain(wal_stream)),
+        (None, None) => wal_stream,
     })
+}
+
+/// Construct an empty `ChangeEnvelope` whose only job is to flip
+/// `is_dataset_ready=true`. Zero-row batch, no-op committer.
+fn build_ready_signal_envelope(
+    schema: &SchemaRef,
+) -> std::result::Result<crate::cdc::ChangeEnvelope, StreamError> {
+    use arrow::array::{ArrayRef, ListArray, RecordBatch, StringArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{DataType, Field};
+
+    // Build zero-row versions of each dataset column.
+    let empty_data_columns: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .map(|f| arrow::array::new_empty_array(f.data_type()))
+        .collect();
+    let data_struct = StructArray::new(schema.fields().clone(), empty_data_columns, None);
+
+    let op_array: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
+    let pk_field = Arc::new(Field::new("item", DataType::Utf8, false));
+    let pk_list = ListArray::new(
+        Arc::clone(&pk_field),
+        OffsetBuffer::new(vec![0i32].into()),
+        Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
+        None,
+    );
+
+    let wrapper_schema = Arc::new(crate::cdc::changes_schema(schema));
+    let record = RecordBatch::try_new(
+        wrapper_schema,
+        vec![op_array, Arc::new(pk_list), Arc::new(data_struct)],
+    )
+    .map_err(|e| StreamError::External(format!("ready-signal batch: {e}")))?;
+    let batch = crate::cdc::ChangeBatch::try_new(record)
+        .map_err(|e| StreamError::External(format!("ready-signal batch validation: {e}")))?;
+
+    Ok(crate::cdc::ChangeEnvelope::new(
+        Box::new(NoOpCommitter),
+        batch,
+        true, // is_dataset_ready
+    ))
+}
+
+struct NoOpCommitter;
+
+#[async_trait::async_trait]
+impl crate::cdc::CommitChange for NoOpCommitter {
+    async fn commit(&self) -> std::result::Result<(), crate::cdc::CommitError> {
+        Ok(())
+    }
 }
 
 fn stream_error(err: Error) -> StreamError {

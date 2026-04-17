@@ -64,13 +64,30 @@ pub async fn setup_slot_and_publication(
         }
         .fail();
     }
+
+    // Retry the setup-path on transient connect/exec failures — catalog queries
+    // are idempotent and slot/publication creation is guarded by `IF EXISTS`
+    // checks. Fatal errors (permission denied, syntax) are propagated on the
+    // first attempt.
+    super::resilience::retry_async(
+        "postgres_replication::setup",
+        super::resilience::DEFAULT_SETUP_MAX_ELAPSED,
+        is_transient_setup_error,
+        || async { setup_once(params, schema_name, table_name).await },
+    )
+    .await
+}
+
+async fn setup_once(
+    params: &ReplicationParams,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<SlotInfo> {
     let (client, connection) = params
         .setup_pg_config()
         .connect(NoTls)
         .await
         .context(SetupConnectSnafu)?;
-    // Drive the connection in the background; ignore the result since we tear it
-    // down when `client` is dropped.
     let conn_task = tokio::spawn(async move {
         if let Err(e) = connection.await {
             tracing::warn!("postgres setup connection terminated: {e}");
@@ -83,6 +100,17 @@ pub async fn setup_slot_and_publication(
     let _ = conn_task.await;
 
     outcome
+}
+
+fn is_transient_setup_error(e: &super::Error) -> bool {
+    match e {
+        super::Error::SetupConnect { source } | super::Error::SetupExec { source } => {
+            super::resilience::is_transient_pg(source)
+        }
+        super::Error::Bootstrap { source } => super::resilience::is_transient_pg(source),
+        // Config, schema, permission errors are fatal.
+        _ => false,
+    }
 }
 
 async fn do_setup(

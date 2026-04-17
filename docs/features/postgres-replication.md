@@ -228,13 +228,14 @@ Spice emits OpenTelemetry observables for every replicated Postgres dataset. Met
 | `dataset_postgres_replication_bootstrap_rows_total` | Counter | Rows loaded during the initial `REPEATABLE READ` snapshot. |
 | `dataset_postgres_replication_bootstrap_complete`   | Gauge   | `1` once bootstrap has finished (or was skipped on resume); `0` while snapshotting. Use as a readiness probe. |
 
-### Errors
+### Errors and resilience
 
 | Metric                                                        | Type    | Description |
 |---------------------------------------------------------------|---------|-------------|
 | `dataset_postgres_replication_decode_errors_total`            | Counter | pgoutput decoder errors. Non-zero usually means a Postgres version mismatch or a replication protocol bug — check logs. |
 | `dataset_postgres_replication_schema_mismatch_errors_total`   | Counter | Source relation no longer matches the dataset's declared schema. The stream errors out; fix the schema and restart. |
-| `dataset_postgres_replication_recv_errors_total`              | Counter | Transport-level errors receiving from the replication connection (TCP drops, auth failures). |
+| `dataset_postgres_replication_recv_errors_total`              | Counter | Transport-level errors receiving from the replication connection. Each one triggers a reconnect attempt. |
+| `dataset_postgres_replication_reconnects_total`               | Counter | Number of times the stream has reconnected after a transient failure (network drop, Postgres restart, TLS reset). A non-zero value with no stream-level error means the connection wobbled and we recovered automatically. |
 
 ### Example Prometheus queries
 
@@ -274,6 +275,7 @@ To keep the default metric cardinality reasonable, only operationally critical m
 | `replication_decode_errors_total`                 | ✅              |
 | `replication_schema_mismatch_errors_total`        | ✅              |
 | `replication_recv_errors_total`                   | ✅              |
+| `replication_reconnects_total`                    | ✅              |
 | `replication_confirmed_flush_lsn`                 | — enable manually |
 | `replication_server_wal_end_lsn`                  | — enable manually |
 | `replication_truncates_total`                     | — enable manually |
@@ -333,6 +335,17 @@ On PostgreSQL 13 or older, `pg_replication_slots` has no inactivity timestamp �
 ### Rebooting a replica
 
 Nothing special required. Spice rejoins its existing slot and resumes from the last acknowledged LSN. The accelerator catches up automatically.
+
+### Resilience
+
+The replication stream is designed to survive transient failures without operator intervention:
+
+- **Network blips / TCP resets / Postgres restarts**: classified as transient and retried with exponential backoff (500 ms → 30 s, ±20 % jitter). The slot's server-side state is the source of truth, so reconnects resume from the last acknowledged LSN — no data loss.
+- **Auth failures, slot missing, schema mismatch, permission denied**: classified as fatal and surfaced as a stream-level error so you can fix the configuration. These are not retried.
+- **Setup / bootstrap phase**: transient errors during initial slot setup or snapshot bootstrap are retried for up to 2 minutes before giving up.
+- **Postgres SQLSTATE classes 08xxx (connection exception) and 57P0x (admin shutdown, cannot-connect-now) are retried**; other server-side errors (23xxx constraint, 42xxx syntax/permission) are not.
+- **Watch `dataset_postgres_replication_reconnects_total`** to detect flaky networks — the stream may be healthy end-to-end while continuously reconnecting under the hood.
+- **No thundering herd across replicas**: the ±20 % jitter means N replicas reconnecting after a common outage don't synchronise their retry attempts.
 
 ### Rebuilding an accelerator from scratch
 

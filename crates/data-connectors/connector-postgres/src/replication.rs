@@ -119,7 +119,7 @@ const METRICS: &[MetricSpec] = &[
             "Bytes of WAL between the server's latest reported position and our last \
              confirmed flush LSN.",
         )
-        .unit("by")
+        .unit("By") // UCUM code for bytes (OpenTelemetry spec §Unit)
         .auto_register(),
     MetricSpec::new(
         "replication_confirmed_flush_lsn",
@@ -201,6 +201,16 @@ const METRICS: &[MetricSpec] = &[
     .description(
         "Total transport-level errors while receiving from the Postgres replication \
              connection (TCP drops, auth failures after reconnect, etc).",
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_reconnects_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Number of times the stream reconnected after a transient failure \
+         (network drop, Postgres restart). A non-zero value with no user-visible \
+         error just means the connection wobbled and we recovered.",
     )
     .auto_register(),
 ];
@@ -305,6 +315,11 @@ impl MetricsProvider for PostgresMetricsProvider {
             "replication_recv_errors_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.replication_recv_errors_total(), &attributes);
+                })))
+            }
+            "replication_reconnects_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.replication_reconnects_total(), &attributes);
                 })))
             }
             _ => None,

@@ -53,6 +53,10 @@ pub struct MetricsCollector {
     wal_decode_errors_total: AtomicU64,
     schema_mismatch_errors_total: AtomicU64,
     replication_recv_errors_total: AtomicU64,
+    /// Number of times the stream reconnected after a transient failure.
+    /// A non-zero value with no user-visible error just means the network
+    /// wobbled and we recovered.
+    replication_reconnects_total: AtomicU64,
 
     // Watermark: commit time of the most-recent transaction we've ingested.
     // Used to compute `replication_lag_ms = now - watermark`.
@@ -134,6 +138,10 @@ impl MetricsCollector {
     }
     pub fn inc_recv_error(&self) {
         self.replication_recv_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn inc_reconnect(&self) {
+        self.replication_reconnects_total
             .fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -222,6 +230,11 @@ impl Metrics {
     pub fn replication_recv_errors_total(&self) -> u64 {
         self.collector
             .replication_recv_errors_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn replication_reconnects_total(&self) -> u64 {
+        self.collector
+            .replication_reconnects_total
             .load(Ordering::Relaxed)
     }
 }

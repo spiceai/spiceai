@@ -52,13 +52,31 @@ pub struct WalStreamInput {
 }
 
 /// Establish the replication connection and return a `ChangesStream`.
+///
+/// The stream is resilient: transient network / TCP / Postgres-restart errors
+/// are handled internally by reconnecting with exponential backoff. Only
+/// *fatal* errors (authentication failure, slot dropped, schema mismatch) are
+/// surfaced to the caller.
 pub async fn start_wal_stream(input: WalStreamInput) -> Result<ChangesStream> {
+    // Do one upfront connection attempt so startup errors (bad host, auth
+    // failure, slot missing) surface immediately instead of being swallowed
+    // by the reconnect loop. If it succeeds we hand the client to the stream;
+    // if it fails with a transient error we still proceed into the resilient
+    // loop so the dataset comes up once Postgres is reachable.
     let config = build_replication_config(&input);
-    let client = ReplicationClient::connect(config)
-        .await
-        .map_err(|source| super::Error::StartReplication { source })?;
-
-    Ok(Box::pin(wal_stream(client, input)))
+    let initial = ReplicationClient::connect(config.clone()).await;
+    match initial {
+        Ok(client) => Ok(Box::pin(wal_stream(Some(client), config, input))),
+        Err(e) if super::resilience::is_transient_pgwire(&e) => {
+            tracing::warn!(
+                error = %e,
+                "initial replication connect failed transiently; stream will reconnect in background"
+            );
+            input.metrics.inc_reconnect();
+            Ok(Box::pin(wal_stream(None, config, input)))
+        }
+        Err(source) => Err(super::Error::StartReplication { source }),
+    }
 }
 
 fn build_replication_config(input: &WalStreamInput) -> ReplicationConfig {
@@ -84,7 +102,8 @@ fn build_replication_config(input: &WalStreamInput) -> ReplicationConfig {
 }
 
 fn wal_stream(
-    mut client: ReplicationClient,
+    initial_client: Option<ReplicationClient>,
+    config: ReplicationConfig,
     input: WalStreamInput,
 ) -> impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<> {
     let schema = input.schema;
@@ -95,16 +114,64 @@ fn wal_stream(
     let metrics = input.metrics;
 
     try_stream! {
-        let mut decoder = Decoder::new();
-        let mut txn: Option<TransactionBuffer> = None;
         let mut first_emitted = !mark_ready_on_first;
+        let mut client_slot: Option<ReplicationClient> = initial_client;
+        let mut backoff = super::resilience::Backoff::default_for_stream();
 
-        loop {
+        // Outer reconnect loop: runs until we hit a fatal error or the stream
+        // reaches a natural end (rare — Postgres replication slots are
+        // indefinite). Transient errors drop the current client and restart.
+        'reconnect: loop {
+            // Ensure we have an open client. Reconnect with backoff on
+            // transient failures.
+            let mut client = match client_slot.take() {
+                Some(c) => { backoff.reset(); c }
+                None => {
+                    loop {
+                        match ReplicationClient::connect(config.clone()).await {
+                            Ok(c) => { backoff.reset(); break c; }
+                            Err(e) if super::resilience::is_transient_pgwire(&e) => {
+                                metrics.inc_reconnect();
+                                tracing::warn!(
+                                    dataset = %dataset_name,
+                                    error = %e,
+                                    retry_in_ms = %backoff.current().as_millis(),
+                                    "replication connect failed transiently; backing off"
+                                );
+                                backoff.wait().await;
+                            }
+                            Err(e) => {
+                                Err(StreamError::External(format!(
+                                    "fatal replication connect failed for {dataset_name}: {e}"
+                                )))?;
+                                unreachable!();
+                            }
+                        }
+                    }
+                }
+            };
+            // Fresh connection: relation cache and any half-built transaction
+            // are stale — Postgres will resend the Relation before the next
+            // change anyway.
+            let mut decoder = Decoder::new();
+            let mut txn: Option<TransactionBuffer> = None;
+
+        'recv: loop {
             let event = match client.recv().await {
                 Ok(Some(e)) => e,
-                Ok(None) => break,
+                Ok(None) => break 'reconnect, // server closed cleanly
                 Err(e) => {
                     metrics.inc_recv_error();
+                    if super::resilience::is_transient_pgwire(&e) {
+                        metrics.inc_reconnect();
+                        tracing::warn!(
+                            dataset = %dataset_name,
+                            error = %e,
+                            "replication recv failed transiently; reconnecting"
+                        );
+                        // Drop this client, loop back to outer reconnect.
+                        break 'recv;
+                    }
                     Err(StreamError::External(format!(
                         "postgres replication recv failed for {dataset_name}: {e}"
                     )))?;
@@ -143,34 +210,31 @@ fn wal_stream(
                             }
                         }
                         DecodedMessage::Insert { relation_id, tuple } => {
-                            let rel = decoder
-                                .relation(relation_id)
-                                .ok_or_else(|| StreamError::External(format!(
-                                    "Insert before Relation for id {relation_id}"
-                                )))?
-                                .clone();
+                            let rel = resolve_relation_with_declared_pks(
+                                &decoder,
+                                relation_id,
+                                &primary_keys,
+                            )?;
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
                                 .push_insert(&rel, tuple);
                             metrics.inc_insert();
                         }
                         DecodedMessage::Update { relation_id, new, .. } => {
-                            let rel = decoder
-                                .relation(relation_id)
-                                .ok_or_else(|| StreamError::External(format!(
-                                    "Update before Relation for id {relation_id}"
-                                )))?
-                                .clone();
+                            let rel = resolve_relation_with_declared_pks(
+                                &decoder,
+                                relation_id,
+                                &primary_keys,
+                            )?;
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
                                 .push_update(&rel, new);
                             metrics.inc_update();
                         }
                         DecodedMessage::Delete { relation_id, old } => {
-                            let rel = decoder
-                                .relation(relation_id)
-                                .ok_or_else(|| StreamError::External(format!(
-                                    "Delete before Relation for id {relation_id}"
-                                )))?
-                                .clone();
+                            let rel = resolve_relation_with_declared_pks(
+                                &decoder,
+                                relation_id,
+                                &primary_keys,
+                            )?;
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
                                 .push_delete(&rel, old);
                             metrics.inc_delete();
@@ -262,11 +326,16 @@ fn wal_stream(
                         reached = ?reached,
                         "replication stream stopped at upper bound"
                     );
-                    break;
+                    break 'reconnect;
                 }
             }
-        }
-    }
+        } // end 'recv
+
+        // Inner 'recv loop broke on a transient error. Sleep with backoff
+        // before the outer 'reconnect loop reconnects.
+        backoff.wait().await;
+        } // end 'reconnect
+    } // end try_stream!
 }
 
 /// Convert a Postgres-epoch microsecond timestamp (from pgoutput Commit) into a
@@ -280,6 +349,33 @@ fn pg_epoch_to_system_time(pg_micros: i64) -> std::time::SystemTime {
     } else {
         std::time::UNIX_EPOCH
     }
+}
+
+/// Clone the cached pgoutput `Relation` and rewrite `is_key` so that *only*
+/// the dataset's declared primary-key columns are treated as keys.
+///
+/// Why: with `REPLICA IDENTITY FULL`, Postgres flags every column as key
+/// (used to match the old tuple during DELETE/UPDATE). That would explode
+/// `ChangeBatch.primary_keys` and include types the delete path can't handle
+/// (floats, dates). The dataset config already tells us which columns are the
+/// real PK — use that.
+fn resolve_relation_with_declared_pks(
+    decoder: &Decoder,
+    relation_id: u32,
+    declared_pks: &[String],
+) -> std::result::Result<super::pgoutput::Relation, StreamError> {
+    let mut rel = decoder
+        .relation(relation_id)
+        .ok_or_else(|| {
+            StreamError::External(format!("change event before Relation for id {relation_id}"))
+        })?
+        .clone();
+    if !declared_pks.is_empty() {
+        for col in &mut rel.columns {
+            col.is_key = declared_pks.iter().any(|pk| pk == &col.name);
+        }
+    }
+    Ok(rel)
 }
 
 fn advance(flush: &AtomicU64, to: u64) {

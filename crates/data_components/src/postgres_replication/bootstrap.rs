@@ -140,24 +140,39 @@ pub async fn snapshot_stream(
         let mut total_rows: u64 = 0;
         let confirmed_flush = Arc::new(AtomicU64::new(0)); // unused for bootstrap, but needed by envelope helper
 
+        // Cache dataset_field_idx → pg_column_idx once (computed from the first
+        // row's column metadata) so the hot per-row loop is O(fields) instead of
+        // O(fields²). All subsequent rows in a `SELECT *` stream share the same
+        // column layout.
+        let mut column_map: Option<Vec<usize>> = None;
+
         use futures::StreamExt;
         while let Some(row_result) = portal_stream.next().await {
             let row = row_result
                 .context(BootstrapSnafu)
                 .map_err(super::err_to_stream)?;
 
-            for (col_idx, field) in dataset_schema.fields().iter().enumerate() {
-                let pg_idx = row
-                    .columns()
+            if column_map.is_none() {
+                let map = dataset_schema
+                    .fields()
                     .iter()
-                    .position(|c| c.name() == field.name())
-                    .ok_or_else(|| super::Error::SchemaMismatch {
-                        message: format!(
-                            "dataset column `{}` not in source table `{schema_name}.{table_name}`",
-                            field.name()
-                        ),
+                    .map(|field| {
+                        row.columns()
+                            .iter()
+                            .position(|c| c.name() == field.name())
+                            .ok_or_else(|| super::Error::SchemaMismatch {
+                                message: format!(
+                                    "dataset column `{}` not in source table `{schema_name}.{table_name}`",
+                                    field.name()
+                                ),
+                            })
                     })
+                    .collect::<Result<Vec<_>>>()
                     .map_err(super::err_to_stream)?;
+                column_map = Some(map);
+            }
+            let column_map_ref = column_map.as_ref().expect("column_map set above");
+            for (col_idx, &pg_idx) in column_map_ref.iter().enumerate() {
                 builders[col_idx]
                     .append_from_row(&row, pg_idx)
                     .map_err(super::err_to_stream)?;
