@@ -44,9 +44,9 @@ use crate::{
     config::ClusterRole,
     datafusion::{DataFusion, request_context_extension::get_current_datafusion},
     dataupdate::{StreamingDataUpdate, UpdateType},
-    timing::TimedStream,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
+use telemetry::timing::TimedStream;
 
 use super::{
     Service, flightsql, flightsql::prepared_statement_query, metrics,

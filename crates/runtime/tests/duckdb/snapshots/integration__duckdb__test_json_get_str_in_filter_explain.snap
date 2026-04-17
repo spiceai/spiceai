@@ -1,0 +1,18 @@
+---
+source: crates/runtime/tests/duckdb/mod.rs
+expression: pretty
+---
++---------------+------------------------------------------------------------------------+
+| plan_type     | plan                                                                   |
++---------------+------------------------------------------------------------------------+
+| logical_plan  | Projection: json_test.id                                               |
+|               |   Filter: json_get_str(json_test.data, Utf8("name")) = Utf8("alice")   |
+|               |     TableScan: json_test projection=[id, data]                         |
+| physical_plan | FilterExec: json_get_str(data@1, name) = alice, projection=[id@0]      |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1 |
+|               |     SchemaCastScanExec                                                 |
+|               |       CooperativeExec                                                  |
+|               |         BytesProcessedExec                                             |
+|               |           DuckSqlExec sql= SELECT "id", "data" FROM "json_test"        |
+|               |                                                                        |
++---------------+------------------------------------------------------------------------+
