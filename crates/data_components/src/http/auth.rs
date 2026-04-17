@@ -623,14 +623,17 @@ mod tests {
             Ok(ClientAuthMethod::Basic)
         );
         assert_eq!(ClientAuthMethod::parse("BODY"), Ok(ClientAuthMethod::Body));
-        assert!(ClientAuthMethod::parse("none").is_err());
+        ClientAuthMethod::parse("none").expect_err("expected unsupported auth method to fail");
     }
 
     #[test]
     fn validates_token_url() {
-        assert!(validate_token_url("https://example.com/oauth/token").is_ok());
-        assert!(validate_token_url("http://localhost:1234/oauth/token").is_ok());
-        assert!(validate_token_url("http://127.0.0.1/oauth/token").is_ok());
+        validate_token_url("https://example.com/oauth/token")
+            .expect("expected https token URL to be accepted");
+        validate_token_url("http://localhost:1234/oauth/token")
+            .expect("expected localhost token URL to be accepted");
+        validate_token_url("http://127.0.0.1/oauth/token")
+            .expect("expected loopback token URL to be accepted");
         assert!(matches!(
             validate_token_url("http://example.com/oauth/token"),
             Err(Error::InsecureTokenUrl { .. })
