@@ -56,29 +56,16 @@ runs:
         if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
           sudo cp /etc/apt/sources.list.d/ubuntu.sources \
                   /etc/apt/sources.list.d/ubuntu.sources.bak
-          # deb822 stanzas are separated by blank lines. For the archive
-          # stanza (identified by archive.ubuntu.com; not security.ubuntu.com),
-          # replace the URIs line with the full space-separated mirror list so
-          # apt fails over through them in order.
-          # NOTE: match only on “archive.ubuntu.com” — the previous regex
-          # ([a-z]+\.)?archive\.ubuntu\.com caused mawk to greedily consume
-          # “archive.” into the optional group, leaving the rest unmatched.
-          sudo awk -v mirrors="$ALL_MIRRORS" '
-            BEGIN { RS = ""; ORS = "\n\n" }
-            {
-              if ($0 ~ /archive\.ubuntu\.com/) {
-                sub(/URIs:[^\n]*/, "URIs: " mirrors)
-              }
-              print
-            }
-          ' /etc/apt/sources.list.d/ubuntu.sources.bak \
-            | sudo tee /etc/apt/sources.list.d/ubuntu.sources > /dev/null
+          # Ubuntu's default deb822 file has separate archive and security
+          # stanzas. Replace only the archive URIs line and leave the
+          # security stanza untouched.
+          sudo sed -i -E \
+            -e "s|^URIs:[[:space:]]*https?://archive\.ubuntu\.com/ubuntu/?$|URIs: ${ALL_MIRRORS}|" \
+            /etc/apt/sources.list.d/ubuntu.sources
           # Fail loudly if the substitution had no effect. Check that the
-          # primary Pittsburgh mirror is now in the file — archive.ubuntu.com
-          # will still appear there as an intentional fallback in ALL_MIRRORS,
-          # so checking for its absence would be a false negative.
+          # primary Pittsburgh mirror is now in the file.
           if ! grep -q 'mirror\.pit\.teraswitch\.com' /etc/apt/sources.list.d/ubuntu.sources; then
-            echo "ERROR: configure-apt: Pittsburgh mirror not found in ubuntu.sources after substitution — awk may have failed to match" >&2
+            echo "ERROR: configure-apt: Pittsburgh mirror not found in ubuntu.sources after substitution" >&2
             echo "--- current ubuntu.sources URIs ---" >&2
             grep '^URIs:' /etc/apt/sources.list.d/ubuntu.sources >&2 || true
             exit 1
