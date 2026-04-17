@@ -225,6 +225,7 @@ impl Runtime {
             .collect()
     }
 
+    #[expect(clippy::result_large_err)]
     fn datasets_iter(self: Arc<Self>, app: &Arc<App>) -> impl Iterator<Item = Result<Dataset>> {
         app.datasets
             .clone()
