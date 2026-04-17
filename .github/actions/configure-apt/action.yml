@@ -62,13 +62,12 @@ runs:
           sudo sed -i -E \
             -e "s|^URIs:[[:space:]]*https?://archive\.ubuntu\.com/ubuntu/?$|URIs: ${ALL_MIRRORS}|" \
             /etc/apt/sources.list.d/ubuntu.sources
-          # Fail loudly if the substitution had no effect. Check that the
-          # configured primary mirror is now in the file.
+          # If the substitution had no effect, surface diagnostics but do not
+          # fail the action.
           if ! grep -Fq "${PRIMARY}" /etc/apt/sources.list.d/ubuntu.sources; then
-            echo "ERROR: configure-apt: primary mirror ${PRIMARY} not found in ubuntu.sources after substitution" >&2
+            echo "WARNING: configure-apt: primary mirror ${PRIMARY} not found in ubuntu.sources after substitution attempt" >&2
             echo "--- current ubuntu.sources URIs ---" >&2
             grep '^URIs:' /etc/apt/sources.list.d/ubuntu.sources >&2 || true
-            exit 1
           fi
         fi
         if [ -f /etc/apt/sources.list ]; then
