@@ -280,11 +280,11 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
         .await
 }
 
-/// Test that user predicates are pushed down into the `VirtualExecutionPlan` queries sent to
+/// Test that user predicates are pushed down into the `FlightSqlExec` queries sent to
 /// executors, rather than being applied as a post-fetch filter on the scheduler.
 ///
 /// Verifies:
-/// - `WHERE score > 85` appears in the `VirtualExecutionPlan name=flightsql` sql string in the EXPLAIN plan
+/// - `WHERE score > 85` appears in the `FlightSqlExec` sql string in the EXPLAIN plan
 /// - Only rows matching the predicate are returned (5 rows: ids 2,4,6,8,10)
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(not(target_os = "windows"))]
@@ -334,7 +334,7 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
             harness.wait_for_executors(Duration::from_secs(15)).await?;
             wait_for_row_count(&harness, "test_data", 10, Duration::from_secs(60)).await?;
 
-            // The user predicate `score > 85` must be visible inside the VirtualExecutionPlan
+            // The user predicate `score > 85` must be visible inside the FlightSqlExec
             // sql string — confirming it was pushed to the executor, not applied above.
             let filtered_sql = "SELECT id, name, score FROM test_data WHERE score > 85 ORDER BY id";
 
@@ -537,7 +537,7 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
 
             // Wait for partition metadata to be fully initialized and assigned
             // to executors. Poll until the EXPLAIN shows a distributed plan
-            // (VirtualExecutionPlan name=flightsql with bucket filters) rather than an EmptyRelation.
+            // (FlightSqlExec with bucket filters) rather than an EmptyRelation.
             let join_sql = "SELECT t.id, t.name, c.category, c.rating \
                             FROM test_data t JOIN categories c ON t.id = c.id \
                             ORDER BY t.id";
@@ -548,7 +548,7 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                 let plan_fmt = arrow::util::pretty::pretty_format_batches(&plan)
                     .expect("format explain")
                     .to_string();
-                if plan_fmt.contains("VirtualExecutionPlan name=flightsql")
+                if plan_fmt.contains("FlightSqlExec")
                     && plan_fmt.contains("bucket")
                 {
                     break plan;
@@ -585,7 +585,7 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
             );
             // Verify distributed execution operators
             assert!(
-                plan_fmt.contains("VirtualExecutionPlan name=flightsql"),
+                plan_fmt.contains("FlightSqlExec"),
                 "plan should use FlightSqlExec for distributed execution \n {plan_fmt}"
             );
             assert!(
