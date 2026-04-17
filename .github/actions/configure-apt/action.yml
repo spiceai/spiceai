@@ -56,20 +56,20 @@ runs:
         if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
           sudo cp /etc/apt/sources.list.d/ubuntu.sources \
                   /etc/apt/sources.list.d/ubuntu.sources.bak
-          # deb822 stanzas are separated by blank lines. For the archive
-          # stanza (matches archive.ubuntu.com; not security.ubuntu.com),
-          # replace the URIs line with the full space-separated mirror
-          # list so apt fails over through them in order.
-          sudo awk -v mirrors="$ALL_MIRRORS" '
-            BEGIN { RS = ""; ORS = "\n\n" }
-            {
-              if ($0 ~ /URIs:[[:space:]]*https?:\/\/([a-z]+\.)?archive\.ubuntu\.com/) {
-                sub(/URIs:[^\n]*/, "URIs: " mirrors)
-              }
-              print
-            }
-          ' /etc/apt/sources.list.d/ubuntu.sources.bak \
-            | sudo tee /etc/apt/sources.list.d/ubuntu.sources > /dev/null
+          # Ubuntu's default deb822 file has separate archive and security
+          # stanzas. Replace only the archive URIs line and leave the
+          # security stanza untouched.
+          sudo sed -i -E \
+            -e "s|^URIs:[[:space:]]*https?://archive\.ubuntu\.com/ubuntu/?$|URIs: ${ALL_MIRRORS}|" \
+            /etc/apt/sources.list.d/ubuntu.sources
+          # Fail loudly if the substitution had no effect. Check that the
+          # configured primary mirror is now in the file.
+          if ! grep -Fq "${PRIMARY}" /etc/apt/sources.list.d/ubuntu.sources; then
+            echo "ERROR: configure-apt: primary mirror ${PRIMARY} not found in ubuntu.sources after substitution" >&2
+            echo "--- current ubuntu.sources URIs ---" >&2
+            grep '^URIs:' /etc/apt/sources.list.d/ubuntu.sources >&2 || true
+            exit 1
+          fi
         fi
         if [ -f /etc/apt/sources.list ]; then
           sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
@@ -86,3 +86,24 @@ runs:
         echo "apt primary archive mirror: ${PRIMARY}"
         echo "deb822 mirror failover list: ${ALL_MIRRORS}"
         echo "apt retry policy installed at /etc/apt/apt.conf.d/99-spice-retries"
+
+    - name: Verify apt mirror configuration (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        echo "=== /etc/apt/apt.conf.d/99-spice-retries ==="
+        cat /etc/apt/apt.conf.d/99-spice-retries
+
+        echo "=== Active URIs in ubuntu.sources (deb822) ==="
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+          grep '^URIs:' /etc/apt/sources.list.d/ubuntu.sources
+        else
+          echo "not present"
+        fi
+
+        echo "=== Active archive lines in sources.list (classic) ==="
+        if [ -f /etc/apt/sources.list ]; then
+          grep 'archive\.ubuntu\.com' /etc/apt/sources.list | grep -v '^#' || true
+        else
+          echo "not present"
+        fi
