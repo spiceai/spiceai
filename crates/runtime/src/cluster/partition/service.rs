@@ -14,11 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Partition service — discovery, assignment, and executor notification.
+//! Service layer: stateful partition reconciliation.
 //!
-//! Both [`super::scheduler_task::PartitionManagementTask`] (periodic) and
-//! [`crate::datafusion::DataFusion`] (on-demand refresh) use this service
-//! to discover and assign partitions.
+//! Consumes [`super::discovery::PartitionDiff`] and applies it to the
+//! [`PartitionStore`], assigns unassigned partitions to connected executors,
+//! and notifies executors of load/unload events.
+//!
+//! Public entry points:
+//! - [`PartitionService::seed_table`] – write the diff to the store only.
+//!   Used at scheduler startup before any executors connect.
+//! - [`PartitionService::reconcile_table`] – seed + assign + notify for one
+//!   table, with no per-cycle assignment cap (pre-refresh / on-demand path).
+//! - [`PartitionService::reconcile_all`] – seed + assign + notify for every
+//!   accelerated table in the app, with the periodic per-cycle cap applied.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -30,15 +38,16 @@ use futures::future::join_all;
 use runtime_proto::scheduler_control_message::Message as SchedulerControlMessageEnum;
 use runtime_proto::{BytesArray, SchedulerControlMessage, UpdatePartitions};
 use snafu::prelude::*;
+use spicepod::partitioning::PartitionedBy;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 use crate::cluster::executor_registry::{self, ExecutorRegistry};
-use crate::cluster::partition::discovery::{discover_new_partitions, table_partition_values};
+use crate::cluster::partition::discovery::{self, PartitionDiff};
 use crate::cluster::partition::{
-    PartitionMetadata, PartitionStore, PartitionValue, partition_value_to_bytes,
+    PartitionMetadata, PartitionStore, PartitionValue, accelerated_tables, partition_value_to_bytes,
 };
 use crate::datafusion::DataFusion;
 
@@ -97,6 +106,9 @@ pub enum Error {
 
     #[snafu(display("Partition discovery timed out for table {table}"))]
     DiscoveryTimeout { table: String },
+
+    #[snafu(display("Failed to read current system time: {source}"))]
+    SystemTime { source: std::time::SystemTimeError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -104,11 +116,15 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Configuration for partition assignment operations.
 #[derive(Debug, Clone)]
 pub struct AssignmentConfig {
-    /// Maximum partitions to assign per cycle
+    /// Maximum partitions to assign per cycle. Only applied to
+    /// [`PartitionService::reconcile_all`] (periodic path). On-demand
+    /// reconciliation ([`PartitionService::reconcile_table`]) is uncapped to
+    /// avoid leaving newly-discovered partitions unassigned when the refresh
+    /// is forwarded to executors.
     pub max_assignments_per_cycle: usize,
-    /// Maximum partitions per executor (soft limit)
+    /// Maximum partitions per executor (soft limit).
     pub max_partitions_per_executor: usize,
-    /// How long to wait for partition discovery before timing out
+    /// How long to wait for partition discovery before timing out.
     pub discovery_timeout: Duration,
 }
 
@@ -120,6 +136,16 @@ impl Default for AssignmentConfig {
             discovery_timeout: Duration::from_secs(60),
         }
     }
+}
+
+/// How many assignments [`assign_pending`] may commit in a single invocation.
+#[derive(Debug, Clone, Copy)]
+enum AssignmentLimit {
+    /// No cap — assign every unassigned partition.
+    Unlimited,
+    /// Cap total assignments at `max_assignments_per_cycle` from
+    /// [`AssignmentConfig`].
+    PerCycleCap,
 }
 
 struct CycleState {
@@ -151,15 +177,11 @@ struct CommitResult {
     failed: Vec<(Assignment, Error)>,
 }
 
-struct DiscoveryResult {
-    new_partitions: Vec<(TableReference, Vec<PartitionValue>)>,
-    removed_partitions: Vec<(TableReference, Vec<PartitionValue>)>,
-}
-
 /// Shared partition infrastructure for discovery and assignment operations.
 ///
-/// Holds the partition manager, executor registry, app reference, and assignment configuration.
-/// Methods take `&Arc<DataFusion>` as a parameter to avoid circular references.
+/// Holds the [`PartitionStore`], executor registry, app reference, and
+/// assignment configuration. Public methods are `seed_table`, `reconcile_table`,
+/// and `reconcile_all`; everything else is an internal composition helper.
 pub struct PartitionService {
     pub partition_store: Arc<PartitionStore>,
     pub executor_registry: Arc<ExecutorRegistry>,
@@ -183,8 +205,37 @@ impl PartitionService {
         }
     }
 
-    /// Discover new partitions for a single table, assign them, and notify executors.
-    pub async fn discover_and_assign_for_table(
+    // ================================================================
+    // Public entry points
+    // ================================================================
+
+    /// Seed the store with current source partitions for a single table.
+    ///
+    /// Writes new partitions as unassigned and removes stale ones; does **not**
+    /// assign to executors or send notifications. Used at scheduler startup
+    /// before executors have connected.
+    pub async fn seed_table(
+        &self,
+        table: &TableReference,
+        partition_by: &[PartitionedBy],
+        df: &Arc<DataFusion>,
+    ) -> Result<()> {
+        self.partition_store
+            .refresh()
+            .await
+            .context(PartitionStoreRefreshSnafu)?;
+        self.record_diff(table, partition_by, df).await?;
+        Ok(())
+    }
+
+    /// Discover new/removed partitions for a single table, add/remove them in
+    /// the store, and assign + notify executors for everything pending on that
+    /// table. Uncapped — assigns every pending partition before returning.
+    ///
+    /// Used by the on-demand refresh path: a `spice refresh` command calls
+    /// this before forwarding the refresh to executors, ensuring any new
+    /// partition values are assigned first.
+    pub async fn reconcile_table(
         &self,
         table: &TableReference,
         df: &Arc<DataFusion>,
@@ -201,13 +252,99 @@ impl PartitionService {
             .await
             .context(PartitionStoreRefreshSnafu)?;
 
-        let new_partitions = match timeout(
+        self.record_diff(table, &partition_by, df).await?;
+
+        self.partition_store
+            .refresh()
+            .await
+            .context(PartitionStoreRefreshSnafu)?;
+
+        let executors = self.executor_registry.connected_executors().await;
+        if executors.is_empty() {
+            tracing::warn!(table = %table, "No executors connected, cannot assign new partitions");
+            return Ok(());
+        }
+
+        self.assign_pending(
+            &[table.clone()],
+            &executors,
+            df,
+            AssignmentLimit::Unlimited,
+        )
+        .await
+    }
+
+    /// Discover, add/remove, and assign partitions for every accelerated table
+    /// declared in the app. The per-cycle assignment cap from
+    /// [`AssignmentConfig::max_assignments_per_cycle`] is applied so that a
+    /// slow cycle can't saturate the cluster in one tick.
+    ///
+    /// Used by the periodic partition-management background task.
+    pub async fn reconcile_all(&self, df: &Arc<DataFusion>) -> Result<()> {
+        let Some(app) = self.app.read().await.clone() else {
+            tracing::warn!("App not initialized, skipping partition discovery");
+            return Ok(());
+        };
+
+        self.partition_store
+            .refresh()
+            .await
+            .context(PartitionStoreRefreshSnafu)?;
+
+        let mut reconciled_tables: Vec<TableReference> = Vec::new();
+        for (table, partition_by) in accelerated_tables(&app) {
+            match self.record_diff(&table, &partition_by, df).await {
+                Ok(_) => reconciled_tables.push(table),
+                Err(e) => {
+                    tracing::warn!(table = %table, error = %e, "Per-table diff failed, continuing");
+                }
+            }
+        }
+
+        if reconciled_tables.is_empty() {
+            return Ok(());
+        }
+
+        self.partition_store
+            .refresh()
+            .await
+            .context(PartitionStoreRefreshSnafu)?;
+
+        let executors = self.executor_registry.connected_executors().await;
+        if executors.is_empty() {
+            return Ok(());
+        }
+
+        self.assign_pending(
+            &reconciled_tables,
+            &executors,
+            df,
+            AssignmentLimit::PerCycleCap,
+        )
+        .await
+    }
+
+    /// Step 1: query the source, diff against the store, and apply the diff.
+    ///
+    /// - Ensures table metadata is initialized before adding new partitions.
+    /// - Adds new partitions (unassigned) with OCC-retry.
+    /// - Removes stale partitions with OCC-retry and emits unload notifications
+    ///   to executors that previously held them.
+    ///
+    /// Returns the computed diff for logging/metrics in the caller.
+    async fn record_diff(
+        &self,
+        table: &TableReference,
+        partition_by: &[PartitionedBy],
+        df: &Arc<DataFusion>,
+    ) -> Result<PartitionDiff> {
+        let diff = match timeout(
             self.config.discovery_timeout,
-            discover_new_partitions(table, &partition_by, &self.partition_store, df),
+            discovery::diff_table_partitions(table, partition_by, &self.partition_store, df),
         )
         .await
         {
-            Ok(Ok(new)) => new,
+            Ok(Ok(d)) => d,
             Ok(Err(e)) => {
                 return Err(Error::DiscoveryFailed {
                     table: table.to_string(),
@@ -221,116 +358,82 @@ impl PartitionService {
             }
         };
 
-        if new_partitions.is_empty() {
-            return Ok(());
+        if diff.is_empty() {
+            return Ok(diff);
         }
 
-        tracing::info!(
-            table = %table,
-            count = new_partitions.len(),
-            "Discovered new partitions before refresh"
-        );
-
-        // Ensure partition metadata is initialized for this table. This handles
-        // the case where refresh is triggered before the periodic metadata seeding
-        // has run (e.g., immediately after startup).
-        let partition_expressions: Vec<String> =
-            partition_by.iter().map(|p| p.expression.clone()).collect();
-        if let Err(e) = self
-            .partition_store
-            .initialize_metadata(table, partition_expressions)
-            .await
-        {
-            tracing::warn!(table = %table, error = %e, "Failed to initialize partition metadata");
-        }
-
-        add_partitions_with_retry(&self.partition_store, table, new_partitions).await?;
-
-        self.partition_store
-            .refresh()
-            .await
-            .context(PartitionStoreRefreshSnafu)?;
-
-        let executor_ids = self.executor_registry.connected_executors().await;
-        if executor_ids.is_empty() {
-            tracing::warn!(table = %table, "No executors connected, cannot assign new partitions");
-            return Ok(());
-        }
-
-        let tables = self
-            .partition_store
-            .list_tables()
-            .await
-            .context(ListTablesSnafu)?;
-        let state = CycleState {
-            executor_ids,
-            tables,
-        };
-
-        let unassigned = find_unassigned_partitions_for_table(&self.partition_store, table);
-        if !unassigned.is_empty() {
-            let assignments = assign_unassigned_partitions(
-                unassigned,
-                &state,
-                &self.partition_store,
-                &self.config,
+        if !diff.new.is_empty() {
+            tracing::info!(
+                table = %table,
+                count = diff.new.len(),
+                "Adding new partitions"
             );
-            let CommitResult { committed, failed } =
-                commit_assignments(&self.partition_store, assignments).await?;
-            if !failed.is_empty() {
-                tracing::warn!("Failed to commit {} partition assignments", failed.len());
+            // Initialize metadata so add_partitions_with_retry can find it.
+            // No-op if already initialized.
+            let partition_expressions: Vec<String> =
+                partition_by.iter().map(|p| p.expression.clone()).collect();
+            if let Err(e) = self
+                .partition_store
+                .initialize_metadata(table, partition_expressions)
+                .await
+            {
+                tracing::warn!(table = %table, error = %e, "Failed to initialize partition metadata");
             }
-            notify_executors(&self.executor_registry, df, committed).await?;
+            add_partitions_with_retry(&self.partition_store, table, diff.new.clone()).await?;
         }
 
-        Ok(())
-    }
-
-    /// Discover new/removed partitions for all tracked tables, assign, and notify executors.
-    pub async fn discover_and_assign_all_tables(&self, df: &Arc<DataFusion>) -> Result<()> {
-        let Some(app) = self.app.read().await.clone() else {
-            tracing::warn!("App not initialized, skipping partition discovery");
-            return Ok(());
-        };
-
-        let state = refresh_state(&self.partition_store, &self.executor_registry).await?;
-
-        let discovery_result =
-            discover_and_sync_partitions(&app, df, &self.partition_store, &state, &self.config)
-                .await?;
-
-        if !discovery_result.new_partitions.is_empty() {
-            add_new_partitions_to_store(&self.partition_store, discovery_result.new_partitions)
-                .await?;
-        }
-
-        if !discovery_result.removed_partitions.is_empty() {
-            remove_stale_partitions_from_store(
+        if !diff.removed.is_empty() {
+            tracing::info!(
+                table = %table,
+                count = diff.removed.len(),
+                "Removing stale partitions"
+            );
+            remove_partitions_with_cleanup(
                 &self.partition_store,
                 &self.executor_registry,
                 df,
-                discovery_result.removed_partitions,
+                table,
+                diff.removed.clone(),
             )
             .await?;
         }
 
+        Ok(diff)
+    }
+
+    /// Step 2: find every unassigned partition across the given tables, assign
+    /// them to connected executors, commit the assignments, and notify the
+    /// executors of the new partitions.
+    async fn assign_pending(
+        &self,
+        tables: &[TableReference],
+        executors: &[String],
+        df: &Arc<DataFusion>,
+        limit: AssignmentLimit,
+    ) -> Result<()> {
+        let state = CycleState {
+            executor_ids: executors.to_vec(),
+            tables: tables.iter().map(ToString::to_string).collect(),
+        };
+
         let unassigned = find_unassigned_partitions(&self.partition_store, &state);
-        if !unassigned.is_empty() {
-            let assignments = assign_unassigned_partitions(
-                unassigned,
-                &state,
-                &self.partition_store,
-                &self.config,
-            );
-            let CommitResult { committed, failed } =
-                commit_assignments(&self.partition_store, assignments).await?;
-            if !failed.is_empty() {
-                tracing::warn!("Failed to commit {} partition assignments", failed.len());
-            }
-            notify_executors(&self.executor_registry, df, committed).await?;
+        if unassigned.is_empty() {
+            return Ok(());
         }
 
-        Ok(())
+        let assignments = assign_unassigned_partitions(
+            unassigned,
+            &state,
+            &self.partition_store,
+            &self.config,
+            limit,
+        );
+        let CommitResult { committed, failed } =
+            commit_assignments(&self.partition_store, assignments).await?;
+        if !failed.is_empty() {
+            tracing::warn!("Failed to commit {} partition assignments", failed.len());
+        }
+        notify_executors(&self.executor_registry, df, committed).await
     }
 }
 
@@ -361,127 +464,6 @@ pub(crate) fn get_partition_config(
         .filter(|pb| !pb.is_empty())
 }
 
-async fn refresh_state(
-    partition_store: &PartitionStore,
-    executor_registry: &ExecutorRegistry,
-) -> Result<CycleState> {
-    partition_store
-        .refresh()
-        .await
-        .context(PartitionStoreRefreshSnafu)?;
-
-    let executor_ids = executor_registry.connected_executors().await;
-    let tables = partition_store
-        .list_tables()
-        .await
-        .context(ListTablesSnafu)?;
-
-    Ok(CycleState {
-        executor_ids,
-        tables,
-    })
-}
-
-/// For each tracked table, queries the source for current partition values and
-/// diffs against the stored metadata. Returns new partitions (in source but not
-/// in metadata) and removed partitions (in metadata but no longer in source).
-/// Does not assign or notify — the caller handles that.
-async fn discover_and_sync_partitions(
-    app: &App,
-    df: &Arc<DataFusion>,
-    partition_store: &PartitionStore,
-    state: &CycleState,
-    config: &AssignmentConfig,
-) -> Result<DiscoveryResult> {
-    let mut new_partitions = Vec::new();
-    let mut removed_partitions = Vec::new();
-
-    for table_name in &state.tables {
-        let table_ref = TableReference::parse_str(table_name);
-
-        let Some(partition_by) = get_partition_config(app, &table_ref) else {
-            continue;
-        };
-
-        let Some(metadata) = partition_store.get_cached_table_metadata(&table_ref) else {
-            continue;
-        };
-
-        let current_partitions: HashSet<Vec<(String, String)>> = metadata
-            .partitions
-            .iter()
-            .map(|p| {
-                let mut v: Vec<_> = p.partition_value.clone().into_iter().collect();
-                v.sort();
-                v
-            })
-            .collect();
-
-        let source_partitions_list = match timeout(
-            config.discovery_timeout,
-            table_partition_values(&table_ref, &partition_by, df),
-        )
-        .await
-        {
-            Ok(Ok(partitions)) => partitions,
-            Ok(Err(e)) => {
-                tracing::warn!(table = %table_ref, error = %e, "Failed to discover partitions from source");
-                continue;
-            }
-            Err(_) => {
-                tracing::warn!(table = %table_ref, timeout_secs = config.discovery_timeout.as_secs(), "Partition discovery timed out");
-                continue;
-            }
-        };
-
-        let source_partitions: HashSet<Vec<(String, String)>> = source_partitions_list
-            .into_iter()
-            .map(|p| {
-                let mut v: Vec<_> = p.into_iter().collect();
-                v.sort();
-                v
-            })
-            .collect();
-
-        let new: Vec<PartitionValue> = source_partitions
-            .difference(&current_partitions)
-            .map(|v| v.iter().cloned().collect())
-            .collect();
-
-        let removed: Vec<PartitionValue> = current_partitions
-            .difference(&source_partitions)
-            .map(|v| v.iter().cloned().collect())
-            .collect();
-
-        if !new.is_empty() {
-            tracing::info!(table = %table_name, count = new.len(), "Discovered new partitions");
-            new_partitions.push((table_ref.clone(), new));
-        }
-
-        if !removed.is_empty() {
-            tracing::info!(table = %table_name, count = removed.len(), "Detected removed partitions");
-            removed_partitions.push((table_ref.clone(), removed));
-        }
-    }
-
-    Ok(DiscoveryResult {
-        new_partitions,
-        removed_partitions,
-    })
-}
-
-async fn add_new_partitions_to_store(
-    partition_store: &PartitionStore,
-    new_partitions: Vec<(TableReference, Vec<PartitionValue>)>,
-) -> Result<()> {
-    for (table, partition_values) in new_partitions {
-        if let Err(e) = add_partitions_with_retry(partition_store, &table, partition_values).await {
-            tracing::error!(table = %table, error = %e, "Failed to add new partitions to metadata");
-        }
-    }
-    Ok(())
-}
-
 async fn add_partitions_with_retry(
     partition_store: &PartitionStore,
     table: &TableReference,
@@ -500,7 +482,7 @@ async fn add_partitions_with_retry(
                 table: table.to_string(),
             })?;
 
-        let now = now_ms();
+        let now = now_ms()?;
         let mut added_any = false;
         for partition_value in &partition_values {
             if metadata
@@ -546,28 +528,6 @@ async fn add_partitions_with_retry(
     }
 }
 
-async fn remove_stale_partitions_from_store(
-    partition_store: &PartitionStore,
-    executor_registry: &ExecutorRegistry,
-    df: &Arc<DataFusion>,
-    removed_partitions: Vec<(TableReference, Vec<PartitionValue>)>,
-) -> Result<()> {
-    for (table, partition_values) in removed_partitions {
-        if let Err(e) = remove_partitions_with_cleanup(
-            partition_store,
-            executor_registry,
-            df,
-            &table,
-            partition_values,
-        )
-        .await
-        {
-            tracing::error!(table = %table, error = %e, "Failed to remove stale partitions");
-        }
-    }
-    Ok(())
-}
-
 async fn remove_partitions_with_cleanup(
     partition_store: &PartitionStore,
     executor_registry: &ExecutorRegistry,
@@ -576,9 +536,12 @@ async fn remove_partitions_with_cleanup(
     partition_values: Vec<PartitionValue>,
 ) -> Result<()> {
     let mut backoff = FibonacciBackoffBuilder::new().max_retries(Some(5)).build();
+    // Rebuilt inside the loop every iteration so that retries on
+    // ConcurrentModification don't accumulate duplicate unload notifications.
     let mut executors_to_notify: HashMap<String, Vec<PartitionValue>> = HashMap::new();
 
     loop {
+        let mut this_attempt: HashMap<String, Vec<PartitionValue>> = HashMap::new();
         let mut metadata = partition_store
             .get_table_metadata(table)
             .await
@@ -598,7 +561,7 @@ async fn remove_partitions_with_cleanup(
             {
                 let partition = &metadata.partitions[pos];
                 for executor_id in &partition.assigned_executors {
-                    executors_to_notify
+                    this_attempt
                         .entry(executor_id.clone())
                         .or_default()
                         .push(partition_value.clone());
@@ -612,11 +575,12 @@ async fn remove_partitions_with_cleanup(
             break;
         }
 
-        metadata.updated_at = now_ms();
+        metadata.updated_at = now_ms()?;
 
         match partition_store.write_metadata(table, metadata).await {
             Ok(()) => {
                 tracing::debug!(table = %table, count = partition_values.len(), "Removed stale partitions");
+                executors_to_notify = this_attempt;
                 break;
             }
             Err(crate::cluster::partition::store::Error::ConcurrentModification { .. }) => {
@@ -727,42 +691,30 @@ fn find_unassigned_partitions(
     unassigned
 }
 
-fn find_unassigned_partitions_for_table(
-    partition_store: &PartitionStore,
-    table: &TableReference,
-) -> Vec<UnassignedPartition> {
-    let Some(metadata) = partition_store.get_cached_table_metadata(table) else {
-        return Vec::new();
-    };
-
-    metadata
-        .unassigned_partitions()
-        .iter()
-        .map(|p| UnassignedPartition {
-            table: table.clone(),
-            partition_value: p.partition_value.clone(),
-        })
-        .collect()
-}
-
 fn assign_unassigned_partitions(
     unassigned: Vec<UnassignedPartition>,
     state: &CycleState,
     partition_store: &PartitionStore,
     config: &AssignmentConfig,
+    limit: AssignmentLimit,
 ) -> Vec<Assignment> {
     if unassigned.is_empty() {
         return Vec::new();
     }
+
+    let cap = match limit {
+        AssignmentLimit::Unlimited => usize::MAX,
+        AssignmentLimit::PerCycleCap => config.max_assignments_per_cycle,
+    };
 
     let mut assignments = Vec::new();
     let mut assignments_this_cycle = 0;
     let mut executor_loads = build_executor_loads(state, partition_store);
 
     for unassigned_partition in unassigned {
-        if assignments_this_cycle >= config.max_assignments_per_cycle {
+        if assignments_this_cycle >= cap {
             tracing::debug!(
-                max_assignments = config.max_assignments_per_cycle,
+                max_assignments = cap,
                 "Reached max assignments per cycle, deferring remaining partitions"
             );
             break;
@@ -1078,11 +1030,12 @@ async fn notify_executor_of_assignments(
     Ok(())
 }
 
-fn now_ms() -> u128 {
+#[expect(clippy::result_large_err)]
+fn now_ms() -> Result<u128> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
+        .map(|d| d.as_millis())
+        .context(SystemTimeSnafu)
 }
 
 #[cfg(test)]
@@ -1149,28 +1102,6 @@ mod tests {
 
         let unassigned = find_unassigned_partitions(&store, &state);
         assert_eq!(unassigned.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_find_unassigned_for_single_table() {
-        let store = make_store();
-        setup_table(
-            &store,
-            "test_table",
-            vec![
-                assigned_partition("date", "2024-01-01", "exec1"),
-                unassigned_partition("date", "2024-01-02"),
-            ],
-        )
-        .await;
-
-        let table_ref = TableReference::parse_str("test_table");
-        let unassigned = find_unassigned_partitions_for_table(&store, &table_ref);
-        assert_eq!(unassigned.len(), 1);
-        assert_eq!(
-            unassigned[0].partition_value.get("date"),
-            Some(&"2024-01-02".to_string())
-        );
     }
 
     #[tokio::test]
@@ -1352,8 +1283,50 @@ mod tests {
         };
 
         let unassigned = find_unassigned_partitions(&store, &state);
-        let assignments = assign_unassigned_partitions(unassigned, &state, &store, &config);
+        let assignments = assign_unassigned_partitions(
+            unassigned,
+            &state,
+            &store,
+            &config,
+            AssignmentLimit::PerCycleCap,
+        );
         assert_eq!(assignments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_assign_unlimited_ignores_cap() {
+        let store = make_store();
+        setup_table(
+            &store,
+            "test_table",
+            vec![
+                unassigned_partition("date", "2024-01-01"),
+                unassigned_partition("date", "2024-01-02"),
+                unassigned_partition("date", "2024-01-03"),
+            ],
+        )
+        .await;
+
+        let state = CycleState {
+            executor_ids: vec!["exec1".to_string()],
+            tables: vec!["test_table".to_string()],
+        };
+        let config = AssignmentConfig {
+            // Low cap that reconcile_table must ignore.
+            max_assignments_per_cycle: 1,
+            ..Default::default()
+        };
+
+        let unassigned = find_unassigned_partitions(&store, &state);
+        let assignments = assign_unassigned_partitions(
+            unassigned,
+            &state,
+            &store,
+            &config,
+            AssignmentLimit::Unlimited,
+        );
+        // All 3 partitions get assigned despite the per-cycle cap of 1.
+        assert_eq!(assignments.len(), 3);
     }
 
     #[tokio::test]
@@ -1435,10 +1408,16 @@ mod tests {
         };
         let config = AssignmentConfig::default();
 
-        let unassigned = find_unassigned_partitions_for_table(&store, &table);
+        let unassigned = find_unassigned_partitions(&store, &state);
         assert_eq!(unassigned.len(), 2);
 
-        let assignments = assign_unassigned_partitions(unassigned, &state, &store, &config);
+        let assignments = assign_unassigned_partitions(
+            unassigned,
+            &state,
+            &store,
+            &config,
+            AssignmentLimit::PerCycleCap,
+        );
         assert_eq!(
             assignments.len(),
             2,
@@ -1466,54 +1445,6 @@ mod tests {
                 p.partition_value
             );
         }
-    }
-
-    /// Verifies that new partitions are assigned with load balancing:
-    /// if exec1 already has 2 partitions and exec2 has 0, new partitions
-    /// should prefer exec2.
-    #[tokio::test]
-    async fn test_new_partitions_assigned_with_load_balancing() {
-        let store = make_store();
-
-        // exec1 has 2 partitions, exec2 has none.
-        setup_table(
-            &store,
-            "orders",
-            vec![
-                assigned_partition("date", "2024-01-01", "exec1"),
-                assigned_partition("date", "2024-01-02", "exec1"),
-            ],
-        )
-        .await;
-
-        // Add 1 new partition to a DIFFERENT table so exec1's locality bonus
-        // for "orders" doesn't apply — pure load balancing.
-        let other_table = TableReference::parse_str("inventory");
-        setup_table(
-            &store,
-            "inventory",
-            vec![unassigned_partition("date", "2024-01-03")],
-        )
-        .await;
-
-        let state = CycleState {
-            executor_ids: vec!["exec1".to_string(), "exec2".to_string()],
-            tables: vec!["orders".to_string(), "inventory".to_string()],
-        };
-        let config = AssignmentConfig {
-            max_partitions_per_executor: 10,
-            ..Default::default()
-        };
-
-        let unassigned = find_unassigned_partitions_for_table(&store, &other_table);
-        let assignments = assign_unassigned_partitions(unassigned, &state, &store, &config);
-        assert_eq!(assignments.len(), 1);
-
-        // exec2 has lower load and no locality bonus for "inventory" → preferred.
-        assert_eq!(
-            assignments[0].executor_id, "exec2",
-            "New partition should be assigned to the less-loaded executor"
-        );
     }
 
     /// Verifies that adding partitions that already exist is a no-op (idempotent).

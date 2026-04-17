@@ -409,8 +409,11 @@ pub enum Error {
     ))]
     UnsupportedAccelerationEngineForSnapshots,
 
-    #[snafu(display("Pre-refresh partition discovery failed for table '{table_name}': {reason}"))]
-    PreRefreshPartitionDiscoveryFailed { table_name: String, reason: String },
+    #[snafu(display("Pre-refresh partition discovery failed for table '{table_name}': {source}"))]
+    PreRefreshPartitionDiscoveryFailed {
+        table_name: String,
+        source: Box<crate::cluster::partition::service::Error>,
+    },
 }
 
 /// Validates that the acceleration engine is supported in distributed mode.
@@ -2128,11 +2131,11 @@ impl DataFusion {
         // runs on a 30-second interval) might not have discovered new partitions yet,
         // causing executors to drop data from unassigned partitions. (fixes #10075)
         partition_service
-            .discover_and_assign_for_table(dataset_name, self)
+            .reconcile_table(dataset_name, self)
             .await
-            .map_err(|e| Error::PreRefreshPartitionDiscoveryFailed {
+            .map_err(|source| Error::PreRefreshPartitionDiscoveryFailed {
                 table_name: dataset_name.to_string(),
-                reason: e.to_string(),
+                source: Box::new(source),
             })?;
 
         let executor_registry = &partition_service.executor_registry;

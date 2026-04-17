@@ -820,7 +820,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     };
 
     if let Some(config) = app.runtime.scheduler.clone() {
-        if let Some(partition_store) = rt.partition_store() {
+        if let Some(_partition_store) = rt.partition_store() {
             // Validate all accelerated datasets/views have partition keys
             // for distributed partition management.
             partition::validate_partition_keys(&app).map_err(|e| {
@@ -829,16 +829,25 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                 }
             })?;
 
-            // Initialize partition metadata for all accelerated tables
-            if let Err(err) = partition::initialize_partition_metadata(
-                rt.datafusion(),
-                Arc::clone(&app),
-                &partition_store,
-            )
-            .await
-            {
+            // Seed partition metadata for all accelerated tables. Requires the
+            // PartitionService to have been wired onto `DataFusion` during
+            // builder setup.
+            let df = rt.datafusion();
+            if let Some(partition_service) = df.partition_service.as_ref() {
+                if let Err(err) = partition::initialize_partition_metadata(
+                    partition_service,
+                    &df,
+                    &app,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "Failed to initialize partition metadata during scheduler startup: {err}"
+                    );
+                }
+            } else {
                 tracing::warn!(
-                    "Failed to initialize partition metadata during scheduler startup: {err}"
+                    "PartitionService not initialized on DataFusion; skipping partition metadata seeding"
                 );
             }
 

@@ -14,11 +14,24 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+//! Discovery layer: query the federated source for a table's partition values
+//! and diff against the partitions currently tracked in [`PartitionStore`].
+//!
+//! This module is deliberately side-effect-free: it reads the source and the
+//! store but never writes. The service layer ([`super::service`]) consumes the
+//! resulting [`PartitionDiff`] and performs any state transitions (adding/
+//! removing partitions, assigning executors, notifying).
+
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::{
     accelerated_table::AcceleratedTable,
-    cluster::partition::{Error, PartitionDiscoverySnafu, Result, metadata::PartitionValue},
+    cluster::partition::{
+        Error, PartitionDiscoverySnafu, PartitionStore, Result, metadata::PartitionValue,
+    },
     datafusion::DataFusion,
     search::util::find_concrete_table_provider,
 };
@@ -33,12 +46,109 @@ use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
 use util::session_state::builder_from_existing;
 
-/// Query the source table provider for partition values for a given table.
+/// Result of comparing the partitions currently in the source table against
+/// the partitions recorded in [`PartitionStore`].
+#[derive(Debug, Default, Clone)]
+pub struct PartitionDiff {
+    /// Partitions present in the source but not yet tracked in the store.
+    pub new: Vec<PartitionValue>,
+    /// Partitions tracked in the store but no longer present in the source.
+    pub removed: Vec<PartitionValue>,
+}
+
+impl PartitionDiff {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.new.is_empty() && self.removed.is_empty()
+    }
+}
+
+/// Query the source and diff against the partitions recorded in [`PartitionStore`].
 ///
-/// If all partition expressions can be resolved statically (e.g. `bucket(N, col)` produces
-/// `0..N-1`), the values are generated without querying the source table. Otherwise, a
-/// `SELECT DISTINCT` is executed against the federated source.
-pub async fn table_partition_values(
+/// If the store has no metadata for the table, all source partitions are reported
+/// as `new` and `removed` is empty. Callers that want strict "skip if no
+/// metadata" behavior should check the store themselves before calling.
+///
+/// This function performs no writes and no assignment — see
+/// [`super::service::PartitionService`] for the state-mutating counterparts.
+pub(crate) async fn diff_table_partitions(
+    table: &TableReference,
+    partition_by: &[PartitionedBy],
+    partition_store: &PartitionStore,
+    df: &Arc<DataFusion>,
+) -> Result<PartitionDiff> {
+    let source_partitions = query_source_partitions(table, partition_by, df).await?;
+
+    let metadata = match partition_store.get_table_metadata(table).await {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            tracing::debug!(
+                table = %table,
+                count = source_partitions.len(),
+                "No partition metadata, treating all source partitions as new"
+            );
+            return Ok(PartitionDiff {
+                new: source_partitions,
+                removed: Vec::new(),
+            });
+        }
+        Err(e) => {
+            return Err(Error::PartitionDiscovery {
+                table: table.to_string(),
+                source: Box::new(e),
+            });
+        }
+    };
+
+    let existing: HashSet<Vec<(String, String)>> = metadata
+        .partitions
+        .iter()
+        .map(|p| sorted_kv(&p.partition_value))
+        .collect();
+
+    let source_set: HashSet<Vec<(String, String)>> =
+        source_partitions.iter().map(sorted_kv).collect();
+
+    let new: Vec<PartitionValue> = source_partitions
+        .iter()
+        .filter(|p| !existing.contains(&sorted_kv(p)))
+        .cloned()
+        .collect();
+
+    let removed: Vec<PartitionValue> = metadata
+        .partitions
+        .iter()
+        .filter(|p| !source_set.contains(&sorted_kv(&p.partition_value)))
+        .map(|p| p.partition_value.clone())
+        .collect();
+
+    if !new.is_empty() || !removed.is_empty() {
+        tracing::debug!(
+            table = %table,
+            new = new.len(),
+            removed = removed.len(),
+            "Computed partition diff"
+        );
+    }
+
+    Ok(PartitionDiff { new, removed })
+}
+
+/// Sort a `PartitionValue` (a `HashMap`) into a deterministic `Vec<(k, v)>`
+/// so that two partition values with the same entries hash/compare equal.
+fn sorted_kv(p: &PartitionValue) -> Vec<(String, String)> {
+    let mut v: Vec<_> = p.clone().into_iter().collect();
+    v.sort();
+    v
+}
+
+/// Query the source table for the partition values present right now.
+///
+/// If every partition expression has a statically known value set (e.g.
+/// `bucket(N, col)` produces `0..N-1`), the values are generated without
+/// querying the source. Otherwise a `SELECT DISTINCT` is executed against the
+/// federated source.
+async fn query_source_partitions(
     table: &TableReference,
     partitioning: &[PartitionedBy],
     df: &Arc<DataFusion>,
@@ -81,17 +191,13 @@ pub async fn table_partition_values(
 
     let batches = execute_partition_discovery_query(df, table, partition_exprs).await?;
 
-    // Convert record batches to partition value strings
     let mut partition_values = Vec::new();
-
     for batch in batches {
         let num_rows = batch.num_rows();
         let num_cols = batch.num_columns();
 
         for row_idx in 0..num_rows {
-            // Build partition value string from column values
             let mut value_parts = HashMap::new();
-
             for col_idx in 0..num_cols {
                 let column = batch.column(col_idx);
                 let value_str = arrow::util::display::array_value_to_string(column, row_idx)
@@ -103,7 +209,6 @@ pub async fn table_partition_values(
                     value_parts.insert(pname, value_str);
                 }
             }
-
             partition_values.push(value_parts);
         }
     }
@@ -115,77 +220,6 @@ pub async fn table_partition_values(
     );
 
     Ok(partition_values)
-}
-
-/// Discovers new partition values for a single table by querying the source
-/// and diffing against existing metadata.
-///
-/// Returns the list of new partition values that exist in the source but are
-/// not yet tracked in the partition store's metadata.
-pub(crate) async fn discover_new_partitions(
-    table: &TableReference,
-    partition_by: &[PartitionedBy],
-    partition_store: &super::PartitionStore,
-    df: &Arc<DataFusion>,
-) -> Result<Vec<PartitionValue>> {
-    use std::collections::HashSet;
-
-    let table_name = table.to_string();
-
-    // Discover current partition values from the source.
-    let source_partitions = table_partition_values(table, partition_by, df).await?;
-
-    if source_partitions.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Get existing metadata.
-    let current_metadata = match partition_store.get_table_metadata(table).await {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            tracing::debug!(
-                table = %table_name,
-                "No partition metadata found, treating all discovered partitions as new"
-            );
-            return Ok(source_partitions);
-        }
-        Err(e) => {
-            return Err(Error::PartitionDiscovery {
-                table: table_name,
-                source: Box::new(e),
-            });
-        }
-    };
-
-    // Diff: source - existing = new.
-    let existing: HashSet<Vec<(String, String)>> = current_metadata
-        .partitions
-        .iter()
-        .map(|p| {
-            let mut v: Vec<_> = p.partition_value.clone().into_iter().collect();
-            v.sort();
-            v
-        })
-        .collect();
-
-    let new_partitions: Vec<PartitionValue> = source_partitions
-        .into_iter()
-        .filter(|p| {
-            let mut v: Vec<_> = p.clone().into_iter().collect();
-            v.sort();
-            !existing.contains(&v)
-        })
-        .collect();
-
-    if !new_partitions.is_empty() {
-        tracing::debug!(
-            table = %table_name,
-            count = new_partitions.len(),
-            "Discovered new partitions"
-        );
-    }
-
-    Ok(new_partitions)
 }
 
 /// Executes a SQL query against the underlying table source of an accelerated dataset to discover partition values.

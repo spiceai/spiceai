@@ -481,8 +481,11 @@ mod tests {
     }
 
     /// Verifies that `add_and_assign_partitions` correctly adds new partitions
-    /// and assigns them to executors in a single operation. This is the core
-    /// mechanism used by the pre-refresh partition discovery fix (#10075).
+    /// and assigns them to executors in a single operation. The pre-refresh
+    /// partition discovery path (`PartitionService::discover_and_assign_for_table`)
+    /// goes through the service's discover → add → assign → notify flow rather
+    /// than this helper; this test exercises the helper's direct add-and-assign
+    /// behavior in isolation.
     #[tokio::test]
     async fn test_add_and_assign_new_partitions() {
         let pm = in_memory_store();
