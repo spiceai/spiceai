@@ -4972,14 +4972,6 @@ dependencies = [
 
 [[package]]
 name = "cudarc"
-version = "0.12.2"
-source = "git+https://github.com/EricLBuehler/cudarc?rev=f6e5bf51153d40e34eb1262b98895ac1235b6422#f6e5bf51153d40e34eb1262b98895ac1235b6422"
-dependencies = [
- "libloading 0.8.9",
-]
-
-[[package]]
-name = "cudarc"
 version = "0.17.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf99ab37ee7072d64d906aa2dada9a3422f1d975cdf8c8055a573bc84897ed8"
@@ -10735,7 +10727,7 @@ dependencies = [
  "bytes",
  "cache",
  "chunking",
- "cudarc 0.12.2",
+ "cudarc 0.19.4",
  "dotenvy",
  "either",
  "futures",
@@ -23546,3 +23538,8 @@ checksum = "2959ca473aae96a14ecedf501d20b3608d2825ba280d5adb57d651721885b0c2"
 dependencies = [
  "zune-core 0.5.1",
 ]
+
+[[patch.unused]]
+name = "cudarc"
+version = "0.12.2"
+source = "git+https://github.com/EricLBuehler/cudarc?rev=f6e5bf51153d40e34eb1262b98895ac1235b6422#f6e5bf51153d40e34eb1262b98895ac1235b6422"
