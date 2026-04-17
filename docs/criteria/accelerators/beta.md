@@ -6,13 +6,15 @@ All criteria must be met for the accelerator to be considered Beta, with excepti
 
 ## Beta Quality Accelerators
 
-| Accelerator | Beta Quality | DRI Sign-off    |
-| ----------- | ------------ | --------------- |
-| Arrow       | ✅            | @Sevenannn      |
-| Cayenne     | ✅            | @phillipleblanc |
-| DuckDB      | ✅            | @peasee         |
-| SQLite      | ✅            | @sgrebnov       |
-| PostgreSQL  | ✅            | @sgrebnov       |
+| Accelerator             | Beta Quality | DRI Sign-off    |
+| ----------------------- | ------------ | --------------- |
+| Arrow                   | ✅            | @Sevenannn      |
+| Cayenne                 | ✅            | @phillipleblanc |
+| DuckDB                  | ✅            | @peasee         |
+| SQLite                  | ✅            | @sgrebnov       |
+| PostgreSQL<sup>\*</sup> | ✅            | @sgrebnov       |
+
+<sup>\*</sup> PostgreSQL is a [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise)-only accelerator.
 
 ## Beta Release Criteria
 

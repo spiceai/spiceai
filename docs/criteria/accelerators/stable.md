@@ -6,13 +6,15 @@ All criteria must be met for the accelerator to be considered Stable, with excep
 
 ## Stable Quality Accelerators
 
-| Accelerator | Stable Quality | DRI Sign-off |
-| ----------- | -------------- | ------------ |
-| Arrow       | ✅              | @peasee      |
-| Cayenne     | ➖              |              |
-| DuckDB      | ✅              | @peasee      |
-| SQLite      | ➖              |              |
-| PostgreSQL  | ➖              |              |
+| Accelerator             | Stable Quality | DRI Sign-off |
+| ----------------------- | -------------- | ------------ |
+| Arrow                   | ✅              | @peasee      |
+| Cayenne                 | ✅              | @peasee      |
+| DuckDB                  | ✅              | @peasee      |
+| SQLite                  | ➖              |              |
+| PostgreSQL<sup>\*</sup> | ➖              |              |
+
+<sup>\*</sup> PostgreSQL is a [Spice.ai Enterprise](https://docs.spice.ai/docs/enterprise)-only accelerator.
 
 ## Stable Release Criteria
 
