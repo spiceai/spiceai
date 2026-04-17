@@ -41,11 +41,12 @@ pub struct SqlTool {
     df: Arc<DataFusion>,
 
     allowed_tables: Option<ResolvedTableAwareAllowlist>,
-    /// When true (the default), the tool rejects any DDL/DML/COPY/Statement plan at
+    /// When true (the default), the tool rejects any DDL, DML, COPY, or
+    /// `LogicalPlan::Statement` plan (including PREPARE/EXECUTE/DEALLOCATE) at
     /// execution time. This prevents LLM- or caller-supplied SQL from mutating data
-    /// via the `/v1/tools/sql` surface, even when a referenced catalog/dataset is
-    /// configured writable. Operators that need write access from a tool should
-    /// configure a distinct writable tool rather than flipping this flag.
+    /// or session state via the `/v1/tools/sql` surface, even when a referenced
+    /// catalog/dataset is configured writable. Operators that need write access from
+    /// a tool should configure a distinct writable tool rather than flipping this flag.
     read_only: bool,
 }
 

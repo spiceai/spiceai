@@ -217,14 +217,16 @@ fn validate_ddl_operation(
 
 /// Strict read-only validator.
 ///
-/// Rejects any plan containing DDL, DML, COPY, or Statement nodes (except PREPARE / EXECUTE
-/// / DEALLOCATE, which do not themselves mutate state). Used by surfaces that must never
-/// perform writes regardless of per-catalog/per-dataset access configuration — notably the
-/// built-in `sql` tool and the LLM-generated SQL path in `/v1/nsql`.
+/// Rejects any plan containing DDL, DML, COPY, or any `LogicalPlan::Statement` node
+/// (including `PREPARE` / `EXECUTE` / `DEALLOCATE`). `EXECUTE` can indirectly invoke a
+/// prepared DDL/DML statement and `PREPARE` / `DEALLOCATE` mutate session state, so all
+/// three are disallowed on surfaces that must guarantee read-only execution — notably
+/// the built-in `sql` tool and the LLM-generated SQL path in `/v1/nsql`.
 ///
 /// # Returns
 /// * `Ok(())` if the plan contains only read operations.
-/// * `Err(DataFusionError)` if the plan contains any write or schema-mutating operation.
+/// * `Err(DataFusionError)` if the plan contains any write, schema-mutating, or
+///   session-mutating operation.
 pub fn validate_sql_query_read_only(plan: &LogicalPlan) -> Result<(), DataFusionError> {
     plan.apply_with_subqueries(|node| match node {
         LogicalPlan::Ddl(ddl) => plan_err!(
@@ -235,16 +237,13 @@ pub fn validate_sql_query_read_only(plan: &LogicalPlan) -> Result<(), DataFusion
             "{} operations are not allowed in read-only SQL context.",
             dml.name()
         ),
-        LogicalPlan::Copy(_) => plan_err!("COPY operations are not allowed in read-only SQL context."),
-        LogicalPlan::Statement(stmt) => match stmt {
-            Statement::Prepare(_) | Statement::Execute(_) | Statement::Deallocate(_) => {
-                Ok(TreeNodeRecursion::Continue)
-            }
-            _ => plan_err!(
-                "Statement '{}' is not allowed in read-only SQL context.",
-                stmt.name()
-            ),
-        },
+        LogicalPlan::Copy(_) => {
+            plan_err!("COPY operations are not allowed in read-only SQL context.")
+        }
+        LogicalPlan::Statement(stmt) => plan_err!(
+            "Statement '{}' is not allowed in read-only SQL context.",
+            stmt.name()
+        ),
         _ => Ok(TreeNodeRecursion::Continue),
     })?;
     Ok(())
@@ -934,7 +933,87 @@ mod tests {
             .await
             .expect("plan should be created");
 
+        validate_sql_query_read_only(&plan).expect_err("DDL must be rejected in read-only context");
+    }
+
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_copy() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("COPY tbl_writable TO '/tmp/out.parquet'")
+            .await
+            .expect("plan should be created");
+
+        let err = validate_sql_query_read_only(&plan)
+            .expect_err("COPY must be rejected in read-only context");
+        assert!(
+            err.to_string().contains("COPY"),
+            "error should cite COPY, got: {err}"
+        );
+    }
+
+    /// `PREPARE` mutates session state and the prepared statement could later be
+    /// `EXECUTE`d to run DDL/DML. The strict read-only validator must reject it.
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_prepare() {
+        let df = create_test_datafusion();
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("PREPARE my_plan AS SELECT * FROM tbl_writable")
+            .await
+            .expect("plan should be created");
+
         validate_sql_query_read_only(&plan)
-            .expect_err("DDL must be rejected in read-only context");
+            .expect_err("PREPARE must be rejected in read-only context");
+    }
+
+    /// `EXECUTE` can invoke a prepared DDL/DML statement and must therefore be
+    /// rejected by the strict read-only validator.
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_execute() {
+        let df = create_test_datafusion();
+
+        // PREPARE first to get a prepared plan on the session, then verify EXECUTE
+        // is rejected. PREPARE itself is also rejected, so run it through the
+        // non-strict path by bypassing the validator.
+        df.ctx
+            .sql("PREPARE my_plan AS SELECT 1")
+            .await
+            .expect("prepare should succeed");
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("EXECUTE my_plan")
+            .await
+            .expect("plan should be created");
+
+        validate_sql_query_read_only(&plan)
+            .expect_err("EXECUTE must be rejected in read-only context");
+    }
+
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_deallocate() {
+        let df = create_test_datafusion();
+
+        df.ctx
+            .sql("PREPARE my_plan AS SELECT 1")
+            .await
+            .expect("prepare should succeed");
+
+        let plan = df
+            .ctx
+            .state()
+            .create_logical_plan("DEALLOCATE my_plan")
+            .await
+            .expect("plan should be created");
+
+        validate_sql_query_read_only(&plan)
+            .expect_err("DEALLOCATE must be rejected in read-only context");
     }
 }

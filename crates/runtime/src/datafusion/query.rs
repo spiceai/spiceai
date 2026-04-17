@@ -192,10 +192,10 @@ pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: QueryMethod,
     tracker: Option<QueryTracker>,
-    /// When true, the validator additionally rejects DDL / DML / COPY / Statement
-    /// plan nodes, regardless of per-catalog writability. Set via
-    /// [`QueryBuilder::read_only`]; used by `/v1/tools/sql` and `/v1/nsql` to contain
-    /// LLM-generated SQL.
+    /// When true, the validator additionally rejects DDL, DML, COPY, or any
+    /// `LogicalPlan::Statement` node (including PREPARE/EXECUTE/DEALLOCATE),
+    /// regardless of per-catalog writability. Set via [`QueryBuilder::read_only`];
+    /// used by `/v1/tools/sql` and `/v1/nsql` to contain LLM-generated SQL.
     read_only: bool,
 }
 

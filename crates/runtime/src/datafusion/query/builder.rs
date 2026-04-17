@@ -68,8 +68,9 @@ impl<'a> QueryBuilder<'a> {
     ///
     /// When enabled, the planned query is additionally checked with
     /// [`crate::datafusion::sql_validator::validate_sql_query_read_only`] and rejected if it
-    /// contains any DDL, DML, COPY, or non-prepared Statement nodes — regardless of
-    /// whether the target catalogs/datasets are individually marked writable.
+    /// contains any DDL, DML, COPY, or `LogicalPlan::Statement` node (including
+    /// `PREPARE`/`EXECUTE`/`DEALLOCATE`) — regardless of whether the target
+    /// catalogs/datasets are individually marked writable.
     ///
     /// Used by surfaces that execute SQL on behalf of an LLM or unauthenticated caller
     /// (the built-in `sql` tool, `/v1/nsql`).
