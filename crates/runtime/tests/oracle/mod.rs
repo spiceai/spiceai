@@ -271,6 +271,21 @@ async fn oracle_test_direct_connection() -> Result<(), anyhow::Error> {
             )
             .await?;
 
+            // Sort pushdown: verify ORDER BY is pushed into the federated SQL and SortExec is removed
+            run_and_snapshot_query(
+                &rt,
+                r#"explain select "ID", "VAL_NUMBER", "VAL_VARCHAR2" from test_tbl order by "VAL_NUMBER" desc limit 2"#,
+                "sort_pushdown_plan",
+            )
+            .await?;
+
+            run_and_snapshot_query(
+                &rt,
+                r#"select "ID", "VAL_NUMBER", "VAL_VARCHAR2" from test_tbl order by "VAL_NUMBER" desc limit 2"#,
+                "sort_pushdown_result",
+            )
+            .await?;
+
             running_container.remove().await.map_err(|e| {
                 tracing::error!("running_container.remove: {e}");
                  e
