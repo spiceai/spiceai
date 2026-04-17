@@ -382,15 +382,20 @@ pub async fn read_bounded_error_body(mut response: Response, max_bytes: usize) -
 /// Trim/flatten an arbitrary error response body for safe inclusion in logs
 /// and error messages. Guarantees the returned string is at most `max_bytes`
 /// bytes *including* the [`TRUNCATED_BODY_MARKER`]; replaces whitespace with
-/// spaces so the result stays single-line. `max_bytes` must be greater than
-/// the length of [`TRUNCATED_BODY_MARKER`]; if it is not, the returned
-/// string is capped at `max_bytes` with no marker.
+/// spaces so the result stays single-line. When `max_bytes` is smaller than
+/// the marker (a degenerate cap), we fill up to `max_bytes` bytes of
+/// sanitized content with no marker, matching the documented upper bound.
 #[must_use]
 pub fn sanitize_error_body(body: &str, max_bytes: usize) -> String {
-    // Reserve room for the truncation marker so a truncated result still fits
-    // inside max_bytes. Fall back to a zero budget if the caller passes a
-    // cap that can't fit the marker.
-    let content_budget = max_bytes.saturating_sub(TRUNCATED_BODY_MARKER.len());
+    // If the cap can accommodate the marker, reserve room for it so a truncated
+    // result still fits inside `max_bytes`. If it can't, we skip the marker and
+    // let the content itself fill `max_bytes` — otherwise small caps would yield
+    // an empty string.
+    let (content_budget, emit_marker) = if max_bytes >= TRUNCATED_BODY_MARKER.len() {
+        (max_bytes - TRUNCATED_BODY_MARKER.len(), true)
+    } else {
+        (max_bytes, false)
+    };
     let mut out = String::with_capacity(body.len().min(max_bytes));
     let mut truncated = false;
     for ch in body.chars() {
@@ -404,7 +409,7 @@ pub fn sanitize_error_body(body: &str, max_bytes: usize) -> String {
         }
         out.push(mapped);
     }
-    if truncated && content_budget > 0 {
+    if truncated && emit_marker {
         out.push_str(TRUNCATED_BODY_MARKER);
     }
     debug_assert!(out.len() <= max_bytes);
@@ -748,5 +753,29 @@ mod tests {
             "sanitized body exceeded total cap: {} bytes",
             out.len(),
         );
+    }
+
+    #[test]
+    fn sanitize_error_body_small_cap_fills_content_without_marker() {
+        // When the cap is too small to hold the truncation marker, the
+        // function must still return up to `max_bytes` bytes of sanitized
+        // content — an empty string would violate the documented upper bound.
+        let small_cap = TRUNCATED_BODY_MARKER.len() - 1;
+        let long = "a".repeat(small_cap * 4);
+        let out = sanitize_error_body(&long, small_cap);
+        assert!(!out.is_empty(), "expected some content even at tiny caps");
+        assert!(
+            !out.contains(TRUNCATED_BODY_MARKER),
+            "marker should not appear when the cap can't hold it: {out:?}"
+        );
+        assert!(
+            out.len() <= small_cap,
+            "sanitized body exceeded tiny cap: {} bytes (cap={small_cap})",
+            out.len(),
+        );
+
+        // Exactly zero cap still returns an empty string.
+        let out = sanitize_error_body("anything", 0);
+        assert_eq!(out, "");
     }
 }

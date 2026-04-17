@@ -934,9 +934,12 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .description("OAuth2 client_secret presented to the token endpoint. Required when the client is confidential; must be set together with http_auth_client_id."),
         ParameterSpec::runtime("auth_scopes")
             .description("Space-separated OAuth2 scopes to request when refreshing. Omit to inherit the scopes bound to the refresh token. Optional."),
+        // Validation happens via `ClientAuthMethod::parse`, which is case-
+        // insensitive. `one_of` would do exact-string matching in
+        // `Parameters::try_new` and reject "BASIC" / "BODY" before the parser
+        // ever sees them, so we don't use it here.
         ParameterSpec::runtime("auth_client_auth")
-            .description("How client credentials are sent to the token endpoint: 'basic' (HTTP Basic header, default per RFC 6749 §2.3.1) or 'body' (client_id/client_secret in the form body).")
-            .one_of(&["basic", "body"]),
+            .description("How client credentials are sent to the token endpoint: 'basic' (HTTP Basic header, default per RFC 6749 §2.3.1) or 'body' (client_id/client_secret in the form body). Case-insensitive."),
     ]);
     all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
     all_parameters
