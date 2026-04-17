@@ -890,6 +890,14 @@
           "items": {
             "type": "string"
           }
+        },
+        "headers": {
+          "description": "Optional headers to send with each export request.\nFor HTTP: sent as HTTP headers. For gRPC: sent as metadata entries\n(keys must be lowercase ASCII, e.g. use `authorization` not `Authorization`).\nValues support secret replacement syntax (e.g., `${secrets:api_key}`).",
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": false,
