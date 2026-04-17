@@ -31,8 +31,8 @@ use arrow::{
 };
 use async_trait::async_trait;
 
-use super::{PgOutputDecodeSnafu, Result};
 use super::pgoutput::{Relation, TupleData, Value};
+use super::{PgOutputDecodeSnafu, Result};
 use crate::cdc::{ChangeBatch, ChangeEnvelope, CommitChange, CommitError, changes_schema};
 
 /// One logical change derived from a pgoutput message.
@@ -145,17 +145,13 @@ pub fn build_change_batch(
         .map(|f| FieldBuilder::new(f.data_type()))
         .collect::<Result<Vec<_>>>()?;
 
-    for change in changes {
-        op_builder.append_value(change.op.as_str());
-        for pk in &change.primary_keys {
-            pk_values.push(pk.clone());
-        }
-        pk_offsets.push(i32::try_from(pk_values.len()).map_err(|e| super::Error::PgOutputDecode {
-            message: format!("too many primary keys: {e}"),
-        })?);
-
-        for (col_idx, field) in dataset_schema.fields().iter().enumerate() {
-            let source_idx = relation
+    // Precompute dataset_field_idx → relation_column_idx once per batch so the
+    // hot path is O(rows × fields) rather than O(rows × fields²).
+    let column_map: Vec<usize> = dataset_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            relation
                 .columns
                 .iter()
                 .position(|c| c.name == *field.name())
@@ -166,9 +162,24 @@ pub fn build_change_batch(
                         relation.namespace,
                         relation.name
                     ),
-                })?;
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    for change in changes {
+        op_builder.append_value(change.op.as_str());
+        for pk in &change.primary_keys {
+            pk_values.push(pk.clone());
+        }
+        pk_offsets.push(i32::try_from(pk_values.len()).map_err(|e| {
+            super::Error::PgOutputDecode {
+                message: format!("too many primary keys: {e}"),
+            }
+        })?);
+
+        for (col_idx, &source_idx) in column_map.iter().enumerate() {
             let value = change.row.columns.get(source_idx).unwrap_or(&None);
-            data_builders[col_idx].append(value)?;
+            data_builders[col_idx].append(value, change.op)?;
         }
     }
 
@@ -267,7 +278,19 @@ enum FieldBuilder {
 impl FieldBuilder {
     fn new(data_type: &DataType) -> Result<Self> {
         Ok(match data_type {
-            DataType::Utf8 | DataType::LargeUtf8 => Self::Utf8(StringBuilder::new()),
+            DataType::Utf8 => Self::Utf8(StringBuilder::new()),
+            DataType::LargeUtf8 => {
+                // pgoutput gives us text and we'd back a StringArray — that won't
+                // line up with a LargeUtf8 struct field and produces a schema
+                // mismatch when building the RecordBatch. Reject with an
+                // actionable error until we add LargeStringBuilder support.
+                return PgOutputDecodeSnafu {
+                    message: "postgres_replication: dataset column uses LargeUtf8 which is \
+                              not yet supported by the replication path. Use Utf8 instead."
+                        .to_string(),
+                }
+                .fail();
+            }
             DataType::Boolean => Self::Bool(BooleanBuilder::new()),
             DataType::Int16 => Self::Int16(Int16Builder::new()),
             DataType::Int32 => Self::Int32(Int32Builder::new()),
@@ -275,10 +298,9 @@ impl FieldBuilder {
             DataType::Float32 => Self::Float32(Float32Builder::new()),
             DataType::Float64 => Self::Float64(Float64Builder::new()),
             DataType::Date32 => Self::Date32(Date32Builder::new()),
-            DataType::Timestamp(TimeUnit::Microsecond, tz) => Self::TimestampMicros(
-                TimestampMicrosecondBuilder::new(),
-                tz.clone(),
-            ),
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+                Self::TimestampMicros(TimestampMicrosecondBuilder::new(), tz.clone())
+            }
             other => {
                 return PgOutputDecodeSnafu {
                     message: format!(
@@ -290,46 +312,70 @@ impl FieldBuilder {
         })
     }
 
-    fn append(&mut self, value: &Option<Value>) -> Result<()> {
+    fn append(&mut self, value: &Option<Value>, op: ChangeOp) -> Result<()> {
         let Some(v) = value else {
             self.append_null();
             return Ok(());
         };
-        let Value::Text(s) = v else {
-            // Binary/unchanged columns: treat as null for this first pass. Binary-format
-            // decoding per-type is deferred; unchanged TOAST cannot be reconstructed
-            // without REPLICA IDENTITY FULL and we do not attempt it here.
-            self.append_null();
-            return Ok(());
+        let s = match v {
+            Value::Text(s) => s,
+            Value::Unchanged => {
+                // For UPDATE with a TOASTed column that wasn't changed, pgoutput
+                // omits the value. Silently coercing to NULL would overwrite the
+                // existing accelerator value — real data corruption. Fail loudly
+                // so the operator sets REPLICA IDENTITY FULL or excludes the
+                // column. For non-UPDATE ops this shouldn't appear.
+                return PgOutputDecodeSnafu {
+                    message: format!(
+                        "postgres_replication: received Value::Unchanged (TOASTed column \
+                         omitted) during {:?} — this would silently overwrite the \
+                         accelerator value with NULL. Set `ALTER TABLE ... REPLICA IDENTITY \
+                         FULL;` on the source so the old tuple is sent with every update.",
+                        op
+                    ),
+                }
+                .fail();
+            }
+            Value::Binary(_) => {
+                // pgoutput binary-format values aren't supported yet; coercing to
+                // NULL silently would be wrong.
+                return PgOutputDecodeSnafu {
+                    message: "postgres_replication: binary-format pgoutput values are not yet \
+                              supported. Ensure the publication uses text format or upgrade \
+                              the decoder."
+                        .to_string(),
+                }
+                .fail();
+            }
         };
         match self {
             Self::Utf8(b) => b.append_value(s),
             Self::Bool(b) => b.append_value(matches!(s.as_str(), "t" | "true" | "TRUE")),
-            Self::Int16(b) => b.append_value(
-                s.parse::<i16>().map_err(|e| super::Error::PgOutputDecode {
+            Self::Int16(b) => {
+                b.append_value(s.parse::<i16>().map_err(|e| super::Error::PgOutputDecode {
                     message: format!("int16 parse '{s}': {e}"),
-                })?,
-            ),
-            Self::Int32(b) => b.append_value(
-                s.parse::<i32>().map_err(|e| super::Error::PgOutputDecode {
+                })?)
+            }
+            Self::Int32(b) => {
+                b.append_value(s.parse::<i32>().map_err(|e| super::Error::PgOutputDecode {
                     message: format!("int32 parse '{s}': {e}"),
-                })?,
-            ),
-            Self::Int64(b) => b.append_value(
-                s.parse::<i64>().map_err(|e| super::Error::PgOutputDecode {
+                })?)
+            }
+            Self::Int64(b) => {
+                b.append_value(s.parse::<i64>().map_err(|e| super::Error::PgOutputDecode {
                     message: format!("int64 parse '{s}': {e}"),
-                })?,
-            ),
-            Self::Float32(b) => b.append_value(
-                s.parse::<f32>().map_err(|e| super::Error::PgOutputDecode {
+                })?)
+            }
+            Self::Float32(b) => {
+                b.append_value(s.parse::<f32>().map_err(|e| super::Error::PgOutputDecode {
                     message: format!("float32 parse '{s}': {e}"),
-                })?,
-            ),
-            Self::Float64(b) => b.append_value(
-                s.parse::<f64>().map_err(|e| super::Error::PgOutputDecode {
+                })?)
+            }
+            Self::Float64(b) => {
+                b.append_value(s.parse::<f64>().map_err(|e| super::Error::PgOutputDecode {
                     message: format!("float64 parse '{s}': {e}"),
-                })?,
-            ),
+                })?)
+            }
             Self::Date32(b) => {
                 // Postgres text format for date: 'YYYY-MM-DD'
                 let parsed = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|e| {
@@ -337,9 +383,11 @@ impl FieldBuilder {
                         message: format!("date parse '{s}': {e}"),
                     }
                 })?;
-                let days_since_epoch = (parsed
-                    - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch"))
-                .num_days();
+                let epoch = match chrono::NaiveDate::from_ymd_opt(1970, 1, 1) {
+                    Some(epoch) => epoch,
+                    None => unreachable!("1970-01-01 is a valid NaiveDate"),
+                };
+                let days_since_epoch = (parsed - epoch).num_days();
                 b.append_value(i32::try_from(days_since_epoch).map_err(|e| {
                     super::Error::PgOutputDecode {
                         message: format!("date overflow: {e}"),
@@ -407,9 +455,9 @@ fn parse_pg_timestamp_micros(s: &str) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::array::{AsArray, Array};
     use crate::postgres_replication::pgoutput::{Column as PgColumn, Value as PgValue};
+    use arrow::array::{Array, AsArray};
+    use arrow::datatypes::{DataType, Field, Schema};
 
     fn make_relation() -> Relation {
         Relation {
@@ -486,11 +534,17 @@ mod tests {
         // data struct — id column
         let data = batch.record.column_by_name("data").expect("data");
         let data = data.as_struct();
-        let id_col = data.column_by_name("id").expect("id").as_primitive::<arrow::datatypes::Int32Type>();
+        let id_col = data
+            .column_by_name("id")
+            .expect("id")
+            .as_primitive::<arrow::datatypes::Int32Type>();
         assert_eq!(id_col.value(0), 1);
         assert_eq!(id_col.value(1), 2);
 
-        let name_col = data.column_by_name("name").expect("name").as_string::<i32>();
+        let name_col = data
+            .column_by_name("name")
+            .expect("name")
+            .as_string::<i32>();
         assert_eq!(name_col.value(0), "Alice");
         assert!(name_col.is_null(1));
     }

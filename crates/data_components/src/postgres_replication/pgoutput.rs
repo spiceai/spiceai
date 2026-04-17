@@ -207,7 +207,7 @@ fn decode_relation(buf: &mut &[u8]) -> Result<Relation> {
     let namespace = read_cstring(buf)?;
     let name = read_cstring(buf)?;
     ensure!(
-        buf.remaining() >= 1 + 2,
+        buf.remaining() > 2,
         PgOutputDecodeSnafu {
             message: "short Relation body".to_string()
         }
@@ -250,7 +250,7 @@ fn decode_relation(buf: &mut &[u8]) -> Result<Relation> {
 
 fn decode_insert(buf: &mut &[u8]) -> Result<DecodedMessage> {
     ensure!(
-        buf.remaining() >= 4 + 1,
+        buf.remaining() > 4,
         PgOutputDecodeSnafu {
             message: "short Insert".to_string()
         }
@@ -269,7 +269,7 @@ fn decode_insert(buf: &mut &[u8]) -> Result<DecodedMessage> {
 
 fn decode_update(buf: &mut &[u8]) -> Result<DecodedMessage> {
     ensure!(
-        buf.remaining() >= 4 + 1,
+        buf.remaining() > 4,
         PgOutputDecodeSnafu {
             message: "short Update".to_string()
         }
@@ -308,7 +308,7 @@ fn decode_update(buf: &mut &[u8]) -> Result<DecodedMessage> {
 
 fn decode_delete(buf: &mut &[u8]) -> Result<DecodedMessage> {
     ensure!(
-        buf.remaining() >= 4 + 1,
+        buf.remaining() > 4,
         PgOutputDecodeSnafu {
             message: "short Delete".to_string()
         }
@@ -327,7 +327,7 @@ fn decode_delete(buf: &mut &[u8]) -> Result<DecodedMessage> {
 
 fn decode_truncate(buf: &mut &[u8]) -> Result<DecodedMessage> {
     ensure!(
-        buf.remaining() >= 4 + 1,
+        buf.remaining() > 4,
         PgOutputDecodeSnafu {
             message: "short Truncate".to_string()
         }
@@ -543,7 +543,8 @@ mod tests {
         buf.push(b'7');
         // col 1: null
         buf.push(b'n');
-        let DecodedMessage::Delete { relation_id, old } = decoder.decode(&buf).expect("decode") else {
+        let DecodedMessage::Delete { relation_id, old } = decoder.decode(&buf).expect("decode")
+        else {
             panic!("expected Delete")
         };
         assert_eq!(relation_id, 42);
@@ -562,7 +563,12 @@ mod tests {
         buf.push(b't');
         buf.extend_from_slice(&1u32.to_be_bytes());
         buf.push(b'X');
-        let DecodedMessage::Update { relation_id, old, new } = decoder.decode(&buf).expect("decode") else {
+        let DecodedMessage::Update {
+            relation_id,
+            old,
+            new,
+        } = decoder.decode(&buf).expect("decode")
+        else {
             panic!("expected Update")
         };
         assert_eq!(relation_id, 42);
@@ -604,7 +610,8 @@ mod tests {
         buf.push(0x00);
         buf.extend_from_slice(&42u32.to_be_bytes());
         buf.extend_from_slice(&43u32.to_be_bytes());
-        let DecodedMessage::Truncate { relation_ids } = decoder.decode(&buf).expect("decode") else {
+        let DecodedMessage::Truncate { relation_ids } = decoder.decode(&buf).expect("decode")
+        else {
             panic!("expected Truncate")
         };
         assert_eq!(relation_ids, vec![42, 43]);

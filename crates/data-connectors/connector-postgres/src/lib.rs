@@ -62,9 +62,8 @@ pub struct Postgres {
     #[cfg(feature = "postgres-replication")]
     params: runtime::parameters::Parameters,
     #[cfg(feature = "postgres-replication")]
-    replication_metrics: std::sync::Arc<
-        data_components::postgres_replication::ReplicationMetricsCollector,
-    >,
+    replication_metrics:
+        std::sync::Arc<data_components::postgres_replication::ReplicationMetricsCollector>,
 }
 
 impl std::fmt::Debug for Postgres {
@@ -168,7 +167,8 @@ impl DataConnectorFactory for PostgresFactory {
                         params: params_for_replication,
                         #[cfg(feature = "postgres-replication")]
                         replication_metrics:
-                            data_components::postgres_replication::ReplicationMetricsCollector::new(),
+                            data_components::postgres_replication::ReplicationMetricsCollector::new(
+                            ),
                     }) as Arc<dyn DataConnector>)
                 }
                 Err(e) => match e {

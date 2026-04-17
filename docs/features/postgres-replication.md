@@ -91,7 +91,8 @@ datasets:
       pg_user: spice
       pg_pass: ${secrets:pg_pass}
       pg_db: myapp
-      pg_sslmode: require
+      pg_sslmode: disable        # TLS for the replication path is a follow-up;
+                                 #   use a private network or a TLS proxy today.
     acceleration:
       enabled: true
       engine: duckdb           # or: sqlite | postgres | cayenne | arrow
@@ -316,15 +317,18 @@ After removing a Spice replica, drop its slot:
 SELECT pg_drop_replication_slot('spice_users_<old-instance-hash>');
 ```
 
-To find orphaned slots (slots that are inactive):
+To find orphaned slots (slots that have been inactive for more than an hour). On PostgreSQL 14+:
 
 ```sql
 SELECT slot_name
   FROM pg_replication_slots
  WHERE slot_name LIKE 'spice_%'
    AND NOT active
-   AND (NOW() - stats_reset) > INTERVAL '1 hour';   -- not recently active
+   AND inactive_since IS NOT NULL
+   AND (NOW() - inactive_since) > INTERVAL '1 hour';
 ```
+
+On PostgreSQL 13 or older, `pg_replication_slots` has no inactivity timestamp — use `pg_stat_replication` or your monitoring system instead.
 
 ### Rebooting a replica
 
@@ -370,7 +374,7 @@ Dropping or renaming columns in use by Spice will require rebuilding the acceler
 - **One table per dataset.** Each Spice dataset replicates exactly one source table; each dataset gets its own slot and publication.
 - **No DDL replication.** Schema changes on the source are not propagated automatically. See *Changing the source schema* above.
 - **TRUNCATE is not applied** to the accelerator — it is logged as a warning and skipped.
-- **No TLS to the replication port** in this initial release. Use a private network or a TLS-terminating proxy. (The underlying client supports TLS; exposing it as a parameter is on the roadmap.)
+- **No TLS to the replication port** in this initial release. Setting `pg_sslmode` to anything other than `disable` is rejected at startup with an actionable error. Use a private network or a TLS-terminating proxy today. (The underlying client supports TLS; exposing it as a parameter is on the roadmap.)
 - **Arrow engine** does not support upsert or delete — `UPDATE`s appear as duplicate inserts and `DELETE`s are silently dropped.
 
 ## Comparison with Debezium + Kafka

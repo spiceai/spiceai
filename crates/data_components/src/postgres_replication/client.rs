@@ -32,7 +32,7 @@ use super::{
     ReplicationMetricsCollector, Result, SchemaMismatchSnafu,
     changes::{TransactionBuffer, build_change_batch, envelope_with_lsn},
     config::ReplicationParams,
-    pgoutput::{Decoder, DecodedMessage},
+    pgoutput::{DecodedMessage, Decoder},
 };
 use crate::cdc::{ChangeEnvelope, ChangesStream, StreamError};
 
@@ -188,19 +188,34 @@ fn wal_stream(
                         DecodedMessage::Other => {}
                     }
                 }
-                ReplicationEvent::Commit { end_lsn, .. } => {
+                ReplicationEvent::Commit { end_lsn, commit_time_micros, .. } => {
                     metrics.inc_transaction();
-                    metrics.record_commit_watermark(std::time::SystemTime::now());
+                    // Postgres pgoutput timestamps are microseconds since
+                    // 2000-01-01 UTC (PostgreSQL epoch). Convert to SystemTime so
+                    // `replication_lag_ms` reflects true source-to-apply latency,
+                    // not local ingest recency.
+                    metrics.record_commit_watermark(pg_epoch_to_system_time(commit_time_micros));
 
                     if let Some(buffer) = txn.take()
                         && !buffer.is_empty()
                     {
-                        let rel = decoder
-                            .relation_iter()
+                        // Guard: we assume the publication contains exactly one
+                        // table. Cross-table changes in a single publication would
+                        // mix relations into one ChangeBatch with the wrong schema.
+                        let mut rels = decoder.relation_iter();
+                        let rel = rels
                             .next()
                             .ok_or_else(|| StreamError::External(
                                 "Commit without prior Relation".to_string(),
                             ))?;
+                        if rels.next().is_some() {
+                            Err(StreamError::External(format!(
+                                "Dataset {dataset_name}: replication publication contains multiple \
+                                 tables, which is not supported. Create a separate publication \
+                                 per dataset (the default `spice_<dataset>_pub`)."
+                            )))?;
+                            unreachable!();
+                        }
 
                         let batch = build_change_batch(&schema, rel, &buffer.changes)
                             .map_err(|e| StreamError::External(format!(
@@ -231,7 +246,13 @@ fn wal_stream(
                 ReplicationEvent::KeepAlive { wal_end, reply_requested, .. } => {
                     metrics.set_server_wal_end(wal_end.0);
                     if reply_requested {
-                        client.update_applied_lsn(wal_end);
+                        // CRITICAL: only acknowledge the LSN we have actually
+                        // applied — NOT the server's current wal_end. ACKing
+                        // beyond what's been persisted to the accelerator would
+                        // let Postgres recycle WAL we still need, and a restart
+                        // could skip un-applied changes.
+                        let applied = confirmed_flush.load(Ordering::Relaxed);
+                        client.update_applied_lsn(Lsn(applied));
                     }
                 }
                 ReplicationEvent::Message { .. } => {}
@@ -245,6 +266,19 @@ fn wal_stream(
                 }
             }
         }
+    }
+}
+
+/// Convert a Postgres-epoch microsecond timestamp (from pgoutput Commit) into a
+/// `SystemTime`. Postgres' epoch is 2000-01-01T00:00:00 UTC, not the Unix epoch.
+fn pg_epoch_to_system_time(pg_micros: i64) -> std::time::SystemTime {
+    // 30 years = 946_684_800 seconds between 1970-01-01 and 2000-01-01.
+    const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
+    let total_micros = pg_micros + PG_EPOCH_UNIX_SECS * 1_000_000;
+    if total_micros >= 0 {
+        std::time::UNIX_EPOCH + std::time::Duration::from_micros(total_micros as u64)
+    } else {
+        std::time::UNIX_EPOCH
     }
 }
 

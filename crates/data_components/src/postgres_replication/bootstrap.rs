@@ -47,24 +47,45 @@ use crate::cdc::{ChangeBatch, ChangeEnvelope, StreamError, changes_schema};
 /// Rows-per-batch when COPY-streaming the initial snapshot.
 const BOOTSTRAP_BATCH_SIZE: usize = 1024;
 
+/// Input for [`snapshot_stream`]. Grouped into a struct to keep the function
+/// signature below clippy's `too_many_arguments` threshold and to make the
+/// callers easier to read.
+pub struct SnapshotInput {
+    pub params: ReplicationParams,
+    /// Reserved for a future `SET TRANSACTION SNAPSHOT` implementation; unused
+    /// today because the bootstrap uses a fresh REPEATABLE READ tx.
+    pub _snapshot_name: Option<String>,
+    pub schema_name: String,
+    pub table_name: String,
+    pub dataset_schema: SchemaRef,
+    pub primary_keys: Vec<String>,
+    pub dataset_name: String,
+    pub metrics: Arc<ReplicationMetricsCollector>,
+}
+
 /// Build a `ChangesStream`-compatible stream that emits all rows of the source
 /// table as op="c" change envelopes.
 pub async fn snapshot_stream(
-    params: ReplicationParams,
-    _snapshot_name: Option<String>,
-    schema_name: String,
-    table_name: String,
-    dataset_schema: SchemaRef,
-    primary_keys: Vec<String>,
-    dataset_name: String,
-    metrics: Arc<ReplicationMetricsCollector>,
+    input: SnapshotInput,
 ) -> Result<impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<>> {
+    let SnapshotInput {
+        params,
+        _snapshot_name,
+        schema_name,
+        table_name,
+        dataset_schema,
+        primary_keys,
+        dataset_name,
+        metrics,
+    } = input;
     let host = params.host.clone();
     let port = params.port;
     let user = params.user.clone();
     let password = params.password.expose_secret().to_string();
     let database = params.database.clone();
-    let sslmode = params.sslmode;
+    // sslmode is already validated as Disable by `setup_slot_and_publication`
+    // before this stream ever runs — TLS for the replication path is a
+    // follow-up. We connect with `NoTls` and do not try to negotiate TLS.
 
     Ok(try_stream! {
         // Fresh non-pooled connection with REPEATABLE READ isolation.
@@ -74,18 +95,8 @@ pub async fn snapshot_stream(
             .user(&user)
             .password(&password)
             .dbname(&database)
-            .application_name(&format!("spice-replication-bootstrap/{dataset_name}"));
-        match sslmode {
-            super::config::SslMode::Disable => {
-                cfg.ssl_mode(tokio_postgres::config::SslMode::Disable);
-            }
-            super::config::SslMode::Prefer => {
-                cfg.ssl_mode(tokio_postgres::config::SslMode::Prefer);
-            }
-            super::config::SslMode::Require => {
-                cfg.ssl_mode(tokio_postgres::config::SslMode::Require);
-            }
-        }
+            .ssl_mode(tokio_postgres::config::SslMode::Disable)
+            .application_name(format!("spice-replication-bootstrap/{dataset_name}"));
 
         let (client, connection) = cfg
             .connect(NoTls)
@@ -233,8 +244,10 @@ fn finish_batch(
         for pk in primary_keys {
             pk_values.push(pk.clone());
         }
-        pk_offsets.push(i32::try_from(pk_values.len()).map_err(|e| super::Error::SchemaMismatch {
-            message: format!("pk list overflow: {e}"),
+        pk_offsets.push(i32::try_from(pk_values.len()).map_err(|e| {
+            super::Error::SchemaMismatch {
+                message: format!("pk list overflow: {e}"),
+            }
         })?);
     }
 
@@ -284,7 +297,18 @@ enum BootstrapBuilder {
 impl BootstrapBuilder {
     fn new(data_type: &DataType) -> Result<Self> {
         Ok(match data_type {
-            DataType::Utf8 | DataType::LargeUtf8 => Self::Utf8(StringBuilder::new()),
+            DataType::Utf8 => Self::Utf8(StringBuilder::new()),
+            DataType::LargeUtf8 => {
+                // Would produce a `StringArray` child for a `LargeUtf8` field
+                // and fail schema validation. Reject with a clear error until
+                // LargeStringBuilder is wired up.
+                return PgOutputDecodeSnafu {
+                    message: "bootstrap: dataset column uses LargeUtf8 which is not yet \
+                              supported by the replication bootstrap path. Use Utf8 instead."
+                        .to_string(),
+                }
+                .fail();
+            }
             DataType::Boolean => Self::Bool(BooleanBuilder::new()),
             DataType::Int16 => Self::Int16(Int16Builder::new()),
             DataType::Int32 => Self::Int32(Int32Builder::new()),
@@ -310,9 +334,8 @@ impl BootstrapBuilder {
         let pg_type = row.columns()[idx].type_().clone();
         match self {
             Self::Utf8(b) => {
-                let v: Option<String> = row
-                    .try_get(idx)
-                    .map_err(|e| super::Error::SchemaMismatch {
+                let v: Option<String> =
+                    row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
                         message: format!("bootstrap read utf8: {e}"),
                     })?;
                 match v {
@@ -321,69 +344,76 @@ impl BootstrapBuilder {
                 }
             }
             Self::Bool(b) => {
-                let v: Option<bool> = row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
-                    message: format!("bootstrap read bool: {e}"),
-                })?;
+                let v: Option<bool> =
+                    row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
+                        message: format!("bootstrap read bool: {e}"),
+                    })?;
                 match v {
                     Some(x) => b.append_value(x),
                     None => b.append_null(),
                 }
             }
             Self::Int16(b) => {
-                let v: Option<i16> = row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
-                    message: format!("bootstrap read int16: {e}"),
-                })?;
+                let v: Option<i16> =
+                    row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
+                        message: format!("bootstrap read int16: {e}"),
+                    })?;
                 match v {
                     Some(x) => b.append_value(x),
                     None => b.append_null(),
                 }
             }
             Self::Int32(b) => {
-                let v: Option<i32> = row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
-                    message: format!("bootstrap read int32: {e}"),
-                })?;
+                let v: Option<i32> =
+                    row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
+                        message: format!("bootstrap read int32: {e}"),
+                    })?;
                 match v {
                     Some(x) => b.append_value(x),
                     None => b.append_null(),
                 }
             }
             Self::Int64(b) => {
-                let v: Option<i64> = row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
-                    message: format!("bootstrap read int64: {e}"),
-                })?;
+                let v: Option<i64> =
+                    row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
+                        message: format!("bootstrap read int64: {e}"),
+                    })?;
                 match v {
                     Some(x) => b.append_value(x),
                     None => b.append_null(),
                 }
             }
             Self::Float32(b) => {
-                let v: Option<f32> = row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
-                    message: format!("bootstrap read f32: {e}"),
-                })?;
+                let v: Option<f32> =
+                    row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
+                        message: format!("bootstrap read f32: {e}"),
+                    })?;
                 match v {
                     Some(x) => b.append_value(x),
                     None => b.append_null(),
                 }
             }
             Self::Float64(b) => {
-                let v: Option<f64> = row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
-                    message: format!("bootstrap read f64: {e}"),
-                })?;
+                let v: Option<f64> =
+                    row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
+                        message: format!("bootstrap read f64: {e}"),
+                    })?;
                 match v {
                     Some(x) => b.append_value(x),
                     None => b.append_null(),
                 }
             }
             Self::Date32(b) => {
-                let v: Option<chrono::NaiveDate> = row.try_get(idx).map_err(|e| {
-                    super::Error::SchemaMismatch {
+                let v: Option<chrono::NaiveDate> =
+                    row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
                         message: format!("bootstrap read date: {e}"),
-                    }
-                })?;
+                    })?;
                 match v {
                     Some(d) => {
-                        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
-                            .expect("epoch is valid");
+                        let epoch = match chrono::NaiveDate::from_ymd_opt(1970, 1, 1) {
+                            Some(epoch) => epoch,
+                            None => unreachable!("1970-01-01 is a valid NaiveDate"),
+                        };
                         let days = (d - epoch).num_days();
                         b.append_value(i32::try_from(days).map_err(|e| {
                             super::Error::SchemaMismatch {
@@ -440,4 +470,3 @@ impl BootstrapBuilder {
         }
     }
 }
-

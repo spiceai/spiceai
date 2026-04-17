@@ -34,11 +34,9 @@ use data_components::postgres_replication::{
 use datafusion::sql::TableReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
-use runtime::component::dataset::Dataset;
 use runtime::component::ComponentType;
-use runtime::component::metrics::{
-    MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback,
-};
+use runtime::component::dataset::Dataset;
+use runtime::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime::federated_table::FederatedTable;
 use runtime::parameters::{ExposedParamLookup, Parameters};
 use secrecy::SecretString;
@@ -54,22 +52,36 @@ pub fn build_changes_stream(
     let dataset_name = dataset.name.to_string();
     let (schema_name, table_name) = split_schema_table(&dataset.from);
 
-    let params_for_stream = match replication_params_from_connector_params(
-        params,
-        &dataset_name,
-    ) {
+    let params_for_stream = match replication_params_from_connector_params(params, &dataset_name) {
         Ok(p) => p,
         Err(e) => {
             let msg = format!("postgres replication: {e}");
-            return Box::pin(futures::stream::once(async move { Err(StreamError::External(msg)) }));
+            return Box::pin(futures::stream::once(async move {
+                Err(StreamError::External(msg))
+            }));
         }
     };
+
+    // Prefer the dataset's explicitly-declared acceleration `primary_key` —
+    // that's what the accelerator write path uses for upsert/delete, and it's
+    // what the operator configured. Fall back to the source TableProvider's
+    // constraints only if acceleration didn't declare one.
+    let declared_pks: Vec<String> = dataset
+        .acceleration
+        .as_ref()
+        .and_then(|a| a.primary_key.as_ref())
+        .map(|pk| pk.iter().map(|s| s.to_string()).collect())
+        .unwrap_or_default();
 
     Box::pin(try_stream! {
         let table_provider = federated_table.table_provider().await;
         let schema = table_provider.schema();
 
-        let primary_keys = extract_primary_keys(&table_provider);
+        let primary_keys = if declared_pks.is_empty() {
+            extract_primary_keys(&table_provider)
+        } else {
+            declared_pks
+        };
 
         let input = ReplicationStreamInput {
             dataset_name: dataset_name.clone(),
@@ -96,8 +108,9 @@ pub fn build_changes_stream(
 const METRICS: &[MetricSpec] = &[
     MetricSpec::new("replication_lag_ms", MetricType::ObservableGaugeU64)
         .description(
-            "Milliseconds between `now()` and the commit-time of the most recent transaction \
-             replicated from Postgres. Primary freshness metric for CDC.",
+            "Milliseconds between now() and the Postgres commit timestamp of the most \
+             recent transaction replicated into the accelerator. Primary freshness metric \
+             for CDC; uses the source's commit_time from pgoutput, not local ingest time.",
         )
         .unit("ms")
         .auto_register(),
@@ -108,52 +121,88 @@ const METRICS: &[MetricSpec] = &[
         )
         .unit("by")
         .auto_register(),
-    MetricSpec::new("replication_confirmed_flush_lsn", MetricType::ObservableGaugeU64)
-        .description(
-            "Most recent LSN Spice has acknowledged to Postgres. Matches \
+    MetricSpec::new(
+        "replication_confirmed_flush_lsn",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "Most recent LSN Spice has acknowledged to Postgres. Matches \
              `pg_replication_slots.confirmed_flush_lsn`.",
-        ),
-    MetricSpec::new("replication_server_wal_end_lsn", MetricType::ObservableGaugeU64)
-        .description(
-            "Most recent WAL end LSN reported by the Postgres server (via keepalive or WAL data).",
-        ),
-    MetricSpec::new("replication_transactions_total", MetricType::ObservableCounterU64)
-        .description("Total number of transactions committed and applied to the accelerator.")
-        .auto_register(),
-    MetricSpec::new("replication_inserts_total", MetricType::ObservableCounterU64)
-        .description("Total INSERT operations received from WAL.")
-        .auto_register(),
-    MetricSpec::new("replication_updates_total", MetricType::ObservableCounterU64)
-        .description("Total UPDATE operations received from WAL.")
-        .auto_register(),
-    MetricSpec::new("replication_deletes_total", MetricType::ObservableCounterU64)
-        .description("Total DELETE operations received from WAL.")
-        .auto_register(),
-    MetricSpec::new("replication_truncates_total", MetricType::ObservableCounterU64)
-        .description("Total TRUNCATE operations received from WAL (currently skipped)."),
-    MetricSpec::new("replication_bootstrap_rows_total", MetricType::ObservableCounterU64)
-        .description("Total rows loaded during the initial-snapshot bootstrap phase."),
-    MetricSpec::new("replication_bootstrap_complete", MetricType::ObservableGaugeU64)
-        .description(
-            "1 once the initial-snapshot bootstrap has finished (or was skipped on resume); \
+    ),
+    MetricSpec::new(
+        "replication_server_wal_end_lsn",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "Most recent WAL end LSN reported by the Postgres server (via keepalive or WAL data).",
+    ),
+    MetricSpec::new(
+        "replication_transactions_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description("Total number of transactions committed and applied to the accelerator.")
+    .auto_register(),
+    MetricSpec::new(
+        "replication_inserts_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description("Total INSERT operations received from WAL.")
+    .auto_register(),
+    MetricSpec::new(
+        "replication_updates_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description("Total UPDATE operations received from WAL.")
+    .auto_register(),
+    MetricSpec::new(
+        "replication_deletes_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description("Total DELETE operations received from WAL.")
+    .auto_register(),
+    MetricSpec::new(
+        "replication_truncates_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description("Total TRUNCATE operations received from WAL (currently skipped)."),
+    MetricSpec::new(
+        "replication_bootstrap_rows_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description("Total rows loaded during the initial-snapshot bootstrap phase."),
+    MetricSpec::new(
+        "replication_bootstrap_complete",
+        MetricType::ObservableGaugeU64,
+    )
+    .description(
+        "1 once the initial-snapshot bootstrap has finished (or was skipped on resume); \
              0 while the snapshot is still running.",
-        )
-        .auto_register(),
-    MetricSpec::new("replication_decode_errors_total", MetricType::ObservableCounterU64)
-        .description("Total pgoutput-decoding errors encountered while parsing WAL events.")
-        .auto_register(),
-    MetricSpec::new("replication_schema_mismatch_errors_total", MetricType::ObservableCounterU64)
-        .description(
-            "Total errors where the source relation no longer matches the declared \
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_decode_errors_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description("Total pgoutput-decoding errors encountered while parsing WAL events.")
+    .auto_register(),
+    MetricSpec::new(
+        "replication_schema_mismatch_errors_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Total errors where the source relation no longer matches the declared \
              accelerator schema.",
-        )
-        .auto_register(),
-    MetricSpec::new("replication_recv_errors_total", MetricType::ObservableCounterU64)
-        .description(
-            "Total transport-level errors while receiving from the Postgres replication \
+    )
+    .auto_register(),
+    MetricSpec::new(
+        "replication_recv_errors_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description(
+        "Total transport-level errors while receiving from the Postgres replication \
              connection (TCP drops, auth failures after reconnect, etc).",
-        )
-        .auto_register(),
+    )
+    .auto_register(),
 ];
 
 #[derive(Debug, Clone)]
@@ -193,9 +242,11 @@ impl MetricsProvider for PostgresMetricsProvider {
                     instrument.observe(v, &attributes);
                 }
             }))),
-            "replication_lag_bytes" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
-                instrument.observe(m.replication_lag_bytes(), &attributes);
-            }))),
+            "replication_lag_bytes" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.replication_lag_bytes(), &attributes);
+                })))
+            }
             "replication_confirmed_flush_lsn" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.confirmed_flush_lsn(), &attributes);
@@ -211,18 +262,26 @@ impl MetricsProvider for PostgresMetricsProvider {
                     instrument.observe(m.wal_transactions_total(), &attributes);
                 })))
             }
-            "replication_inserts_total" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
-                instrument.observe(m.wal_inserts_total(), &attributes);
-            }))),
-            "replication_updates_total" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
-                instrument.observe(m.wal_updates_total(), &attributes);
-            }))),
-            "replication_deletes_total" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
-                instrument.observe(m.wal_deletes_total(), &attributes);
-            }))),
-            "replication_truncates_total" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
-                instrument.observe(m.wal_truncates_total(), &attributes);
-            }))),
+            "replication_inserts_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.wal_inserts_total(), &attributes);
+                })))
+            }
+            "replication_updates_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.wal_updates_total(), &attributes);
+                })))
+            }
+            "replication_deletes_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.wal_deletes_total(), &attributes);
+                })))
+            }
+            "replication_truncates_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.wal_truncates_total(), &attributes);
+                })))
+            }
             "replication_bootstrap_rows_total" => {
                 Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
                     instrument.observe(m.bootstrap_rows_total(), &attributes);
@@ -264,7 +323,8 @@ fn replication_params_from_connector_params(
     let user = required_string(params, "user")?;
     let password_str = required_secret(params, "pass")?;
     let database = required_string(params, "db")?;
-    let sslmode = config::SslMode::from_str_or_default(optional_string(params, "sslmode").as_deref());
+    let sslmode =
+        config::SslMode::from_str_or_default(optional_string(params, "sslmode").as_deref());
 
     let slot_name = optional_string(params, "replication_slot")
         .unwrap_or_else(|| config::default_slot_name(dataset_name));
@@ -298,18 +358,14 @@ fn replication_params_from_connector_params(
 fn required_string(params: &Parameters, key: &str) -> std::result::Result<String, String> {
     match params.get(key).expose() {
         ExposedParamLookup::Present(v) => Ok(v.to_string()),
-        ExposedParamLookup::Absent(name) => {
-            Err(format!("missing required parameter `{name}`"))
-        }
+        ExposedParamLookup::Absent(name) => Err(format!("missing required parameter `{name}`")),
     }
 }
 
 fn required_secret(params: &Parameters, key: &str) -> std::result::Result<String, String> {
     match params.get(key).expose() {
         ExposedParamLookup::Present(v) => Ok(v.to_string()),
-        ExposedParamLookup::Absent(name) => {
-            Err(format!("missing required secret `{name}`"))
-        }
+        ExposedParamLookup::Absent(name) => Err(format!("missing required secret `{name}`")),
     }
 }
 

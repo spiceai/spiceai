@@ -4218,7 +4218,6 @@ dependencies = [
 name = "connector-postgres"
 version = "2.0.0-unstable"
 dependencies = [
- "arrow",
  "async-stream",
  "async-trait",
  "data_components",
@@ -4226,16 +4225,12 @@ dependencies = [
  "datafusion-table-providers",
  "fundu",
  "futures",
- "linkme",
  "opentelemetry",
- "paste",
  "runtime",
  "secrecy",
  "snafu",
  "tokio",
  "tokio-postgres",
- "tracing",
- "twox-hash",
 ]
 
 [[package]]

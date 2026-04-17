@@ -149,7 +149,7 @@ impl ReplicationParams {
             .user(&self.user)
             .password(self.password.expose_secret())
             .dbname(&self.database)
-            .application_name(&format!("spice-replication-setup/{}", self.slot_name));
+            .application_name(format!("spice-replication-setup/{}", self.slot_name));
         match self.sslmode {
             SslMode::Disable => cfg.ssl_mode(tokio_postgres::config::SslMode::Disable),
             SslMode::Prefer => cfg.ssl_mode(tokio_postgres::config::SslMode::Prefer),
@@ -172,25 +172,14 @@ mod tests {
     }
 
     #[test]
-    fn default_names_are_deterministic_for_fixed_env() {
-        // SAFETY: single-threaded test; set-get-unset within one test.
-        // We guard by restoring previous value.
-        let prev = std::env::var("SPICE_INSTANCE_ID").ok();
-        // SAFETY: no concurrent reads of this env var during this test.
-        unsafe {
-            std::env::set_var("SPICE_INSTANCE_ID", "replica-a");
-        }
+    fn default_names_are_deterministic_within_a_process() {
+        // Whatever the current env is, two calls should produce the same name.
+        // We intentionally don't mutate SPICE_INSTANCE_ID here because Rust
+        // tests run concurrently and other tests may also read it.
         let a1 = default_slot_name("users");
         let a2 = default_slot_name("users");
         assert_eq!(a1, a2);
         assert!(a1.starts_with("spice_users_"));
-        // SAFETY: reverting to the value from before this test.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("SPICE_INSTANCE_ID", v),
-                None => std::env::remove_var("SPICE_INSTANCE_ID"),
-            }
-        }
     }
 
     #[test]

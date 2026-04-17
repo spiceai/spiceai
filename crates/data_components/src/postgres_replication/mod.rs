@@ -79,6 +79,16 @@ pub enum Error {
 
     #[snafu(display("Bootstrap stream error: {source}"))]
     Bootstrap { source: tokio_postgres::Error },
+
+    #[snafu(display("Invalid Postgres LSN string `{lsn}`: expected `XXXXXXXX/YYYYYYYY`"))]
+    InvalidLsn { lsn: String },
+
+    #[snafu(display(
+        "`pg_sslmode: {mode}` is not supported by the Postgres replication path yet. \
+         Configure `pg_sslmode: disable` or terminate TLS at a private-network boundary. \
+         TLS support for replication is tracked as a follow-up."
+    ))]
+    TlsNotSupported { mode: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -110,8 +120,19 @@ pub struct ReplicationStreamInput {
 /// Steps performed lazily on first poll:
 ///   1. Open a regular (non-replication) Postgres connection to set up the
 ///      publication and replication slot.
-///   2. If this is a fresh slot, run a COPY-based snapshot of the source table.
+///   2. If this is a fresh slot, stream the source table's existing rows via a
+///      `SELECT * FROM <table>` over a `REPEATABLE READ` transaction (not
+///      `COPY` — row streaming).
 ///   3. Hand off to the `pgwire_replication::ReplicationClient` for streaming WAL.
+///
+/// Note: the initial snapshot is NOT tied to the slot's exported snapshot LSN
+/// (that would require `CREATE_REPLICATION_SLOT ... EXPORT_SNAPSHOT` via the
+/// replication protocol). The consequence is at-least-once semantics across
+/// the snapshot/WAL boundary — rows committed on the source between slot
+/// creation and the start of the bootstrap transaction may be delivered twice.
+/// The accelerator relies on PK-based upsert (`on_conflict: upsert`) to make
+/// this safe. True exactly-once would require the exported-snapshot handshake
+/// and is tracked as a follow-up.
 ///
 /// Back-pressure: the returned stream waits for each envelope's `commit()` to
 /// complete before emitting the next one, so the accelerator's write throughput
@@ -119,11 +140,12 @@ pub struct ReplicationStreamInput {
 pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream {
     let confirmed_flush = Arc::new(AtomicU64::new(0));
     Box::pin(
-        stream::once(async move { start_inner(input, confirmed_flush).await })
-            .flat_map(|result| match result {
+        stream::once(async move { start_inner(input, confirmed_flush).await }).flat_map(|result| {
+            match result {
                 Ok(stream) => stream,
                 Err(e) => stream::once(async move { Err(stream_error(e)) }).boxed(),
-            }),
+            }
+        }),
     )
 }
 
@@ -147,16 +169,16 @@ async fn start_inner(
     // 2. If the slot was just created and bootstrap is enabled, run snapshot.
     let bootstrap_stream = if outcome.created_fresh && params.initial_snapshot {
         Some(
-            bootstrap::snapshot_stream(
-                params.clone(),
-                outcome.snapshot_name.clone(),
-                schema_name.clone(),
-                table_name.clone(),
-                Arc::clone(&schema),
-                primary_keys.clone(),
-                dataset_name.clone(),
-                Arc::clone(&metrics),
-            )
+            bootstrap::snapshot_stream(bootstrap::SnapshotInput {
+                params: params.clone(),
+                _snapshot_name: outcome.snapshot_name.clone(),
+                schema_name: schema_name.clone(),
+                table_name: table_name.clone(),
+                dataset_schema: Arc::clone(&schema),
+                primary_keys: primary_keys.clone(),
+                dataset_name: dataset_name.clone(),
+                metrics: Arc::clone(&metrics),
+            })
             .await?,
         )
     } else {

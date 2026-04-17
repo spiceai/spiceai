@@ -25,7 +25,8 @@ use tokio_postgres::NoTls;
 
 use super::{
     MissingPrimaryKeySnafu, Result, SetupConnectSnafu, SetupExecSnafu, SourceTableNotFoundSnafu,
-    UnsupportedReplicaIdentitySnafu, config::ReplicationParams,
+    TlsNotSupportedSnafu, UnsupportedReplicaIdentitySnafu,
+    config::{ReplicationParams, SslMode},
 };
 
 /// Info about a slot after `setup_slot_and_publication` returns.
@@ -54,6 +55,15 @@ pub async fn setup_slot_and_publication(
     schema_name: &str,
     table_name: &str,
 ) -> Result<SlotInfo> {
+    // TLS is not yet wired up for the replication path. Fail fast with an
+    // actionable error instead of silently connecting plaintext, which would
+    // be wrong against TLS-enforced Postgres services.
+    if !matches!(params.sslmode, SslMode::Disable) {
+        return TlsNotSupportedSnafu {
+            mode: format!("{:?}", params.sslmode).to_ascii_lowercase(),
+        }
+        .fail();
+    }
     let (client, connection) = params
         .setup_pg_config()
         .connect(NoTls)
@@ -100,12 +110,8 @@ async fn do_setup(
         });
     }
 
-    let (consistent_lsn, snapshot_name) = create_logical_slot(
-        client,
-        &params.slot_name,
-        params.temporary_slot,
-    )
-    .await?;
+    let (consistent_lsn, snapshot_name) =
+        create_logical_slot(client, &params.slot_name, params.temporary_slot).await?;
 
     tracing::info!(
         slot = %params.slot_name,
@@ -254,7 +260,7 @@ async fn create_logical_slot(
         .context(SetupExecSnafu)?;
 
     let lsn_str: String = row.get(1);
-    let consistent_lsn = parse_lsn(&lsn_str);
+    let consistent_lsn = parse_lsn(&lsn_str)?;
 
     // Use the LSN itself as a pseudo-snapshot-name — it's unused downstream when
     // we do REPEATABLE READ bootstrap rather than SET TRANSACTION SNAPSHOT.
@@ -262,14 +268,26 @@ async fn create_logical_slot(
 }
 
 /// Parses a Postgres LSN string like "16/B374D848" into a u64.
-#[must_use]
-pub fn parse_lsn(s: &str) -> u64 {
-    let Some((hi, lo)) = s.split_once('/') else {
-        return 0;
-    };
-    let hi = u64::from_str_radix(hi, 16).unwrap_or(0);
-    let lo = u64::from_str_radix(lo, 16).unwrap_or(0);
-    (hi << 32) | lo
+/// Errors on malformed input rather than defaulting to 0, because 0 is also
+/// the "server decides" sentinel downstream — silently coercing invalid input
+/// would change the replication start position.
+pub fn parse_lsn(s: &str) -> Result<u64> {
+    let (hi_str, lo_str) = s
+        .split_once('/')
+        .ok_or_else(|| super::Error::InvalidLsn { lsn: s.to_string() })?;
+    let hi = u64::from_str_radix(hi_str, 16)
+        .map_err(|_| super::Error::InvalidLsn { lsn: s.to_string() })?;
+    let lo = u64::from_str_radix(lo_str, 16)
+        .map_err(|_| super::Error::InvalidLsn { lsn: s.to_string() })?;
+    Ok((hi << 32) | lo)
+}
+
+// Keep an infallible helper for the tests that previously relied on `.unwrap_or(0)`
+// semantics. Inline in tests only — prefer `parse_lsn` at call sites.
+#[cfg(test)]
+#[allow(dead_code)]
+fn parse_lsn_or_zero(s: &str) -> u64 {
+    parse_lsn(s).unwrap_or(0)
 }
 
 #[must_use]
@@ -291,9 +309,37 @@ mod tests {
 
     #[test]
     fn lsn_round_trip() {
-        assert_eq!(parse_lsn("0/0"), 0);
-        assert_eq!(parse_lsn("16/B374D848"), (0x16u64 << 32) | 0xB374_D848);
+        assert_eq!(parse_lsn("0/0").expect("parse"), 0);
+        assert_eq!(
+            parse_lsn("16/B374D848").expect("parse"),
+            (0x16u64 << 32) | 0xB374_D848
+        );
         assert_eq!(format_lsn((0x16u64 << 32) | 0xB374_D848), "16/B374D848");
+    }
+
+    #[test]
+    fn parse_lsn_rejects_malformed() {
+        assert!(matches!(
+            parse_lsn("not-an-lsn"),
+            Err(super::super::Error::InvalidLsn { .. })
+        ));
+        assert!(matches!(
+            parse_lsn("16ZZ/00"),
+            Err(super::super::Error::InvalidLsn { .. })
+        ));
+        // Missing slash.
+        assert!(matches!(
+            parse_lsn("16B374D848"),
+            Err(super::super::Error::InvalidLsn { .. })
+        ));
+    }
+
+    // `parse_lsn_or_zero` exists for one test-only call site; silence dead-code
+    // warning by exercising it here.
+    #[test]
+    fn parse_lsn_or_zero_fallback() {
+        assert_eq!(parse_lsn_or_zero("not-an-lsn"), 0);
+        assert_eq!(parse_lsn_or_zero("16/1"), (0x16u64 << 32) | 0x1);
     }
 
     #[test]

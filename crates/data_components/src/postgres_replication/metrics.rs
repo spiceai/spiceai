@@ -165,7 +165,9 @@ impl Metrics {
         self.collector.wal_truncates_total.load(Ordering::Relaxed)
     }
     pub fn wal_transactions_total(&self) -> u64 {
-        self.collector.wal_transactions_total.load(Ordering::Relaxed)
+        self.collector
+            .wal_transactions_total
+            .load(Ordering::Relaxed)
     }
 
     pub fn bootstrap_rows_total(&self) -> u64 {
@@ -194,7 +196,13 @@ impl Metrics {
     /// Milliseconds since the most recent transaction we've ingested.
     /// Returns `None` before the first commit is seen.
     pub fn replication_lag_ms(&self) -> Option<u64> {
-        let watermark = self.collector.last_commit_seen_at.read().ok()?.as_ref().copied()?;
+        let watermark = self
+            .collector
+            .last_commit_seen_at
+            .read()
+            .ok()?
+            .as_ref()
+            .copied()?;
         SystemTime::now()
             .duration_since(watermark)
             .ok()
@@ -202,7 +210,9 @@ impl Metrics {
     }
 
     pub fn wal_decode_errors_total(&self) -> u64 {
-        self.collector.wal_decode_errors_total.load(Ordering::Relaxed)
+        self.collector
+            .wal_decode_errors_total
+            .load(Ordering::Relaxed)
     }
     pub fn schema_mismatch_errors_total(&self) -> u64 {
         self.collector
