@@ -223,25 +223,61 @@ impl ExecutionPlan for SqlServerExecPlan {
         Ok(self)
     }
 
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.limit
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        Some(Arc::new(SqlServerExecPlan {
+            projected_schema: Arc::clone(&self.projected_schema),
+            table_reference: self.table_reference.clone(),
+            pool: Arc::clone(&self.pool),
+            filters: self.filters.clone(),
+            limit,
+            sort_exprs: self.sort_exprs.clone(),
+            properties: self.properties.clone(),
+        }))
+    }
+
     fn try_pushdown_sort(
         &self,
         order: &[PhysicalSortExpr],
     ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        // MSSQL treats NULLs as smallest: ASC => nulls first, DESC => nulls last.
+        // Track whether the requested null ordering matches MSSQL's native behavior.
+        let mut nulls_match_native = true;
         for sort_expr in order {
             // Only support simple column references
             if sort_expr.expr.as_any().downcast_ref::<Column>().is_none() {
                 return Ok(SortOrderPushdownResult::Unsupported);
             }
-            // MSSQL treats NULLs as smallest: ASC => nulls first, DESC => nulls last
             let expected_nulls_first = !sort_expr.options.descending;
             if sort_expr.options.nulls_first != expected_nulls_first {
-                return Ok(SortOrderPushdownResult::Unsupported);
+                nulls_match_native = false;
             }
         }
 
         let sort_exprs = order.to_vec();
+
+        // Build equivalence properties reflecting MSSQL's actual null ordering behavior,
+        // not the requested ordering. MSSQL always sorts NULLs as smallest (ASC => nulls
+        // first, DESC => nulls last) regardless of what the user requested.
+        let native_sort_exprs: Vec<PhysicalSortExpr> = sort_exprs
+            .iter()
+            .map(|expr| PhysicalSortExpr {
+                expr: Arc::clone(&expr.expr),
+                options: datafusion::arrow::compute::SortOptions {
+                    descending: expr.options.descending,
+                    nulls_first: !expr.options.descending,
+                },
+            })
+            .collect();
         let mut eq_properties = EquivalenceProperties::new(Arc::clone(&self.projected_schema));
-        if let Some(ordering) = LexOrdering::new(sort_exprs.clone()) {
+        if let Some(ordering) = LexOrdering::new(native_sort_exprs) {
             eq_properties.add_orderings([ordering]);
         }
 
@@ -260,9 +296,15 @@ impl ExecutionPlan for SqlServerExecPlan {
             ),
         };
 
-        Ok(SortOrderPushdownResult::Exact {
-            inner: Arc::new(new_plan),
-        })
+        let inner = Arc::new(new_plan) as Arc<dyn ExecutionPlan>;
+        if nulls_match_native {
+            Ok(SortOrderPushdownResult::Exact { inner })
+        } else {
+            // MSSQL can't express NULLS FIRST/LAST, so the sort is pushed down
+            // for performance but DataFusion will add a verification sort for
+            // correct null ordering.
+            Ok(SortOrderPushdownResult::Inexact { inner })
+        }
     }
 
     fn execute(
