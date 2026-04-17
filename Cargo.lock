@@ -16090,6 +16090,7 @@ dependencies = [
  "runtime-api-types",
  "runtime-async",
  "runtime-auth",
+ "runtime-cluster",
  "runtime-datafusion",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
@@ -16226,6 +16227,43 @@ dependencies = [
  "tonic",
  "tower 0.5.3",
  "tracing",
+]
+
+[[package]]
+name = "runtime-cluster"
+version = "2.0.0-unstable"
+dependencies = [
+ "app",
+ "arrow",
+ "arrow-flight",
+ "arrow-ipc",
+ "arrow-schema",
+ "arrow_tools",
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "data_components",
+ "datafusion",
+ "datafusion-expr",
+ "datafusion-proto",
+ "flight_client",
+ "fundu",
+ "futures",
+ "object_store",
+ "object_store_occ",
+ "runtime-datafusion",
+ "runtime-proto",
+ "runtime-request-context",
+ "runtime-table-partition",
+ "serde",
+ "snafu",
+ "spicepod",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "util",
+ "uuid 1.21.0",
 ]
 
 [[package]]

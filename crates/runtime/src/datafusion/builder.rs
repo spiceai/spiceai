@@ -449,11 +449,12 @@ impl DataFusionBuilder {
         let cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>> =
             // Rules only for distributed query
             if let Some(executor_registry) = &self.executor_registry {
-                use crate::cluster::FederatedPartitionProvider;
+                use crate::cluster::{AcceleratedPartitionProvider, FederatedPartitionProvider};
 
                 // Accelerated tables
                 ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
-                    Arc::clone(executor_registry) as Arc<dyn TablePartitionProvider>,
+                    Arc::new(AcceleratedPartitionProvider::new(Arc::clone(executor_registry)))
+                        as Arc<dyn TablePartitionProvider>,
                     &ctx,
                 )));
 

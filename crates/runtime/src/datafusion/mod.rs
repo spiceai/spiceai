@@ -133,10 +133,10 @@ pub mod sort_columns;
 pub(crate) mod sql_validator;
 pub mod udf;
 
-pub const SPICE_DEFAULT_CATALOG: &str = "spice";
+pub use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+
 pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";
 pub const SPICE_EVAL_SCHEMA: &str = "eval";
-pub const SPICE_DEFAULT_SCHEMA: &str = "public";
 pub const SPICE_METADATA_SCHEMA: &str = "metadata";
 pub const SPICE_SCP_SCHEMA: &str = "scp";
 
@@ -2128,7 +2128,7 @@ impl DataFusion {
         // runs on a 30-second interval) might not have discovered new partitions yet,
         // causing executors to drop data from unassigned partitions. (fixes #10075)
         partition_service
-            .discover_and_assign_for_table(dataset_name, self)
+            .discover_and_assign_for_table(dataset_name, self.as_ref())
             .await
             .map_err(|e| Error::PreRefreshPartitionDiscoveryFailed {
                 table_name: dataset_name.to_string(),
@@ -2859,6 +2859,31 @@ impl DataFusion {
         };
         self.ctx
             .parse_sql_expr(expr, &tbl_provider.schema().to_dfschema()?)
+    }
+}
+
+#[async_trait::async_trait]
+impl runtime_cluster::context::PartitionExprResolver for DataFusion {
+    async fn try_parse_expr(
+        &self,
+        tbl: &TableReference,
+        expr: &str,
+    ) -> Result<Expr, DataFusionError> {
+        DataFusion::try_parse_expr(self, tbl, expr).await
+    }
+}
+
+#[async_trait::async_trait]
+impl runtime_cluster::context::PartitionDiscoverer for DataFusion {
+    async fn table_partition_values(
+        &self,
+        table: &TableReference,
+        partition_by: &[spicepod::partitioning::PartitionedBy],
+    ) -> Result<Vec<runtime_cluster::PartitionValue>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        crate::cluster::partition::discovery::table_partition_values(table, partition_by, self)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 }
 

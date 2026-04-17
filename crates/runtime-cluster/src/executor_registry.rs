@@ -25,9 +25,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use data_components::flightsql::{FlightSQLTable, FlightSqlClient};
-use datafusion::{catalog::TableProvider, datasource::DefaultTableSource, sql::TableReference};
+use datafusion::{catalog::TableProvider, sql::TableReference};
 use datafusion_expr::{Expr, TableScan};
-use datafusion_federation::FederatedTableProviderAdaptor;
 use flight_client::cookie::CookieStore;
 use runtime_datafusion::analyzer_rule::TablePartitionProvider;
 use runtime_proto::{MetricsRequest, MetricsResponse, SchedulerControlMessage};
@@ -35,13 +34,7 @@ use snafu::prelude::*;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::{
-    accelerated_table::AcceleratedTable,
-    cluster::{
-        PartitionStore,
-        partition::{PartitionValue, executor_selection},
-    },
-};
+use crate::{PartitionStore, PartitionValue, executor_selection};
 
 /// Error type for executor registry operations.
 #[derive(Debug, Snafu)]
@@ -133,7 +126,7 @@ pub type TablePartitions = HashMap<TableReference, Vec<Expr>>;
 #[derive(Debug)]
 pub struct ExecutorRegistry {
     /// Map of `executor_id` -> connection
-    connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
+    pub connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
 
     /// Map of `executor_id` -> `FlightSqlClient`
     /// An executor may be in `connections` and not in `flight_sql_clients` (e.g. during initial connection).
@@ -297,32 +290,36 @@ impl ExecutorRegistry {
             })
         }
     }
+
+    /// Resolves a table's partitions using the accelerations partition store and returns
+    /// one FlightSQL table provider per selected executor. The caller decides whether the
+    /// table should actually be partitioned (e.g. `AcceleratedPartitionProvider` checks
+    /// `AcceleratedTable` downcast in the runtime crate).
+    pub fn resolve_accelerated_partitions(
+        &self,
+        table: &TableReference,
+        schema: &SchemaRef,
+    ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
+        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
+            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
+            return Vec::new();
+        };
+        let Ok(connections) = self.connections.try_read() else {
+            tracing::warn!("Failed to acquire read lock on connections");
+            return Vec::new();
+        };
+
+        get_partitions_from_manager(
+            &self.accelerations_partition_store,
+            &connections,
+            &flight_sql_clients,
+            table,
+            schema,
+        )
+    }
 }
 
-fn is_accelerated_table_provider(table_provider: &Arc<dyn TableProvider>) -> bool {
-    if table_provider
-        .as_any()
-        .downcast_ref::<AcceleratedTable>()
-        .is_some()
-    {
-        return true;
-    }
-
-    if let Some(adaptor) = table_provider
-        .as_any()
-        .downcast_ref::<FederatedTableProviderAdaptor>()
-        && let Some(inner_provider) = adaptor.table_provider.as_ref()
-    {
-        return inner_provider
-            .as_any()
-            .downcast_ref::<AcceleratedTable>()
-            .is_some();
-    }
-
-    false
-}
-
-fn flight_sql_table_provider(
+pub(crate) fn flight_sql_table_provider(
     executor_id: &str,
     client: FlightSqlClient,
     table: &TableReference,
@@ -342,7 +339,7 @@ fn flight_sql_table_provider(
 ///
 /// Uses the given [`PartitionStore`] to look up partition metadata, validates liveness against
 /// `connections`, selects a minimal executor set, and returns `(FlightSQL provider, partition values)` pairs.
-fn get_partitions_from_manager(
+pub(crate) fn get_partitions_from_manager(
     partition_store: &PartitionStore,
     connections: &HashMap<String, ExecutorConnection>,
     flight_sql_clients: &HashMap<String, FlightSqlClient>,
@@ -433,42 +430,6 @@ fn get_partitions_from_manager(
             Some((provider, partition_values))
         })
         .collect()
-}
-
-impl TablePartitionProvider for ExecutorRegistry {
-    /// Partitions accelerated tables using the accelerations partition manager.
-    fn should_partition(&self, tbl: &TableScan) -> bool {
-        let Some(default) = tbl.source.as_any().downcast_ref::<DefaultTableSource>() else {
-            return false;
-        };
-        is_accelerated_table_provider(&default.table_provider)
-    }
-
-    fn get_partitions(
-        &self,
-        table: &TableReference,
-        schema: &SchemaRef,
-    ) -> Vec<(Arc<dyn TableProvider>, Vec<PartitionValue>)> {
-        let Ok(flight_sql_clients) = self.flight_sql_clients.try_read() else {
-            tracing::warn!("Failed to acquire read lock on flight_sql_clients");
-            return Vec::new();
-        };
-        let Ok(connections) = self.connections.try_read() else {
-            tracing::warn!("Failed to acquire read lock on connections");
-            return Vec::new();
-        };
-
-        get_partitions_from_manager(
-            &self.accelerations_partition_store,
-            &connections,
-            &flight_sql_clients,
-            table,
-            schema,
-        )
-        .into_iter()
-        .map(|(provider, _)| (provider, vec![])) // Executors only materialize data for their assigned partitions; bucket filters are redundant and expensive to evaluate per-row.
-        .collect()
-    }
 }
 
 /// Partition provider for federated (non-accelerated) tables such as Cayenne tables.

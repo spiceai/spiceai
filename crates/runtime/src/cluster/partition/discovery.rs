@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 
 use crate::{
     accelerated_table::AcceleratedTable,
-    cluster::partition::{Error, PartitionDiscoverySnafu, Result, metadata::PartitionValue},
+    cluster::partition::{Error, PartitionDiscoverySnafu, PartitionValue, Result},
     datafusion::DataFusion,
     search::util::find_concrete_table_provider,
 };
@@ -41,7 +41,7 @@ use util::session_state::builder_from_existing;
 pub async fn table_partition_values(
     table: &TableReference,
     partitioning: &[PartitionedBy],
-    df: &Arc<DataFusion>,
+    df: &DataFusion,
 ) -> Result<Vec<PartitionValue>> {
     let table_name = table.to_string();
 
@@ -122,11 +122,12 @@ pub async fn table_partition_values(
 ///
 /// Returns the list of new partition values that exist in the source but are
 /// not yet tracked in the partition store's metadata.
+#[allow(dead_code)]
 pub(crate) async fn discover_new_partitions(
     table: &TableReference,
     partition_by: &[PartitionedBy],
     partition_store: &super::PartitionStore,
-    df: &Arc<DataFusion>,
+    df: &DataFusion,
 ) -> Result<Vec<PartitionValue>> {
     use std::collections::HashSet;
 
@@ -194,7 +195,7 @@ pub(crate) async fn discover_new_partitions(
 /// to query the *federated* table (the source) rather than the accelerated table itself, as the
 /// acceleration will be empty (for schedulers).
 async fn execute_partition_discovery_query(
-    df: &Arc<DataFusion>,
+    df: &DataFusion,
     table: &TableReference,
     partition_exprs: Vec<String>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>> {

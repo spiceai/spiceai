@@ -16,9 +16,9 @@ limitations under the License.
 
 //! Partition service — discovery, assignment, and executor notification.
 //!
-//! Both [`super::scheduler_task::PartitionManagementTask`] (periodic) and
-//! [`crate::datafusion::DataFusion`] (on-demand refresh) use this service
-//! to discover and assign partitions.
+//! Runtime-side code (`scheduler_task::PartitionManagementTask` and the
+//! on-demand refresh path in `DataFusion`) uses this service via the
+//! [`crate::context::PartitionOperations`] trait.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -27,6 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use app::App;
 use datafusion::sql::TableReference;
 use futures::future::join_all;
+use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use runtime_proto::scheduler_control_message::Message as SchedulerControlMessageEnum;
 use runtime_proto::{BytesArray, SchedulerControlMessage, UpdatePartitions};
 use snafu::prelude::*;
@@ -35,39 +36,26 @@ use tokio::time::timeout;
 
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
-use crate::cluster::executor_registry::{self, ExecutorRegistry};
-use crate::cluster::partition::discovery::{discover_new_partitions, table_partition_values};
-use crate::cluster::partition::{
-    PartitionMetadata, PartitionStore, PartitionValue, partition_value_to_bytes,
-};
-use crate::datafusion::DataFusion;
+use crate::context::PartitionOperations;
+use crate::executor_registry::{self, ExecutorRegistry};
+use crate::{PartitionMetadata, PartitionStore, PartitionValue, partition_value_to_bytes, store};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to refresh partition store: {source}"))]
-    PartitionStoreRefresh {
-        source: crate::cluster::partition::store::Error,
-    },
+    PartitionStoreRefresh { source: store::Error },
 
     #[snafu(display("Failed to list tables: {source}"))]
-    ListTables {
-        source: crate::cluster::partition::store::Error,
-    },
+    ListTables { source: store::Error },
 
     #[snafu(display("Failed to get table metadata for {table}: {source}"))]
-    GetTableMetadata {
-        table: String,
-        source: crate::cluster::partition::store::Error,
-    },
+    GetTableMetadata { table: String, source: store::Error },
 
     #[snafu(display("Table metadata not found for {table}"))]
     TableMetadataNotFound { table: String },
 
     #[snafu(display("Failed to write metadata for {table}: {source}"))]
-    WriteMetadata {
-        table: String,
-        source: crate::cluster::partition::store::Error,
-    },
+    WriteMetadata { table: String, source: store::Error },
 
     #[snafu(display(
         "Concurrent modification detected for {table} partition {partition} after {retries} retries"
@@ -92,7 +80,7 @@ pub enum Error {
     #[snafu(display("Partition discovery failed for table {table}: {source}"))]
     DiscoveryFailed {
         table: String,
-        source: crate::cluster::partition::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("Partition discovery timed out for table {table}"))]
@@ -159,12 +147,12 @@ struct DiscoveryResult {
 /// Shared partition infrastructure for discovery and assignment operations.
 ///
 /// Holds the partition manager, executor registry, app reference, and assignment configuration.
-/// Methods take `&Arc<DataFusion>` as a parameter to avoid circular references.
+/// Methods take `&dyn PartitionOperations` to avoid a concrete `DataFusion` dependency.
 pub struct PartitionService {
     pub partition_store: Arc<PartitionStore>,
     pub executor_registry: Arc<ExecutorRegistry>,
     pub config: AssignmentConfig,
-    pub(crate) app: Arc<RwLock<Option<Arc<App>>>>,
+    pub app: Arc<RwLock<Option<Arc<App>>>>,
 }
 
 impl PartitionService {
@@ -187,7 +175,7 @@ impl PartitionService {
     pub async fn discover_and_assign_for_table(
         &self,
         table: &TableReference,
-        df: &Arc<DataFusion>,
+        ops: &dyn PartitionOperations,
     ) -> Result<()> {
         let Some(app) = self.app.read().await.clone() else {
             return Ok(());
@@ -203,7 +191,7 @@ impl PartitionService {
 
         let new_partitions = match timeout(
             self.config.discovery_timeout,
-            discover_new_partitions(table, &partition_by, &self.partition_store, df),
+            discover_new_partitions(table, &partition_by, &self.partition_store, ops),
         )
         .await
         {
@@ -280,14 +268,17 @@ impl PartitionService {
             if !failed.is_empty() {
                 tracing::warn!("Failed to commit {} partition assignments", failed.len());
             }
-            notify_executors(&self.executor_registry, df, committed).await?;
+            notify_executors(&self.executor_registry, ops, committed).await?;
         }
 
         Ok(())
     }
 
     /// Discover new/removed partitions for all tracked tables, assign, and notify executors.
-    pub async fn discover_and_assign_all_tables(&self, df: &Arc<DataFusion>) -> Result<()> {
+    pub async fn discover_and_assign_all_tables(
+        &self,
+        ops: &dyn PartitionOperations,
+    ) -> Result<()> {
         let Some(app) = self.app.read().await.clone() else {
             tracing::warn!("App not initialized, skipping partition discovery");
             return Ok(());
@@ -296,7 +287,7 @@ impl PartitionService {
         let state = refresh_state(&self.partition_store, &self.executor_registry).await?;
 
         let discovery_result =
-            discover_and_sync_partitions(&app, df, &self.partition_store, &state, &self.config)
+            discover_and_sync_partitions(&app, ops, &self.partition_store, &state, &self.config)
                 .await?;
 
         if !discovery_result.new_partitions.is_empty() {
@@ -308,7 +299,7 @@ impl PartitionService {
             remove_stale_partitions_from_store(
                 &self.partition_store,
                 &self.executor_registry,
-                df,
+                ops,
                 discovery_result.removed_partitions,
             )
             .await?;
@@ -327,7 +318,7 @@ impl PartitionService {
             if !failed.is_empty() {
                 tracing::warn!("Failed to commit {} partition assignments", failed.len());
             }
-            notify_executors(&self.executor_registry, df, committed).await?;
+            notify_executors(&self.executor_registry, ops, committed).await?;
         }
 
         Ok(())
@@ -338,27 +329,32 @@ impl PartitionService {
 ///
 /// Searches both datasets and views for a matching table reference.
 #[must_use]
-pub(crate) fn get_partition_config(
+pub fn get_partition_config(
     app: &app::App,
     table: &TableReference,
 ) -> Option<Vec<spicepod::partitioning::PartitionedBy>> {
     let acceleration = app
         .datasets
         .iter()
-        .find(|d| crate::datafusion::resolved_equality(d.name.clone().into(), table.clone()))
+        .find(|d| resolved_equality(&d.name.clone().into(), table))
         .and_then(|d| d.acceleration.as_ref())
         .or_else(|| {
             app.views
                 .iter()
-                .find(|v| {
-                    crate::datafusion::resolved_equality(v.name.clone().into(), table.clone())
-                })
+                .find(|v| resolved_equality(&v.name.clone().into(), table))
                 .and_then(|v| v.acceleration.as_ref())
         });
 
     acceleration
         .map(|a| a.partition_by.clone())
         .filter(|pb| !pb.is_empty())
+}
+
+fn resolved_equality(a: &TableReference, b: &TableReference) -> bool {
+    a.clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+        == b.clone()
+            .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
 }
 
 async fn refresh_state(
@@ -382,13 +378,56 @@ async fn refresh_state(
     })
 }
 
+/// Calls the discoverer for current source partitions and diffs against the
+/// local metadata, returning the set of partition values present in the source
+/// but not yet recorded in the partition store.
+async fn discover_new_partitions(
+    table: &TableReference,
+    partition_by: &[spicepod::partitioning::PartitionedBy],
+    partition_store: &PartitionStore,
+    ops: &dyn PartitionOperations,
+) -> std::result::Result<Vec<PartitionValue>, Box<dyn std::error::Error + Send + Sync>> {
+    let source_partitions = ops.table_partition_values(table, partition_by).await?;
+
+    if source_partitions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let current_metadata = match partition_store.get_table_metadata(table).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return Ok(source_partitions),
+        Err(e) => return Err(Box::new(e)),
+    };
+
+    let existing: HashSet<Vec<(String, String)>> = current_metadata
+        .partitions
+        .iter()
+        .map(|p| {
+            let mut v: Vec<_> = p.partition_value.clone().into_iter().collect();
+            v.sort();
+            v
+        })
+        .collect();
+
+    let new_partitions: Vec<PartitionValue> = source_partitions
+        .into_iter()
+        .filter(|p| {
+            let mut v: Vec<_> = p.clone().into_iter().collect();
+            v.sort();
+            !existing.contains(&v)
+        })
+        .collect();
+
+    Ok(new_partitions)
+}
+
 /// For each tracked table, queries the source for current partition values and
 /// diffs against the stored metadata. Returns new partitions (in source but not
 /// in metadata) and removed partitions (in metadata but no longer in source).
 /// Does not assign or notify — the caller handles that.
 async fn discover_and_sync_partitions(
     app: &App,
-    df: &Arc<DataFusion>,
+    ops: &dyn PartitionOperations,
     partition_store: &PartitionStore,
     state: &CycleState,
     config: &AssignmentConfig,
@@ -419,7 +458,7 @@ async fn discover_and_sync_partitions(
 
         let source_partitions_list = match timeout(
             config.discovery_timeout,
-            table_partition_values(&table_ref, &partition_by, df),
+            ops.table_partition_values(&table_ref, &partition_by),
         )
         .await
         {
@@ -524,18 +563,16 @@ async fn add_partitions_with_retry(
                 tracing::debug!(table = %table, count = partition_values.len(), "Added new partitions to metadata");
                 return Ok(());
             }
-            Err(crate::cluster::partition::store::Error::ConcurrentModification { .. }) => {
-                match backoff.next_duration() {
-                    Some(duration) => tokio::time::sleep(duration).await,
-                    None => {
-                        return Err(Error::MaxRetriesExceeded {
-                            table: table.to_string(),
-                            partition: format!("{} partitions", partition_values.len()),
-                            retries: 5,
-                        });
-                    }
+            Err(store::Error::ConcurrentModification { .. }) => match backoff.next_duration() {
+                Some(duration) => tokio::time::sleep(duration).await,
+                None => {
+                    return Err(Error::MaxRetriesExceeded {
+                        table: table.to_string(),
+                        partition: format!("{} partitions", partition_values.len()),
+                        retries: 5,
+                    });
                 }
-            }
+            },
             Err(e) => {
                 return Err(Error::WriteMetadata {
                     table: table.to_string(),
@@ -549,14 +586,14 @@ async fn add_partitions_with_retry(
 async fn remove_stale_partitions_from_store(
     partition_store: &PartitionStore,
     executor_registry: &ExecutorRegistry,
-    df: &Arc<DataFusion>,
+    ops: &dyn PartitionOperations,
     removed_partitions: Vec<(TableReference, Vec<PartitionValue>)>,
 ) -> Result<()> {
     for (table, partition_values) in removed_partitions {
         if let Err(e) = remove_partitions_with_cleanup(
             partition_store,
             executor_registry,
-            df,
+            ops,
             &table,
             partition_values,
         )
@@ -571,7 +608,7 @@ async fn remove_stale_partitions_from_store(
 async fn remove_partitions_with_cleanup(
     partition_store: &PartitionStore,
     executor_registry: &ExecutorRegistry,
-    df: &Arc<DataFusion>,
+    ops: &dyn PartitionOperations,
     table: &TableReference,
     partition_values: Vec<PartitionValue>,
 ) -> Result<()> {
@@ -619,18 +656,16 @@ async fn remove_partitions_with_cleanup(
                 tracing::debug!(table = %table, count = partition_values.len(), "Removed stale partitions");
                 break;
             }
-            Err(crate::cluster::partition::store::Error::ConcurrentModification { .. }) => {
-                match backoff.next_duration() {
-                    Some(duration) => tokio::time::sleep(duration).await,
-                    None => {
-                        return Err(Error::MaxRetriesExceeded {
-                            table: table.to_string(),
-                            partition: format!("{} partitions", partition_values.len()),
-                            retries: 5,
-                        });
-                    }
+            Err(store::Error::ConcurrentModification { .. }) => match backoff.next_duration() {
+                Some(duration) => tokio::time::sleep(duration).await,
+                None => {
+                    return Err(Error::MaxRetriesExceeded {
+                        table: table.to_string(),
+                        partition: format!("{} partitions", partition_values.len()),
+                        retries: 5,
+                    });
                 }
-            }
+            },
             Err(e) => {
                 return Err(Error::WriteMetadata {
                     table: table.to_string(),
@@ -643,7 +678,7 @@ async fn remove_partitions_with_cleanup(
     for (executor_id, partitions) in &executors_to_notify {
         if let Err(e) = notify_executor_to_unload(
             executor_registry,
-            df,
+            ops,
             executor_id,
             table,
             partitions.clone(),
@@ -659,14 +694,14 @@ async fn remove_partitions_with_cleanup(
 
 async fn notify_executor_to_unload(
     executor_registry: &ExecutorRegistry,
-    df: &Arc<DataFusion>,
+    ops: &dyn PartitionOperations,
     executor_id: &str,
     table: &TableReference,
     partitions: Vec<PartitionValue>,
 ) -> Result<()> {
     let mut partitions_bytes = Vec::new();
     for p in partitions {
-        let bytes = partition_value_to_bytes(p, table, df)
+        let bytes = partition_value_to_bytes(p, table, ops)
             .await
             .context(PartitionValueConversionSnafu)?;
         partitions_bytes.push(bytes.to_vec());
@@ -952,25 +987,23 @@ async fn assign_partition_with_retry(
             .await
         {
             Ok(()) => return Ok(()),
-            Err(crate::cluster::partition::store::Error::ConcurrentModification { .. }) => {
-                match backoff.next_duration() {
-                    Some(duration) => {
-                        tracing::debug!(
-                            table = %table,
-                            partition = ?partition_value,
-                            "Concurrent modification detected, retrying"
-                        );
-                        tokio::time::sleep(duration).await;
-                    }
-                    None => {
-                        return Err(Error::MaxRetriesExceeded {
-                            table: table.to_string(),
-                            partition: format!("{partition_value:?}"),
-                            retries: 3,
-                        });
-                    }
+            Err(store::Error::ConcurrentModification { .. }) => match backoff.next_duration() {
+                Some(duration) => {
+                    tracing::debug!(
+                        table = %table,
+                        partition = ?partition_value,
+                        "Concurrent modification detected, retrying"
+                    );
+                    tokio::time::sleep(duration).await;
                 }
-            }
+                None => {
+                    return Err(Error::MaxRetriesExceeded {
+                        table: table.to_string(),
+                        partition: format!("{partition_value:?}"),
+                        retries: 3,
+                    });
+                }
+            },
             Err(e) => {
                 return Err(Error::WriteMetadata {
                     table: table.to_string(),
@@ -983,7 +1016,7 @@ async fn assign_partition_with_retry(
 
 async fn notify_executors(
     executor_registry: &ExecutorRegistry,
-    df: &Arc<DataFusion>,
+    ops: &dyn PartitionOperations,
     committed: Vec<Assignment>,
 ) -> Result<()> {
     let mut by_executor: HashMap<String, Vec<Assignment>> = HashMap::new();
@@ -1000,7 +1033,7 @@ async fn notify_executors(
             .map(|(executor_id, assignments)| {
                 let registry = executor_registry;
                 async move {
-                    notify_executor_of_assignments(registry, df, &executor_id, assignments).await
+                    notify_executor_of_assignments(registry, ops, &executor_id, assignments).await
                 }
             })
             .collect();
@@ -1032,7 +1065,7 @@ async fn notify_executors(
 
 async fn notify_executor_of_assignments(
     registry: &ExecutorRegistry,
-    df: &Arc<DataFusion>,
+    ops: &dyn PartitionOperations,
     executor_id: &str,
     assignments: Vec<Assignment>,
 ) -> Result<()> {
@@ -1047,7 +1080,7 @@ async fn notify_executor_of_assignments(
     for (table, partition_values) in by_table {
         let mut partitions_bytes = Vec::new();
         for p in partition_values {
-            let bytes = partition_value_to_bytes(p, &table, df)
+            let bytes = partition_value_to_bytes(p, &table, ops)
                 .await
                 .context(PartitionValueConversionSnafu)?;
             partitions_bytes.push(bytes.to_vec());
@@ -1104,7 +1137,7 @@ mod tests {
             .initialize_metadata(&table_ref, vec!["date".to_string()])
             .await
             .expect("init");
-        let metadata = super::super::metadata::TablePartitionMetadata {
+        let metadata = crate::metadata::TablePartitionMetadata {
             table_name: table.to_string(),
             partitions,
             schema_version: 1,

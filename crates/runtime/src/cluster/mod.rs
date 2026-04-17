@@ -399,20 +399,27 @@ fn update_scheduler_pollers(
     *known_schedulers = next_schedulers;
 }
 
+pub(crate) mod accelerated_partition_provider;
 mod composite_flight_service;
 mod control_stream_client;
 pub mod datafusion;
-pub(crate) mod executor_registry;
 pub mod metrics_collector;
 pub mod partition;
 mod scheduler_registry;
 mod servers;
 mod service;
 
+// Re-export executor registry types from `runtime-cluster` so in-crate callers can keep
+// importing them from `crate::cluster` (the executor_registry module moved out of runtime).
+pub mod executor_registry {
+    pub use runtime_cluster::executor_registry::*;
+}
+
 use crate::cluster::partition::service::PartitionService;
+pub use accelerated_partition_provider::AcceleratedPartitionProvider;
 pub use control_stream_client::ControlStreamManager;
-pub use executor_registry::{ExecutorRegistry, FederatedPartitionProvider};
 pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
+pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider};
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};

@@ -22,7 +22,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 
-use super::metadata::PartitionValue;
+use crate::metadata::PartitionValue;
 
 /// Errors that can occur during executor selection.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -132,6 +132,7 @@ runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-api-types = { path = "../runtime-api-types" }
 runtime-async = { path = "../runtime-async" }
 runtime-auth = { path = "../runtime-auth" }
+runtime-cluster = { path = "../runtime-cluster" }
 runtime-datafusion = { path = "../runtime-datafusion" }
 runtime-datafusion-index = { path = "../runtime-datafusion-index" }
 runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }

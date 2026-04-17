@@ -22,9 +22,9 @@ use object_store::ObjectStore;
 use object_store_occ::{InsertResult, ObjectState, WriteResult};
 use snafu::prelude::*;
 
-use crate::cluster::partition::metadata::PartitionValue;
-
-use super::metadata::{PartitionMetadata, TablePartitionMetadata, normalized_table_name};
+use crate::metadata::{
+    PartitionMetadata, PartitionValue, TablePartitionMetadata, normalized_table_name,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -431,7 +431,7 @@ impl PartitionStore {
     }
 
     /// Write metadata using `insert_or_update` with conflict handling.
-    pub(crate) async fn write_metadata(
+    pub async fn write_metadata(
         &self,
         table: &TableReference,
         metadata: TablePartitionMetadata,
@@ -460,8 +460,8 @@ fn now_ms() -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
     use object_store::memory::InMemory;
+    use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
     fn in_memory_store() -> PartitionStore {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

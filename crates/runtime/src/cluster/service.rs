@@ -652,7 +652,7 @@ impl ClusterService for ClusterServiceImpl {
                             match partition_value_to_bytes(
                                 partition.clone(),
                                 table_ref,
-                                &self.datafusion,
+                                self.datafusion.as_ref(),
                             )
                             .await
                             {

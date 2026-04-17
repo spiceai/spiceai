@@ -25,40 +25,36 @@ use std::{
 };
 
 use arrow::array::{Array, RecordBatch};
-use arrow_flight::{
-    FlightData, FlightDescriptor, PutResult, flight_service_server::FlightService,
-    utils::flight_data_to_arrow_batch,
-};
+use arrow_flight::{FlightData, FlightDescriptor, PutResult, utils::flight_data_to_arrow_batch};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::{DataType, SchemaRef};
-use byte_unit::rust_decimal::prelude::Zero;
 use datafusion::{
     common::DFSchema,
     scalar::ScalarValue,
     sql::{ResolvedTableReference, TableReference},
 };
 use datafusion_expr::{Expr, execution_props::ExecutionProps, lit};
-use futures::{Stream, TryStreamExt as _};
+use futures::{Stream, TryStreamExt as _, stream::BoxStream};
+use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::{ResultExt, Snafu, ensure};
 use tokio::sync::mpsc::{self, Sender};
 use tokio_stream::{StreamExt, adapters::Peekable, wrappers::ReceiverStream};
 use tonic::{Response, Streaming};
 
-use crate::{
-    cluster::{
-        PartitionStore, executor_registry::ExecutorRegistry, partition::metadata::PartitionValue,
-    },
-    datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA},
-    flight::Service as FlightSvc,
-};
+use crate::flight_config::{KEEPALIVE_APP_METADATA, do_put_idle_timeout};
+use crate::{ExecutorRegistry, PartitionStore, PartitionValue, store};
+
+/// Stream type used by Arrow Flight `DoPut` responses — matches what the runtime
+/// crate's `FlightService` impl declares as its associated `DoPutStream` type.
+pub type DoPutStream = BoxStream<'static, std::result::Result<PutResult, tonic::Status>>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to create partition metadata for table {table}"))]
     CreateMetadata {
         table: String,
-        source: Box<super::store::Error>,
+        source: Box<store::Error>,
     },
 
     #[snafu(display("Cannot find partition metadata for table {table}"))]
@@ -139,7 +135,7 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to persist partition assignment: {source}"))]
-    PersistAssignment { source: Box<super::store::Error> },
+    PersistAssignment { source: Box<store::Error> },
 
     #[snafu(display("Upstream execution error: {source}"))]
     UpstreamExecution {
@@ -183,7 +179,7 @@ type ExecutorFilter = (ExecutorId, Arc<dyn datafusion::physical_plan::PhysicalEx
 ///
 /// Batches are decoded and routed incrementally from the Flight stream to
 /// avoid materializing the full payload in memory.
-pub(crate) async fn forward_federated_partitioned_write(
+pub async fn forward_federated_partitioned_write(
     executor_registry: &ExecutorRegistry,
     ctx: Arc<datafusion::prelude::SessionContext>,
     io_runtime: tokio::runtime::Handle,
@@ -191,7 +187,7 @@ pub(crate) async fn forward_federated_partitioned_write(
     first_message: FlightData,
     mut streaming_flight: Peekable<Streaming<FlightData>>,
     raw_partition_by: &[String],
-) -> Result<Response<<FlightSvc as FlightService>::DoPutStream>> {
+) -> Result<Response<DoPutStream>> {
     let schema = Arc::new(
         try_schema_from_flatbuffer_bytes(&first_message.data_header).context(DecodeSchemaSnafu)?,
     );
@@ -260,7 +256,7 @@ fn maybe_read_first_batch(
 ///
 /// Accepts an async stream of [`RecordBatch`] and routes each batch to the
 /// correct executor as it arrives, avoiding full materialization in memory.
-pub(crate) async fn forward_partitioned_batches(
+pub async fn forward_partitioned_batches(
     executor_registry: &ExecutorRegistry,
     ctx: Arc<datafusion::prelude::SessionContext>,
     io_runtime: tokio::runtime::Handle,
@@ -442,7 +438,7 @@ async fn route_batch_and_assign_unseen(
     )> = partitioned
         .into_iter()
         .filter_map(|(_key, (scalar_values, sub_batch))| {
-            if sub_batch.num_rows().is_zero() {
+            if sub_batch.num_rows() == 0 {
                 return None;
             }
             let partition_value: PartitionValue = partition_expr_keys
@@ -859,8 +855,7 @@ async fn forward_batches_to_executor(
     // so the executor never reaches its deadline while a write-through is active.
     // Clamp to a minimum non-zero duration to avoid a tight loop when the
     // idle timeout is very small (e.g. in tests with 1-2s timeouts).
-    let keepalive_interval =
-        (crate::flight::do_put_idle_timeout() / 3).max(std::time::Duration::from_millis(100));
+    let keepalive_interval = (do_put_idle_timeout() / 3).max(std::time::Duration::from_millis(100));
 
     let encoder_batches = Arc::clone(&batches_forwarded);
     let encoder_keepalives = Arc::clone(&keepalives_sent);
@@ -930,7 +925,7 @@ async fn forward_batches_to_executor(
                     // No data for a while — send a keepalive to prevent the
                     // executor's DoPut idle timeout from firing.
                     let keepalive = arrow_flight::FlightData {
-                        app_metadata: bytes::Bytes::from_static(crate::flight::KEEPALIVE_APP_METADATA),
+                        app_metadata: bytes::Bytes::from_static(KEEPALIVE_APP_METADATA),
                         ..Default::default()
                     };
                     if tx.send(keepalive).await.is_err() {
