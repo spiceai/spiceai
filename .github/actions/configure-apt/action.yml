@@ -73,10 +73,14 @@ runs:
             }
           ' /etc/apt/sources.list.d/ubuntu.sources.bak \
             | sudo tee /etc/apt/sources.list.d/ubuntu.sources > /dev/null
-          # Fail loudly if the substitution had no effect (archive.ubuntu.com
-          # still present means the awk condition did not match).
-          if grep -q 'archive\.ubuntu\.com' /etc/apt/sources.list.d/ubuntu.sources; then
-            echo "ERROR: configure-apt: archive.ubuntu.com still present in ubuntu.sources after mirror substitution" >&2
+          # Fail loudly if the substitution had no effect. Check that the
+          # primary Pittsburgh mirror is now in the file — archive.ubuntu.com
+          # will still appear there as an intentional fallback in ALL_MIRRORS,
+          # so checking for its absence would be a false negative.
+          if ! grep -q 'mirror\.pit\.teraswitch\.com' /etc/apt/sources.list.d/ubuntu.sources; then
+            echo "ERROR: configure-apt: Pittsburgh mirror not found in ubuntu.sources after substitution — awk may have failed to match" >&2
+            echo "--- current ubuntu.sources URIs ---" >&2
+            grep '^URIs:' /etc/apt/sources.list.d/ubuntu.sources >&2 || true
             exit 1
           fi
         fi
