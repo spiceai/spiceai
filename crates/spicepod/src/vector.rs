@@ -35,10 +35,8 @@ pub struct VectorStore {
 
     /// Partition expressions used to organize vector data.
     ///
-    /// Each item may be either a plain expression string
-    /// (for example, `"YEAR(created_at)"` or `"bucket(100, user_id)"`)
-    /// or a single-entry mapping from partition name to expression
-    /// (for example, `{ year: "YEAR(created_at)" }`).
+    /// Each item must be a plain expression string,
+    /// for example `"YEAR(created_at)"` or `"bucket(100, user_id)"`.
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",

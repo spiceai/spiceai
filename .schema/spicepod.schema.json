@@ -2222,7 +2222,7 @@
           ]
         },
         "partition_by": {
-          "description": "Partition expressions used to physically partition accelerated data.\n\nEach list item can be either:\n- a plain expression string, such as `\"YEAR(created_at)\"` or `\"bucket(10, user_id)\"`, or\n- a single-entry object mapping a partition name to an expression, such as `{ year: \"YEAR(created_at)\" }`.",
+          "description": "Partition expressions used to physically partition accelerated data.\n\nEach list item must be a plain expression string, such as\n`\"YEAR(created_at)\"` or `\"bucket(10, user_id)\"`.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/PartitionedBySchema"
@@ -2737,7 +2737,7 @@
           ]
         },
         "partition_by": {
-          "description": "Partition expressions used to organize vector data.\n\nEach item may be either a plain expression string\n(for example, `\"YEAR(created_at)\"` or `\"bucket(100, user_id)\"`)\nor a single-entry mapping from partition name to expression\n(for example, `{ year: \"YEAR(created_at)\" }`).",
+          "description": "Partition expressions used to organize vector data.\n\nEach item must be a plain expression string,\nfor example `\"YEAR(created_at)\"` or `\"bucket(100, user_id)\"`.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/PartitionedBySchema"

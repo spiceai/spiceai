@@ -309,9 +309,8 @@ pub struct Acceleration {
 
     /// Partition expressions used to physically partition accelerated data.
     ///
-    /// Each list item can be either:
-    /// - a plain expression string, such as `"YEAR(created_at)"` or `"bucket(10, user_id)"`, or
-    /// - a single-entry object mapping a partition name to an expression, such as `{ year: "YEAR(created_at)" }`.
+    /// Each list item must be a plain expression string, such as
+    /// `"YEAR(created_at)"` or `"bucket(10, user_id)"`.
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
