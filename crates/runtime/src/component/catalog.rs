@@ -163,6 +163,7 @@ pub struct CatalogBuilder {
 impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
     type Error = crate::Error;
 
+    #[expect(clippy::result_large_err)]
     fn try_from(catalog: spicepod_catalog::Catalog) -> std::result::Result<Self, Self::Error> {
         let provider = Catalog::provider(&catalog.from);
         let catalog_id = Catalog::catalog_id(&catalog.from).map(String::from);
