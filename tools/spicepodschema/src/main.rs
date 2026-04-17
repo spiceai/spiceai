@@ -189,7 +189,10 @@ mod tests {
             .and_then(Value::as_object)
             .expect("properties present");
         assert_eq!(
-            props.get("mode").and_then(|v| v.get("$ref")).and_then(Value::as_str),
+            props
+                .get("mode")
+                .and_then(|v| v.get("$ref"))
+                .and_then(Value::as_str),
             Some("#/$defs/AccessMode"),
             "alias `mode` should be injected with the same $ref as `access`"
         );
@@ -208,7 +211,10 @@ mod tests {
 
         inject_into_object(&mut obj);
 
-        let props = obj.get("properties").and_then(Value::as_object).expect("properties");
+        let props = obj
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("properties");
         assert!(
             !props.contains_key("mode"),
             "alias must not be injected when $ref does not match the configured target"
@@ -224,7 +230,10 @@ mod tests {
 
         inject_into_object(&mut obj);
 
-        let props = obj.get("properties").and_then(Value::as_object).expect("properties");
+        let props = obj
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("properties");
         let mode = props.get("mode").expect("mode preserved");
         assert_eq!(
             mode.get("description").and_then(Value::as_str),
@@ -256,7 +265,10 @@ mod tests {
             .get("CacheConfig")
             .and_then(Value::as_object)
             .expect("CacheConfig");
-        let props = cache.get("properties").and_then(Value::as_object).expect("properties");
+        let props = cache
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("properties");
         assert!(
             props.contains_key("eviction_policy"),
             "nested alias must be injected recursively"

@@ -179,9 +179,7 @@ partition_by:
   - year: "YEAR(created_at)"
     month: "MONTH(created_at)"
 "#;
-        let err = from_str::<Test>(yaml)
-            .err()
-            .expect("multi-entry mapping must be rejected");
+        let err = from_str::<Test>(yaml).expect_err("multi-entry mapping must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("single-entry mapping"),
@@ -191,26 +189,25 @@ partition_by:
 
     #[test]
     fn deserialize_partition_by_rejects_non_string_value() {
-        let yaml = r#"
+        let yaml = r"
 partition_by:
   - year: 2024
-"#;
-        let err = from_str::<Test>(yaml)
-            .err()
-            .expect("non-string expression must be rejected");
+";
+        let err = from_str::<Test>(yaml).expect_err("non-string expression must be rejected");
         let msg = err.to_string();
-        assert!(msg.contains("must be a string expression"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("must be a string expression"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
     fn deserialize_partition_by_rejects_scalar_items() {
-        let yaml = r#"
+        let yaml = r"
 partition_by:
   - 42
-"#;
-        let err = from_str::<Test>(yaml)
-            .err()
-            .expect("non-string, non-object item must be rejected");
+";
+        let err = from_str::<Test>(yaml).expect_err("non-string, non-object item must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("expected a string expression"),
