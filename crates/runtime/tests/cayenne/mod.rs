@@ -751,7 +751,6 @@ async fn doput_to_table(
             .collect(),
     );
 
-    #[expect(clippy::needless_collect)]
     let flight_data_stream = FlightDataEncoderBuilder::new()
         .with_flight_descriptor(Some(flight_descriptor))
         .build(futures::stream::iter(
