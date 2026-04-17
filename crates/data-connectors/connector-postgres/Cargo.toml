@@ -32,6 +32,7 @@ datafusion-table-providers = { workspace = true, features = ["postgres", "postgr
 fundu = { workspace = true, optional = true }
 futures.workspace = true
 linkme.workspace = true
+opentelemetry = { workspace = true, optional = true }
 paste.workspace = true
 runtime = { path = "../../runtime" }
 secrecy.workspace = true
@@ -50,4 +51,5 @@ postgres-replication = [
     "dep:tokio-postgres",
     "dep:async-stream",
     "dep:fundu",
+    "dep:opentelemetry",
 ]

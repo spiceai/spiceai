@@ -39,7 +39,7 @@ use tokio_postgres::NoTls;
 use tokio_postgres::types::Type;
 
 use super::{
-    BootstrapSnafu, PgOutputDecodeSnafu, Result, SetupConnectSnafu,
+    BootstrapSnafu, PgOutputDecodeSnafu, ReplicationMetricsCollector, Result, SetupConnectSnafu,
     changes::envelope_with_lsn, config::ReplicationParams,
 };
 use crate::cdc::{ChangeBatch, ChangeEnvelope, StreamError, changes_schema};
@@ -57,6 +57,7 @@ pub async fn snapshot_stream(
     dataset_schema: SchemaRef,
     primary_keys: Vec<String>,
     dataset_name: String,
+    metrics: Arc<ReplicationMetricsCollector>,
 ) -> Result<impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<>> {
     let host = params.host.clone();
     let port = params.port;
@@ -152,6 +153,7 @@ pub async fn snapshot_stream(
             }
             rows_in_batch += 1;
             total_rows += 1;
+            metrics.add_bootstrap_rows(1);
 
             if rows_in_batch >= BOOTSTRAP_BATCH_SIZE {
                 let batch = finish_batch(
@@ -188,6 +190,7 @@ pub async fn snapshot_stream(
                 .map_err(super::err_to_stream)?;
             yield envelope_with_lsn(batch, Arc::clone(&confirmed_flush), 0, true);
         }
+        metrics.mark_bootstrap_complete();
 
         client
             .simple_query("COMMIT")

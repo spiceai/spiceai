@@ -197,6 +197,99 @@ params:
 
 Each Spice replica can use a different `pg_replication_slot` while sharing a publication (`pg_publication`).
 
+## Metrics
+
+Spice emits OpenTelemetry observables for every replicated Postgres dataset. Metric names follow the standard Spice pattern `dataset_postgres_<metric>` with a single `name=<dataset>` attribute, so they work unchanged with the built-in Prometheus scrape endpoint and OTLP exporter.
+
+### Core freshness signals
+
+| Metric                                 | Type    | Unit  | Description |
+|----------------------------------------|---------|-------|-------------|
+| `dataset_postgres_replication_lag_ms`  | Gauge   | ms    | `now() − commit_time(latest ingested txn)`. Primary CDC freshness signal. Alert when this crosses your SLO (e.g. `> 5000`). |
+| `dataset_postgres_replication_lag_bytes` | Gauge | bytes | `server_wal_end_lsn − confirmed_flush_lsn`. Indicates unacknowledged WAL still held by Spice's slot. Track alongside Postgres disk headroom. |
+| `dataset_postgres_replication_confirmed_flush_lsn` | Gauge | — | Most recent LSN Spice has acknowledged. Matches `pg_replication_slots.confirmed_flush_lsn` for the dataset's slot. |
+| `dataset_postgres_replication_server_wal_end_lsn` | Gauge | — | Latest WAL end LSN reported by the server via keepalive. Diff against `confirmed_flush_lsn` to reproduce `lag_bytes`. |
+
+### Throughput counters
+
+| Metric                                        | Type    | Description |
+|-----------------------------------------------|---------|-------------|
+| `dataset_postgres_replication_transactions_total` | Counter | Committed transactions applied. |
+| `dataset_postgres_replication_inserts_total`  | Counter | `INSERT` rows from WAL. |
+| `dataset_postgres_replication_updates_total`  | Counter | `UPDATE` rows from WAL. |
+| `dataset_postgres_replication_deletes_total`  | Counter | `DELETE` rows from WAL. |
+| `dataset_postgres_replication_truncates_total` | Counter | `TRUNCATE` operations received (currently skipped — see Limitations). Non-zero means source truncates happened without being reflected in the accelerator. |
+
+### Bootstrap progress
+
+| Metric                                        | Type    | Description |
+|-----------------------------------------------|---------|-------------|
+| `dataset_postgres_replication_bootstrap_rows_total` | Counter | Rows loaded during the initial `REPEATABLE READ` snapshot. |
+| `dataset_postgres_replication_bootstrap_complete`   | Gauge   | `1` once bootstrap has finished (or was skipped on resume); `0` while snapshotting. Use as a readiness probe. |
+
+### Errors
+
+| Metric                                                        | Type    | Description |
+|---------------------------------------------------------------|---------|-------------|
+| `dataset_postgres_replication_decode_errors_total`            | Counter | pgoutput decoder errors. Non-zero usually means a Postgres version mismatch or a replication protocol bug — check logs. |
+| `dataset_postgres_replication_schema_mismatch_errors_total`   | Counter | Source relation no longer matches the dataset's declared schema. The stream errors out; fix the schema and restart. |
+| `dataset_postgres_replication_recv_errors_total`              | Counter | Transport-level errors receiving from the replication connection (TCP drops, auth failures). |
+
+### Example Prometheus queries
+
+```promql
+# Dataset freshness SLI — alert when lag > 5s
+max by (name) (dataset_postgres_replication_lag_ms) > 5000
+
+# Change-apply throughput (events/sec over 1m)
+sum by (name) (
+  rate(dataset_postgres_replication_inserts_total[1m])
+  + rate(dataset_postgres_replication_updates_total[1m])
+  + rate(dataset_postgres_replication_deletes_total[1m])
+)
+
+# Error rate across all replicated datasets
+sum by (name) (
+  rate(dataset_postgres_replication_decode_errors_total[5m])
+  + rate(dataset_postgres_replication_schema_mismatch_errors_total[5m])
+  + rate(dataset_postgres_replication_recv_errors_total[5m])
+)
+
+# WAL backpressure — Spice lagging the server
+max by (name) (dataset_postgres_replication_lag_bytes) > 100 * 1024 * 1024   # > 100 MiB
+```
+
+### Auto-registered vs opt-in
+
+To keep the default metric cardinality reasonable, only operationally critical metrics auto-register. Everything else shows up once you explicitly enable it under the dataset's `metrics` block:
+
+| Metric name                                       | Auto-registered |
+|---------------------------------------------------|-----------------|
+| `replication_lag_ms`                              | ✅              |
+| `replication_lag_bytes`                           | ✅              |
+| `replication_transactions_total`                  | ✅              |
+| `replication_inserts_total` / `updates_total` / `deletes_total` | ✅ |
+| `replication_bootstrap_complete`                  | ✅              |
+| `replication_decode_errors_total`                 | ✅              |
+| `replication_schema_mismatch_errors_total`        | ✅              |
+| `replication_recv_errors_total`                   | ✅              |
+| `replication_confirmed_flush_lsn`                 | — enable manually |
+| `replication_server_wal_end_lsn`                  | — enable manually |
+| `replication_truncates_total`                     | — enable manually |
+| `replication_bootstrap_rows_total`                | — enable manually |
+
+Enable an opt-in metric on a dataset:
+
+```yaml
+datasets:
+  - from: postgres:public.users
+    name: users
+    metrics:
+      metrics:
+        - name: replication_confirmed_flush_lsn
+          enabled: true
+```
+
 ## Operations
 
 ### Monitoring replication lag

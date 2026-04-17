@@ -32,7 +32,8 @@ use std::time::Duration;
 use arrow::array::AsArray;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use data_components::postgres_replication::{
-    ReplicationParams, ReplicationStreamInput, config, start_replication_stream,
+    ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput, config,
+    start_replication_stream,
 };
 use futures::StreamExt;
 use secrecy::SecretString;
@@ -105,6 +106,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
         primary_keys: vec!["id".into()],
         schema_name: "public".into(),
         table_name: "repl_users".into(),
+        metrics: ReplicationMetricsCollector::new(),
     };
 
     let mut stream = start_replication_stream(input);
@@ -202,6 +204,7 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
         primary_keys: vec!["id".into()],
         schema_name: "public".into(),
         table_name: "repl_users".into(),
+        metrics: ReplicationMetricsCollector::new(),
     };
 
     let mut stream_a = start_replication_stream(build_input(params_a));

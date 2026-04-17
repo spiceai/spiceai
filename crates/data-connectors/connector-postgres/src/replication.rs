@@ -28,11 +28,17 @@ use std::time::Duration;
 use async_stream::try_stream;
 use data_components::cdc::{ChangesStream, StreamError};
 use data_components::postgres_replication::{
-    ReplicationParams, ReplicationStreamInput, config, start_replication_stream,
+    ReplicationMetrics, ReplicationMetricsCollector, ReplicationParams, ReplicationStreamInput,
+    config, start_replication_stream,
 };
 use datafusion::sql::TableReference;
 use futures::StreamExt;
+use opentelemetry::KeyValue;
 use runtime::component::dataset::Dataset;
+use runtime::component::ComponentType;
+use runtime::component::metrics::{
+    MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback,
+};
 use runtime::federated_table::FederatedTable;
 use runtime::parameters::{ExposedParamLookup, Parameters};
 use secrecy::SecretString;
@@ -43,6 +49,7 @@ pub fn build_changes_stream(
     params: &Parameters,
     dataset: &Dataset,
     federated_table: Arc<FederatedTable>,
+    metrics: Arc<ReplicationMetricsCollector>,
 ) -> ChangesStream {
     let dataset_name = dataset.name.to_string();
     let (schema_name, table_name) = split_schema_table(&dataset.from);
@@ -71,6 +78,7 @@ pub fn build_changes_stream(
             primary_keys,
             schema_name,
             table_name,
+            metrics,
         };
 
         let mut inner = start_replication_stream(input);
@@ -78,6 +86,171 @@ pub fn build_changes_stream(
             yield item?;
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// MetricsProvider — exposes replication counters/gauges under
+// `dataset_postgres_*` in OpenTelemetry.
+// ---------------------------------------------------------------------------
+
+const METRICS: &[MetricSpec] = &[
+    MetricSpec::new("replication_lag_ms", MetricType::ObservableGaugeU64)
+        .description(
+            "Milliseconds between `now()` and the commit-time of the most recent transaction \
+             replicated from Postgres. Primary freshness metric for CDC.",
+        )
+        .unit("ms")
+        .auto_register(),
+    MetricSpec::new("replication_lag_bytes", MetricType::ObservableGaugeU64)
+        .description(
+            "Bytes of WAL between the server's latest reported position and our last \
+             confirmed flush LSN.",
+        )
+        .unit("by")
+        .auto_register(),
+    MetricSpec::new("replication_confirmed_flush_lsn", MetricType::ObservableGaugeU64)
+        .description(
+            "Most recent LSN Spice has acknowledged to Postgres. Matches \
+             `pg_replication_slots.confirmed_flush_lsn`.",
+        ),
+    MetricSpec::new("replication_server_wal_end_lsn", MetricType::ObservableGaugeU64)
+        .description(
+            "Most recent WAL end LSN reported by the Postgres server (via keepalive or WAL data).",
+        ),
+    MetricSpec::new("replication_transactions_total", MetricType::ObservableCounterU64)
+        .description("Total number of transactions committed and applied to the accelerator.")
+        .auto_register(),
+    MetricSpec::new("replication_inserts_total", MetricType::ObservableCounterU64)
+        .description("Total INSERT operations received from WAL.")
+        .auto_register(),
+    MetricSpec::new("replication_updates_total", MetricType::ObservableCounterU64)
+        .description("Total UPDATE operations received from WAL.")
+        .auto_register(),
+    MetricSpec::new("replication_deletes_total", MetricType::ObservableCounterU64)
+        .description("Total DELETE operations received from WAL.")
+        .auto_register(),
+    MetricSpec::new("replication_truncates_total", MetricType::ObservableCounterU64)
+        .description("Total TRUNCATE operations received from WAL (currently skipped)."),
+    MetricSpec::new("replication_bootstrap_rows_total", MetricType::ObservableCounterU64)
+        .description("Total rows loaded during the initial-snapshot bootstrap phase."),
+    MetricSpec::new("replication_bootstrap_complete", MetricType::ObservableGaugeU64)
+        .description(
+            "1 once the initial-snapshot bootstrap has finished (or was skipped on resume); \
+             0 while the snapshot is still running.",
+        )
+        .auto_register(),
+    MetricSpec::new("replication_decode_errors_total", MetricType::ObservableCounterU64)
+        .description("Total pgoutput-decoding errors encountered while parsing WAL events.")
+        .auto_register(),
+    MetricSpec::new("replication_schema_mismatch_errors_total", MetricType::ObservableCounterU64)
+        .description(
+            "Total errors where the source relation no longer matches the declared \
+             accelerator schema.",
+        )
+        .auto_register(),
+    MetricSpec::new("replication_recv_errors_total", MetricType::ObservableCounterU64)
+        .description(
+            "Total transport-level errors while receiving from the Postgres replication \
+             connection (TCP drops, auth failures after reconnect, etc).",
+        )
+        .auto_register(),
+];
+
+#[derive(Debug, Clone)]
+pub struct PostgresMetricsProvider {
+    metrics: ReplicationMetrics,
+}
+
+impl PostgresMetricsProvider {
+    #[must_use]
+    pub fn new(metrics: ReplicationMetrics) -> Self {
+        Self { metrics }
+    }
+}
+
+impl MetricsProvider for PostgresMetricsProvider {
+    fn component_type(&self) -> ComponentType {
+        ComponentType::Dataset
+    }
+
+    fn component_name(&self) -> &'static str {
+        "postgres"
+    }
+
+    fn available_metrics(&self) -> &'static [MetricSpec] {
+        METRICS
+    }
+
+    fn callback_to_observe_metric(
+        &self,
+        metric: &MetricSpec,
+        attributes: Vec<KeyValue>,
+    ) -> Option<ObserveMetricCallback> {
+        let m = self.metrics.clone();
+        match metric.name {
+            "replication_lag_ms" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                if let Some(v) = m.replication_lag_ms() {
+                    instrument.observe(v, &attributes);
+                }
+            }))),
+            "replication_lag_bytes" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                instrument.observe(m.replication_lag_bytes(), &attributes);
+            }))),
+            "replication_confirmed_flush_lsn" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.confirmed_flush_lsn(), &attributes);
+                })))
+            }
+            "replication_server_wal_end_lsn" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.server_wal_end_lsn(), &attributes);
+                })))
+            }
+            "replication_transactions_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.wal_transactions_total(), &attributes);
+                })))
+            }
+            "replication_inserts_total" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                instrument.observe(m.wal_inserts_total(), &attributes);
+            }))),
+            "replication_updates_total" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                instrument.observe(m.wal_updates_total(), &attributes);
+            }))),
+            "replication_deletes_total" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                instrument.observe(m.wal_deletes_total(), &attributes);
+            }))),
+            "replication_truncates_total" => Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                instrument.observe(m.wal_truncates_total(), &attributes);
+            }))),
+            "replication_bootstrap_rows_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.bootstrap_rows_total(), &attributes);
+                })))
+            }
+            "replication_bootstrap_complete" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.bootstrap_complete(), &attributes);
+                })))
+            }
+            "replication_decode_errors_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.wal_decode_errors_total(), &attributes);
+                })))
+            }
+            "replication_schema_mismatch_errors_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.schema_mismatch_errors_total(), &attributes);
+                })))
+            }
+            "replication_recv_errors_total" => {
+                Some(ObserveMetricCallback::U64(Box::new(move |instrument| {
+                    instrument.observe(m.replication_recv_errors_total(), &attributes);
+                })))
+            }
+            _ => None,
+        }
+    }
 }
 
 fn replication_params_from_connector_params(

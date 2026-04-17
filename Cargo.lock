@@ -4227,6 +4227,7 @@ dependencies = [
  "fundu",
  "futures",
  "linkme",
+ "opentelemetry",
  "paste",
  "runtime",
  "secrecy",

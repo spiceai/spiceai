@@ -29,7 +29,7 @@ use secrecy::ExposeSecret;
 use pgwire_replication::{Lsn, ReplicationClient, ReplicationConfig, ReplicationEvent, TlsConfig};
 
 use super::{
-    Result, SchemaMismatchSnafu,
+    ReplicationMetricsCollector, Result, SchemaMismatchSnafu,
     changes::{TransactionBuffer, build_change_batch, envelope_with_lsn},
     config::ReplicationParams,
     pgoutput::{Decoder, DecodedMessage},
@@ -48,6 +48,7 @@ pub struct WalStreamInput {
     /// ready — used when we skip bootstrap (existing slot resume path).
     pub is_dataset_ready_on_first_event: bool,
     pub confirmed_flush: Arc<AtomicU64>,
+    pub metrics: Arc<ReplicationMetricsCollector>,
 }
 
 /// Establish the replication connection and return a `ChangesStream`.
@@ -91,6 +92,7 @@ fn wal_stream(
     let primary_keys = input.primary_keys;
     let confirmed_flush = Arc::clone(&input.confirmed_flush);
     let mark_ready_on_first = input.is_dataset_ready_on_first_event;
+    let metrics = input.metrics;
 
     try_stream! {
         let mut decoder = Decoder::new();
@@ -102,6 +104,7 @@ fn wal_stream(
                 Ok(Some(e)) => e,
                 Ok(None) => break,
                 Err(e) => {
+                    metrics.inc_recv_error();
                     Err(StreamError::External(format!(
                         "postgres replication recv failed for {dataset_name}: {e}"
                     )))?;
@@ -113,19 +116,31 @@ fn wal_stream(
                 ReplicationEvent::Begin { final_lsn, .. } => {
                     txn = Some(TransactionBuffer::new(final_lsn.0));
                 }
-                ReplicationEvent::XLogData { data, .. } => {
-                    let msg = decoder
-                        .decode(&data)
-                        .map_err(|e| StreamError::External(format!(
-                            "pgoutput decode failed for {dataset_name}: {e}"
-                        )))?;
+                ReplicationEvent::XLogData { data, wal_end, .. } => {
+                    metrics.set_server_wal_end(wal_end.0);
+                    let msg = match decoder.decode(&data) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            metrics.inc_decode_error();
+                            Err(StreamError::External(format!(
+                                "pgoutput decode failed for {dataset_name}: {e}"
+                            )))?;
+                            unreachable!();
+                        }
+                    };
 
                     match msg {
                         DecodedMessage::Relation(rel) => {
-                            validate_relation_against_schema(&schema, &rel, &primary_keys)
-                                .map_err(|e| StreamError::External(format!(
+                            if let Err(e) = validate_relation_against_schema(
+                                &schema,
+                                &rel,
+                                &primary_keys,
+                            ) {
+                                metrics.inc_schema_mismatch_error();
+                                Err(StreamError::External(format!(
                                     "schema mismatch for {dataset_name}: {e}"
                                 )))?;
+                            }
                         }
                         DecodedMessage::Insert { relation_id, tuple } => {
                             let rel = decoder
@@ -136,6 +151,7 @@ fn wal_stream(
                                 .clone();
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
                                 .push_insert(&rel, tuple);
+                            metrics.inc_insert();
                         }
                         DecodedMessage::Update { relation_id, new, .. } => {
                             let rel = decoder
@@ -146,6 +162,7 @@ fn wal_stream(
                                 .clone();
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
                                 .push_update(&rel, new);
+                            metrics.inc_update();
                         }
                         DecodedMessage::Delete { relation_id, old } => {
                             let rel = decoder
@@ -156,8 +173,10 @@ fn wal_stream(
                                 .clone();
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
                                 .push_delete(&rel, old);
+                            metrics.inc_delete();
                         }
                         DecodedMessage::Truncate { .. } => {
+                            metrics.inc_truncate();
                             tracing::warn!(
                                 dataset = %dataset_name,
                                 "TRUNCATE received from postgres replication; skipping (not yet supported)"
@@ -170,6 +189,9 @@ fn wal_stream(
                     }
                 }
                 ReplicationEvent::Commit { end_lsn, .. } => {
+                    metrics.inc_transaction();
+                    metrics.record_commit_watermark(std::time::SystemTime::now());
+
                     if let Some(buffer) = txn.take()
                         && !buffer.is_empty()
                     {
@@ -200,10 +222,14 @@ fn wal_stream(
                         advance(&confirmed_flush, end_lsn.0);
                     }
                     // Forward the durable LSN to the replication client so it
-                    // can send StandbyStatusUpdate in the background.
-                    client.update_applied_lsn(Lsn(confirmed_flush.load(Ordering::Relaxed)));
+                    // can send StandbyStatusUpdate in the background, and mirror
+                    // it into the metrics collector for observability.
+                    let applied = confirmed_flush.load(Ordering::Relaxed);
+                    metrics.set_confirmed_flush_lsn(applied);
+                    client.update_applied_lsn(Lsn(applied));
                 }
                 ReplicationEvent::KeepAlive { wal_end, reply_requested, .. } => {
+                    metrics.set_server_wal_end(wal_end.0);
                     if reply_requested {
                         client.update_applied_lsn(wal_end);
                     }

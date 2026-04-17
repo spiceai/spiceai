@@ -25,6 +25,7 @@ pub mod bootstrap;
 pub mod changes;
 pub mod client;
 pub mod config;
+pub mod metrics;
 pub mod pgoutput;
 pub mod slot;
 
@@ -38,6 +39,7 @@ use snafu::Snafu;
 use crate::cdc::{ChangesStream, StreamError};
 
 pub use config::ReplicationParams;
+pub use metrics::{Metrics as ReplicationMetrics, MetricsCollector as ReplicationMetricsCollector};
 pub use slot::{SlotInfo, SlotSetupOutcome};
 
 #[derive(Debug, Snafu)]
@@ -94,6 +96,10 @@ pub struct ReplicationStreamInput {
     /// Schema-qualified table name being replicated (e.g. `public.users`).
     pub schema_name: String,
     pub table_name: String,
+    /// Shared collector that the stream updates as it processes events.
+    /// The connector reads this via its `MetricsProvider` to expose OpenTelemetry
+    /// observables.
+    pub metrics: Arc<ReplicationMetricsCollector>,
 }
 
 /// Starts the bootstrap+WAL replication stream.
@@ -132,6 +138,7 @@ async fn start_inner(
         primary_keys,
         schema_name,
         table_name,
+        metrics,
     } = input;
 
     // 1. Set up slot and publication. This is idempotent: existing resources are reused.
@@ -148,10 +155,14 @@ async fn start_inner(
                 Arc::clone(&schema),
                 primary_keys.clone(),
                 dataset_name.clone(),
+                Arc::clone(&metrics),
             )
             .await?,
         )
     } else {
+        // No bootstrap this run — if the slot already existed, consider the
+        // accelerator "already populated" so operators see bootstrap_complete=1.
+        metrics.mark_bootstrap_complete();
         None
     };
 
@@ -166,6 +177,7 @@ async fn start_inner(
         dataset_name,
         is_dataset_ready_on_first_event: bootstrap_stream.is_none(),
         confirmed_flush,
+        metrics,
     })
     .await?;
 

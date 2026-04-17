@@ -33,6 +33,8 @@ use datafusion_table_providers::sql::db_connection_pool::{
     postgrespool::{self, PostgresConnectionPool},
 };
 use runtime::component::dataset::Dataset;
+#[cfg(feature = "postgres-replication")]
+use runtime::component::metrics::MetricsProvider;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -59,6 +61,10 @@ pub struct Postgres {
     postgres_factory: PostgresTableFactory,
     #[cfg(feature = "postgres-replication")]
     params: runtime::parameters::Parameters,
+    #[cfg(feature = "postgres-replication")]
+    replication_metrics: std::sync::Arc<
+        data_components::postgres_replication::ReplicationMetricsCollector,
+    >,
 }
 
 impl std::fmt::Debug for Postgres {
@@ -160,6 +166,9 @@ impl DataConnectorFactory for PostgresFactory {
                         postgres_factory,
                         #[cfg(feature = "postgres-replication")]
                         params: params_for_replication,
+                        #[cfg(feature = "postgres-replication")]
+                        replication_metrics:
+                            data_components::postgres_replication::ReplicationMetricsCollector::new(),
                     }) as Arc<dyn DataConnector>)
                 }
                 Err(e) => match e {
@@ -325,7 +334,17 @@ impl DataConnector for Postgres {
             &self.params,
             dataset,
             federated_table,
+            Arc::clone(&self.replication_metrics),
         ))
+    }
+
+    #[cfg(feature = "postgres-replication")]
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        Some(Arc::new(replication::PostgresMetricsProvider::new(
+            data_components::postgres_replication::ReplicationMetrics::new(Arc::clone(
+                &self.replication_metrics,
+            )),
+        )))
     }
 }
 
