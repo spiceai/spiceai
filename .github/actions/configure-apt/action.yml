@@ -86,3 +86,24 @@ runs:
         echo "apt primary archive mirror: ${PRIMARY}"
         echo "deb822 mirror failover list: ${ALL_MIRRORS}"
         echo "apt retry policy installed at /etc/apt/apt.conf.d/99-spice-retries"
+
+    - name: Verify apt mirror configuration (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        echo "=== /etc/apt/apt.conf.d/99-spice-retries ==="
+        cat /etc/apt/apt.conf.d/99-spice-retries
+
+        echo "=== Active URIs in ubuntu.sources (deb822) ==="
+        if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+          grep '^URIs:' /etc/apt/sources.list.d/ubuntu.sources
+        else
+          echo "not present"
+        fi
+
+        echo "=== Active archive lines in sources.list (classic) ==="
+        if [ -f /etc/apt/sources.list ]; then
+          grep 'archive\.ubuntu\.com' /etc/apt/sources.list | grep -v '^#' || true
+        else
+          echo "not present"
+        fi
