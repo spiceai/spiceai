@@ -120,6 +120,7 @@ impl Runtime {
 
     /// Returns a list of valid views from the given App, with SQL validated and dependencies extracted.
     /// Skips any that fail to parse and logs an error for them.
+    #[expect(clippy::result_large_err)]
     pub(crate) fn get_valid_views(
         self: Arc<Self>,
         app: &Arc<App>,
