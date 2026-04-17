@@ -270,13 +270,7 @@ impl ExecutionPlan for OracleExecPlan {
             ),
         };
 
-        // Return Inexact rather than Exact so DataFusion keeps the SortExec wrapper
-        // above us. Exact would replace the SortExec with `inner`, which loses the
-        // SortExec's embedded fetch (`ORDER BY ... LIMIT N` is represented as a
-        // single SortExec with fetch=N in DF 52). Keeping the SortExec preserves the
-        // fetch as a TopK applied to our already-sorted SQL output.
-        // We can use Exact once we use DF version which includes PR https://github.com/apache/datafusion/pull/21182
-        Ok(SortOrderPushdownResult::Inexact {
+        Ok(SortOrderPushdownResult::Exact {
             inner: Arc::new(new_plan),
         })
     }
