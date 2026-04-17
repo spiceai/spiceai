@@ -53,7 +53,7 @@ on:
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
-        default: '30'
+        default: '300'
         type: string
       concurrency_count:
         description: 'How many concurrent client connections to use?'
