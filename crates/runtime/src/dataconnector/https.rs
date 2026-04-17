@@ -649,13 +649,8 @@ impl Https {
         match err {
             AuthErr::InvalidTokenUrl { .. }
             | AuthErr::InsecureTokenUrl { .. }
-            | AuthErr::UnsupportedTokenType { .. } => DataConnectorError::InvalidConfiguration {
-                dataconnector,
-                message: err.to_string(),
-                connector_component: component,
-                source: Box::new(err),
-            },
-            AuthErr::TokenEndpointStatus {
+            | AuthErr::UnsupportedTokenType { .. }
+            | AuthErr::TokenEndpointStatus {
                 status: 400 | 401 | 403,
                 ..
             } => DataConnectorError::InvalidConfiguration {
