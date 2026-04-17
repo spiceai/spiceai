@@ -65,7 +65,7 @@ runs:
           # If the substitution had no effect, surface diagnostics but do not
           # fail the action.
           if ! grep -Fq "${PRIMARY}" /etc/apt/sources.list.d/ubuntu.sources; then
-            echo "WARNING: configure-apt: primary mirror ${PRIMARY} not found in ubuntu.sources after substitution attempt" >&2
+            echo "::warning::configure-apt: primary mirror ${PRIMARY} not found in ubuntu.sources after substitution attempt"
             echo "--- current ubuntu.sources URIs ---" >&2
             grep '^URIs:' /etc/apt/sources.list.d/ubuntu.sources >&2 || true
           fi
