@@ -9,7 +9,7 @@ All criteria must be met for the model to be considered RC.
 | Model Type              | RC Quality | DRI Sign-off |
 | ----------------------- | ---------- | ------------ |
 | Anthropic               | ➖         |              |
-| AWS Bedrock             | ➖         |              |
+| Amazon Bedrock          | ➖         |              |
 | Azure OpenAI            | ➖         |              |
 | Databricks              | ➖         |              |
 | File                    | ✅         | @sgrebnov    |

@@ -8,7 +8,7 @@ All criteria must be met for the embedding component to be considered Stable.
 
 |     Embedding Type      | Stable Quality | DRI Sign-off |
 | ----------------------- | -------------- | ------------ |
-| AWS Bedrock             | ➖             |              |
+| Amazon Bedrock          | ➖             |              |
 | Azure OpenAI            | ➖             |              |
 | Databricks              | ➖             |              |
 | File                    | ➖             |              |

@@ -9,7 +9,7 @@ All criteria must be met for the model to be considered Alpha. As Alpha signifie
 | Model Type              | Alpha Quality | DRI Sign-off    |
 | ----------------------- | ------------- | --------------- |
 | Anthropic               | ➖            |                 |
-| AWS Bedrock             | ➖            |                 |
+| Amazon Bedrock          | ➖            |                 |
 | Azure OpenAI            | ➖            |                 |
 | Databricks              | ➖            |                 |
 | File                    | ✅            | @Jeadie         |

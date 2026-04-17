@@ -9,7 +9,7 @@ All criteria must be met for the model to be considered Stable.
 |     Model Type          | Stable Quality | DRI Sign-off |
 | ----------------------- | -------------- | ------------ |
 | Anthropic               | ➖             |              |
-| AWS Bedrock             | ➖             |              |
+| Amazon Bedrock          | ➖             |              |
 | Azure OpenAI            | ➖             |              |
 | Databricks              | ➖             |              |
 | File                    | ➖             |              |
