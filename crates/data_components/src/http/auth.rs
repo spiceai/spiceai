@@ -40,7 +40,9 @@ use tokio::time::sleep;
 use url::Url;
 use util::fibonacci_backoff::{Backoff as _, FibonacciBackoffBuilder};
 
-use crate::resilient_http::{configure_client_builder, send_request_with_retry};
+use crate::resilient_http::{
+    configure_client_builder, read_bounded_error_body, send_request_with_retry,
+};
 
 /// Refresh the access token this many seconds before it is reported to expire.
 const TOKEN_REFRESH_BUFFER_SECS: u64 = 60;
@@ -354,7 +356,7 @@ async fn exchange_refresh_token(
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
-        let body = read_bounded_error_body(response).await;
+        let body = read_bounded_error_body(response, MAX_ERROR_BODY_BYTES).await;
         return Err(Error::TokenEndpointStatus {
             url: config.token_url.clone(),
             status,
@@ -377,70 +379,6 @@ async fn exchange_refresh_token(
         refresh_token: raw.refresh_token.map(SecretString::from),
         expires_in: raw.expires_in,
     })
-}
-
-/// Stream chunks from the token endpoint's error response, stopping as soon as
-/// we have enough bytes to fill [`MAX_ERROR_BODY_BYTES`] after sanitization.
-/// Prevents a misbehaving or malicious token endpoint from forcing us to buffer
-/// an unbounded body just so we can surface the first 512 bytes of it.
-async fn read_bounded_error_body(mut response: reqwest::Response) -> String {
-    // Cap the raw read at a small multiple of the sanitized cap to allow for
-    // UTF-8 completion and whitespace expansion, while still bounding memory.
-    const READ_CAP_BYTES: usize = MAX_ERROR_BODY_BYTES * 2;
-    let mut raw: Vec<u8> = Vec::new();
-    while raw.len() < READ_CAP_BYTES {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                let remaining = READ_CAP_BYTES - raw.len();
-                if chunk.len() <= remaining {
-                    raw.extend_from_slice(&chunk);
-                } else {
-                    raw.extend_from_slice(&chunk[..remaining]);
-                    break;
-                }
-            }
-            // End of body (Ok(None)) or a network error mid-stream (Err(_))
-            // both stop the read with whatever we have so far — an error
-            // diagnostic from the token endpoint is best-effort by design.
-            Ok(None) | Err(_) => break,
-        }
-    }
-    let text = String::from_utf8_lossy(&raw);
-    sanitize_error_body(&text)
-}
-
-/// Marker appended to the returned string when the body was truncated. The
-/// content budget below is reduced by this marker's length so the final
-/// returned string is never larger than [`MAX_ERROR_BODY_BYTES`].
-const TRUNCATION_MARKER: &str = "…<truncated>";
-
-/// Trim/flatten an arbitrary error response body for safe inclusion in logs
-/// and [`Error::TokenEndpointStatus`]. Guarantees the returned string is at
-/// most [`MAX_ERROR_BODY_BYTES`] bytes *including* the truncation marker;
-/// replaces whitespace with spaces so the result stays single-line.
-fn sanitize_error_body(body: &str) -> String {
-    // Reserve room for the truncation marker so a truncated result still fits
-    // inside MAX_ERROR_BODY_BYTES. MAX_ERROR_BODY_BYTES is large relative to
-    // the marker, so the subtraction can't wrap.
-    const CONTENT_BUDGET: usize = MAX_ERROR_BODY_BYTES - TRUNCATION_MARKER.len();
-    let mut out = String::with_capacity(body.len().min(MAX_ERROR_BODY_BYTES));
-    let mut truncated = false;
-    for ch in body.chars() {
-        // Replace any whitespace character (including newlines/tabs/CR) with a
-        // regular space so the error string stays a single line in logs. Runs
-        // of whitespace are preserved as runs of spaces rather than collapsed.
-        let mapped = if ch.is_whitespace() { ' ' } else { ch };
-        if out.len() + mapped.len_utf8() > CONTENT_BUDGET {
-            truncated = true;
-            break;
-        }
-        out.push(mapped);
-    }
-    if truncated {
-        out.push_str(TRUNCATION_MARKER);
-    }
-    debug_assert!(out.len() <= MAX_ERROR_BODY_BYTES);
-    out
 }
 
 fn build_token_request(
@@ -848,23 +786,6 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
-    }
-
-    #[test]
-    fn sanitize_error_body_replaces_whitespace_and_truncates() {
-        let out = sanitize_error_body("line1\nline2\tfield");
-        assert_eq!(out, "line1 line2 field");
-
-        let long = "a".repeat(MAX_ERROR_BODY_BYTES + 64);
-        let out = sanitize_error_body(&long);
-        assert!(out.ends_with(TRUNCATION_MARKER), "got: {out}");
-        // The total returned string (content + truncation marker) must fit
-        // inside the cap, not just the content portion.
-        assert!(
-            out.len() <= MAX_ERROR_BODY_BYTES,
-            "sanitized body exceeded total cap: {} bytes",
-            out.len(),
-        );
     }
 
     /// Drives the background refresh loop long enough to verify that after
