@@ -933,7 +933,7 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
         ParameterSpec::component("auth_client_secret").secret()
             .description("OAuth2 client_secret presented to the token endpoint. Required when the client is confidential; must be set together with http_auth_client_id."),
         ParameterSpec::runtime("auth_scopes")
-            .description("Space-separated OAuth2 scopes requested when refreshing the access token (e.g. 'read:data offline_access'). Optional."),
+            .description("Space-separated OAuth2 scopes to request when refreshing. Omit to inherit the scopes bound to the refresh token. Optional."),
         ParameterSpec::runtime("auth_client_auth")
             .description("How client credentials are sent to the token endpoint: 'basic' (HTTP Basic header, default per RFC 6749 §2.3.1) or 'body' (client_id/client_secret in the form body).")
             .one_of(&["basic", "body"]),

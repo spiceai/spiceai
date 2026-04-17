@@ -916,7 +916,7 @@ async fn start_oauth_http_server(
     Ok((tx, addr))
 }
 
-/// End-to-end check for OAuth2 refresh-token auth on the HTTP connector:
+/// End-to-end check for `OAuth2` refresh-token auth on the HTTP connector:
 /// the connector should exchange the refresh token at startup, then stamp
 /// `Authorization: Bearer <access_token>` onto every data request.
 #[tokio::test]
