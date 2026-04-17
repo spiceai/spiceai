@@ -2222,7 +2222,7 @@
           ]
         },
         "partition_by": {
-          "description": "Partition expressions used to physically partition accelerated data.\n\nEach list item must be a plain expression string, such as\n`\"YEAR(created_at)\"` or `\"bucket(10, user_id)\"`.",
+          "description": "Partition expressions used to physically partition accelerated data.\n\nEach item must be a plain expression string,\nfor example `\"YEAR(created_at)\"` or `\"bucket(100, user_id)\"`.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/PartitionedBySchema"
