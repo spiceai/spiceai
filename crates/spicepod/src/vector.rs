@@ -33,6 +33,12 @@ pub struct VectorStore {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
 
+    /// Partition expressions used to organize vector data.
+    ///
+    /// Each item may be either a plain expression string
+    /// (for example, `"YEAR(created_at)"` or `"bucket(100, user_id)"`)
+    /// or a single-entry mapping from partition name to expression
+    /// (for example, `{ year: "YEAR(created_at)" }`).
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",

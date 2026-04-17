@@ -117,16 +117,64 @@
   "x-spice-connectors": {
     "dataConnectors": [
       {
-        "name": "debezium",
-        "prefix": "debezium",
-        "paramsRef": "#/$defs/DebeziumDataConnectorParams",
-        "schemaRef": "#/$defs/DebeziumDataset"
+        "name": "http",
+        "prefix": "http",
+        "paramsRef": "#/$defs/HttpDataConnectorParams",
+        "schemaRef": "#/$defs/HttpDataset"
+      },
+      {
+        "name": "https",
+        "prefix": "http",
+        "paramsRef": "#/$defs/HttpsDataConnectorParams",
+        "schemaRef": "#/$defs/HttpsDataset"
+      },
+      {
+        "name": "iceberg",
+        "prefix": "iceberg",
+        "paramsRef": "#/$defs/IcebergDataConnectorParams",
+        "schemaRef": "#/$defs/IcebergDataset"
       },
       {
         "name": "glue",
         "prefix": "glue",
         "paramsRef": "#/$defs/GlueDataConnectorParams",
         "schemaRef": "#/$defs/GlueDataset"
+      },
+      {
+        "name": "github",
+        "prefix": "github",
+        "paramsRef": "#/$defs/GithubDataConnectorParams",
+        "schemaRef": "#/$defs/GithubDataset"
+      },
+      {
+        "name": "git",
+        "prefix": "git",
+        "paramsRef": "#/$defs/GitDataConnectorParams",
+        "schemaRef": "#/$defs/GitDataset"
+      },
+      {
+        "name": "file",
+        "prefix": "file",
+        "paramsRef": "#/$defs/FileDataConnectorParams",
+        "schemaRef": "#/$defs/FileDataset"
+      },
+      {
+        "name": "debezium",
+        "prefix": "debezium",
+        "paramsRef": "#/$defs/DebeziumDataConnectorParams",
+        "schemaRef": "#/$defs/DebeziumDataset"
+      },
+      {
+        "name": "s3",
+        "prefix": "s3",
+        "paramsRef": "#/$defs/S3DataConnectorParams",
+        "schemaRef": "#/$defs/S3Dataset"
+      },
+      {
+        "name": "kafka",
+        "prefix": "kafka",
+        "paramsRef": "#/$defs/KafkaDataConnectorParams",
+        "schemaRef": "#/$defs/KafkaDataset"
       },
       {
         "name": "gs",
@@ -141,52 +189,10 @@
         "schemaRef": "#/$defs/GcsDataset"
       },
       {
-        "name": "s3",
-        "prefix": "s3",
-        "paramsRef": "#/$defs/S3DataConnectorParams",
-        "schemaRef": "#/$defs/S3Dataset"
-      },
-      {
-        "name": "http",
-        "prefix": "http",
-        "paramsRef": "#/$defs/HttpDataConnectorParams",
-        "schemaRef": "#/$defs/HttpDataset"
-      },
-      {
-        "name": "https",
-        "prefix": "http",
-        "paramsRef": "#/$defs/HttpsDataConnectorParams",
-        "schemaRef": "#/$defs/HttpsDataset"
-      },
-      {
-        "name": "kafka",
-        "prefix": "kafka",
-        "paramsRef": "#/$defs/KafkaDataConnectorParams",
-        "schemaRef": "#/$defs/KafkaDataset"
-      },
-      {
-        "name": "github",
-        "prefix": "github",
-        "paramsRef": "#/$defs/GithubDataConnectorParams",
-        "schemaRef": "#/$defs/GithubDataset"
-      },
-      {
-        "name": "memory",
-        "prefix": "memory",
-        "paramsRef": "#/$defs/MemoryDataConnectorParams",
-        "schemaRef": "#/$defs/MemoryDataset"
-      },
-      {
-        "name": "localpod",
-        "prefix": "localpod",
-        "paramsRef": "#/$defs/LocalpodDataConnectorParams",
-        "schemaRef": "#/$defs/LocalpodDataset"
-      },
-      {
-        "name": "file",
-        "prefix": "file",
-        "paramsRef": "#/$defs/FileDataConnectorParams",
-        "schemaRef": "#/$defs/FileDataset"
+        "name": "dynamodb",
+        "prefix": "dynamodb",
+        "paramsRef": "#/$defs/DynamodbDataConnectorParams",
+        "schemaRef": "#/$defs/DynamodbDataset"
       },
       {
         "name": "abfs",
@@ -207,50 +213,34 @@
         "schemaRef": "#/$defs/SinkDataset"
       },
       {
+        "name": "memory",
+        "prefix": "memory",
+        "paramsRef": "#/$defs/MemoryDataConnectorParams",
+        "schemaRef": "#/$defs/MemoryDataset"
+      },
+      {
+        "name": "localpod",
+        "prefix": "localpod",
+        "paramsRef": "#/$defs/LocalpodDataConnectorParams",
+        "schemaRef": "#/$defs/LocalpodDataset"
+      },
+      {
         "name": "spice.ai",
         "prefix": "spiceai",
         "paramsRef": "#/$defs/SpiceAiDataConnectorParams",
         "schemaRef": "#/$defs/SpiceAiDataset"
-      },
-      {
-        "name": "dynamodb",
-        "prefix": "dynamodb",
-        "paramsRef": "#/$defs/DynamodbDataConnectorParams",
-        "schemaRef": "#/$defs/DynamodbDataset"
-      },
-      {
-        "name": "iceberg",
-        "prefix": "iceberg",
-        "paramsRef": "#/$defs/IcebergDataConnectorParams",
-        "schemaRef": "#/$defs/IcebergDataset"
-      },
-      {
-        "name": "git",
-        "prefix": "git",
-        "paramsRef": "#/$defs/GitDataConnectorParams",
-        "schemaRef": "#/$defs/GitDataset"
       }
     ],
     "dataAccelerators": [
-      {
-        "name": "arrow",
-        "prefix": "arrow",
-        "paramsRef": "#/$defs/ArrowAcceleratorParams"
-      },
-      {
-        "name": "arrow",
-        "prefix": "arrow",
-        "paramsRef": "#/$defs/ArrowAcceleratorParams"
-      },
       {
         "name": "duckdb",
         "prefix": "duckdb",
         "paramsRef": "#/$defs/DuckdbAcceleratorParams"
       },
       {
-        "name": "turso",
-        "prefix": "turso",
-        "paramsRef": "#/$defs/TursoAcceleratorParams"
+        "name": "arrow",
+        "prefix": "arrow",
+        "paramsRef": "#/$defs/ArrowAcceleratorParams"
       },
       {
         "name": "cayenne",
@@ -268,14 +258,24 @@
         "paramsRef": "#/$defs/DuckdbAcceleratorParams"
       },
       {
-        "name": "postgres",
-        "prefix": "pg",
-        "paramsRef": "#/$defs/PostgresAcceleratorParams"
+        "name": "arrow",
+        "prefix": "arrow",
+        "paramsRef": "#/$defs/ArrowAcceleratorParams"
       },
       {
         "name": "sqlite",
         "prefix": "sqlite",
         "paramsRef": "#/$defs/SqliteAcceleratorParams"
+      },
+      {
+        "name": "turso",
+        "prefix": "turso",
+        "paramsRef": "#/$defs/TursoAcceleratorParams"
+      },
+      {
+        "name": "postgres",
+        "prefix": "pg",
+        "paramsRef": "#/$defs/PostgresAcceleratorParams"
       }
     ],
     "catalogConnectors": [
@@ -1673,12 +1673,36 @@
           "if": {
             "properties": {
               "from": {
-                "pattern": "^debezium:"
+                "pattern": "^http:"
               }
             }
           },
           "then": {
-            "$ref": "#/$defs/DebeziumDataset"
+            "$ref": "#/$defs/HttpDataset"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^https:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/HttpsDataset"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^iceberg:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/IcebergDataset"
           }
         },
         {
@@ -1691,6 +1715,78 @@
           },
           "then": {
             "$ref": "#/$defs/GlueDataset"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^github:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/GithubDataset"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^git:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/GitDataset"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^file:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/FileDataset"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^debezium:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/DebeziumDataset"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^s3:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/S3Dataset"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^kafka:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/KafkaDataset"
           }
         },
         {
@@ -1721,96 +1817,12 @@
           "if": {
             "properties": {
               "from": {
-                "pattern": "^s3:"
+                "pattern": "^dynamodb:"
               }
             }
           },
           "then": {
-            "$ref": "#/$defs/S3Dataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^http:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/HttpDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^https:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/HttpsDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^kafka:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/KafkaDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^github:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/GithubDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^memory:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/MemoryDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^localpod:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/LocalpodDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^file:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/FileDataset"
+            "$ref": "#/$defs/DynamodbDataset"
           }
         },
         {
@@ -1853,48 +1865,36 @@
           "if": {
             "properties": {
               "from": {
+                "pattern": "^memory:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/MemoryDataset"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
+                "pattern": "^localpod:"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/LocalpodDataset"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "from": {
                 "pattern": "^spice\\.ai:"
               }
             }
           },
           "then": {
             "$ref": "#/$defs/SpiceAiDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^dynamodb:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/DynamodbDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^iceberg:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/IcebergDataset"
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "from": {
-                "pattern": "^git:"
-              }
-            }
-          },
-          "then": {
-            "$ref": "#/$defs/GitDataset"
           }
         }
       ]
@@ -2222,6 +2222,7 @@
           ]
         },
         "partition_by": {
+          "description": "Partition expressions used to physically partition accelerated data.\n\nEach list item can be either:\n- a plain expression string, such as `\"YEAR(created_at)\"` or `\"bucket(10, user_id)\"`, or\n- a single-entry object mapping a partition name to an expression, such as `{ year: \"YEAR(created_at)\" }`.",
           "type": "array",
           "items": {
             "$ref": "#/$defs/PartitionedBySchema"
@@ -2263,52 +2264,6 @@
           "if": {
             "properties": {
               "engine": {
-                "const": "arrow"
-              }
-            }
-          },
-          "then": {
-            "properties": {
-              "params": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/ArrowAcceleratorParams"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ]
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "engine": {
-                "const": "arrow"
-              }
-            }
-          },
-          "then": {
-            "properties": {
-              "params": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/ArrowAcceleratorParams"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ]
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "engine": {
                 "const": "duckdb"
               }
             }
@@ -2332,7 +2287,7 @@
           "if": {
             "properties": {
               "engine": {
-                "const": "turso"
+                "const": "arrow"
               }
             }
           },
@@ -2341,7 +2296,7 @@
               "params": {
                 "anyOf": [
                   {
-                    "$ref": "#/$defs/TursoAcceleratorParams"
+                    "$ref": "#/$defs/ArrowAcceleratorParams"
                   },
                   {
                     "type": "null"
@@ -2424,7 +2379,7 @@
           "if": {
             "properties": {
               "engine": {
-                "const": "postgres"
+                "const": "arrow"
               }
             }
           },
@@ -2433,7 +2388,7 @@
               "params": {
                 "anyOf": [
                   {
-                    "$ref": "#/$defs/PostgresAcceleratorParams"
+                    "$ref": "#/$defs/ArrowAcceleratorParams"
                   },
                   {
                     "type": "null"
@@ -2457,6 +2412,52 @@
                 "anyOf": [
                   {
                     "$ref": "#/$defs/SqliteAcceleratorParams"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "engine": {
+                "const": "turso"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/TursoAcceleratorParams"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "engine": {
+                "const": "postgres"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/PostgresAcceleratorParams"
                   },
                   {
                     "type": "null"
@@ -2586,7 +2587,7 @@
       ]
     },
     "PartitionedBySchema": {
-      "description": "Schema-only helper that describes the accepted YAML/JSON shapes for a\n`partition_by` list item: either a plain expression string\n(e.g. `\"YEAR(created_at)\"` or `\"bucket(10, user_id)\"`) or a single-entry\nobject mapping a partition name to an expression\n(e.g. `{ year: \"YEAR(created_at)\" }`).\n\nThis type is only used to generate an accurate JSON schema for the custom\n`deserialize_partition_by` deserializer; it is not used at runtime.",
+      "description": "Schema-only helper for `partition_by` item shapes used in generated JSON\nschema. Not used at runtime.",
       "anyOf": [
         {
           "type": "string"
@@ -2738,6 +2739,7 @@
           ]
         },
         "partition_by": {
+          "description": "Partition expressions used to organize vector data.\n\nEach item may be either a plain expression string\n(for example, `\"YEAR(created_at)\"` or `\"bucket(100, user_id)\"`)\nor a single-entry mapping from partition name to expression\n(for example, `{ year: \"YEAR(created_at)\" }`).",
           "type": "array",
           "items": {
             "$ref": "#/$defs/PartitionedBySchema"
@@ -3309,861 +3311,6 @@
         }
       ]
     },
-    "DebeziumDataConnectorParams": {
-      "title": "DebeziumParams",
-      "type": "object",
-      "properties": {
-        "debezium_transport": {
-          "description": "The message broker transport to use. The default is kafka.",
-          "type": "string",
-          "default": "kafka"
-        },
-        "debezium_message_format": {
-          "description": "The message format to use. The default is json.",
-          "type": "string",
-          "default": "json"
-        },
-        "kafka_bootstrap_servers": {
-          "description": "A list of host/port pairs for establishing the initial Kafka cluster connection.",
-          "type": "string"
-        },
-        "kafka_security_protocol": {
-          "description": "Security protocol for Kafka connections. Default: 'sasl_ssl'. Options: 'plaintext', 'ssl', 'sasl_plaintext', 'sasl_ssl'.",
-          "type": "string",
-          "default": "sasl_ssl"
-        },
-        "kafka_sasl_mechanism": {
-          "description": "SASL authentication mechanism. Default: 'SCRAM-SHA-512'. Options: 'PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512'.",
-          "type": "string",
-          "default": "SCRAM-SHA-512"
-        },
-        "kafka_sasl_username": {
-          "description": "SASL username.",
-          "type": "string",
-          "x-secret": true
-        },
-        "kafka_sasl_password": {
-          "description": "SASL password.",
-          "type": "string",
-          "x-secret": true
-        },
-        "kafka_ssl_ca_location": {
-          "description": "Path to the SSL/TLS CA certificate file for server verification.",
-          "type": "string",
-          "x-secret": true
-        },
-        "kafka_enable_ssl_certificate_verification": {
-          "description": "Enable SSL/TLS certificate verification. Default: 'true'.",
-          "type": "string",
-          "default": "true"
-        },
-        "kafka_ssl_endpoint_identification_algorithm": {
-          "description": "SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'.",
-          "type": "string",
-          "default": "https"
-        },
-        "kafka_consumer_group_id": {
-          "description": "Kafka consumer group id to use for this dataset. If not set, a unique id will be generated.",
-          "type": "string"
-        },
-        "batch_max_size": {
-          "description": "Maximum number of change events to batch together before processing",
-          "type": "string",
-          "default": "10000"
-        },
-        "batch_max_duration": {
-          "description": "Maximum time to wait for a batch to fill before processing",
-          "type": "string",
-          "default": "1s"
-        }
-      },
-      "required": [
-        "debezium_transport",
-        "debezium_message_format",
-        "kafka_bootstrap_servers"
-      ],
-      "additionalProperties": true
-    },
-    "GlueDataConnectorParams": {
-      "title": "GlueParams",
-      "type": "object",
-      "properties": {
-        "glue_catalog_id": {
-          "type": "string",
-          "x-secret": true
-        },
-        "glue_region": {
-          "type": "string",
-          "x-secret": true
-        },
-        "glue_endpoint": {
-          "type": "string",
-          "x-secret": true
-        },
-        "glue_url_style": {
-          "description": "Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.",
-          "type": "string",
-          "enum": [
-            "vhost",
-            "path"
-          ]
-        },
-        "glue_key": {
-          "type": "string",
-          "x-secret": true
-        },
-        "glue_secret": {
-          "type": "string",
-          "x-secret": true
-        },
-        "glue_session_token": {
-          "type": "string",
-          "x-secret": true
-        },
-        "glue_auth": {
-          "description": "Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.",
-          "type": "string",
-          "x-secret": true
-        },
-        "glue_iam_role_source": {
-          "description": "IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.",
-          "type": "string",
-          "enum": [
-            "auto",
-            "metadata",
-            "env"
-          ]
-        },
-        "glue_versioning": {
-          "description": "Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.",
-          "type": "string",
-          "default": "enabled"
-        },
-        "client_timeout": {
-          "description": "The timeout setting for S3 client.",
-          "type": "string"
-        },
-        "allow_http": {
-          "description": "Allow HTTP protocol for S3 endpoint.",
-          "type": "string"
-        },
-        "file_format": {
-          "type": "string"
-        },
-        "file_extension": {
-          "type": "string"
-        },
-        "schema_infer_max_records": {
-          "description": "Set a limit in terms of records to scan to infer the schema.",
-          "type": "string"
-        },
-        "tsv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "tsv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "tsv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "tsv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "csv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "csv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "csv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_delimiter": {
-          "description": "The character separating values within a row.",
-          "type": "string"
-        },
-        "file_compression_type": {
-          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
-          "type": "string",
-          "enum": [
-            "GZIP",
-            "BZIP2",
-            "XZ",
-            "ZSTD",
-            "UNCOMPRESSED"
-          ]
-        },
-        "hive_partitioning_enabled": {
-          "description": "Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "schema_source_path": {
-          "description": "Specify a path to use for schema inference.",
-          "type": "string"
-        },
-        "json_format": {
-          "description": "json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. When 'file_format' is explicitly 'json', effective default is 'json' (no SODA auto-detection).",
-          "type": "string",
-          "default": "auto",
-          "enum": [
-            "json",
-            "jsonl",
-            "ndjson",
-            "ldjson",
-            "array",
-            "object",
-            "soda",
-            "socrata",
-            "auto"
-          ]
-        },
-        "json_pointer": {
-          "description": "An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing.",
-          "type": "string"
-        },
-        "json_path": {
-          "description": "Alias for 'json_pointer'. An RFC 6901 JSON Pointer to extract data from within a JSON value.",
-          "type": "string"
-        },
-        "flatten_json": {
-          "description": "Set true to flatten nested structs in JSON as separate columns.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "soda_metadata": {
-          "description": "Set to 'enabled' to include Socrata internal metadata columns (sid, id, position, etc.) in the schema for SODA format responses. Defaults to disabled.",
-          "type": "string",
-          "default": "disabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        },
-        "refresh_skip": {
-          "description": "Control skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Set to 'enabled' (default) or 'disabled'.",
-          "type": "string",
-          "default": "enabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
-    "GsDataConnectorParams": {
-      "title": "GsParams",
-      "type": "object",
-      "properties": {
-        "gcs_service_account_path": {
-          "description": "Path to a GCS service account JSON key file.",
-          "type": "string",
-          "x-secret": true
-        },
-        "gcs_service_account_key": {
-          "description": "GCS service account JSON key as a string.",
-          "type": "string",
-          "x-secret": true
-        },
-        "gcs_application_default_credentials": {
-          "description": "Use Google Application Default Credentials for authentication. If GOOGLE_APPLICATION_CREDENTIALS env var is set, uses that path.",
-          "type": "string",
-          "default": "false",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "allow_http": {
-          "description": "Allow insecure HTTP connections.",
-          "type": "string",
-          "default": "false",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "gcs_max_retries": {
-          "description": "The maximum number of retries.",
-          "type": "string",
-          "default": "3"
-        },
-        "gcs_retry_timeout": {
-          "description": "Retry timeout.",
-          "type": "string"
-        },
-        "gcs_backoff_initial_duration": {
-          "description": "Initial backoff duration.",
-          "type": "string"
-        },
-        "gcs_backoff_max_duration": {
-          "description": "Maximum backoff duration.",
-          "type": "string"
-        },
-        "gcs_backoff_base": {
-          "description": "The base of the exponential to use",
-          "type": "string"
-        },
-        "gcs_skip_signature": {
-          "description": "Skip signing requests. Used for public buckets.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "client_timeout": {
-          "description": "The timeout setting for GCS client.",
-          "type": "string"
-        },
-        "file_format": {
-          "type": "string"
-        },
-        "file_extension": {
-          "type": "string"
-        },
-        "schema_infer_max_records": {
-          "description": "Set a limit in terms of records to scan to infer the schema.",
-          "type": "string"
-        },
-        "tsv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "tsv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "tsv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "tsv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "csv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "csv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "csv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_delimiter": {
-          "description": "The character separating values within a row.",
-          "type": "string"
-        },
-        "file_compression_type": {
-          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
-          "type": "string",
-          "enum": [
-            "GZIP",
-            "BZIP2",
-            "XZ",
-            "ZSTD",
-            "UNCOMPRESSED"
-          ]
-        },
-        "hive_partitioning_enabled": {
-          "description": "Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "schema_source_path": {
-          "description": "Specify a path to use for schema inference.",
-          "type": "string"
-        },
-        "json_format": {
-          "description": "json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. When 'file_format' is explicitly 'json', effective default is 'json' (no SODA auto-detection).",
-          "type": "string",
-          "default": "auto",
-          "enum": [
-            "json",
-            "jsonl",
-            "ndjson",
-            "ldjson",
-            "array",
-            "object",
-            "soda",
-            "socrata",
-            "auto"
-          ]
-        },
-        "json_pointer": {
-          "description": "An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing.",
-          "type": "string"
-        },
-        "json_path": {
-          "description": "Alias for 'json_pointer'. An RFC 6901 JSON Pointer to extract data from within a JSON value.",
-          "type": "string"
-        },
-        "flatten_json": {
-          "description": "Set true to flatten nested structs in JSON as separate columns.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "soda_metadata": {
-          "description": "Set to 'enabled' to include Socrata internal metadata columns (sid, id, position, etc.) in the schema for SODA format responses. Defaults to disabled.",
-          "type": "string",
-          "default": "disabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        },
-        "refresh_skip": {
-          "description": "Control skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Set to 'enabled' (default) or 'disabled'.",
-          "type": "string",
-          "default": "enabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
-    "GcsDataConnectorParams": {
-      "title": "GcsParams",
-      "type": "object",
-      "properties": {
-        "gcs_service_account_path": {
-          "description": "Path to a GCS service account JSON key file.",
-          "type": "string",
-          "x-secret": true
-        },
-        "gcs_service_account_key": {
-          "description": "GCS service account JSON key as a string.",
-          "type": "string",
-          "x-secret": true
-        },
-        "gcs_application_default_credentials": {
-          "description": "Use Google Application Default Credentials for authentication. If GOOGLE_APPLICATION_CREDENTIALS env var is set, uses that path.",
-          "type": "string",
-          "default": "false",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "allow_http": {
-          "description": "Allow insecure HTTP connections.",
-          "type": "string",
-          "default": "false",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "gcs_max_retries": {
-          "description": "The maximum number of retries.",
-          "type": "string",
-          "default": "3"
-        },
-        "gcs_retry_timeout": {
-          "description": "Retry timeout.",
-          "type": "string"
-        },
-        "gcs_backoff_initial_duration": {
-          "description": "Initial backoff duration.",
-          "type": "string"
-        },
-        "gcs_backoff_max_duration": {
-          "description": "Maximum backoff duration.",
-          "type": "string"
-        },
-        "gcs_backoff_base": {
-          "description": "The base of the exponential to use",
-          "type": "string"
-        },
-        "gcs_skip_signature": {
-          "description": "Skip signing requests. Used for public buckets.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "client_timeout": {
-          "description": "The timeout setting for GCS client.",
-          "type": "string"
-        },
-        "file_format": {
-          "type": "string"
-        },
-        "file_extension": {
-          "type": "string"
-        },
-        "schema_infer_max_records": {
-          "description": "Set a limit in terms of records to scan to infer the schema.",
-          "type": "string"
-        },
-        "tsv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "tsv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "tsv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "tsv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "csv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "csv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "csv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_delimiter": {
-          "description": "The character separating values within a row.",
-          "type": "string"
-        },
-        "file_compression_type": {
-          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
-          "type": "string",
-          "enum": [
-            "GZIP",
-            "BZIP2",
-            "XZ",
-            "ZSTD",
-            "UNCOMPRESSED"
-          ]
-        },
-        "hive_partitioning_enabled": {
-          "description": "Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "schema_source_path": {
-          "description": "Specify a path to use for schema inference.",
-          "type": "string"
-        },
-        "json_format": {
-          "description": "json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. When 'file_format' is explicitly 'json', effective default is 'json' (no SODA auto-detection).",
-          "type": "string",
-          "default": "auto",
-          "enum": [
-            "json",
-            "jsonl",
-            "ndjson",
-            "ldjson",
-            "array",
-            "object",
-            "soda",
-            "socrata",
-            "auto"
-          ]
-        },
-        "json_pointer": {
-          "description": "An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing.",
-          "type": "string"
-        },
-        "json_path": {
-          "description": "Alias for 'json_pointer'. An RFC 6901 JSON Pointer to extract data from within a JSON value.",
-          "type": "string"
-        },
-        "flatten_json": {
-          "description": "Set true to flatten nested structs in JSON as separate columns.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "soda_metadata": {
-          "description": "Set to 'enabled' to include Socrata internal metadata columns (sid, id, position, etc.) in the schema for SODA format responses. Defaults to disabled.",
-          "type": "string",
-          "default": "disabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        },
-        "refresh_skip": {
-          "description": "Control skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Set to 'enabled' (default) or 'disabled'.",
-          "type": "string",
-          "default": "enabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
-    "S3DataConnectorParams": {
-      "title": "S3Params",
-      "type": "object",
-      "properties": {
-        "s3_region": {
-          "type": "string",
-          "x-secret": true
-        },
-        "s3_endpoint": {
-          "type": "string",
-          "x-secret": true
-        },
-        "s3_url_style": {
-          "description": "Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.",
-          "type": "string",
-          "enum": [
-            "vhost",
-            "path"
-          ]
-        },
-        "s3_key": {
-          "type": "string",
-          "x-secret": true
-        },
-        "s3_secret": {
-          "type": "string",
-          "x-secret": true
-        },
-        "s3_session_token": {
-          "type": "string",
-          "x-secret": true
-        },
-        "s3_auth": {
-          "description": "Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.",
-          "type": "string",
-          "x-secret": true
-        },
-        "s3_iam_role_source": {
-          "description": "IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.",
-          "type": "string",
-          "enum": [
-            "auto",
-            "metadata",
-            "env"
-          ]
-        },
-        "s3_versioning": {
-          "description": "Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.",
-          "type": "string",
-          "default": "enabled"
-        },
-        "client_timeout": {
-          "description": "The timeout setting for S3 client.",
-          "type": "string"
-        },
-        "allow_http": {
-          "description": "Allow HTTP protocol for S3 endpoint.",
-          "type": "string"
-        },
-        "file_format": {
-          "type": "string"
-        },
-        "file_extension": {
-          "type": "string"
-        },
-        "schema_infer_max_records": {
-          "description": "Set a limit in terms of records to scan to infer the schema.",
-          "type": "string"
-        },
-        "tsv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "tsv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "tsv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "tsv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_has_header": {
-          "description": "Set true to indicate that the first line is a header.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "csv_quote": {
-          "description": "The quote character in a row.",
-          "type": "string"
-        },
-        "csv_escape": {
-          "description": "The escape character in a row.",
-          "type": "string"
-        },
-        "csv_schema_infer_max_records": {
-          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
-          "type": "string",
-          "deprecated": true
-        },
-        "csv_delimiter": {
-          "description": "The character separating values within a row.",
-          "type": "string"
-        },
-        "file_compression_type": {
-          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
-          "type": "string",
-          "enum": [
-            "GZIP",
-            "BZIP2",
-            "XZ",
-            "ZSTD",
-            "UNCOMPRESSED"
-          ]
-        },
-        "hive_partitioning_enabled": {
-          "description": "Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "schema_source_path": {
-          "description": "Specify a path to use for schema inference.",
-          "type": "string"
-        },
-        "json_format": {
-          "description": "json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. When 'file_format' is explicitly 'json', effective default is 'json' (no SODA auto-detection).",
-          "type": "string",
-          "default": "auto",
-          "enum": [
-            "json",
-            "jsonl",
-            "ndjson",
-            "ldjson",
-            "array",
-            "object",
-            "soda",
-            "socrata",
-            "auto"
-          ]
-        },
-        "json_pointer": {
-          "description": "An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing.",
-          "type": "string"
-        },
-        "json_path": {
-          "description": "Alias for 'json_pointer'. An RFC 6901 JSON Pointer to extract data from within a JSON value.",
-          "type": "string"
-        },
-        "flatten_json": {
-          "description": "Set true to flatten nested structs in JSON as separate columns.",
-          "type": "string",
-          "enum": [
-            "true",
-            "false"
-          ]
-        },
-        "soda_metadata": {
-          "description": "Set to 'enabled' to include Socrata internal metadata columns (sid, id, position, etc.) in the schema for SODA format responses. Defaults to disabled.",
-          "type": "string",
-          "default": "disabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        },
-        "refresh_skip": {
-          "description": "Control skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Set to 'enabled' (default) or 'disabled'.",
-          "type": "string",
-          "default": "enabled",
-          "enum": [
-            "enabled",
-            "disabled"
-          ]
-        }
-      },
-      "additionalProperties": true
-    },
     "HttpDataConnectorParams": {
       "title": "HttpParams",
       "type": "object",
@@ -4694,61 +3841,292 @@
       },
       "additionalProperties": true
     },
-    "KafkaDataConnectorParams": {
-      "title": "KafkaParams",
+    "IcebergDataConnectorParams": {
+      "title": "IcebergParams",
       "type": "object",
       "properties": {
-        "kafka_bootstrap_servers": {
-          "description": "A list of host/port pairs for establishing the initial Kafka cluster connection.",
+        "metadata_path": {
+          "description": "The path including scheme to the metadata file for the Hadoop table. Must specify a path to a `.json` file. For example, `s3a://my-bucket/warehouse/namespace/table/metadata/v1.metadata.json`",
           "type": "string"
         },
-        "kafka_security_protocol": {
-          "description": "Security protocol for Kafka connections. Default: 'sasl_ssl'. Options: 'plaintext', 'ssl', 'sasl_plaintext', 'sasl_ssl'.",
-          "type": "string",
-          "default": "sasl_ssl"
-        },
-        "kafka_sasl_mechanism": {
-          "description": "SASL authentication mechanism. Default: 'SCRAM-SHA-512'. Options: 'PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512'.",
-          "type": "string",
-          "default": "SCRAM-SHA-512"
-        },
-        "kafka_sasl_username": {
-          "description": "SASL username.",
+        "iceberg_token": {
+          "description": "Bearer token value to use for Authorization header.",
           "type": "string",
           "x-secret": true
         },
-        "kafka_sasl_password": {
-          "description": "SASL password.",
+        "iceberg_oauth2_credential": {
+          "description": "Credential to use for OAuth2 client credential flow when initializing the catalog. Separated by a colon as <client_id>:<client_secret>.",
           "type": "string",
           "x-secret": true
         },
-        "kafka_ssl_ca_location": {
-          "description": "Path to the SSL/TLS CA certificate file for server verification.",
+        "iceberg_oauth2_token_url": {
+          "description": "The URL to use for OAuth2 token endpoint.",
+          "type": "string"
+        },
+        "iceberg_oauth2_scope": {
+          "description": "The scope to use for OAuth2 token endpoint (default: catalog).",
+          "type": "string",
+          "default": "catalog"
+        },
+        "iceberg_oauth2_server_url": {
+          "description": "URL of the OAuth2 server tokens endpoint.",
+          "type": "string"
+        },
+        "iceberg_sigv4_enabled": {
+          "description": "Enable SigV4 authentication for the catalog (for connecting to AWS Glue).",
+          "type": "string"
+        },
+        "iceberg_signing_region": {
+          "description": "The region to use when signing the request for SigV4. Defaults to the region in the catalog URL if available.",
+          "type": "string"
+        },
+        "iceberg_signing_name": {
+          "description": "The name to use when signing the request for SigV4.",
+          "type": "string",
+          "default": "glue"
+        },
+        "iceberg_warehouse": {
+          "description": "Name of the Iceberg warehouse.",
+          "type": "string"
+        },
+        "iceberg_s3_endpoint": {
+          "description": "Configure an alternative endpoint for the S3 service. This can be any s3-compatible object storage service. i.e. Minio, Cloudflare R2, etc.",
           "type": "string",
           "x-secret": true
         },
-        "kafka_enable_ssl_certificate_verification": {
-          "description": "Enable SSL/TLS certificate verification. Default: 'true'.",
+        "iceberg_s3_access_key_id": {
+          "description": "The AWS access key ID to use for S3 storage.",
           "type": "string",
-          "default": "true",
+          "x-secret": true
+        },
+        "iceberg_s3_secret_access_key": {
+          "description": "The AWS secret access key to use for S3 storage.",
+          "type": "string",
+          "x-secret": true
+        },
+        "iceberg_s3_session_token": {
+          "description": "Configure the static session token used for S3 storage.",
+          "type": "string",
+          "x-secret": true
+        },
+        "iceberg_s3_iam_role_source": {
+          "description": "IAM role credential source. 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.",
+          "type": "string",
+          "enum": [
+            "auto",
+            "metadata",
+            "env"
+          ]
+        },
+        "iceberg_s3_region": {
+          "description": "The AWS S3 region to use.",
+          "type": "string",
+          "x-secret": true
+        },
+        "iceberg_s3_role_session_name": {
+          "description": "An optional identifier for the assumed role session for auditing purposes.",
+          "type": "string",
+          "x-secret": true
+        },
+        "iceberg_s3_role_arn": {
+          "description": "The Amazon Resource Name (ARN) of the role to assume. If provided instead of s3_access_key_id and s3_secret_access_key, temporary credentials will be fetched by assuming this role",
+          "type": "string",
+          "x-secret": true
+        },
+        "iceberg_s3_connect_timeout": {
+          "description": "Configure socket connection timeout, in seconds (default: 60).",
+          "type": "string"
+        },
+        "iceberg_gcs_project_id": {
+          "description": "The Google Cloud project ID for GCS storage.",
+          "type": "string"
+        },
+        "iceberg_gcs_credentials": {
+          "description": "Base64-encoded Google Cloud service account credentials JSON for GCS storage.",
+          "type": "string",
+          "x-secret": true
+        },
+        "iceberg_gcs_token": {
+          "description": "OAuth2 token to use for GCS authentication.",
+          "type": "string",
+          "x-secret": true
+        },
+        "iceberg_gcs_service_path": {
+          "description": "Custom endpoint URL for GCS (for emulators or custom endpoints).",
+          "type": "string"
+        },
+        "iceberg_gcs_no_auth": {
+          "description": "Set to 'true' to allow anonymous access to GCS (for public buckets).",
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "GlueDataConnectorParams": {
+      "title": "GlueParams",
+      "type": "object",
+      "properties": {
+        "glue_catalog_id": {
+          "type": "string",
+          "x-secret": true
+        },
+        "glue_region": {
+          "type": "string",
+          "x-secret": true
+        },
+        "glue_endpoint": {
+          "type": "string",
+          "x-secret": true
+        },
+        "glue_url_style": {
+          "description": "Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.",
+          "type": "string",
+          "enum": [
+            "vhost",
+            "path"
+          ]
+        },
+        "glue_key": {
+          "type": "string",
+          "x-secret": true
+        },
+        "glue_secret": {
+          "type": "string",
+          "x-secret": true
+        },
+        "glue_session_token": {
+          "type": "string",
+          "x-secret": true
+        },
+        "glue_auth": {
+          "description": "Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.",
+          "type": "string",
+          "x-secret": true
+        },
+        "glue_iam_role_source": {
+          "description": "IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.",
+          "type": "string",
+          "enum": [
+            "auto",
+            "metadata",
+            "env"
+          ]
+        },
+        "glue_versioning": {
+          "description": "Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.",
+          "type": "string",
+          "default": "enabled"
+        },
+        "client_timeout": {
+          "description": "The timeout setting for S3 client.",
+          "type": "string"
+        },
+        "allow_http": {
+          "description": "Allow HTTP protocol for S3 endpoint.",
+          "type": "string"
+        },
+        "file_format": {
+          "type": "string"
+        },
+        "file_extension": {
+          "type": "string"
+        },
+        "schema_infer_max_records": {
+          "description": "Set a limit in terms of records to scan to infer the schema.",
+          "type": "string"
+        },
+        "tsv_has_header": {
+          "description": "Set true to indicate that the first line is a header.",
+          "type": "string",
           "enum": [
             "true",
             "false"
           ]
         },
-        "kafka_ssl_endpoint_identification_algorithm": {
-          "description": "SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'.",
+        "tsv_quote": {
+          "description": "The quote character in a row.",
+          "type": "string"
+        },
+        "tsv_escape": {
+          "description": "The escape character in a row.",
+          "type": "string"
+        },
+        "tsv_schema_infer_max_records": {
+          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
           "type": "string",
-          "default": "https",
+          "deprecated": true
+        },
+        "csv_has_header": {
+          "description": "Set true to indicate that the first line is a header.",
+          "type": "string",
           "enum": [
-            "none",
-            "https"
+            "true",
+            "false"
           ]
         },
-        "schema_infer_max_records": {
-          "description": "Number of Kafka messages to sample for schema inference. Default: '1'. Increase if your data has optional fields or varying structure.",
+        "csv_quote": {
+          "description": "The quote character in a row.",
+          "type": "string"
+        },
+        "csv_escape": {
+          "description": "The escape character in a row.",
+          "type": "string"
+        },
+        "csv_schema_infer_max_records": {
+          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
           "type": "string",
-          "default": "1"
+          "deprecated": true
+        },
+        "csv_delimiter": {
+          "description": "The character separating values within a row.",
+          "type": "string"
+        },
+        "file_compression_type": {
+          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
+          "type": "string",
+          "enum": [
+            "GZIP",
+            "BZIP2",
+            "XZ",
+            "ZSTD",
+            "UNCOMPRESSED"
+          ]
+        },
+        "hive_partitioning_enabled": {
+          "description": "Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "schema_source_path": {
+          "description": "Specify a path to use for schema inference.",
+          "type": "string"
+        },
+        "json_format": {
+          "description": "json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. When 'file_format' is explicitly 'json', effective default is 'json' (no SODA auto-detection).",
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "json",
+            "jsonl",
+            "ndjson",
+            "ldjson",
+            "array",
+            "object",
+            "soda",
+            "socrata",
+            "auto"
+          ]
+        },
+        "json_pointer": {
+          "description": "An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing.",
+          "type": "string"
+        },
+        "json_path": {
+          "description": "Alias for 'json_pointer'. An RFC 6901 JSON Pointer to extract data from within a JSON value.",
+          "type": "string"
         },
         "flatten_json": {
           "description": "Set true to flatten nested structs in JSON as separate columns.",
@@ -4758,24 +4136,25 @@
             "false"
           ]
         },
-        "kafka_consumer_group_id": {
-          "description": "Kafka consumer group id to use for this dataset. If not set, a unique id will be generated.",
-          "type": "string"
-        },
-        "batch_max_size": {
-          "description": "Maximum number of change events to batch together before processing",
+        "soda_metadata": {
+          "description": "Set to 'enabled' to include Socrata internal metadata columns (sid, id, position, etc.) in the schema for SODA format responses. Defaults to disabled.",
           "type": "string",
-          "default": "10000"
+          "default": "disabled",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
         },
-        "batch_max_duration": {
-          "description": "Maximum time to wait for a batch to fill before processing",
+        "refresh_skip": {
+          "description": "Control skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Set to 'enabled' (default) or 'disabled'.",
           "type": "string",
-          "default": "1s"
+          "default": "enabled",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
         }
       },
-      "required": [
-        "kafka_bootstrap_servers"
-      ],
       "additionalProperties": true
     },
     "GithubDataConnectorParams": {
@@ -4843,16 +4222,37 @@
       },
       "additionalProperties": true
     },
-    "MemoryDataConnectorParams": {
-      "title": "MemoryParams",
+    "GitDataConnectorParams": {
+      "title": "GitParams",
       "type": "object",
-      "properties": {},
-      "additionalProperties": true
-    },
-    "LocalpodDataConnectorParams": {
-      "title": "LocalpodParams",
-      "type": "object",
-      "properties": {},
+      "properties": {
+        "include": {
+          "description": "Include only files matching the glob pattern. Multiple patterns can be separated by comma or semicolon.",
+          "type": "string",
+          "examples": [
+            "*.rs",
+            "**/*.yaml;src/**/*.json"
+          ]
+        },
+        "fetch_content": {
+          "description": "Whether to fetch file content. Set to 'true' to include file content in the 'content' column.",
+          "type": "string",
+          "default": "false"
+        },
+        "cache_path": {
+          "description": "Custom path for the local Git repository cache. If not specified, uses system temp directory.",
+          "type": "string"
+        },
+        "max_files": {
+          "description": "Maximum number of files to materialize from a Git repository. Default: 5000. Hard limit: 50000.",
+          "type": "string",
+          "default": "5000"
+        },
+        "max_file_bytes": {
+          "description": "Maximum size (bytes) for an individual file when fetching content. Files larger than this value are skipped. Default: 524288. Maximum: 5242880 (5 MiB).",
+          "type": "string"
+        }
+      },
       "additionalProperties": true
     },
     "FileDataConnectorParams": {
@@ -4989,6 +4389,832 @@
           ]
         }
       },
+      "additionalProperties": true
+    },
+    "DebeziumDataConnectorParams": {
+      "title": "DebeziumParams",
+      "type": "object",
+      "properties": {
+        "debezium_transport": {
+          "description": "The message broker transport to use. The default is kafka.",
+          "type": "string",
+          "default": "kafka"
+        },
+        "debezium_message_format": {
+          "description": "The message format to use. The default is json.",
+          "type": "string",
+          "default": "json"
+        },
+        "kafka_bootstrap_servers": {
+          "description": "A list of host/port pairs for establishing the initial Kafka cluster connection.",
+          "type": "string"
+        },
+        "kafka_security_protocol": {
+          "description": "Security protocol for Kafka connections. Default: 'sasl_ssl'. Options: 'plaintext', 'ssl', 'sasl_plaintext', 'sasl_ssl'.",
+          "type": "string",
+          "default": "sasl_ssl"
+        },
+        "kafka_sasl_mechanism": {
+          "description": "SASL authentication mechanism. Default: 'SCRAM-SHA-512'. Options: 'PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512'.",
+          "type": "string",
+          "default": "SCRAM-SHA-512"
+        },
+        "kafka_sasl_username": {
+          "description": "SASL username.",
+          "type": "string",
+          "x-secret": true
+        },
+        "kafka_sasl_password": {
+          "description": "SASL password.",
+          "type": "string",
+          "x-secret": true
+        },
+        "kafka_ssl_ca_location": {
+          "description": "Path to the SSL/TLS CA certificate file for server verification.",
+          "type": "string",
+          "x-secret": true
+        },
+        "kafka_enable_ssl_certificate_verification": {
+          "description": "Enable SSL/TLS certificate verification. Default: 'true'.",
+          "type": "string",
+          "default": "true"
+        },
+        "kafka_ssl_endpoint_identification_algorithm": {
+          "description": "SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'.",
+          "type": "string",
+          "default": "https"
+        },
+        "kafka_consumer_group_id": {
+          "description": "Kafka consumer group id to use for this dataset. If not set, a unique id will be generated.",
+          "type": "string"
+        },
+        "batch_max_size": {
+          "description": "Maximum number of change events to batch together before processing",
+          "type": "string",
+          "default": "10000"
+        },
+        "batch_max_duration": {
+          "description": "Maximum time to wait for a batch to fill before processing",
+          "type": "string",
+          "default": "1s"
+        }
+      },
+      "required": [
+        "debezium_transport",
+        "debezium_message_format",
+        "kafka_bootstrap_servers"
+      ],
+      "additionalProperties": true
+    },
+    "S3DataConnectorParams": {
+      "title": "S3Params",
+      "type": "object",
+      "properties": {
+        "s3_region": {
+          "type": "string",
+          "x-secret": true
+        },
+        "s3_endpoint": {
+          "type": "string",
+          "x-secret": true
+        },
+        "s3_url_style": {
+          "description": "Controls S3 URL addressing style. Supported values: 'vhost' and 'path'. When not set, auto-detected from the endpoint.",
+          "type": "string",
+          "enum": [
+            "vhost",
+            "path"
+          ]
+        },
+        "s3_key": {
+          "type": "string",
+          "x-secret": true
+        },
+        "s3_secret": {
+          "type": "string",
+          "x-secret": true
+        },
+        "s3_session_token": {
+          "type": "string",
+          "x-secret": true
+        },
+        "s3_auth": {
+          "description": "Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.",
+          "type": "string",
+          "x-secret": true
+        },
+        "s3_iam_role_source": {
+          "description": "IAM role credential source (used when auth is 'iam_role' or unset, i.e. default IAM-based auth). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.",
+          "type": "string",
+          "enum": [
+            "auto",
+            "metadata",
+            "env"
+          ]
+        },
+        "s3_versioning": {
+          "description": "Enables S3 object versioning support when set to 'enabled'. Defaults to 'enabled'.",
+          "type": "string",
+          "default": "enabled"
+        },
+        "client_timeout": {
+          "description": "The timeout setting for S3 client.",
+          "type": "string"
+        },
+        "allow_http": {
+          "description": "Allow HTTP protocol for S3 endpoint.",
+          "type": "string"
+        },
+        "file_format": {
+          "type": "string"
+        },
+        "file_extension": {
+          "type": "string"
+        },
+        "schema_infer_max_records": {
+          "description": "Set a limit in terms of records to scan to infer the schema.",
+          "type": "string"
+        },
+        "tsv_has_header": {
+          "description": "Set true to indicate that the first line is a header.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "tsv_quote": {
+          "description": "The quote character in a row.",
+          "type": "string"
+        },
+        "tsv_escape": {
+          "description": "The escape character in a row.",
+          "type": "string"
+        },
+        "tsv_schema_infer_max_records": {
+          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
+          "type": "string",
+          "deprecated": true
+        },
+        "csv_has_header": {
+          "description": "Set true to indicate that the first line is a header.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "csv_quote": {
+          "description": "The quote character in a row.",
+          "type": "string"
+        },
+        "csv_escape": {
+          "description": "The escape character in a row.",
+          "type": "string"
+        },
+        "csv_schema_infer_max_records": {
+          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
+          "type": "string",
+          "deprecated": true
+        },
+        "csv_delimiter": {
+          "description": "The character separating values within a row.",
+          "type": "string"
+        },
+        "file_compression_type": {
+          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
+          "type": "string",
+          "enum": [
+            "GZIP",
+            "BZIP2",
+            "XZ",
+            "ZSTD",
+            "UNCOMPRESSED"
+          ]
+        },
+        "hive_partitioning_enabled": {
+          "description": "Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "schema_source_path": {
+          "description": "Specify a path to use for schema inference.",
+          "type": "string"
+        },
+        "json_format": {
+          "description": "json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. When 'file_format' is explicitly 'json', effective default is 'json' (no SODA auto-detection).",
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "json",
+            "jsonl",
+            "ndjson",
+            "ldjson",
+            "array",
+            "object",
+            "soda",
+            "socrata",
+            "auto"
+          ]
+        },
+        "json_pointer": {
+          "description": "An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing.",
+          "type": "string"
+        },
+        "json_path": {
+          "description": "Alias for 'json_pointer'. An RFC 6901 JSON Pointer to extract data from within a JSON value.",
+          "type": "string"
+        },
+        "flatten_json": {
+          "description": "Set true to flatten nested structs in JSON as separate columns.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "soda_metadata": {
+          "description": "Set to 'enabled' to include Socrata internal metadata columns (sid, id, position, etc.) in the schema for SODA format responses. Defaults to disabled.",
+          "type": "string",
+          "default": "disabled",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
+        },
+        "refresh_skip": {
+          "description": "Control skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Set to 'enabled' (default) or 'disabled'.",
+          "type": "string",
+          "default": "enabled",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "KafkaDataConnectorParams": {
+      "title": "KafkaParams",
+      "type": "object",
+      "properties": {
+        "kafka_bootstrap_servers": {
+          "description": "A list of host/port pairs for establishing the initial Kafka cluster connection.",
+          "type": "string"
+        },
+        "kafka_security_protocol": {
+          "description": "Security protocol for Kafka connections. Default: 'sasl_ssl'. Options: 'plaintext', 'ssl', 'sasl_plaintext', 'sasl_ssl'.",
+          "type": "string",
+          "default": "sasl_ssl"
+        },
+        "kafka_sasl_mechanism": {
+          "description": "SASL authentication mechanism. Default: 'SCRAM-SHA-512'. Options: 'PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512'.",
+          "type": "string",
+          "default": "SCRAM-SHA-512"
+        },
+        "kafka_sasl_username": {
+          "description": "SASL username.",
+          "type": "string",
+          "x-secret": true
+        },
+        "kafka_sasl_password": {
+          "description": "SASL password.",
+          "type": "string",
+          "x-secret": true
+        },
+        "kafka_ssl_ca_location": {
+          "description": "Path to the SSL/TLS CA certificate file for server verification.",
+          "type": "string",
+          "x-secret": true
+        },
+        "kafka_enable_ssl_certificate_verification": {
+          "description": "Enable SSL/TLS certificate verification. Default: 'true'.",
+          "type": "string",
+          "default": "true",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "kafka_ssl_endpoint_identification_algorithm": {
+          "description": "SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'.",
+          "type": "string",
+          "default": "https",
+          "enum": [
+            "none",
+            "https"
+          ]
+        },
+        "schema_infer_max_records": {
+          "description": "Number of Kafka messages to sample for schema inference. Default: '1'. Increase if your data has optional fields or varying structure.",
+          "type": "string",
+          "default": "1"
+        },
+        "flatten_json": {
+          "description": "Set true to flatten nested structs in JSON as separate columns.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "kafka_consumer_group_id": {
+          "description": "Kafka consumer group id to use for this dataset. If not set, a unique id will be generated.",
+          "type": "string"
+        },
+        "batch_max_size": {
+          "description": "Maximum number of change events to batch together before processing",
+          "type": "string",
+          "default": "10000"
+        },
+        "batch_max_duration": {
+          "description": "Maximum time to wait for a batch to fill before processing",
+          "type": "string",
+          "default": "1s"
+        }
+      },
+      "required": [
+        "kafka_bootstrap_servers"
+      ],
+      "additionalProperties": true
+    },
+    "GsDataConnectorParams": {
+      "title": "GsParams",
+      "type": "object",
+      "properties": {
+        "gcs_service_account_path": {
+          "description": "Path to a GCS service account JSON key file.",
+          "type": "string",
+          "x-secret": true
+        },
+        "gcs_service_account_key": {
+          "description": "GCS service account JSON key as a string.",
+          "type": "string",
+          "x-secret": true
+        },
+        "gcs_application_default_credentials": {
+          "description": "Use Google Application Default Credentials for authentication. If GOOGLE_APPLICATION_CREDENTIALS env var is set, uses that path.",
+          "type": "string",
+          "default": "false",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "allow_http": {
+          "description": "Allow insecure HTTP connections.",
+          "type": "string",
+          "default": "false",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "gcs_max_retries": {
+          "description": "The maximum number of retries.",
+          "type": "string",
+          "default": "3"
+        },
+        "gcs_retry_timeout": {
+          "description": "Retry timeout.",
+          "type": "string"
+        },
+        "gcs_backoff_initial_duration": {
+          "description": "Initial backoff duration.",
+          "type": "string"
+        },
+        "gcs_backoff_max_duration": {
+          "description": "Maximum backoff duration.",
+          "type": "string"
+        },
+        "gcs_backoff_base": {
+          "description": "The base of the exponential to use",
+          "type": "string"
+        },
+        "gcs_skip_signature": {
+          "description": "Skip signing requests. Used for public buckets.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "client_timeout": {
+          "description": "The timeout setting for GCS client.",
+          "type": "string"
+        },
+        "file_format": {
+          "type": "string"
+        },
+        "file_extension": {
+          "type": "string"
+        },
+        "schema_infer_max_records": {
+          "description": "Set a limit in terms of records to scan to infer the schema.",
+          "type": "string"
+        },
+        "tsv_has_header": {
+          "description": "Set true to indicate that the first line is a header.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "tsv_quote": {
+          "description": "The quote character in a row.",
+          "type": "string"
+        },
+        "tsv_escape": {
+          "description": "The escape character in a row.",
+          "type": "string"
+        },
+        "tsv_schema_infer_max_records": {
+          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
+          "type": "string",
+          "deprecated": true
+        },
+        "csv_has_header": {
+          "description": "Set true to indicate that the first line is a header.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "csv_quote": {
+          "description": "The quote character in a row.",
+          "type": "string"
+        },
+        "csv_escape": {
+          "description": "The escape character in a row.",
+          "type": "string"
+        },
+        "csv_schema_infer_max_records": {
+          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
+          "type": "string",
+          "deprecated": true
+        },
+        "csv_delimiter": {
+          "description": "The character separating values within a row.",
+          "type": "string"
+        },
+        "file_compression_type": {
+          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
+          "type": "string",
+          "enum": [
+            "GZIP",
+            "BZIP2",
+            "XZ",
+            "ZSTD",
+            "UNCOMPRESSED"
+          ]
+        },
+        "hive_partitioning_enabled": {
+          "description": "Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "schema_source_path": {
+          "description": "Specify a path to use for schema inference.",
+          "type": "string"
+        },
+        "json_format": {
+          "description": "json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. When 'file_format' is explicitly 'json', effective default is 'json' (no SODA auto-detection).",
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "json",
+            "jsonl",
+            "ndjson",
+            "ldjson",
+            "array",
+            "object",
+            "soda",
+            "socrata",
+            "auto"
+          ]
+        },
+        "json_pointer": {
+          "description": "An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing.",
+          "type": "string"
+        },
+        "json_path": {
+          "description": "Alias for 'json_pointer'. An RFC 6901 JSON Pointer to extract data from within a JSON value.",
+          "type": "string"
+        },
+        "flatten_json": {
+          "description": "Set true to flatten nested structs in JSON as separate columns.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "soda_metadata": {
+          "description": "Set to 'enabled' to include Socrata internal metadata columns (sid, id, position, etc.) in the schema for SODA format responses. Defaults to disabled.",
+          "type": "string",
+          "default": "disabled",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
+        },
+        "refresh_skip": {
+          "description": "Control skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Set to 'enabled' (default) or 'disabled'.",
+          "type": "string",
+          "default": "enabled",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "GcsDataConnectorParams": {
+      "title": "GcsParams",
+      "type": "object",
+      "properties": {
+        "gcs_service_account_path": {
+          "description": "Path to a GCS service account JSON key file.",
+          "type": "string",
+          "x-secret": true
+        },
+        "gcs_service_account_key": {
+          "description": "GCS service account JSON key as a string.",
+          "type": "string",
+          "x-secret": true
+        },
+        "gcs_application_default_credentials": {
+          "description": "Use Google Application Default Credentials for authentication. If GOOGLE_APPLICATION_CREDENTIALS env var is set, uses that path.",
+          "type": "string",
+          "default": "false",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "allow_http": {
+          "description": "Allow insecure HTTP connections.",
+          "type": "string",
+          "default": "false",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "gcs_max_retries": {
+          "description": "The maximum number of retries.",
+          "type": "string",
+          "default": "3"
+        },
+        "gcs_retry_timeout": {
+          "description": "Retry timeout.",
+          "type": "string"
+        },
+        "gcs_backoff_initial_duration": {
+          "description": "Initial backoff duration.",
+          "type": "string"
+        },
+        "gcs_backoff_max_duration": {
+          "description": "Maximum backoff duration.",
+          "type": "string"
+        },
+        "gcs_backoff_base": {
+          "description": "The base of the exponential to use",
+          "type": "string"
+        },
+        "gcs_skip_signature": {
+          "description": "Skip signing requests. Used for public buckets.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "client_timeout": {
+          "description": "The timeout setting for GCS client.",
+          "type": "string"
+        },
+        "file_format": {
+          "type": "string"
+        },
+        "file_extension": {
+          "type": "string"
+        },
+        "schema_infer_max_records": {
+          "description": "Set a limit in terms of records to scan to infer the schema.",
+          "type": "string"
+        },
+        "tsv_has_header": {
+          "description": "Set true to indicate that the first line is a header.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "tsv_quote": {
+          "description": "The quote character in a row.",
+          "type": "string"
+        },
+        "tsv_escape": {
+          "description": "The escape character in a row.",
+          "type": "string"
+        },
+        "tsv_schema_infer_max_records": {
+          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
+          "type": "string",
+          "deprecated": true
+        },
+        "csv_has_header": {
+          "description": "Set true to indicate that the first line is a header.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "csv_quote": {
+          "description": "The quote character in a row.",
+          "type": "string"
+        },
+        "csv_escape": {
+          "description": "The escape character in a row.",
+          "type": "string"
+        },
+        "csv_schema_infer_max_records": {
+          "description": "**DEPRECATED**: use 'schema_infer_max_records' instead\n\nSet a limit in terms of records to scan to infer the schema.",
+          "type": "string",
+          "deprecated": true
+        },
+        "csv_delimiter": {
+          "description": "The character separating values within a row.",
+          "type": "string"
+        },
+        "file_compression_type": {
+          "description": "The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED",
+          "type": "string",
+          "enum": [
+            "GZIP",
+            "BZIP2",
+            "XZ",
+            "ZSTD",
+            "UNCOMPRESSED"
+          ]
+        },
+        "hive_partitioning_enabled": {
+          "description": "Enable partitioning using hive-style partitioning from the folder structure. Defaults to false.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "schema_source_path": {
+          "description": "Specify a path to use for schema inference.",
+          "type": "string"
+        },
+        "json_format": {
+          "description": "json | jsonl | ndjson | ldjson | array | object | soda | socrata | auto. When 'file_format' is explicitly 'json', effective default is 'json' (no SODA auto-detection).",
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "json",
+            "jsonl",
+            "ndjson",
+            "ldjson",
+            "array",
+            "object",
+            "soda",
+            "socrata",
+            "auto"
+          ]
+        },
+        "json_pointer": {
+          "description": "An RFC 6901 JSON Pointer to extract data from within a JSON value. E.g. '/data' for {\"data\": [...]} or '/response/items' for nested objects. A leading '/' is added automatically if missing.",
+          "type": "string"
+        },
+        "json_path": {
+          "description": "Alias for 'json_pointer'. An RFC 6901 JSON Pointer to extract data from within a JSON value.",
+          "type": "string"
+        },
+        "flatten_json": {
+          "description": "Set true to flatten nested structs in JSON as separate columns.",
+          "type": "string",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "soda_metadata": {
+          "description": "Set to 'enabled' to include Socrata internal metadata columns (sid, id, position, etc.) in the schema for SODA format responses. Defaults to disabled.",
+          "type": "string",
+          "default": "disabled",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
+        },
+        "refresh_skip": {
+          "description": "Control skipping refreshes for single-file S3 datasets when cached ETag/Version metadata matches. Set to 'enabled' (default) or 'disabled'.",
+          "type": "string",
+          "default": "enabled",
+          "enum": [
+            "enabled",
+            "disabled"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "DynamodbDataConnectorParams": {
+      "title": "DynamodbParams",
+      "type": "object",
+      "properties": {
+        "dynamodb_aws_region": {
+          "description": "The AWS region to use for DynamoDB.",
+          "type": "string",
+          "x-secret": true
+        },
+        "dynamodb_aws_access_key_id": {
+          "description": "The AWS access key ID to use for DynamoDB.",
+          "type": "string",
+          "x-secret": true
+        },
+        "dynamodb_aws_secret_access_key": {
+          "description": "The AWS secret access key to use for DynamoDB.",
+          "type": "string",
+          "x-secret": true
+        },
+        "dynamodb_aws_session_token": {
+          "description": "The AWS session token to use for DynamoDB.",
+          "type": "string",
+          "x-secret": true
+        },
+        "dynamodb_aws_auth": {
+          "description": "Authentication method. Use 'iam_role' for IAM role-based authentication or 'key' for explicit access key credentials",
+          "type": "string",
+          "default": "iam_role"
+        },
+        "dynamodb_aws_iam_role_source": {
+          "description": "IAM role credential source (only used when aws_auth is 'iam_role'). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables",
+          "type": "string",
+          "enum": [
+            "auto",
+            "metadata",
+            "env"
+          ]
+        },
+        "unnest_depth": {
+          "description": "Maximum nesting depth for unnesting embedded documents into a flattened structure. Higher values expand deeper nested fields.",
+          "type": "string"
+        },
+        "schema_infer_max_records": {
+          "description": "Number of documents to use to infer the schema. Defaults to 10.",
+          "type": "string",
+          "default": "10"
+        },
+        "scan_segments": {
+          "description": "Number of segments. 'auto' by default.",
+          "type": "string",
+          "default": "auto"
+        },
+        "scan_interval": {
+          "description": "Interval in milliseconds between polling for new records in a DynamoDB stream.",
+          "type": "string",
+          "default": "0s"
+        },
+        "time_format": {
+          "description": "Go-style time format used for parsing/formatting timestamps",
+          "type": "string",
+          "default": "2006-01-02T15:04:05.000Z07:00"
+        },
+        "ready_lag": {
+          "description": "When using Streams, once tables reaches this lag, it will be reported as Ready",
+          "type": "string",
+          "default": "2s"
+        },
+        "endpoint_url": {
+          "description": "Custom endpoint URL for DynamoDB-compatible services (e.g., DynamoDB Local, ScyllaDB Alternator).",
+          "type": "string"
+        },
+        "lag_exceeds_shard_retention_behavior": {
+          "description": "Behavior when stream lag exceeds shard retention (24h). 'error' marks dataset as Error, 'ready_before_load' marks Ready then re-bootstraps, 'ready_after_load' re-bootstraps then marks Ready",
+          "type": "string",
+          "default": "error"
+        }
+      },
+      "required": [
+        "dynamodb_aws_region"
+      ],
       "additionalProperties": true
     },
     "AbfsDataConnectorParams": {
@@ -5573,6 +5799,18 @@
       "properties": {},
       "additionalProperties": true
     },
+    "MemoryDataConnectorParams": {
+      "title": "MemoryParams",
+      "type": "object",
+      "properties": {},
+      "additionalProperties": true
+    },
+    "LocalpodDataConnectorParams": {
+      "title": "LocalpodParams",
+      "type": "object",
+      "properties": {},
+      "additionalProperties": true
+    },
     "SpiceAiDataConnectorParams": {
       "title": "SpiceAiParams",
       "type": "object",
@@ -5586,260 +5824,6 @@
           "x-secret": true
         },
         "spiceai_endpoint": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": true
-    },
-    "DynamodbDataConnectorParams": {
-      "title": "DynamodbParams",
-      "type": "object",
-      "properties": {
-        "dynamodb_aws_region": {
-          "description": "The AWS region to use for DynamoDB.",
-          "type": "string",
-          "x-secret": true
-        },
-        "dynamodb_aws_access_key_id": {
-          "description": "The AWS access key ID to use for DynamoDB.",
-          "type": "string",
-          "x-secret": true
-        },
-        "dynamodb_aws_secret_access_key": {
-          "description": "The AWS secret access key to use for DynamoDB.",
-          "type": "string",
-          "x-secret": true
-        },
-        "dynamodb_aws_session_token": {
-          "description": "The AWS session token to use for DynamoDB.",
-          "type": "string",
-          "x-secret": true
-        },
-        "dynamodb_aws_auth": {
-          "description": "Authentication method. Use 'iam_role' for IAM role-based authentication or 'key' for explicit access key credentials",
-          "type": "string",
-          "default": "iam_role"
-        },
-        "dynamodb_aws_iam_role_source": {
-          "description": "IAM role credential source (only used when aws_auth is 'iam_role'). 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables",
-          "type": "string",
-          "enum": [
-            "auto",
-            "metadata",
-            "env"
-          ]
-        },
-        "unnest_depth": {
-          "description": "Maximum nesting depth for unnesting embedded documents into a flattened structure. Higher values expand deeper nested fields.",
-          "type": "string"
-        },
-        "schema_infer_max_records": {
-          "description": "Number of documents to use to infer the schema. Defaults to 10.",
-          "type": "string",
-          "default": "10"
-        },
-        "scan_segments": {
-          "description": "Number of segments. 'auto' by default.",
-          "type": "string",
-          "default": "auto"
-        },
-        "scan_interval": {
-          "description": "Interval in milliseconds between polling for new records in a DynamoDB stream.",
-          "type": "string",
-          "default": "0s"
-        },
-        "time_format": {
-          "description": "Go-style time format used for parsing/formatting timestamps",
-          "type": "string",
-          "default": "2006-01-02T15:04:05.000Z07:00"
-        },
-        "ready_lag": {
-          "description": "When using Streams, once tables reaches this lag, it will be reported as Ready",
-          "type": "string",
-          "default": "2s"
-        },
-        "endpoint_url": {
-          "description": "Custom endpoint URL for DynamoDB-compatible services (e.g., DynamoDB Local, ScyllaDB Alternator).",
-          "type": "string"
-        },
-        "lag_exceeds_shard_retention_behavior": {
-          "description": "Behavior when stream lag exceeds shard retention (24h). 'error' marks dataset as Error, 'ready_before_load' marks Ready then re-bootstraps, 'ready_after_load' re-bootstraps then marks Ready",
-          "type": "string",
-          "default": "error"
-        }
-      },
-      "required": [
-        "dynamodb_aws_region"
-      ],
-      "additionalProperties": true
-    },
-    "IcebergDataConnectorParams": {
-      "title": "IcebergParams",
-      "type": "object",
-      "properties": {
-        "metadata_path": {
-          "description": "The path including scheme to the metadata file for the Hadoop table. Must specify a path to a `.json` file. For example, `s3a://my-bucket/warehouse/namespace/table/metadata/v1.metadata.json`",
-          "type": "string"
-        },
-        "iceberg_token": {
-          "description": "Bearer token value to use for Authorization header.",
-          "type": "string",
-          "x-secret": true
-        },
-        "iceberg_oauth2_credential": {
-          "description": "Credential to use for OAuth2 client credential flow when initializing the catalog. Separated by a colon as <client_id>:<client_secret>.",
-          "type": "string",
-          "x-secret": true
-        },
-        "iceberg_oauth2_token_url": {
-          "description": "The URL to use for OAuth2 token endpoint.",
-          "type": "string"
-        },
-        "iceberg_oauth2_scope": {
-          "description": "The scope to use for OAuth2 token endpoint (default: catalog).",
-          "type": "string",
-          "default": "catalog"
-        },
-        "iceberg_oauth2_server_url": {
-          "description": "URL of the OAuth2 server tokens endpoint.",
-          "type": "string"
-        },
-        "iceberg_sigv4_enabled": {
-          "description": "Enable SigV4 authentication for the catalog (for connecting to AWS Glue).",
-          "type": "string"
-        },
-        "iceberg_signing_region": {
-          "description": "The region to use when signing the request for SigV4. Defaults to the region in the catalog URL if available.",
-          "type": "string"
-        },
-        "iceberg_signing_name": {
-          "description": "The name to use when signing the request for SigV4.",
-          "type": "string",
-          "default": "glue"
-        },
-        "iceberg_warehouse": {
-          "description": "Name of the Iceberg warehouse.",
-          "type": "string"
-        },
-        "iceberg_s3_endpoint": {
-          "description": "Configure an alternative endpoint for the S3 service. This can be any s3-compatible object storage service. i.e. Minio, Cloudflare R2, etc.",
-          "type": "string",
-          "x-secret": true
-        },
-        "iceberg_s3_access_key_id": {
-          "description": "The AWS access key ID to use for S3 storage.",
-          "type": "string",
-          "x-secret": true
-        },
-        "iceberg_s3_secret_access_key": {
-          "description": "The AWS secret access key to use for S3 storage.",
-          "type": "string",
-          "x-secret": true
-        },
-        "iceberg_s3_session_token": {
-          "description": "Configure the static session token used for S3 storage.",
-          "type": "string",
-          "x-secret": true
-        },
-        "iceberg_s3_iam_role_source": {
-          "description": "IAM role credential source. 'auto' uses the default AWS credential chain, 'metadata' uses only instance/container metadata (IMDS, ECS, EKS/IRSA), 'env' uses only environment variables.",
-          "type": "string",
-          "enum": [
-            "auto",
-            "metadata",
-            "env"
-          ]
-        },
-        "iceberg_s3_region": {
-          "description": "The AWS S3 region to use.",
-          "type": "string",
-          "x-secret": true
-        },
-        "iceberg_s3_role_session_name": {
-          "description": "An optional identifier for the assumed role session for auditing purposes.",
-          "type": "string",
-          "x-secret": true
-        },
-        "iceberg_s3_role_arn": {
-          "description": "The Amazon Resource Name (ARN) of the role to assume. If provided instead of s3_access_key_id and s3_secret_access_key, temporary credentials will be fetched by assuming this role",
-          "type": "string",
-          "x-secret": true
-        },
-        "iceberg_s3_connect_timeout": {
-          "description": "Configure socket connection timeout, in seconds (default: 60).",
-          "type": "string"
-        },
-        "iceberg_gcs_project_id": {
-          "description": "The Google Cloud project ID for GCS storage.",
-          "type": "string"
-        },
-        "iceberg_gcs_credentials": {
-          "description": "Base64-encoded Google Cloud service account credentials JSON for GCS storage.",
-          "type": "string",
-          "x-secret": true
-        },
-        "iceberg_gcs_token": {
-          "description": "OAuth2 token to use for GCS authentication.",
-          "type": "string",
-          "x-secret": true
-        },
-        "iceberg_gcs_service_path": {
-          "description": "Custom endpoint URL for GCS (for emulators or custom endpoints).",
-          "type": "string"
-        },
-        "iceberg_gcs_no_auth": {
-          "description": "Set to 'true' to allow anonymous access to GCS (for public buckets).",
-          "type": "string"
-        }
-      },
-      "additionalProperties": true
-    },
-    "GitDataConnectorParams": {
-      "title": "GitParams",
-      "type": "object",
-      "properties": {
-        "include": {
-          "description": "Include only files matching the glob pattern. Multiple patterns can be separated by comma or semicolon.",
-          "type": "string",
-          "examples": [
-            "*.rs",
-            "**/*.yaml;src/**/*.json"
-          ]
-        },
-        "fetch_content": {
-          "description": "Whether to fetch file content. Set to 'true' to include file content in the 'content' column.",
-          "type": "string",
-          "default": "false"
-        },
-        "cache_path": {
-          "description": "Custom path for the local Git repository cache. If not specified, uses system temp directory.",
-          "type": "string"
-        },
-        "max_files": {
-          "description": "Maximum number of files to materialize from a Git repository. Default: 5000. Hard limit: 50000.",
-          "type": "string",
-          "default": "5000"
-        },
-        "max_file_bytes": {
-          "description": "Maximum size (bytes) for an individual file when fetching content. Files larger than this value are skipped. Default: 524288. Maximum: 5242880 (5 MiB).",
-          "type": "string"
-        }
-      },
-      "additionalProperties": true
-    },
-    "ArrowAcceleratorParams": {
-      "title": "ArrowParams",
-      "type": "object",
-      "properties": {
-        "file_watcher": {
-          "type": "string"
-        },
-        "hash_index": {
-          "description": "Enable hash index for fast primary key lookups. Set to 'enabled' to enable (requires primary_key). Default: disabled.",
-          "type": "string"
-        },
-        "arrow_sort_columns": {
-          "description": "Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id').",
           "type": "string"
         }
       },
@@ -5895,22 +5879,20 @@
       },
       "additionalProperties": true
     },
-    "TursoAcceleratorParams": {
-      "title": "TursoParams",
+    "ArrowAcceleratorParams": {
+      "title": "ArrowParams",
       "type": "object",
       "properties": {
-        "turso_turso_file": {
-          "description": "Path to the Turso database file. If not specified, defaults to {spice_data_dir}/{dataset_name}.turso",
+        "file_watcher": {
           "type": "string"
         },
-        "turso_internal_timestamp_format": {
-          "description": "Internal timestamp storage format: 'rfc3339' (default, preserves precision/timezone) or 'integer_millis' (performance, millisecond precision only)",
-          "type": "string",
-          "default": "rfc3339",
-          "enum": [
-            "rfc3339",
-            "integer_millis"
-          ]
+        "hash_index": {
+          "description": "Enable hash index for fast primary key lookups. Set to 'enabled' to enable (requires primary_key). Default: disabled.",
+          "type": "string"
+        },
+        "arrow_sort_columns": {
+          "description": "Comma-separated list of columns to sort data by during inserts (e.g., 'timestamp,user_id').",
+          "type": "string"
         }
       },
       "additionalProperties": true
@@ -6037,6 +6019,42 @@
       },
       "additionalProperties": true
     },
+    "SqliteAcceleratorParams": {
+      "title": "SqliteParams",
+      "type": "object",
+      "properties": {
+        "sqlite_file": {
+          "type": "string"
+        },
+        "busy_timeout": {
+          "type": "string"
+        },
+        "file_watcher": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "TursoAcceleratorParams": {
+      "title": "TursoParams",
+      "type": "object",
+      "properties": {
+        "turso_turso_file": {
+          "description": "Path to the Turso database file. If not specified, defaults to {spice_data_dir}/{dataset_name}.turso",
+          "type": "string"
+        },
+        "turso_internal_timestamp_format": {
+          "description": "Internal timestamp storage format: 'rfc3339' (default, preserves precision/timezone) or 'integer_millis' (performance, millisecond precision only)",
+          "type": "string",
+          "default": "rfc3339",
+          "enum": [
+            "rfc3339",
+            "integer_millis"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
     "PostgresAcceleratorParams": {
       "title": "PostgresParams",
       "type": "object",
@@ -6076,22 +6094,6 @@
           "description": "The maximum number of connections created in the connection pool.",
           "type": "string",
           "default": "10"
-        }
-      },
-      "additionalProperties": true
-    },
-    "SqliteAcceleratorParams": {
-      "title": "SqliteParams",
-      "type": "object",
-      "properties": {
-        "sqlite_file": {
-          "type": "string"
-        },
-        "busy_timeout": {
-          "type": "string"
-        },
-        "file_watcher": {
-          "type": "string"
         }
       },
       "additionalProperties": true
@@ -8359,22 +8361,358 @@
       },
       "additionalProperties": true
     },
-    "DebeziumDataset": {
+    "HttpDataset": {
       "type": "object",
       "properties": {
         "from": {
-          "description": "Data source path for debezium connector. Format: debezium:<path>",
+          "description": "Data source path for http connector. Format: http:<path>",
           "type": "string",
-          "pattern": "^debezium:"
+          "pattern": "^http:"
         },
         "name": {
           "type": "string"
         },
         "params": {
-          "description": "Connection parameters for the debezium data connector.",
+          "description": "Connection parameters for the http data connector.",
           "anyOf": [
             {
-              "$ref": "#/$defs/DebeziumDataConnectorParams"
+              "$ref": "#/$defs/HttpDataConnectorParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "HttpsDataset": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Data source path for https connector. Format: https:<path>",
+          "type": "string",
+          "pattern": "^https:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Connection parameters for the https data connector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HttpsDataConnectorParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "IcebergDataset": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Data source path for iceberg connector. Format: iceberg:<path>",
+          "type": "string",
+          "pattern": "^iceberg:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Connection parameters for the iceberg data connector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IcebergDataConnectorParams"
             },
             {
               "type": "null"
@@ -8543,6 +8881,1014 @@
           "anyOf": [
             {
               "$ref": "#/$defs/GlueDataConnectorParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "GithubDataset": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Data source path for github connector. Format: github:<path>",
+          "type": "string",
+          "pattern": "^github:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Connection parameters for the github data connector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GithubDataConnectorParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "GitDataset": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Data source path for git connector. Format: git:<path>",
+          "type": "string",
+          "pattern": "^git:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Connection parameters for the git data connector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GitDataConnectorParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "FileDataset": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Data source path for file connector. Format: file:<path>",
+          "type": "string",
+          "pattern": "^file:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Connection parameters for the file data connector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FileDataConnectorParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "DebeziumDataset": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Data source path for debezium connector. Format: debezium:<path>",
+          "type": "string",
+          "pattern": "^debezium:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Connection parameters for the debezium data connector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DebeziumDataConnectorParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "S3Dataset": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Data source path for s3 connector. Format: s3:<path>",
+          "type": "string",
+          "pattern": "^s3:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Connection parameters for the s3 data connector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/S3DataConnectorParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "KafkaDataset": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Data source path for kafka connector. Format: kafka:<path>",
+          "type": "string",
+          "pattern": "^kafka:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Connection parameters for the kafka data connector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KafkaDataConnectorParams"
             },
             {
               "type": "null"
@@ -9031,1198 +10377,22 @@
       ],
       "additionalProperties": false
     },
-    "S3Dataset": {
+    "DynamodbDataset": {
       "type": "object",
       "properties": {
         "from": {
-          "description": "Data source path for s3 connector. Format: s3:<path>",
+          "description": "Data source path for dynamodb connector. Format: dynamodb:<path>",
           "type": "string",
-          "pattern": "^s3:"
+          "pattern": "^dynamodb:"
         },
         "name": {
           "type": "string"
         },
         "params": {
-          "description": "Connection parameters for the s3 data connector.",
+          "description": "Connection parameters for the dynamodb data connector.",
           "anyOf": [
             {
-              "$ref": "#/$defs/S3DataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "HttpDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for http connector. Format: http:<path>",
-          "type": "string",
-          "pattern": "^http:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the http data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/HttpDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "HttpsDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for https connector. Format: https:<path>",
-          "type": "string",
-          "pattern": "^https:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the https data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/HttpsDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "KafkaDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for kafka connector. Format: kafka:<path>",
-          "type": "string",
-          "pattern": "^kafka:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the kafka data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/KafkaDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "GithubDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for github connector. Format: github:<path>",
-          "type": "string",
-          "pattern": "^github:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the github data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GithubDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "MemoryDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for memory connector. Format: memory:<path>",
-          "type": "string",
-          "pattern": "^memory:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the memory data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/MemoryDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "LocalpodDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for localpod connector. Format: localpod:<path>",
-          "type": "string",
-          "pattern": "^localpod:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the localpod data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/LocalpodDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "FileDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for file connector. Format: file:<path>",
-          "type": "string",
-          "pattern": "^file:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the file data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/FileDataConnectorParams"
+              "$ref": "#/$defs/DynamodbDataConnectorParams"
             },
             {
               "type": "null"
@@ -10879,6 +11049,342 @@
       ],
       "additionalProperties": false
     },
+    "MemoryDataset": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Data source path for memory connector. Format: memory:<path>",
+          "type": "string",
+          "pattern": "^memory:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Connection parameters for the memory data connector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryDataConnectorParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "LocalpodDataset": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "Data source path for localpod connector. Format: localpod:<path>",
+          "type": "string",
+          "pattern": "^localpod:"
+        },
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "description": "Connection parameters for the localpod data connector.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalpodDataConnectorParams"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "acceleration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Acceleration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
     "SpiceAiDataset": {
       "type": "object",
       "properties": {
@@ -10972,687 +11478,6 @@
           "anyOf": [
             {
               "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "DynamodbDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for dynamodb connector. Format: dynamodb:<path>",
-          "type": "string",
-          "pattern": "^dynamodb:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the dynamodb data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/DynamodbDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "IcebergDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for iceberg connector. Format: iceberg:<path>",
-          "type": "string",
-          "pattern": "^iceberg:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the iceberg data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/IcebergDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "GitDataset": {
-      "type": "object",
-      "properties": {
-        "from": {
-          "description": "Data source path for git connector. Format: git:<path>",
-          "type": "string",
-          "pattern": "^git:"
-        },
-        "name": {
-          "type": "string"
-        },
-        "params": {
-          "description": "Connection parameters for the git data connector.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GitDataConnectorParams"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "acceleration": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Acceleration"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "embeddings": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ColumnEmbeddingConfig"
-          }
-        },
-        "dependsOn": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "deprecated": true
-        },
-        "unsupported_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UnsupportedTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "ready_state": {
-          "$ref": "#/$defs/ReadyState"
-        },
-        "metrics": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Metrics"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "vectors": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VectorStore"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "check_availability": {
-          "$ref": "#/$defs/CheckAvailability"
-        },
-        "mode": {
-          "$ref": "#/$defs/AccessMode"
-        }
-      },
-      "required": [
-        "from",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "ArrowAcceleratedDataset": {
-      "description": "Dataset with arrow acceleration engine.",
-      "type": "object",
-      "properties": {
-        "from": {
-          "type": "string"
-        },
-        "name": {
-          "type": "string"
-        },
-        "acceleration": {
-          "type": "object",
-          "properties": {
-            "engine": {
-              "type": "string",
-              "const": "arrow"
-            },
-            "params": {
-              "description": "Configuration parameters for the arrow acceleration engine.",
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/ArrowAcceleratorParams"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            }
-          },
-          "additionalProperties": true
-        },
-        "description": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "metadata": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "columns": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Column"
-          }
-        },
-        "access": {
-          "$ref": "#/$defs/AccessMode"
-        },
-        "params": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Params"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "has_metadata_table": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "replication": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Replication"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "time_partition_column": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "time_partition_format": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimeFormat"
             },
             {
               "type": "null"
@@ -11905,8 +11730,8 @@
       ],
       "additionalProperties": false
     },
-    "TursoAcceleratedDataset": {
-      "description": "Dataset with turso acceleration engine.",
+    "ArrowAcceleratedDataset": {
+      "description": "Dataset with arrow acceleration engine.",
       "type": "object",
       "properties": {
         "from": {
@@ -11920,13 +11745,13 @@
           "properties": {
             "engine": {
               "type": "string",
-              "const": "turso"
+              "const": "arrow"
             },
             "params": {
-              "description": "Configuration parameters for the turso acceleration engine.",
+              "description": "Configuration parameters for the arrow acceleration engine.",
               "anyOf": [
                 {
-                  "$ref": "#/$defs/TursoAcceleratorParams"
+                  "$ref": "#/$defs/ArrowAcceleratorParams"
                 },
                 {
                   "type": "null"
@@ -12259,8 +12084,8 @@
       ],
       "additionalProperties": false
     },
-    "PostgresAcceleratedDataset": {
-      "description": "Dataset with postgres acceleration engine.",
+    "SqliteAcceleratedDataset": {
+      "description": "Dataset with sqlite acceleration engine.",
       "type": "object",
       "properties": {
         "from": {
@@ -12274,13 +12099,13 @@
           "properties": {
             "engine": {
               "type": "string",
-              "const": "postgres"
+              "const": "sqlite"
             },
             "params": {
-              "description": "Configuration parameters for the postgres acceleration engine.",
+              "description": "Configuration parameters for the sqlite acceleration engine.",
               "anyOf": [
                 {
-                  "$ref": "#/$defs/PostgresAcceleratorParams"
+                  "$ref": "#/$defs/SqliteAcceleratorParams"
                 },
                 {
                   "type": "null"
@@ -12436,8 +12261,8 @@
       ],
       "additionalProperties": false
     },
-    "SqliteAcceleratedDataset": {
-      "description": "Dataset with sqlite acceleration engine.",
+    "TursoAcceleratedDataset": {
+      "description": "Dataset with turso acceleration engine.",
       "type": "object",
       "properties": {
         "from": {
@@ -12451,13 +12276,190 @@
           "properties": {
             "engine": {
               "type": "string",
-              "const": "sqlite"
+              "const": "turso"
             },
             "params": {
-              "description": "Configuration parameters for the sqlite acceleration engine.",
+              "description": "Configuration parameters for the turso acceleration engine.",
               "anyOf": [
                 {
-                  "$ref": "#/$defs/SqliteAcceleratorParams"
+                  "$ref": "#/$defs/TursoAcceleratorParams"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "additionalProperties": true
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "access": {
+          "$ref": "#/$defs/AccessMode"
+        },
+        "params": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Params"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "has_metadata_table": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "replication": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Replication"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "embeddings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ColumnEmbeddingConfig"
+          }
+        },
+        "dependsOn": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "invalid_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/InvalidTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "deprecated": true
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnsupportedTypeAction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ready_state": {
+          "$ref": "#/$defs/ReadyState"
+        },
+        "metrics": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Metrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vectors": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VectorStore"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_availability": {
+          "$ref": "#/$defs/CheckAvailability"
+        },
+        "mode": {
+          "$ref": "#/$defs/AccessMode"
+        }
+      },
+      "required": [
+        "from",
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "PostgresAcceleratedDataset": {
+      "description": "Dataset with postgres acceleration engine.",
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "acceleration": {
+          "type": "object",
+          "properties": {
+            "engine": {
+              "type": "string",
+              "const": "postgres"
+            },
+            "params": {
+              "description": "Configuration parameters for the postgres acceleration engine.",
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PostgresAcceleratorParams"
                 },
                 {
                   "type": "null"

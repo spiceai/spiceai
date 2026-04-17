@@ -26,14 +26,8 @@ pub struct PartitionedBy {
     pub expression: String,
 }
 
-/// Schema-only helper that describes the accepted YAML/JSON shapes for a
-/// `partition_by` list item: either a plain expression string
-/// (e.g. `"YEAR(created_at)"` or `"bucket(10, user_id)"`) or a single-entry
-/// object mapping a partition name to an expression
-/// (e.g. `{ year: "YEAR(created_at)" }`).
-///
-/// This type is only used to generate an accurate JSON schema for the custom
-/// `deserialize_partition_by` deserializer; it is not used at runtime.
+/// Schema-only helper for `partition_by` item shapes used in generated JSON
+/// schema. Not used at runtime.
 #[cfg(feature = "schemars")]
 #[derive(JsonSchema)]
 #[serde(untagged)]

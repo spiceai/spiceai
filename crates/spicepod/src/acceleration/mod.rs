@@ -307,6 +307,11 @@ pub struct Acceleration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
 
+    /// Partition expressions used to physically partition accelerated data.
+    ///
+    /// Each list item can be either:
+    /// - a plain expression string, such as `"YEAR(created_at)"` or `"bucket(10, user_id)"`, or
+    /// - a single-entry object mapping a partition name to an expression, such as `{ year: "YEAR(created_at)" }`.
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
