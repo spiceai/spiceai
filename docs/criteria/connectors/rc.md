@@ -24,6 +24,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | FlightSQL                        | ➖          |              |
 | FTP/SFTP                         | ➖          |              |
 | GCS                              | ➖          |              |
+| Git                              | ✅          | @lukekim     |
 | GitHub                           | ✅          | @peasee      |
 | Glue                             | ➖          |              |
 | GraphQL                          | ✅          | @peasee      |
@@ -73,6 +74,7 @@ This table defines the required features and/or tests for each connector:
 | File                             | ✅ (1)                 | ✅ (1)                   | ➖                 | ➖                        | ✅                   | ☑️                          |
 | FTP/SFTP                         | ➖                     | ➖                       | ➖                 | ➖                        | ➖                   | ☑️                          |
 | GCS                              | ✅ (1)                 | ✅ (1)                   | ➖                 | ➖                        | ✅                   | ☑️                          |
+| Git                              | ➖                     | ➖                       | ☑️                 | ➖                        | ➖                   | ☑️                          |
 | GitHub                           | ➖                     | ➖                       | ☑️                 | ➖                        | ➖                   | ☑️                          |
 | Glue                             | ➖                     | ➖                       | ☑️                 | ➖                        | ✅                   | ✅                          |
 | GraphQL                          | ➖                     | ➖                       | ➖                 | ➖                        | ➖                   | ☑️                          |
