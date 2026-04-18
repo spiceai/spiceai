@@ -128,20 +128,49 @@ async fn do_setup(
     validate_replica_identity(client, schema_name, table_name).await?;
     ensure_publication(client, &params.publication_name, schema_name, table_name).await?;
 
-    if let Some(confirmed_flush_lsn) = read_slot_confirmed_flush(client, &params.slot_name).await? {
-        tracing::info!(
-            slot = %params.slot_name,
-            publication = %params.publication_name,
-            confirmed_flush_lsn = %format_lsn(confirmed_flush_lsn),
-            "Resuming from existing replication slot"
-        );
-        return Ok(SlotInfo {
-            slot_name: params.slot_name.clone(),
-            publication_name: params.publication_name.clone(),
-            consistent_lsn: confirmed_flush_lsn,
-            snapshot_name: None,
-            created_fresh: false,
-        });
+    // Distinguish three catalog states for the named slot:
+    //   * None            — no slot exists; we create one and need a bootstrap.
+    //   * Some(0)         — slot exists but confirmed_flush_lsn is NULL. This
+    //                       happens when a previous run crashed between slot
+    //                       creation and the first StandbyStatusUpdate, i.e.
+    //                       before any bootstrap rows were applied on the
+    //                       accelerator. Treat it as bootstrap-required so we
+    //                       don't silently skip the initial snapshot and leave
+    //                       the accelerator missing historical rows.
+    //   * Some(lsn) lsn>0 — normal resume from the durable checkpoint.
+    match read_slot_confirmed_flush(client, &params.slot_name).await? {
+        Some(confirmed_flush_lsn) if confirmed_flush_lsn != 0 => {
+            tracing::info!(
+                slot = %params.slot_name,
+                publication = %params.publication_name,
+                confirmed_flush_lsn = %format_lsn(confirmed_flush_lsn),
+                "Resuming from existing replication slot"
+            );
+            return Ok(SlotInfo {
+                slot_name: params.slot_name.clone(),
+                publication_name: params.publication_name.clone(),
+                consistent_lsn: confirmed_flush_lsn,
+                snapshot_name: None,
+                created_fresh: false,
+            });
+        }
+        Some(_) => {
+            tracing::warn!(
+                slot = %params.slot_name,
+                publication = %params.publication_name,
+                "Existing replication slot has no confirmed_flush_lsn — \
+                 treating as bootstrap-required so the accelerator is not \
+                 left missing historical rows from a crashed first run"
+            );
+            return Ok(SlotInfo {
+                slot_name: params.slot_name.clone(),
+                publication_name: params.publication_name.clone(),
+                consistent_lsn: 0,
+                snapshot_name: None,
+                created_fresh: true,
+            });
+        }
+        None => {}
     }
 
     let (consistent_lsn, snapshot_name) =

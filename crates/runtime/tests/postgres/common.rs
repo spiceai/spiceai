@@ -111,7 +111,9 @@ pub async fn start_postgres_docker_container_with_logical_wal(
 ) -> Result<RunningContainer<'static>, anyhow::Error> {
     let container_name = format!("{PG_DOCKER_CONTAINER}-repl-{port}");
     let container_name: &'static str = Box::leak(container_name.into_boxed_str());
-    let port = port.try_into().unwrap_or(15432);
+    let port: u16 = port
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("port {port} does not fit in u16: {e}"))?;
 
     let running_container = ContainerRunnerBuilder::new(container_name)
         .image(format!("{}postgres:latest", container_registry()))
