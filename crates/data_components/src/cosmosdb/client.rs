@@ -63,7 +63,7 @@ impl CosmosDBClient {
                     .parse()
                     .map_err(boxed_err)
                     .context(InvalidConnectionStringSnafu)?;
-                let endpoint = parsed.account_endpoint.clone();
+                let endpoint = parsed.account_endpoint;
 
                 let client = CosmosClient::with_connection_string(Secret::from(conn_str), None)
                     .map_err(boxed_err)
