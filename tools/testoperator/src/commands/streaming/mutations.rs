@@ -38,7 +38,7 @@ use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Schema};
 use rand::rngs::StdRng;
 use rand::seq::index::sample;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use test_framework::anyhow::{Context, Result};
 
 use super::datasets::DatasetType;

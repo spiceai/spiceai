@@ -531,7 +531,7 @@ pub async fn execute(_ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
 
 async fn execute_login(args: &LoginArgs) -> Result<()> {
     use crate::commands::login::merge_auth_config;
-    use rand::Rng;
+    use rand::RngExt;
 
     // Generate auth code
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";

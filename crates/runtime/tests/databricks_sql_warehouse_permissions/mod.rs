@@ -46,7 +46,6 @@ use crate::{
 /// 15 minutes — enough for a cold warehouse to wake up + run queries.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(900);
 
-#[expect(clippy::expect_used)]
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"))
 }
