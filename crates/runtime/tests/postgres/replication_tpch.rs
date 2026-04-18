@@ -382,10 +382,11 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
                 0.01,
             )
             .await?;
+            // Seeded orders with dates < 1995-01-01: ids 3, 5, 6, 9, 10 = 5 rows.
             assert_scalar_i64(
                 &rt,
                 "SELECT count(*) FROM tpch_orders WHERE o_orderdate < DATE '1995-01-01'",
-                3,
+                5,
             )
             .await?;
             assert_scalar_i64(
