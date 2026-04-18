@@ -227,7 +227,11 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
     let mut stream_a = start_replication_stream(build_input(params_a));
     let mut stream_b = start_replication_stream(build_input(params_b));
 
-    // Each replica should see its own bootstrap independently.
+    // Each replica should see its own bootstrap independently. Commit the
+    // envelopes so the replication stream's LSN-ACK / back-pressure path
+    // mirrors real runtime usage — otherwise confirmed_flush_lsn never
+    // advances and the slot state can become inconsistent (source of flaky
+    // WAL-retention / cleanup timing behavior).
     let env_a = tokio::time::timeout(Duration::from_secs(30), stream_a.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("bootstrap a missing"))??;
@@ -236,6 +240,8 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
         .ok_or_else(|| anyhow::anyhow!("bootstrap b missing"))??;
     assert_eq!(env_a.change_batch.record.num_rows(), 2);
     assert_eq!(env_b.change_batch.record.num_rows(), 2);
+    env_a.commit().await?;
+    env_b.commit().await?;
 
     // A live insert should propagate to BOTH replicas.
     source
@@ -250,6 +256,8 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
         .ok_or_else(|| anyhow::anyhow!("live b missing"))??;
     assert_eq!(live_a.change_batch.record.num_rows(), 1);
     assert_eq!(live_b.change_batch.record.num_rows(), 1);
+    live_a.commit().await?;
+    live_b.commit().await?;
 
     // Confirm each replica has its own slot in pg_replication_slots.
     let slots = source

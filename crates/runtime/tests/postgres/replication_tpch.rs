@@ -244,16 +244,40 @@ async fn wait_for_row_count(
     let sql = format!("SELECT count(*) AS c FROM {dataset_name}");
     loop {
         let batches = run_query(rt, &sql).await?;
-        let count = batches
-            .first()
-            .and_then(|b| {
-                b.column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
-            })
-            .map(|a| a.value(0))
-            .unwrap_or_default();
-        if u64::try_from(count).unwrap_or(0) == expected {
+        // Surface schema/type regressions as explicit test errors instead of
+        // letting them turn into a 60-second timeout — they'd look like
+        // "missing rows" otherwise.
+        let batch = batches.first().ok_or_else(|| {
+            anyhow!(
+                "Query `{sql}` returned no record batches while waiting for \
+                 {dataset_name} to reach {expected} rows"
+            )
+        })?;
+        if batch.num_rows() == 0 {
+            return Err(anyhow!(
+                "Query `{sql}` returned an empty record batch while waiting for \
+                 {dataset_name} to reach {expected} rows"
+            ));
+        }
+        let column = batch.column(0);
+        let count_i64 = column
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .ok_or_else(|| {
+                anyhow!(
+                    "Query `{sql}` returned unexpected count column type while \
+                     waiting for {dataset_name}: expected Int64, got {}",
+                    column.data_type()
+                )
+            })?
+            .value(0);
+        let count = u64::try_from(count_i64).map_err(|_| {
+            anyhow!(
+                "Query `{sql}` returned negative count {count_i64} while waiting \
+                 for {dataset_name} to reach {expected} rows"
+            )
+        })?;
+        if count == expected {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {

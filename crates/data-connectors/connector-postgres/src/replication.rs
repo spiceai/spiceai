@@ -74,10 +74,12 @@ pub fn build_changes_stream(
         .unwrap_or_default();
 
     // UPDATE events rely on `on_conflict: upsert` (or an upsert-dedup
-    // variant) to mutate the existing row in place. Without it, DuckDB /
-    // SQLite / Postgres / Cayenne engines silently append duplicate rows
-    // on every UPDATE. The Arrow engine genuinely can't support upsert and
-    // is documented as append-only for UPDATEs — skip the check there.
+    // variant) to mutate the existing row in place, and the conflict target
+    // MUST match the dataset's primary key — otherwise the accelerator's
+    // write path falls through to append and silently inserts duplicate rows
+    // on every UPDATE. DuckDB / SQLite / Postgres / Cayenne all need this;
+    // the Arrow engine genuinely can't support upsert and is documented as
+    // append-only for UPDATEs — skip the check there.
     let engine = dataset
         .acceleration
         .as_ref()
@@ -88,22 +90,30 @@ pub fn build_changes_stream(
         runtime::component::dataset::acceleration::Engine::Arrow
             | runtime::component::dataset::acceleration::Engine::PartitionedArrow
     );
-    let has_upsert = dataset.acceleration.as_ref().is_some_and(|a| {
-        a.on_conflict.values().any(|behavior| {
+    // The on_conflict map is keyed on a ColumnReference (same type as
+    // primary_key), so checking whether the PK has an Upsert entry is a
+    // direct lookup. This is a much tighter check than "any value is
+    // Upsert" — a misconfigured `on_conflict` targeting a non-PK column
+    // would previously pass and still let UPDATEs append duplicate rows.
+    let has_upsert_on_pk = dataset.acceleration.as_ref().is_some_and(|a| {
+        a.primary_key.as_ref().is_some_and(|pk| {
             matches!(
-                behavior,
-                runtime::component::dataset::acceleration::OnConflictBehavior::Upsert(_)
+                a.on_conflict.get(pk),
+                Some(runtime::component::dataset::acceleration::OnConflictBehavior::Upsert(_))
             )
         })
     });
-    let missing_upsert_error = (engine_supports_upsert && !has_upsert).then(|| {
+    let missing_upsert_error = (engine_supports_upsert && !has_upsert_on_pk).then(|| {
+        let pk_hint = declared_pks
+            .first()
+            .map_or_else(|| "<pk>".to_string(), Clone::clone);
         format!(
             "postgres replication for dataset `{dataset_name}`: `refresh_mode: changes` \
-             requires an `acceleration.on_conflict` entry with `upsert` (or an \
-             `upsert_dedup*` variant) for the primary key so UPDATE events apply as \
-             upserts instead of duplicate inserts. Add: `on_conflict: {{ <pk>: upsert }}` \
-             on the `{engine}` engine. (The `arrow` engine is exempt — documented \
-             append-only semantics.)"
+             requires an `acceleration.on_conflict` entry keyed on the dataset's \
+             `primary_key` with an `upsert` (or `upsert_dedup*`) behavior so UPDATE \
+             events apply as upserts instead of duplicate inserts. Add: \
+             `on_conflict: {{ {pk_hint}: upsert }}` on the `{engine}` engine. \
+             (The `arrow` engine is exempt — documented append-only semantics.)"
         )
     });
 
