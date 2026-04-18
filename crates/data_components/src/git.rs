@@ -856,9 +856,20 @@ impl GitClient {
         // real object on disk, but the Git object in the tree is still the
         // pointer file. Reading the blob would surface the pointer's
         // metadata instead of the actual content.
+        //
+        // Hold the per-cache-path mutex for the duration of the scan so a
+        // concurrent query against a different ref cannot swap the working
+        // tree underneath us. The guard is released at the end of the
+        // `spawn_blocking` closure when this binding is dropped.
+        let lfs_guard = if self.enable_lfs {
+            Some(cache_mutex_for(&self.cache_path).lock_owned().await)
+        } else {
+            None
+        };
         let lfs_content_root = self.enable_lfs.then(|| self.cache_path.clone());
 
         let entries = task::spawn_blocking(move || {
+            let _lfs_guard = lfs_guard;
             let commit_oid = Self::resolve_reference_blocking(&repo, reference.as_deref())?;
             let commit = repo.find_commit(commit_oid).context(GitSnafu)?;
             let tree = commit.tree().context(GitSnafu)?;
@@ -908,19 +919,41 @@ impl GitClient {
                     return TreeWalkResult::Ok;
                 };
 
-                let Ok(size) = i64::try_from(blob.size()) else {
+                // Determine the authoritative on-disk byte length. For
+                // LFS-tracked files the blob itself only holds the pointer,
+                // so `blob.size()` is ~150 bytes regardless of the real
+                // payload. When `enable_lfs` is on we stat the working-tree
+                // entry and use that size both for the row's `size` column
+                // and for the `max_file_bytes` check.
+                let lfs_on_disk_size = if let Some(root) = lfs_content_root.as_ref() {
+                    match std::fs::metadata(root.join(&full_path)) {
+                        Ok(meta) => Some(meta.len() as usize),
+                        Err(err) => {
+                            tracing::warn!(
+                                "Failed to stat LFS-materialized file {}: {err}. Falling back to blob size.",
+                                full_path
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let effective_size = lfs_on_disk_size.unwrap_or_else(|| blob.size());
+
+                let Ok(size) = i64::try_from(effective_size) else {
                     tracing::warn!(
                         "File {} is too large to represent ({} bytes), skipping",
                         full_path,
-                        blob.size()
+                        effective_size
                     );
                     return TreeWalkResult::Ok;
                 };
-                if blob.size() > max_file_bytes {
+                if effective_size > max_file_bytes {
                     tracing::debug!(
                         "Skipping {} because it exceeds the configured max file size ({} bytes)",
                         full_path,
-                        blob.size()
+                        effective_size
                     );
                     return TreeWalkResult::Ok;
                 }
@@ -928,62 +961,32 @@ impl GitClient {
                 let sha = entry.id().to_string();
                 let mode = format!("{:o}", entry.filemode());
 
-                let content = if fetch_content {
-                    // `LfsLookup` captures whether the LFS branch is in play
-                    // and, if so, whether the materialized file is usable.
-                    #[derive(Clone)]
-                    enum LfsLookup {
-                        Disabled,
-                        Materialized(Vec<u8>),
-                        Skip,
+                let decode = |bytes: &[u8]| -> Option<String> {
+                    if let Ok(text) = std::str::from_utf8(bytes) {
+                        Some(text.to_string())
+                    } else {
+                        tracing::debug!(
+                            "File {} is not valid UTF-8, skipping content",
+                            full_path
+                        );
+                        None
                     }
+                };
 
-                    let lfs_bytes = if let Some(root) = lfs_content_root.as_ref() {
+                let content = if fetch_content {
+                    if let Some(root) = lfs_content_root.as_ref() {
                         match std::fs::read(root.join(&full_path)) {
-                            Ok(bytes) if bytes.len() <= max_file_bytes => {
-                                LfsLookup::Materialized(bytes)
-                            }
-                            Ok(bytes) => {
-                                tracing::debug!(
-                                    "Skipping LFS-materialized {} because on-disk size ({} bytes) exceeds max_file_bytes",
-                                    full_path,
-                                    bytes.len()
-                                );
-                                // Signal "LFS skip" without falling back to
-                                // the pointer-file blob content.
-                                LfsLookup::Skip
-                            }
+                            Ok(bytes) => decode(&bytes),
                             Err(err) => {
                                 tracing::warn!(
-                                    "Failed to read LFS-materialized content for {}: {err}. Skipping content for this file.",
+                                    "Failed to read LFS-materialized content for {}: {err}. Leaving content NULL.",
                                     full_path
                                 );
-                                LfsLookup::Skip
+                                None
                             }
                         }
                     } else {
-                        LfsLookup::Disabled
-                    };
-
-                    let decode = |bytes: &[u8]| -> Option<String> {
-                        if let Ok(text) = std::str::from_utf8(bytes) {
-                            Some(text.to_string())
-                        } else {
-                            tracing::debug!(
-                                "File {} is not valid UTF-8, skipping content",
-                                full_path
-                            );
-                            None
-                        }
-                    };
-
-                    match lfs_bytes {
-                        LfsLookup::Materialized(bytes) => decode(&bytes),
-                        // LFS enabled but content not usable (oversize or
-                        // unreadable) — leave content NULL rather than
-                        // emitting the LFS pointer as "content".
-                        LfsLookup::Skip => None,
-                        LfsLookup::Disabled => decode(blob.content()),
+                        decode(blob.content())
                     }
                 } else {
                     None
@@ -1208,7 +1211,9 @@ impl GitClient {
 fn classify_remote_error(err: git2::Error, repo_url: &str) -> Error {
     if matches!(err.code(), git2::ErrorCode::Auth) {
         Error::AuthenticationFailed {
-            repo_url: repo_url.to_string(),
+            // Store the sanitized URL so user-facing messages, debug output,
+            // and log scrapes never surface inline credentials.
+            repo_url: sanitize_repo_url(repo_url),
             source: err,
         }
     } else {

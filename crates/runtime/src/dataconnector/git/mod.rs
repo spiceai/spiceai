@@ -281,7 +281,7 @@ impl Git {
 
         tracing::debug!(
             "Connecting to Git repository: {} (reference: {:?})",
-            repo_url,
+            data_components::git::sanitize_repo_url(&repo_url),
             reference
         );
 
