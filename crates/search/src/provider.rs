@@ -169,6 +169,24 @@ impl SearchQueryProvider {
     #[must_use]
     pub fn with_include_score(mut self, include_score: bool) -> Self {
         self.include_score = include_score;
+        // Schema field ordering depends on `include_score` (the `_score`
+        // column is removed when `false`), and stored constraints reference
+        // positional indices into the advertised schema. Recompute so PK
+        // indices stay consistent with the current `schema()`.
+        self.constraints = Some(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+            self.schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, f)| {
+                    if self.primary_key.contains(f.name()) {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        )]));
         self
     }
 
