@@ -24,9 +24,9 @@ use cache::{
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::sql::TableReference;
-use rand::distributions::Alphanumeric;
+use rand::distr::Alphanumeric;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use spicepod::component::caching::{CacheEngine, CachingPolicy, HashingAlgorithm};
 use std::collections::HashSet;
 use std::hash::Hasher;
