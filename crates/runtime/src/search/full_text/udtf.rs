@@ -387,7 +387,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
             fts_indexes
                 .iter()
                 .find(|idx| idx.search_fields.contains(requested))
-                .cloned()
+                .copied()
                 .cloned()
                 .ok_or_else(|| {
                     DataFusionError::Plan(format!(

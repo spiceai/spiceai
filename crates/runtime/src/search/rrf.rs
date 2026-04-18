@@ -270,18 +270,19 @@ impl ReciprocalRankFusionArgs {
                 // `Expr::Alias` carrying the parameter name in `spice.parameter_name`.
                 // Treat the column's name as the string value so it slots into the
                 // existing string-based extraction (`time_column`, `join_key`, ...).
-                Expr::Alias(alias) => match (
-                    alias.expr.as_ref(),
-                    alias
-                        .metadata
-                        .as_ref()
-                        .and_then(|m| m.inner().get("spice.parameter_name")),
-                ) {
-                    (Expr::Column(column), Some(name)) => {
+                Expr::Alias(alias) => {
+                    if let (Expr::Column(column), Some(name)) = (
+                        alias.expr.as_ref(),
+                        alias
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.inner().get("spice.parameter_name")),
+                    ) {
                         Ok((name.clone(), ScalarValue::Utf8(Some(column.name.clone()))))
+                    } else {
+                        not_impl_err!("{RRF_UDF_NAME} does not yet support {arg} arguments.")
                     }
-                    _ => not_impl_err!("{RRF_UDF_NAME} does not yet support {arg} arguments."),
-                },
+                }
                 // Show a useful error for the rest
                 other_expr => {
                     not_impl_err!("{RRF_UDF_NAME} does not yet support {other_expr} arguments.")
