@@ -8,8 +8,17 @@ All criteria must be met for the Catalog to be considered Stable, with exception
 
 | Catalog       | Stable Quality | DRI Sign-off |
 | ------------- | -------------- | ------------ |
+| ADBC          | ➖             |              |
+| Cayenne       | ➖             |              |
 | Databricks    | ➖             |              |
+| DuckLake      | ➖             |              |
+| Glue          | ➖             |              |
 | Iceberg       | ➖             |              |
+| MS SQL        | ➖             |              |
+| MySQL         | ➖             |              |
+| Oracle        | ➖             |              |
+| PostgreSQL    | ➖             |              |
+| Snowflake     | ➖             |              |
 | Spice.ai      | ➖             |              |
 | Unity Catalog | ✅             | @Sevenannn   |
 
@@ -44,4 +53,5 @@ This section is required if the Catalog does not use an existing Data Connector.
 - [ ] Documentation includes all information and steps for a user to set up the Catalog.
 - [ ] Documentation includes all known issues/limitations for the Catalog.
 - [ ] The Catalog has an easy to follow cookbook recipe.
+- [ ] The Catalog has a Deployment Guide in [spiceai/docs](https://github.com/spiceai/docs) covering production deployment topology, configuration, secrets management, and operational considerations (e.g. [Databricks Deployment Guide](https://spiceai.org/docs/next/components/data-connectors/databricks/deployment)).
 - [ ] The Catalog status is updated in the table of Catalogs in [spiceai/docs](https://github.com/spiceai/docs).
