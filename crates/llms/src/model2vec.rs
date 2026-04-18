@@ -149,6 +149,10 @@ fn local_model_path(name: &str) -> Result<Option<PathBuf>, super::embeddings::Er
             });
         };
 
+        // Trim leading path separators so `~//foo` doesn't silently resolve to `/foo`
+        // via PathBuf::join's absolute-path override.
+        let home_relative_path = home_relative_path.trim_start_matches(['/', '\\']);
+
         return Ok(Some(home_dir.join(home_relative_path)));
     }
 
@@ -308,6 +312,15 @@ mod tests {
                 .expect("home-relative model path should resolve")
                 .expect("home-relative model path should be treated as local"),
             home_dir_path.join("model")
+        );
+
+        // Leading separators after `~/` must not silently resolve to an absolute path
+        // outside the home directory.
+        assert_eq!(
+            local_model_path("~//tmp/model")
+                .expect("home-relative model path should resolve")
+                .expect("home-relative model path should be treated as local"),
+            home_dir_path.join("tmp/model")
         );
     }
 
