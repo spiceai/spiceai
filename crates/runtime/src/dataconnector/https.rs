@@ -24,8 +24,11 @@ use crate::dataconnector::listing::{
 use data_components::http::auth::{
     ClientAuthMethod, HttpAuthenticator, RefreshTokenAuth, RefreshTokenConfig,
 };
+use data_components::http::json_nest::HttpJsonNesting;
 use secrecy::{ExposeSecret, SecretString};
+use serde_json::Value;
 use snafu::prelude::*;
+use spicepod::semantic::Column;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
@@ -719,6 +722,10 @@ impl Https {
             source: e.into(),
         })?;
 
+        if let Some(nesting) = parse_http_json_nesting(dataset)? {
+            provider = provider.with_json_nesting(nesting);
+        }
+
         if let Some((auth_config, refresh_token)) = self.resolve_refresh_token_auth(dataset)? {
             // Fail fast if the user also set an Authorization custom header:
             // reqwest would append ours after theirs and send two Authorization
@@ -795,6 +802,60 @@ impl Https {
 
         Ok(provider)
     }
+}
+
+/// Parse `dataset.columns` looking for the `metadata.json_object: "*"`
+/// marker that enables JSON schema decomposition. Returns `None` when
+/// no column is marked, otherwise the full nesting configuration.
+///
+/// Consistent with the DynamoDB connector: exactly one column may be
+/// marked, and the only supported marker value is `"*"`.
+fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<HttpJsonNesting>> {
+    let marked: Vec<&Column> = dataset
+        .columns
+        .iter()
+        .filter(|col| col.metadata.contains_key("json_object"))
+        .collect();
+
+    if marked.is_empty() {
+        return Ok(None);
+    }
+
+    if marked.len() > 1 {
+        let names: Vec<&str> = marked.iter().map(|c| c.name.as_str()).collect();
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "https".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!(
+                "Multiple columns have 'json_object' metadata defined: {}. Only one column can be configured as a JSON object column.",
+                names.join(", ")
+            ),
+        });
+    }
+
+    let json_column = marked[0];
+    let Some(marker) = json_column.metadata.get("json_object") else {
+        unreachable!("json_object key existence was checked above")
+    };
+
+    let is_wildcard = matches!(marker, Value::String(s) if s == "*");
+    if !is_wildcard {
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "https".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!(
+                "Column '{}' has invalid 'json_object' value: {:?}. Only '*' is supported.",
+                json_column.name, marker
+            ),
+        });
+    }
+
+    let column_order: Vec<String> = dataset.columns.iter().map(|col| col.name.clone()).collect();
+
+    Ok(Some(HttpJsonNesting::new(
+        column_order,
+        json_column.name.clone(),
+    )))
 }
 
 #[async_trait]

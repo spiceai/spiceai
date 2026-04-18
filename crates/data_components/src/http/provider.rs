@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::json_nest::{HttpJsonNesting, decompose_json_row};
 use arrow::{
     array::{ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -91,6 +92,9 @@ pub enum Error {
 
     #[snafu(display("HTTP pagination error: {message}"))]
     Pagination { message: String },
+
+    #[snafu(display("Failed to decompose HTTP response row into declared columns: {source}"))]
+    JsonNesting { source: super::json_nest::Error },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -117,6 +121,7 @@ impl From<Error> for DataFusionError {
             Error::InvalidUrl { source } => DataFusionError::External(Box::new(source)),
             Error::Arrow { source } => DataFusionError::ArrowError(Box::new(source), None),
             Error::DataFusion { source } => source,
+            Error::JsonNesting { source } => DataFusionError::External(Box::new(source)),
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
             }
@@ -311,6 +316,10 @@ pub struct HttpTableProvider {
     health_probe: Option<String>,
     pagination: Option<PaginationConfig>,
     auth: Option<Arc<dyn super::auth::HttpAuthenticator>>,
+    /// When set, JSON response rows are decomposed into the declared
+    /// static columns plus a catch-all JSON column. Schema is replaced
+    /// with the user-declared columns (all `Utf8`).
+    json_nesting: Option<HttpJsonNesting>,
 }
 
 impl std::fmt::Debug for HttpTableProvider {
@@ -357,7 +366,24 @@ impl HttpTableProvider {
             health_probe: None,
             pagination: None,
             auth: None,
+            json_nesting: None,
         }
+    }
+
+    /// Configure JSON schema decomposition. Replaces the provider's
+    /// schema with one built from the user-declared columns (all
+    /// `Utf8`, nullable). Each scanned JSON response row is decomposed
+    /// at query time via [`decompose_json_row`].
+    #[must_use]
+    pub fn with_json_nesting(mut self, nesting: HttpJsonNesting) -> Self {
+        let fields: Vec<Field> = nesting
+            .column_order
+            .iter()
+            .map(|name| Field::new(name, DataType::Utf8, true))
+            .collect();
+        self.schema = Arc::new(Schema::new(fields));
+        self.json_nesting = Some(nesting);
+        self
     }
 
     pub fn with_allowed_paths<I, S>(mut self, paths: I) -> Result<Self>
@@ -1085,8 +1111,14 @@ impl HttpTableProvider {
     ) -> DataFusionResult<SchemaRef> {
         let mut projected_schema = project_schema(schema, projection)?;
         if projected_schema.fields.is_empty() {
-            let idx = schema.index_of("content")?;
-            projected_schema = SchemaRef::from(schema.project(&[idx])?);
+            // Fall back to a single column so downstream operators
+            // (e.g. COUNT(*)) have something to scan. Prefer `content`
+            // for the default schema; otherwise use the first field
+            // (e.g. when `with_json_nesting` has replaced the schema).
+            let idx = schema.index_of("content").unwrap_or(0);
+            if !schema.fields.is_empty() {
+                projected_schema = SchemaRef::from(schema.project(&[idx])?);
+            }
         }
         Ok(projected_schema)
     }
@@ -1266,6 +1298,10 @@ impl HttpExec {
             .map_err(DataFusionError::from);
         }
 
+        if let Some(nesting) = &self.provider.json_nesting {
+            return self.create_batch_from_rows_nested(content_rows, nesting);
+        }
+
         // Store the actual values from the partition for the primary key
         let path_for_batch = path.unwrap_or("");
         let query_for_batch = query.unwrap_or("");
@@ -1356,6 +1392,40 @@ impl HttpExec {
         let batch = RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
             .map_err(DataFusionError::from)?;
         Ok(batch)
+    }
+
+    /// Create a `RecordBatch` for the user-declared columns by
+    /// decomposing each JSON response row according to the nesting
+    /// configuration. All output columns are `Utf8`.
+    fn create_batch_from_rows_nested(
+        &self,
+        content_rows: &[String],
+        nesting: &HttpJsonNesting,
+    ) -> DataFusionResult<RecordBatch> {
+        // Decompose every row up front; this preserves row alignment
+        // across columns even when keys are missing or null.
+        let decomposed: Vec<super::json_nest::DecomposedRow> = content_rows
+            .iter()
+            .map(|row| decompose_json_row(row, nesting))
+            .collect::<super::json_nest::Result<Vec<_>>>()
+            .map_err(|source| DataFusionError::External(Box::new(Error::JsonNesting { source })))?;
+
+        let columns: Vec<ArrayRef> = self
+            .projected_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let name = field.name().as_str();
+                let iter = decomposed
+                    .iter()
+                    .map(|row| row.get(name).and_then(|v| v.as_deref()));
+                let arr: StringArray = iter.collect();
+                Arc::new(arr) as ArrayRef
+            })
+            .collect();
+
+        RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
+            .map_err(DataFusionError::from)
     }
 
     /// Parse content into individual rows
