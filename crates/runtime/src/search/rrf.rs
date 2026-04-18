@@ -1594,8 +1594,8 @@ mod tests {
         assert_eq!(many_with_k_and_column.join_key, Some(col("hello")));
     }
 
-    /// Build the `Expr::Alias { expr: Column(name), metadata: { spice.parameter_name: param } }`
-    /// shape that the Spice DataFusion fork emits for non-literal named arguments.
+    /// Build the `Expr::Alias { expr: Column(name), metadata: { "spice.parameter_name": param } }`
+    /// shape that the Spice `DataFusion` fork emits for non-literal named arguments.
     fn aliased_column_named(param: &str, column_name: &str) -> Expr {
         let metadata = FieldMetadata::new(BTreeMap::from([(
             "spice.parameter_name".to_string(),
