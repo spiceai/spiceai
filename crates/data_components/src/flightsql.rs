@@ -401,9 +401,7 @@ impl TableProvider for FlightSQLTable {
         for filter in filters {
             match to_sql_preserving_precedence(filter) {
                 Ok(_) => {
-                    // Keep remote filtering for performance, but mark it inexact so
-                    // DataFusion re-applies the predicate locally for correctness.
-                    filter_push_down.push(TableProviderFilterPushDown::Inexact);
+                    filter_push_down.push(TableProviderFilterPushDown::Exact);
                 }
                 Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
             }
@@ -705,6 +703,37 @@ impl ExecutionPlan for FlightSqlExec {
 
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let merged_limit = match (self.limit, limit) {
+            (Some(existing), Some(new_limit)) => Some(existing.min(new_limit)),
+            (Some(existing), None) => Some(existing),
+            (None, Some(new_limit)) => Some(new_limit),
+            (None, None) => None,
+        };
+
+        let new_plan = FlightSqlExec {
+            projected_schema: Arc::clone(&self.projected_schema),
+            table_reference: self.table_reference.clone(),
+            client: self.client.clone(),
+            filters: self.filters.clone(),
+            limit: merged_limit,
+            sort_exprs: self.sort_exprs.clone(),
+            properties: self.properties.clone(),
+            cookie_store: Arc::clone(&self.cookie_store),
+            metrics: ExecutionPlanMetricsSet::new(),
+        };
+
+        Some(Arc::new(new_plan))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.limit
     }
 }
 

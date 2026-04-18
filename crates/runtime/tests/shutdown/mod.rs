@@ -21,7 +21,7 @@ use std::{
 };
 
 use app::AppBuilder;
-use rand::Rng;
+use rand::RngExt;
 use runtime::Runtime;
 use spicepod::{component::dataset::Dataset, param::Params};
 use tokio::time::sleep;

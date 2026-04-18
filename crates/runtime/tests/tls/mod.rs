@@ -73,7 +73,7 @@ use arrow_flight::{
     sql::{CommandStatementQuery, ProstMessageExt},
 };
 use prost::Message;
-use rand::Rng;
+use rand::RngExt;
 use runtime::{Runtime, auth::EndpointAuth, config::Config, tls::TlsConfig};
 use tonic::transport::Channel;
 
