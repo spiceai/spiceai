@@ -28,7 +28,13 @@ use std::sync::{
 
 use app::{App, AppBuilder};
 use arrow::{array::RecordBatch, datatypes::DataType};
-use axum::{Router, routing::get};
+use axum::{
+    Form, Router,
+    extract::State,
+    http::{HeaderMap as AxumHeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::{get, post},
+};
 use cache::result::CacheStatus;
 use futures::TryStreamExt;
 use reqwest::{Client, header::HeaderMap};
@@ -732,6 +738,324 @@ async fn test_http_json_edge_cases_results_cache() -> Result<(), String> {
             );
 
             rt.shutdown().await;
+
+            tx.send(())
+                .map_err(|()| "Failed to send shutdown signal".to_string())?;
+            Ok(())
+        })
+        .await
+}
+
+const SECURE_DATA_JSON: &str = r#"[
+    {"id": 1, "name": "secret-alpha"},
+    {"id": 2, "name": "secret-beta"}
+]"#;
+
+#[derive(Clone)]
+struct OauthServerState {
+    /// Access tokens that should be considered valid. Prefixed with
+    /// `access-` and a monotonic counter, so each refresh produces a
+    /// distinct token.
+    issued_access_tokens: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Refresh tokens considered valid. We seed one entry and append newly
+    /// issued refresh tokens on each exchange; previously issued refresh
+    /// tokens remain valid for the duration of the test server (we never
+    /// invalidate them), which keeps the test stub simple.
+    valid_refresh_tokens: Arc<tokio::sync::Mutex<Vec<String>>>,
+    token_requests: Arc<AtomicUsize>,
+    data_requests: Arc<AtomicUsize>,
+    last_auth_header: Arc<tokio::sync::Mutex<Option<String>>>,
+    refresh_counter: Arc<AtomicUsize>,
+}
+
+impl OauthServerState {
+    fn with_seed_refresh(seed: &str) -> Self {
+        Self {
+            issued_access_tokens: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            valid_refresh_tokens: Arc::new(tokio::sync::Mutex::new(vec![seed.to_string()])),
+            token_requests: Arc::new(AtomicUsize::new(0)),
+            data_requests: Arc::new(AtomicUsize::new(0)),
+            last_auth_header: Arc::new(tokio::sync::Mutex::new(None)),
+            refresh_counter: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+async fn oauth_token_handler(
+    State(state): State<OauthServerState>,
+    Form(params): Form<HashMap<String, String>>,
+) -> impl IntoResponse {
+    state.token_requests.fetch_add(1, Ordering::SeqCst);
+
+    if params.get("grant_type").map(String::as_str) != Some("refresh_token") {
+        return (
+            StatusCode::BAD_REQUEST,
+            [("content-type", "application/json")],
+            r#"{"error":"unsupported_grant_type"}"#.to_string(),
+        );
+    }
+
+    let Some(presented) = params.get("refresh_token") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            [("content-type", "application/json")],
+            r#"{"error":"invalid_request"}"#.to_string(),
+        );
+    };
+
+    let valid = {
+        let guard = state.valid_refresh_tokens.lock().await;
+        guard.iter().any(|t| t == presented)
+    };
+    if !valid {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [("content-type", "application/json")],
+            r#"{"error":"invalid_grant"}"#.to_string(),
+        );
+    }
+
+    let n = state.refresh_counter.fetch_add(1, Ordering::SeqCst) + 1;
+    let access = format!("access-{n}");
+    let rotated = format!("refresh-{n}");
+
+    state.issued_access_tokens.lock().await.push(access.clone());
+    state
+        .valid_refresh_tokens
+        .lock()
+        .await
+        .push(rotated.clone());
+
+    let body = serde_json::json!({
+        "access_token": access,
+        "refresh_token": rotated,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    })
+    .to_string();
+
+    (StatusCode::OK, [("content-type", "application/json")], body)
+}
+
+async fn oauth_secure_handler(
+    State(state): State<OauthServerState>,
+    headers: AxumHeaderMap,
+) -> impl IntoResponse {
+    state.data_requests.fetch_add(1, Ordering::SeqCst);
+
+    let auth_value = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    *state.last_auth_header.lock().await = auth_value.clone();
+
+    let Some(auth) = auth_value else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [("content-type", "application/json")],
+            r#"{"error":"missing_bearer"}"#.to_string(),
+        );
+    };
+
+    let Some(token) = auth.strip_prefix("Bearer ") else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [("content-type", "application/json")],
+            r#"{"error":"bad_scheme"}"#.to_string(),
+        );
+    };
+
+    let known = state
+        .issued_access_tokens
+        .lock()
+        .await
+        .iter()
+        .any(|t| t == token);
+
+    if !known {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [("content-type", "application/json")],
+            r#"{"error":"invalid_token"}"#.to_string(),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        SECURE_DATA_JSON.to_string(),
+    )
+}
+
+async fn start_oauth_http_server(
+    state: OauthServerState,
+) -> Result<(tokio::sync::oneshot::Sender<()>, SocketAddr), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+    let app = Router::new()
+        .route("/oauth/token", post(oauth_token_handler))
+        .route("/api/secure", get(oauth_secure_handler))
+        .with_state(state);
+
+    let tcp_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("bind oauth listener: {e}"))?;
+    let addr = tcp_listener
+        .local_addr()
+        .map_err(|e| format!("oauth local_addr: {e}"))?;
+
+    tokio::spawn(async move {
+        axum::serve(tcp_listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .expect("OAuth test server failed while serving requests");
+    });
+
+    Ok((tx, addr))
+}
+
+/// End-to-end check for `OAuth2` refresh-token auth on the HTTP connector:
+/// the connector should exchange the refresh token at startup, then stamp
+/// `Authorization: Bearer <access_token>` onto every data request.
+#[tokio::test]
+async fn test_http_oauth2_refresh_token_auth() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let state = OauthServerState::with_seed_refresh("seed-refresh");
+            let (tx, addr) = start_oauth_http_server(state.clone()).await?;
+            tracing::debug!("OAuth test server started at {addr}");
+
+            let mut dataset = Dataset::new(format!("http://{addr}/api"), "secure_data");
+            dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
+                ("file_format".to_string(), "json".to_string()),
+                ("allowed_request_paths".to_string(), "/secure".to_string()),
+                (
+                    "auth_token_url".to_string(),
+                    format!("http://{addr}/oauth/token"),
+                ),
+                (
+                    "http_auth_refresh_token".to_string(),
+                    "seed-refresh".to_string(),
+                ),
+                ("http_auth_client_id".to_string(), "test-client".to_string()),
+                (
+                    "http_auth_client_secret".to_string(),
+                    "test-secret".to_string(),
+                ),
+                ("auth_scopes".to_string(), "read:data".to_string()),
+            ])));
+
+            let app = AppBuilder::new("http_oauth_refresh_test")
+                .with_dataset(dataset)
+                .build();
+            let mut rt = load_runtime(app).await?;
+
+            // Initial refresh-token exchange happens during connector init, before
+            // the first data query. Confirm it occurred exactly once.
+            assert_eq!(
+                state.token_requests.load(Ordering::SeqCst),
+                1,
+                "expected a single OAuth2 token exchange at startup",
+            );
+
+            let queries: QueryTests = vec![(
+                "SELECT request_path, content FROM secure_data WHERE request_path = '/secure'",
+                "http_oauth_refresh_token",
+                Some(Box::new(|result_batches| {
+                    let total_rows: usize = result_batches.iter().map(RecordBatch::num_rows).sum();
+                    assert!(
+                        total_rows > 0,
+                        "expected at least one row, got {total_rows}"
+                    );
+                })),
+            )];
+
+            for (query, snapshot_suffix, validate_result) in queries {
+                run_query_and_check_results(
+                    &mut rt,
+                    snapshot_suffix,
+                    query,
+                    false,
+                    validate_result,
+                )
+                .await?;
+            }
+
+            assert!(
+                state.data_requests.load(Ordering::SeqCst) >= 1,
+                "expected at least one data request to /api/secure"
+            );
+
+            let last_auth = state.last_auth_header.lock().await.clone();
+            assert_eq!(
+                last_auth.as_deref(),
+                Some("Bearer access-1"),
+                "data request should carry the access token issued by the OAuth server"
+            );
+
+            tx.send(())
+                .map_err(|()| "Failed to send shutdown signal".to_string())?;
+            Ok(())
+        })
+        .await
+}
+
+/// A missing `auth_token_url` alongside a configured `http_auth_refresh_token`
+/// should be rejected at dataset registration instead of silently proceeding
+/// without auth.
+#[tokio::test]
+async fn test_http_oauth2_rejects_partial_configuration() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let (tx, addr, _) = start_http_server().await?;
+
+            let mut dataset = Dataset::new(format!("http://{addr}/api"), "partial_auth");
+            dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
+                ("file_format".to_string(), "json".to_string()),
+                ("allowed_request_paths".to_string(), "/shows".to_string()),
+                (
+                    "http_auth_refresh_token".to_string(),
+                    "rt-without-url".to_string(),
+                ),
+            ])));
+
+            let app = AppBuilder::new("http_oauth_partial_test")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            // The dataset should fail to load because http_auth_refresh_token
+            // requires auth_token_url. load_components completes even when
+            // individual datasets fail, so inspect the query path to confirm
+            // the failure surfaced.
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    return Err("Timed out waiting for component load to complete".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            let query_result = rt
+                .datafusion()
+                .query_builder("SELECT 1 FROM partial_auth LIMIT 1")
+                .build()
+                .run()
+                .await;
+            assert!(
+                query_result.is_err(),
+                "partial OAuth2 auth config should prevent the dataset from serving queries"
+            );
 
             tx.send(())
                 .map_err(|()| "Failed to send shutdown signal".to_string())?;
