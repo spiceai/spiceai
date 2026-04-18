@@ -108,6 +108,13 @@ pub async fn register_external_connectors() {
     )
     .await;
 
+    #[cfg(feature = "elasticsearch")]
+    register_connector_factory(
+        connector_elasticsearch::CONNECTOR_NAME,
+        connector_elasticsearch::factory(),
+    )
+    .await;
+
     #[cfg(feature = "flightsql")]
     register_connector_factory(
         connector_flightsql::CONNECTOR_NAME,

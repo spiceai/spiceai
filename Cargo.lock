@@ -4037,6 +4037,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-elasticsearch"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "elasticsearch",
+ "linkme",
+ "paste",
+ "runtime",
+ "secrecy",
+ "snafu",
+ "tracing",
+]
+
+[[package]]
 name = "connector-flightsql"
 version = "2.0.0-unstable"
 dependencies = [
@@ -5237,6 +5253,7 @@ dependencies = [
  "document_parse",
  "duckdb",
  "dynamodb-streams",
+ "elasticsearch",
  "flate2",
  "flight_client",
  "futures",
@@ -6924,6 +6941,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "elasticsearch"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -15856,6 +15887,7 @@ dependencies = [
  "document_parse",
  "duckdb",
  "dynamodb-streams",
+ "elasticsearch",
  "event_stream",
  "flight_client",
  "fundu",
@@ -16984,6 +17016,7 @@ dependencies = [
  "datafusion-expr",
  "datafusion-functions-json",
  "datafusion-optimizer-rules",
+ "elasticsearch",
  "futures",
  "insta",
  "itertools 0.14.0",
@@ -18100,6 +18133,7 @@ dependencies = [
  "connector-delta-lake",
  "connector-dremio",
  "connector-duckdb",
+ "connector-elasticsearch",
  "connector-flightsql",
  "connector-ftp",
  "connector-graphql",
