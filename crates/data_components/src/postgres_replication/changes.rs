@@ -23,8 +23,8 @@ use std::sync::{Arc, atomic::AtomicU64};
 use arrow::{
     array::{
         ArrayRef, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int16Builder,
-        Int32Builder, Int64Builder, ListArray, RecordBatch, StringArray, StringBuilder,
-        StructArray, TimestampMicrosecondBuilder,
+        Int32Builder, Int64Builder, LargeStringBuilder, ListArray, RecordBatch, StringArray,
+        StringBuilder, StructArray, TimestampMicrosecondBuilder,
     },
     buffer::OffsetBuffer,
     datatypes::{DataType, Field, SchemaRef, TimeUnit},
@@ -114,6 +114,21 @@ impl TransactionBuffer {
                 .map(|c| c.name.clone())
                 .collect(),
             row: old,
+        });
+    }
+
+    /// Record a TRUNCATE for the relation. Row payload is empty — the
+    /// accelerator path applies it as an unconditional delete-all.
+    pub fn push_truncate(&mut self, relation: &Relation) {
+        self.changes.push(DecodedChange {
+            op: ChangeOp::Truncate,
+            primary_keys: relation
+                .columns
+                .iter()
+                .filter(|c| c.is_key)
+                .map(|c| c.name.clone())
+                .collect(),
+            row: TupleData { columns: vec![] },
         });
     }
 
@@ -265,6 +280,7 @@ impl CommitChange for LsnCommitter {
 /// and parses strings into the appropriate typed column.
 enum FieldBuilder {
     Utf8(StringBuilder),
+    LargeUtf8(LargeStringBuilder),
     Bool(BooleanBuilder),
     Int16(Int16Builder),
     Int32(Int32Builder),
@@ -279,18 +295,7 @@ impl FieldBuilder {
     fn new(data_type: &DataType) -> Result<Self> {
         Ok(match data_type {
             DataType::Utf8 => Self::Utf8(StringBuilder::new()),
-            DataType::LargeUtf8 => {
-                // pgoutput gives us text and we'd back a StringArray — that won't
-                // line up with a LargeUtf8 struct field and produces a schema
-                // mismatch when building the RecordBatch. Reject with an
-                // actionable error until we add LargeStringBuilder support.
-                return PgOutputDecodeSnafu {
-                    message: "postgres_replication: dataset column uses LargeUtf8 which is \
-                              not yet supported by the replication path. Use Utf8 instead."
-                        .to_string(),
-                }
-                .fail();
-            }
+            DataType::LargeUtf8 => Self::LargeUtf8(LargeStringBuilder::new()),
             DataType::Boolean => Self::Bool(BooleanBuilder::new()),
             DataType::Int16 => Self::Int16(Int16Builder::new()),
             DataType::Int32 => Self::Int32(Int32Builder::new()),
@@ -350,6 +355,7 @@ impl FieldBuilder {
         };
         match self {
             Self::Utf8(b) => b.append_value(s),
+            Self::LargeUtf8(b) => b.append_value(s),
             Self::Bool(b) => b.append_value(matches!(s.as_str(), "t" | "true" | "TRUE")),
             Self::Int16(b) => {
                 b.append_value(s.parse::<i16>().map_err(|e| super::Error::PgOutputDecode {
@@ -406,6 +412,7 @@ impl FieldBuilder {
     fn append_null(&mut self) {
         match self {
             Self::Utf8(b) => b.append_null(),
+            Self::LargeUtf8(b) => b.append_null(),
             Self::Bool(b) => b.append_null(),
             Self::Int16(b) => b.append_null(),
             Self::Int32(b) => b.append_null(),
@@ -420,6 +427,7 @@ impl FieldBuilder {
     fn finish(mut self) -> ArrayRef {
         match &mut self {
             Self::Utf8(b) => Arc::new(b.finish()),
+            Self::LargeUtf8(b) => Arc::new(b.finish()),
             Self::Bool(b) => Arc::new(b.finish()),
             Self::Int16(b) => Arc::new(b.finish()),
             Self::Int32(b) => Arc::new(b.finish()),

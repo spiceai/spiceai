@@ -91,8 +91,8 @@ datasets:
       pg_user: spice
       pg_pass: ${secrets:pg_pass}
       pg_db: myapp
-      pg_sslmode: disable        # TLS for the replication path is a follow-up;
-                                 #   use a private network or a TLS proxy today.
+      pg_sslmode: verify-full      # or: disable | prefer | require | verify-ca
+      pg_sslrootcert: /etc/ssl/pg-ca.pem   # optional; omit to use system root CAs
     acceleration:
       enabled: true
       engine: duckdb           # or: sqlite | postgres | cayenne | arrow
@@ -219,7 +219,7 @@ Spice emits OpenTelemetry observables for every replicated Postgres dataset. Met
 | `dataset_postgres_replication_inserts_total`  | Counter | `INSERT` rows from WAL. |
 | `dataset_postgres_replication_updates_total`  | Counter | `UPDATE` rows from WAL. |
 | `dataset_postgres_replication_deletes_total`  | Counter | `DELETE` rows from WAL. |
-| `dataset_postgres_replication_truncates_total` | Counter | `TRUNCATE` operations received (currently skipped — see Limitations). Non-zero means source truncates happened without being reflected in the accelerator. |
+| `dataset_postgres_replication_truncates_total` | Counter | `TRUNCATE` operations received and applied to the accelerator (all rows deleted). |
 
 ### Bootstrap progress
 
@@ -386,8 +386,6 @@ Dropping or renaming columns in use by Spice will require rebuilding the acceler
 
 - **One table per dataset.** Each Spice dataset replicates exactly one source table; each dataset gets its own slot and publication.
 - **No DDL replication.** Schema changes on the source are not propagated automatically. See *Changing the source schema* above.
-- **TRUNCATE is not applied** to the accelerator — it is logged as a warning and skipped.
-- **No TLS to the replication port** in this initial release. Setting `pg_sslmode` to anything other than `disable` is rejected at startup with an actionable error. Use a private network or a TLS-terminating proxy today. (The underlying client supports TLS; exposing it as a parameter is on the roadmap.)
 - **Arrow engine** does not support upsert or delete — `UPDATE`s appear as duplicate inserts and `DELETE`s are silently dropped.
 
 ## Comparison with Debezium + Kafka

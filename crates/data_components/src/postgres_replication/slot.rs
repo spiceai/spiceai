@@ -25,8 +25,7 @@ use tokio_postgres::NoTls;
 
 use super::{
     MissingPrimaryKeySnafu, Result, SetupConnectSnafu, SetupExecSnafu, SourceTableNotFoundSnafu,
-    TlsNotSupportedSnafu, UnsupportedReplicaIdentitySnafu,
-    config::{ReplicationParams, SslMode},
+    TlsConfigSnafu, UnsupportedReplicaIdentitySnafu, config::ReplicationParams,
 };
 
 /// Info about a slot after `setup_slot_and_publication` returns.
@@ -55,16 +54,6 @@ pub async fn setup_slot_and_publication(
     schema_name: &str,
     table_name: &str,
 ) -> Result<SlotInfo> {
-    // TLS is not yet wired up for the replication path. Fail fast with an
-    // actionable error instead of silently connecting plaintext, which would
-    // be wrong against TLS-enforced Postgres services.
-    if !matches!(params.sslmode, SslMode::Disable) {
-        return TlsNotSupportedSnafu {
-            mode: format!("{:?}", params.sslmode).to_ascii_lowercase(),
-        }
-        .fail();
-    }
-
     // Retry the setup-path on transient connect/exec failures — catalog queries
     // are idempotent and slot/publication creation is guarded by `IF EXISTS`
     // checks. Fatal errors (permission denied, syntax) are propagated on the
@@ -83,16 +72,29 @@ async fn setup_once(
     schema_name: &str,
     table_name: &str,
 ) -> Result<SlotInfo> {
-    let (client, connection) = params
-        .setup_pg_config()
-        .connect(NoTls)
-        .await
-        .context(SetupConnectSnafu)?;
-    let conn_task = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            tracing::warn!("postgres setup connection terminated: {e}");
+    let cfg = params.setup_pg_config();
+    let tls = params.native_tls_connector().context(TlsConfigSnafu)?;
+
+    let (client, conn_task) = match tls {
+        Some(connector) => {
+            let (client, connection) = cfg.connect(connector).await.context(SetupConnectSnafu)?;
+            let task = tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    tracing::warn!("postgres setup connection terminated: {e}");
+                }
+            });
+            (client, task)
         }
-    });
+        None => {
+            let (client, connection) = cfg.connect(NoTls).await.context(SetupConnectSnafu)?;
+            let task = tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    tracing::warn!("postgres setup connection terminated: {e}");
+                }
+            });
+            (client, task)
+        }
+    };
 
     let outcome = do_setup(&client, params, schema_name, table_name).await;
 

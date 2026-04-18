@@ -31,7 +31,7 @@ use pgwire_replication::{Lsn, ReplicationClient, ReplicationConfig, ReplicationE
 use super::{
     ReplicationMetricsCollector, Result, SchemaMismatchSnafu,
     changes::{TransactionBuffer, build_change_batch, envelope_with_lsn},
-    config::ReplicationParams,
+    config::{ReplicationParams, SslMode},
     pgoutput::{DecodedMessage, Decoder},
 };
 use crate::cdc::{ChangeEnvelope, ChangesStream, StreamError};
@@ -80,10 +80,20 @@ pub async fn start_wal_stream(input: WalStreamInput) -> Result<ChangesStream> {
 }
 
 fn build_replication_config(input: &WalStreamInput) -> ReplicationConfig {
-    // TLS for replication is always disabled in this first pass. Users who
-    // need TLS should terminate it upstream or we can add it in a follow-up;
-    // the rustls feature is enabled on the crate already.
-    let tls = TlsConfig::default();
+    // Map our `SslMode` to pgwire-replication's `TlsConfig`. The crate uses
+    // rustls and its own SslMode enum (Disabled / Require / VerifyCa /
+    // VerifyFull), so we pick the matching constructor and pass the optional
+    // CA path.
+    let tls = match input.params.sslmode {
+        SslMode::Disable => TlsConfig::disabled(),
+        // Prefer → Require: pgwire-replication doesn't distinguish prefer
+        // from require (prefer would mean "try TLS, fall back to plaintext",
+        // which the underlying pgoutput transport doesn't support safely).
+        // Users who want prefer-semantics should use Disable or Require.
+        SslMode::Prefer | SslMode::Require => TlsConfig::require(),
+        SslMode::VerifyCa => TlsConfig::verify_ca(input.params.sslrootcert.clone()),
+        SslMode::VerifyFull => TlsConfig::verify_full(input.params.sslrootcert.clone()),
+    };
     ReplicationConfig {
         host: input.params.host.clone(),
         port: input.params.port,
@@ -241,9 +251,23 @@ fn wal_stream(
                         }
                         DecodedMessage::Truncate { .. } => {
                             metrics.inc_truncate();
-                            tracing::warn!(
+                            // Push a synthetic truncate change into the txn buffer —
+                            // we fabricate a row-less change with op="t" which the
+                            // downstream `write_change` / `process_truncate` path
+                            // turns into an accelerator-level "delete all".
+                            let rel = resolve_relation_with_declared_pks(
+                                &decoder,
+                                // Relation id is inside the Truncate message; for
+                                // single-table publications the cached relation is
+                                // unambiguous, so we use the first cached one.
+                                decoder.relation_iter().next().map(|r| r.relation_id).unwrap_or(0),
+                                &primary_keys,
+                            )?;
+                            txn.get_or_insert_with(|| TransactionBuffer::new(0))
+                                .push_truncate(&rel);
+                            tracing::info!(
                                 dataset = %dataset_name,
-                                "TRUNCATE received from postgres replication; skipping (not yet supported)"
+                                "TRUNCATE from postgres replication queued for accelerator"
                             );
                         }
                         // Begin/Commit should not come via XLogData with this

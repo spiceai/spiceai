@@ -71,8 +71,10 @@ num_cpus = "1.16"
 object_store = { workspace = true }
 opendal.workspace = true
 oracle = { version = "0.6", optional = true }
+native-tls = { workspace = true, optional = true }
 percent-encoding.workspace = true
 pgwire-replication = { workspace = true, optional = true }
+postgres-native-tls = { workspace = true, optional = true }
 rand.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
@@ -151,12 +153,11 @@ odbc = ["datafusion-table-providers/federation", "db_connection_pool/odbc"]
 oracle = ["dep:oracle", "dep:bb8", "dep:bb8-oracle", "dep:bigdecimal"]
 postgres = [
     "dep:tokio-postgres",
+    "dep:pgwire-replication",
+    "dep:native-tls",
+    "dep:postgres-native-tls",
     "datafusion-table-providers/postgres",
     "datafusion-table-providers/postgres-federation",
-]
-postgres-replication = [
-    "postgres",
-    "dep:pgwire-replication",
 ]
 s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
 scylladb = ["dep:scylla", "datafusion-table-providers/federation"]

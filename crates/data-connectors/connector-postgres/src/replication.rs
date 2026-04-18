@@ -352,6 +352,7 @@ fn replication_params_from_connector_params(
     let database = required_string(params, "db")?;
     let sslmode =
         config::SslMode::from_str_or_default(optional_string(params, "sslmode").as_deref());
+    let sslrootcert = optional_string(params, "sslrootcert").map(std::path::PathBuf::from);
 
     let slot_name = optional_string(params, "replication_slot")
         .unwrap_or_else(|| config::default_slot_name(dataset_name));
@@ -374,6 +375,7 @@ fn replication_params_from_connector_params(
         password: SecretString::from(password_str),
         database,
         sslmode,
+        sslrootcert,
         slot_name,
         publication_name,
         initial_snapshot,

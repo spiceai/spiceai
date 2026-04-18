@@ -29,9 +29,9 @@ use datafusion_table_providers::{
 use crate::{init_tracing, utils::test_request_context};
 
 pub mod common;
-#[cfg(feature = "postgres-replication")]
+#[cfg(feature = "postgres")]
 pub mod replication;
-#[cfg(all(feature = "postgres-replication", feature = "duckdb"))]
+#[cfg(all(feature = "postgres", feature = "duckdb"))]
 pub mod replication_tpch;
 
 #[tokio::test]

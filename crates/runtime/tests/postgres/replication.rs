@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Integration tests for the `postgres-replication` feature.
+//! Integration tests for postgres logical replication.
 //!
 //! These exercise the end-to-end data path:
 //! - Start a Postgres container with `wal_level=logical`.
@@ -57,6 +57,7 @@ fn params_for(port: u16, slot_name: &str, publication_name: &str) -> Replication
         password: SecretString::from(common::PG_PASSWORD.to_string()),
         database: "postgres".into(),
         sslmode: config::SslMode::Disable,
+        sslrootcert: None,
         slot_name: slot_name.into(),
         publication_name: publication_name.into(),
         initial_snapshot: true,
@@ -81,9 +82,7 @@ async fn setup_source_table(port: u16) -> Result<tokio_postgres::Client, anyhow:
             "CREATE TABLE IF NOT EXISTS public.repl_users (id int PRIMARY KEY, name text)",
         )
         .await?;
-    client
-        .simple_query("TRUNCATE public.repl_users")
-        .await?;
+    client.simple_query("TRUNCATE public.repl_users").await?;
     client
         .simple_query("INSERT INTO public.repl_users VALUES (1, 'Alice'), (2, 'Bob')")
         .await?;

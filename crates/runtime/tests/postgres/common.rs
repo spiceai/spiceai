@@ -104,7 +104,7 @@ pub async fn start_postgres_docker_container(
 
 /// Like [`start_postgres_docker_container`] but launches Postgres with
 /// `wal_level=logical` and generous slot/sender limits so that the
-/// `postgres-replication` tests can create multiple replication slots.
+/// postgres replication tests can create multiple replication slots.
 #[instrument]
 pub async fn start_postgres_docker_container_with_logical_wal(
     port: usize,

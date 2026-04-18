@@ -28,22 +28,21 @@ use std::sync::{Arc, atomic::AtomicU64};
 use arrow::{
     array::{
         ArrayRef, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int16Builder,
-        Int32Builder, Int64Builder, ListArray, RecordBatch, StringArray, StringBuilder,
-        StructArray, TimestampMicrosecondBuilder,
+        Int32Builder, Int64Builder, LargeStringBuilder, ListArray, RecordBatch, StringArray,
+        StringBuilder, StructArray, TimestampMicrosecondBuilder,
     },
     buffer::OffsetBuffer,
     datatypes::{DataType, Field, SchemaRef, TimeUnit},
 };
 use async_stream::try_stream;
 use futures::Stream;
-use secrecy::ExposeSecret;
 use snafu::ResultExt;
 use tokio_postgres::NoTls;
 use tokio_postgres::types::Type;
 
 use super::{
     BootstrapSnafu, PgOutputDecodeSnafu, ReplicationMetricsCollector, Result, SetupConnectSnafu,
-    changes::envelope_with_lsn, config::ReplicationParams,
+    TlsConfigSnafu, changes::envelope_with_lsn, config::ReplicationParams,
 };
 use crate::cdc::{ChangeBatch, ChangeEnvelope, StreamError, changes_schema};
 
@@ -81,36 +80,45 @@ pub async fn snapshot_stream(
         dataset_name,
         metrics,
     } = input;
-    let host = params.host.clone();
-    let port = params.port;
-    let user = params.user.clone();
-    let password = params.password.expose_secret().to_string();
-    let database = params.database.clone();
-    // sslmode is already validated as Disable by `setup_slot_and_publication`
-    // before this stream ever runs — TLS for the replication path is a
-    // follow-up. We connect with `NoTls` and do not try to negotiate TLS.
+    // Eagerly build the TLS connector — avoids doing it inside `try_stream!`
+    // where error conversion is awkward.
+    let tls_connector = params.native_tls_connector().context(TlsConfigSnafu)?;
+    let params_for_stream = params.clone();
+    let dataset_name_clone = dataset_name.clone();
 
     Ok(try_stream! {
-        // Fresh non-pooled connection with REPEATABLE READ isolation.
-        let mut cfg = tokio_postgres::Config::new();
-        cfg.host(&host)
-            .port(port)
-            .user(&user)
-            .password(&password)
-            .dbname(&database)
-            .ssl_mode(tokio_postgres::config::SslMode::Disable)
-            .application_name(format!("spice-replication-bootstrap/{dataset_name}"));
+        let cfg = params_for_stream.pg_config(
+            &format!("spice-replication-bootstrap/{dataset_name_clone}")
+        );
 
-        let (client, connection) = cfg
-            .connect(NoTls)
-            .await
-            .context(SetupConnectSnafu)
-            .map_err(super::err_to_stream)?;
-        let conn_task = tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!("postgres bootstrap connection terminated: {e}");
+        let (client, conn_task) = match tls_connector {
+            Some(connector) => {
+                let (c, connection) = cfg
+                    .connect(connector)
+                    .await
+                    .context(SetupConnectSnafu)
+                    .map_err(super::err_to_stream)?;
+                let t = tokio::spawn(async move {
+                    if let Err(e) = connection.await {
+                        tracing::warn!("postgres bootstrap connection terminated: {e}");
+                    }
+                });
+                (c, t)
             }
-        });
+            None => {
+                let (c, connection) = cfg
+                    .connect(NoTls)
+                    .await
+                    .context(SetupConnectSnafu)
+                    .map_err(super::err_to_stream)?;
+                let t = tokio::spawn(async move {
+                    if let Err(e) = connection.await {
+                        tracing::warn!("postgres bootstrap connection terminated: {e}");
+                    }
+                });
+                (c, t)
+            }
+        };
 
         // REPEATABLE READ to lock in a consistent view.
         client
@@ -307,6 +315,7 @@ fn quote_ident(s: &str) -> String {
 /// Row-driven builder that pulls typed values out of `tokio_postgres::Row`.
 enum BootstrapBuilder {
     Utf8(StringBuilder),
+    LargeUtf8(LargeStringBuilder),
     Bool(BooleanBuilder),
     Int16(Int16Builder),
     Int32(Int32Builder),
@@ -321,17 +330,7 @@ impl BootstrapBuilder {
     fn new(data_type: &DataType) -> Result<Self> {
         Ok(match data_type {
             DataType::Utf8 => Self::Utf8(StringBuilder::new()),
-            DataType::LargeUtf8 => {
-                // Would produce a `StringArray` child for a `LargeUtf8` field
-                // and fail schema validation. Reject with a clear error until
-                // LargeStringBuilder is wired up.
-                return PgOutputDecodeSnafu {
-                    message: "bootstrap: dataset column uses LargeUtf8 which is not yet \
-                              supported by the replication bootstrap path. Use Utf8 instead."
-                        .to_string(),
-                }
-                .fail();
-            }
+            DataType::LargeUtf8 => Self::LargeUtf8(LargeStringBuilder::new()),
             DataType::Boolean => Self::Bool(BooleanBuilder::new()),
             DataType::Int16 => Self::Int16(Int16Builder::new()),
             DataType::Int32 => Self::Int32(Int32Builder::new()),
@@ -360,6 +359,16 @@ impl BootstrapBuilder {
                 let v: Option<String> =
                     row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
                         message: format!("bootstrap read utf8: {e}"),
+                    })?;
+                match v {
+                    Some(s) => b.append_value(s),
+                    None => b.append_null(),
+                }
+            }
+            Self::LargeUtf8(b) => {
+                let v: Option<String> =
+                    row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
+                        message: format!("bootstrap read large utf8: {e}"),
                     })?;
                 match v {
                     Some(s) => b.append_value(s),
@@ -476,6 +485,7 @@ impl BootstrapBuilder {
     fn finish(mut self) -> ArrayRef {
         match &mut self {
             Self::Utf8(b) => Arc::new(b.finish()),
+            Self::LargeUtf8(b) => Arc::new(b.finish()),
             Self::Bool(b) => Arc::new(b.finish()),
             Self::Int16(b) => Arc::new(b.finish()),
             Self::Int32(b) => Arc::new(b.finish()),

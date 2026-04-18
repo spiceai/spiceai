@@ -246,7 +246,11 @@ async fn wait_for_row_count(
         let batches = run_query(rt, &sql).await?;
         let count = batches
             .first()
-            .and_then(|b| b.column(0).as_any().downcast_ref::<arrow::array::Int64Array>())
+            .and_then(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+            })
             .map(|a| a.value(0))
             .unwrap_or_default();
         if count as u64 == expected {
@@ -261,11 +265,7 @@ async fn wait_for_row_count(
     }
 }
 
-async fn assert_scalar_i64(
-    rt: &Runtime,
-    sql: &str,
-    expected: i64,
-) -> Result<(), anyhow::Error> {
+async fn assert_scalar_i64(rt: &Runtime, sql: &str, expected: i64) -> Result<(), anyhow::Error> {
     let batches = run_query(rt, sql).await?;
     let Some(batch) = batches.first() else {
         return Err(anyhow!("no rows from `{sql}`"));
@@ -450,7 +450,11 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
                 .await?;
                 let seg = batch
                     .first()
-                    .and_then(|b| b.column(0).as_any().downcast_ref::<arrow::array::StringArray>())
+                    .and_then(|b| {
+                        b.column(0)
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringArray>()
+                    })
                     .map(|a| a.value(0).to_string());
                 if seg.as_deref() == Some("UPDATED") {
                     break;
@@ -486,7 +490,11 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
                 .await?;
                 let price = batch
                     .first()
-                    .and_then(|b| b.column(0).as_any().downcast_ref::<arrow::array::Float64Array>())
+                    .and_then(|b| {
+                        b.column(0)
+                            .as_any()
+                            .downcast_ref::<arrow::array::Float64Array>()
+                    })
                     .map(|a| a.value(0));
                 if (price.unwrap_or_default() - 1.00).abs() < 0.01 {
                     break;
@@ -503,7 +511,11 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
             // -------------------------------------------------------------
             // 6. DELETE path.
             // -------------------------------------------------------------
-            exec(&source, "DELETE FROM public.tpch_orders WHERE o_orderkey IN (1, 2, 3)").await?;
+            exec(
+                &source,
+                "DELETE FROM public.tpch_orders WHERE o_orderkey IN (1, 2, 3)",
+            )
+            .await?;
             wait_for_row_count(&rt, "tpch_orders", 9).await?;
             assert_scalar_i64(
                 &rt,
@@ -513,7 +525,11 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
             .await?;
 
             // Delete from the smaller table too, to exercise different PK type (int4).
-            exec(&source, "DELETE FROM public.tpch_nation WHERE n_nationkey = 4").await?;
+            exec(
+                &source,
+                "DELETE FROM public.tpch_nation WHERE n_nationkey = 4",
+            )
+            .await?;
             wait_for_row_count(&rt, "tpch_nation", 4).await?;
 
             // -------------------------------------------------------------
@@ -540,8 +556,8 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
                 "SELECT r_regionkey, r_name FROM tpch_region ORDER BY r_regionkey",
             )
             .await?;
-            let pretty = pretty_format_batches(&regions)
-                .map_err(|e| anyhow!("format regions: {e}"))?;
+            let pretty =
+                pretty_format_batches(&regions).map_err(|e| anyhow!("format regions: {e}"))?;
             insta::assert_snapshot!("tpch_postgres_replication_regions", pretty);
 
             rt.shutdown().await;

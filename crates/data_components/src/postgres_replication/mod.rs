@@ -19,7 +19,8 @@ limitations under the License.
 //! Streams WAL changes from a source Postgres database directly into the local
 //! accelerator via the existing [`crate::cdc::ChangesStream`] abstraction.
 //!
-//! Entry point: [`start_replication_stream`].
+//! Entry point: [`start_replication_stream`]. Compiled as part of the
+//! `postgres` feature on this crate — no separate feature flag.
 
 pub mod bootstrap;
 pub mod changes;
@@ -84,12 +85,8 @@ pub enum Error {
     #[snafu(display("Invalid Postgres LSN string `{lsn}`: expected `XXXXXXXX/YYYYYYYY`"))]
     InvalidLsn { lsn: String },
 
-    #[snafu(display(
-        "`pg_sslmode: {mode}` is not supported by the Postgres replication path yet. \
-         Configure `pg_sslmode: disable` or terminate TLS at a private-network boundary. \
-         TLS support for replication is tracked as a follow-up."
-    ))]
-    TlsNotSupported { mode: String },
+    #[snafu(display("Failed to build TLS configuration for Postgres replication: {source}"))]
+    TlsConfig { source: config::TlsConfigError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

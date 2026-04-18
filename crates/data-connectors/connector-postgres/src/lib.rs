@@ -17,10 +17,8 @@ limitations under the License.
 //! `PostgreSQL` data connector for Spice.ai runtime.
 //!
 //! This crate provides the `PostgreSQL` connector implementation, allowing
-//! Spice.ai to connect to `PostgreSQL` databases as data sources.
-//!
-//! With the `postgres-replication` feature (on by default) the connector also
-//! exposes a direct WAL-based `ChangesStream`, letting users set
+//! Spice.ai to connect to `PostgreSQL` databases as data sources. It also
+//! exposes a direct WAL-based `ChangesStream`, so users can set
 //! `acceleration.refresh_mode: changes` on a Postgres dataset and get
 //! change-by-change replication into the local accelerator without Debezium.
 
@@ -33,7 +31,6 @@ use datafusion_table_providers::sql::db_connection_pool::{
     postgrespool::{self, PostgresConnectionPool},
 };
 use runtime::component::dataset::Dataset;
-#[cfg(feature = "postgres-replication")]
 use runtime::component::metrics::MetricsProvider;
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
@@ -47,7 +44,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-#[cfg(feature = "postgres-replication")]
 mod replication;
 
 #[derive(Debug, Snafu)]
@@ -59,9 +55,7 @@ pub enum Error {
 /// `PostgreSQL` data connector.
 pub struct Postgres {
     postgres_factory: PostgresTableFactory,
-    #[cfg(feature = "postgres-replication")]
     params: runtime::parameters::Parameters,
-    #[cfg(feature = "postgres-replication")]
     replication_metrics:
         std::sync::Arc<data_components::postgres_replication::ReplicationMetricsCollector>,
 }
@@ -103,7 +97,7 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("connection_pool_size")
         .description("The maximum number of connections created in the connection pool.")
         .default("5"),
-    // --- Logical replication (postgres-replication feature) ---
+    // --- Logical replication (WAL streaming) ---
     ParameterSpec::component("replication_slot").description(
         "Name of the Postgres replication slot to create/reuse for this dataset. \
          Defaults to `spice_<dataset>_<instance-hash>`. Each Spice replica MUST have \
@@ -150,7 +144,6 @@ impl DataConnectorFactory for PostgresFactory {
                 SecretBox::from(format!("Spice.ai {}", env!("CARGO_PKG_VERSION"))),
             );
 
-            #[cfg(feature = "postgres-replication")]
             let params_for_replication = params.parameters.clone();
 
             match PostgresConnectionPool::new(param_map).await {
@@ -163,9 +156,7 @@ impl DataConnectorFactory for PostgresFactory {
                     let postgres_factory = PostgresTableFactory::new(Arc::new(pool));
                     Ok(Arc::new(Postgres {
                         postgres_factory,
-                        #[cfg(feature = "postgres-replication")]
                         params: params_for_replication,
-                        #[cfg(feature = "postgres-replication")]
                         replication_metrics:
                             data_components::postgres_replication::ReplicationMetricsCollector::new(
                             ),
@@ -317,12 +308,10 @@ impl DataConnector for Postgres {
         }
     }
 
-    #[cfg(feature = "postgres-replication")]
     fn supports_changes_stream(&self) -> bool {
         true
     }
 
-    #[cfg(feature = "postgres-replication")]
     fn changes_stream(
         &self,
         federated_table: Arc<runtime::federated_table::FederatedTable>,
@@ -338,7 +327,6 @@ impl DataConnector for Postgres {
         ))
     }
 
-    #[cfg(feature = "postgres-replication")]
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
         Some(Arc::new(replication::PostgresMetricsProvider::new(
             data_components::postgres_replication::ReplicationMetrics::new(Arc::clone(

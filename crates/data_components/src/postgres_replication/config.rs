@@ -16,6 +16,7 @@ limitations under the License.
 
 //! Replication parameters derived from connector params + environment.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
@@ -32,6 +33,9 @@ pub struct ReplicationParams {
     pub password: SecretString,
     pub database: String,
     pub sslmode: SslMode,
+    /// Optional path to a PEM-encoded CA certificate bundle. Only used when
+    /// `sslmode` is `VerifyCa` or `VerifyFull`.
+    pub sslrootcert: Option<PathBuf>,
 
     pub slot_name: String,
     pub publication_name: String,
@@ -48,6 +52,7 @@ impl std::fmt::Debug for ReplicationParams {
             .field("user", &self.user)
             .field("database", &self.database)
             .field("sslmode", &self.sslmode)
+            .field("sslrootcert", &self.sslrootcert)
             .field("slot_name", &self.slot_name)
             .field("publication_name", &self.publication_name)
             .field("initial_snapshot", &self.initial_snapshot)
@@ -57,11 +62,25 @@ impl std::fmt::Debug for ReplicationParams {
     }
 }
 
+/// SSL negotiation + certificate-verification mode. Matches the standard
+/// libpq sslmode values so users can set `pg_sslmode` with their normal
+/// Postgres vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SslMode {
+    /// No TLS. Plaintext connection; rejected by TLS-enforced servers.
     Disable,
+    /// Try TLS; fall back to plaintext if the server doesn't support it.
+    /// No cert verification.
     Prefer,
+    /// Require TLS. No cert verification (vulnerable to MITM — use for
+    /// development only).
     Require,
+    /// Require TLS and verify the server certificate chains to a trusted
+    /// CA. Does NOT verify the hostname.
+    VerifyCa,
+    /// Require TLS, verify chain, and verify the hostname in the cert
+    /// matches the server's hostname (recommended for production).
+    VerifyFull,
 }
 
 impl SslMode {
@@ -69,9 +88,29 @@ impl SslMode {
     pub fn from_str_or_default(s: Option<&str>) -> Self {
         match s.map(str::to_ascii_lowercase).as_deref() {
             Some("disable") => Self::Disable,
-            Some("require") | Some("verify-ca") | Some("verify-full") => Self::Require,
+            Some("require") => Self::Require,
+            Some("verify-ca") => Self::VerifyCa,
+            Some("verify-full") => Self::VerifyFull,
             _ => Self::Prefer,
         }
+    }
+
+    /// Whether this mode requires any TLS negotiation at all.
+    #[must_use]
+    pub fn requires_tls(self) -> bool {
+        !matches!(self, Self::Disable)
+    }
+
+    /// Whether this mode verifies the server certificate chain.
+    #[must_use]
+    pub fn verifies_certificate(self) -> bool {
+        matches!(self, Self::VerifyCa | Self::VerifyFull)
+    }
+
+    /// Whether this mode verifies the server hostname against the cert.
+    #[must_use]
+    pub fn verifies_hostname(self) -> bool {
+        matches!(self, Self::VerifyFull)
     }
 }
 
@@ -180,20 +219,138 @@ impl ReplicationParams {
     /// Build a tokio-postgres config for setup queries (not replication).
     #[must_use]
     pub fn setup_pg_config(&self) -> tokio_postgres::Config {
+        self.pg_config(&format!("spice-replication-setup/{}", self.slot_name))
+    }
+
+    /// Build a tokio-postgres config with a custom application_name.
+    #[must_use]
+    pub fn pg_config(&self, application_name: &str) -> tokio_postgres::Config {
         let mut cfg = tokio_postgres::Config::new();
         cfg.host(&self.host)
             .port(self.port)
             .user(&self.user)
             .password(self.password.expose_secret())
             .dbname(&self.database)
-            .application_name(format!("spice-replication-setup/{}", self.slot_name));
+            .application_name(application_name);
         match self.sslmode {
             SslMode::Disable => cfg.ssl_mode(tokio_postgres::config::SslMode::Disable),
             SslMode::Prefer => cfg.ssl_mode(tokio_postgres::config::SslMode::Prefer),
-            SslMode::Require => cfg.ssl_mode(tokio_postgres::config::SslMode::Require),
+            SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => {
+                cfg.ssl_mode(tokio_postgres::config::SslMode::Require)
+            }
         };
         cfg
     }
+
+    /// Build a native-tls `MakeTlsConnector` matching the configured sslmode.
+    /// Returns `None` when TLS is disabled — callers should connect with `NoTls`
+    /// in that case.
+    ///
+    /// - `Disable` → `None` (no TLS)
+    /// - `Prefer` / `Require` → accept any certificate (no verification)
+    /// - `VerifyCa` → verify chain against the configured `sslrootcert` (or
+    ///   system roots if none provided); hostname verification DISABLED
+    /// - `VerifyFull` → verify chain AND hostname (strictest)
+    pub fn native_tls_connector(
+        &self,
+    ) -> std::result::Result<Option<postgres_native_tls::MakeTlsConnector>, TlsConfigError> {
+        if !self.sslmode.requires_tls() {
+            return Ok(None);
+        }
+
+        let mut builder = native_tls::TlsConnector::builder();
+        if !self.sslmode.verifies_certificate() {
+            // require/prefer: accept anything — encryption only, no trust anchor.
+            builder
+                .danger_accept_invalid_certs(true)
+                .danger_accept_invalid_hostnames(true);
+        } else if !self.sslmode.verifies_hostname() {
+            // verify-ca: chain is verified but hostname is not.
+            builder.danger_accept_invalid_hostnames(true);
+        }
+        // verify-full: both chain and hostname checked (native-tls default).
+
+        if let Some(ca_path) = &self.sslrootcert {
+            let pem_bytes = std::fs::read(ca_path).map_err(|e| TlsConfigError::ReadCa {
+                path: ca_path.clone(),
+                source: e,
+            })?;
+            for cert in parse_pem_certificates(&pem_bytes)? {
+                builder.add_root_certificate(cert);
+            }
+        }
+
+        let connector = builder.build().map_err(TlsConfigError::BuildConnector)?;
+        Ok(Some(postgres_native_tls::MakeTlsConnector::new(connector)))
+    }
+}
+
+/// Errors raised while assembling TLS configuration from `ReplicationParams`.
+#[derive(Debug)]
+pub enum TlsConfigError {
+    ReadCa {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    ParseCa {
+        source: native_tls::Error,
+    },
+    BuildConnector(native_tls::Error),
+}
+
+impl std::fmt::Display for TlsConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TlsConfigError::ReadCa { path, source } => {
+                write!(
+                    f,
+                    "failed to read sslrootcert at {}: {source}",
+                    path.display()
+                )
+            }
+            TlsConfigError::ParseCa { source } => {
+                write!(f, "failed to parse sslrootcert PEM: {source}")
+            }
+            TlsConfigError::BuildConnector(source) => {
+                write!(f, "failed to build native-tls connector: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TlsConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TlsConfigError::ReadCa { source, .. } => Some(source),
+            TlsConfigError::ParseCa { source } => Some(source),
+            TlsConfigError::BuildConnector(source) => Some(source),
+        }
+    }
+}
+
+/// Split a PEM blob into individual `native_tls::Certificate`s.
+fn parse_pem_certificates(
+    pem: &[u8],
+) -> std::result::Result<Vec<native_tls::Certificate>, TlsConfigError> {
+    let mut certs = Vec::new();
+    let mut remaining = pem;
+    while let Some(begin) = find_subslice(remaining, b"-----BEGIN CERTIFICATE-----") {
+        let tail = &remaining[begin..];
+        let Some(end_rel) = find_subslice(tail, b"-----END CERTIFICATE-----") else {
+            break;
+        };
+        let end = begin + end_rel + b"-----END CERTIFICATE-----".len();
+        let block = &remaining[begin..end];
+        let cert = native_tls::Certificate::from_pem(block)
+            .map_err(|source| TlsConfigError::ParseCa { source })?;
+        certs.push(cert);
+        remaining = &remaining[end..];
+    }
+    Ok(certs)
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]

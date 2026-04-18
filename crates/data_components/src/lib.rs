@@ -55,7 +55,7 @@ pub mod odbc;
 pub mod oracle;
 #[cfg(feature = "postgres")]
 pub mod postgres;
-#[cfg(feature = "postgres-replication")]
+#[cfg(feature = "postgres")]
 pub mod postgres_replication;
 pub mod refresh_skip;
 pub mod resilient_http;

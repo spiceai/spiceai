@@ -23,28 +23,20 @@ license.workspace = true
 description = "PostgreSQL data connector for Spice.ai runtime"
 
 [dependencies]
-async-stream = { workspace = true, optional = true }
+async-stream.workspace = true
 async-trait.workspace = true
-data_components = { path = "../../data_components", optional = true }
+data_components = { path = "../../data_components", features = ["postgres"] }
 datafusion.workspace = true
 datafusion-table-providers = { workspace = true, features = ["postgres", "postgres-federation"] }
-fundu = { workspace = true, optional = true }
+fundu.workspace = true
 futures.workspace = true
-opentelemetry = { workspace = true, optional = true }
+opentelemetry.workspace = true
 runtime = { path = "../../runtime" }
 secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true
-tokio-postgres = { workspace = true, optional = true }
+tokio-postgres.workspace = true
 
 [features]
-default = ["postgres-replication"]
+default = []
 postgres-write = []
-postgres-replication = [
-    "dep:data_components",
-    "data_components/postgres-replication",
-    "dep:tokio-postgres",
-    "dep:async-stream",
-    "dep:fundu",
-    "dep:opentelemetry",
-]
