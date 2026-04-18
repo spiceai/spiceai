@@ -160,34 +160,43 @@ impl Metrics {
         Self { collector }
     }
 
+    #[must_use]
     pub fn wal_inserts_total(&self) -> u64 {
         self.collector.wal_inserts_total.load(Ordering::Relaxed)
     }
+    #[must_use]
     pub fn wal_updates_total(&self) -> u64 {
         self.collector.wal_updates_total.load(Ordering::Relaxed)
     }
+    #[must_use]
     pub fn wal_deletes_total(&self) -> u64 {
         self.collector.wal_deletes_total.load(Ordering::Relaxed)
     }
+    #[must_use]
     pub fn wal_truncates_total(&self) -> u64 {
         self.collector.wal_truncates_total.load(Ordering::Relaxed)
     }
+    #[must_use]
     pub fn wal_transactions_total(&self) -> u64 {
         self.collector
             .wal_transactions_total
             .load(Ordering::Relaxed)
     }
 
+    #[must_use]
     pub fn bootstrap_rows_total(&self) -> u64 {
         self.collector.bootstrap_rows_total.load(Ordering::Relaxed)
     }
+    #[must_use]
     pub fn bootstrap_complete(&self) -> u64 {
         self.collector.bootstrap_complete.load(Ordering::Relaxed)
     }
 
+    #[must_use]
     pub fn confirmed_flush_lsn(&self) -> u64 {
         self.collector.confirmed_flush_lsn.load(Ordering::Relaxed)
     }
+    #[must_use]
     pub fn server_wal_end_lsn(&self) -> u64 {
         self.collector.server_wal_end_lsn.load(Ordering::Relaxed)
     }
@@ -195,6 +204,7 @@ impl Metrics {
     /// Bytes between the server's reported WAL end and our last confirmed
     /// flush LSN. Returns 0 if the server hasn't reported yet or if we're
     /// ahead of the last-seen server position (can happen with stale atomic reads).
+    #[must_use]
     pub fn replication_lag_bytes(&self) -> u64 {
         let server = self.server_wal_end_lsn();
         let confirmed = self.confirmed_flush_lsn();
@@ -203,6 +213,7 @@ impl Metrics {
 
     /// Milliseconds since the most recent transaction we've ingested.
     /// Returns `None` before the first commit is seen.
+    #[must_use]
     pub fn replication_lag_ms(&self) -> Option<u64> {
         let watermark = self
             .collector
@@ -217,21 +228,25 @@ impl Metrics {
             .and_then(|d| u64::try_from(d.as_millis()).ok())
     }
 
+    #[must_use]
     pub fn wal_decode_errors_total(&self) -> u64 {
         self.collector
             .wal_decode_errors_total
             .load(Ordering::Relaxed)
     }
+    #[must_use]
     pub fn schema_mismatch_errors_total(&self) -> u64 {
         self.collector
             .schema_mismatch_errors_total
             .load(Ordering::Relaxed)
     }
+    #[must_use]
     pub fn replication_recv_errors_total(&self) -> u64 {
         self.collector
             .replication_recv_errors_total
             .load(Ordering::Relaxed)
     }
+    #[must_use]
     pub fn replication_reconnects_total(&self) -> u64 {
         self.collector
             .replication_reconnects_total

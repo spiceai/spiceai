@@ -96,9 +96,13 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
 
     let port = common::get_random_port()?;
     let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
-    let source = setup_source_table(port as u16).await?;
+    let source = setup_source_table(u16::try_from(port).expect("port fits in u16")).await?;
 
-    let params = params_for(port as u16, "spice_itest_slot_a", "spice_itest_pub_a");
+    let params = params_for(
+        u16::try_from(port).expect("port fits in u16"),
+        "spice_itest_slot_a",
+        "spice_itest_pub_a",
+    );
     let input = ReplicationStreamInput {
         dataset_name: "repl_users".into(),
         params,
@@ -196,11 +200,19 @@ async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
 
     let port = common::get_random_port()?;
     let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
-    let source = setup_source_table(port as u16).await?;
+    let source = setup_source_table(u16::try_from(port).expect("port fits in u16")).await?;
 
     // Two independent consumers — same publication, distinct slots.
-    let params_a = params_for(port as u16, "spice_itest_slot_r1", "spice_itest_pub_r");
-    let params_b = params_for(port as u16, "spice_itest_slot_r2", "spice_itest_pub_r");
+    let params_a = params_for(
+        u16::try_from(port).expect("port fits in u16"),
+        "spice_itest_slot_r1",
+        "spice_itest_pub_r",
+    );
+    let params_b = params_for(
+        u16::try_from(port).expect("port fits in u16"),
+        "spice_itest_slot_r2",
+        "spice_itest_pub_r",
+    );
 
     let build_input = |p: ReplicationParams| ReplicationStreamInput {
         dataset_name: "repl_users".into(),

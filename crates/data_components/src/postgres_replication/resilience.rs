@@ -89,20 +89,31 @@ impl Backoff {
 
 fn jitter(d: Duration) -> Duration {
     // Cheap PRNG without pulling in a dep here: use the current nanos.
-    let nanos = d.subsec_nanos() as u64
+    let nanos = u64::from(d.subsec_nanos())
         ^ std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|e| e.subsec_nanos() as u64)
+            .map(|e| u64::from(e.subsec_nanos()))
             .unwrap_or(0);
-    // Map to [-20%, +20%] of `d`.
-    let span = (d.as_millis() as i64) / 5;
-    let delta = if span == 0 {
-        0
-    } else {
-        (nanos as i64) % (2 * span) - span
-    };
-    let base = d.as_millis() as i64;
-    Duration::from_millis((base + delta).max(1) as u64)
+    // Map to [-20%, +20%] of `d`. The casts below are intentional — we're
+    // computing a small bounded signed offset to add to a positive base and
+    // clamping back to a u64 millis. Out-of-range inputs would already be
+    // unsafe at this layer (an hours-long jitter base doesn't make sense).
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        reason = "bounded millis arithmetic: span fits in i64, sign-bit cast is scoped to a jitter delta"
+    )]
+    {
+        let span = (d.as_millis() as i64) / 5;
+        let delta = if span == 0 {
+            0
+        } else {
+            (nanos as i64) % (2 * span) - span
+        };
+        let base = d.as_millis() as i64;
+        Duration::from_millis((base + delta).max(1) as u64)
+    }
 }
 
 /// Classify a `pgwire_replication::PgWireError` as transient (worth
@@ -112,11 +123,13 @@ fn jitter(d: Duration) -> Duration {
 /// pgwire-replication may add variants over time. The heuristic: anything
 /// that looks like an IO / connection / EOF error is transient; authentication,
 /// protocol, slot-not-found, or decoding errors are fatal.
+#[must_use]
 pub fn is_transient_pgwire(err: &pgwire_replication::PgWireError) -> bool {
     is_transient_by_display(&err.to_string())
 }
 
 /// Same classifier for tokio-postgres (used by setup + bootstrap).
+#[must_use]
 pub fn is_transient_pg(err: &tokio_postgres::Error) -> bool {
     if err.is_closed() {
         return true;

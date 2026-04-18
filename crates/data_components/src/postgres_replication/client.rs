@@ -305,8 +305,10 @@ fn wal_stream(
                         }
                         // Begin/Commit should not come via XLogData with this
                         // client — they're already surfaced as distinct events.
-                        DecodedMessage::Begin { .. } | DecodedMessage::Commit { .. } => {}
-                        DecodedMessage::Other => {}
+                        // Grouped with Other because the handling is identical (no-op).
+                        DecodedMessage::Begin { .. }
+                        | DecodedMessage::Commit { .. }
+                        | DecodedMessage::Other => {}
                     }
                 }
                 ReplicationEvent::Commit { end_lsn, commit_time_micros, .. } => {
@@ -401,10 +403,9 @@ fn pg_epoch_to_system_time(pg_micros: i64) -> std::time::SystemTime {
     // 30 years = 946_684_800 seconds between 1970-01-01 and 2000-01-01.
     const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
     let total_micros = pg_micros + PG_EPOCH_UNIX_SECS * 1_000_000;
-    if total_micros >= 0 {
-        std::time::UNIX_EPOCH + std::time::Duration::from_micros(total_micros as u64)
-    } else {
-        std::time::UNIX_EPOCH
+    match u64::try_from(total_micros) {
+        Ok(pos) => std::time::UNIX_EPOCH + std::time::Duration::from_micros(pos),
+        Err(_) => std::time::UNIX_EPOCH,
     }
 }
 

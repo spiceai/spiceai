@@ -70,7 +70,7 @@ pub fn build_changes_stream(
         .acceleration
         .as_ref()
         .and_then(|a| a.primary_key.as_ref())
-        .map(|pk| pk.iter().map(|s| s.to_string()).collect())
+        .map(|pk| pk.iter().map(ToString::to_string).collect())
         .unwrap_or_default();
 
     Box::pin(try_stream! {
@@ -359,11 +359,9 @@ fn replication_params_from_connector_params(
     let publication_name = optional_string(params, "publication")
         .unwrap_or_else(|| config::default_publication_name(dataset_name));
     let initial_snapshot = optional_string(params, "replication_initial_snapshot")
-        .map(|s| parse_bool_default_true(&s))
-        .unwrap_or(true);
+        .is_none_or(|s| parse_bool_default_true(&s));
     let temporary_slot = optional_string(params, "replication_temporary_slot")
-        .map(|s| parse_bool_default_false(&s))
-        .unwrap_or(false);
+        .is_some_and(|s| parse_bool_default_false(&s));
     let status_interval = optional_string(params, "replication_status_interval")
         .and_then(|s| fundu::parse_duration(&s).ok())
         .unwrap_or(DEFAULT_STATUS_INTERVAL);

@@ -79,25 +79,22 @@ async fn setup_once(
     let cfg = params.setup_pg_config();
     let tls = params.native_tls_connector().context(TlsConfigSnafu)?;
 
-    let (client, conn_task) = match tls {
-        Some(connector) => {
-            let (client, connection) = cfg.connect(connector).await.context(SetupConnectSnafu)?;
-            let task = tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    tracing::warn!("postgres setup connection terminated: {e}");
-                }
-            });
-            (client, task)
-        }
-        None => {
-            let (client, connection) = cfg.connect(NoTls).await.context(SetupConnectSnafu)?;
-            let task = tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    tracing::warn!("postgres setup connection terminated: {e}");
-                }
-            });
-            (client, task)
-        }
+    let (client, conn_task) = if let Some(connector) = tls {
+        let (client, connection) = cfg.connect(connector).await.context(SetupConnectSnafu)?;
+        let task = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!("postgres setup connection terminated: {e}");
+            }
+        });
+        (client, task)
+    } else {
+        let (client, connection) = cfg.connect(NoTls).await.context(SetupConnectSnafu)?;
+        let task = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::warn!("postgres setup connection terminated: {e}");
+            }
+        });
+        (client, task)
     };
 
     let outcome = do_setup(&client, params, schema_name, table_name).await;
@@ -340,14 +337,20 @@ pub fn parse_lsn(s: &str) -> Result<u64> {
 // Keep an infallible helper for the tests that previously relied on `.unwrap_or(0)`
 // semantics. Inline in tests only — prefer `parse_lsn` at call sites.
 #[cfg(test)]
-#[allow(dead_code)]
 fn parse_lsn_or_zero(s: &str) -> u64 {
     parse_lsn(s).unwrap_or(0)
 }
 
 #[must_use]
 pub fn format_lsn(lsn: u64) -> String {
-    format!("{:X}/{:X}", lsn >> 32, lsn as u32)
+    // Postgres LSN strings are intentionally "high32/low32" in hex, so truncating
+    // the low 32 bits is exactly what we want here.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "intentional: Postgres LSN format separates the low 32 bits"
+    )]
+    let low = lsn as u32;
+    format!("{high:X}/{low:X}", high = lsn >> 32)
 }
 
 /// Minimal identifier quoting: double-quote and escape any embedded quotes.

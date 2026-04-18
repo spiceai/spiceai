@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 //! End-to-end integration test for the Postgres logical-replication path,
-//! driven through the full Spice Runtime (Spicepod datasets + DuckDB
+//! driven through the full Spice Runtime (Spicepod datasets + `DuckDB`
 //! accelerator) using a TPC-H-shaped schema.
 //!
 //! What this test validates that the pure-library test at `replication.rs`
@@ -62,31 +62,31 @@ const CHANGE_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(30);
 // ---------------------------------------------------------------------------
 
 const DDL_STATEMENTS: &[&str] = &[
-    r#"CREATE TABLE public.tpch_region (
+    r"CREATE TABLE public.tpch_region (
         r_regionkey int4 PRIMARY KEY,
         r_name      text NOT NULL,
         r_comment   text
-    )"#,
-    r#"CREATE TABLE public.tpch_nation (
+    )",
+    r"CREATE TABLE public.tpch_nation (
         n_nationkey int4 PRIMARY KEY,
         n_name      text NOT NULL,
         n_regionkey int4 NOT NULL,
         n_comment   text
-    )"#,
-    r#"CREATE TABLE public.tpch_customer (
+    )",
+    r"CREATE TABLE public.tpch_customer (
         c_custkey     int8 PRIMARY KEY,
         c_name        text NOT NULL,
         c_nationkey   int4 NOT NULL,
         c_acctbal     float8 NOT NULL,
         c_mktsegment  text
-    )"#,
-    r#"CREATE TABLE public.tpch_orders (
+    )",
+    r"CREATE TABLE public.tpch_orders (
         o_orderkey    int8 PRIMARY KEY,
         o_custkey     int8 NOT NULL,
         o_orderstatus text NOT NULL,
         o_totalprice  float8 NOT NULL,
         o_orderdate   date NOT NULL
-    )"#,
+    )",
 ];
 
 const SEED_STATEMENTS: &[&str] = &[
@@ -253,7 +253,7 @@ async fn wait_for_row_count(
             })
             .map(|a| a.value(0))
             .unwrap_or_default();
-        if count as u64 == expected {
+        if u64::try_from(count).unwrap_or(0) == expected {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
@@ -461,8 +461,7 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
                 }
                 if std::time::Instant::now() >= deadline {
                     return Err(anyhow!(
-                        "Timed out waiting for UPDATE on customer=1; saw segment={:?}",
-                        seg
+                        "Timed out waiting for UPDATE on customer=1; saw segment={seg:?}"
                     ));
                 }
                 sleep(Duration::from_millis(250)).await;
@@ -501,8 +500,7 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
                 }
                 if std::time::Instant::now() >= deadline {
                     return Err(anyhow!(
-                        "Timed out waiting for UPDATE on order=5; saw price={:?}",
-                        price
+                        "Timed out waiting for UPDATE on order=5; saw price={price:?}"
                     ));
                 }
                 sleep(Duration::from_millis(250)).await;

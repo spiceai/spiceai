@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! PostgreSQL logical replication for Spice acceleration.
+//! `PostgreSQL` logical replication for Spice acceleration.
 //!
 //! Streams WAL changes from a source Postgres database directly into the local
 //! accelerator via the existing [`crate::cdc::ChangesStream`] abstraction.
@@ -135,6 +135,7 @@ pub struct ReplicationStreamInput {
 /// Back-pressure: the returned stream waits for each envelope's `commit()` to
 /// complete before emitting the next one, so the accelerator's write throughput
 /// naturally paces the replication stream.
+#[must_use]
 pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream {
     // Initialized to 0 until `start_inner` learns the effective start LSN from
     // slot setup. This matters: KeepAlive replies and `replication_lag_bytes`
@@ -146,7 +147,7 @@ pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream 
         stream::once(async move { start_inner(input, confirmed_flush).await }).flat_map(|result| {
             match result {
                 Ok(stream) => stream,
-                Err(e) => stream::once(async move { Err(stream_error(e)) }).boxed(),
+                Err(e) => stream::once(async move { Err(stream_error(&e)) }).boxed(),
             }
         }),
     )
@@ -179,19 +180,15 @@ async fn start_inner(
 
     // 2. If the slot was just created and bootstrap is enabled, run snapshot.
     let bootstrap_stream = if outcome.created_fresh && params.initial_snapshot {
-        Some(
-            bootstrap::snapshot_stream(bootstrap::SnapshotInput {
-                params: params.clone(),
-                _snapshot_name: outcome.snapshot_name.clone(),
-                schema_name: schema_name.clone(),
-                table_name: table_name.clone(),
-                dataset_schema: Arc::clone(&schema),
-                primary_keys: primary_keys.clone(),
-                dataset_name: dataset_name.clone(),
-                metrics: Arc::clone(&metrics),
-            })
-            .await?,
-        )
+        Some(bootstrap::snapshot_stream(bootstrap::SnapshotInput {
+            params: params.clone(),
+            schema_name: schema_name.clone(),
+            table_name: table_name.clone(),
+            dataset_schema: Arc::clone(&schema),
+            primary_keys: primary_keys.clone(),
+            dataset_name: dataset_name.clone(),
+            metrics: Arc::clone(&metrics),
+        })?)
     } else {
         // No bootstrap this run — if the slot already existed, consider the
         // accelerator "already populated" so operators see bootstrap_complete=1.
@@ -287,12 +284,17 @@ impl crate::cdc::CommitChange for NoOpCommitter {
     }
 }
 
-fn stream_error(err: Error) -> StreamError {
+fn stream_error(err: &Error) -> StreamError {
     StreamError::External(err.to_string())
 }
 
 /// Helper for `async_stream::try_stream!` blocks to turn an [`Error`] into the
-/// `StreamError` that the cdc machinery speaks.
+/// `StreamError` that the cdc machinery speaks. Takes the error by value so it
+/// can be used directly as a function pointer in `Result::map_err`.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "used as a function pointer in map_err; taking by reference would require a closure at every call site"
+)]
 pub(crate) fn err_to_stream(err: Error) -> StreamError {
-    stream_error(err)
+    stream_error(&err)
 }

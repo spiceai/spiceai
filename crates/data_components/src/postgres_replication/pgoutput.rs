@@ -62,7 +62,7 @@ pub enum DecodedMessage {
     Truncate {
         relation_ids: Vec<RelationId>,
     },
-    /// Ignored types (Type, Origin, Message, StreamStart, etc.) still get decoded
+    /// Ignored types (Type, Origin, Message, `StreamStart`, etc.) still get decoded
     /// to a length so we can skip them safely.
     Other,
 }
@@ -97,7 +97,7 @@ pub struct TupleData {
 pub enum Value {
     /// Text-format representation (pgoutput emits text for most types).
     Text(String),
-    /// Binary-format payload for columns with TYPE_OID emitting binary.
+    /// Binary-format payload for columns with `TYPE_OID` emitting binary.
     Binary(Vec<u8>),
     /// TOAST column that was not changed in the UPDATE.
     Unchanged,
@@ -621,6 +621,6 @@ mod tests {
     fn decode_unknown_message_type_errors() {
         let mut decoder = Decoder::new();
         let buf = [b'Z', 0, 0, 0];
-        assert!(decoder.decode(&buf).is_err());
+        decoder.decode(&buf).expect_err("unknown message type");
     }
 }

@@ -194,7 +194,14 @@ fn xxh3_short_hash(s: &str) -> String {
     h.write(s.as_bytes());
     let v = h.finish();
     // 8 hex chars is enough to disambiguate replicas at human scale.
-    format!("{:08x}", v as u32)
+    // Truncating the low 32 bits is intentional — we only want 8 hex chars.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "intentional 32-bit truncation to produce an 8-hex-char identifier"
+    )]
+    {
+        format!("{:08x}", v as u32)
+    }
 }
 
 // Environment-based hostname discovery only. We intentionally avoid reading
@@ -221,7 +228,7 @@ impl ReplicationParams {
         self.pg_config(&format!("spice-replication-setup/{}", self.slot_name))
     }
 
-    /// Build a tokio-postgres config with a custom application_name.
+    /// Build a tokio-postgres config with a custom `application_name`.
     #[must_use]
     pub fn pg_config(&self, application_name: &str) -> tokio_postgres::Config {
         let mut cfg = tokio_postgres::Config::new();
@@ -364,9 +371,10 @@ impl std::error::Error for TlsConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             TlsConfigError::ReadCa { source, .. } => Some(source),
-            TlsConfigError::ParseCa { source } => Some(source),
+            TlsConfigError::ParseCa { source } | TlsConfigError::BuildConnector(source) => {
+                Some(source)
+            }
             TlsConfigError::TruncatedPem { .. } | TlsConfigError::EmptyCaBundle { .. } => None,
-            TlsConfigError::BuildConnector(source) => Some(source),
         }
     }
 }

@@ -55,9 +55,6 @@ const BOOTSTRAP_BATCH_SIZE: usize = 1024;
 /// callers easier to read.
 pub struct SnapshotInput {
     pub params: ReplicationParams,
-    /// Reserved for a future `SET TRANSACTION SNAPSHOT` implementation; unused
-    /// today because the bootstrap uses a fresh REPEATABLE READ tx.
-    pub _snapshot_name: Option<String>,
     pub schema_name: String,
     pub table_name: String,
     pub dataset_schema: SchemaRef,
@@ -68,12 +65,11 @@ pub struct SnapshotInput {
 
 /// Build a `ChangesStream`-compatible stream that emits all rows of the source
 /// table as op="c" change envelopes.
-pub async fn snapshot_stream(
+pub fn snapshot_stream(
     input: SnapshotInput,
 ) -> Result<impl Stream<Item = std::result::Result<ChangeEnvelope, StreamError>> + Send + use<>> {
     let SnapshotInput {
         params,
-        _snapshot_name,
         schema_name,
         table_name,
         dataset_schema,
@@ -84,41 +80,37 @@ pub async fn snapshot_stream(
     // Eagerly build the TLS connector — avoids doing it inside `try_stream!`
     // where error conversion is awkward.
     let tls_connector = params.native_tls_connector().context(TlsConfigSnafu)?;
-    let params_for_stream = params.clone();
     let dataset_name_clone = dataset_name.clone();
 
     Ok(try_stream! {
-        let cfg = params_for_stream.pg_config(
+        let cfg = params.pg_config(
             &format!("spice-replication-bootstrap/{dataset_name_clone}")
         );
 
-        let (client, conn_task) = match tls_connector {
-            Some(connector) => {
-                let (c, connection) = cfg
-                    .connect(connector)
-                    .await
-                    .context(SetupConnectSnafu)
-                    .map_err(super::err_to_stream)?;
-                let t = tokio::spawn(async move {
-                    if let Err(e) = connection.await {
-                        tracing::warn!("postgres bootstrap connection terminated: {e}");
-                    }
-                });
-                (c, t)
-            }
-            None => {
-                let (c, connection) = cfg
-                    .connect(NoTls)
-                    .await
-                    .context(SetupConnectSnafu)
-                    .map_err(super::err_to_stream)?;
-                let t = tokio::spawn(async move {
-                    if let Err(e) = connection.await {
-                        tracing::warn!("postgres bootstrap connection terminated: {e}");
-                    }
-                });
-                (c, t)
-            }
+        let (client, conn_task) = if let Some(connector) = tls_connector {
+            let (c, connection) = cfg
+                .connect(connector)
+                .await
+                .context(SetupConnectSnafu)
+                .map_err(super::err_to_stream)?;
+            let t = tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    tracing::warn!("postgres bootstrap connection terminated: {e}");
+                }
+            });
+            (c, t)
+        } else {
+            let (c, connection) = cfg
+                .connect(NoTls)
+                .await
+                .context(SetupConnectSnafu)
+                .map_err(super::err_to_stream)?;
+            let t = tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    tracing::warn!("postgres bootstrap connection terminated: {e}");
+                }
+            });
+            (c, t)
         };
 
         // REPEATABLE READ to lock in a consistent view.
@@ -183,7 +175,9 @@ pub async fn snapshot_stream(
                     .map_err(super::err_to_stream)?;
                 column_map = Some(map);
             }
-            let column_map_ref = column_map.as_ref().expect("column_map set above");
+            let Some(column_map_ref) = column_map.as_ref() else {
+                unreachable!("column_map is initialized above on first iteration")
+            };
             for (col_idx, &pg_idx) in column_map_ref.iter().enumerate() {
                 builders[col_idx]
                     .append_from_row(&row, pg_idx)
@@ -516,9 +510,8 @@ impl BootstrapBuilder {
                     })?;
                 match v {
                     Some(d) => {
-                        let epoch = match chrono::NaiveDate::from_ymd_opt(1970, 1, 1) {
-                            Some(epoch) => epoch,
-                            None => unreachable!("1970-01-01 is a valid NaiveDate"),
+                        let Some(epoch) = chrono::NaiveDate::from_ymd_opt(1970, 1, 1) else {
+                            unreachable!("1970-01-01 is a valid NaiveDate")
                         };
                         let days = (d - epoch).num_days();
                         b.append_value(i32::try_from(days).map_err(|e| {
@@ -644,14 +637,14 @@ impl BootstrapBuilder {
             Self::TimestampMicros(b, tz) => {
                 let arr = b.finish();
                 Arc::new(match tz {
-                    Some(tz) => arr.with_timezone(tz.clone()),
+                    Some(tz) => arr.with_timezone(Arc::clone(tz)),
                     None => arr,
                 })
             }
             Self::TimestampNanos(b, tz) => {
                 let arr = b.finish();
                 Arc::new(match tz {
-                    Some(tz) => arr.with_timezone(tz.clone()),
+                    Some(tz) => arr.with_timezone(Arc::clone(tz)),
                     None => arr,
                 })
             }

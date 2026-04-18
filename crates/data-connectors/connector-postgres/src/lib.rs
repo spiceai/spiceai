@@ -54,7 +54,7 @@ pub enum Error {
 
 /// `PostgreSQL` data connector.
 pub struct Postgres {
-    postgres_factory: PostgresTableFactory,
+    factory: PostgresTableFactory,
     params: runtime::parameters::Parameters,
     replication_metrics:
         std::sync::Arc<data_components::postgres_replication::ReplicationMetricsCollector>,
@@ -153,9 +153,9 @@ impl DataConnectorFactory for PostgresFactory {
                         .unwrap_or(datafusion_table_providers::UnsupportedTypeAction::String);
                     let pool = pool.with_unsupported_type_action(unsupported_type_action);
 
-                    let postgres_factory = PostgresTableFactory::new(Arc::new(pool));
+                    let factory = PostgresTableFactory::new(Arc::new(pool));
                     Ok(Arc::new(Postgres {
-                        postgres_factory,
+                        factory,
                         params: params_for_replication,
                         replication_metrics:
                             data_components::postgres_replication::ReplicationMetricsCollector::new(
@@ -219,7 +219,7 @@ impl DataConnector for Postgres {
         dataset: &Dataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         match self
-            .postgres_factory
+            .factory
             .read_write_table_provider(dataset.path().into())
             .await
         {
@@ -265,11 +265,7 @@ impl DataConnector for Postgres {
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
-        match self
-            .postgres_factory
-            .table_provider(dataset.path().into())
-            .await
-        {
+        match self.factory.table_provider(dataset.path().into()).await {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(err_source) = e.source() {

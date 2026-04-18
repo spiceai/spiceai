@@ -206,7 +206,7 @@ pub fn build_change_batch(
         })?);
 
         for (col_idx, &source_idx) in column_map.iter().enumerate() {
-            let value = change.row.columns.get(source_idx).unwrap_or(&None);
+            let value = change.row.columns.get(source_idx).and_then(Option::as_ref);
             data_builders[col_idx].append(value, change.op)?;
         }
     }
@@ -253,7 +253,7 @@ fn nullable_clone(schema: &SchemaRef) -> SchemaRef {
 }
 
 /// Public alias used by `bootstrap::finish_batch` so the two code paths stay
-/// in lockstep on ChangeBatch schema shape.
+/// in lockstep on `ChangeBatch` schema shape.
 pub(super) fn nullable_clone_for_bootstrap(schema: &SchemaRef) -> SchemaRef {
     nullable_clone(schema)
 }
@@ -392,7 +392,7 @@ impl FieldBuilder {
         })
     }
 
-    fn append(&mut self, value: &Option<Value>, op: ChangeOp) -> Result<()> {
+    fn append(&mut self, value: Option<&Value>, op: ChangeOp) -> Result<()> {
         let Some(v) = value else {
             self.append_null();
             return Ok(());
@@ -408,10 +408,9 @@ impl FieldBuilder {
                 return PgOutputDecodeSnafu {
                     message: format!(
                         "postgres_replication: received Value::Unchanged (TOASTed column \
-                         omitted) during {:?} — this would silently overwrite the \
+                         omitted) during {op:?} — this would silently overwrite the \
                          accelerator value with NULL. Set `ALTER TABLE ... REPLICA IDENTITY \
-                         FULL;` on the source so the old tuple is sent with every update.",
-                        op
+                         FULL;` on the source so the old tuple is sent with every update."
                     ),
                 }
                 .fail();
@@ -459,37 +458,37 @@ impl FieldBuilder {
             Self::Int8(b) => {
                 b.append_value(s.parse::<i8>().map_err(|e| super::Error::PgOutputDecode {
                     message: format!("int8 parse '{s}': {e}"),
-                })?)
+                })?);
             }
             Self::Int16(b) => {
                 b.append_value(s.parse::<i16>().map_err(|e| super::Error::PgOutputDecode {
                     message: format!("int16 parse '{s}': {e}"),
-                })?)
+                })?);
             }
             Self::Int32(b) => {
                 b.append_value(s.parse::<i32>().map_err(|e| super::Error::PgOutputDecode {
                     message: format!("int32 parse '{s}': {e}"),
-                })?)
+                })?);
             }
             Self::Int64(b) => {
                 b.append_value(s.parse::<i64>().map_err(|e| super::Error::PgOutputDecode {
                     message: format!("int64 parse '{s}': {e}"),
-                })?)
+                })?);
             }
             Self::UInt32(b) => {
                 b.append_value(s.parse::<u32>().map_err(|e| super::Error::PgOutputDecode {
                     message: format!("uint32 parse '{s}': {e}"),
-                })?)
+                })?);
             }
             Self::Float32(b) => {
                 b.append_value(s.parse::<f32>().map_err(|e| super::Error::PgOutputDecode {
                     message: format!("float32 parse '{s}': {e}"),
-                })?)
+                })?);
             }
             Self::Float64(b) => {
                 b.append_value(s.parse::<f64>().map_err(|e| super::Error::PgOutputDecode {
                     message: format!("float64 parse '{s}': {e}"),
-                })?)
+                })?);
             }
             Self::Date32(b) => {
                 let days = parse_pg_date_days_since_epoch(s)?;
@@ -562,14 +561,14 @@ impl FieldBuilder {
             Self::TimestampMicros(b, tz) => {
                 let arr = b.finish();
                 Arc::new(match tz {
-                    Some(tz) => arr.with_timezone(tz.clone()),
+                    Some(tz) => arr.with_timezone(Arc::clone(tz)),
                     None => arr,
                 })
             }
             Self::TimestampNanos(b, tz) => {
                 let arr = b.finish();
                 Arc::new(match tz {
-                    Some(tz) => arr.with_timezone(tz.clone()),
+                    Some(tz) => arr.with_timezone(Arc::clone(tz)),
                     None => arr,
                 })
             }
@@ -584,9 +583,8 @@ fn parse_pg_date_days_since_epoch(s: &str) -> Result<i32> {
             message: format!("date parse '{s}': {e}"),
         }
     })?;
-    let epoch = match chrono::NaiveDate::from_ymd_opt(1970, 1, 1) {
-        Some(epoch) => epoch,
-        None => unreachable!("1970-01-01 is a valid NaiveDate"),
+    let Some(epoch) = chrono::NaiveDate::from_ymd_opt(1970, 1, 1) else {
+        unreachable!("1970-01-01 is a valid NaiveDate")
     };
     let days = (parsed - epoch).num_days();
     i32::try_from(days).map_err(|e| super::Error::PgOutputDecode {
@@ -1028,8 +1026,8 @@ mod tests {
 
     /// NOT NULL name column is the scenario where the original bug bites:
     /// DELETE with REPLICA IDENTITY DEFAULT sends name=null, and
-    /// StructArray::new would reject that unless we intentionally relax the
-    /// field's nullability when assembling the ChangeBatch.
+    /// `StructArray::new` would reject that unless we intentionally relax the
+    /// field's nullability when assembling the `ChangeBatch`.
     fn non_nullable_users_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -1355,9 +1353,8 @@ mod tests {
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
             true,
         );
-        let err = match FieldBuilder::new(field.data_type()) {
-            Ok(_) => panic!("expected List rejection"),
-            Err(e) => e,
+        let Err(err) = FieldBuilder::new(field.data_type()) else {
+            panic!("expected List rejection");
         };
         let msg = err.to_string();
         assert!(
@@ -1368,11 +1365,10 @@ mod tests {
 
     #[test]
     fn fieldbuilder_rejects_interval() {
-        let err = match FieldBuilder::new(&DataType::Interval(
+        let Err(err) = FieldBuilder::new(&DataType::Interval(
             arrow::datatypes::IntervalUnit::MonthDayNano,
-        )) {
-            Ok(_) => panic!("expected Interval rejection"),
-            Err(e) => e,
+        )) else {
+            panic!("expected Interval rejection");
         };
         assert!(err.to_string().contains("INTERVAL"));
     }
@@ -1400,15 +1396,27 @@ mod tests {
     #[test]
     fn numeric_parser_handles_standard_cases() {
         // Scale 2, value 123.45 → 12345
-        assert_eq!(parse_pg_numeric_public("123.45", 2).unwrap(), 12_345i128);
+        assert_eq!(
+            parse_pg_numeric_public("123.45", 2).expect("parse 123.45"),
+            12_345i128
+        );
         // Negative
-        assert_eq!(parse_pg_numeric_public("-7.25", 2).unwrap(), -725i128);
+        assert_eq!(
+            parse_pg_numeric_public("-7.25", 2).expect("parse -7.25"),
+            -725i128
+        );
         // Integer (no decimal point) with scale 2 → padded
-        assert_eq!(parse_pg_numeric_public("7", 2).unwrap(), 700i128);
+        assert_eq!(parse_pg_numeric_public("7", 2).expect("parse 7"), 700i128);
         // Explicit "+" sign
-        assert_eq!(parse_pg_numeric_public("+1.5", 2).unwrap(), 150i128);
+        assert_eq!(
+            parse_pg_numeric_public("+1.5", 2).expect("parse +1.5"),
+            150i128
+        );
         // Zero
-        assert_eq!(parse_pg_numeric_public("0.00", 2).unwrap(), 0i128);
+        assert_eq!(
+            parse_pg_numeric_public("0.00", 2).expect("parse 0.00"),
+            0i128
+        );
     }
 
     #[test]
@@ -1429,13 +1437,13 @@ mod tests {
     #[test]
     fn hex_decoder_round_trips() {
         assert_eq!(
-            decode_hex("deadbeef").unwrap(),
+            decode_hex("deadbeef").expect("decode deadbeef"),
             vec![0xde, 0xad, 0xbe, 0xef]
         );
-        assert_eq!(decode_hex("").unwrap(), Vec::<u8>::new());
+        assert_eq!(decode_hex("").expect("decode empty"), Vec::<u8>::new());
         // Odd length → error.
-        assert!(decode_hex("abc").is_err());
+        decode_hex("abc").expect_err("odd length should fail");
         // Invalid digit → error.
-        assert!(decode_hex("zz").is_err());
+        decode_hex("zz").expect_err("invalid digit should fail");
     }
 }
