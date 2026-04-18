@@ -927,7 +927,7 @@ impl GitClient {
                 // and for the `max_file_bytes` check.
                 let lfs_on_disk_size = if let Some(root) = lfs_content_root.as_ref() {
                     match std::fs::metadata(root.join(&full_path)) {
-                        Ok(meta) => Some(meta.len() as usize),
+                        Ok(meta) => Some(usize::try_from(meta.len()).unwrap_or(usize::MAX)),
                         Err(err) => {
                             tracing::warn!(
                                 "Failed to stat LFS-materialized file {}: {err}. Falling back to blob size.",
