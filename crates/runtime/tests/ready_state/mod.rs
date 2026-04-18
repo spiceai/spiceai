@@ -612,6 +612,73 @@ async fn run_ready_state_test(
             () = cloned_rt.load_components() => {}
         }
 
+        // Assert dataset readiness state right after registration / load_components returns.
+        // This is the core behavior being tested: the reported readiness should reflect the
+        // configured `ReadyState` before the initial acceleration refresh completes.
+        let dataset_status_key = format!("dataset:{dataset_name}");
+        match ready_state {
+            ReadyState::OnRegistration => {
+                // `on_registration` marks the dataset ready immediately, regardless of the
+                // federated source. Poll briefly to account for scheduling races.
+                let ready_within = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    async {
+                        loop {
+                            if matches!(
+                                rt.status().get_component_status(&dataset_status_key),
+                                Some(runtime::status::ComponentStatus::Ready)
+                            ) {
+                                return;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
+                    },
+                )
+                .await;
+                assert!(
+                    ready_within.is_ok(),
+                    "Dataset {dataset_name} with ready_state=on_registration should be Ready before initial load completes, but status was {:?}",
+                    rt.status().get_component_status(&dataset_status_key)
+                );
+            }
+            ReadyState::OnSchemaResolved => {
+                // `on_schema_resolved` marks the dataset ready once the federated source's
+                // schema is resolved (access verified). For the slow-loading test sources used
+                // here, the federated provider is `Immediate` (schema is available
+                // synchronously before the builder runs), so readiness should transition to
+                // Ready before the initial refresh completes.
+                let ready_within = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    async {
+                        loop {
+                            if matches!(
+                                rt.status().get_component_status(&dataset_status_key),
+                                Some(runtime::status::ComponentStatus::Ready)
+                            ) {
+                                return;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
+                    },
+                )
+                .await;
+                assert!(
+                    ready_within.is_ok(),
+                    "Dataset {dataset_name} with ready_state=on_schema_resolved should be Ready after schema resolution and before initial load completes, but status was {:?}",
+                    rt.status().get_component_status(&dataset_status_key)
+                );
+            }
+            ReadyState::OnLoad => {
+                // `on_load` must NOT report the dataset as Ready before the initial refresh
+                // completes. The slow-loading source is wired to take ~5s.
+                let status = rt.status().get_component_status(&dataset_status_key);
+                assert!(
+                    !matches!(status, Some(runtime::status::ComponentStatus::Ready)),
+                    "Dataset {dataset_name} with ready_state=on_load should not be Ready before initial load completes, but status was {status:?}"
+                );
+            }
+        }
+
         tracing::info!("Running initial query");
         // Run a query before data is loaded
         let query_sql = format!("SELECT * FROM {dataset_name}");
@@ -684,6 +751,17 @@ async fn run_ready_state_test(
         // Wait for acceleration to load
         tracing::info!("Waiting for acceleration to load");
         tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+        // After the initial refresh has completed, the dataset should be Ready for every
+        // configured `ReadyState` variant (including `on_load`).
+        assert!(
+            matches!(
+                rt.status().get_component_status(&dataset_status_key),
+                Some(runtime::status::ComponentStatus::Ready)
+            ),
+            "Dataset {dataset_name} should be Ready after initial load completes, but status was {:?}",
+            rt.status().get_component_status(&dataset_status_key)
+        );
 
         // Query again, now we should get results
         tracing::info!("Running query after loading");

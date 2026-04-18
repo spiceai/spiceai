@@ -1677,6 +1677,14 @@ impl DataFusion {
         // with a fake schema. Once the deferred connector is triggered, the source will be
         // re-initialized with a real provider.
         let effective_ready_state = if source.as_any().is::<DeferredConnector>() {
+            if dataset.ready_state != ReadyState::OnLoad {
+                tracing::warn!(
+                    "Dataset {dataset_name}: configured ready_state '{configured}' is overridden to '{forced}' because the source connector is deferred (e.g. awaiting interactive auth); the dataset will be marked ready only after the initial load completes.",
+                    dataset_name = dataset.name,
+                    configured = dataset.ready_state,
+                    forced = ReadyState::OnLoad,
+                );
+            }
             ReadyState::OnLoad
         } else {
             dataset.ready_state
