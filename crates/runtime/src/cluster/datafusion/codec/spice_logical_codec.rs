@@ -383,7 +383,9 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
                 column: provider_args.column.clone(),
                 limit: provider_args.limit.map(|l| l as u64),
                 include_score: provider_args.include_score,
-                distance_metric: provider_args.distance_metric.map(|m| m.as_str().to_string()),
+                distance_metric: provider_args
+                    .distance_metric
+                    .map(|m| m.as_str().to_string()),
             });
             buf.extend_from_slice(&args.encode_to_vec());
             return Ok(());
