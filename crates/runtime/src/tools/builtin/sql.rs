@@ -38,7 +38,7 @@ pub struct SqlToolParams {
 
 /// Default description advertised to LLMs / tool selection when the `sql` tool
 /// is in its read-only posture (the default).
-const DEFAULT_READ_ONLY_DESCRIPTION: &str = "Run a read-only SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: \"catalog\".\"schema\".\"table\". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix. DDL and write statements (INSERT/UPDATE/DELETE/COPY/CREATE/DROP) are rejected.";
+const DEFAULT_READ_ONLY_DESCRIPTION: &str = "Run a read-only SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: \"catalog\".\"schema\".\"table\". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix. DDL and write statements (INSERT/UPDATE/DELETE/COPY/CREATE/DROP) are rejected, as are session-mutating statements (PREPARE/EXECUTE/DEALLOCATE).";
 
 /// Default description advertised to LLMs / tool selection when the operator
 /// has opted the tool into writable mode via [`SqlTool::allow_writes`].

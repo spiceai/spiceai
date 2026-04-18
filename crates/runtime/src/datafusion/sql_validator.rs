@@ -223,6 +223,14 @@ fn validate_ddl_operation(
 /// three are disallowed on surfaces that must guarantee read-only execution — notably
 /// the built-in `sql` tool and the LLM-generated SQL path in `/v1/nsql`.
 ///
+/// Spice's planner can also represent DDL/DML as [`LogicalPlan::Extension`] nodes
+/// (for example, `DdlExtensionNode` from `datafusion-ddl`, `DmlExtensionNode` from
+/// `datafusion-dml`, and the `DistributedCayenne{Insert,Update,Delete,Merge}` /
+/// `CayenneMerge` distributed DML nodes). Those nodes are matched here by their
+/// stable [`UserDefinedLogicalNodeCore::name`] so that write-capable plans produced
+/// by Spice's custom planner cannot bypass the read-only guarantee. Any new
+/// write-capable extension node type MUST be added to [`WRITE_CAPABLE_EXTENSION_NAMES`].
+///
 /// # Returns
 /// * `Ok(())` if the plan contains only read operations.
 /// * `Err(DataFusionError)` if the plan contains any write, schema-mutating, or
@@ -244,10 +252,43 @@ pub fn validate_sql_query_read_only(plan: &LogicalPlan) -> Result<(), DataFusion
             "Statement '{}' is not allowed in read-only SQL context.",
             stmt.name()
         ),
+        LogicalPlan::Extension(ext) => {
+            let name = ext.node.name();
+            if WRITE_CAPABLE_EXTENSION_NAMES.contains(&name) {
+                plan_err!(
+                    "Write-capable extension plan '{name}' is not allowed in read-only SQL context."
+                )
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        }
         _ => Ok(TreeNodeRecursion::Continue),
     })?;
     Ok(())
 }
+
+/// Stable [`UserDefinedLogicalNodeCore::name`] values for every Spice logical-plan
+/// extension node that performs (or dispatches) a write, a schema mutation, or any
+/// other side-effect that must not be reachable via the read-only SQL path.
+///
+/// Keep this list in sync with:
+/// - `datafusion_ddl::DdlExtensionNode` → `"DdlExtension"`
+/// - `datafusion_dml::DmlExtensionNode` → `"DmlExtension"`
+/// - `cayenne::ddl::logical_nodes::CayenneMergeNode` → `"CayenneMerge"`
+/// - `crate::datafusion::cayenne_ddl::logical_nodes::DistributedCayenne{Insert,Update,Delete}Node`
+///   → `"CayenneInsert"` / `"CayenneUpdate"` / `"CayenneDelete"` (they reuse the non-
+///   distributed names by design)
+/// - `crate::datafusion::cayenne_ddl::logical_nodes::DistributedCayenneMergeNode`
+///   → `"DistributedCayenneMerge"`
+const WRITE_CAPABLE_EXTENSION_NAMES: &[&str] = &[
+    "DdlExtension",
+    "DmlExtension",
+    "CayenneInsert",
+    "CayenneUpdate",
+    "CayenneDelete",
+    "CayenneMerge",
+    "DistributedCayenneMerge",
+];
 
 #[cfg(test)]
 mod tests {
@@ -1015,5 +1056,119 @@ mod tests {
 
         validate_sql_query_read_only(&plan)
             .expect_err("DEALLOCATE must be rejected in read-only context");
+    }
+
+    /// Spice's custom planner represents DDL/DML as [`LogicalPlan::Extension`]
+    /// nodes (e.g. `DdlExtensionNode`, `DmlExtensionNode`, `DistributedCayenne*Node`).
+    /// The strict read-only validator must reject those by
+    /// [`UserDefinedLogicalNodeCore::name`] so a write-capable plan cannot
+    /// bypass the check by being wrapped in an extension node.
+    ///
+    /// Constructing a real `DmlExtensionNode` requires a full catalog-handler
+    /// wiring, so this test uses a minimal stub extension node whose `.name()`
+    /// matches one of the names in [`WRITE_CAPABLE_EXTENSION_NAMES`] to
+    /// exercise the name-based deny directly.
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_write_capable_extension_node() {
+        use datafusion::{
+            common::{DFSchema, DFSchemaRef},
+            logical_expr::{Expr, Extension, LogicalPlan, UserDefinedLogicalNodeCore},
+        };
+        use std::cmp::Ordering;
+        use std::fmt;
+
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        struct StubWriteExtension {
+            schema: DFSchemaRef,
+            name: &'static str,
+        }
+
+        impl PartialOrd for StubWriteExtension {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                self.name.partial_cmp(other.name)
+            }
+        }
+
+        impl UserDefinedLogicalNodeCore for StubWriteExtension {
+            fn name(&self) -> &'static str {
+                self.name
+            }
+            fn inputs(&self) -> Vec<&LogicalPlan> {
+                vec![]
+            }
+            fn schema(&self) -> &DFSchemaRef {
+                &self.schema
+            }
+            fn expressions(&self) -> Vec<Expr> {
+                vec![]
+            }
+            fn fmt_for_explain(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "StubWriteExtension({})", self.name)
+            }
+            fn with_exprs_and_inputs(
+                &self,
+                _exprs: Vec<Expr>,
+                _inputs: Vec<LogicalPlan>,
+            ) -> Result<Self, DataFusionError> {
+                Ok(self.clone())
+            }
+        }
+
+        let schema: DFSchemaRef = Arc::new(DFSchema::empty());
+
+        for banned_name in super::WRITE_CAPABLE_EXTENSION_NAMES {
+            let plan = LogicalPlan::Extension(Extension {
+                node: Arc::new(StubWriteExtension {
+                    schema: Arc::clone(&schema),
+                    name: banned_name,
+                }),
+            });
+            let err = validate_sql_query_read_only(&plan)
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("extension '{banned_name}' must be rejected in read-only context")
+                });
+            let err_msg = err.to_string();
+            assert!(
+                err_msg.contains(banned_name) && err_msg.contains("read-only"),
+                "error should cite '{banned_name}' and read-only, got: {err}"
+            );
+        }
+
+        // A benign (non-write) extension name must still be allowed so
+        // read-only optimizer extensions such as `IndexTableScanNode` and
+        // `DuckDBAggregatePushdownNode` are not blocked.
+        let plan = LogicalPlan::Extension(Extension {
+            node: Arc::new(StubWriteExtension {
+                schema,
+                name: "IndexTableScanNode",
+            }),
+        });
+        validate_sql_query_read_only(&plan)
+            .expect("non-write extension must be allowed in read-only context");
+    }
+
+    /// Integration check: DDL/DML produced through Spice's planner wrapper
+    /// ([`DataFusion::create_logical_plan`]) — rather than `DataFusion`'s raw
+    /// planner — must still be rejected. This covers the statement-level
+    /// rewrites (`plan_distributed_dml`, `plan_create_table`, etc.) that can
+    /// emit `LogicalPlan::Extension` instead of `LogicalPlan::{Ddl,Dml}`.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_read_only_validator_rejects_dml_via_spice_planner() {
+        let df = create_test_datafusion();
+        let session = df.ctx.state();
+
+        // INSERT is dispatched through Spice's `plan_distributed_dml`. Without a
+        // distributed cluster it returns a standard `LogicalPlan::Dml`, still
+        // covered by the read-only arm — but this exercises the Spice wrapper
+        // rather than `SessionState::create_logical_plan` directly.
+        let plan = df
+            .create_logical_plan(&session, "INSERT INTO tbl_writable VALUES (1, 'foo', 42.0)")
+            .await
+            .expect("plan should be created via Spice planner");
+
+        validate_sql_query_read_only(&plan)
+            .expect_err("INSERT via Spice planner must be rejected in read-only context");
     }
 }
