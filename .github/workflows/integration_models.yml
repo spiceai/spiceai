@@ -135,8 +135,8 @@ jobs:
           name: ai-integration-test-archive
           path: ./integration.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; skip artifact zip compression.
-          compression-level: 0
+          # Archive is already zstd-compressed; use minimal artifact zip compression.
+          compression-level: 1
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
@@ -448,8 +448,8 @@ jobs:
           name: ai-integration-test-archive-extended
           path: ./integration-extended.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; skip artifact zip compression.
-          compression-level: 0
+          # Archive is already zstd-compressed; use minimal artifact zip compression.
+          compression-level: 1
 
       - name: Kill spiceio
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
