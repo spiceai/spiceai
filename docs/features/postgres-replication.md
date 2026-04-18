@@ -18,7 +18,7 @@ This is the recommended way to keep a Spice accelerator (DuckDB, SQLite, Postgre
 
 On first start the connector:
 
-1. Creates a **publication** (default name `spice_<dataset>_pub`) containing the source table.
+1. Creates a **publication** (default name `spice_<dataset>_<hash>_pub`) containing the source table. The short hash disambiguates long dataset names that would otherwise truncate to the same identifier.
 2. Creates a **replication slot** (default name `spice_<dataset>_<instance-hash>`).
 3. Runs a **REPEATABLE READ snapshot** of the source table so the accelerator starts with all existing rows (`op = "c"`).
 4. Starts streaming WAL changes from the slot. Each committed transaction is delivered as a `ChangeBatch` (grouped `INSERT`/`UPDATE`/`DELETE`) and applied to the accelerator.
@@ -104,7 +104,7 @@ datasets:
 
 Start the runtime. Spice will:
 
-- Auto-create publication `spice_users_pub`.
+- Auto-create publication `spice_users_<hash>_pub`.
 - Auto-create replication slot `spice_users_<instance-hash>`.
 - Snapshot `public.users` into the DuckDB accelerator.
 - Stream every subsequent change as it commits on Postgres.
@@ -116,7 +116,7 @@ All replication-specific parameters live under `params:` on the dataset and star
 | Parameter                              | Default                             | Description |
 |----------------------------------------|-------------------------------------|-------------|
 | `pg_replication_slot`                  | `spice_<dataset>_<instance-hash>`   | Name of the replication slot. Must be unique per replica. |
-| `pg_publication`                       | `spice_<dataset>_pub`               | Publication name. Shared across replicas. Auto-created if missing. |
+| `pg_publication`                       | `spice_<dataset>_<dataset-hash>_pub` | Publication name. Shared across replicas. Auto-created if missing. The short hash disambiguates datasets whose names share a long truncated prefix. |
 | `pg_replication_initial_snapshot`      | `true`                              | If `true`, take an initial snapshot of the table's existing rows before streaming. Set to `false` if you are pre-seeding the accelerator yourself. |
 | `pg_replication_temporary_slot`        | `false`                             | If `true`, the slot is dropped when Spice disconnects. Every restart re-bootstraps. |
 | `pg_replication_status_interval`       | `10s`                               | How often `StandbyStatusUpdate` (LSN acknowledgement) is sent back to Postgres. Lower values free WAL faster; higher values reduce network chatter. Accepts any [fundu](https://docs.rs/fundu) duration string (`500ms`, `30s`, `2m`). |

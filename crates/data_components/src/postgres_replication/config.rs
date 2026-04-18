@@ -120,46 +120,58 @@ impl SslMode {
 ///   - up to `SLOT_DATASET_PORTION_MAX` / `PUB_DATASET_PORTION_MAX` of
 ///     sanitized dataset name
 ///   - 1 byte `_`
-///   - fixed 8-byte hash (slot) OR 3 bytes `pub` (publication)
+///   - 6 bytes dataset-hash (slot only, to survive truncation collisions)
+///   - 1 byte `_`
+///   - fixed 8-byte instance hash (slot) OR 3 bytes `pub` (publication)
 ///
 /// which keeps the final identifier under the limit.
 const PG_IDENTIFIER_MAX_BYTES: usize = 63;
 const SLOT_PREFIX: &str = "spice_";
 const SLOT_HASH_LEN: usize = 8;
-/// Max sanitized-dataset bytes for a slot name: 63 − (6 + 1 + 8) = 48.
+const DATASET_HASH_LEN: usize = 6;
+/// Max sanitized-dataset bytes for a slot name: 63 − (6 + 1 + 6 + 1 + 8) = 41.
 const SLOT_DATASET_PORTION_MAX: usize =
-    PG_IDENTIFIER_MAX_BYTES - SLOT_PREFIX.len() - 1 - SLOT_HASH_LEN;
-/// Max sanitized-dataset bytes for a publication name: 63 − (6 + 1 + 3) = 53.
-const PUB_DATASET_PORTION_MAX: usize = PG_IDENTIFIER_MAX_BYTES - SLOT_PREFIX.len() - 1 - 3;
+    PG_IDENTIFIER_MAX_BYTES - SLOT_PREFIX.len() - 1 - DATASET_HASH_LEN - 1 - SLOT_HASH_LEN;
+/// Max sanitized-dataset bytes for a publication name: 63 − (6 + 1 + 6 + 1 + 3) = 46.
+const PUB_DATASET_PORTION_MAX: usize =
+    PG_IDENTIFIER_MAX_BYTES - SLOT_PREFIX.len() - 1 - DATASET_HASH_LEN - 1 - 3;
 
-/// Build a default slot name: `spice_{sanitized_dataset}_{instance_suffix}`.
+/// Build a default slot name:
+/// `spice_{sanitized_dataset}_{dataset_suffix}_{instance_suffix}`.
 ///
-/// `instance_suffix` is an 8-char blake3-ish hash (actually `twox-hash` xxh3 for
-/// zero-dep reuse) of `SPICE_INSTANCE_ID` falling back to the machine hostname,
-/// so each replica gets a distinct, deterministic slot across restarts.
+/// `dataset_suffix` is a short hash of the *full* dataset name so that two
+/// long dataset names that happen to share the same truncated sanitized prefix
+/// still produce distinct default slot names.
+///
+/// `instance_suffix` is an 8-char blake3-ish hash (actually `twox-hash` xxh3
+/// for zero-dep reuse) of `SPICE_INSTANCE_ID` falling back to the machine
+/// hostname, so each replica gets a distinct, deterministic slot across
+/// restarts.
 ///
 /// The sanitized dataset portion is truncated to keep the final identifier
-/// within Postgres' 63-byte limit. Truncation is collision-resistant in
-/// practice because the 8-char instance hash tail disambiguates replicas, but
-/// if you need exact names across replicas, set `pg_replication_slot` explicitly.
+/// within Postgres' 63-byte limit.
 #[must_use]
 pub fn default_slot_name(dataset_name: &str) -> String {
     let instance = std::env::var("SPICE_INSTANCE_ID")
         .ok()
         .or_else(|| hostname::get().ok().and_then(|h| h.into_string().ok()))
         .unwrap_or_else(|| "unknown".to_string());
-    let hash = xxh3_short_hash(&instance);
+    let instance_hash = xxh3_short_hash(&instance);
+    let dataset_hash = xxh3_short_hash_prefix(dataset_name, DATASET_HASH_LEN);
     let dataset = truncate_to_bytes(&sanitize(dataset_name), SLOT_DATASET_PORTION_MAX);
-    format!("{SLOT_PREFIX}{dataset}_{hash}")
+    format!("{SLOT_PREFIX}{dataset}_{dataset_hash}_{instance_hash}")
 }
 
-/// Default publication is shared across replicas: `spice_{dataset}_pub`.
+/// Default publication is shared across replicas:
+/// `spice_{sanitized_dataset}_{dataset_suffix}_pub`.
 ///
-/// Same truncation rules as [`default_slot_name`].
+/// The `dataset_suffix` disambiguates truncated dataset names for the same
+/// reason as [`default_slot_name`].
 #[must_use]
 pub fn default_publication_name(dataset_name: &str) -> String {
+    let dataset_hash = xxh3_short_hash_prefix(dataset_name, DATASET_HASH_LEN);
     let dataset = truncate_to_bytes(&sanitize(dataset_name), PUB_DATASET_PORTION_MAX);
-    format!("{SLOT_PREFIX}{dataset}_pub")
+    format!("{SLOT_PREFIX}{dataset}_{dataset_hash}_pub")
 }
 
 /// Truncate an ASCII identifier to at most `max_bytes` bytes. Our `sanitize`
@@ -202,6 +214,10 @@ fn xxh3_short_hash(s: &str) -> String {
     {
         format!("{:08x}", v as u32)
     }
+}
+
+fn xxh3_short_hash_prefix(s: &str, len: usize) -> String {
+    xxh3_short_hash(s).chars().take(len).collect()
 }
 
 // Environment-based hostname discovery only. We intentionally avoid reading
@@ -440,11 +456,13 @@ mod tests {
 
     #[test]
     fn publication_default() {
-        assert_eq!(default_publication_name("users"), "spice_users_pub");
-        assert_eq!(
-            default_publication_name("public.orders"),
-            "spice_public_orders_pub"
-        );
+        // Format: spice_{dataset}_{6-char hash}_pub
+        let users = default_publication_name("users");
+        assert!(users.starts_with("spice_users_"), "got {users}");
+        assert!(users.ends_with("_pub"), "got {users}");
+        let orders = default_publication_name("public.orders");
+        assert!(orders.starts_with("spice_public_orders_"), "got {orders}");
+        assert!(orders.ends_with("_pub"), "got {orders}");
     }
 
     #[test]
@@ -473,5 +491,17 @@ mod tests {
         );
         assert!(pubname.starts_with(SLOT_PREFIX));
         assert!(pubname.ends_with("_pub"));
+    }
+
+    #[test]
+    fn truncated_prefix_collisions_are_disambiguated() {
+        // Two dataset names that share the first 60 characters must still
+        // produce distinct default slot and publication names — the dataset
+        // hash suffix guards against truncation collisions.
+        let shared_prefix = "a".repeat(60);
+        let a = format!("{shared_prefix}_alpha");
+        let b = format!("{shared_prefix}_beta");
+        assert_ne!(default_slot_name(&a), default_slot_name(&b));
+        assert_ne!(default_publication_name(&a), default_publication_name(&b));
     }
 }
