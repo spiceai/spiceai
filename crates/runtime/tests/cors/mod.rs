@@ -25,7 +25,7 @@ use crate::{
     utils::{test_request_context, wait_until_true},
 };
 use app::AppBuilder;
-use rand::Rng;
+use rand::RngExt;
 use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use spicepod::component::runtime::CorsConfig;
 
