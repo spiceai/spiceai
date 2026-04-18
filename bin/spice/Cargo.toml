@@ -77,7 +77,7 @@ rustyline = "17"
 dialoguer = "0.12"
 
 # Random number generation (for auth codes)
-rand = "0.9"
+rand = "0.10"
 
 # Open URLs in browser
 open = "5"

@@ -1,16 +1,14 @@
 ---
 source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
-expression: plan
+expression: __plan
 ---
-+---------------+-------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                  |
-+---------------+-------------------------------------------------------------------------------------------------------+
-| logical_plan  | Filter: tcat.myschema.users.id = Int64(3)                                                             |
-|               |   TableScan: tcat.myschema.users projection=[id], partial_filters=[tcat.myschema.users.id = Int64(3)] |
-| physical_plan | FilterExec: id@0 = 3                                                                                  |
-|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1                                |
-|               |     CooperativeExec                                                                                   |
-|               |       BytesProcessedExec                                                                              |
-|               |         FlightSqlExec sql=SELECT id FROM tcat.myschema.users WHERE (("id" = 3))                       |
-|               |                                                                                                       |
-+---------------+-------------------------------------------------------------------------------------------------------+
++---------------+----------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                               |
++---------------+----------------------------------------------------------------------------------------------------+
+| logical_plan  | SubqueryAlias: tcat.myschema.users                                                                 |
+|               |   TableScan: tcat.myschema.users projection=[id], full_filters=[tcat.myschema.users.id = Int64(3)] |
+| physical_plan | CooperativeExec                                                                                    |
+|               |   BytesProcessedExec                                                                               |
+|               |     FlightSqlExec sql=SELECT id FROM tcat.myschema.users WHERE (("id" = 3))                        |
+|               |                                                                                                    |
++---------------+----------------------------------------------------------------------------------------------------+

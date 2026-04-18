@@ -25,11 +25,13 @@ limitations under the License.
 //!    the AST, stored in the [`DdlExtensionStore`], and stripped before
 //!    delegating to `DataFusion`.
 //!
-//! 2. **DML interception** — DELETE and UPDATE statements targeting Cayenne
-//!    catalog tables, plus INSERT statements targeting distributed
-//!    write-through tables, are converted into [`LogicalPlan::Extension`]
-//!    nodes directly for distributed mode. Support for additional DML types
-//!    (MERGE) may be added in the future.
+//! 2. **DML interception (optional overlay)** — only statements that need
+//!    non-default behavior are rewritten to extension nodes:
+//!    - DELETE/UPDATE targeting Cayenne tables in scheduler mode,
+//!    - INSERT targeting distributed write-through tables,
+//!    - MERGE targeting Cayenne tables.
+//!
+//!    All other DML uses standard `DataFusion` planning/execution unchanged.
 //!
 //! For everything else, the planner delegates to `DataFusion`'s standard
 //! `session.statement_to_plan()` path.
@@ -58,9 +60,8 @@ use datafusion_federation::FederatedTableProviderAdaptor;
 
 use crate::accelerated_table::AcceleratedTable;
 use crate::config::ClusterRole;
-use crate::datafusion::ddl::acceleration_options::SharedDdlExtensionStore;
-
-use super::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use datafusion_ddl::{SharedDdlExtensionStore, has_ddl_extensions};
 
 /// The type of catalog backing the planner's DML interception.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +92,11 @@ pub struct PlannerContext {
     /// Used by `CREATE TABLE ... LIKE` to resolve auto-generated partition
     /// labels (e.g. `expr0`) back to the original SQL expression.
     pub executor_registry: Option<Arc<crate::cluster::executor_registry::ExecutorRegistry>>,
+
+    /// DDL handler for `CREATE TABLE ... LIKE`.
+    /// Used to produce a [`datafusion_ddl::DdlExtensionNode`] for the LIKE path,
+    /// bypassing the standard analyzer rule.
+    pub ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
 }
 
 /// Create a [`LogicalPlan`] from SQL, intercepting DDL extensions and
@@ -116,11 +122,7 @@ pub async fn create_logical_plan(
                 let has_columns = !ct.columns.is_empty();
                 let has_partition_by = ct.partition_by.is_some();
                 let has_with = !matches!(ct.table_options, CreateTableOptions::None);
-                if has_columns
-                    || has_partition_by
-                    || has_with
-                    || create_table::has_ddl_extensions(ct)
-                {
+                if has_columns || has_partition_by || has_with || has_ddl_extensions(ct) {
                     return Err(DataFusionError::Plan(
                         "CREATE TABLE ... (LIKE ...) cannot be combined with PARTITION BY, WITH \
                          options, or additional column definitions. The new table inherits all \
@@ -135,7 +137,7 @@ pub async fn create_logical_plan(
             // DDL: CREATE TABLE with extensions (WITH options, PARTITION BY).
             // Intercepted regardless of catalog mode — extensions apply to
             // all catalog types (Cayenne, Iceberg, etc.).
-            SQLStatement::CreateTable(ct) if create_table::has_ddl_extensions(ct) => {
+            SQLStatement::CreateTable(ct) if has_ddl_extensions(ct) => {
                 return create_table::plan_create_table(
                     statement,
                     session,
@@ -178,14 +180,13 @@ pub async fn create_logical_plan(
     session.statement_to_plan(statement).await
 }
 
-/// Plan a DML statement, producing either a local or distributed extension
-/// node.
+/// Plan a DML statement with an optional distributed overlay.
 ///
 /// For local mode, returns the standard `DataFusion` plan unchanged.
 ///
-/// For distributed (scheduler) mode, wraps the plan into a distributed
-/// extension node that forwards the operation to executors when the target
-/// table supports scheduler-side routing.
+/// For distributed (scheduler) mode, rewrites only supported targets into
+/// extension nodes that forward work to executors. Non-targets keep the
+/// original `DataFusion` DML plan.
 async fn plan_distributed_dml(
     statement: Statement,
     session: &SessionState,
@@ -225,7 +226,7 @@ async fn plan_distributed_dml(
     match expected_op {
         WriteOp::Delete => delete::plan_distributed_delete(dml),
         WriteOp::Update => update::plan_distributed_update(dml),
-        WriteOp::Insert(_) => Ok(insert::plan_distributed_insert(dml)),
+        WriteOp::Insert(_) => insert::plan_distributed_insert(dml),
         WriteOp::Ctas => Err(DataFusionError::Internal(
             "CTAS should not reach DML planner".to_string(),
         )),

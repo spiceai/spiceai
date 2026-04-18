@@ -24,9 +24,9 @@ use cache::{
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion::sql::TableReference;
-use rand::distributions::Alphanumeric;
+use rand::distr::Alphanumeric;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use spicepod::component::caching::{CacheEngine, CachingPolicy, HashingAlgorithm};
 use std::collections::HashSet;
 use std::hash::Hasher;
@@ -144,7 +144,7 @@ fn bench_simple_cache_concurrent_get(c: &mut Criterion) {
                                     let mut rng = StdRng::seed_from_u64(thread_id as u64);
                                     handle.block_on(async {
                                         for _ in 0..OPERATIONS_PER_THREAD {
-                                            let key = rng.gen_range(0..KEY_SPACE);
+                                            let key = rng.random_range(0..KEY_SPACE);
                                             black_box(cache.get_raw_key(&key).await);
                                         }
                                     });
@@ -202,7 +202,7 @@ fn bench_simple_cache_concurrent_put(c: &mut Criterion) {
                                     let mut rng = StdRng::seed_from_u64(thread_id as u64);
                                     handle.block_on(async {
                                         for _ in 0..OPERATIONS_PER_THREAD {
-                                            let key = rng.gen_range(0..KEY_SPACE);
+                                            let key = rng.random_range(0..KEY_SPACE);
                                             let value = random_value(&mut rng);
                                             black_box(cache.put_raw_key(&key, value).await);
                                         }
@@ -268,8 +268,8 @@ fn bench_simple_cache_concurrent_mixed(c: &mut Criterion) {
                                     let mut rng = StdRng::seed_from_u64(thread_id as u64);
                                     handle.block_on(async {
                                         for _ in 0..OPERATIONS_PER_THREAD {
-                                            let key = rng.gen_range(0..KEY_SPACE);
-                                            if rng.gen_bool(0.8) {
+                                            let key = rng.random_range(0..KEY_SPACE);
+                                            if rng.random_bool(0.8) {
                                                 black_box(cache.get_raw_key(&key).await);
                                             } else {
                                                 let value = random_value(&mut rng);
@@ -348,7 +348,7 @@ fn bench_lru_cache_concurrent_get(c: &mut Criterion) {
                                             let mut rng = StdRng::seed_from_u64(thread_id as u64);
                                             handle.block_on(async {
                                                 for _ in 0..OPERATIONS_PER_THREAD {
-                                                    let key = rng.gen_range(0..KEY_SPACE);
+                                                    let key = rng.random_range(0..KEY_SPACE);
                                                     black_box(cache.get_raw_key(&key).await);
                                                 }
                                             });
@@ -414,7 +414,7 @@ fn bench_lru_cache_concurrent_put(c: &mut Criterion) {
                                             let mut rng = StdRng::seed_from_u64(thread_id as u64);
                                             handle.block_on(async {
                                                 for _ in 0..OPERATIONS_PER_THREAD {
-                                                    let key = rng.gen_range(0..KEY_SPACE);
+                                                    let key = rng.random_range(0..KEY_SPACE);
                                                     let value = BenchValue(random_value(&mut rng));
                                                     black_box(cache.put_raw_key(&key, value).await);
                                                 }
@@ -492,8 +492,8 @@ fn bench_lru_cache_concurrent_mixed(c: &mut Criterion) {
                                             let mut rng = StdRng::seed_from_u64(thread_id as u64);
                                             handle.block_on(async {
                                                 for _ in 0..OPERATIONS_PER_THREAD {
-                                                    let key = rng.gen_range(0..KEY_SPACE);
-                                                    if rng.gen_bool(0.8) {
+                                                    let key = rng.random_range(0..KEY_SPACE);
+                                                    if rng.random_bool(0.8) {
                                                         black_box(cache.get_raw_key(&key).await);
                                                     } else {
                                                         let value =

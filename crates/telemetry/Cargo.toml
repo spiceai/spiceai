@@ -16,11 +16,13 @@ hostname = "0.4.2"
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../otel-arrow" }
+pin-project.workspace = true
 sha2.workspace = true
 snafu.workspace = true
 sysinfo.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+futures.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 
 [features]

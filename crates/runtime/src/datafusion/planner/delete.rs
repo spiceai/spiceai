@@ -28,23 +28,25 @@ use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{Extension, LogicalPlan};
 use datafusion_expr::DmlStatement;
 
-use crate::datafusion::cayenne_ddl::analyzer_rule::extract_filter_sql;
+use crate::datafusion::cayenne_ddl::dml_planner::extract_filters;
 use crate::datafusion::cayenne_ddl::logical_nodes::DistributedCayenneDeleteNode;
 
 /// Wrap a `DataFusion` `DmlStatement` (DELETE) into a distributed Cayenne
 /// extension node for forwarding to executor nodes.
 ///
+/// This rewrite is only used for scheduler-side distributed overlay paths.
+///
 /// This is only called in distributed (scheduler) mode. In local mode,
 /// the standard `DataFusion` plan is returned unchanged by the caller.
 pub(super) fn plan_distributed_delete(dml: &DmlStatement) -> DFResult<LogicalPlan> {
-    let filter_sql = extract_filter_sql(&dml.input)?;
+    let filters = extract_filters(&dml.input)?;
 
     Ok(LogicalPlan::Extension(Extension {
         node: Arc::new(DistributedCayenneDeleteNode::new(
             dml.table_name.clone(),
             Arc::clone(&dml.input),
             Arc::clone(&dml.output_schema),
-            filter_sql,
+            filters,
         )),
     }))
 }

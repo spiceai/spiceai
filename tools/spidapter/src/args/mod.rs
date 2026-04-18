@@ -50,16 +50,6 @@ pub struct StdioArgs {
     #[arg(long)]
     pub channel: Option<String>,
 
-    /// Custom container image registry (e.g. `ghcr.io/spiceai`).
-    /// When set, the app's image registry is updated before deploying.
-    #[arg(long, env = "SPIDAPTER_IMAGE_REGISTRY")]
-    pub image_registry: Option<String>,
-
-    /// Custom container image name (e.g. `spiceai-dev`).
-    /// When set, the app's image name is updated before deploying.
-    #[arg(long, env = "SPIDAPTER_IMAGE_NAME")]
-    pub image_name: Option<String>,
-
     /// Custom container image tag (e.g. `spicebench-sf10`).
     /// When set, the app's image tag is updated before deploying.
     #[arg(long, env = "SPIDAPTER_IMAGE_TAG")]

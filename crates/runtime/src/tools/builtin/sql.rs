@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use std::{borrow::Cow, sync::Arc};
 
 use crate::{
-    datafusion::DataFusion,
+    datafusion::{DataFusion, query::write_to_json_string},
     tools::{SpiceModelTool, utils::parameters},
 };
 use futures::TryStreamExt;
@@ -94,10 +94,7 @@ impl SpiceModelTool for SqlTool {
                 .await
                 .boxed()?;
 
-            let buf = Vec::new();
-            let mut writer = arrow_json::ArrayWriter::new(buf);
-            writer.write_batches(batches.iter().collect::<Vec<&RecordBatch>>().as_slice())?;
-            Ok(Value::String(String::from_utf8(writer.into_inner())?))
+            Ok(Value::String(write_to_json_string(&batches)?))
         }
         .instrument(span.clone())
         .await;

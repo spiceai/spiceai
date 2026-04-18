@@ -42,3 +42,8 @@ tracing.workspace = true
 [features]
 default = []
 spark = []
+
+[dev-dependencies]
+app = { path = "../../app" }
+spicepod = { path = "../../spicepod" }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync"] }

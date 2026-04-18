@@ -38,9 +38,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Rust 1.93.1
+      - name: Install Rust 1.94.1
         if: steps.check_pr.outputs.skip != 'true'
-        run: rustup toolchain install 1.93.1 --profile minimal
+        run: rustup toolchain install 1.94.1 --profile minimal
 
       - name: Set up make
         if: runner.os != 'macOS' && steps.check_pr.outputs.skip != 'true'
@@ -71,7 +71,7 @@ jobs:
 
       - name: Upload OpenAPI artifact
         if: steps.check_pr.outputs.skip != 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: openapi.json
           path: .schema/openapi.json
