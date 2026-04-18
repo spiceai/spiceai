@@ -338,15 +338,17 @@ impl ExecutionPlan for BytesProcessedExec {
 
     // Allow optimizer to push limits through to inputs
     fn supports_limit_pushdown(&self) -> bool {
-        true
+        self.input_exec.supports_limit_pushdown()
     }
 
-    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        None
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        self.input_exec
+            .with_fetch(limit)
+            .map(|plan| self.wrap_input_exec(plan))
     }
 
     fn fetch(&self) -> Option<usize> {
-        None
+        self.input_exec.fetch()
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -384,9 +386,20 @@ impl ExecutionPlan for BytesProcessedExec {
 
     fn try_pushdown_sort(
         &self,
-        _order: &[PhysicalSortExpr],
+        order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>, DataFusionError> {
-        Ok(SortOrderPushdownResult::Unsupported)
+        let result = self.input_exec.try_pushdown_sort(order)?;
+        Ok(result.map(|plan| self.wrap_input_exec(plan)))
+    }
+}
+
+impl BytesProcessedExec {
+    fn wrap_input_exec(&self, input_exec: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        let mut exec = BytesProcessedExec::new(input_exec, Arc::clone(&self.emit_bytes_callback));
+        if self.fallback_to_new_context {
+            exec = exec.fallback_to_new_context();
+        }
+        Arc::new(exec) as Arc<dyn ExecutionPlan>
     }
 }
 

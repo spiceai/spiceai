@@ -1,6 +1,6 @@
 ---
 source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
-expression: plan
+expression: __plan
 ---
 +---------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
 | plan_type     | plan                                                                                                                                                                   |
@@ -12,9 +12,11 @@ expression: plan
 |               |         Projection: o.quantity, p.name                                                                                                                                 |
 |               |           Inner Join: o.product_id = p.product_id                                                                                                                      |
 |               |             SubqueryAlias: o                                                                                                                                           |
-|               |               TableScan: jcat.store.orders projection=[product_id, quantity]                                                                                           |
+|               |               SubqueryAlias: jcat.store.orders                                                                                                                         |
+|               |                 TableScan: jcat.store.orders projection=[product_id, quantity]                                                                                         |
 |               |             SubqueryAlias: p                                                                                                                                           |
-|               |               TableScan: jcat.store.products projection=[product_id, name]                                                                                             |
+|               |               SubqueryAlias: jcat.store.products                                                                                                                       |
+|               |                 TableScan: jcat.store.products projection=[product_id, name]                                                                                           |
 | physical_plan | ProjectionExec: expr=[CAST(name@0 AS LargeUtf8) as name, total_qty@1 as total_qty]                                                                                     |
 |               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1, maintains_sort_order=true                                                                      |
 |               |     SortPreservingMergeExec: [name@0 ASC NULLS LAST]                                                                                                                   |

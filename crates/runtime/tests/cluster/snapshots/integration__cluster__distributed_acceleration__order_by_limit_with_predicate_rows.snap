@@ -1,0 +1,13 @@
+---
+source: crates/runtime/tests/cluster/distributed_acceleration.rs
+expression: pred_rows_fmt
+---
++----+--------------+-------+
+| id | name         | score |
++----+--------------+-------+
+| 1  | John Doe     | 85    |
+| 2  | Jane Smith   | 92    |
+| 4  | Emily Brown  | 89    |
+| 6  | Sarah Wilson | 94    |
+| 7  | Tom Anderson | 81    |
++----+--------------+-------+

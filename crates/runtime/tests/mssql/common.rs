@@ -58,7 +58,7 @@ pub async fn start_mssql_docker_container(
             test: Some(vec![
                 "CMD-SHELL".to_string(),
                 format!(
-                    "/opt/mssql-tools/bin/sqlcmd -C -U sa -P {MSSQL_ROOT_PASSWORD} -Q \"SELECT 1\""
+                    "/opt/mssql-tools18/bin/sqlcmd -C -U sa -P {MSSQL_ROOT_PASSWORD} -Q \"SELECT 1\""
                 ),
             ]),
             interval: Some(250_000_000),

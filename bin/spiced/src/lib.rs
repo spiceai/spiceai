@@ -39,6 +39,7 @@ use runtime::config::ClusterRole;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
+use runtime::secrets::ExposeSecret;
 use runtime::spice_metrics;
 use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory};
 use runtime_async::ManagedTokioRuntime;
@@ -533,23 +534,40 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    if let Some(ref metrics_registry) = prometheus_registry {
-        let otel_config = telemetry_config
-            .get()
-            .and_then(|c| c.otel_exporter.as_ref())
-            .filter(|c| c.enabled);
+    let otel_config = telemetry_config
+        .get()
+        .and_then(|c| c.otel_exporter.as_ref())
+        .filter(|c| c.enabled);
+
+    let needs_metrics =
+        prometheus_registry.is_some() || otel_config.is_some() || metrics_reader.is_some();
+
+    if needs_metrics {
+        // Resolve secrets in OTEL exporter headers before initializing metrics
+        let resolved_otel_headers = if let Some(config) = otel_config {
+            let mut resolved = std::collections::HashMap::new();
+            let secrets = rt.secrets();
+            let secrets_guard = secrets.read().await;
+            for (key, value) in &config.headers {
+                let resolved_value = secrets_guard
+                    .inject_secrets(key, runtime::secrets::ParamStr(value.as_ref()))
+                    .await;
+                resolved.insert(key.clone(), resolved_value.expose_secret().to_string());
+            }
+            drop(secrets_guard);
+            resolved
+        } else {
+            std::collections::HashMap::new()
+        };
 
         init_metrics(
             &rt.datafusion(),
-            metrics_registry.clone(),
+            prometheus_registry.clone(),
             otel_config,
+            resolved_otel_headers,
             metrics_reader,
         )
         .context(UnableToInitializeMetricsSnafu)?;
-    } else if let Some(reader) = metrics_reader {
-        // In cluster mode without --metrics, we still need to register the MetricsReader
-        // so executors can respond to metrics requests from schedulers
-        init_cluster_metrics_only(reader);
     }
 
     let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
@@ -570,7 +588,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     let rt = Arc::new(rt);
 
-    if prometheus_registry.is_some() {
+    if needs_metrics {
         rt.init_cache_metrics();
     }
 
@@ -670,44 +688,69 @@ async fn build_app(args: &Args) -> Result<(Option<Arc<App>>, Option<app::Error>)
     Ok((app, spicepod_load_error))
 }
 
+/// Initializes the global [`SdkMeterProvider`] with whichever metric sinks the
+/// caller has configured. Each reader is attached independently; any
+/// combination is valid as long as at least one source is present.
+///
+/// Sinks and how they are turned on:
+/// - **Prometheus scrape** (`registry` is `Some`): enabled by passing
+///   `--metrics <addr>` on the command line. Also attaches the `spice_metrics`
+///   periodic reader that writes runtime metrics into `DataFusion` for the local
+///   task-history / observability tables.
+/// - **Cluster on-demand OTLP** (`metrics_reader` is `Some`): enabled when
+///   spiced runs as a cluster executor. The reader lets a scheduler pull
+///   metrics over the control stream even when neither `--metrics` nor
+///   `otel_exporter` is configured — this subsumes the former
+///   `init_cluster_metrics_only` path.
+/// - **OTEL push exporter** (`otel_config` is `Some` and enabled): enabled
+///   purely by `runtime.telemetry.otel_exporter` in `spicepod.yaml`. No
+///   command-line flag is required; works standalone or alongside the other
+///   sinks. `resolved_otel_headers` must already have secret templates
+///   resolved by the caller.
+///
+/// Caller is expected to short-circuit (not invoke this fn) when none of the
+/// three sources is configured — otherwise an empty `MeterProvider` would be
+/// installed.
 fn init_metrics(
     df: &Arc<DataFusion>,
-    registry: prometheus::Registry,
+    registry: Option<prometheus::Registry>,
     otel_config: Option<&app::spicepod::component::runtime::OtelExporterConfig>,
+    resolved_otel_headers: std::collections::HashMap<String, String>,
     metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let resource = Resource::builder().build();
 
-    let prometheus_exporter = opentelemetry_prometheus::exporter()
-        .with_registry(registry)
-        .without_scope_info()
-        .without_units()
-        .without_counter_suffixes()
-        .without_target_info()
-        .build()?;
+    let mut provider_builder = SdkMeterProvider::builder().with_resource(resource);
 
-    let spice_metrics_exporter =
-        OtelArrowExporter::new(spice_metrics::SpiceMetricsExporter::new(df));
+    // Case 1: Prometheus scrape
+    if let Some(registry) = registry {
+        let prometheus_exporter = opentelemetry_prometheus::exporter()
+            .with_registry(registry)
+            .without_scope_info()
+            .without_units()
+            .without_counter_suffixes()
+            .without_target_info()
+            .build()?;
+        provider_builder = provider_builder.with_reader(prometheus_exporter);
 
-    let spice_metrics_reader =
-        PeriodicReader::builder(spice_metrics_exporter, opentelemetry_sdk::runtime::Tokio)
-            .with_interval(Duration::from_secs(30))
-            .build();
+        let spice_metrics_exporter =
+            OtelArrowExporter::new(spice_metrics::SpiceMetricsExporter::new(df));
+        let spice_metrics_reader =
+            PeriodicReader::builder(spice_metrics_exporter, opentelemetry_sdk::runtime::Tokio)
+                .with_interval(Duration::from_secs(30))
+                .build();
+        provider_builder = provider_builder.with_reader(spice_metrics_reader);
+    }
 
-    let mut provider_builder = SdkMeterProvider::builder()
-        .with_resource(resource)
-        .with_reader(prometheus_exporter)
-        .with_reader(spice_metrics_reader);
-
-    // Add cluster metrics reader for on-demand OTLP collection in cluster mode
+    // Case 2: Cluster on-demand OTLP
     if let Some(reader) = metrics_reader {
         provider_builder = provider_builder.with_reader(reader);
         tracing::debug!("Cluster metrics reader enabled for on-demand OTLP collection");
     }
 
-    // Add OTEL push exporter if configured
+    // Case 3: OTEL push exporter
     if let Some(config) = otel_config {
-        match create_otel_reader(config) {
+        match create_otel_reader(config, resolved_otel_headers) {
             Ok(otel_reader) => {
                 provider_builder = provider_builder.with_reader(otel_reader);
                 let protocol = if config.is_http() { "http" } else { "grpc" };
@@ -730,27 +773,12 @@ fn init_metrics(
     Ok(())
 }
 
-/// Initializes metrics collection for cluster mode without Prometheus.
-///
-/// This is used by executors that don't have `--metrics` enabled but still need to
-/// respond to metrics requests from schedulers via the control stream.
-fn init_cluster_metrics_only(metrics_reader: runtime::metrics_reader::MetricsReader) {
-    let resource = Resource::builder().build();
-
-    let provider = SdkMeterProvider::builder()
-        .with_resource(resource)
-        .with_reader(metrics_reader)
-        .build();
-
-    global::set_meter_provider(provider);
-    tracing::debug!("Cluster metrics reader enabled for on-demand OTLP collection (no Prometheus)");
-}
-
 /// Creates an OTEL periodic reader from the spicepod config
 fn create_otel_reader(
     config: &app::spicepod::component::runtime::OtelExporterConfig,
+    resolved_headers: std::collections::HashMap<String, String>,
 ) -> Result<runtime::otel_push_exporter::OtelPeriodicReader, runtime::otel_push_exporter::Error> {
-    runtime::otel_push_exporter::create_otel_periodic_reader(config)
+    runtime::otel_push_exporter::create_otel_periodic_reader(config, resolved_headers)
 }
 
 async fn start_anonymous_telemetry(
