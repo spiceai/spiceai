@@ -17,7 +17,7 @@ limitations under the License.
 use arrow::{array::StringArray, util::pretty::pretty_format_batches};
 use async_openai::types::embeddings::EmbeddingInput;
 use futures::TryStreamExt;
-use rand::Rng;
+use rand::RngExt;
 use reqwest::{Client, header::HeaderMap};
 use runtime::{Runtime, config::Config};
 use runtime_secrets::get_params_with_secrets;
