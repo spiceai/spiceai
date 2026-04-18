@@ -492,6 +492,31 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("When true, a permanent error (authentication failure, access denied) will disable the connector to prevent a thundering herd of failed requests.")
         .default("true")
         .is_boolean(),
+
+    // Backwards-compat aliases: earlier releases of the Git connector read
+    // these runtime options from `dataset.params` using a `git_`-prefixed
+    // key. Runtime parameters normally reject the prefix, but these
+    // deprecated entries keep those existing spicepods working while they
+    // migrate to the unprefixed forms above. Emit a deprecation warning so
+    // the mis-prefixed keys surface in logs.
+    ParameterSpec::component("include")
+        .description("[deprecated] Use unprefixed 'include'.")
+        .deprecated("Rename 'git_include' to 'include'."),
+    ParameterSpec::component("fetch_content")
+        .description("[deprecated] Use unprefixed 'fetch_content'.")
+        .deprecated("Rename 'git_fetch_content' to 'fetch_content'."),
+    ParameterSpec::component("cache_path")
+        .description("[deprecated] Use unprefixed 'cache_path'.")
+        .deprecated("Rename 'git_cache_path' to 'cache_path'."),
+    ParameterSpec::component("max_files")
+        .description("[deprecated] Use unprefixed 'max_files'.")
+        .deprecated("Rename 'git_max_files' to 'max_files'."),
+    ParameterSpec::component("max_file_bytes")
+        .description("[deprecated] Use unprefixed 'max_file_bytes'.")
+        .deprecated("Rename 'git_max_file_bytes' to 'max_file_bytes'."),
+    ParameterSpec::component("enable_lfs")
+        .description("[deprecated] Use unprefixed 'enable_lfs'.")
+        .deprecated("Rename 'git_enable_lfs' to 'enable_lfs'."),
 ];
 
 impl DataConnectorFactory for GitFactory {

@@ -110,23 +110,25 @@ const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Matches `Authorization: <scheme>[ <value>]` header strings that a
 /// subprocess may emit, so we can redact the credential before surfacing
-/// stderr to users.
+/// stderr to users. The pattern is a compile-time constant, so the
+/// `unreachable!()` arm is unreachable in practice — it only exists to
+/// satisfy the project-wide ban on `unwrap`/`expect` in non-test code.
 static AUTH_HEADER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    #[expect(
-        clippy::expect_used,
-        reason = "pattern is a compile-time constant; a failure here would indicate a program bug, not a runtime input error"
-    )]
-    let re = regex::Regex::new(r"(?i)(Authorization\s*:\s*)(\S+\s+)?\S+").expect("valid regex");
-    re
+    regex::Regex::new(r"(?i)(Authorization\s*:\s*)(\S+\s+)?\S+")
+        .unwrap_or_else(|e| unreachable!("AUTH_HEADER_RE pattern must compile: {e}"))
 });
 
 /// Global map of per-cache-path mutexes. Every mutator of a given on-disk
 /// Git cache holds the corresponding mutex for the duration of the operation
 /// so that concurrent clone/fetch/checkout calls targeting the same cache do
 /// not corrupt the working tree.
+///
+/// Backed by a `DashMap` with sharded internal locking so `cache_mutex_for`
+/// can be called from async code without risking a Tokio worker stall on
+/// the outer map — only the (very brief) shard-local lock is ever held.
 static GIT_CACHE_MUTEXES: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    dashmap::DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
 
 /// Strip any `userinfo` (`user[:password]@`) component from a Git URL so it
 /// is safe to log or use as a map key. Returns the original string when the
@@ -168,13 +170,11 @@ impl Drop for InflightGuard {
 }
 
 fn cache_mutex_for(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
-    let mut guard = GIT_CACHE_MUTEXES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     Arc::<tokio::sync::Mutex<()>>::clone(
-        guard
+        GIT_CACHE_MUTEXES
             .entry(path.to_path_buf())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .value(),
     )
 }
 

@@ -5227,6 +5227,7 @@ dependencies = [
  "clickhouse-rs",
  "criterion 0.7.0",
  "ctor",
+ "dashmap",
  "dataformat-json",
  "datafusion",
  "datafusion-datasource",
