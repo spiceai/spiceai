@@ -66,7 +66,10 @@ fn init_test_repo(root: &Path) -> anyhow::Result<()> {
     std::fs::write(root.join("README.md"), "# Sample Repo\n")?;
     std::fs::create_dir_all(root.join("src"))?;
     std::fs::write(root.join("src/main.rs"), "fn main() {}\n")?;
-    std::fs::write(root.join("src/lib.rs"), "pub fn add(a: i32, b: i32) -> i32 { a + b }\n")?;
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )?;
     std::fs::write(root.join("config.yaml"), "version: 1\n")?;
 
     run(&["add", "."])?;
@@ -75,9 +78,7 @@ fn init_test_repo(root: &Path) -> anyhow::Result<()> {
 }
 
 fn make_git_dataset(repo_path: &Path, cache_path: &Path, include: Option<&str>) -> Dataset {
-    let path_str = repo_path
-        .to_str()
-        .expect("repo path must be UTF-8");
+    let path_str = repo_path.to_str().expect("repo path must be UTF-8");
     let mut dataset = Dataset::new(format!("git:file://{path_str}@main"), "git_test");
 
     let mut params = HashMap::new();

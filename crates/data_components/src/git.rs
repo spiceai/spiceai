@@ -532,9 +532,7 @@ impl GitClient {
     /// deliberately excluded — it is *not* an SSH transport and must not
     /// trigger ssh-agent fallback.
     fn is_ssh_url(url: &str) -> bool {
-        url.starts_with("git@")
-            || url.starts_with("ssh://")
-            || url.starts_with("git+ssh://")
+        url.starts_with("git@") || url.starts_with("ssh://") || url.starts_with("git+ssh://")
     }
 
     fn resolve_credentials(
@@ -578,10 +576,7 @@ impl GitClient {
                     token,
                 )
             } else if let Some(password) = credentials.password.as_deref() {
-                (
-                    credentials.username.as_deref().unwrap_or("git"),
-                    password,
-                )
+                (credentials.username.as_deref().unwrap_or("git"), password)
             } else {
                 return Err(git2::Error::from_str(
                     "HTTP authentication required but no credentials were provided",
@@ -624,8 +619,10 @@ impl GitClient {
 
         match err.code() {
             ErrorCode::Auth | ErrorCode::Certificate => true,
-            _ => matches!(err.class(), ErrorClass::Http | ErrorClass::Ssh)
-                && err.message().to_ascii_lowercase().contains("403"),
+            _ => {
+                matches!(err.class(), ErrorClass::Http | ErrorClass::Ssh)
+                    && err.message().to_ascii_lowercase().contains("403")
+            }
         }
     }
 
@@ -727,9 +724,8 @@ impl GitClient {
 
             if cache_path.exists() {
                 tracing::debug!("Opening existing repository at {}", cache_path.display());
-                let repo = Repository::open(&cache_path).map_err(|source| {
-                    classify_remote_error(source, &repo_url)
-                })?;
+                let repo = Repository::open(&cache_path)
+                    .map_err(|source| classify_remote_error(source, &repo_url))?;
 
                 // Fetch latest changes
                 {
@@ -1176,7 +1172,9 @@ mod tests {
     #[async_trait]
     impl RateLimiter for TestRateLimiter {
         async fn update_from_headers(&self, _headers: &reqwest::header::HeaderMap) {}
-        async fn check_rate_limit(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        async fn check_rate_limit(
+            &self,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
     }
@@ -1238,8 +1236,7 @@ mod tests {
 
     #[test]
     fn exponential_backoff_is_bounded() {
-        let client = test_client("https://github.com/spiceai/spiceai.git")
-            .expect("valid client");
+        let client = test_client("https://github.com/spiceai/spiceai.git").expect("valid client");
         let long_delay = client.backoff_delay(50);
         assert!(long_delay <= RETRY_MAX_BACKOFF);
     }
@@ -1247,13 +1244,19 @@ mod tests {
     #[test]
     fn ssh_url_detection() {
         assert!(GitClient::is_ssh_url("git@github.com:spiceai/spiceai.git"));
-        assert!(GitClient::is_ssh_url("ssh://git@github.com/spiceai/spiceai.git"));
+        assert!(GitClient::is_ssh_url(
+            "ssh://git@github.com/spiceai/spiceai.git"
+        ));
         assert!(GitClient::is_ssh_url(
             "git+ssh://github.com/spiceai/spiceai.git"
         ));
-        assert!(!GitClient::is_ssh_url("https://github.com/spiceai/spiceai.git"));
+        assert!(!GitClient::is_ssh_url(
+            "https://github.com/spiceai/spiceai.git"
+        ));
         // git:// is the anonymous git protocol, not SSH — must not be classified as SSH.
-        assert!(!GitClient::is_ssh_url("git://github.com/spiceai/spiceai.git"));
+        assert!(!GitClient::is_ssh_url(
+            "git://github.com/spiceai/spiceai.git"
+        ));
     }
 
     #[test]

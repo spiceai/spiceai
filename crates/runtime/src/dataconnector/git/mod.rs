@@ -16,9 +16,7 @@ limitations under the License.
 
 use crate::component::ComponentType;
 use crate::component::dataset::Dataset;
-use crate::component::metrics::{
-    MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback,
-};
+use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use crate::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, ParameterSpec, Parameters,
@@ -175,12 +173,7 @@ impl Git {
             .ok()
             .map(|s| s.expose_secret().to_string());
 
-        let ssh_key_path = self
-            .params
-            .get("ssh_key")
-            .expose()
-            .ok()
-            .map(PathBuf::from);
+        let ssh_key_path = self.params.get("ssh_key").expose().ok().map(PathBuf::from);
 
         let ssh_passphrase = self
             .params
@@ -500,9 +493,7 @@ const GIT_METRICS: &[MetricSpec] = &[MetricSpec::new(
     "inflight_operations",
     MetricType::ObservableGaugeU64,
 )
-.description(
-    "Current number of Git network operations (clone/fetch) holding a concurrency permit",
-)
+.description("Current number of Git network operations (clone/fetch) holding a concurrency permit")
 .auto_register()];
 
 #[derive(Debug, Clone)]
