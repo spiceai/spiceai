@@ -1178,8 +1178,13 @@ fn attach_query_active_guard_to_stream(
 }
 
 /// Wraps a record batch stream so that cancellation via the supplied
-/// [`CancellationToken`] yields a single `DataFusionError::Execution` error and
-/// terminates the stream.
+/// [`CancellationToken`] yields a single [`DataFusionError::External`] wrapping
+/// [`Error::QueryCancelled`] and terminates the stream.
+///
+/// Using [`Error::QueryCancelled`] lets downstream callers (HTTP status
+/// mapping, Flight status mapping, metrics) distinguish cancellation from
+/// other query failures via [`is_cancellation_error`] or an
+/// [`std::error::Error::downcast_ref`] on the external error source.
 ///
 /// The wrapper also keeps ownership of any `guard` (typically an
 /// [`ActiveQueryGuard`]) so that the query's registry entry is removed when the
@@ -1201,6 +1206,12 @@ where
         emitted_cancel: bool,
     }
 
+    fn cancellation_error(query_id: &str) -> DataFusionError {
+        DataFusionError::External(Box::new(Error::QueryCancelled {
+            query_id: query_id.to_string(),
+        }))
+    }
+
     let schema = stream.schema();
 
     let state = State {
@@ -1217,18 +1228,13 @@ where
         }
         if state.token.is_cancelled() {
             state.emitted_cancel = true;
-            let err = DataFusionError::Execution(format!("Query {} was cancelled", state.query_id));
-            return Some((Err(err), state));
+            return Some((Err(cancellation_error(&state.query_id)), state));
         }
         tokio::select! {
             biased;
             () = state.token.cancelled() => {
                 state.emitted_cancel = true;
-                let err = DataFusionError::Execution(format!(
-                    "Query {} was cancelled",
-                    state.query_id
-                ));
-                Some((Err(err), state))
+                Some((Err(cancellation_error(&state.query_id)), state))
             }
             next = state.stream.next() => {
                 next.map(|item| (item, state))
@@ -1237,6 +1243,18 @@ where
     });
 
     Box::pin(RecordBatchStreamAdapter::new(schema, Box::pin(wrapped)))
+}
+
+/// Returns true if `err` represents a query cancellation produced by
+/// [`attach_cancellation_to_stream`].
+#[must_use]
+pub fn is_cancellation_error(err: &DataFusionError) -> bool {
+    let DataFusionError::External(source) = err else {
+        return false;
+    };
+    source
+        .downcast_ref::<Error>()
+        .is_some_and(|e| matches!(e, Error::QueryCancelled { .. }))
 }
 
 #[must_use]
