@@ -318,12 +318,7 @@ impl DataFusionBuilder {
                 self.memory_limit,
                 self.temp_directory.clone(),
                 self.io_runtime.clone(),
-            ))
-            .with_analyzer_rules(AnalyzerRulesBuilder::default().build());
-
-        for rule in self.additional_analyzer_rules {
-            state = state.with_analyzer_rule(rule);
-        }
+            ));
 
         #[cfg(feature = "duckdb")]
         {
@@ -367,15 +362,6 @@ impl DataFusionBuilder {
 
         if let Err(e) = datafusion_spark::register_all(&mut state) {
             panic!("Unable to register Spark functions: {e}");
-        }
-
-        let ctx = SessionContext::new_with_state(state);
-
-        // Add cache invalidation optimizer rule if caching is enabled
-        if let Some(caching) = &self.caching {
-            ctx.add_optimizer_rule(Arc::new(CacheInvalidationOptimizerRule::new(
-                Arc::downgrade(caching),
-            )));
         }
 
         let catalog = MemoryCatalogProvider::new();
@@ -423,6 +409,14 @@ impl DataFusionBuilder {
             }
         }
 
+        let ctx = SessionContext::new_with_state(state);
+
+        // Add cache invalidation optimizer rule if caching is enabled
+        if let Some(caching) = &self.caching {
+            ctx.add_optimizer_rule(Arc::new(CacheInvalidationOptimizerRule::new(
+                Arc::downgrade(caching),
+            )));
+        }
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
         // Enable URL-based table resolution (e.g., SELECT * FROM 's3://bucket/data.parquet')
@@ -447,10 +441,12 @@ impl DataFusionBuilder {
             datafusion_ddl::new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
 
         let cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>> =
-            // Rules only for distributed query
+            // How we handle Cayenne DDL depends if its single node vs distributed.
             if let Some(executor_registry) = &self.executor_registry {
                 use crate::cluster::FederatedPartitionProvider;
 
+
+                // Rules only for distributed query
                 // Accelerated tables
                 ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
                     Arc::clone(executor_registry) as Arc<dyn TablePartitionProvider>,
@@ -485,7 +481,6 @@ impl DataFusionBuilder {
                 }
             };
 
-        // How we handle Cayenne DDL depends if its single node vs distributed.
         if let Some(ref cayenne_ddl_handler) = cayenne_ddl_handler {
             ctx.add_analyzer_rule(Arc::new(datafusion_ddl::DdlAnalyzerRule::new(
                 ctx.state().catalog_list(),
@@ -495,6 +490,14 @@ impl DataFusionBuilder {
                 SPICE_DEFAULT_SCHEMA,
                 SPICE_DEFAULT_CATALOG,
             )));
+        }
+
+        // Add these analyzer rules after `PartitionedTableScanRewrite` to allow expansion across partitions/executors.
+        for rule in AnalyzerRulesBuilder::default().build() {
+            ctx.add_analyzer_rule(rule);
+        }
+        for rule in self.additional_analyzer_rules {
+            ctx.add_analyzer_rule(rule);
         }
 
         // Iceberg DDL analyzer rule.
