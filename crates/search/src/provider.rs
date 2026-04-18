@@ -64,6 +64,8 @@ pub enum UdtfSource {
         column: Option<String>,
         limit: Option<usize>,
         include_score: Option<bool>,
+        /// Distance metric name ("cosine", "l2", or "dot"). `None` = default (cosine).
+        distance_metric: Option<String>,
     },
 }
 
@@ -77,6 +79,10 @@ pub struct SearchQueryProvider {
     pub primary_key: Vec<String>,
     pub constraints: Option<Constraints>,
     pub pre_limit: Option<usize>,
+    /// When `false`, the [`SEARCH_SCORE_COLUMN_NAME`] column is projected out of
+    /// both the advertised schema and the scan result. When `true` (default),
+    /// the score column is exposed so callers can order/inspect results.
+    pub include_score: bool,
     /// Optional callback invoked before a table scan is performed.
     ///
     /// This callback can be used to perform custom actions (such as logging, metrics, or side effects)
@@ -117,6 +123,7 @@ impl SearchQueryProvider {
             search_column,
             primary_key,
             pre_limit,
+            include_score: true,
             scan_callback: None,
             constraints: None,
             udtf_source: None,
@@ -154,6 +161,14 @@ impl SearchQueryProvider {
     #[must_use]
     pub fn with_udtf_source(mut self, source: UdtfSource) -> Self {
         self.udtf_source = Some(source);
+        self
+    }
+
+    /// When set to `false`, the advertised schema and scan output exclude the
+    /// internal score column ([`SEARCH_SCORE_COLUMN_NAME`]).
+    #[must_use]
+    pub fn with_include_score(mut self, include_score: bool) -> Self {
+        self.include_score = include_score;
         self
     }
 
@@ -454,6 +469,13 @@ impl TableProvider for SearchQueryProvider {
             if !fields_map.contains_key(f.name()) {
                 fields_map.insert(f.name().clone(), Arc::clone(f));
             }
+        }
+
+        // When `include_score = false`, drop the internal score column from the
+        // advertised schema so callers of `SELECT * FROM text_search(..., include_score => false)`
+        // don't see it.
+        if !self.include_score {
+            fields_map.remove(SEARCH_SCORE_COLUMN_NAME);
         }
 
         // Add `match` only if its a chunked search field (chunking offsets must be from this search index).

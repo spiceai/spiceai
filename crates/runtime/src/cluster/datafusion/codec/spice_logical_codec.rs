@@ -19,7 +19,7 @@ use crate::cluster::datafusion::codec::udtf_args::{
     RrfArgs, TextSearchArgs, UdtfArgs, UdtfArgsExt, VectorSearchArgs,
 };
 use crate::embeddings::udtf::{
-    VectorSearchTableFunc, VectorSearchTableFuncArgs, VectorSearchUDTFProvider,
+    DistanceMetric, VectorSearchTableFunc, VectorSearchTableFuncArgs, VectorSearchUDTFProvider,
 };
 use crate::search::full_text::udtf::{TextSearchTableFunc, TextSearchTableFuncArgs};
 use crate::search::rrf::ReciprocalRankFusion;
@@ -121,6 +121,11 @@ impl SpiceLogicalCodec {
                     column: vector_args.column,
                     limit: vector_args.limit.map(Self::limit_from_u64).transpose()?,
                     include_score: vector_args.include_score,
+                    distance_metric: vector_args
+                        .distance_metric
+                        .as_deref()
+                        .map(DistanceMetric::parse)
+                        .transpose()?,
                 });
                 udtf.call(&exprs)
             }
@@ -168,6 +173,11 @@ impl SpiceLogicalCodec {
                         column: args.column.clone(),
                         limit: args.limit.map(Self::limit_from_u64).transpose()?,
                         include_score: args.include_score,
+                        distance_metric: args
+                            .distance_metric
+                            .as_deref()
+                            .map(DistanceMetric::parse)
+                            .transpose()?,
                     });
                     (vector_exprs, vs.rank_weight)
                 }
@@ -350,12 +360,14 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
                     column,
                     limit,
                     include_score,
+                    distance_metric,
                 } => UdtfArgs::vector_search(VectorSearchArgs {
                     table: table.clone(),
                     query: query.clone(),
                     column: column.clone(),
                     limit: limit.map(|l| l as u64),
                     include_score: *include_score,
+                    distance_metric: distance_metric.clone(),
                 }),
             };
             buf.extend_from_slice(&args.encode_to_vec());
@@ -371,6 +383,7 @@ impl LogicalExtensionCodec for SpiceLogicalCodec {
                 column: provider_args.column.clone(),
                 limit: provider_args.limit.map(|l| l as u64),
                 include_score: provider_args.include_score,
+                distance_metric: provider_args.distance_metric.map(|m| m.as_str().to_string()),
             });
             buf.extend_from_slice(&args.encode_to_vec());
             return Ok(());

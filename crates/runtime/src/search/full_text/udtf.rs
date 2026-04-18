@@ -434,6 +434,7 @@ impl TableFunctionImpl for TextSearchTableFunc {
                 args.limit,
             )?
             .with_udtf_source(udtf_source)
+            .with_include_score(args.include_score.unwrap_or(true))
             .call_on_scan(Arc::new(|| {
                 async {
                     let request_context = RequestContext::current(AsyncMarker::new().await);
@@ -474,9 +475,7 @@ impl ScalarUDFImpl for TextSearchTableFunc {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        TextSearchTableFunc, TextSearchTableFuncArgs, levenshtein, suggest_column,
-    };
+    use super::{TextSearchTableFunc, TextSearchTableFuncArgs, levenshtein, suggest_column};
     use datafusion::common::Column;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::prelude::Expr;
@@ -541,10 +540,11 @@ mod tests {
     #[test]
     fn args_column_errors_on_no_search_fields() {
         let args = args_with_column(None);
-        let err = args
-            .column(&[])
-            .expect_err("No search fields should error");
-        assert!(err.to_string().contains("no associated full text search index"));
+        let err = args.column(&[]).expect_err("No search fields should error");
+        assert!(
+            err.to_string()
+                .contains("no associated full text search index")
+        );
     }
 
     #[test]
@@ -576,7 +576,10 @@ mod tests {
             .expect_err("Unknown column should error");
         let msg = err.to_string();
         assert!(msg.contains("'title'"), "expected suggestion in: {msg}");
-        assert!(msg.contains("Did you mean"), "expected suggestion in: {msg}");
+        assert!(
+            msg.contains("Did you mean"),
+            "expected suggestion in: {msg}"
+        );
     }
 
     #[test]

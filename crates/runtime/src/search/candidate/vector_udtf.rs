@@ -58,6 +58,7 @@ impl CandidateGeneration for VectorUDTFGeneration {
             column: Some(self.embedding_column.clone()),
             limit: None,
             include_score: Some(true),
+            distance_metric: None,
         });
         self.df
             .ctx
