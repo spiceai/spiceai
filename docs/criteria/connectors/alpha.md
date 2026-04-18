@@ -24,6 +24,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | FlightSQL                        | ➖             |                 |
 | FTP/SFTP                         | ➖             |                 |
 | GCS                              | ➖             |                 |
+| Git                              | ✅             | @lukekim        |
 | GitHub                           | ✅             | @peasee         |
 | Glue                             | ✅             | @kczimm         |
 | GraphQL                          | ➖             |                 |
