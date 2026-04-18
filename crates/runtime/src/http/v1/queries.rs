@@ -679,14 +679,14 @@ pub(crate) async fn cancel(
 /// List currently-active synchronous queries known to this runtime.
 ///
 /// This reports queries running behind `/v1/sql`, FlightSQL, NSQL, `/v1/search`,
-/// and tool-driven SQL. Async async-jobs queries are reported via `GET /v1/queries`.
+/// and tool-driven SQL. Async jobs queries are reported via `GET /v1/queries`.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/queries/active",
     operation_id = "list_active_queries",
     tag = "Queries",
     responses(
-        (status = 200, description = "List of active sync queries", body = ListQueriesResponse),
+        (status = 200, description = "List of active sync queries", body = ListActiveQueriesResponse),
     )
 ))]
 pub(crate) async fn list_active() -> Response {

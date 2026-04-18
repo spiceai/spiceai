@@ -195,8 +195,9 @@ pub struct Query {
     sql: QueryMethod,
     tracker: Option<QueryTracker>,
     query_id: uuid::Uuid,
-    /// Cancellation token for cooperative cancellation. If unset the query is
-    /// not cancellable (used for internal runtime queries that must always run).
+    /// Cancellation token for cooperative cancellation. If unset, query
+    /// execution inherits the request-context cancellation token. Set this to
+    /// override the request-context token for this query.
     cancellation_token: Option<tokio_util::sync::CancellationToken>,
 }
 
