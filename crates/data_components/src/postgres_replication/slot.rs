@@ -46,9 +46,13 @@ pub type SlotSetupOutcome = SlotInfo;
 /// from. If `created_fresh = true`, the caller is expected to run a snapshot
 /// bootstrap using `snapshot_name` before starting WAL streaming.
 ///
-/// For existing slots we return `consistent_lsn = 0` which instructs
-/// `START_REPLICATION` to resume from the server-side `confirmed_flush_lsn` —
-/// this is Postgres' built-in durable checkpoint.
+/// For existing slots we query `pg_replication_slots.confirmed_flush_lsn` and
+/// return it as `consistent_lsn` so the caller can seed its in-memory
+/// `confirmed_flush` atomic (and metrics) from the server's own durable
+/// checkpoint. That value is also passed to `START_REPLICATION`, so we resume
+/// from the same LSN Postgres already knows about. If the catalog hasn't
+/// initialized the LSN yet (NULL on brand-new slots, rare race) we fall back
+/// to 0 — pgwire-replication treats that as "server decides".
 pub async fn setup_slot_and_publication(
     params: &ReplicationParams,
     schema_name: &str,
@@ -124,17 +128,17 @@ async fn do_setup(
     validate_replica_identity(client, schema_name, table_name).await?;
     ensure_publication(client, &params.publication_name, schema_name, table_name).await?;
 
-    let existing_slot = slot_exists(client, &params.slot_name).await?;
-    if existing_slot {
+    if let Some(confirmed_flush_lsn) = read_slot_confirmed_flush(client, &params.slot_name).await? {
         tracing::info!(
             slot = %params.slot_name,
             publication = %params.publication_name,
+            confirmed_flush_lsn = %format_lsn(confirmed_flush_lsn),
             "Resuming from existing replication slot"
         );
         return Ok(SlotInfo {
             slot_name: params.slot_name.clone(),
             publication_name: params.publication_name.clone(),
-            consistent_lsn: 0, // sentinel: pgwire-replication treats 0 as "server decides"
+            consistent_lsn: confirmed_flush_lsn,
             snapshot_name: None,
             created_fresh: false,
         });
@@ -251,15 +255,36 @@ async fn ensure_publication(
     Ok(())
 }
 
-async fn slot_exists(client: &tokio_postgres::Client, slot_name: &str) -> Result<bool> {
+/// Look up an existing slot's `confirmed_flush_lsn`.
+///
+/// Returns:
+/// - `Ok(None)` if no slot exists with that name — caller should create one.
+/// - `Ok(Some(0))` if the slot exists but its catalog `confirmed_flush_lsn`
+///   is NULL (brand-new slot before the first keepalive). This is rare but
+///   valid; 0 is pgwire-replication's "server decides" sentinel so downstream
+///   behavior is preserved.
+/// - `Ok(Some(lsn))` with the catalog's LSN on the normal resume path.
+async fn read_slot_confirmed_flush(
+    client: &tokio_postgres::Client,
+    slot_name: &str,
+) -> Result<Option<u64>> {
     let row = client
-        .query_one(
-            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+        .query_opt(
+            "SELECT confirmed_flush_lsn::text \
+             FROM pg_replication_slots \
+             WHERE slot_name = $1",
             &[&slot_name],
         )
         .await
         .context(SetupExecSnafu)?;
-    Ok(row.get(0))
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let lsn_str: Option<String> = row.get(0);
+    match lsn_str {
+        Some(s) => Ok(Some(parse_lsn(&s)?)),
+        None => Ok(Some(0)),
+    }
 }
 
 /// Executes `CREATE_REPLICATION_SLOT` via a regular SQL function call rather

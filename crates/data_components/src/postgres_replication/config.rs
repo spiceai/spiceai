@@ -197,8 +197,11 @@ fn xxh3_short_hash(s: &str) -> String {
     format!("{:08x}", v as u32)
 }
 
-// `hostname` is a tiny crate; we avoid adding it by using libc/unistd only where needed.
-// For cross-platform simplicity, reuse `std::env::var("HOSTNAME")` as a fallback.
+// Environment-based hostname discovery only. We intentionally avoid reading
+// `/etc/hostname` because that's blocking I/O, and this function is called on
+// a Tokio runtime thread during connector initialization. Any Kubernetes or
+// Docker deployment already sets `HOSTNAME`, and fallback callers see
+// `"unknown"` in the unlikely case neither env var is set.
 mod hostname {
     pub fn get() -> std::io::Result<std::ffi::OsString> {
         if let Ok(h) = std::env::var("HOSTNAME") {
@@ -206,10 +209,6 @@ mod hostname {
         }
         if let Ok(h) = std::env::var("COMPUTERNAME") {
             return Ok(h.into());
-        }
-        // Last resort: uname(2)-like fallback for unix via /etc/hostname.
-        if let Ok(contents) = std::fs::read_to_string("/etc/hostname") {
-            return Ok(contents.trim().to_string().into());
         }
         Err(std::io::Error::other("hostname unavailable"))
     }
@@ -275,7 +274,13 @@ impl ReplicationParams {
                 path: ca_path.clone(),
                 source: e,
             })?;
-            for cert in parse_pem_certificates(&pem_bytes)? {
+            let certs = parse_pem_certificates(ca_path, &pem_bytes)?;
+            if certs.is_empty() {
+                return Err(TlsConfigError::EmptyCaBundle {
+                    path: ca_path.clone(),
+                });
+            }
+            for cert in certs {
                 builder.add_root_certificate(cert);
             }
         }
@@ -295,6 +300,14 @@ pub enum TlsConfigError {
     ParseCa {
         source: native_tls::Error,
     },
+    /// `BEGIN CERTIFICATE` marker with no matching `END CERTIFICATE`.
+    TruncatedPem {
+        path: PathBuf,
+    },
+    /// `sslrootcert` supplied but file contained zero parseable certificates.
+    EmptyCaBundle {
+        path: PathBuf,
+    },
     BuildConnector(native_tls::Error),
 }
 
@@ -311,6 +324,16 @@ impl std::fmt::Display for TlsConfigError {
             TlsConfigError::ParseCa { source } => {
                 write!(f, "failed to parse sslrootcert PEM: {source}")
             }
+            TlsConfigError::TruncatedPem { path } => write!(
+                f,
+                "sslrootcert at {} has a BEGIN CERTIFICATE block without a matching END marker",
+                path.display()
+            ),
+            TlsConfigError::EmptyCaBundle { path } => write!(
+                f,
+                "sslrootcert at {} contains no parseable CA certificates",
+                path.display()
+            ),
             TlsConfigError::BuildConnector(source) => {
                 write!(f, "failed to build native-tls connector: {source}")
             }
@@ -323,13 +346,19 @@ impl std::error::Error for TlsConfigError {
         match self {
             TlsConfigError::ReadCa { source, .. } => Some(source),
             TlsConfigError::ParseCa { source } => Some(source),
+            TlsConfigError::TruncatedPem { .. } | TlsConfigError::EmptyCaBundle { .. } => None,
             TlsConfigError::BuildConnector(source) => Some(source),
         }
     }
 }
 
-/// Split a PEM blob into individual `native_tls::Certificate`s.
+/// Split a PEM blob into individual `native_tls::Certificate`s. An unmatched
+/// `BEGIN CERTIFICATE` (missing `END CERTIFICATE`) returns
+/// `TlsConfigError::TruncatedPem` rather than silently returning whatever was
+/// parsed so far — the alternative would leave operators thinking their CA
+/// bundle is loaded when it isn't.
 fn parse_pem_certificates(
+    path: &std::path::Path,
     pem: &[u8],
 ) -> std::result::Result<Vec<native_tls::Certificate>, TlsConfigError> {
     let mut certs = Vec::new();
@@ -337,7 +366,9 @@ fn parse_pem_certificates(
     while let Some(begin) = find_subslice(remaining, b"-----BEGIN CERTIFICATE-----") {
         let tail = &remaining[begin..];
         let Some(end_rel) = find_subslice(tail, b"-----END CERTIFICATE-----") else {
-            break;
+            return Err(TlsConfigError::TruncatedPem {
+                path: path.to_path_buf(),
+            });
         };
         let end = begin + end_rel + b"-----END CERTIFICATE-----".len();
         let block = &remaining[begin..end];
