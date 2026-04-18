@@ -73,6 +73,40 @@ pub fn build_changes_stream(
         .map(|pk| pk.iter().map(ToString::to_string).collect())
         .unwrap_or_default();
 
+    // UPDATE events rely on `on_conflict: upsert` (or an upsert-dedup
+    // variant) to mutate the existing row in place. Without it, DuckDB /
+    // SQLite / Postgres / Cayenne engines silently append duplicate rows
+    // on every UPDATE. The Arrow engine genuinely can't support upsert and
+    // is documented as append-only for UPDATEs — skip the check there.
+    let engine = dataset
+        .acceleration
+        .as_ref()
+        .map(|a| a.engine.to_unpartitioned())
+        .unwrap_or_default();
+    let engine_supports_upsert = !matches!(
+        engine,
+        runtime::component::dataset::acceleration::Engine::Arrow
+            | runtime::component::dataset::acceleration::Engine::PartitionedArrow
+    );
+    let has_upsert = dataset.acceleration.as_ref().is_some_and(|a| {
+        a.on_conflict.values().any(|behavior| {
+            matches!(
+                behavior,
+                runtime::component::dataset::acceleration::OnConflictBehavior::Upsert(_)
+            )
+        })
+    });
+    let missing_upsert_error = (engine_supports_upsert && !has_upsert).then(|| {
+        format!(
+            "postgres replication for dataset `{dataset_name}`: `refresh_mode: changes` \
+             requires an `acceleration.on_conflict` entry with `upsert` (or an \
+             `upsert_dedup*` variant) for the primary key so UPDATE events apply as \
+             upserts instead of duplicate inserts. Add: `on_conflict: {{ <pk>: upsert }}` \
+             on the `{engine}` engine. (The `arrow` engine is exempt — documented \
+             append-only semantics.)"
+        )
+    });
+
     Box::pin(try_stream! {
         let table_provider = federated_table.table_provider().await;
         let schema = table_provider.schema();
@@ -93,6 +127,10 @@ pub fn build_changes_stream(
                  `acceleration.on_conflict` entry) — `refresh_mode: changes` cannot route \
                  UPDATE/DELETE events without one."
             )))?;
+        }
+
+        if let Some(msg) = missing_upsert_error {
+            Err(StreamError::External(msg))?;
         }
 
         let input = ReplicationStreamInput {

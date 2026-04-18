@@ -153,11 +153,10 @@ For workloads that need true upsert semantics (so `UPDATE`s replace existing row
 
 Every Spice replica must have its own replication slot. Spice handles this automatically by hashing the replica's identity into the default slot name:
 
-| Source                    | Used for |
-|---------------------------|----------|
-| `SPICE_INSTANCE_ID` env   | Preferred — set it explicitly per replica. |
-| `HOSTNAME` / `COMPUTERNAME` | Fallback — works on k8s where each pod has a distinct hostname. |
-| `/etc/hostname`           | Last resort. |
+| Source                          | Used for |
+|---------------------------------|----------|
+| `SPICE_INSTANCE_ID` env         | Preferred — set it explicitly per replica. |
+| `HOSTNAME` / `COMPUTERNAME` env | Fallback — works on k8s where each pod has a distinct hostname. |
 
 ### Example: Kubernetes StatefulSet
 

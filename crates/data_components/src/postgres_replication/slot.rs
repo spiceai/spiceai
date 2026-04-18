@@ -314,7 +314,7 @@ async fn read_slot_confirmed_flush(
 /// Executes `CREATE_REPLICATION_SLOT` via a regular SQL function call rather
 /// than the replication-connection command because we want the snapshot and
 /// LSN to be usable from a normal (non-replication) connection afterwards for
-/// the initial snapshot COPY.
+/// the initial snapshot query.
 ///
 /// Returns (`consistent_lsn`, `snapshot_name`).
 async fn create_logical_slot(
@@ -322,14 +322,14 @@ async fn create_logical_slot(
     slot_name: &str,
     temporary: bool,
 ) -> Result<(u64, String)> {
-    // pg_create_logical_replication_slot doesn't support EXPORT_SNAPSHOT directly
-    // via SQL on older versions, but pg_create_logical_replication_slot with
-    // temporary=false returns (slot_name, lsn). For a fully-featured snapshot
-    // export we'd need to go through the replication protocol, but in PG 16+ the
-    // SQL function exposes (slot_name, lsn). We capture the LSN and use it as
-    // the starting position; for the initial snapshot we rely on a REPEATABLE
-    // READ transaction instead of the exported snapshot — simpler and works on
-    // any connection.
+    // `pg_create_logical_replication_slot(...)` has long returned
+    // `(slot_name, lsn)` via SQL, and this query relies only on that stable
+    // shape. The limitation here is not the returned columns but that the SQL
+    // function path does not give us the equivalent of replication-protocol
+    // `EXPORT_SNAPSHOT` for bootstrapping from an exported snapshot. We
+    // capture the LSN as the starting position and use a REPEATABLE READ
+    // transaction for the initial snapshot instead, which keeps this path
+    // usable from a normal connection.
     let row = client
         .query_one(
             "SELECT slot_name, lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput', $2)",

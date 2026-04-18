@@ -19,8 +19,9 @@ limitations under the License.
 //! Modeled after [`crate::dynamodb`]'s streams metrics: a lightweight
 //! `Collector` with `AtomicU64` counters and an `RwLock<SystemTime>` watermark,
 //! wrapped in a read-only `Metrics` handle. The connector exposes these via
-//! `MetricsProvider` so they flow through OpenTelemetry as
-//! `dataset_postgres_<name>` observables.
+//! `MetricsProvider` so they flow through OpenTelemetry as observables named
+//! `dataset_postgres_<metric_spec_name>`, for example
+//! `dataset_postgres_replication_lag_ms`.
 
 use std::sync::{
     Arc, RwLock,
