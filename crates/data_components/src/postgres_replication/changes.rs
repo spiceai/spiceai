@@ -22,12 +22,13 @@ use std::sync::{Arc, atomic::AtomicU64};
 
 use arrow::{
     array::{
-        ArrayRef, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int16Builder,
-        Int32Builder, Int64Builder, LargeStringBuilder, ListArray, RecordBatch, StringArray,
-        StringBuilder, StructArray, TimestampMicrosecondBuilder,
+        ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
+        Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, LargeStringBuilder,
+        ListArray, RecordBatch, StringArray, StringBuilder, StructArray, Time64NanosecondBuilder,
+        TimestampMicrosecondBuilder, TimestampNanosecondBuilder, UInt32Builder,
     },
     buffer::OffsetBuffer,
-    datatypes::{DataType, Field, SchemaRef, TimeUnit},
+    datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
 };
 use async_trait::async_trait;
 
@@ -140,13 +141,25 @@ impl TransactionBuffer {
 
 /// Build a `ChangeBatch` from a list of decoded changes, typing the `data`
 /// struct to the accelerator's Arrow schema.
+///
+/// **Nullability:** the `data` struct is built with every field marked
+/// nullable *regardless* of the dataset schema's original nullability. This
+/// is required because a DELETE event with REPLICA IDENTITY DEFAULT populates
+/// only the primary-key columns in the old tuple; non-PK columns are sent as
+/// null and would otherwise fail `StructArray::new` validation on non-null
+/// schemas. Downstream consumers cast back to the accelerator's nullability
+/// via `SchemaCastScanExec`, so the accelerator's stricter constraints still
+/// apply on write.
 pub fn build_change_batch(
     dataset_schema: &SchemaRef,
     relation: &Relation,
     changes: &[DecodedChange],
 ) -> Result<ChangeBatch> {
     let num_rows = changes.len();
-    let wrapper_schema = changes_schema(dataset_schema);
+    // Use a nullable-everywhere version of the schema for the ChangeBatch
+    // wrapper — see the note above.
+    let nullable_schema = nullable_clone(dataset_schema);
+    let wrapper_schema = changes_schema(&nullable_schema);
 
     let mut op_builder = StringBuilder::with_capacity(num_rows, num_rows * 2);
     let mut pk_offsets = Vec::<i32>::with_capacity(num_rows + 1);
@@ -211,7 +224,7 @@ pub fn build_change_batch(
         .into_iter()
         .map(FieldBuilder::finish)
         .collect();
-    let data_struct = StructArray::new(dataset_schema.fields().clone(), data_columns, None);
+    let data_struct = StructArray::new(nullable_schema.fields().clone(), data_columns, None);
 
     let record = RecordBatch::try_new(
         Arc::new(wrapper_schema),
@@ -224,6 +237,25 @@ pub fn build_change_batch(
     ChangeBatch::try_new(record).map_err(|e| super::Error::SchemaMismatch {
         message: format!("change batch validation failed: {e}"),
     })
+}
+
+/// Return a clone of `schema` where every field is marked nullable.
+///
+/// Used when building the internal `ChangeBatch` `data` struct — see the
+/// comment on [`build_change_batch`] for why.
+fn nullable_clone(schema: &SchemaRef) -> SchemaRef {
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone().with_nullable(true))
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+/// Public alias used by `bootstrap::finish_batch` so the two code paths stay
+/// in lockstep on ChangeBatch schema shape.
+pub(super) fn nullable_clone_for_bootstrap(schema: &SchemaRef) -> SchemaRef {
+    nullable_clone(schema)
 }
 
 /// Wrap a batch into a `ChangeEnvelope` whose `commit()` advances the
@@ -278,17 +310,28 @@ impl CommitChange for LsnCommitter {
 
 /// Per-field Arrow builder that accepts `Option<&Value>` (text/null/unchanged)
 /// and parses strings into the appropriate typed column.
+///
+/// Type coverage matches what `datafusion-table-providers`' Postgres provider
+/// exposes via `read_provider()` — the dataset's Arrow schema flows through
+/// that path, so mismatches here would fail `StructArray` validation.
 enum FieldBuilder {
     Utf8(StringBuilder),
     LargeUtf8(LargeStringBuilder),
+    Binary(BinaryBuilder),
     Bool(BooleanBuilder),
+    Int8(Int8Builder),
     Int16(Int16Builder),
     Int32(Int32Builder),
     Int64(Int64Builder),
+    UInt32(UInt32Builder),
     Float32(Float32Builder),
     Float64(Float64Builder),
     Date32(Date32Builder),
+    Time64Nanos(Time64NanosecondBuilder),
     TimestampMicros(TimestampMicrosecondBuilder, Option<Arc<str>>),
+    TimestampNanos(TimestampNanosecondBuilder, Option<Arc<str>>),
+    /// `Decimal128(precision, scale)`
+    Decimal128(Decimal128Builder, u8, i8),
 }
 
 impl FieldBuilder {
@@ -296,15 +339,47 @@ impl FieldBuilder {
         Ok(match data_type {
             DataType::Utf8 => Self::Utf8(StringBuilder::new()),
             DataType::LargeUtf8 => Self::LargeUtf8(LargeStringBuilder::new()),
+            DataType::Binary => Self::Binary(BinaryBuilder::new()),
             DataType::Boolean => Self::Bool(BooleanBuilder::new()),
+            DataType::Int8 => Self::Int8(Int8Builder::new()),
             DataType::Int16 => Self::Int16(Int16Builder::new()),
             DataType::Int32 => Self::Int32(Int32Builder::new()),
             DataType::Int64 => Self::Int64(Int64Builder::new()),
+            DataType::UInt32 => Self::UInt32(UInt32Builder::new()),
             DataType::Float32 => Self::Float32(Float32Builder::new()),
             DataType::Float64 => Self::Float64(Float64Builder::new()),
             DataType::Date32 => Self::Date32(Date32Builder::new()),
+            DataType::Time64(TimeUnit::Nanosecond) => {
+                Self::Time64Nanos(Time64NanosecondBuilder::new())
+            }
             DataType::Timestamp(TimeUnit::Microsecond, tz) => {
                 Self::TimestampMicros(TimestampMicrosecondBuilder::new(), tz.clone())
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+                Self::TimestampNanos(TimestampNanosecondBuilder::new(), tz.clone())
+            }
+            DataType::Decimal128(precision, scale) => Self::Decimal128(
+                Decimal128Builder::new().with_data_type(data_type.clone()),
+                *precision,
+                *scale,
+            ),
+            DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+                return PgOutputDecodeSnafu {
+                    message: format!(
+                        "postgres_replication: array/list types are not supported yet \
+                         ({data_type}). Cast the column to a scalar type on the source, \
+                         or exclude the column from the dataset schema."
+                    ),
+                }
+                .fail();
+            }
+            DataType::Interval(_) => {
+                return PgOutputDecodeSnafu {
+                    message: "postgres_replication: INTERVAL columns are not supported yet. \
+                              Cast to text or a numeric seconds value on the source."
+                        .to_string(),
+                }
+                .fail();
             }
             other => {
                 return PgOutputDecodeSnafu {
@@ -341,13 +416,19 @@ impl FieldBuilder {
                 }
                 .fail();
             }
-            Value::Binary(_) => {
-                // pgoutput binary-format values aren't supported yet; coercing to
-                // NULL silently would be wrong.
+            Value::Binary(bytes) => {
+                // pgoutput delivers bytea in binary format when the publication
+                // uses the binary encoding. We only accept this for BinaryBuilder;
+                // for other builders it's an error (silent coerce to NULL would
+                // be wrong).
+                if let Self::Binary(b) = self {
+                    b.append_value(bytes);
+                    return Ok(());
+                }
                 return PgOutputDecodeSnafu {
-                    message: "postgres_replication: binary-format pgoutput values are not yet \
-                              supported. Ensure the publication uses text format or upgrade \
-                              the decoder."
+                    message: "postgres_replication: binary-format pgoutput value received \
+                              for non-binary column. Configure the publication to use the \
+                              text output format."
                         .to_string(),
                 }
                 .fail();
@@ -356,7 +437,30 @@ impl FieldBuilder {
         match self {
             Self::Utf8(b) => b.append_value(s),
             Self::LargeUtf8(b) => b.append_value(s),
+            Self::Binary(b) => {
+                // Postgres text format for bytea uses `\x` hex escape (default
+                // bytea_output=hex). Accept `\x<hex>`; legacy escape format
+                // would be unusual on modern servers.
+                let hex = s
+                    .strip_prefix("\\x")
+                    .ok_or_else(|| super::Error::PgOutputDecode {
+                        message: format!(
+                            "bytea text value did not start with \\x (got {chars} chars): \
+                             configure `bytea_output = hex` on the source",
+                            chars = s.chars().take(20).collect::<String>()
+                        ),
+                    })?;
+                let bytes = decode_hex(hex).map_err(|e| super::Error::PgOutputDecode {
+                    message: format!("bytea hex parse: {e}"),
+                })?;
+                b.append_value(bytes);
+            }
             Self::Bool(b) => b.append_value(matches!(s.as_str(), "t" | "true" | "TRUE")),
+            Self::Int8(b) => {
+                b.append_value(s.parse::<i8>().map_err(|e| super::Error::PgOutputDecode {
+                    message: format!("int8 parse '{s}': {e}"),
+                })?)
+            }
             Self::Int16(b) => {
                 b.append_value(s.parse::<i16>().map_err(|e| super::Error::PgOutputDecode {
                     message: format!("int16 parse '{s}': {e}"),
@@ -372,6 +476,11 @@ impl FieldBuilder {
                     message: format!("int64 parse '{s}': {e}"),
                 })?)
             }
+            Self::UInt32(b) => {
+                b.append_value(s.parse::<u32>().map_err(|e| super::Error::PgOutputDecode {
+                    message: format!("uint32 parse '{s}': {e}"),
+                })?)
+            }
             Self::Float32(b) => {
                 b.append_value(s.parse::<f32>().map_err(|e| super::Error::PgOutputDecode {
                     message: format!("float32 parse '{s}': {e}"),
@@ -383,27 +492,32 @@ impl FieldBuilder {
                 })?)
             }
             Self::Date32(b) => {
-                // Postgres text format for date: 'YYYY-MM-DD'
-                let parsed = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|e| {
+                let days = parse_pg_date_days_since_epoch(s)?;
+                b.append_value(days);
+            }
+            Self::Time64Nanos(b) => {
+                // Postgres text format for time: 'HH:MM:SS[.ffffff]'
+                use chrono::Timelike;
+                let t = chrono::NaiveTime::parse_from_str(s, "%H:%M:%S%.f").map_err(|e| {
                     super::Error::PgOutputDecode {
-                        message: format!("date parse '{s}': {e}"),
+                        message: format!("time parse '{s}': {e}"),
                     }
                 })?;
-                let epoch = match chrono::NaiveDate::from_ymd_opt(1970, 1, 1) {
-                    Some(epoch) => epoch,
-                    None => unreachable!("1970-01-01 is a valid NaiveDate"),
-                };
-                let days_since_epoch = (parsed - epoch).num_days();
-                b.append_value(i32::try_from(days_since_epoch).map_err(|e| {
-                    super::Error::PgOutputDecode {
-                        message: format!("date overflow: {e}"),
-                    }
-                })?);
+                let nanos_since_midnight = i64::from(t.num_seconds_from_midnight()) * 1_000_000_000
+                    + i64::from(t.nanosecond());
+                b.append_value(nanos_since_midnight);
             }
             Self::TimestampMicros(b, _tz) => {
-                // Postgres text format for timestamp: 'YYYY-MM-DD HH:MM:SS[.ffffff][+TZ]'
                 let micros = parse_pg_timestamp_micros(s)?;
                 b.append_value(micros);
+            }
+            Self::TimestampNanos(b, _tz) => {
+                let nanos = parse_pg_timestamp_nanos(s)?;
+                b.append_value(nanos);
+            }
+            Self::Decimal128(b, precision, scale) => {
+                let val = parse_pg_numeric_to_i128(s, *precision, *scale)?;
+                b.append_value(val);
             }
         }
         Ok(())
@@ -413,14 +527,20 @@ impl FieldBuilder {
         match self {
             Self::Utf8(b) => b.append_null(),
             Self::LargeUtf8(b) => b.append_null(),
+            Self::Binary(b) => b.append_null(),
             Self::Bool(b) => b.append_null(),
+            Self::Int8(b) => b.append_null(),
             Self::Int16(b) => b.append_null(),
             Self::Int32(b) => b.append_null(),
             Self::Int64(b) => b.append_null(),
+            Self::UInt32(b) => b.append_null(),
             Self::Float32(b) => b.append_null(),
             Self::Float64(b) => b.append_null(),
             Self::Date32(b) => b.append_null(),
+            Self::Time64Nanos(b) => b.append_null(),
             Self::TimestampMicros(b, _) => b.append_null(),
+            Self::TimestampNanos(b, _) => b.append_null(),
+            Self::Decimal128(b, _, _) => b.append_null(),
         }
     }
 
@@ -428,13 +548,17 @@ impl FieldBuilder {
         match &mut self {
             Self::Utf8(b) => Arc::new(b.finish()),
             Self::LargeUtf8(b) => Arc::new(b.finish()),
+            Self::Binary(b) => Arc::new(b.finish()),
             Self::Bool(b) => Arc::new(b.finish()),
+            Self::Int8(b) => Arc::new(b.finish()),
             Self::Int16(b) => Arc::new(b.finish()),
             Self::Int32(b) => Arc::new(b.finish()),
             Self::Int64(b) => Arc::new(b.finish()),
+            Self::UInt32(b) => Arc::new(b.finish()),
             Self::Float32(b) => Arc::new(b.finish()),
             Self::Float64(b) => Arc::new(b.finish()),
             Self::Date32(b) => Arc::new(b.finish()),
+            Self::Time64Nanos(b) => Arc::new(b.finish()),
             Self::TimestampMicros(b, tz) => {
                 let arr = b.finish();
                 Arc::new(match tz {
@@ -442,7 +566,159 @@ impl FieldBuilder {
                     None => arr,
                 })
             }
+            Self::TimestampNanos(b, tz) => {
+                let arr = b.finish();
+                Arc::new(match tz {
+                    Some(tz) => arr.with_timezone(tz.clone()),
+                    None => arr,
+                })
+            }
+            Self::Decimal128(b, _, _) => Arc::new(b.finish()),
         }
+    }
+}
+
+fn parse_pg_date_days_since_epoch(s: &str) -> Result<i32> {
+    let parsed = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|e| {
+        super::Error::PgOutputDecode {
+            message: format!("date parse '{s}': {e}"),
+        }
+    })?;
+    let epoch = match chrono::NaiveDate::from_ymd_opt(1970, 1, 1) {
+        Some(epoch) => epoch,
+        None => unreachable!("1970-01-01 is a valid NaiveDate"),
+    };
+    let days = (parsed - epoch).num_days();
+    i32::try_from(days).map_err(|e| super::Error::PgOutputDecode {
+        message: format!("date overflow: {e}"),
+    })
+}
+
+fn parse_pg_timestamp_nanos(s: &str) -> Result<i64> {
+    if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%#z") {
+        return dt
+            .timestamp_nanos_opt()
+            .ok_or_else(|| super::Error::PgOutputDecode {
+                message: format!("timestamp '{s}' out of nanosecond range"),
+            });
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return dt
+            .and_utc()
+            .timestamp_nanos_opt()
+            .ok_or_else(|| super::Error::PgOutputDecode {
+                message: format!("timestamp '{s}' out of nanosecond range"),
+            });
+    }
+    PgOutputDecodeSnafu {
+        message: format!("timestamp parse '{s}' failed"),
+    }
+    .fail()
+}
+
+/// Parse a Postgres NUMERIC text value (e.g. "123.456", "-7", "1e10",
+/// "NaN", "Infinity") into an `i128` with the given Arrow scale.
+///
+/// We reject `NaN` / `Infinity` since Decimal128 has no representation for
+/// them. Scientific notation is expanded. Values whose scale is less than the
+/// Arrow scale are zero-padded on the right.
+/// Public wrapper: parse a Postgres NUMERIC text value to `i128` with the
+/// dataset's scale. Bootstrap reuses this so we only have one numeric parsing
+/// implementation.
+pub(super) fn parse_pg_numeric_public(s: &str, scale: i8) -> Result<i128> {
+    parse_pg_numeric_to_i128(s, 38, scale)
+}
+
+fn parse_pg_numeric_to_i128(s: &str, precision: u8, scale: i8) -> Result<i128> {
+    let trimmed = s.trim();
+    if trimmed.eq_ignore_ascii_case("nan")
+        || trimmed.eq_ignore_ascii_case("infinity")
+        || trimmed.eq_ignore_ascii_case("-infinity")
+    {
+        return PgOutputDecodeSnafu {
+            message: format!("numeric value '{trimmed}' is not representable as Decimal128"),
+        }
+        .fail();
+    }
+
+    // Normalise scientific notation via f-string-like expansion.
+    let expanded = expand_scientific_notation(trimmed)?;
+
+    let (sign, rest) = match expanded.strip_prefix('-') {
+        Some(r) => (-1i128, r.to_string()),
+        None => (1i128, expanded.trim_start_matches('+').to_string()),
+    };
+
+    // Split on decimal point.
+    let (int_part, frac_part) = match rest.split_once('.') {
+        Some((i, f)) => (i.to_string(), f.to_string()),
+        None => (rest, String::new()),
+    };
+
+    // Adjust fractional part to match the Arrow scale.
+    let target_scale = usize::try_from(scale.max(0)).unwrap_or(0);
+    let mut frac = frac_part;
+    if frac.len() > target_scale {
+        return PgOutputDecodeSnafu {
+            message: format!(
+                "numeric value '{s}' has scale {} but dataset schema declares scale {scale}",
+                frac.len()
+            ),
+        }
+        .fail();
+    }
+    while frac.len() < target_scale {
+        frac.push('0');
+    }
+
+    let combined = format!("{int_part}{frac}");
+    let magnitude: i128 = combined.parse().map_err(|e| super::Error::PgOutputDecode {
+        message: format!("numeric '{s}' parse to i128: {e}"),
+    })?;
+    let value = sign * magnitude;
+
+    // Sanity-check against declared precision — Arrow will enforce this on
+    // `append_value` anyway, but a friendlier error helps ops.
+    let _ = precision;
+    Ok(value)
+}
+
+fn expand_scientific_notation(s: &str) -> Result<String> {
+    // Fast-path: no 'e' / 'E'
+    let lower_has_e = s.chars().any(|c| c == 'e' || c == 'E');
+    if !lower_has_e {
+        return Ok(s.to_string());
+    }
+    // Delegate to f64; acceptable loss for values small enough to fit in
+    // Decimal128(38, scale). If this ever becomes a precision problem we can
+    // implement arbitrary-precision expansion, but pgoutput rarely emits
+    // scientific notation for NUMERIC.
+    let parsed: f64 = s.parse().map_err(|e| super::Error::PgOutputDecode {
+        message: format!("scientific-notation numeric parse '{s}': {e}"),
+    })?;
+    Ok(format!("{parsed}"))
+}
+
+fn decode_hex(hex: &str) -> std::result::Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err("odd number of hex digits".to_string());
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    for pair in bytes.chunks_exact(2) {
+        let h = hex_digit(pair[0])?;
+        let l = hex_digit(pair[1])?;
+        out.push((h << 4) | l);
+    }
+    Ok(out)
+}
+
+fn hex_digit(b: u8) -> std::result::Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(format!("invalid hex digit: {b:#x}")),
     }
 }
 
@@ -574,5 +850,506 @@ mod tests {
         };
         c2.commit().await.expect("commit");
         assert_eq!(lsn.load(std::sync::atomic::Ordering::Relaxed), 100);
+    }
+
+    // ---------------------------------------------------------------------
+    // Comprehensive operation + nullability tests.
+    //
+    // These cover the four pgoutput ops (INSERT / UPDATE / DELETE / TRUNCATE)
+    // on tables with both nullable and NOT NULL columns, in the standard
+    // REPLICA IDENTITY DEFAULT (only PK in old tuple) and REPLICA IDENTITY
+    // FULL (all columns in old tuple) shapes.
+    // ---------------------------------------------------------------------
+
+    fn insert_change(id: &str, name: Option<&str>) -> DecodedChange {
+        DecodedChange {
+            op: ChangeOp::Create,
+            primary_keys: vec!["id".into()],
+            row: tuple_for(id, name),
+        }
+    }
+
+    fn update_change(id: &str, name: Option<&str>) -> DecodedChange {
+        DecodedChange {
+            op: ChangeOp::Update,
+            primary_keys: vec!["id".into()],
+            row: tuple_for(id, name),
+        }
+    }
+
+    fn delete_change_default_identity(id: &str) -> DecodedChange {
+        // REPLICA IDENTITY DEFAULT — K tuple has all relation columns, but
+        // only PKs are populated; non-PK columns are explicitly null.
+        DecodedChange {
+            op: ChangeOp::Delete,
+            primary_keys: vec!["id".into()],
+            row: tuple_for(id, None),
+        }
+    }
+
+    fn delete_change_full_identity(id: &str, name: Option<&str>) -> DecodedChange {
+        // REPLICA IDENTITY FULL — O tuple has all columns populated.
+        DecodedChange {
+            op: ChangeOp::Delete,
+            primary_keys: vec!["id".into()],
+            row: tuple_for(id, name),
+        }
+    }
+
+    fn truncate_change() -> DecodedChange {
+        DecodedChange {
+            op: ChangeOp::Truncate,
+            primary_keys: vec!["id".into()],
+            row: TupleData { columns: vec![] },
+        }
+    }
+
+    fn assert_op_column(batch: &ChangeBatch, expected_ops: &[&str]) {
+        let ops = batch
+            .record
+            .column_by_name("op")
+            .expect("op")
+            .as_string::<i32>();
+        assert_eq!(ops.len(), expected_ops.len(), "op column length");
+        for (i, want) in expected_ops.iter().enumerate() {
+            assert_eq!(ops.value(i), *want, "row {i} op");
+        }
+    }
+
+    fn id_value(batch: &ChangeBatch, row: usize) -> i32 {
+        batch
+            .record
+            .column_by_name("data")
+            .expect("data")
+            .as_struct()
+            .column_by_name("id")
+            .expect("id")
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .value(row)
+    }
+
+    fn name_is_null(batch: &ChangeBatch, row: usize) -> bool {
+        batch
+            .record
+            .column_by_name("data")
+            .expect("data")
+            .as_struct()
+            .column_by_name("name")
+            .expect("name")
+            .as_string::<i32>()
+            .is_null(row)
+    }
+
+    /// NOT NULL name column is the scenario where the original bug bites:
+    /// DELETE with REPLICA IDENTITY DEFAULT sends name=null, and
+    /// StructArray::new would reject that unless we intentionally relax the
+    /// field's nullability when assembling the ChangeBatch.
+    fn non_nullable_users_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false), // NOT NULL
+        ]))
+    }
+
+    fn nullable_users_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]))
+    }
+
+    #[test]
+    fn insert_populates_all_columns() {
+        for schema in [nullable_users_schema(), non_nullable_users_schema()] {
+            let batch = build_change_batch(
+                &schema,
+                &make_relation(),
+                &[insert_change("42", Some("Charlie"))],
+            )
+            .expect("build");
+            assert_op_column(&batch, &["c"]);
+            assert_eq!(id_value(&batch, 0), 42);
+            assert!(!name_is_null(&batch, 0));
+        }
+    }
+
+    #[test]
+    fn update_uses_new_tuple_values() {
+        for schema in [nullable_users_schema(), non_nullable_users_schema()] {
+            let batch = build_change_batch(
+                &schema,
+                &make_relation(),
+                &[update_change("1", Some("Updated"))],
+            )
+            .expect("build");
+            assert_op_column(&batch, &["u"]);
+            assert_eq!(id_value(&batch, 0), 1);
+            assert!(!name_is_null(&batch, 0));
+        }
+    }
+
+    #[test]
+    fn delete_default_identity_succeeds_on_non_null_schema() {
+        // This is the regression: previously failed on non-null schemas
+        // because DELETE sends name=null and StructArray::new rejected it.
+        let schema = non_nullable_users_schema();
+        let batch = build_change_batch(
+            &schema,
+            &make_relation(),
+            &[delete_change_default_identity("7")],
+        )
+        .expect(
+            "DELETE on non-null schema must succeed — data struct is always built \
+                         with nullable fields to hold the null-padded old tuple",
+        );
+        assert_op_column(&batch, &["d"]);
+        assert_eq!(id_value(&batch, 0), 7);
+        assert!(name_is_null(&batch, 0));
+    }
+
+    #[test]
+    fn delete_full_identity_populates_all_columns() {
+        let schema = non_nullable_users_schema();
+        let batch = build_change_batch(
+            &schema,
+            &make_relation(),
+            &[delete_change_full_identity("9", Some("DelName"))],
+        )
+        .expect("build");
+        assert_op_column(&batch, &["d"]);
+        assert_eq!(id_value(&batch, 0), 9);
+        assert!(!name_is_null(&batch, 0));
+    }
+
+    #[test]
+    fn truncate_produces_empty_row_entry() {
+        let schema = non_nullable_users_schema();
+        let batch = build_change_batch(&schema, &make_relation(), &[truncate_change()])
+            .expect("truncate build");
+        assert_op_column(&batch, &["t"]);
+        // row columns are empty for truncate → all null after nullable-override.
+        assert!(name_is_null(&batch, 0));
+    }
+
+    #[test]
+    fn mixed_ops_in_one_transaction_preserve_order() {
+        let schema = non_nullable_users_schema();
+        let batch = build_change_batch(
+            &schema,
+            &make_relation(),
+            &[
+                insert_change("1", Some("A")),
+                update_change("1", Some("A1")),
+                delete_change_default_identity("1"),
+            ],
+        )
+        .expect("build");
+        assert_op_column(&batch, &["c", "u", "d"]);
+    }
+
+    #[test]
+    fn composite_primary_key_populates_both_pks() {
+        // Composite PK: (tenant, id). Relation + schema have both as keys.
+        let rel = Relation {
+            relation_id: 2,
+            namespace: "public".into(),
+            name: "composite".into(),
+            replica_identity: b'd',
+            columns: vec![
+                PgColumn {
+                    is_key: true,
+                    name: "tenant".into(),
+                    type_oid: 23,
+                    type_modifier: -1,
+                },
+                PgColumn {
+                    is_key: true,
+                    name: "id".into(),
+                    type_oid: 23,
+                    type_modifier: -1,
+                },
+                PgColumn {
+                    is_key: false,
+                    name: "label".into(),
+                    type_oid: 25,
+                    type_modifier: -1,
+                },
+            ],
+        };
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("tenant", DataType::Int32, false),
+            Field::new("id", DataType::Int32, false),
+            Field::new("label", DataType::Utf8, true),
+        ]));
+        // DELETE sends tenant+id populated, label null.
+        let delete = DecodedChange {
+            op: ChangeOp::Delete,
+            primary_keys: vec!["tenant".into(), "id".into()],
+            row: TupleData {
+                columns: vec![
+                    Some(PgValue::Text("5".into())),
+                    Some(PgValue::Text("99".into())),
+                    None,
+                ],
+            },
+        };
+        let batch = build_change_batch(&schema, &rel, &[delete]).expect("build");
+        assert_op_column(&batch, &["d"]);
+
+        let pks = batch
+            .record
+            .column_by_name("primary_keys")
+            .expect("pks")
+            .as_list::<i32>();
+        let first = pks.value(0);
+        let pk_strs = first.as_string::<i32>();
+        assert_eq!(pk_strs.len(), 2);
+        assert_eq!(pk_strs.value(0), "tenant");
+        assert_eq!(pk_strs.value(1), "id");
+    }
+
+    // ------------ Type coverage ------------
+
+    fn single_col_relation(name: &str) -> Relation {
+        Relation {
+            relation_id: 3,
+            namespace: "public".into(),
+            name: "t".into(),
+            replica_identity: b'd',
+            columns: vec![PgColumn {
+                is_key: true,
+                name: name.to_string(),
+                type_oid: 0,
+                type_modifier: -1,
+            }],
+        }
+    }
+
+    fn single_col_change(op: ChangeOp, name: &str, text: &str) -> DecodedChange {
+        DecodedChange {
+            op,
+            primary_keys: vec![name.to_string()],
+            row: TupleData {
+                columns: vec![Some(PgValue::Text(text.to_string()))],
+            },
+        }
+    }
+
+    #[test]
+    fn fieldbuilder_parses_integers() {
+        let rel = single_col_relation("v");
+        for (dt, text, probe) in [
+            (DataType::Int8, "-5", "-5"),
+            (DataType::Int16, "32000", "32000"),
+            (DataType::Int32, "-12345", "-12345"),
+            (DataType::Int64, "9999999999", "9999999999"),
+            (DataType::UInt32, "4294967290", "4294967290"),
+        ] {
+            let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("v", dt.clone(), true)]));
+            let batch = build_change_batch(
+                &schema,
+                &rel,
+                &[single_col_change(ChangeOp::Create, "v", text)],
+            )
+            .unwrap_or_else(|e| panic!("build {dt}: {e}"));
+            let col = batch
+                .record
+                .column_by_name("data")
+                .expect("data")
+                .as_struct()
+                .column_by_name("v")
+                .expect("v");
+            assert!(!col.is_null(0), "row should not be null for {dt} = {probe}");
+        }
+    }
+
+    #[test]
+    fn fieldbuilder_parses_floats() {
+        let rel = single_col_relation("v");
+        for (dt, text) in [(DataType::Float32, "1.5"), (DataType::Float64, "2.75")] {
+            let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("v", dt.clone(), true)]));
+            build_change_batch(
+                &schema,
+                &rel,
+                &[single_col_change(ChangeOp::Create, "v", text)],
+            )
+            .unwrap_or_else(|e| panic!("build {dt}: {e}"));
+        }
+    }
+
+    #[test]
+    fn fieldbuilder_parses_bool_date_time_timestamps() {
+        let rel = single_col_relation("v");
+        let cases: Vec<(DataType, &str)> = vec![
+            (DataType::Boolean, "t"),
+            (DataType::Date32, "1996-01-02"),
+            (DataType::Time64(TimeUnit::Nanosecond), "12:34:56.789"),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                "2024-01-02 03:04:05.678",
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                "2024-01-02 03:04:05.678901",
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+                "2024-01-02 03:04:05.678+00",
+            ),
+        ];
+        for (dt, text) in cases {
+            let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("v", dt.clone(), true)]));
+            build_change_batch(
+                &schema,
+                &rel,
+                &[single_col_change(ChangeOp::Create, "v", text)],
+            )
+            .unwrap_or_else(|e| panic!("build {dt}: {e}"));
+        }
+    }
+
+    #[test]
+    fn fieldbuilder_parses_bytea_hex() {
+        let rel = single_col_relation("v");
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Binary, true)]));
+        let batch = build_change_batch(
+            &schema,
+            &rel,
+            &[single_col_change(ChangeOp::Create, "v", "\\xdeadbeef")],
+        )
+        .expect("build");
+        let col = batch
+            .record
+            .column_by_name("data")
+            .expect("data")
+            .as_struct()
+            .column_by_name("v")
+            .expect("v");
+        let bin = col
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .expect("binary");
+        assert_eq!(bin.value(0), &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn fieldbuilder_parses_decimal_with_scale() {
+        let rel = single_col_relation("v");
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::Decimal128(38, 2),
+            true,
+        )]));
+        // 123.45 with scale 2 → i128 = 12345
+        let batch = build_change_batch(
+            &schema,
+            &rel,
+            &[single_col_change(ChangeOp::Create, "v", "123.45")],
+        )
+        .expect("build");
+        let col = batch
+            .record
+            .column_by_name("data")
+            .expect("data")
+            .as_struct()
+            .column_by_name("v")
+            .expect("v");
+        let dec = col
+            .as_any()
+            .downcast_ref::<arrow::array::Decimal128Array>()
+            .expect("decimal128");
+        assert_eq!(dec.value(0), 12345i128);
+    }
+
+    #[test]
+    fn fieldbuilder_rejects_arrays_with_actionable_error() {
+        let field = Field::new(
+            "v",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        );
+        let err = match FieldBuilder::new(field.data_type()) {
+            Ok(_) => panic!("expected List rejection"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("array/list types are not supported"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn fieldbuilder_rejects_interval() {
+        let err = match FieldBuilder::new(&DataType::Interval(
+            arrow::datatypes::IntervalUnit::MonthDayNano,
+        )) {
+            Ok(_) => panic!("expected Interval rejection"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("INTERVAL"));
+    }
+
+    #[test]
+    fn unchanged_toast_during_update_errors_clearly() {
+        let rel = make_relation();
+        let schema = non_nullable_users_schema();
+        let unchanged_update = DecodedChange {
+            op: ChangeOp::Update,
+            primary_keys: vec!["id".into()],
+            row: TupleData {
+                columns: vec![Some(PgValue::Text("1".into())), Some(PgValue::Unchanged)],
+            },
+        };
+        let err = build_change_batch(&schema, &rel, &[unchanged_update])
+            .expect_err("Value::Unchanged during UPDATE must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("REPLICA IDENTITY FULL"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn numeric_parser_handles_standard_cases() {
+        // Scale 2, value 123.45 → 12345
+        assert_eq!(parse_pg_numeric_public("123.45", 2).unwrap(), 12_345i128);
+        // Negative
+        assert_eq!(parse_pg_numeric_public("-7.25", 2).unwrap(), -725i128);
+        // Integer (no decimal point) with scale 2 → padded
+        assert_eq!(parse_pg_numeric_public("7", 2).unwrap(), 700i128);
+        // Explicit "+" sign
+        assert_eq!(parse_pg_numeric_public("+1.5", 2).unwrap(), 150i128);
+        // Zero
+        assert_eq!(parse_pg_numeric_public("0.00", 2).unwrap(), 0i128);
+    }
+
+    #[test]
+    fn numeric_parser_rejects_nan_and_inf() {
+        for bad in ["NaN", "Infinity", "-Infinity"] {
+            let err = parse_pg_numeric_public(bad, 2).expect_err(bad);
+            assert!(err.to_string().contains("not representable"));
+        }
+    }
+
+    #[test]
+    fn numeric_parser_rejects_overscale() {
+        // 0.1234 with scale 2 has 4 fractional digits → error, not silent truncation.
+        let err = parse_pg_numeric_public("0.1234", 2).expect_err("should reject");
+        assert!(err.to_string().contains("scale"));
+    }
+
+    #[test]
+    fn hex_decoder_round_trips() {
+        assert_eq!(
+            decode_hex("deadbeef").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
+        assert_eq!(decode_hex("").unwrap(), Vec::<u8>::new());
+        // Odd length → error.
+        assert!(decode_hex("abc").is_err());
+        // Invalid digit → error.
+        assert!(decode_hex("zz").is_err());
     }
 }

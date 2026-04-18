@@ -27,9 +27,10 @@ use std::sync::{Arc, atomic::AtomicU64};
 
 use arrow::{
     array::{
-        ArrayRef, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int16Builder,
-        Int32Builder, Int64Builder, LargeStringBuilder, ListArray, RecordBatch, StringArray,
-        StringBuilder, StructArray, TimestampMicrosecondBuilder,
+        ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
+        Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, LargeStringBuilder,
+        ListArray, RecordBatch, StringArray, StringBuilder, StructArray, Time64NanosecondBuilder,
+        TimestampMicrosecondBuilder, TimestampNanosecondBuilder, UInt32Builder,
     },
     buffer::OffsetBuffer,
     datatypes::{DataType, Field, SchemaRef, TimeUnit},
@@ -290,8 +291,13 @@ fn finish_batch(
         None,
     );
 
-    let data_struct = StructArray::new(dataset_schema.fields().clone(), data_arrays, None);
-    let wrapper_schema = Arc::new(changes_schema(dataset_schema));
+    // Mirror the nullability decision in `changes::build_change_batch`: the
+    // ChangeBatch's internal data struct is always nullable so it can hold
+    // null-padded rows (not relevant for bootstrap, but keeps the schema
+    // identical to the WAL path so downstream code sees a consistent shape).
+    let nullable_schema = super::changes::nullable_clone_for_bootstrap(dataset_schema);
+    let data_struct = StructArray::new(nullable_schema.fields().clone(), data_arrays, None);
+    let wrapper_schema = Arc::new(changes_schema(&nullable_schema));
     let record = RecordBatch::try_new(
         wrapper_schema,
         vec![
@@ -316,14 +322,20 @@ fn quote_ident(s: &str) -> String {
 enum BootstrapBuilder {
     Utf8(StringBuilder),
     LargeUtf8(LargeStringBuilder),
+    Binary(BinaryBuilder),
     Bool(BooleanBuilder),
+    Int8(Int8Builder),
     Int16(Int16Builder),
     Int32(Int32Builder),
     Int64(Int64Builder),
+    UInt32(UInt32Builder),
     Float32(Float32Builder),
     Float64(Float64Builder),
     Date32(Date32Builder),
+    Time64Nanos(Time64NanosecondBuilder),
     TimestampMicros(TimestampMicrosecondBuilder, Option<Arc<str>>),
+    TimestampNanos(TimestampNanosecondBuilder, Option<Arc<str>>),
+    Decimal128(Decimal128Builder, u8, i8),
 }
 
 impl BootstrapBuilder {
@@ -331,15 +343,46 @@ impl BootstrapBuilder {
         Ok(match data_type {
             DataType::Utf8 => Self::Utf8(StringBuilder::new()),
             DataType::LargeUtf8 => Self::LargeUtf8(LargeStringBuilder::new()),
+            DataType::Binary => Self::Binary(BinaryBuilder::new()),
             DataType::Boolean => Self::Bool(BooleanBuilder::new()),
+            DataType::Int8 => Self::Int8(Int8Builder::new()),
             DataType::Int16 => Self::Int16(Int16Builder::new()),
             DataType::Int32 => Self::Int32(Int32Builder::new()),
             DataType::Int64 => Self::Int64(Int64Builder::new()),
+            DataType::UInt32 => Self::UInt32(UInt32Builder::new()),
             DataType::Float32 => Self::Float32(Float32Builder::new()),
             DataType::Float64 => Self::Float64(Float64Builder::new()),
             DataType::Date32 => Self::Date32(Date32Builder::new()),
+            DataType::Time64(TimeUnit::Nanosecond) => {
+                Self::Time64Nanos(Time64NanosecondBuilder::new())
+            }
             DataType::Timestamp(TimeUnit::Microsecond, tz) => {
                 Self::TimestampMicros(TimestampMicrosecondBuilder::new(), tz.clone())
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+                Self::TimestampNanos(TimestampNanosecondBuilder::new(), tz.clone())
+            }
+            DataType::Decimal128(precision, scale) => Self::Decimal128(
+                Decimal128Builder::new().with_data_type(data_type.clone()),
+                *precision,
+                *scale,
+            ),
+            DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+                return PgOutputDecodeSnafu {
+                    message: format!(
+                        "bootstrap: array/list types are not supported yet ({data_type}). \
+                         Cast the column to a scalar type on the source, or exclude it."
+                    ),
+                }
+                .fail();
+            }
+            DataType::Interval(_) => {
+                return PgOutputDecodeSnafu {
+                    message: "bootstrap: INTERVAL columns are not supported yet. \
+                              Cast to text or numeric seconds on the source."
+                        .to_string(),
+                }
+                .fail();
             }
             other => {
                 return PgOutputDecodeSnafu {
@@ -375,11 +418,30 @@ impl BootstrapBuilder {
                     None => b.append_null(),
                 }
             }
+            Self::Binary(b) => {
+                let v: Option<Vec<u8>> =
+                    row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
+                        message: format!("bootstrap read bytea: {e}"),
+                    })?;
+                match v {
+                    Some(bytes) => b.append_value(bytes),
+                    None => b.append_null(),
+                }
+            }
             Self::Bool(b) => {
                 let v: Option<bool> =
                     row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
                         message: format!("bootstrap read bool: {e}"),
                     })?;
+                match v {
+                    Some(x) => b.append_value(x),
+                    None => b.append_null(),
+                }
+            }
+            Self::Int8(b) => {
+                let v: Option<i8> = row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
+                    message: format!("bootstrap read int8: {e}"),
+                })?;
                 match v {
                     Some(x) => b.append_value(x),
                     None => b.append_null(),
@@ -409,6 +471,16 @@ impl BootstrapBuilder {
                 let v: Option<i64> =
                     row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
                         message: format!("bootstrap read int64: {e}"),
+                    })?;
+                match v {
+                    Some(x) => b.append_value(x),
+                    None => b.append_null(),
+                }
+            }
+            Self::UInt32(b) => {
+                let v: Option<u32> =
+                    row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
+                        message: format!("bootstrap read uint32: {e}"),
                     })?;
                 match v {
                     Some(x) => b.append_value(x),
@@ -456,8 +528,22 @@ impl BootstrapBuilder {
                     None => b.append_null(),
                 }
             }
+            Self::Time64Nanos(b) => {
+                use chrono::Timelike;
+                let v: Option<chrono::NaiveTime> =
+                    row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
+                        message: format!("bootstrap read time: {e}"),
+                    })?;
+                match v {
+                    Some(t) => {
+                        let nanos = i64::from(t.num_seconds_from_midnight()) * 1_000_000_000
+                            + i64::from(t.nanosecond());
+                        b.append_value(nanos);
+                    }
+                    None => b.append_null(),
+                }
+            }
             Self::TimestampMicros(b, _tz) => {
-                // Differentiate timestamptz vs timestamp.
                 if pg_type == Type::TIMESTAMPTZ {
                     let v: Option<chrono::DateTime<chrono::Utc>> =
                         row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
@@ -478,6 +564,62 @@ impl BootstrapBuilder {
                     }
                 }
             }
+            Self::TimestampNanos(b, _tz) => {
+                if pg_type == Type::TIMESTAMPTZ {
+                    let v: Option<chrono::DateTime<chrono::Utc>> =
+                        row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
+                            message: format!("bootstrap read timestamptz: {e}"),
+                        })?;
+                    match v {
+                        Some(dt) => {
+                            let nanos = dt.timestamp_nanos_opt().ok_or_else(|| {
+                                super::Error::SchemaMismatch {
+                                    message: format!("timestamptz '{dt}' out of nanosecond range"),
+                                }
+                            })?;
+                            b.append_value(nanos);
+                        }
+                        None => b.append_null(),
+                    }
+                } else {
+                    let v: Option<chrono::NaiveDateTime> =
+                        row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
+                            message: format!("bootstrap read timestamp: {e}"),
+                        })?;
+                    match v {
+                        Some(dt) => {
+                            let nanos = dt.and_utc().timestamp_nanos_opt().ok_or_else(|| {
+                                super::Error::SchemaMismatch {
+                                    message: format!("timestamp '{dt}' out of nanosecond range"),
+                                }
+                            })?;
+                            b.append_value(nanos);
+                        }
+                        None => b.append_null(),
+                    }
+                }
+            }
+            Self::Decimal128(b, _precision, scale) => {
+                // Read NUMERIC as text from Postgres; parse to i128 with the
+                // dataset's declared scale. Uses the same routine as the WAL
+                // path so behavior is consistent.
+                let v: Option<String> =
+                    row.try_get(idx).map_err(|e| super::Error::SchemaMismatch {
+                        message: format!("bootstrap read numeric (as text): {e}"),
+                    })?;
+                match v {
+                    Some(s) => {
+                        let value =
+                            super::changes::parse_pg_numeric_public(&s, *scale).map_err(|e| {
+                                super::Error::SchemaMismatch {
+                                    message: format!("bootstrap numeric parse '{s}': {e}"),
+                                }
+                            })?;
+                        b.append_value(value);
+                    }
+                    None => b.append_null(),
+                }
+            }
         }
         Ok(())
     }
@@ -486,13 +628,17 @@ impl BootstrapBuilder {
         match &mut self {
             Self::Utf8(b) => Arc::new(b.finish()),
             Self::LargeUtf8(b) => Arc::new(b.finish()),
+            Self::Binary(b) => Arc::new(b.finish()),
             Self::Bool(b) => Arc::new(b.finish()),
+            Self::Int8(b) => Arc::new(b.finish()),
             Self::Int16(b) => Arc::new(b.finish()),
             Self::Int32(b) => Arc::new(b.finish()),
             Self::Int64(b) => Arc::new(b.finish()),
+            Self::UInt32(b) => Arc::new(b.finish()),
             Self::Float32(b) => Arc::new(b.finish()),
             Self::Float64(b) => Arc::new(b.finish()),
             Self::Date32(b) => Arc::new(b.finish()),
+            Self::Time64Nanos(b) => Arc::new(b.finish()),
             Self::TimestampMicros(b, tz) => {
                 let arr = b.finish();
                 Arc::new(match tz {
@@ -500,6 +646,14 @@ impl BootstrapBuilder {
                     None => arr,
                 })
             }
+            Self::TimestampNanos(b, tz) => {
+                let arr = b.finish();
+                Arc::new(match tz {
+                    Some(tz) => arr.with_timezone(tz.clone()),
+                    None => arr,
+                })
+            }
+            Self::Decimal128(b, _, _) => Arc::new(b.finish()),
         }
     }
 }
