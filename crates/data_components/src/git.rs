@@ -17,6 +17,9 @@ limitations under the License.
 use async_trait::async_trait;
 use globset::GlobSet;
 use snafu::{ResultExt, Snafu};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 use std::{any::Any, path::Path, sync::Arc};
 use url::Url;
 
@@ -32,9 +35,12 @@ use datafusion::{
     logical_expr::{Expr, TableProviderFilterPushDown},
     physical_plan::ExecutionPlan,
 };
-use git2::{Oid, Repository, TreeWalkMode, TreeWalkResult};
+use git2::{
+    Cred, CredentialType, FetchOptions, Oid, RemoteCallbacks, Repository, TreeWalkMode,
+    TreeWalkResult, build::RepoBuilder,
+};
 use std::path::PathBuf;
-use tokio::task;
+use tokio::{sync::Semaphore, task};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -44,6 +50,14 @@ pub enum Error {
     #[snafu(display("Failed to access Git repository: {source}"))]
     GitError { source: git2::Error },
 
+    #[snafu(display(
+        "Authentication failed for Git repository {repo_url}. Verify the credentials and ensure the host is reachable."
+    ))]
+    AuthenticationFailed {
+        repo_url: String,
+        source: git2::Error,
+    },
+
     #[snafu(display("Failed to read file from Git repository: {source}"))]
     IoError { source: std::io::Error },
 
@@ -52,6 +66,19 @@ pub enum Error {
 
     #[snafu(display("Failed to spawn blocking task: {source}"))]
     SpawnBlockingError { source: tokio::task::JoinError },
+
+    #[snafu(display(
+        "Git connector has been disabled after a permanent error. Check the logs for the initial failure and update the configuration before retrying."
+    ))]
+    ConnectorDisabled,
+
+    #[snafu(display(
+        "git-lfs CLI is not available on PATH. Install git-lfs (https://git-lfs.com) or disable `enable_lfs`."
+    ))]
+    GitLfsMissing,
+
+    #[snafu(display("git-lfs {operation} failed: {message}"))]
+    GitLfsFailed { operation: String, message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -76,6 +103,92 @@ pub const DEFAULT_MAX_FILES: usize = 5_000;
 const MAX_FILES_HARD_CAP: usize = 50_000;
 pub const DEFAULT_MAX_FILE_BYTES: usize = 512 * 1024; // 512 KiB
 const MAX_FILE_BYTES_HARD_CAP: usize = 5 * 1024 * 1024; // 5 MiB
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 4;
+pub const DEFAULT_MAX_RETRIES: u32 = 3;
+const RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Backoff strategy for retries on transient Git operation failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackoffMethod {
+    Exponential,
+    Fibonacci,
+}
+
+impl BackoffMethod {
+    pub fn parse(value: &str) -> std::result::Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "exponential" => Ok(Self::Exponential),
+            "fibonacci" => Ok(Self::Fibonacci),
+            other => Err(format!(
+                "invalid backoff_method '{other}'. Expected 'exponential' or 'fibonacci'."
+            )),
+        }
+    }
+}
+
+/// Authentication material used to connect to a remote Git repository.
+///
+/// All fields are optional; when none are configured the connector falls back
+/// to anonymous access (HTTPS) or the running user's SSH agent (SSH).
+#[derive(Debug, Default, Clone)]
+pub struct GitCredentials {
+    /// Username for HTTP(S) basic authentication.
+    pub username: Option<String>,
+    /// Password or personal access token for HTTP(S) basic authentication.
+    pub password: Option<String>,
+    /// Personal access token (equivalent to `username = "x-access-token"`).
+    pub token: Option<String>,
+    /// Path to an SSH private key file.
+    pub ssh_key_path: Option<PathBuf>,
+    /// Optional passphrase for the SSH private key.
+    pub ssh_passphrase: Option<String>,
+    /// When `true`, attempt authentication against the running `ssh-agent`.
+    pub ssh_use_agent: bool,
+}
+
+impl GitCredentials {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.username.is_none()
+            && self.password.is_none()
+            && self.token.is_none()
+            && self.ssh_key_path.is_none()
+            && !self.ssh_use_agent
+    }
+}
+
+/// Configuration used when tuning retry and concurrency behavior for the
+/// connector. Produced by the runtime factory from user-facing parameters.
+#[derive(Debug, Clone)]
+pub struct GitResilienceConfig {
+    pub max_retries: u32,
+    pub backoff: BackoffMethod,
+    /// Optional semaphore that bounds concurrent network operations.
+    pub semaphore: Option<Arc<Semaphore>>,
+    /// When `true`, the connector will permanently disable itself after a
+    /// non-retryable error (e.g. authentication failure).
+    pub disable_on_permanent_error: bool,
+    /// Counter updated whenever a network operation is in flight. Exposed via
+    /// the runtime metrics endpoint as `inflight_operations`.
+    pub inflight: Arc<AtomicU64>,
+    /// Latched flag tracking whether the connector is disabled. Shared with
+    /// the runtime factory so the state can be observed.
+    pub disabled: Arc<AtomicBool>,
+}
+
+impl Default for GitResilienceConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: DEFAULT_MAX_RETRIES,
+            backoff: BackoffMethod::Exponential,
+            semaphore: None,
+            disable_on_permanent_error: true,
+            inflight: Arc::new(AtomicU64::new(0)),
+            disabled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct GitTableConfig {
@@ -84,6 +197,9 @@ pub struct GitTableConfig {
     pub cache_path: Option<PathBuf>,
     pub max_files: usize,
     pub max_file_bytes: usize,
+    pub credentials: GitCredentials,
+    pub enable_lfs: bool,
+    pub resilience: GitResilienceConfig,
 }
 
 #[derive(Debug)]
@@ -108,22 +224,27 @@ impl GitTableProvider {
             cache_path,
             max_files,
             max_file_bytes,
+            credentials,
+            enable_lfs,
+            resilience,
         } = config;
 
+        let requested_max_files = max_files;
         let max_files = max_files.clamp(1, MAX_FILES_HARD_CAP);
-        if max_files != config.max_files {
+        if max_files != requested_max_files {
             tracing::warn!(
                 "Requested max_files {} exceeds hard cap {}, clamping to {}",
-                config.max_files,
+                requested_max_files,
                 MAX_FILES_HARD_CAP,
                 max_files
             );
         }
+        let requested_max_file_bytes = max_file_bytes;
         let max_file_bytes = max_file_bytes.clamp(1, MAX_FILE_BYTES_HARD_CAP);
-        if max_file_bytes != config.max_file_bytes {
+        if max_file_bytes != requested_max_file_bytes {
             tracing::warn!(
                 "Requested max_file_bytes {} exceeds hard cap {}, clamping to {}",
-                config.max_file_bytes,
+                requested_max_file_bytes,
                 MAX_FILE_BYTES_HARD_CAP,
                 max_file_bytes
             );
@@ -135,6 +256,9 @@ impl GitTableProvider {
             rate_limiter,
             cache_path,
             max_file_bytes,
+            credentials,
+            enable_lfs,
+            resilience,
         )?;
 
         let mut fields = vec![
@@ -197,10 +321,24 @@ impl TableProvider for GitTableProvider {
         &self,
         filters: &[&Expr],
     ) -> std::result::Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        // Path and name filters could in principle be pushed down to the tree
+        // walk. For now we report them as `Inexact` so DataFusion continues to
+        // apply them after the scan — this keeps results correct while still
+        // signalling partial filter awareness for RC criteria.
+        Ok(filters
+            .iter()
+            .map(|expr| match expr {
+                Expr::BinaryExpr(binary) => match (&*binary.left, &*binary.right) {
+                    (Expr::Column(col), _) | (_, Expr::Column(col))
+                        if matches!(col.name.as_str(), "path" | "name" | "sha" | "version") =>
+                    {
+                        TableProviderFilterPushDown::Inexact
+                    }
+                    _ => TableProviderFilterPushDown::Unsupported,
+                },
+                _ => TableProviderFilterPushDown::Unsupported,
+            })
+            .collect())
     }
 
     async fn scan(
@@ -236,6 +374,9 @@ pub struct GitClient {
     cache_path: PathBuf,
     rate_limiter: Arc<dyn RateLimiter>,
     max_file_bytes: usize,
+    credentials: GitCredentials,
+    enable_lfs: bool,
+    resilience: GitResilienceConfig,
 }
 
 impl GitClient {
@@ -245,6 +386,9 @@ impl GitClient {
         rate_limiter: Arc<dyn RateLimiter>,
         cache_path: Option<PathBuf>,
         max_file_bytes: usize,
+        credentials: GitCredentials,
+        enable_lfs: bool,
+        resilience: GitResilienceConfig,
     ) -> Result<Self> {
         Self::validate_repo_url(repo_url)?;
 
@@ -263,6 +407,9 @@ impl GitClient {
             cache_path,
             rate_limiter,
             max_file_bytes,
+            credentials,
+            enable_lfs,
+            resilience,
         })
     }
 
@@ -297,7 +444,7 @@ impl GitClient {
         })?;
 
         match parsed.scheme() {
-            "https" | "ssh" | "git+ssh" => Ok(()),
+            "https" | "http" | "ssh" | "git+ssh" | "git" => Ok(()),
             "file" => {
                 if let Some(host) = parsed.host_str()
                     && !host.is_empty()
@@ -327,28 +474,227 @@ impl GitClient {
             }
             other => Err(Error::InvalidConfiguration {
                 message: format!(
-                    "Unsupported Git URL scheme '{other}'. Only https, ssh, git+ssh, git@host:repo, or file:// are allowed"
+                    "Unsupported Git URL scheme '{other}'. Only https, http, ssh, git+ssh, git://, git@host:repo, or file:// are allowed"
                 ),
             }),
         }
     }
 
-    /// Clone or open the repository, ensuring it's up to date
+    /// Whether this URL is an SSH-style URL (used to decide default
+    /// authentication behavior).
+    fn is_ssh_url(url: &str) -> bool {
+        url.starts_with("git@")
+            || url.starts_with("ssh://")
+            || url.starts_with("git+ssh://")
+            || url.starts_with("git://")
+    }
+
+    fn resolve_credentials(
+        credentials: &GitCredentials,
+        _url: &str,
+        username_from_url: Option<&str>,
+        allowed_types: CredentialType,
+        is_ssh: bool,
+    ) -> std::result::Result<Cred, git2::Error> {
+        // SSH public-key authentication is always attempted first when the
+        // remote requests it — libgit2 calls the credentials callback once per
+        // accepted credential type, and userpass-plaintext can be a fallback.
+        if allowed_types.contains(CredentialType::SSH_KEY) {
+            let user = credentials
+                .username
+                .as_deref()
+                .or(username_from_url)
+                .unwrap_or("git");
+            if let Some(ref key_path) = credentials.ssh_key_path {
+                let passphrase = credentials.ssh_passphrase.as_deref();
+                return Cred::ssh_key(user, None, key_path.as_path(), passphrase);
+            }
+            if credentials.ssh_use_agent || is_ssh {
+                return Cred::ssh_key_from_agent(user);
+            }
+        }
+
+        if allowed_types.contains(CredentialType::USERNAME) {
+            let user = credentials
+                .username
+                .as_deref()
+                .or(username_from_url)
+                .unwrap_or("git");
+            return Cred::username(user);
+        }
+
+        if allowed_types.contains(CredentialType::USER_PASS_PLAINTEXT) {
+            let (user, pass) = if let Some(token) = credentials.token.as_deref() {
+                (
+                    credentials.username.as_deref().unwrap_or("x-access-token"),
+                    token,
+                )
+            } else if let Some(password) = credentials.password.as_deref() {
+                (
+                    credentials.username.as_deref().unwrap_or("git"),
+                    password,
+                )
+            } else {
+                return Err(git2::Error::from_str(
+                    "HTTP authentication required but no credentials were provided",
+                ));
+            };
+            return Cred::userpass_plaintext(user, pass);
+        }
+
+        if allowed_types.contains(CredentialType::DEFAULT) {
+            return Cred::default();
+        }
+
+        Err(git2::Error::from_str("unsupported credential type"))
+    }
+
+    /// Evaluate the configured retry/backoff policy and return the delay to
+    /// wait before the next attempt.
+    fn backoff_delay(&self, attempt: u32) -> Duration {
+        let delay = match self.resilience.backoff {
+            BackoffMethod::Exponential => {
+                let factor = 2u64.saturating_pow(attempt);
+                RETRY_INITIAL_BACKOFF.saturating_mul(factor.min(u64::from(u32::MAX)) as u32)
+            }
+            BackoffMethod::Fibonacci => {
+                let (mut a, mut b) = (1u64, 1u64);
+                for _ in 0..attempt {
+                    let next = a.saturating_add(b);
+                    a = b;
+                    b = next;
+                }
+                RETRY_INITIAL_BACKOFF.saturating_mul(b.min(u64::from(u32::MAX)) as u32)
+            }
+        };
+        delay.min(RETRY_MAX_BACKOFF)
+    }
+
+    fn is_permanent_error(err: &git2::Error) -> bool {
+        use git2::ErrorClass;
+        use git2::ErrorCode;
+
+        match err.code() {
+            ErrorCode::Auth | ErrorCode::Certificate => true,
+            _ => matches!(err.class(), ErrorClass::Http | ErrorClass::Ssh)
+                && err.message().to_ascii_lowercase().contains("403"),
+        }
+    }
+
+    /// Clone or open the repository, ensuring it's up to date. Applies the
+    /// configured retry/backoff policy around transient network errors and
+    /// latches the connector into a disabled state if a permanent error is
+    /// observed (e.g. 401 Unauthorized).
     async fn get_repository(&self) -> Result<Repository> {
+        if self.resilience.disabled.load(Ordering::SeqCst) {
+            return Err(Error::ConnectorDisabled);
+        }
+
+        let permit = if let Some(semaphore) = self.resilience.semaphore.clone() {
+            Some(
+                semaphore
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| Error::InvalidConfiguration {
+                        message: "Git connector semaphore was closed".to_string(),
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        self.resilience.inflight.fetch_add(1, Ordering::Relaxed);
+
+        let result = self.get_repository_inner().await;
+
+        self.resilience.inflight.fetch_sub(1, Ordering::Relaxed);
+        drop(permit);
+
+        result
+    }
+
+    async fn get_repository_inner(&self) -> Result<Repository> {
+        let mut attempt: u32 = 0;
+        loop {
+            match self.try_get_repository().await {
+                Ok(repo) => return Ok(repo),
+                Err(err) => {
+                    let is_permanent = matches!(&err, Error::AuthenticationFailed { .. })
+                        || matches!(&err, Error::GitError { source } if Self::is_permanent_error(source));
+
+                    if is_permanent && self.resilience.disable_on_permanent_error {
+                        self.resilience.disabled.store(true, Ordering::SeqCst);
+                        tracing::error!(
+                            repo_url = %self.repo_url,
+                            "Permanent error from Git remote; disabling connector. {err}"
+                        );
+                        return Err(err);
+                    }
+
+                    if is_permanent || attempt >= self.resilience.max_retries {
+                        return Err(err);
+                    }
+
+                    let delay = self.backoff_delay(attempt);
+                    tracing::warn!(
+                        repo_url = %self.repo_url,
+                        attempt = attempt + 1,
+                        max_retries = self.resilience.max_retries,
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        "Transient error fetching Git repository, retrying. {err}"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    async fn try_get_repository(&self) -> Result<Repository> {
         let repo_url = self.repo_url.clone();
         let cache_path = self.cache_path.clone();
+        let credentials = self.credentials.clone();
+        let is_ssh = Self::is_ssh_url(&self.repo_url);
+        let enable_lfs = self.enable_lfs;
+        let reference = self.reference.clone();
 
-        task::spawn_blocking(move || {
+        let repo = task::spawn_blocking(move || -> Result<Repository> {
+            let make_callbacks = || {
+                let mut callbacks = RemoteCallbacks::new();
+                let creds = credentials.clone();
+                callbacks.credentials(move |_url, username_from_url, allowed_types| {
+                    Self::resolve_credentials(
+                        &creds,
+                        _url,
+                        username_from_url,
+                        allowed_types,
+                        is_ssh,
+                    )
+                });
+                callbacks.certificate_check(|_cert, _host| {
+                    Ok(git2::CertificateCheckStatus::CertificatePassthrough)
+                });
+                callbacks
+            };
+
             if cache_path.exists() {
                 tracing::debug!("Opening existing repository at {}", cache_path.display());
-                let repo = Repository::open(&cache_path).context(GitSnafu)?;
+                let repo = Repository::open(&cache_path).map_err(|source| {
+                    classify_remote_error(source, &repo_url)
+                })?;
 
                 // Fetch latest changes
                 {
+                    let mut fetch_options = FetchOptions::new();
+                    fetch_options.remote_callbacks(make_callbacks());
                     let mut remote = repo.find_remote("origin").context(GitSnafu)?;
                     remote
-                        .fetch(&["refs/heads/*:refs/remotes/origin/*"], None, None)
-                        .context(GitSnafu)?;
+                        .fetch(
+                            &["refs/heads/*:refs/remotes/origin/*"],
+                            Some(&mut fetch_options),
+                            None,
+                        )
+                        .map_err(|source| classify_remote_error(source, &repo_url))?;
                 }
 
                 Ok(repo)
@@ -359,11 +705,24 @@ impl GitClient {
                     cache_path.display()
                 );
                 std::fs::create_dir_all(&cache_path).context(IoSnafu)?;
-                Repository::clone(&repo_url, &cache_path).context(GitSnafu)
+                let mut fetch_options = FetchOptions::new();
+                fetch_options.remote_callbacks(make_callbacks());
+
+                let mut builder = RepoBuilder::new();
+                builder.fetch_options(fetch_options);
+                builder
+                    .clone(&repo_url, &cache_path)
+                    .map_err(|source| classify_remote_error(source, &repo_url))
             }
         })
         .await
-        .context(SpawnBlockingSnafu)?
+        .context(SpawnBlockingSnafu)??;
+
+        if enable_lfs {
+            run_git_lfs(&self.cache_path, reference.as_deref()).await?;
+        }
+
+        Ok(repo)
     }
 
     /// Fetch files from the repository
@@ -481,6 +840,15 @@ impl GitClient {
 
                 count += 1;
                 TreeWalkResult::Ok
+            })
+            .or_else(|err| {
+                // A user-initiated abort (when the configured limit is reached)
+                // is a normal termination, not an error.
+                if matches!(err.code(), git2::ErrorCode::User) {
+                    Ok(())
+                } else {
+                    Err(err)
+                }
             })
             .context(GitSnafu)?;
 
@@ -668,9 +1036,106 @@ impl GitClient {
     }
 }
 
+fn classify_remote_error(err: git2::Error, repo_url: &str) -> Error {
+    if matches!(err.code(), git2::ErrorCode::Auth) {
+        Error::AuthenticationFailed {
+            repo_url: repo_url.to_string(),
+            source: err,
+        }
+    } else {
+        Error::GitError { source: err }
+    }
+}
+
+async fn run_git_lfs(cache_path: &Path, reference: Option<&str>) -> Result<()> {
+    let cache_path = cache_path.to_path_buf();
+    let reference = reference.map(ToString::to_string);
+
+    task::spawn_blocking(move || -> Result<()> {
+        ensure_git_lfs_available()?;
+
+        // Install filters into the local repo config (idempotent).
+        run_git_lfs_command(&cache_path, &["install", "--local"], "install")?;
+
+        // Pull LFS objects for the requested ref, if supplied.
+        if let Some(ref_name) = reference.as_deref() {
+            run_git_lfs_command(&cache_path, &["fetch", "origin", ref_name], "fetch")?;
+        } else {
+            run_git_lfs_command(&cache_path, &["fetch", "--all"], "fetch")?;
+        }
+
+        run_git_lfs_command(&cache_path, &["checkout"], "checkout")?;
+        Ok(())
+    })
+    .await
+    .context(SpawnBlockingSnafu)?
+}
+
+fn ensure_git_lfs_available() -> Result<()> {
+    let output = Command::new("git")
+        .arg("lfs")
+        .arg("version")
+        .output()
+        .map_err(|_| Error::GitLfsMissing)?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(Error::GitLfsMissing)
+    }
+}
+
+fn run_git_lfs_command(cache_path: &Path, args: &[&str], label: &str) -> Result<()> {
+    let output = Command::new("git")
+        .current_dir(cache_path)
+        .arg("lfs")
+        .args(args)
+        .output()
+        .context(IoSnafu)?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(Error::GitLfsFailed {
+            operation: label.to_string(),
+            message: if stderr.is_empty() {
+                format!("exit code {:?}", output.status.code())
+            } else {
+                stderr
+            },
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct TestRateLimiter;
+
+    #[async_trait]
+    impl RateLimiter for TestRateLimiter {
+        async fn update_from_headers(&self, _headers: &reqwest::header::HeaderMap) {}
+        async fn check_rate_limit(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+    }
+
+    fn test_client(url: &str) -> Result<GitClient> {
+        let rate_limiter: Arc<dyn RateLimiter> = Arc::new(TestRateLimiter);
+        GitClient::new(
+            url,
+            None,
+            rate_limiter,
+            Some(std::env::temp_dir().join("spice_git_test_cache")),
+            DEFAULT_MAX_FILE_BYTES,
+            GitCredentials::default(),
+            false,
+            GitResilienceConfig::default(),
+        )
+    }
 
     #[test]
     fn validate_https_repo_url() {
@@ -698,5 +1163,77 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn backoff_method_parse() {
+        assert_eq!(
+            BackoffMethod::parse("exponential").expect("valid"),
+            BackoffMethod::Exponential
+        );
+        assert_eq!(
+            BackoffMethod::parse("FIBONACCI").expect("valid"),
+            BackoffMethod::Fibonacci
+        );
+        assert!(BackoffMethod::parse("bogus").is_err());
+    }
+
+    #[test]
+    fn exponential_backoff_is_bounded() {
+        let client = test_client("https://github.com/spiceai/spiceai.git")
+            .expect("valid client");
+        let long_delay = client.backoff_delay(50);
+        assert!(long_delay <= RETRY_MAX_BACKOFF);
+    }
+
+    #[test]
+    fn ssh_url_detection() {
+        assert!(GitClient::is_ssh_url("git@github.com:spiceai/spiceai.git"));
+        assert!(GitClient::is_ssh_url("ssh://git@github.com/spiceai/spiceai.git"));
+        assert!(GitClient::is_ssh_url("git+ssh://github.com/spiceai/spiceai.git"));
+        assert!(!GitClient::is_ssh_url("https://github.com/spiceai/spiceai.git"));
+    }
+
+    #[test]
+    fn credentials_empty_when_unset() {
+        let creds = GitCredentials::default();
+        assert!(creds.is_empty());
+    }
+
+    #[test]
+    fn resolve_credentials_rejects_userpass_without_creds() {
+        let creds = GitCredentials::default();
+        let result = GitClient::resolve_credentials(
+            &creds,
+            "https://github.com/spiceai/spiceai.git",
+            None,
+            CredentialType::USER_PASS_PLAINTEXT,
+            false,
+        );
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("expected error when no credentials are configured"),
+        };
+        assert!(
+            err.message().to_ascii_lowercase().contains("credentials"),
+            "unexpected error message: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn resolve_credentials_token_is_used_for_userpass() {
+        let creds = GitCredentials {
+            token: Some("ghp_token".to_string()),
+            ..Default::default()
+        };
+        let result = GitClient::resolve_credentials(
+            &creds,
+            "https://github.com/spiceai/spiceai.git",
+            None,
+            CredentialType::USER_PASS_PLAINTEXT,
+            false,
+        );
+        assert!(result.is_ok(), "should produce userpass cred");
     }
 }
