@@ -244,12 +244,41 @@ impl TextSearchTableFunc {
     }
 
     fn parse_args(args: &[Expr]) -> DataFusionResult<TextSearchTableFuncArgs> {
-        // Filter out passthrough parameters (those with `spice.parameter_name` metadata).
-        // These are meant for table functions like RRF (e.g. `rank_weight => X`), not
-        // for `text_search` itself.
-        let mut args = args.iter().filter(|arg| {
-            !matches!(arg, Expr::Literal(_, Some(meta)) if meta.inner().contains_key("spice.parameter_name"))
-        });
+        // Split args into positional and named. Named args carry a
+        // `spice.parameter_name` metadata key (set by the Spice DataFusion
+        // fork for `name => value` syntax). Historically we dropped every
+        // such arg before positional parsing, which silently discarded
+        // user-supplied named args like `limit => 10` or
+        // `include_score => false`. Extract them into a map instead and
+        // merge into the parsed args after positional parsing.
+        fn named_param(e: &Expr) -> Option<(&str, &Expr)> {
+            match e {
+                Expr::Literal(_, Some(meta)) => meta
+                    .inner()
+                    .get("spice.parameter_name")
+                    .map(|n| (n.as_str(), e)),
+                Expr::Alias(alias) => alias
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.inner().get("spice.parameter_name"))
+                    .map(|n| (n.as_str(), alias.expr.as_ref())),
+                _ => None,
+            }
+        }
+        let mut named: std::collections::HashMap<&str, &Expr> =
+            std::collections::HashMap::new();
+        let positional: Vec<&Expr> = args
+            .iter()
+            .filter(|a| {
+                if let Some((name, inner)) = named_param(a) {
+                    named.insert(name, inner);
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        let mut args = positional.into_iter();
 
         let tbl = args.next();
         let Some(Expr::Column(c)) = tbl else {

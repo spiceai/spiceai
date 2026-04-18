@@ -223,7 +223,14 @@ struct ReciprocalRankFusionArgs {
     pub limit: Option<usize>,
 }
 
-type SearchUdtfArgs = (String, String, Option<String>, Option<usize>, Option<bool>);
+type SearchUdtfArgs = (
+    String,
+    String,
+    Option<String>,
+    Option<usize>,
+    Option<bool>,
+    Option<String>,
+);
 
 impl ReciprocalRankFusionArgs {
     /// Constructs `ReciprocalRankFusionArgs` from an rrf UDTF invocation, which is a `TableScan` node
@@ -353,7 +360,16 @@ impl ReciprocalRankFusionArgs {
             decay_constant: self.decay_constant,
             decay_scale_secs: self.decay_scale_secs,
             decay_window_secs: self.decay_window_secs,
-            limit: self.limit.map(|l| u64::try_from(l).unwrap_or(u64::MAX)),
+            limit: self
+                .limit
+                .map(|l| {
+                    u64::try_from(l).map_err(|_| {
+                        DataFusionError::Plan(format!(
+                            "{RRF_UDF_NAME}: limit value {l} cannot be represented as u64 for serialization."
+                        ))
+                    })
+                })
+                .transpose()?,
         })
     }
 
@@ -387,9 +403,7 @@ impl ReciprocalRankFusionArgs {
                         column: search_args.2,
                         limit: search_args.3.map(|l| l as u64),
                         include_score: search_args.4,
-                        // distance_metric is not captured at parse time for nested
-                        // rrf subqueries today; inherit the vector_search default.
-                        distance_metric: None,
+                        distance_metric: search_args.5,
                     },
                     rank_weight,
                 ))
@@ -423,38 +437,65 @@ impl ReciprocalRankFusionArgs {
 
     /// Parses common search UDTF arguments from expressions.
     ///
-    /// Returns: (table, query, column, limit, `include_score`)
+    /// Returns: (table, query, column, limit, `include_score`, `distance_metric`)
+    ///
+    /// Handles both positional arguments and named arguments (which the Spice
+    /// `DataFusion` fork wraps in `Expr::Literal` / `Expr::Alias` with a
+    /// `spice.parameter_name` metadata key). Named args are extracted into a
+    /// map first so they are not silently dropped — otherwise a caller like
+    /// `text_search(foo, 'q', limit => 1000)` or
+    /// `vector_search(foo, 'q', distance_metric => 'l2')` nested inside
+    /// `rrf(...)` would lose the named arg on the way through and execute
+    /// with the wrong semantics.
     fn parse_search_args(args: &[Expr]) -> Result<SearchUdtfArgs> {
-        // Filter out passthrough parameters (those with spice.parameter_name metadata)
-        let args: Vec<_> = args
-            .iter()
-            .filter(|arg| {
-                !matches!(arg, Expr::Literal(_, Some(meta)) if meta.inner().contains_key("spice.parameter_name"))
-            })
-            .collect();
+        fn named_param(e: &Expr) -> Option<(&str, &Expr)> {
+            match e {
+                Expr::Literal(_, Some(meta)) => meta
+                    .inner()
+                    .get("spice.parameter_name")
+                    .map(|n| (n.as_str(), e)),
+                Expr::Alias(alias) => alias
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.inner().get("spice.parameter_name"))
+                    .map(|n| (n.as_str(), alias.expr.as_ref())),
+                _ => None,
+            }
+        }
 
-        // Extract table reference from first arg
-        let table = match args.first() {
+        // Split args into positional (no spice.parameter_name) and named.
+        let mut named: std::collections::HashMap<&str, &Expr> = std::collections::HashMap::new();
+        let mut positional: Vec<&Expr> = Vec::with_capacity(args.len());
+        for a in args {
+            if let Some((name, inner)) = named_param(a) {
+                named.insert(name, inner);
+            } else {
+                positional.push(a);
+            }
+        }
+
+        // Extract table reference from first positional arg
+        let table = match positional.first() {
             Some(Expr::Column(c)) => table_ref_from_column_expr(c).to_quoted_string(),
             _ => {
                 return exec_err!("First argument to search UDTF must be a table reference");
             }
         };
 
-        // Extract query string from second arg
-        let query = match args.get(1) {
+        // Extract query string from second positional arg
+        let query = match positional.get(1) {
             Some(Expr::Literal(ScalarValue::Utf8(Some(q)), _)) => q.clone(),
             _ => {
                 return exec_err!("Second argument to search UDTF must be a query string");
             }
         };
 
-        // Extract optional column, limit, include_score from remaining args
+        // Extract optional column, limit, include_score from remaining positional args
         let mut column = None;
         let mut limit = None;
         let mut include_score = None;
 
-        for arg in args.iter().skip(2) {
+        for arg in positional.iter().skip(2) {
             match arg {
                 Expr::Column(Column { name, .. }) => {
                     column = Some(name.clone());
@@ -472,7 +513,35 @@ impl ReciprocalRankFusionArgs {
             }
         }
 
-        Ok((table, query, column, limit, include_score))
+        // Merge in named args for any field not already set positionally.
+        if column.is_none() {
+            if let Some(Expr::Column(Column { name, .. })) = named.get("column") {
+                column = Some(name.clone());
+            } else if let Some(Expr::Literal(ScalarValue::Utf8(Some(s)), _)) = named.get("column") {
+                column = Some(s.clone());
+            }
+        }
+        if limit.is_none() {
+            if let Some(Expr::Literal(ScalarValue::UInt64(Some(l)), _)) = named.get("limit") {
+                limit = Some(Self::parse_limit_u64(*l)?);
+            } else if let Some(Expr::Literal(ScalarValue::Int64(Some(l)), _)) = named.get("limit") {
+                limit = Some(Self::parse_limit_i64(*l)?);
+            }
+        }
+        if include_score.is_none() {
+            if let Some(Expr::Literal(ScalarValue::Boolean(Some(b)), _)) =
+                named.get("include_score")
+            {
+                include_score = Some(*b);
+            }
+        }
+
+        let distance_metric = match named.get("distance_metric") {
+            Some(Expr::Literal(ScalarValue::Utf8(Some(s)), _)) => Some(s.clone()),
+            _ => None,
+        };
+
+        Ok((table, query, column, limit, include_score, distance_metric))
     }
 }
 
@@ -702,14 +771,23 @@ impl ReciprocalRankFusion {
             // column names (going through `col()`/`ident()` on the name string
             // would lose the original Column identity).
             let join_key_for_sort = join_key.clone();
-            let sorted = joined
+            // Only drop the synthetic row-id column if it is not the join key
+            // itself. When the user does not provide `join_key`, the inferred
+            // key *is* `__spice_rrf_row_id`, and it must survive into the
+            // final sort (and user-visible output).
+            let join_key_is_rrf_rowid = join_key.qualified_name().1 == "__spice_rrf_row_id";
+            let aggregated = joined
                 .select(columns)?
-                .aggregate(vec![join_key], agg_cols)?
-                .drop_columns(&["__spice_rrf_row_id"])?
-                .sort(vec![
-                    col("fused_score").sort(false, false),
-                    join_key_for_sort.sort(true, true),
-                ])?;
+                .aggregate(vec![join_key], agg_cols)?;
+            let aggregated = if join_key_is_rrf_rowid {
+                aggregated
+            } else {
+                aggregated.drop_columns(&["__spice_rrf_row_id"])?
+            };
+            let sorted = aggregated.sort(vec![
+                col("fused_score").sort(false, false),
+                join_key_for_sort.sort(true, true),
+            ])?;
 
             // Apply the RRF-level limit so `FROM rrf(..., limit => N)` alone is
             // sufficient — users don't have to add an outer LIMIT clause.
@@ -895,13 +973,14 @@ impl ReciprocalRankFusion {
     // Create an internal row ID for rows that don't have a user-provided join key.
     //
     // To keep this cheap, only hash columns whose data type is identity-like
-    // (ints, floats, bool, date/time, decimal, fixed-size binary). Primary keys
-    // are nearly always one of these, and these types serialize to a few bytes
-    // per row instead of the full payload of wide text/list/struct columns.
+    // (ints, floats, bool, date/time, decimal, fixed/variable-size binary,
+    // and strings — which commonly back UUID/hash primary keys). Primary keys
+    // are nearly always one of these, and these types serialize compactly
+    // compared to list/struct columns.
     //
     // If a schema has no identity-like columns (rare — e.g. a table of only
-    // string columns used as a composite key), fall back to hashing all
-    // non-score, non-embedding columns so correctness is preserved.
+    // list/struct columns), fall back to hashing all non-score, non-embedding
+    // columns so correctness is preserved.
     fn with_rrf_rowid(df: DataFrame) -> Result<DataFrame> {
         let schema = df.schema();
         let is_identity_like = |dt: &DataType| -> bool {
@@ -929,6 +1008,12 @@ impl ReciprocalRankFusion {
                     | DataType::Decimal128(_, _)
                     | DataType::Decimal256(_, _)
                     | DataType::FixedSizeBinary(_)
+                    | DataType::Binary
+                    | DataType::LargeBinary
+                    | DataType::BinaryView
+                    | DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Utf8View
             )
         };
 
