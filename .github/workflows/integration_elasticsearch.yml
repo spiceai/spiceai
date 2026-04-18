@@ -35,7 +35,7 @@ env:
 jobs:
   test-elasticsearch:
     name: Elasticsearch Integration Tests
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
 
     services:
       elasticsearch:
