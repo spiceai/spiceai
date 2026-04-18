@@ -108,6 +108,18 @@ pub const DEFAULT_MAX_RETRIES: u32 = 3;
 const RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Matches `Authorization: <scheme>[ <value>]` header strings that a
+/// subprocess may emit, so we can redact the credential before surfacing
+/// stderr to users.
+static AUTH_HEADER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    #[expect(
+        clippy::expect_used,
+        reason = "pattern is a compile-time constant; a failure here would indicate a program bug, not a runtime input error"
+    )]
+    let re = regex::Regex::new(r"(?i)(Authorization\s*:\s*)(\S+\s+)?\S+").expect("valid regex");
+    re
+});
+
 /// Global map of per-cache-path mutexes. Every mutator of a given on-disk
 /// Git cache holds the corresponding mutex for the duration of the operation
 /// so that concurrent clone/fetch/checkout calls targeting the same cache do
@@ -1353,9 +1365,6 @@ fn sanitize_subprocess_output(text: &str, credentials: &GitCredentials) -> Strin
     // Redact any Authorization header (Basic / Bearer / custom scheme) the
     // subprocess might have printed. The match is scoped to the remainder of
     // the line so surrounding log context is preserved.
-    static AUTH_HEADER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)(Authorization\s*:\s*)(\S+\s+)?\S+").expect("valid regex")
-    });
     let cleaned = AUTH_HEADER_RE
         .replace_all(&cleaned, "${1}<redacted>")
         .into_owned();
@@ -1444,22 +1453,13 @@ impl TempAskpass {
 
 fn basic_auth_parts(credentials: &GitCredentials) -> Option<(String, String)> {
     if let Some(token) = credentials.token.as_deref() {
-        Some((
-            credentials
-                .username
-                .as_deref()
-                .unwrap_or("x-access-token")
-                .to_string(),
-            token.to_string(),
-        ))
-    } else if let Some(password) = credentials.password.as_deref() {
-        Some((
-            credentials.username.as_deref().unwrap_or("git").to_string(),
-            password.to_string(),
-        ))
-    } else {
-        None
+        let user = credentials.username.as_deref().unwrap_or("x-access-token");
+        return Some((user.to_string(), token.to_string()));
     }
+    credentials.password.as_deref().map(|pass| {
+        let user = credentials.username.as_deref().unwrap_or("git");
+        (user.to_string(), pass.to_string())
+    })
 }
 
 fn sh_single_quote(value: &str) -> String {

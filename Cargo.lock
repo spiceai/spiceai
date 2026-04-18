@@ -5280,6 +5280,7 @@ dependencies = [
  "snowflake-api",
  "spark-connect-rs",
  "telemetry",
+ "tempfile",
  "tiberius",
  "token_provider",
  "tokio",
