@@ -212,27 +212,26 @@ pub async fn snapshot_stream(
             }
         }
 
-        // Final batch: mark dataset ready.
-        if rows_in_batch > 0 {
-            let batch = finish_batch(
+        // Build the final batch but do NOT yield it yet. We first commit the
+        // REPEATABLE READ transaction; only if that succeeds do we emit the
+        // ready-signalling envelope. If COMMIT fails we error out and the
+        // runtime never sees `is_dataset_ready=true`, matching the durable
+        // state of the bootstrap.
+        let final_batch = if rows_in_batch > 0 {
+            finish_batch(
                 &dataset_schema,
                 &mut builders,
                 rows_in_batch,
                 &primary_keys,
             )
-            .map_err(super::err_to_stream)?;
-            yield envelope_with_lsn(batch, Arc::clone(&confirmed_flush), 0, true);
+            .map_err(super::err_to_stream)?
         } else {
-            // Empty table: still need to flip the ready flag. Emit an empty batch.
-            let batch = finish_batch(&dataset_schema, &mut builders, 0, &primary_keys)
-                .map_err(super::err_to_stream)?;
-            yield envelope_with_lsn(batch, Arc::clone(&confirmed_flush), 0, true);
-        }
+            // Empty table: still need an envelope to flip the ready flag. The
+            // batch has zero rows.
+            finish_batch(&dataset_schema, &mut builders, 0, &primary_keys)
+                .map_err(super::err_to_stream)?
+        };
 
-        // Wait for a successful COMMIT before marking bootstrap complete —
-        // if the commit fails (network drop, server restart), we don't want
-        // the `replication_bootstrap_complete` metric to flip, because it's
-        // watched as a readiness signal.
         client
             .simple_query("COMMIT")
             .await
@@ -248,6 +247,9 @@ pub async fn snapshot_stream(
             rows = total_rows,
             "initial snapshot bootstrap complete"
         );
+
+        // Yield AFTER the commit has succeeded so readiness matches durability.
+        yield envelope_with_lsn(final_batch, Arc::clone(&confirmed_flush), 0, true);
     })
 }
 

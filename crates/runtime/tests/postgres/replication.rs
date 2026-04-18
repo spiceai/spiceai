@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::expect_used)]
 //! Integration tests for postgres logical replication.
 //!
 //! These exercise the end-to-end data path:
@@ -114,7 +115,7 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(30), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("bootstrap envelope missing"))??;
-    let (_committer, change_batch, is_ready) = envelope.into_parts();
+    let (committer, change_batch, is_ready) = envelope.into_parts();
     let ops = change_batch
         .record
         .column_by_name("op")
@@ -125,6 +126,9 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
         assert_eq!(ops.value(i), "c");
     }
     assert!(is_ready, "last bootstrap envelope must mark dataset ready");
+    // Exercise the commit path so the test mirrors runtime usage (bootstrap
+    // commits are no-ops but regressions in the interface should break here).
+    committer.commit().await?;
 
     // --- 2. Live insert ---
     source
@@ -158,13 +162,14 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(15), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("update envelope missing"))??;
-    let (_c, change_batch, _) = envelope.into_parts();
+    let (committer, change_batch, _) = envelope.into_parts();
     let ops = change_batch
         .record
         .column_by_name("op")
         .expect("op")
         .as_string::<i32>();
     assert_eq!(ops.value(0), "u");
+    committer.commit().await?;
 
     // --- 4. Live delete ---
     source
@@ -173,13 +178,14 @@ async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     let envelope = tokio::time::timeout(Duration::from_secs(15), stream.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("delete envelope missing"))??;
-    let (_c, change_batch, _) = envelope.into_parts();
+    let (committer, change_batch, _) = envelope.into_parts();
     let ops = change_batch
         .record
         .column_by_name("op")
         .expect("op")
         .as_string::<i32>();
     assert_eq!(ops.value(0), "d");
+    committer.commit().await?;
 
     Ok(())
 }

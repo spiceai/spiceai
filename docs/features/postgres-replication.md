@@ -131,9 +131,9 @@ All existing `pg_host`, `pg_port`, `pg_user`, `pg_pass`, `pg_db`, `pg_sslmode`, 
 | `sqlite`      | ✅       | ✅ (upsert) | ✅       | Great for small/medium datasets. |
 | `postgres`    | ✅       | ✅ (upsert) | ✅       | Use when the accelerator is another Postgres. |
 | `cayenne`     | ✅       | ✅ (upsert) | ✅       | S3-backed Vortex format, good for read-heavy analytics. |
-| `arrow`       | ✅       | ❌ (becomes insert) | ❌ | Arrow's in-memory engine does not support `on_conflict`. Updates are appended as new rows; deletes are ignored. |
+| `arrow`       | ✅       | ❌ (becomes insert) | ✅ | Arrow's in-memory engine does not support `on_conflict` semantics, so `UPDATE`s are appended as new rows instead of being merged. `DELETE` and `TRUNCATE` are applied via Arrow's `DeletionTableProvider`. |
 
-For anything other than append-only tables, use DuckDB, SQLite, Postgres, or Cayenne.
+For workloads that need true upsert semantics (so `UPDATE`s replace existing rows instead of duplicating them), use DuckDB, SQLite, Postgres, or Cayenne. Arrow is a good fit for append-only replication where deletes are OK but updates are rare.
 
 ## Multi-replica deployments
 
@@ -386,7 +386,7 @@ Dropping or renaming columns in use by Spice will require rebuilding the acceler
 
 - **One table per dataset.** Each Spice dataset replicates exactly one source table; each dataset gets its own slot and publication.
 - **No DDL replication.** Schema changes on the source are not propagated automatically. See *Changing the source schema* above.
-- **Arrow engine** does not support upsert or delete — `UPDATE`s appear as duplicate inserts and `DELETE`s are silently dropped.
+- **Arrow engine** does not support `on_conflict` (upsert) semantics. `UPDATE`s therefore appear as additional inserts rather than replacing existing rows. `DELETE` and `TRUNCATE` are applied. For true upsert behavior use DuckDB, SQLite, Postgres, or Cayenne.
 
 ## Comparison with Debezium + Kafka
 

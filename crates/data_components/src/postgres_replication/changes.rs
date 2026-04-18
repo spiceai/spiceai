@@ -683,20 +683,106 @@ fn parse_pg_numeric_to_i128(s: &str, precision: u8, scale: i8) -> Result<i128> {
     Ok(value)
 }
 
+/// Expand scientific-notation NUMERIC text to its decimal form WITHOUT going
+/// through floating-point. Preserves precision up to the full Decimal128 range.
 fn expand_scientific_notation(s: &str) -> Result<String> {
-    // Fast-path: no 'e' / 'E'
-    let lower_has_e = s.chars().any(|c| c == 'e' || c == 'E');
-    if !lower_has_e {
+    // Fast-path: no 'e' / 'E'.
+    let Some(e_idx) = s.find(['e', 'E']) else {
         return Ok(s.to_string());
+    };
+    let significand = &s[..e_idx];
+    let exponent_str = &s[e_idx + 1..];
+    if significand.is_empty() {
+        return sci_err(s, "missing significand");
     }
-    // Delegate to f64; acceptable loss for values small enough to fit in
-    // Decimal128(38, scale). If this ever becomes a precision problem we can
-    // implement arbitrary-precision expansion, but pgoutput rarely emits
-    // scientific notation for NUMERIC.
-    let parsed: f64 = s.parse().map_err(|e| super::Error::PgOutputDecode {
-        message: format!("scientific-notation numeric parse '{s}': {e}"),
-    })?;
-    Ok(format!("{parsed}"))
+    if exponent_str.is_empty() {
+        return sci_err(s, "missing exponent");
+    }
+    let exponent: i64 = exponent_str
+        .parse()
+        .map_err(|e| scientific_notation_numeric_error(s, &format!("invalid exponent: {e}")))?;
+
+    let (sign, unsigned) = match significand.as_bytes().first() {
+        Some(b'+') => ("", &significand[1..]),
+        Some(b'-') => ("-", &significand[1..]),
+        _ => ("", significand),
+    };
+    if unsigned.is_empty() {
+        return sci_err(s, "missing digits in significand");
+    }
+
+    let mut digits = String::with_capacity(unsigned.len());
+    let mut seen_decimal = false;
+    let mut seen_digit = false;
+    let mut fractional_digits: i64 = 0;
+    for ch in unsigned.chars() {
+        match ch {
+            '0'..='9' => {
+                digits.push(ch);
+                seen_digit = true;
+                if seen_decimal {
+                    fractional_digits += 1;
+                }
+            }
+            '.' if !seen_decimal => seen_decimal = true,
+            '.' => return sci_err(s, "multiple decimal points in significand"),
+            _ => return sci_err(s, "invalid character in significand"),
+        }
+    }
+    if !seen_digit {
+        return sci_err(s, "missing digits in significand");
+    }
+    if digits.bytes().all(|b| b == b'0') {
+        return Ok("0".to_string());
+    }
+
+    let decimal_shift = exponent - fractional_digits;
+    if decimal_shift >= 0 {
+        let zero_count: usize = decimal_shift
+            .try_into()
+            .map_err(|_| scientific_notation_numeric_error(s, "exponent is too large to expand"))?;
+        let mut out = String::with_capacity(sign.len() + digits.len() + zero_count);
+        out.push_str(sign);
+        out.push_str(&digits);
+        out.extend(std::iter::repeat_n('0', zero_count));
+        return Ok(out);
+    }
+
+    let split_pos = i64::try_from(digits.len())
+        .map_err(|_| scientific_notation_numeric_error(s, "significand is too large to expand"))?
+        + decimal_shift;
+
+    if split_pos > 0 {
+        let split_index: usize = split_pos.try_into().map_err(|_| {
+            scientific_notation_numeric_error(s, "expanded decimal point is out of range")
+        })?;
+        let mut out = String::with_capacity(sign.len() + digits.len() + 1);
+        out.push_str(sign);
+        out.push_str(&digits[..split_index]);
+        out.push('.');
+        out.push_str(&digits[split_index..]);
+        return Ok(out);
+    }
+
+    let leading_zero_count: usize = (-split_pos)
+        .try_into()
+        .map_err(|_| scientific_notation_numeric_error(s, "exponent is too small to expand"))?;
+    let mut out = String::with_capacity(sign.len() + 2 + leading_zero_count + digits.len());
+    out.push_str(sign);
+    out.push_str("0.");
+    out.extend(std::iter::repeat_n('0', leading_zero_count));
+    out.push_str(&digits);
+    Ok(out)
+}
+
+fn sci_err(s: &str, reason: &str) -> Result<String> {
+    Err(scientific_notation_numeric_error(s, reason))
+}
+
+fn scientific_notation_numeric_error(s: &str, reason: &str) -> super::Error {
+    super::Error::PgOutputDecode {
+        message: format!("scientific-notation numeric parse '{s}': {reason}"),
+    }
 }
 
 fn decode_hex(hex: &str) -> std::result::Result<Vec<u8>, String> {

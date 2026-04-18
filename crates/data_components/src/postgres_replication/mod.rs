@@ -136,6 +136,11 @@ pub struct ReplicationStreamInput {
 /// complete before emitting the next one, so the accelerator's write throughput
 /// naturally paces the replication stream.
 pub fn start_replication_stream(input: ReplicationStreamInput) -> ChangesStream {
+    // Initialized to 0 until `start_inner` learns the effective start LSN from
+    // slot setup. This matters: KeepAlive replies and `replication_lag_bytes`
+    // both read from this atomic, and a pinned-at-0 value would report a wildly
+    // inflated lag until the first Commit. `start_inner` seeds it before
+    // handing the atomic to the WAL client.
     let confirmed_flush = Arc::new(AtomicU64::new(0));
     Box::pin(
         stream::once(async move { start_inner(input, confirmed_flush).await }).flat_map(|result| {
@@ -162,7 +167,15 @@ async fn start_inner(
     } = input;
 
     // 1. Set up slot and publication. This is idempotent: existing resources are reused.
+    //    After this call, seed `confirmed_flush` with the slot's consistent LSN
+    //    so KeepAlive replies before any commit don't ACK 0 (which would pin
+    //    lag_bytes artificially high and, in the resume case, accidentally
+    //    advance the slot backwards if we acted on it).
     let outcome = slot::setup_slot_and_publication(&params, &schema_name, &table_name).await?;
+    if outcome.consistent_lsn > 0 {
+        confirmed_flush.store(outcome.consistent_lsn, std::sync::atomic::Ordering::Release);
+        metrics.set_confirmed_flush_lsn(outcome.consistent_lsn);
+    }
 
     // 2. If the slot was just created and bootstrap is enabled, run snapshot.
     let bootstrap_stream = if outcome.created_fresh && params.initial_snapshot {
