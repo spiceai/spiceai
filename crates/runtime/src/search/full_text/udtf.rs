@@ -359,9 +359,7 @@ impl TextSearchTableFunc {
         if column.is_none() {
             if let Some(Expr::Column(Column { name, .. })) = named.get("column") {
                 column = Some(name.clone());
-            } else if let Some(Expr::Literal(ScalarValue::Utf8(Some(s)), _)) =
-                named.get("column")
-            {
+            } else if let Some(Expr::Literal(ScalarValue::Utf8(Some(s)), _)) = named.get("column") {
                 column = Some(s.clone());
             }
         }
