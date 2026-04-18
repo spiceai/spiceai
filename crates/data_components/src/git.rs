@@ -108,6 +108,25 @@ pub const DEFAULT_MAX_RETRIES: u32 = 3;
 const RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Global map of per-cache-path mutexes. Every mutator of a given on-disk
+/// Git cache holds the corresponding mutex for the duration of the operation
+/// so that concurrent clone/fetch/checkout calls targeting the same cache do
+/// not corrupt the working tree.
+static GIT_CACHE_MUTEXES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn cache_mutex_for(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    let mut guard = GIT_CACHE_MUTEXES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::<tokio::sync::Mutex<()>>::clone(
+        guard
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
+}
+
 /// Backoff strategy for retries on transient Git operation failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackoffMethod {
@@ -695,11 +714,22 @@ impl GitClient {
     }
 
     async fn try_get_repository(&self) -> Result<Repository> {
+        // Serialize mutation of the on-disk cache. The per-URL
+        // `max_concurrent_requests` semaphore bounds outbound remote
+        // concurrency, but because every dataset targeting the same URL
+        // shares a single cache directory, concurrent clone/fetch/checkout
+        // operations against the same cache would corrupt the working tree.
+        // Holding this mutex across the blocking Git operations guarantees
+        // exactly one mutator per cache directory at a time.
+        let cache_lock = cache_mutex_for(&self.cache_path);
+        let _cache_guard = cache_lock.lock().await;
+
         let repo_url = self.repo_url.clone();
         let cache_path = self.cache_path.clone();
         let credentials = self.credentials.clone();
         let enable_lfs = self.enable_lfs;
         let reference = self.reference.clone();
+        let reference_for_task = reference.clone();
 
         let repo = task::spawn_blocking(move || -> Result<Repository> {
             let make_callbacks = || {
@@ -714,7 +744,7 @@ impl GitClient {
                 callbacks
             };
 
-            if cache_path.exists() {
+            let repo = if cache_path.exists() {
                 tracing::debug!("Opening existing repository at {}", cache_path.display());
                 let repo = Repository::open(&cache_path)
                     .map_err(|source| classify_remote_error(source, &repo_url))?;
@@ -736,7 +766,7 @@ impl GitClient {
                         .map_err(|source| classify_remote_error(source, &repo_url))?;
                 }
 
-                Ok(repo)
+                repo
             } else {
                 tracing::info!(
                     "Cloning repository {} to {}",
@@ -751,8 +781,27 @@ impl GitClient {
                 builder.fetch_options(fetch_options);
                 builder
                     .clone(&repo_url, &cache_path)
-                    .map_err(|source| classify_remote_error(source, &repo_url))
+                    .map_err(|source| classify_remote_error(source, &repo_url))?
+            };
+
+            // When LFS is enabled we read file content from the working tree.
+            // That requires the working tree to reflect the requested
+            // reference; otherwise queries against non-HEAD refs (or
+            // concurrent queries against different refs sharing the same
+            // cache) would surface whatever happens to be checked out.
+            if enable_lfs {
+                let commit_oid =
+                    Self::resolve_reference_blocking(&repo, reference_for_task.as_deref())?;
+                let commit = repo.find_commit(commit_oid).context(GitSnafu)?;
+                let object = commit.as_object().clone();
+                let mut checkout = git2::build::CheckoutBuilder::new();
+                checkout.force();
+                repo.checkout_tree(&object, Some(&mut checkout))
+                    .context(GitSnafu)?;
+                repo.set_head_detached(commit_oid).context(GitSnafu)?;
             }
+
+            Ok(repo)
         })
         .await
         .context(SpawnBlockingSnafu)??;
@@ -855,36 +904,55 @@ impl GitClient {
                 let mode = format!("{:o}", entry.filemode());
 
                 let content = if fetch_content {
-                    let bytes = if let Some(root) = lfs_content_root.as_ref() {
+                    let lfs_bytes = if let Some(root) = lfs_content_root.as_ref() {
                         match std::fs::read(root.join(&full_path)) {
-                            Ok(bytes) if bytes.len() <= max_file_bytes => bytes,
+                            Ok(bytes) if bytes.len() <= max_file_bytes => Some(Some(bytes)),
                             Ok(bytes) => {
                                 tracing::debug!(
-                                    "Skipping LFS content for {} because on-disk size ({} bytes) exceeds max_file_bytes",
+                                    "Skipping LFS-materialized {} because on-disk size ({} bytes) exceeds max_file_bytes",
                                     full_path,
                                     bytes.len()
                                 );
-                                blob.content().to_vec()
+                                // Signal "LFS skip" without falling back to
+                                // the pointer-file blob content.
+                                Some(None)
                             }
                             Err(err) => {
                                 tracing::warn!(
-                                    "Failed to read LFS-materialized content for {}: {}. Falling back to blob content.",
-                                    full_path, err
+                                    "Failed to read LFS-materialized content for {}: {err}. Skipping content for this file.",
+                                    full_path
                                 );
-                                blob.content().to_vec()
+                                Some(None)
                             }
                         }
                     } else {
-                        blob.content().to_vec()
-                    };
-                    if let Ok(text) = std::str::from_utf8(&bytes) {
-                        Some(text.to_string())
-                    } else {
-                        tracing::debug!(
-                            "File {} is not valid UTF-8, skipping content",
-                            full_path
-                        );
                         None
+                    };
+                    match lfs_bytes {
+                        Some(Some(bytes)) => match std::str::from_utf8(&bytes) {
+                            Ok(text) => Some(text.to_string()),
+                            Err(_) => {
+                                tracing::debug!(
+                                    "File {} is not valid UTF-8, skipping content",
+                                    full_path
+                                );
+                                None
+                            }
+                        },
+                        // LFS enabled but content not usable (oversize or
+                        // unreadable) — leave content NULL rather than
+                        // emitting the LFS pointer as "content".
+                        Some(None) => None,
+                        None => match std::str::from_utf8(blob.content()) {
+                            Ok(text) => Some(text.to_string()),
+                            Err(_) => {
+                                tracing::debug!(
+                                    "File {} is not valid UTF-8, skipping content",
+                                    full_path
+                                );
+                                None
+                            }
+                        },
                     }
                 } else {
                     None

@@ -77,7 +77,7 @@ HTTP(S) credentials are stored as secrets and can be supplied directly or refere
 | -------------------- | ------- | ------- | ----------------------------------------------------------------------------------------------------------------- |
 | `git_username`       | string  | none    | Username for HTTP(S) basic authentication                                                                         |
 | `git_password`       | secret  | none    | Password or personal access token for HTTP(S) basic authentication                                                |
-| `git_token`          | secret  | none    | Personal access token used for HTTP(S) authentication (equivalent to username `x-access-token` + password `<token>`) |
+| `git_token`          | secret  | none    | Personal access token used for HTTP(S) authentication. Sent as the password with username defaulting to `x-access-token`; override the username by also setting `git_username` |
 | `git_ssh_key`        | string  | none    | Absolute path to an SSH private key used when authenticating to the remote                                        |
 | `git_ssh_passphrase` | secret  | none    | Passphrase for the SSH private key identified by `git_ssh_key`                                                    |
 | `git_ssh_use_agent`  | boolean | `true`  | Authenticate via the running `ssh-agent` when no explicit `git_ssh_key` is provided                               |
