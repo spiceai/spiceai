@@ -3,7 +3,7 @@
 # The enterprise version is ent_testoperator_run_throughput.yml
 # This file is kept only to prevent merge conflicts with upstream.
 # ============================================================================
-name: "throughput tests (upstream - disabled)"
+name: 'throughput tests (upstream - disabled)'
 run-name: throughput - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
 
 on: [workflow_dispatch]
