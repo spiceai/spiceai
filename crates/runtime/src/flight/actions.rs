@@ -36,6 +36,10 @@ enum ActionType {
     GetAsyncQueryStatus,
     GetAsyncQueryResult,
     CancelAsyncQuery,
+    /// Cancels a synchronous query running via FlightSQL or HTTP `/v1/sql`.
+    /// Body: JSON `{"query_id": "<uuid>"}`.
+    /// Response: JSON `{"query_id": "...", "cancelled": bool}`.
+    CancelQuery,
     Unknown,
 }
 
@@ -57,6 +61,7 @@ impl ActionType {
         match s {
             "CreatePreparedStatement" => ActionType::CreatePreparedStatement,
             "ClosePreparedStatement" => ActionType::ClosePreparedStatement,
+            "CancelQuery" => ActionType::CancelQuery,
             _ => ActionType::Unknown,
         }
     }
@@ -69,6 +74,7 @@ impl ActionType {
             ActionType::GetAsyncQueryStatus => async_actions::action_types::GET_ASYNC_QUERY_STATUS,
             ActionType::GetAsyncQueryResult => async_actions::action_types::GET_ASYNC_QUERY_RESULT,
             ActionType::CancelAsyncQuery => async_actions::action_types::CANCEL_ASYNC_QUERY,
+            ActionType::CancelQuery => "CancelQuery",
             ActionType::Unknown => "Unknown",
         }
     }
@@ -127,6 +133,13 @@ pub(crate) async fn list() -> Response<<Service as FlightService>::ListActionsSt
             Response Message: JSON {query_id: string, cancelled: boolean, status: string}"
             .into(),
     };
+    let cancel_query_action_type = FlightActionType {
+        r#type: ActionType::CancelQuery.to_string(),
+        description: "Cancels a running synchronous query (FlightSQL or HTTP /v1/sql).\n
+            Request Message: JSON {query_id: string}\n
+            Response Message: JSON {query_id: string, cancelled: boolean}"
+            .into(),
+    };
 
     let actions: Vec<Result<FlightActionType, Status>> = vec![
         Ok(create_prepared_statement_action_type),
@@ -135,6 +148,7 @@ pub(crate) async fn list() -> Response<<Service as FlightService>::ListActionsSt
         Ok(get_async_query_status_action_type),
         Ok(get_async_query_result_action_type),
         Ok(cancel_async_query_action_type),
+        Ok(cancel_query_action_type),
     ];
 
     let output = TimedStream::new(futures::stream::iter(actions), || start);
@@ -192,6 +206,11 @@ pub(crate) async fn do_action(
             let body = async_actions::handle_cancel_async_query(&request.get_ref().body).await?;
             futures::stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })])
         }
+        ActionType::CancelQuery => {
+            tracing::trace!("do_action: CancelQuery");
+            let body = handle_cancel_query(&request.get_ref().body)?;
+            futures::stream::iter(vec![Ok(arrow_flight::Result { body: body.into() })])
+        }
         ActionType::Unknown => return Err(Status::invalid_argument("Unknown action type")),
     };
 
@@ -199,4 +218,37 @@ pub(crate) async fn do_action(
         stream,
         move || start,
     ))))
+}
+
+#[derive(serde::Deserialize)]
+struct CancelQueryRequest {
+    query_id: String,
+}
+
+#[derive(serde::Serialize)]
+struct CancelQueryResponse {
+    query_id: String,
+    cancelled: bool,
+}
+
+/// Handles the custom `CancelQuery` Flight action by looking up the supplied
+/// query id in the runtime's sync query registry and signalling its
+/// cancellation token.
+fn handle_cancel_query(body: &[u8]) -> Result<Vec<u8>, Status> {
+    let req: CancelQueryRequest = serde_json::from_slice(body).map_err(|e| {
+        Status::invalid_argument(format!("Invalid CancelQuery request body: {e}"))
+    })?;
+
+    let parsed = uuid::Uuid::parse_str(&req.query_id)
+        .map_err(|e| Status::invalid_argument(format!("Invalid query_id (expected UUID): {e}")))?;
+
+    let registry = crate::datafusion::query::registry::global_registry();
+    let cancelled = registry.cancel(parsed);
+
+    let resp = CancelQueryResponse {
+        query_id: req.query_id,
+        cancelled,
+    };
+    serde_json::to_vec(&resp)
+        .map_err(|e| Status::internal(format!("Failed to encode CancelQuery response: {e}")))
 }

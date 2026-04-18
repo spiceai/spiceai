@@ -300,6 +300,7 @@ pub(crate) fn routes(
     let queries_router = Router::new()
         .route("/v1/queries", post(v1::queries::submit))
         .route("/v1/queries", get(v1::queries::list))
+        .route("/v1/queries/active", get(v1::queries::list_active))
         .route("/v1/queries/{query_id}", get(v1::queries::get_query))
         .route(
             "/v1/queries/{query_id}/status",
@@ -409,7 +410,18 @@ async fn track_metrics(
     let response = Arc::clone(&request_context)
         .scope(async move {
             request_context.load_extensions().await;
-            next.run(req).await
+            // Install a drop guard on the request's cancellation token so
+            // that if this future is dropped before the response completes
+            // (for example, the client disconnects while a streaming SQL or
+            // SSE response is being produced), the cancellation token fires
+            // and any cooperating in-flight query terminates promptly.
+            //
+            // The guard is disarmed once the response has been produced, so
+            // normal completion does not cancel the token.
+            let cancel_guard = request_context.cancellation_token().clone().drop_guard();
+            let response = next.run(req).await;
+            cancel_guard.disarm();
+            response
         })
         .await;
 

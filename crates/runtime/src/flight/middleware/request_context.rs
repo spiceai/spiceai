@@ -154,7 +154,13 @@ where
 
         Box::pin(Arc::clone(&request_context).scope(async move {
             request_context.load_extensions().await;
-            inner.call(req).await
+            // Drop guard cancels the request's cancellation token if the
+            // future is dropped mid-flight (e.g. client disconnects during a
+            // long-running Flight stream). Disarmed on normal completion.
+            let cancel_guard = request_context.cancellation_token().clone().drop_guard();
+            let result = inner.call(req).await;
+            cancel_guard.disarm();
+            result
         }))
     }
 }

@@ -58,6 +58,7 @@ mod cache;
 pub mod error_code;
 mod handle;
 mod metrics;
+pub mod registry;
 mod tracker;
 
 pub use handle::{DistributedJobStatus, QueryHandle, QueryHandleError};
@@ -151,6 +152,9 @@ pub enum Error {
         Use the synchronous query API (/v1/sql or Flight SQL) instead."
     ))]
     CayenneCatalogTableNotSupportedInDistributedQuery { table: String },
+
+    #[snafu(display("Query {query_id} was cancelled"))]
+    QueryCancelled { query_id: String },
 }
 
 impl Error {
@@ -190,6 +194,10 @@ pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: QueryMethod,
     tracker: Option<QueryTracker>,
+    query_id: uuid::Uuid,
+    /// Cancellation token for cooperative cancellation. If unset the query is
+    /// not cancellable (used for internal runtime queries that must always run).
+    cancellation_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 macro_rules! handle_error {
@@ -511,6 +519,33 @@ impl Query {
         if let Some(traceparent) = request_context.trace_parent() {
             crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
         }
+
+        // Resolve the cancellation token for this query. An explicit token on
+        // the `Query` takes precedence; otherwise the query inherits the
+        // request-scoped token so that cancelling the originating request
+        // cancels this query too. A child token is used so that cancelling the
+        // query (via admin cancel endpoint) does not propagate upwards to the
+        // request and abort other in-progress work.
+        let query_cancel_token = match &self.cancellation_token {
+            Some(t) => t.clone(),
+            None => request_context.child_cancellation_token(),
+        };
+
+        // Register in the process-wide active-query registry so administrative
+        // cancel endpoints can locate this query by id. The guard is captured
+        // by the returned stream so the registration is removed on completion,
+        // drop, or cancellation.
+        let sql_preview: Arc<str> = match &self.sql {
+            QueryMethod::Text { sql, .. } => Arc::clone(sql),
+            QueryMethod::Plan(_) => Arc::from("<logical plan>"),
+        };
+        let active_query_guard = crate::datafusion::query::registry::global_registry().register(
+            self.query_id,
+            sql_preview,
+            request_context.protocol(),
+            query_cancel_token.clone(),
+        );
+        let query_id_str = self.query_id.to_string();
 
         let inner_span = span.clone();
 
@@ -851,6 +886,18 @@ impl Query {
                     inner_span.clone(),
                 );
 
+                // Wrap with cancellation observation so that cancelling the
+                // query (via admin cancel, FlightSQL ActionCancelQueryRequest,
+                // or client disconnect) terminates the stream with a clear
+                // error. The active-query registry guard is held by the
+                // wrapped stream so deregistration occurs on drop.
+                let final_stream = attach_cancellation_to_stream(
+                    final_stream,
+                    query_cancel_token.clone(),
+                    query_id_str.clone(),
+                    active_query_guard,
+                );
+
                 Ok(QueryResult::new(
                     attach_query_tracker_to_stream(
                         inner_span,
@@ -878,6 +925,8 @@ impl Query {
             df: Arc::clone(df),
             sql: QueryMethod::Plan(Box::new(plan.clone())),
             tracker: None,
+            query_id: uuid::Uuid::new_v4(),
+            cancellation_token: None,
         }
     }
 
@@ -1121,6 +1170,68 @@ fn attach_query_active_guard_to_stream(
         schema,
         Box::pin(updated_stream.instrument(span)),
     ))
+}
+
+/// Wraps a record batch stream so that cancellation via the supplied
+/// [`CancellationToken`] yields a single `DataFusionError::Execution` error and
+/// terminates the stream.
+///
+/// The wrapper also keeps ownership of any `guard` (typically an
+/// [`ActiveQueryGuard`]) so that the query's registry entry is removed when the
+/// stream is dropped, whether it completes, errors, or is cancelled.
+fn attach_cancellation_to_stream<G>(
+    stream: SendableRecordBatchStream,
+    cancellation_token: tokio_util::sync::CancellationToken,
+    query_id: String,
+    guard: G,
+) -> SendableRecordBatchStream
+where
+    G: Send + 'static,
+{
+    let schema = stream.schema();
+
+    struct State<G> {
+        stream: SendableRecordBatchStream,
+        token: tokio_util::sync::CancellationToken,
+        query_id: String,
+        _guard: G,
+        emitted_cancel: bool,
+    }
+
+    let state = State {
+        stream,
+        token: cancellation_token,
+        query_id,
+        _guard: guard,
+        emitted_cancel: false,
+    };
+
+    let wrapped = futures::stream::unfold(state, |mut state| async move {
+        if state.emitted_cancel {
+            return None;
+        }
+        if state.token.is_cancelled() {
+            state.emitted_cancel = true;
+            let err = DataFusionError::Execution(format!("Query {} was cancelled", state.query_id));
+            return Some((Err(err), state));
+        }
+        tokio::select! {
+            biased;
+            () = state.token.cancelled() => {
+                state.emitted_cancel = true;
+                let err = DataFusionError::Execution(format!(
+                    "Query {} was cancelled",
+                    state.query_id
+                ));
+                Some((Err(err), state))
+            }
+            next = state.stream.next() => {
+                next.map(|item| (item, state))
+            }
+        }
+    });
+
+    Box::pin(RecordBatchStreamAdapter::new(schema, Box::pin(wrapped)))
 }
 
 #[must_use]

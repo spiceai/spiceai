@@ -36,6 +36,7 @@ use std::{
         atomic::{AtomicI16, AtomicU8},
     },
 };
+use tokio_util::sync::CancellationToken;
 
 static HTTP_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
 static FLIGHT_DIMENSIONS: OnceLock<Vec<KeyValue>> = OnceLock::new();
@@ -57,6 +58,13 @@ pub struct RequestContext {
     /// The raw `authorization` header value from the incoming request, if present.
     /// Used to forward credentials when proxying requests (e.g. scheduler → executor).
     authorization_header: Option<String>,
+    /// Cancellation token for cooperative cancellation of work performed on behalf
+    /// of this request (query execution, search, LLM tool loops, etc.).
+    ///
+    /// The token is cancelled either when the request future is dropped (e.g. the
+    /// client disconnects) via a drop-guard installed by the transport layer, or
+    /// when an administrative cancel is issued against a registered query id.
+    cancellation_token: CancellationToken,
 }
 
 #[async_trait::async_trait]
@@ -298,6 +306,38 @@ impl RequestContext {
     pub fn exited_top_level_query(&self) -> bool {
         self.nested_query_level.fetch_add(-1, Ordering::Relaxed) == 1
     }
+
+    /// Returns the cancellation token bound to this request's lifetime.
+    ///
+    /// The token is cancelled when the request is aborted (client disconnect,
+    /// administrative cancel, or transport-level shutdown). Long-running work
+    /// performed on behalf of this request should check this token cooperatively.
+    #[must_use]
+    pub fn cancellation_token(&self) -> &CancellationToken {
+        &self.cancellation_token
+    }
+
+    /// Returns a child cancellation token that is cancelled when either this
+    /// request's token is cancelled or the child is cancelled explicitly.
+    ///
+    /// Use this to create scoped cancellation for a sub-operation (for example,
+    /// a single query within a request that may execute many queries).
+    #[must_use]
+    pub fn child_cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token.child_token()
+    }
+
+    /// Returns `true` if cancellation has been requested for this request.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation_token.is_cancelled()
+    }
+
+    /// Cancels this request's cancellation token, signalling all cooperating
+    /// operations to stop. This is used by the administrative cancel paths.
+    pub fn cancel(&self) {
+        self.cancellation_token.cancel();
+    }
 }
 
 impl AuthRequestContext for RequestContext {
@@ -325,6 +365,7 @@ pub struct RequestContextBuilder {
     extensions: Extensions,
     trace_parent: Option<TraceParent>,
     authorization_header: Option<String>,
+    cancellation_token: Option<CancellationToken>,
 }
 
 impl RequestContextBuilder {
@@ -340,6 +381,7 @@ impl RequestContextBuilder {
             extensions: Extensions::default(),
             trace_parent: None,
             authorization_header: None,
+            cancellation_token: None,
         }
     }
 
@@ -429,6 +471,18 @@ impl RequestContextBuilder {
     #[must_use]
     pub fn with_authorization_header(mut self, authorization_header: Option<String>) -> Self {
         self.authorization_header = authorization_header;
+        self
+    }
+
+    /// Supplies a pre-existing cancellation token to use as this request's
+    /// cancellation token. If unset, a fresh token is created in `build()`.
+    ///
+    /// Use this to parent a request's cancellation token to a broader scope
+    /// (for example, a scheduler-side request token derived from an executor-side
+    /// token so that cancellation cascades).
+    #[must_use]
+    pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
         self
     }
 
@@ -528,6 +582,7 @@ impl RequestContextBuilder {
             trace_parent: self.trace_parent,
             nested_query_level: AtomicI16::new(0),
             authorization_header: self.authorization_header,
+            cancellation_token: self.cancellation_token.unwrap_or_default(),
         }
     }
 
@@ -652,5 +707,48 @@ mod tests {
             ctx.scoped_client_supplied_cache_key().as_deref(),
             Some("anonymous:shared-key")
         );
+    }
+
+    #[test]
+    fn test_cancellation_token_starts_uncancelled() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal).build();
+        assert!(!ctx.is_cancelled());
+        assert!(!ctx.cancellation_token().is_cancelled());
+    }
+
+    #[test]
+    fn test_cancel_signals_token() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal).build();
+        ctx.cancel();
+        assert!(ctx.is_cancelled());
+        assert!(ctx.cancellation_token().is_cancelled());
+    }
+
+    #[test]
+    fn test_child_cancellation_token_inherits_parent_cancel() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal).build();
+        let child = ctx.child_cancellation_token();
+        assert!(!child.is_cancelled());
+        ctx.cancel();
+        assert!(child.is_cancelled());
+    }
+
+    #[test]
+    fn test_cancelling_child_does_not_cancel_parent() {
+        let ctx = RequestContextBuilder::new(Protocol::Internal).build();
+        let child = ctx.child_cancellation_token();
+        child.cancel();
+        assert!(child.is_cancelled());
+        assert!(!ctx.is_cancelled());
+    }
+
+    #[test]
+    fn test_with_cancellation_token_uses_supplied_token() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let ctx = RequestContextBuilder::new(Protocol::Internal)
+            .with_cancellation_token(token.clone())
+            .build();
+        token.cancel();
+        assert!(ctx.is_cancelled());
     }
 }

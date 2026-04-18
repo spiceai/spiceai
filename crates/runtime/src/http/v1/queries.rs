@@ -252,6 +252,28 @@ pub struct QuerySummary {
     pub created_at: String,
 }
 
+/// Summary of an active (in-flight) synchronous query.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ActiveQuerySummary {
+    /// Query ID (UUID as string).
+    pub query_id: String,
+    /// Protocol this query was submitted through (http, flight, flightsql, internal).
+    pub protocol: String,
+    /// SQL preview (first 100 chars).
+    pub sql_preview: String,
+    /// When the query began execution, in milliseconds since epoch.
+    pub started_at_ms: u64,
+}
+
+/// Response for listing active sync queries.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ListActiveQueriesResponse {
+    pub queries: Vec<ActiveQuerySummary>,
+    pub total_count: usize,
+}
+
 /// Response object for the query status route
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -599,6 +621,11 @@ pub(crate) async fn get_chunk(
 }
 
 /// Cancel a running query.
+///
+/// The query id is first checked against the runtime's sync query registry
+/// (covering `/v1/sql`, FlightSQL, NSQL-driven, and tool-driven synchronous
+/// queries). If not found, the request is forwarded to the async job executor
+/// (which requires cluster mode with a scheduler role).
 #[cfg_attr(feature = "openapi", utoipa::path(
     post,
     path = "/v1/queries/{query_id}/cancel",
@@ -617,6 +644,23 @@ pub(crate) async fn cancel(
     Extension(rt): Extension<Arc<Runtime>>,
     Path(query_id): Path<String>,
 ) -> Response {
+    // First attempt: sync query registry. This works regardless of cluster mode.
+    if let Ok(parsed_uuid) = uuid::Uuid::parse_str(&query_id) {
+        let registry = crate::datafusion::query::registry::global_registry();
+        if registry.cancel(parsed_uuid) {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "query_id": query_id,
+                    "status": "cancelled",
+                    "scope": "sync",
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Fallback: async jobs API. Requires cluster scheduler mode.
     let executor = match get_executor(&rt) {
         Ok(e) => e,
         Err(resp) => return resp,
@@ -630,6 +674,51 @@ pub(crate) async fn cancel(
         }
         Err(e) => error_to_response(&e),
     }
+}
+
+/// List currently-active synchronous queries known to this runtime.
+///
+/// This reports queries running behind `/v1/sql`, FlightSQL, NSQL, `/v1/search`,
+/// and tool-driven SQL. Async async-jobs queries are reported via `GET /v1/queries`.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/queries/active",
+    operation_id = "list_active_queries",
+    tag = "Queries",
+    responses(
+        (status = 200, description = "List of active sync queries", body = ListQueriesResponse),
+    )
+))]
+pub(crate) async fn list_active() -> Response {
+    let registry = crate::datafusion::query::registry::global_registry();
+    let queries: Vec<ActiveQuerySummary> = registry
+        .list()
+        .into_iter()
+        .map(|info| {
+            let sql_preview = if info.sql_preview.chars().count() > 100 {
+                let truncated: String = info.sql_preview.chars().take(97).collect();
+                format!("{truncated}...")
+            } else {
+                info.sql_preview.to_string()
+            };
+            ActiveQuerySummary {
+                query_id: info.query_id.to_string(),
+                protocol: info.protocol.as_str().to_string(),
+                sql_preview,
+                started_at_ms: info.started_at_ms,
+            }
+        })
+        .collect();
+
+    let total_count = queries.len();
+    (
+        StatusCode::OK,
+        Json(ListActiveQueriesResponse {
+            queries,
+            total_count,
+        }),
+    )
+        .into_response()
 }
 
 /// List all queries.

@@ -407,6 +407,16 @@ pub(crate) async fn handle_nsql_query(
     let mut num_retries = 0;
 
     loop {
+        // Cooperative cancellation: bail out between LLM/query iterations if
+        // the request was cancelled (client disconnect or admin cancel).
+        if context.is_cancelled() {
+            return (
+                StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT),
+                headers,
+                "NSQL request cancelled".to_string(),
+            );
+        }
+
         let Ok(mut req) = sql_gen.create_request_for_query(&model, &query, &sql_gen_ctx) else {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -418,11 +428,26 @@ pub(crate) async fn handle_nsql_query(
         req.messages.extend(schema_messages.clone());
         req.messages.extend(sample_data_messages.clone());
 
-        let resp = match nql_model.chat_request(req).instrument(span.clone()).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("Error running NQL model: {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
+        // Race the LLM call against the request's cancellation token so that
+        // a long-running model inference does not pin the request after a
+        // cancel/disconnect. Dropping the chat_request future tears down the
+        // underlying client/network resources.
+        let chat_fut = nql_model.chat_request(req).instrument(span.clone());
+        let resp = tokio::select! {
+            biased;
+            () = context.cancellation_token().cancelled() => {
+                return (
+                    StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT),
+                    headers,
+                    "NSQL request cancelled".to_string(),
+                );
+            }
+            res = chat_fut => match res {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("Error running NQL model: {e}");
+                    return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
+                }
             }
         };
 
