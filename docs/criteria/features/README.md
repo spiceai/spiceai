@@ -1,3 +1,7 @@
+# Feature Release Criteria
+
+This directory contains the generic release criteria applied to runtime subsystems and cross-cutting features that are not covered by a component-specific criteria subdirectory (connectors, accelerators, catalogs, models, embeddings). See [../PRINCIPLES.md](../PRINCIPLES.md) for how feature criteria interact with component criteria.
+
 ## Release Stages
 
 | Stage | Summary | API/Config Stability | Production Use |

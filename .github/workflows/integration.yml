@@ -150,7 +150,9 @@ jobs:
         with:
           name: integration-test-archive
           path: ./integration.tar.zst
-          retention-days: 1
+          retention-days: 3
+          # Archive is already zstd-compressed; skip artifact zip compression.
+          compression-level: 0
 
       - name: Upload retention OOM test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -158,7 +160,9 @@ jobs:
         with:
           name: integration-retention-oom-test-archive
           path: ./retention_oom.tar.zst
-          retention-days: 1
+          retention-days: 3
+          # Archive is already zstd-compressed; skip artifact zip compression.
+          compression-level: 0
 
       - name: Upload AWS SDK test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -166,7 +170,9 @@ jobs:
         with:
           name: integration-aws-sdk-test-archive
           path: ./integration_aws_sdk.tar.zst
-          retention-days: 1
+          retention-days: 3
+          # Archive is already zstd-compressed; skip artifact zip compression.
+          compression-level: 0
 
       - name: Upload AWS SDK credential bridge test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -174,7 +180,9 @@ jobs:
         with:
           name: integration-aws-sdk-credential-bridge-test-archive
           path: ./integration_aws_sdk_credential_bridge.tar.zst
-          retention-days: 1
+          retention-days: 3
+          # Archive is already zstd-compressed; skip artifact zip compression.
+          compression-level: 0
 
       - name: Upload partition table test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -182,7 +190,9 @@ jobs:
         with:
           name: integration-partition-table-test-archive
           path: ./partition_table_test.tar.zst
-          retention-days: 1
+          retention-days: 3
+          # Archive is already zstd-compressed; skip artifact zip compression.
+          compression-level: 0
 
       - name: Upload data components test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -190,7 +200,9 @@ jobs:
         with:
           name: integration-data-components-test-archive
           path: ./data_components_hadoop.tar.zst
-          retention-days: 1
+          retention-days: 3
+          # Archive is already zstd-compressed; skip artifact zip compression.
+          compression-level: 0
 
   test:
     name: Integration Tests (part ${{ matrix.label }})
