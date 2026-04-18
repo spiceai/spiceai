@@ -265,8 +265,7 @@ impl TextSearchTableFunc {
                 _ => None,
             }
         }
-        let mut named: std::collections::HashMap<&str, &Expr> =
-            std::collections::HashMap::new();
+        let mut named: std::collections::HashMap<&str, &Expr> = std::collections::HashMap::new();
         let positional: Vec<&Expr> = args
             .iter()
             .filter(|a| {
