@@ -259,7 +259,7 @@ prost = { version = "0.14.1", default-features = false, features = [
     "derive",
 ] }
 r2d2 = "0.8.10"
-rand = "0.9.2"
+rand = "0.10.1"
 rdkafka = { version = "0.39.0" }
 regex = "1.12.3"
 # Pinned to 0.12.24 due to hf-hub content-range header issue with 0.12.25+ (tower-http decompression change)
