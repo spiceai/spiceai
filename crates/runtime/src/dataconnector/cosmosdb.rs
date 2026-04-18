@@ -27,14 +27,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use data_components::cosmosdb::{
-    CosmosDBClient, CosmosDBCredential, CosmosDBTableProvider,
-    provider::CosmosDBTableProviderConfig, DEFAULT_QUERY, DEFAULT_SCHEMA_INFER_MAX_RECORDS,
+    CosmosDBClient, CosmosDBCredential, CosmosDBTableProvider, DEFAULT_QUERY,
+    DEFAULT_SCHEMA_INFER_MAX_RECORDS, provider::CosmosDBTableProviderConfig,
 };
 use datafusion::datasource::TableProvider;
 
 use super::{
-    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
-    DataConnectorFactory, ParameterSpec, Parameters,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    ParameterSpec, Parameters,
 };
 use crate::component::dataset::Dataset;
 
@@ -201,8 +201,7 @@ impl DataConnector for CosmosDB {
         })?;
 
         let database_param = self.params.get("database").expose().ok();
-        let (database, container) =
-            resolve_database_and_container(dataset, database_param)?;
+        let (database, container) = resolve_database_and_container(dataset, database_param)?;
 
         let query = self
             .params

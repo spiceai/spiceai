@@ -322,8 +322,7 @@ impl ExecutionPlan for CosmosDBExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let mut builder =
-            RecordBatchReceiverStream::builder(Arc::clone(&self.projected_schema), 2);
+        let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&self.projected_schema), 2);
         let tx = builder.tx();
 
         let client = self.client.clone();
@@ -354,9 +353,8 @@ impl ExecutionPlan for CosmosDBExec {
                 buffer.push(strip_system_fields(doc));
 
                 if buffer.len() >= STREAM_BATCH_SIZE {
-                    let batch =
-                        decode_batch(&buffer, &full_schema, projection.as_deref())
-                            .map_err(to_df_error)?;
+                    let batch = decode_batch(&buffer, &full_schema, projection.as_deref())
+                        .map_err(to_df_error)?;
                     buffer.clear();
                     if tx.send(Ok(batch)).await.is_err() {
                         // Receiver dropped; stop scanning.
@@ -404,9 +402,9 @@ fn decode_batch(
     }
 
     let full_batch = if batches.len() == 1 {
-        batches.pop().unwrap_or_else(|| {
-            RecordBatch::new_empty(Arc::clone(full_schema))
-        })
+        batches
+            .pop()
+            .unwrap_or_else(|| RecordBatch::new_empty(Arc::clone(full_schema)))
     } else if batches.is_empty() {
         RecordBatch::new_empty(Arc::clone(full_schema))
     } else {
@@ -414,9 +412,7 @@ fn decode_batch(
     };
 
     if let Some(indices) = projection {
-        full_batch
-            .project(indices)
-            .context(JsonDecodeSnafu)
+        full_batch.project(indices).context(JsonDecodeSnafu)
     } else {
         Ok(full_batch)
     }

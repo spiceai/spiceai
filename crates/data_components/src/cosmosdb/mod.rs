@@ -80,10 +80,7 @@ pub enum Error {
         "Azure Cosmos DB container '{container}' in database '{database}' returned no documents to infer schema from. \
         Ensure the container is populated, or pin a schema explicitly via the dataset `columns` configuration."
     ))]
-    EmptyContainer {
-        database: String,
-        container: String,
-    },
+    EmptyContainer { database: String, container: String },
 
     #[snafu(display("Failed to infer Arrow schema from Cosmos DB documents: {source}"))]
     SchemaInference { source: arrow::error::ArrowError },

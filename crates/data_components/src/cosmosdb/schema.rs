@@ -35,13 +35,7 @@ use super::{Error, SchemaInferenceSnafu};
 
 /// System fields stamped on every Cosmos document. Stripped prior to schema
 /// inference so they never become user-visible columns.
-const COSMOS_SYSTEM_FIELDS: &[&str] = &[
-    "_rid",
-    "_self",
-    "_etag",
-    "_attachments",
-    "_ts",
-];
+const COSMOS_SYSTEM_FIELDS: &[&str] = &["_rid", "_self", "_etag", "_attachments", "_ts"];
 
 /// Strip Cosmos DB-internal system fields from a top-level JSON object. Any
 /// non-object value is returned unchanged.
@@ -71,8 +65,12 @@ pub fn infer_schema(samples: &[Value]) -> Result<SchemaRef, Error> {
         return Ok(Arc::new(Schema::empty()));
     }
 
-    let schema = infer_json_schema_from_iterator(samples.iter().map(Result::<_, arrow::error::ArrowError>::Ok))
-        .context(SchemaInferenceSnafu)?;
+    let schema = infer_json_schema_from_iterator(
+        samples
+            .iter()
+            .map(Result::<_, arrow::error::ArrowError>::Ok),
+    )
+    .context(SchemaInferenceSnafu)?;
 
     Ok(Arc::new(schema))
 }
