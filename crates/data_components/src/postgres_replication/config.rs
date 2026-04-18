@@ -258,13 +258,32 @@ impl ReplicationParams {
         }
 
         let mut builder = native_tls::TlsConnector::builder();
+        // The `danger_accept_invalid_*` calls below implement the standard libpq
+        // sslmode contract (see https://www.postgresql.org/docs/current/libpq-ssl.html
+        // Table 34.1). Each dangerous flag is gated on an explicit user choice of
+        // `pg_sslmode`: `prefer`/`require` opt out of all certificate validation,
+        // `verify-ca` opts out of hostname validation. We emit a runtime warning
+        // in each non-verifying branch so operators see the security posture of
+        // their deployment in the logs. Production-safe default is `verify-full`,
+        // which takes the no-danger-flags path and is the native-tls default.
         if !self.sslmode.verifies_certificate() {
             // require/prefer: accept anything — encryption only, no trust anchor.
+            tracing::warn!(
+                sslmode = ?self.sslmode,
+                "Postgres replication TLS is not verifying server certificates. \
+                 Set pg_sslmode=verify-full for production deployments."
+            );
             builder
                 .danger_accept_invalid_certs(true)
                 .danger_accept_invalid_hostnames(true);
         } else if !self.sslmode.verifies_hostname() {
             // verify-ca: chain is verified but hostname is not.
+            tracing::warn!(
+                sslmode = ?self.sslmode,
+                "Postgres replication TLS is verifying the certificate chain but \
+                 not the server hostname. Set pg_sslmode=verify-full to enable \
+                 full MITM protection."
+            );
             builder.danger_accept_invalid_hostnames(true);
         }
         // verify-full: both chain and hostname checked (native-tls default).
