@@ -125,7 +125,7 @@ pub async fn try_from_table(
         let model_read = embedding_models.read().await;
         let Some(model) = model_read.get(&config.model) else {
             return Err(Box::from(format!(
-                "Cannot make S3 vector index for table '{ds_name}' column '{column}'. Embedding model '{}' is not defined in the Spicepod or failed to load. Define it under `embeddings` and try again.",
+                "Cannot make S3 vector index for table '{ds_name}' column '{column}'. Embedding model '{}' is not defined in the Spicepod or failed to load. Ensure it is defined under `embeddings` and loads successfully, then check earlier model-load errors or logs for details.",
                 config.model
             )));
         };
