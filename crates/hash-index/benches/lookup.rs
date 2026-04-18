@@ -46,7 +46,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use hash_index::{HashIndex, HashIndexBuilder, RowLocation, hash_key, index_threshold};
-use rand::Rng;
+use rand::RngExt;
 use std::hint::black_box;
 use std::sync::Arc;
 
