@@ -2490,6 +2490,11 @@
           "description": "The table is ready immediately on registration, with fallback to federated table for queries until the initial load completes.",
           "type": "string",
           "const": "on_registration"
+        },
+        {
+          "description": "The table is ready once the federated source's schema has been resolved (which also implies access\nto the source has been verified), without waiting for the initial data refresh to complete. Queries\nfall back to the federated source until the initial load completes. Subsequent refresh failures are\nstill reported via dataset status and metrics.",
+          "type": "string",
+          "const": "on_schema_resolved"
         }
       ]
     },
