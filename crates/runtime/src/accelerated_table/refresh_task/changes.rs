@@ -297,10 +297,12 @@ impl RefreshTask {
         let ctx = SessionContext::new();
         let session_state = ctx.state();
         let _lock_guard = self.accelerator_write_mutex.lock().await;
-        // DeletionTableProvider impls treat an EMPTY filter list as a no-op
-        // (guard against accidental full-table deletes). To actually wipe the
-        // table we pass an always-true literal, which gets emitted as
-        // `DELETE FROM <table> WHERE TRUE`.
+        // Some DeletionTableProvider impls (notably DuckDB, see
+        // crates/data_components/src/duckdb.rs) treat an empty filter list as
+        // a no-op to guard against accidental full-table deletes. To get
+        // uniform "wipe the whole table" semantics we pass an always-true
+        // literal, which is emitted as `DELETE FROM <table> WHERE TRUE` and
+        // applied consistently across engines.
         let delete_plan = DeletionTableProvider::delete_from(
             deletion_provider.as_ref(),
             &session_state,

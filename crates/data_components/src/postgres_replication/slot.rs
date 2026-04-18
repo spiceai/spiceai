@@ -77,7 +77,10 @@ async fn setup_once(
     table_name: &str,
 ) -> Result<SlotInfo> {
     let cfg = params.setup_pg_config();
-    let tls = params.native_tls_connector().context(TlsConfigSnafu)?;
+    let tls = params
+        .native_tls_connector()
+        .await
+        .context(TlsConfigSnafu)?;
 
     let (client, conn_task) = if let Some(connector) = tls {
         let (client, connection) = cfg.connect(connector).await.context(SetupConnectSnafu)?;
@@ -237,7 +240,7 @@ async fn ensure_publication(
                 schema = quote_ident(schema_name),
                 table = quote_ident(table_name),
             );
-            client.simple_query(&stmt).await.context(SetupExecSnafu)?;
+            ignore_duplicate_object(client.simple_query(&stmt).await)?;
         }
         return Ok(());
     }
@@ -248,8 +251,32 @@ async fn ensure_publication(
         schema = quote_ident(schema_name),
         table = quote_ident(table_name),
     );
-    client.simple_query(&stmt).await.context(SetupExecSnafu)?;
+    // In multi-replica deployments two replicas can both observe `exists =
+    // false` and race into `CREATE PUBLICATION` / `ALTER PUBLICATION`. The
+    // loser gets SQLSTATE 42710 (`duplicate_object`); treat that as success
+    // since the desired state is already achieved.
+    ignore_duplicate_object(client.simple_query(&stmt).await)?;
     Ok(())
+}
+
+/// Treats a `duplicate_object` SQLSTATE (42710) as success — some replica beat
+/// us to the publication/ALTER. Any other Postgres error is surfaced through
+/// `SetupExecSnafu`.
+fn ignore_duplicate_object<T>(
+    res: std::result::Result<T, tokio_postgres::Error>,
+) -> Result<Option<T>> {
+    match res {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => {
+            if e.as_db_error()
+                .is_some_and(|db| db.code().code() == "42710")
+            {
+                Ok(None)
+            } else {
+                Err(e).context(SetupExecSnafu)
+            }
+        }
+    }
 }
 
 /// Look up an existing slot's `confirmed_flush_lsn`.

@@ -77,12 +77,16 @@ pub fn snapshot_stream(
         dataset_name,
         metrics,
     } = input;
-    // Eagerly build the TLS connector — avoids doing it inside `try_stream!`
-    // where error conversion is awkward.
-    let tls_connector = params.native_tls_connector().context(TlsConfigSnafu)?;
     let dataset_name_clone = dataset_name.clone();
 
     Ok(try_stream! {
+        // Build the TLS connector inside the stream because it's an async
+        // operation (reads sslrootcert via tokio::fs).
+        let tls_connector = params
+            .native_tls_connector()
+            .await
+            .context(TlsConfigSnafu)
+            .map_err(super::err_to_stream)?;
         let cfg = params.pg_config(
             &format!("spice-replication-bootstrap/{dataset_name_clone}")
         );

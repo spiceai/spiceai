@@ -257,7 +257,7 @@ impl ReplicationParams {
     /// - `VerifyCa` → verify chain against the configured `sslrootcert` (or
     ///   system roots if none provided); hostname verification DISABLED
     /// - `VerifyFull` → verify chain AND hostname (strictest)
-    pub fn native_tls_connector(
+    pub async fn native_tls_connector(
         &self,
     ) -> std::result::Result<Option<postgres_native_tls::MakeTlsConnector>, TlsConfigError> {
         if !self.sslmode.requires_tls() {
@@ -296,10 +296,14 @@ impl ReplicationParams {
         // verify-full: both chain and hostname checked (native-tls default).
 
         if let Some(ca_path) = &self.sslrootcert {
-            let pem_bytes = std::fs::read(ca_path).map_err(|e| TlsConfigError::ReadCa {
-                path: ca_path.clone(),
-                source: e,
-            })?;
+            // Async I/O — this method is called from Tokio runtime threads
+            // during setup/bootstrap; std::fs::read would block the reactor.
+            let pem_bytes = tokio::fs::read(ca_path)
+                .await
+                .map_err(|e| TlsConfigError::ReadCa {
+                    path: ca_path.clone(),
+                    source: e,
+                })?;
             let certs = parse_pem_certificates(ca_path, &pem_bytes)?;
             if certs.is_empty() {
                 return Err(TlsConfigError::EmptyCaBundle {
