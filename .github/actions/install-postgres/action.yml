@@ -8,6 +8,10 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    - name: Configure apt mirrors (Linux)
+      if: runner.os == 'Linux'
+      uses: ./.github/actions/configure-apt
+
     - name: Install PostgreSQL (Linux)
       if: runner.os == 'Linux'
       shell: bash

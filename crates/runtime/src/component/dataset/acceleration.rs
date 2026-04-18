@@ -354,6 +354,7 @@ impl Acceleration {
 impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
     type Error = crate::Error;
 
+    #[expect(clippy::result_large_err)]
     fn try_from(
         acceleration: spicepod_acceleration::Acceleration,
     ) -> std::result::Result<Self, Self::Error> {
