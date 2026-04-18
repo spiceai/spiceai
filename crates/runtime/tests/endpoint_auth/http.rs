@@ -24,7 +24,7 @@ use crate::{
     init_tracing,
     utils::{register_test_connectors, test_request_context, wait_until_true},
 };
-use rand::Rng;
+use rand::RngExt;
 use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use runtime_auth::{HttpAuth, api_key::ApiKeyAuth};
 use spicepod::component::runtime::ApiKey;
