@@ -646,7 +646,7 @@ impl HttpTableProvider {
             test_url.set_path(health_probe_path);
             test_url
         } else {
-            use rand::Rng;
+            use rand::RngExt;
             use rand::distr::Alphanumeric;
 
             // Generate a random path that should return 404

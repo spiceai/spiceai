@@ -43,7 +43,7 @@ dependencies = [
  "regex",
  "toml 1.0.7+spec-1.1.0",
  "windows-registry",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -110,7 +110,7 @@ checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
 dependencies = [
  "cfg-if",
  "cipher 0.4.4",
- "cpufeatures",
+ "cpufeatures 0.2.17",
 ]
 
 [[package]]
@@ -121,7 +121,7 @@ checksum = "7e713c57c2a2b19159e7be83b9194600d7e8eb3b7c2cd67e671adf47ce189a05"
 dependencies = [
  "cfg-if",
  "cipher 0.5.0-rc.1",
- "cpufeatures",
+ "cpufeatures 0.2.17",
 ]
 
 [[package]]
@@ -330,7 +330,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -341,7 +341,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -391,7 +391,7 @@ dependencies = [
  "miniz_oxide",
  "num-bigint",
  "quad-rand",
- "rand 0.9.2",
+ "rand 0.9.4",
  "regex-lite",
  "serde",
  "serde_bytes",
@@ -1144,7 +1144,7 @@ dependencies = [
  "derive_builder",
  "eventsource-stream",
  "futures",
- "rand 0.9.2",
+ "rand 0.9.4",
  "reqwest 0.12.24",
  "reqwest-eventsource",
  "secrecy",
@@ -1443,9 +1443,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.15.4"
+version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b7b6141e96a8c160799cc2d5adecd5cbbe5054cb8c7c4af53da0f83bb7ad256"
+checksum = "0ec6fb3fe69024a75fa7e1bfb48aa6cf59706a101658ea01bfd33b2b248a038f"
 dependencies = [
  "aws-lc-sys",
  "untrusted 0.7.1",
@@ -1454,9 +1454,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.37.1"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b092fe214090261288111db7a2b2c2118e5a7f30dc2569f1732c4069a6840549"
+checksum = "f50037ee5e1e41e7b8f9d161680a725bd1626cb6f8c7e901f91f942850852fe7"
 dependencies = [
  "cc",
  "cmake",
@@ -1694,7 +1694,7 @@ dependencies = [
  "http 0.2.12",
  "http 1.4.0",
  "http-body 1.0.1",
- "lru 0.16.3",
+ "lru",
  "percent-encoding",
  "regex-lite",
  "sha2 0.10.9",
@@ -2321,7 +2321,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "prost 0.14.3",
  "prost-types",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rustc_version",
  "serde",
  "tokio",
@@ -2393,7 +2393,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "prost 0.14.3",
  "prost-types",
- "rand 0.9.2",
+ "rand 0.9.4",
  "serde",
  "tokio",
  "tokio-stream",
@@ -2728,7 +2728,7 @@ dependencies = [
  "cc",
  "cfg-if",
  "constant_time_eq",
- "cpufeatures",
+ "cpufeatures 0.2.17",
 ]
 
 [[package]]
@@ -2965,7 +2965,7 @@ dependencies = [
  "indexmap 2.13.0",
  "js-sys",
  "once_cell",
- "rand 0.9.2",
+ "rand 0.9.4",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -3135,7 +3135,7 @@ dependencies = [
  "opentelemetry",
  "parking_lot 0.12.5",
  "pingora-lru",
- "rand 0.8.5",
+ "rand 0.10.1",
  "rstest 0.25.0",
  "snafu",
  "spicepod",
@@ -3220,7 +3220,7 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58#7de0d9fdff7dfb6289442abfba821e8d77f57c58"
+source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
 dependencies = [
  "byteorder",
  "candle-kernels",
@@ -3236,7 +3236,7 @@ dependencies = [
  "num_cpus",
  "objc2-foundation 0.3.2",
  "objc2-metal 0.3.2",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rand_distr 0.5.1",
  "rayon",
  "safetensors 0.7.0",
@@ -3259,7 +3259,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58#7de0d9fdff7dfb6289442abfba821e8d77f57c58"
+source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3279,7 +3279,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58#7de0d9fdff7dfb6289442abfba821e8d77f57c58"
+source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
 dependencies = [
  "cudaforge",
 ]
@@ -3299,7 +3299,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58#7de0d9fdff7dfb6289442abfba821e8d77f57c58"
+source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
 dependencies = [
  "half",
  "objc2 0.6.3",
@@ -3313,7 +3313,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58#7de0d9fdff7dfb6289442abfba821e8d77f57c58"
+source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -3341,14 +3341,14 @@ dependencies = [
 [[package]]
 name = "candle-transformers"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58#7de0d9fdff7dfb6289442abfba821e8d77f57c58"
+source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
 dependencies = [
  "byteorder",
  "candle-core",
  "candle-nn",
  "fancy-regex 0.17.0",
  "num-traits",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rayon",
  "serde",
  "serde_json",
@@ -3359,7 +3359,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58#7de0d9fdff7dfb6289442abfba821e8d77f57c58"
+source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
 dependencies = [
  "ug",
  "ug-cuda",
@@ -3561,6 +3561,17 @@ dependencies = [
  "quote",
  "regex",
  "vob",
+]
+
+[[package]]
+name = "chacha20"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f8d983286843e49675a4b7a2d174efe136dc93a18d69130dd18198a6c167601"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -4427,6 +4438,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cpufeatures"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "crc"
 version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4926,7 +4946,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
  "digest 0.10.7",
  "fiat-crypto 0.2.9",
@@ -4942,7 +4962,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f9200d1d13637f15a6acb71e758f64624048d85b31a5fdbfd8eca1e2687d0b7"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
  "digest 0.11.0-rc.3",
  "fiat-crypto 0.3.0",
@@ -5244,7 +5264,7 @@ dependencies = [
  "oracle",
  "parquet",
  "percent-encoding",
- "rand 0.9.2",
+ "rand 0.10.1",
  "rdkafka",
  "regex",
  "reqwest 0.12.24",
@@ -5340,7 +5360,7 @@ dependencies = [
  "object_store",
  "parking_lot 0.12.5",
  "parquet",
- "rand 0.9.2",
+ "rand 0.9.4",
  "regex",
  "sqlparser",
  "tempfile",
@@ -5459,7 +5479,7 @@ dependencies = [
  "log",
  "object_store",
  "parquet",
- "rand 0.9.2",
+ "rand 0.9.4",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -5601,7 +5621,7 @@ dependencies = [
  "log",
  "object_store",
  "parking_lot 0.12.5",
- "rand 0.9.2",
+ "rand 0.9.4",
  "tempfile",
  "url",
 ]
@@ -5704,7 +5724,7 @@ dependencies = [
  "log",
  "md-5 0.10.6",
  "num-traits",
- "rand 0.9.2",
+ "rand 0.9.4",
  "regex",
  "sha2 0.10.9",
  "unicode-segmentation",
@@ -6065,7 +6085,7 @@ dependencies = [
  "datafusion-functions-nested",
  "log",
  "percent-encoding",
- "rand 0.9.2",
+ "rand 0.9.4",
  "sha1 0.10.6",
  "url",
 ]
@@ -6146,7 +6166,7 @@ dependencies = [
  "postgres-native-tls",
  "r2d2",
  "r2d2_adbc",
- "rand 0.9.2",
+ "rand 0.9.4",
  "regex",
  "rusqlite",
  "rust_decimal",
@@ -6164,6 +6184,12 @@ dependencies = [
  "url",
  "uuid 1.21.0",
 ]
+
+[[package]]
+name = "datasketches"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c286de4e81ea2590afc24d754e0f83810c566f50a1388fa75ebd57928c0d9745"
 
 [[package]]
 name = "db_connection_pool"
@@ -6567,7 +6593,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7134,7 +7160,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7345,7 +7371,7 @@ checksum = "4e7f34442dbe69c60fe8eaf58a8cafff81a1f278816d8ab4db255b3bef4ac3c4"
 dependencies = [
  "getrandom 0.3.4",
  "libm",
- "rand 0.9.2",
+ "rand 0.9.4",
  "siphasher",
 ]
 
@@ -7604,7 +7630,7 @@ checksum = "c2d1f04709a8ac06e8e8042875a3c466cc4832d3c1a18dbcb9dba3c6e83046bc"
 dependencies = [
  "half",
  "num-traits",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rand_distr 0.5.1",
 ]
 
@@ -8155,7 +8181,7 @@ dependencies = [
  "log",
  "rustversion",
  "windows-link 0.1.3",
- "windows-result 0.3.4",
+ "windows-result 0.4.1",
 ]
 
 [[package]]
@@ -8247,6 +8273,7 @@ dependencies = [
  "js-sys",
  "libc",
  "r-efi",
+ "rand_core 0.10.1",
  "wasip2",
  "wasip3",
  "wasm-bindgen",
@@ -8379,7 +8406,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "portable-atomic",
  "quanta",
- "rand 0.9.2",
+ "rand 0.9.4",
  "smallvec 1.15.1",
  "spinning_top",
  "web-time",
@@ -8594,7 +8621,7 @@ dependencies = [
  "cfg-if",
  "crunchy",
  "num-traits",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rand_distr 0.5.1",
  "zerocopy",
 ]
@@ -8648,7 +8675,7 @@ dependencies = [
  "arrow-schema",
  "criterion 0.6.0",
  "parking_lot 0.12.5",
- "rand 0.9.2",
+ "rand 0.10.1",
  "snafu",
  "telemetry",
  "tokio",
@@ -8821,7 +8848,7 @@ dependencies = [
  "log",
  "native-tls",
  "num_cpus",
- "rand 0.9.2",
+ "rand 0.9.4",
  "reqwest 0.12.24",
  "serde",
  "serde_json",
@@ -8847,7 +8874,7 @@ dependencies = [
  "idna",
  "ipnet",
  "once_cell",
- "rand 0.9.2",
+ "rand 0.9.4",
  "ring",
  "thiserror 2.0.18",
  "tinyvec",
@@ -8869,7 +8896,7 @@ dependencies = [
  "moka",
  "once_cell",
  "parking_lot 0.12.5",
- "rand 0.9.2",
+ "rand 0.9.4",
  "resolv-conf",
  "smallvec 1.15.1",
  "thiserror 2.0.18",
@@ -9274,15 +9301,6 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tower-service",
-]
-
-[[package]]
-name = "hyperloglogplus"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "621debdf94dcac33e50475fdd76d34d5ea9c0362a834b9db08c3024696c1fbe3"
-dependencies = [
- "serde",
 ]
 
 [[package]]
@@ -9906,7 +9924,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9979,7 +9997,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10148,7 +10166,7 @@ version = "0.2.0-rc.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d546793a04a1d3049bd192856f804cfe96356e2cf36b54b4e575155babe9f41"
 dependencies = [
- "cpufeatures",
+ "cpufeatures 0.2.17",
 ]
 
 [[package]]
@@ -10664,7 +10682,7 @@ dependencies = [
  "mistralrs-core",
  "model2vec-rs",
  "paste",
- "rand 0.9.2",
+ "rand 0.10.1",
  "regex",
  "reqwest 0.12.24",
  "reqwest-eventsource",
@@ -10797,15 +10815,6 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.12.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
-dependencies = [
- "hashbrown 0.15.5",
-]
-
-[[package]]
-name = "lru"
 version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1dc47f592c06f33f8e3aea9591776ec7c9f9e4124778ff8a3c3b87159f7e593"
@@ -10855,6 +10864,12 @@ checksum = "ab6473172471198271ff72e9379150e9dfd70d8e533e0752a27e515b48dd375e"
 dependencies = [
  "twox-hash",
 ]
+
+[[package]]
+name = "lz4_flex"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db9a0d582c2874f68138a16ce1867e0ffde6c0bb0a0df85e1f36d04146db488a"
 
 [[package]]
 name = "lzma-rust2"
@@ -11256,7 +11271,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=fd241009ddac8f6043bda4019cb6359989521aa8#fd241009ddac8f6043bda4019cb6359989521aa8"
+source = "git+https://github.com/spiceai/mistral.rs?rev=27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84#27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -11268,7 +11283,7 @@ dependencies = [
  "indexmap 2.13.0",
  "mistralrs-core",
  "mistralrs-macros",
- "rand 0.9.2",
+ "rand 0.9.4",
  "reqwest 0.13.1",
  "schemars 1.2.1",
  "serde",
@@ -11283,7 +11298,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=fd241009ddac8f6043bda4019cb6359989521aa8#fd241009ddac8f6043bda4019cb6359989521aa8"
+source = "git+https://github.com/spiceai/mistral.rs?rev=27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84#27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84"
 dependencies = [
  "anyhow",
  "apodize",
@@ -11294,7 +11309,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=fd241009ddac8f6043bda4019cb6359989521aa8#fd241009ddac8f6043bda4019cb6359989521aa8"
+source = "git+https://github.com/spiceai/mistral.rs?rev=27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84#27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84"
 dependencies = [
  "ahash 0.8.12",
  "akin",
@@ -11350,7 +11365,7 @@ dependencies = [
  "ordered-float 5.1.0",
  "parking_lot 0.12.5",
  "radix_trie 0.3.0",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rand_distr 0.5.1",
  "rand_isaac",
  "rayon",
@@ -11393,7 +11408,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-macros"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=fd241009ddac8f6043bda4019cb6359989521aa8#fd241009ddac8f6043bda4019cb6359989521aa8"
+source = "git+https://github.com/spiceai/mistral.rs?rev=27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84#27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -11404,7 +11419,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=fd241009ddac8f6043bda4019cb6359989521aa8#fd241009ddac8f6043bda4019cb6359989521aa8"
+source = "git+https://github.com/spiceai/mistral.rs?rev=27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84#27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11424,7 +11439,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=fd241009ddac8f6043bda4019cb6359989521aa8#fd241009ddac8f6043bda4019cb6359989521aa8"
+source = "git+https://github.com/spiceai/mistral.rs?rev=27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84#27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -11441,7 +11456,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=fd241009ddac8f6043bda4019cb6359989521aa8#fd241009ddac8f6043bda4019cb6359989521aa8"
+source = "git+https://github.com/spiceai/mistral.rs?rev=27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84#27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -11471,7 +11486,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=fd241009ddac8f6043bda4019cb6359989521aa8#fd241009ddac8f6043bda4019cb6359989521aa8"
+source = "git+https://github.com/spiceai/mistral.rs?rev=27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84#27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84"
 dependencies = [
  "candle-core",
  "image 0.25.9",
@@ -11599,7 +11614,7 @@ dependencies = [
  "openssl-probe 0.1.6",
  "pbkdf2 0.12.2",
  "percent-encoding",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rustc_version_runtime",
  "rustls 0.23.36",
  "rustversion",
@@ -11754,12 +11769,12 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "keyed_priority_queue",
- "lru 0.16.3",
+ "lru",
  "mysql_common",
  "native-tls",
  "pem",
  "percent-encoding",
- "rand 0.9.2",
+ "rand 0.9.4",
  "serde",
  "serde_json",
  "socket2 0.5.10",
@@ -12064,7 +12079,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12537,7 +12552,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "percent-encoding",
  "quick-xml 0.38.4",
- "rand 0.9.2",
+ "rand 0.9.4",
  "reqwest 0.12.24",
  "ring",
  "rustls-pemfile 2.2.0",
@@ -12946,7 +12961,7 @@ dependencies = [
  "futures-util",
  "opentelemetry",
  "percent-encoding",
- "rand 0.9.2",
+ "rand 0.9.4",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -13673,7 +13688,7 @@ dependencies = [
  "pkcs8 0.11.0-rc.7",
  "primefield",
  "primeorder 0.14.0-pre.9",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rand_core 0.9.5",
  "rfc6979 0.5.0-rc.1",
  "rsa 0.10.0-rc.9",
@@ -13752,7 +13767,7 @@ dependencies = [
  "picky-asn1",
  "picky-asn1-der",
  "picky-asn1-x509",
- "rand 0.9.2",
+ "rand 0.9.4",
  "serde",
  "sha1 0.11.0-rc.2",
  "thiserror 2.0.18",
@@ -13799,7 +13814,7 @@ checksum = "3aa964c4e12e6328388b7059c93aac37b052be7962bbb70dd239b515532be4bf"
 dependencies = [
  "arrayvec",
  "hashbrown 0.5.0",
- "parking_lot 0.11.2",
+ "parking_lot 0.12.5",
  "rand 0.8.5",
 ]
 
@@ -13970,7 +13985,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d1fe60d06143b2430aa532c94cfe9e29783047f06c0d7fd359a9a51b729fa25"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash 0.5.1",
 ]
@@ -13982,7 +13997,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffd40cc99d0fbb02b4b3771346b811df94194bc103983efa0203c8893755085"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "universal-hash 0.6.0-rc.2",
 ]
 
@@ -14045,7 +14060,7 @@ dependencies = [
  "hmac 0.12.1",
  "md-5 0.10.6",
  "memchr",
- "rand 0.9.2",
+ "rand 0.9.4",
  "sha2 0.10.9",
  "stringprep",
 ]
@@ -14338,7 +14353,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck 0.4.1",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "petgraph",
@@ -14372,7 +14387,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.10.5",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.114",
@@ -14680,7 +14695,7 @@ dependencies = [
  "bytes",
  "getrandom 0.3.4",
  "lru-slab",
- "rand 0.9.2",
+ "rand 0.9.4",
  "ring",
  "rustc-hash 2.1.1",
  "rustls 0.23.36",
@@ -14800,12 +14815,23 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.9.2"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6db2770f06117d490610c7488547d543617b21bfa07796d7a12f6f1bd53850d1"
+checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
 dependencies = [
  "rand_chacha 0.9.0",
  "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
+dependencies = [
+ "chacha20",
+ "getrandom 0.4.1",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -14866,6 +14892,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_core"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
 name = "rand_distr"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14882,7 +14914,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a8615d50dcf34fa31f7ab52692afec947c4dd0ab803cc87cb3b0b4570ff7463"
 dependencies = [
  "num-traits",
- "rand 0.9.2",
+ "rand 0.9.4",
 ]
 
 [[package]]
@@ -14972,7 +15004,7 @@ dependencies = [
  "num-traits",
  "paste",
  "profiling",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rand_chacha 0.9.0",
  "simd_helpers",
  "thiserror 2.0.18",
@@ -15589,7 +15621,7 @@ dependencies = [
  "paste",
  "pin-project-lite",
  "process-wrap",
- "rand 0.9.2",
+ "rand 0.9.4",
  "reqwest 0.12.24",
  "rmcp-macros",
  "schemars 0.8.22",
@@ -15876,7 +15908,7 @@ dependencies = [
  "postcard",
  "prometheus",
  "prost 0.14.3",
- "rand 0.9.2",
+ "rand 0.10.1",
  "rayon",
  "rdkafka",
  "regex",
@@ -16159,7 +16191,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "futures",
  "governor",
- "rand 0.9.2",
+ "rand 0.10.1",
  "snafu",
  "tokio",
  "tracing",
@@ -16202,7 +16234,7 @@ dependencies = [
  "keyring",
  "logos",
  "percent-encoding",
- "rand 0.9.2",
+ "rand 0.10.1",
  "reqwest 0.12.24",
  "secrecy",
  "serde_json",
@@ -16409,7 +16441,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -16510,7 +16542,7 @@ dependencies = [
  "security-framework 3.5.1",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -16861,7 +16893,7 @@ dependencies = [
  "futures",
  "hashbrown 0.15.5",
  "itertools 0.14.0",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rand_pcg 0.9.0",
  "scylla-cql",
  "smallvec 1.15.1",
@@ -17126,7 +17158,7 @@ checksum = "4db5a4a562bcc0017c34cd0efbabf447be783f00576a2a516947f884e6a7ed57"
 dependencies = [
  "ahash 0.8.12",
  "annotate-snippets",
- "base64 0.21.7",
+ "base64 0.22.1",
  "encoding_rs_io",
  "nohash-hasher",
  "num-traits",
@@ -17348,7 +17380,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "digest 0.10.7",
 ]
 
@@ -17359,7 +17391,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c5e046edf639aa2e7afb285589e5405de2ef7e61d4b0ac1e30256e3eab911af9"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "digest 0.11.0-rc.3",
 ]
 
@@ -17376,7 +17408,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "digest 0.10.7",
 ]
 
@@ -17387,7 +17419,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1e3878ab0f98e35b2df35fe53201d088299b41a6bb63e3e34dada2ac4abd924"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "digest 0.11.0-rc.3",
 ]
 
@@ -17575,6 +17607,12 @@ name = "sketches-ddsketch"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1e9a774a6c28142ac54bb25d25562e6bcf957493a184f15ad4eebccb23e410a"
+
+[[package]]
+name = "sketches-ddsketch"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05e40b6cf54d988dc1a2223531b969c9a9e30906ad90ef64890c27b4bfbb46ea"
 dependencies = [
  "serde",
 ]
@@ -17966,7 +18004,7 @@ dependencies = [
  "opentelemetry",
  "pem",
  "predicates",
- "rand 0.9.2",
+ "rand 0.10.1",
  "rcgen",
  "repl",
  "reqwest 0.12.24",
@@ -18035,7 +18073,7 @@ dependencies = [
  "futures",
  "prost 0.14.3",
  "prost-types",
- "rand 0.9.2",
+ "rand 0.9.4",
  "reqwest 0.12.24",
  "rustls 0.23.36",
  "rustls-native-certs 0.8.3",
@@ -18360,7 +18398,7 @@ dependencies = [
  "pkcs8 0.11.0-rc.7",
  "primefield",
  "primeorder 0.14.0-pre.9",
- "rand 0.9.2",
+ "rand 0.9.4",
  "reqwest 0.12.24",
  "rsa 0.10.0-rc.9",
  "rustls 0.23.36",
@@ -18888,9 +18926,9 @@ checksum = "f764005d11ee5f36500a149ace24e00e3da98b0158b3e2d53a7495660d3f4d60"
 
 [[package]]
 name = "tantivy"
-version = "0.25.0"
+version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "502915c7381c5cb2d2781503962610cb880ad8f1a0ca95df1bae645d5ebf2545"
+checksum = "778da245841522199d512d19511b041425d8cff3a8f262b4e1516fceb050289a"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -18901,17 +18939,17 @@ dependencies = [
  "census",
  "crc32fast",
  "crossbeam-channel",
+ "datasketches",
  "downcast-rs 2.0.2",
  "fastdivide",
  "fnv",
  "fs4",
  "htmlescape",
- "hyperloglogplus",
  "itertools 0.14.0",
  "levenshtein_automata",
  "log",
- "lru 0.12.5",
- "lz4_flex 0.11.6",
+ "lru",
+ "lz4_flex 0.13.0",
  "measure_time",
  "memmap2",
  "once_cell",
@@ -18922,7 +18960,7 @@ dependencies = [
  "rustc-hash 2.1.1",
  "serde",
  "serde_json",
- "sketches-ddsketch",
+ "sketches-ddsketch 0.4.0",
  "smallvec 1.15.1",
  "tantivy-bitpacker",
  "tantivy-columnar",
@@ -18934,24 +18972,25 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "time",
+ "typetag",
  "uuid 1.21.0",
  "winapi",
 ]
 
 [[package]]
 name = "tantivy-bitpacker"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3b04eed5108d8283607da6710fe17a7663523440eaf7ea5a1a440d19a1448b6"
+checksum = "4fed3d674429bcd2de5d0a6d1aa5495fed8afd9c5ecce993019caf7615f53fa4"
 dependencies = [
  "bitpacking",
 ]
 
 [[package]]
 name = "tantivy-columnar"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b628488ae936c83e92b5c4056833054ca56f76c0e616aee8339e24ac89119cd"
+checksum = "c57166f5bcfd478f370ab8445afb4678dce44801fa5ce5c451aaf8595583c5dc"
 dependencies = [
  "downcast-rs 2.0.2",
  "fastdivide",
@@ -18965,9 +19004,9 @@ dependencies = [
 
 [[package]]
 name = "tantivy-common"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f880aa7cab0c063a47b62596d10991cdd0b6e0e0575d9c5eeb298b307a25de55"
+checksum = "bbf10915aa75da3c3b0d58b58853d2e889efbaf32d4982a4c3715dde6bba23e5"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -18989,20 +19028,22 @@ dependencies = [
 
 [[package]]
 name = "tantivy-query-grammar"
-version = "0.25.0"
+version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "768fccdc84d60d86235d42d7e4c33acf43c418258ff5952abf07bd7837fcd26b"
+checksum = "dfadb8526b6da90704feb293b0701a6aae62ea14983143344be2dc5ce30f1d82"
 dependencies = [
+ "fnv",
  "nom 7.1.3",
+ "ordered-float 5.1.0",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "tantivy-sstable"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8292095d1a8a2c2b36380ec455f910ab52dde516af36321af332c93f20ab7d5"
+checksum = "8a2cfc3ac5164cbadc28965ffb145a8f47582a60ae5897859ad8d4316596c606"
 dependencies = [
  "futures-util",
  "itertools 0.14.0",
@@ -19014,20 +19055,19 @@ dependencies = [
 
 [[package]]
 name = "tantivy-stacker"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23d38a379411169f0b3002c9cba61cdfe315f757e9d4f239c00c282497a0749d"
+checksum = "6cbb051742da9d53ca9e8fff43a9b10e319338b24e2c0e15d0372df19ffeb951"
 dependencies = [
  "murmurhash32",
- "rand_distr 0.4.3",
  "tantivy-common",
 ]
 
 [[package]]
 name = "tantivy-tokenizer-api"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23024f6aeb25ceb1a0e27740c84bdb0fae52626737b7e9a9de6ad5aa25c7b038"
+checksum = "eac258c2c6390673f2685813afeeafcb8c4e0ee7de8dd3fc46838dcc37263f98"
 dependencies = [
  "serde",
 ]
@@ -19092,7 +19132,7 @@ dependencies = [
  "getrandom 0.4.1",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -19192,7 +19232,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "otel-arrow",
- "rand 0.9.2",
+ "rand 0.10.1",
  "rcgen",
  "regex",
  "reqwest 0.12.24",
@@ -19254,7 +19294,7 @@ dependencies = [
  "hf-hub",
  "insta",
  "itertools 0.14.0",
- "rand 0.9.2",
+ "rand 0.10.1",
  "reqwest 0.12.24",
  "serde",
  "serde_json",
@@ -19272,7 +19312,7 @@ version = "1.9.3"
 source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3#ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3"
 dependencies = [
  "hf-hub",
- "rand 0.9.2",
+ "rand 0.9.4",
  "serde",
  "serde_json",
  "text-embeddings-backend-candle",
@@ -19626,7 +19666,7 @@ dependencies = [
  "monostate",
  "onig",
  "paste",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rayon",
  "rayon-cond",
  "regex",
@@ -19659,7 +19699,7 @@ dependencies = [
  "monostate",
  "onig",
  "paste",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rayon",
  "rayon-cond",
  "regex",
@@ -19742,7 +19782,7 @@ dependencies = [
  "pin-project-lite",
  "postgres-protocol",
  "postgres-types",
- "rand 0.9.2",
+ "rand 0.9.4",
  "socket2 0.6.2",
  "tokio",
  "tokio-util",
@@ -20404,7 +20444,7 @@ dependencies = [
  "http 1.4.0",
  "httparse",
  "log",
- "rand 0.9.2",
+ "rand 0.9.4",
  "sha1 0.10.6",
  "thiserror 2.0.18",
  "utf-8",
@@ -20465,7 +20505,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "paste",
  "polling",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rapidhash",
  "regex",
  "regex-syntax",
@@ -20603,7 +20643,7 @@ version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
 dependencies = [
- "rand 0.9.2",
+ "rand 0.9.4",
 ]
 
 [[package]]
@@ -20699,7 +20739,7 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "pin-project",
- "rand 0.9.2",
+ "rand 0.9.4",
  "reqwest 0.12.24",
  "serde",
  "serde_json",
@@ -21068,7 +21108,7 @@ dependencies = [
  "futures",
  "humantime",
  "parking_lot 0.12.5",
- "rand 0.9.2",
+ "rand 0.10.1",
  "serde_json",
  "tokio",
  "tracing",
@@ -21134,7 +21174,7 @@ checksum = "b672338555252d43fd2240c714dc444b8c6fb0a5c5335e65a07bba7742735ddb"
 dependencies = [
  "getrandom 0.4.1",
  "js-sys",
- "rand 0.9.2",
+ "rand 0.9.4",
  "serde_core",
  "sha1_smol",
  "wasm-bindgen",
@@ -21284,7 +21324,7 @@ dependencies = [
  "paste",
  "pin-project-lite",
  "prost 0.14.3",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rustc-hash 2.1.1",
  "simdutf8",
  "static_assertions",
@@ -21333,7 +21373,7 @@ dependencies = [
  "paste",
  "pin-project-lite",
  "prost 0.14.3",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rustc-hash 2.1.1",
  "simdutf8",
  "static_assertions",
@@ -21358,7 +21398,7 @@ dependencies = [
  "itertools 0.14.0",
  "num-traits",
  "pco",
- "rand 0.9.2",
+ "rand 0.9.4",
  "rustc-hash 2.1.1",
  "tracing",
  "vortex-alp",
@@ -21726,7 +21766,7 @@ source = "git+https://github.com/spiceai/vortex.git?rev=d694abda6cf4081a7a6e93b0
 dependencies = [
  "getrandom 0.3.4",
  "parking_lot 0.12.5",
- "sketches-ddsketch",
+ "sketches-ddsketch 0.3.0",
 ]
 
 [[package]]
@@ -21790,7 +21830,7 @@ dependencies = [
  "itertools 0.14.0",
  "parking_lot 0.12.5",
  "roaring",
- "sketches-ddsketch",
+ "sketches-ddsketch 0.3.0",
  "tracing",
  "vortex-array 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=d694abda6cf4081a7a6e93b08da1bba28204f41e)",
  "vortex-buffer 0.1.0 (git+https://github.com/spiceai/vortex.git?rev=d694abda6cf4081a7a6e93b08da1bba28204f41e)",
@@ -22252,7 +22292,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -22976,7 +23016,7 @@ dependencies = [
  "async-trait",
  "futures",
  "llms",
- "rand 0.9.2",
+ "rand 0.10.1",
  "spicepod",
  "tokio",
  "tracing",
