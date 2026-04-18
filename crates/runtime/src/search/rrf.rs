@@ -48,6 +48,13 @@ use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
 use crate::search::util::table_ref_from_column_expr;
 
 pub static RRF_UDF_NAME: &str = "rrf";
+
+/// When the user sets a fused-result `limit` on `rrf()`, each underlying search
+/// subquery is asked for `limit * RRF_CANDIDATE_POOL_FACTOR` rows so the
+/// rank-fusion has a wider pool of candidates to combine. The post-fuse
+/// `.limit(0, Some(l))` still caps the final result to exactly `l` rows. This
+/// trades a small amount of extra index work for materially better recall.
+pub const RRF_CANDIDATE_POOL_FACTOR: usize = 4;
 pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
     Documentation {
     doc_section: DocSection::default(),
@@ -60,6 +67,7 @@ pub static DOCUMENTATION: LazyLock<Documentation> = LazyLock::new(|| {
             "Inline text_search or vector_search UDTF invocations".to_string(),
         ),
         ("k".to_string(), "RRF smoothing parameter (default: 60.0)".to_string()),
+        ("limit".to_string(), "Upper bound on fused result rows. Also propagated to any nested search query that does not specify its own limit, reducing work in the underlying search indexes.".to_string()),
         ("join_key".to_string(), "Column name to use for joining results instead of auto-generated row ID".to_string()),
         ("time_column".to_string(), "Column name containing timestamps for recency boosting".to_string()),
         ("recency_decay".to_string(), "Type of decay function: 'linear' or 'exponential' (default: 'exponential')".to_string()),
@@ -105,6 +113,17 @@ macro_rules! extract_string {
               $key,
               DataType::Utf8,
               ScalarValue::Utf8(Some(val), ..) => val
+          )
+      };
+  }
+
+macro_rules! extract_u64 {
+      ($map:expr, $key:literal) => {
+          extract_scalar_base!(
+              $map,
+              $key,
+              DataType::UInt64,
+              ScalarValue::UInt64(Some(val), ..) => val
           )
       };
   }
@@ -210,6 +229,9 @@ struct ReciprocalRankFusionArgs {
     pub decay_constant: Option<f64>,
     pub decay_scale_secs: Option<f64>,
     pub decay_window_secs: Option<f64>,
+    /// Optional upper bound on the fused result set. When set, also used as a
+    /// default limit for any nested search subquery that does not specify its own.
+    pub limit: Option<usize>,
 }
 
 type SearchUdtfArgs = (String, String, Option<String>, Option<usize>, Option<bool>);
@@ -254,6 +276,24 @@ impl ReciprocalRankFusionArgs {
                         }
                     }
                 }
+                // Identifier passed as a named argument (e.g. `time_column => mycol`).
+                // The Spice DataFusion fork wraps non-literal named arguments in an
+                // `Expr::Alias` carrying the parameter name in `spice.parameter_name`.
+                // Treat the column's name as the string value so it slots into the
+                // existing string-based extraction (`time_column`, `join_key`, ...).
+                Expr::Alias(alias) => match (
+                    alias.expr.as_ref(),
+                    alias
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.inner().get("spice.parameter_name")),
+                ) {
+                    (Expr::Column(column), Some(name)) => Ok((
+                        name.clone(),
+                        ScalarValue::Utf8(Some(column.name.clone())),
+                    )),
+                    _ => not_impl_err!("{RRF_UDF_NAME} does not yet support {arg} arguments."),
+                },
                 // Show a useful error for the rest
                 other_expr => {
                     not_impl_err!("{RRF_UDF_NAME} does not yet support {other_expr} arguments.")
@@ -274,10 +314,13 @@ impl ReciprocalRankFusionArgs {
             join_key: extract_string!(rrf_args, "join_key").map(ident),
             time_column: extract_string!(rrf_args, "time_column").map(ident),
             recency_decay: extract_string!(rrf_args, "recency_decay")
-                .and_then(|rd| RecencyDecay::from_str(&rd).ok()),
+                .map(|rd| RecencyDecay::from_str(&rd))
+                .transpose()?,
             decay_constant: extract_f64!(rrf_args, "decay_constant"),
             decay_scale_secs: extract_f64!(rrf_args, "decay_scale_secs"),
             decay_window_secs: extract_f64!(rrf_args, "decay_window_secs"),
+            limit: extract_u64!(rrf_args, "limit")
+                .map(|v| usize::try_from(v).unwrap_or(usize::MAX)),
         })
     }
 
@@ -307,6 +350,7 @@ impl ReciprocalRankFusionArgs {
             decay_constant: self.decay_constant,
             decay_scale_secs: self.decay_scale_secs,
             decay_window_secs: self.decay_window_secs,
+            limit: self.limit.map(|l| u64::try_from(l).unwrap_or(u64::MAX)),
         })
     }
 
@@ -637,11 +681,19 @@ impl ReciprocalRankFusion {
                 }
             }));
 
-            joined
+            let sorted = joined
                 .select(columns)?
                 .aggregate(vec![join_key], agg_cols)?
                 .drop_columns(&["__spice_rrf_row_id"])?
-                .sort(vec![col("fused_score").sort(false, false)])
+                .sort(vec![col("fused_score").sort(false, false)])?;
+
+            // Apply the RRF-level limit so `FROM rrf(..., limit => N)` alone is
+            // sufficient — users don't have to add an outer LIMIT clause.
+            if let Some(l) = args.limit {
+                sorted.limit(0, Some(l))
+            } else {
+                Ok(sorted)
+            }
         } else {
             exec_err!("{RRF_UDF_NAME}: Unable to join result sets")
         }
@@ -719,6 +771,22 @@ impl ReciprocalRankFusion {
                         "{RRF_UDF_NAME}: Query at position {i} does not have a `_score` column."
                     );
                 }
+
+                // Propagate the RRF-level `limit` into each subquery as a wider
+                // candidate pool. The subquery search providers honor scan-level
+                // limits (pushed down through DataFusion's optimizer), so this
+                // reduces work in the underlying search indexes and network
+                // overhead. We multiply by RRF_CANDIDATE_POOL_FACTOR so the
+                // rank-fusion has enough overlap candidates to produce a stable
+                // top-`l` result; the final `.limit(0, Some(l))` after fusion
+                // still caps the user-visible output exactly.
+                let df = match args.limit {
+                    Some(l) => {
+                        let pool = l.saturating_mul(RRF_CANDIDATE_POOL_FACTOR);
+                        df.limit(0, Some(pool))?
+                    }
+                    None => df,
+                };
 
                 let df_with_id = match join_key {
                     Some(_) => Ok(df),
@@ -1422,5 +1490,74 @@ mod tests {
         assert_eq!(many_with_k_and_column.search_udtf_exprs.len(), 100);
         // assert_eq!(many_with_k_and_column.k, 1337.0f64);
         assert_eq!(many_with_k_and_column.join_key, Some(col("hello")));
+    }
+
+    /// Build the `Expr::Alias { expr: Column(name), metadata: { spice.parameter_name: param } }`
+    /// shape that the Spice DataFusion fork emits for non-literal named arguments.
+    fn aliased_column_named(param: &str, column_name: &str) -> Expr {
+        let metadata = FieldMetadata::new(BTreeMap::from([(
+            "spice.parameter_name".to_string(),
+            param.to_string(),
+        )]));
+        col(column_name).alias_with_metadata(param, Some(metadata))
+    }
+
+    #[test]
+    fn test_parse_limit_named_arg() {
+        let exprs = vec![
+            stub_scalar_function("a"),
+            stub_scalar_function("b"),
+            spice_named_lit!("limit", 25_u64),
+        ];
+        let args = ReciprocalRankFusionArgs::from_udtf_exprs(&exprs).expect("Must parse args");
+        assert_eq!(args.limit, Some(25));
+    }
+
+    #[test]
+    fn test_parse_time_column_as_identifier() {
+        // SQL: rrf(s1, s2, time_column => picked_at, join_key => id)
+        let exprs = vec![
+            stub_scalar_function("a"),
+            stub_scalar_function("b"),
+            aliased_column_named("time_column", "picked_at"),
+            aliased_column_named("join_key", "id"),
+        ];
+        let args =
+            ReciprocalRankFusionArgs::from_udtf_exprs(&exprs).expect("Must parse identifier args");
+        assert_eq!(args.time_column, Some(col("picked_at")));
+        assert_eq!(args.join_key, Some(col("id")));
+    }
+
+    #[test]
+    fn test_identifier_and_string_named_args_are_equivalent() {
+        let from_string = ReciprocalRankFusionArgs::from_udtf_exprs(&[
+            stub_scalar_function("a"),
+            stub_scalar_function("b"),
+            spice_named_lit!("time_column", "picked_at"),
+        ])
+        .expect("Must parse string form");
+        let from_ident = ReciprocalRankFusionArgs::from_udtf_exprs(&[
+            stub_scalar_function("a"),
+            stub_scalar_function("b"),
+            aliased_column_named("time_column", "picked_at"),
+        ])
+        .expect("Must parse identifier form");
+        assert_eq!(from_string.time_column, from_ident.time_column);
+    }
+
+    #[test]
+    fn test_unsupported_named_arg_returns_error() {
+        // A bare Column expression (no Alias wrapper, no metadata) is not a valid named arg.
+        let exprs = vec![
+            stub_scalar_function("a"),
+            stub_scalar_function("b"),
+            col("not_a_named_arg"),
+        ];
+        let err = ReciprocalRankFusionArgs::from_udtf_exprs(&exprs)
+            .expect_err("Bare column should not be accepted as a named arg");
+        assert!(
+            err.to_string().contains("does not yet support"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -194,6 +194,7 @@ mod tests {
             decay_constant: None,
             decay_scale_secs: None,
             decay_window_secs: None,
+            limit: None,
         });
         let bytes = args.encode_to_vec();
         let deserialized = UdtfArgs::decode(bytes.as_slice()).expect("decode");

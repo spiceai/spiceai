@@ -280,6 +280,9 @@ message RrfArgs {
     optional double decay_scale_secs = 7;
     // Window size for linear decay function (default: 86400).
     optional double decay_window_secs = 8;
+    // Optional upper bound on result rows. When set, also propagated to any nested
+    // search query that does not specify its own limit.
+    optional uint64 limit = 9;
 }
 
 // A nested query within an RRF invocation.

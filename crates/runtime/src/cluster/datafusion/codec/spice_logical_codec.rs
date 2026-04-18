@@ -226,6 +226,12 @@ impl SpiceLogicalCodec {
                 ScalarValue::Float64(Some(decay_window_secs)),
             ));
         }
+        if let Some(limit) = rrf_args.limit {
+            exprs.push(Self::named_literal(
+                "limit",
+                ScalarValue::UInt64(Some(limit)),
+            ));
+        }
 
         // Invoke the RRF UDTF
         let rrf_udtf = ReciprocalRankFusion::from_ctx(&runtime.df.ctx);

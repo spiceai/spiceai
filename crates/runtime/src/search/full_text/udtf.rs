@@ -102,8 +102,11 @@ impl TextSearchTableFuncArgs {
         let col: String = if let Some(col) = column {
             if !search_fields.contains(col) {
                 return Err(DataFusionError::Execution(format!(
-                    "User function 'text_search' is called on table '{tbl}' that does not have a full text search index on '{col}' column. Index is on column(s): {}",
-                    search_fields.join(", ")
+                    "User function 'text_search' is called on table '{tbl}' that does not have a full text search index on '{col}' column. Index is on column(s): {}.{}",
+                    search_fields.join(", "),
+                    suggest_column(col, search_fields)
+                        .map(|s| format!(" Did you mean '{s}'?"))
+                        .unwrap_or_default()
                 )));
             }
             col.clone()
@@ -114,8 +117,9 @@ impl TextSearchTableFuncArgs {
                 (Some(field), None) => field.clone(),
                 (Some(_), Some(_)) => {
                     return Err(DataFusionError::Execution(format!(
-                        "User function 'text_search' is called on table '{tbl}' that has {} full text search columns. Must call 'text_search' with column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`",
-                        search_fields.len()
+                        "User function 'text_search' is called on table '{tbl}' that has {} full text search columns ({}). Must call 'text_search' with column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`",
+                        search_fields.len(),
+                        search_fields.join(", ")
                     )));
                 }
                 _ => {
@@ -127,6 +131,53 @@ impl TextSearchTableFuncArgs {
         };
         Ok(col)
     }
+}
+
+/// Suggest the closest indexed column for a misspelled column name using
+/// case-insensitive Levenshtein distance. Returns `None` if no column is reasonably close.
+fn suggest_column(target: &str, candidates: &[String]) -> Option<String> {
+    let target_lower = target.to_lowercase();
+    let (best, distance) = candidates
+        .iter()
+        .map(|c| (c, levenshtein(&target_lower, &c.to_lowercase())))
+        .min_by_key(|(_, d)| *d)?;
+
+    // Only suggest if the edit distance is small relative to the target length.
+    // This avoids nonsense suggestions for wildly different names.
+    let threshold = target.len().div_ceil(2).max(2);
+    if distance <= threshold {
+        Some(best.clone())
+    } else {
+        None
+    }
+}
+
+/// Compute Levenshtein edit distance between two byte strings. Operates on UTF-8
+/// code units which is sufficient for column-name typo detection.
+fn levenshtein(a: &str, b: &str) -> usize {
+    if a == b {
+        return 0;
+    }
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    if a_bytes.is_empty() {
+        return b_bytes.len();
+    }
+    if b_bytes.is_empty() {
+        return a_bytes.len();
+    }
+
+    let mut prev: Vec<usize> = (0..=b_bytes.len()).collect();
+    let mut curr: Vec<usize> = vec![0; b_bytes.len() + 1];
+    for (i, &ac) in a_bytes.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &bc) in b_bytes.iter().enumerate() {
+            let cost = usize::from(ac != bc);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b_bytes.len()]
 }
 
 #[derive(Debug)]
@@ -193,7 +244,12 @@ impl TextSearchTableFunc {
     }
 
     fn parse_args(args: &[Expr]) -> DataFusionResult<TextSearchTableFuncArgs> {
-        let mut args = args.iter();
+        // Filter out passthrough parameters (those with `spice.parameter_name` metadata).
+        // These are meant for table functions like RRF (e.g. `rank_weight => X`), not
+        // for `text_search` itself.
+        let mut args = args.iter().filter(|arg| {
+            !matches!(arg, Expr::Literal(_, Some(meta)) if meta.inner().contains_key("spice.parameter_name"))
+        });
 
         let tbl = args.next();
         let Some(Expr::Column(c)) = tbl else {
@@ -297,26 +353,68 @@ impl TableFunctionImpl for TextSearchTableFunc {
             )));
         };
 
-        let mut fts_indexes =
-            find_index_in_table_provider::<FullTextDatabaseIndex>(&table_provider)
-                .ok_or_else(|| {
-                    DataFusionError::Plan(format!(
-                        "Table '{}' does not have a full text search index.",
-                        args.tbl.clone()
-                    ))
-                })?
-                .0;
+        let fts_indexes = find_index_in_table_provider::<FullTextDatabaseIndex>(&table_provider)
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "Table '{}' does not have a full text search index.",
+                    args.tbl.clone()
+                ))
+            })?
+            .0;
 
-        let Some(fts_index) = fts_indexes.pop() else {
+        if fts_indexes.is_empty() {
             return Err(DataFusionError::Plan(format!(
                 "Table '{}' does not have a full text search index.",
                 args.tbl.clone()
+            )));
+        }
+
+        // Aggregate all indexed columns across every FTS index on this table so we can
+        // both match the user's requested column to the correct index and surface a
+        // helpful error that lists every searchable column.
+        let mut all_search_fields: Vec<String> = fts_indexes
+            .iter()
+            .flat_map(|idx| idx.search_fields.iter().cloned())
+            .collect();
+        all_search_fields.sort();
+        all_search_fields.dedup();
+
+        // Pick the index that actually contains the user-requested column. This matters
+        // when a table has multiple FTS indexes: previously we popped the last index and
+        // then validated the column against only that index, producing incorrect
+        // "no index on column" errors for columns that are in fact indexed.
+        let fts_index: FullTextDatabaseIndex = if let Some(ref requested) = args.column {
+            fts_indexes
+                .iter()
+                .find(|idx| idx.search_fields.contains(requested))
+                .cloned()
+                .cloned()
+                .ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "User function 'text_search' is called on table '{}' that does not have a full text search index on '{requested}' column. Indexed column(s): {}.{}",
+                        args.tbl,
+                        all_search_fields.join(", "),
+                        suggest_column(requested, &all_search_fields)
+                            .map(|s| format!(" Did you mean '{s}'?"))
+                            .unwrap_or_default()
+                    ))
+                })?
+        } else if fts_indexes.len() == 1 {
+            // Exactly one FTS index. Defer to `column()` which picks the single search
+            // field or errors with a helpful message listing the available columns.
+            fts_indexes[0].clone()
+        } else {
+            return Err(DataFusionError::Plan(format!(
+                "User function 'text_search' is called on table '{}' that has {} full text search column(s) ({}). Must call 'text_search' with a column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`",
+                args.tbl,
+                all_search_fields.len(),
+                all_search_fields.join(", "),
             )));
         };
 
         // Select single column if needed.
         let column = args.column(&fts_index.search_fields)?;
-        let mut fts_index = fts_index.clone();
+        let mut fts_index = fts_index;
         fts_index.search_fields = vec![column.clone()];
 
         // Create UDTF source for distributed serialization
@@ -371,5 +469,165 @@ impl ScalarUDFImpl for TextSearchTableFunc {
     /// Required for `UserDefined` signature - accepts any types like `VariadicAny` would.
     fn coerce_types(&self, arg_types: &[DataType]) -> DataFusionResult<Vec<DataType>> {
         Ok(arg_types.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        TextSearchTableFunc, TextSearchTableFuncArgs, levenshtein, suggest_column,
+    };
+    use datafusion::common::Column;
+    use datafusion::logical_expr::expr::FieldMetadata;
+    use datafusion::prelude::Expr;
+    use datafusion::scalar::ScalarValue;
+    use datafusion::sql::TableReference;
+    use std::collections::BTreeMap;
+
+    fn fields(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn args_with_column(column: Option<&str>) -> TextSearchTableFuncArgs {
+        TextSearchTableFuncArgs {
+            tbl: TableReference::bare("docs"),
+            query: "hello".to_string(),
+            column: column.map(str::to_string),
+            limit: None,
+            include_score: Some(true),
+        }
+    }
+
+    #[test]
+    fn levenshtein_basic_cases() {
+        assert_eq!(levenshtein("", ""), 0);
+        assert_eq!(levenshtein("abc", "abc"), 0);
+        assert_eq!(levenshtein("", "abc"), 3);
+        assert_eq!(levenshtein("abc", ""), 3);
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("title", "titel"), 2);
+    }
+
+    #[test]
+    fn suggest_column_returns_close_match() {
+        let cands = fields(&["title", "body", "summary"]);
+        assert_eq!(suggest_column("titel", &cands), Some("title".to_string()));
+        // Case-insensitive
+        assert_eq!(suggest_column("TITLE", &cands), Some("title".to_string()));
+        // Exact
+        assert_eq!(suggest_column("body", &cands), Some("body".to_string()));
+    }
+
+    #[test]
+    fn suggest_column_returns_none_for_distant() {
+        let cands = fields(&["title", "body"]);
+        assert_eq!(suggest_column("completely_unrelated", &cands), None);
+    }
+
+    #[test]
+    fn suggest_column_handles_empty_candidates() {
+        assert_eq!(suggest_column("anything", &[]), None);
+    }
+
+    #[test]
+    fn args_column_picks_unique_search_field() {
+        let args = args_with_column(None);
+        let picked = args
+            .column(&fields(&["body"]))
+            .expect("Single search field should be picked automatically");
+        assert_eq!(picked, "body");
+    }
+
+    #[test]
+    fn args_column_errors_on_no_search_fields() {
+        let args = args_with_column(None);
+        let err = args
+            .column(&[])
+            .expect_err("No search fields should error");
+        assert!(err.to_string().contains("no associated full text search index"));
+    }
+
+    #[test]
+    fn args_column_errors_when_multiple_and_unspecified() {
+        let args = args_with_column(None);
+        let err = args
+            .column(&fields(&["title", "body"]))
+            .expect_err("Multiple search fields without explicit column should error");
+        let msg = err.to_string();
+        assert!(msg.contains("title"));
+        assert!(msg.contains("body"));
+        assert!(msg.contains("Must call 'text_search' with column parameter"));
+    }
+
+    #[test]
+    fn args_column_validates_explicit_choice() {
+        let args = args_with_column(Some("body"));
+        let picked = args
+            .column(&fields(&["title", "body"]))
+            .expect("Explicit valid column should succeed");
+        assert_eq!(picked, "body");
+    }
+
+    #[test]
+    fn args_column_errors_with_did_you_mean_for_typo() {
+        let args = args_with_column(Some("titel"));
+        let err = args
+            .column(&fields(&["title", "body"]))
+            .expect_err("Unknown column should error");
+        let msg = err.to_string();
+        assert!(msg.contains("'title'"), "expected suggestion in: {msg}");
+        assert!(msg.contains("Did you mean"), "expected suggestion in: {msg}");
+    }
+
+    #[test]
+    fn args_column_errors_without_suggestion_for_distant_typo() {
+        let args = args_with_column(Some("completely_unrelated"));
+        let err = args
+            .column(&fields(&["title", "body"]))
+            .expect_err("Unknown column should error");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("Did you mean"),
+            "should not suggest a far match: {msg}"
+        );
+    }
+
+    fn passthrough_lit(name: &str) -> Expr {
+        let meta = FieldMetadata::new(BTreeMap::from([(
+            "spice.parameter_name".to_string(),
+            name.to_string(),
+        )]));
+        Expr::Literal(ScalarValue::Float64(Some(2.0)), Some(meta))
+    }
+
+    #[test]
+    fn parse_args_filters_passthrough_named_args() {
+        // Args: tbl, query, then a passthrough `rank_weight` literal that
+        // belongs to RRF, not to text_search itself. Must be ignored.
+        let exprs = vec![
+            Expr::Column(Column::new_unqualified("docs")),
+            Expr::Literal(ScalarValue::Utf8(Some("hello".to_string())), None),
+            passthrough_lit("rank_weight"),
+        ];
+        let parsed = TextSearchTableFunc::parse_args(&exprs)
+            .expect("Passthrough named arg should be ignored");
+        assert_eq!(parsed.query, "hello");
+        assert_eq!(parsed.column, None);
+        assert_eq!(parsed.limit, None);
+        assert_eq!(parsed.include_score, Some(true));
+    }
+
+    #[test]
+    fn parse_args_passthrough_does_not_consume_real_args() {
+        // Same as above but with an explicit column following the passthrough.
+        let exprs = vec![
+            Expr::Column(Column::new_unqualified("docs")),
+            Expr::Literal(ScalarValue::Utf8(Some("hello".to_string())), None),
+            passthrough_lit("rank_weight"),
+            Expr::Column(Column::new_unqualified("body")),
+        ];
+        let parsed = TextSearchTableFunc::parse_args(&exprs)
+            .expect("Passthrough named arg should be ignored");
+        assert_eq!(parsed.column.as_deref(), Some("body"));
     }
 }

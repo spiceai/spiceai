@@ -139,34 +139,79 @@ impl VectorSearchTableFuncArgs {
             .cloned();
         match (self.column.as_deref(), cfg) {
             (Some(col), Some(cfg)) => Ok((col.to_string(), cfg)),
-            (Some(col), None) => Err(DataFusionError::Plan(format!(
-                "User function 'vector_search' is called on table '{}' that does not have a embedding index on '{col}' column. Index is on column(s): {}",
-                self.tbl,
-                embedded_columns
-                    .keys()
-                    .collect::<Vec<_>>()
-                    .iter()
-                    .join(", ")
-            ))),
+            (Some(col), None) => {
+                let available: Vec<String> = embedded_columns.keys().cloned().collect();
+                let suggestion = closest_column(col, &available)
+                    .map(|s| format!(" Did you mean '{s}'?"))
+                    .unwrap_or_default();
+                Err(DataFusionError::Plan(format!(
+                    "User function 'vector_search' is called on table '{}' that does not have an embedding index on '{col}' column. Indexed column(s): {}.{suggestion}",
+                    self.tbl,
+                    available.iter().join(", ")
+                )))
+            }
             (None, _) => {
                 if embedded_columns.len() > 1 {
+                    let available: Vec<String> = embedded_columns.keys().cloned().collect();
                     return Err(DataFusionError::Plan(format!(
-                        "User function 'vector_search' is called on table '{}' that has {} vector search columns. Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`.",
+                        "User function 'vector_search' is called on table '{}' that has {} vector search columns ({}). Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`.",
                         self.tbl,
-                        embedded_columns.len()
+                        embedded_columns.len(),
+                        available.iter().join(", ")
                     )));
                 }
                 if let Some((col, cfg)) = embedded_columns.iter().next() {
                     Ok((col.clone(), cfg.clone()))
                 } else {
                     Err(DataFusionError::Plan(format!(
-                        "User function 'vector_search' is called on table '{}' that has no associated full text search index.",
+                        "User function 'vector_search' is called on table '{}' that has no associated embedding index.",
                         self.tbl,
                     )))
                 }
             }
         }
     }
+}
+
+/// Suggest the closest available column to `target` using case-insensitive
+/// Levenshtein distance. Returns `None` if nothing is reasonably close.
+fn closest_column(target: &str, candidates: &[String]) -> Option<String> {
+    let target_lower = target.to_lowercase();
+    let (best, distance) = candidates
+        .iter()
+        .map(|c| (c, levenshtein_bytes(&target_lower, &c.to_lowercase())))
+        .min_by_key(|(_, d)| *d)?;
+    let threshold = target.len().div_ceil(2).max(2);
+    if distance <= threshold {
+        Some(best.clone())
+    } else {
+        None
+    }
+}
+
+fn levenshtein_bytes(a: &str, b: &str) -> usize {
+    if a == b {
+        return 0;
+    }
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    if a_bytes.is_empty() {
+        return b_bytes.len();
+    }
+    if b_bytes.is_empty() {
+        return a_bytes.len();
+    }
+    let mut prev: Vec<usize> = (0..=b_bytes.len()).collect();
+    let mut curr: Vec<usize> = vec![0; b_bytes.len() + 1];
+    for (i, &ac) in a_bytes.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &bc) in b_bytes.iter().enumerate() {
+            let cost = usize::from(ac != bc);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b_bytes.len()]
 }
 
 #[derive(Debug)]
@@ -736,4 +781,53 @@ fn alias_value_to_match(
         })
         .collect::<Vec<Expr>>();
     Ok(Arc::new(ViewTable::new(bldr.project(cols)?.build()?, None)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{closest_column, levenshtein_bytes};
+
+    fn fields(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn levenshtein_bytes_basic_cases() {
+        assert_eq!(levenshtein_bytes("", ""), 0);
+        assert_eq!(levenshtein_bytes("abc", "abc"), 0);
+        assert_eq!(levenshtein_bytes("", "abc"), 3);
+        assert_eq!(levenshtein_bytes("abc", ""), 3);
+        assert_eq!(levenshtein_bytes("kitten", "sitting"), 3);
+        assert_eq!(levenshtein_bytes("content", "contnet"), 2);
+    }
+
+    #[test]
+    fn closest_column_returns_close_match() {
+        let cands = fields(&["content", "title", "body"]);
+        assert_eq!(
+            closest_column("contnet", &cands),
+            Some("content".to_string())
+        );
+        // Case-insensitive
+        assert_eq!(
+            closest_column("CONTENT", &cands),
+            Some("content".to_string())
+        );
+        // Exact match
+        assert_eq!(
+            closest_column("title", &cands),
+            Some("title".to_string())
+        );
+    }
+
+    #[test]
+    fn closest_column_returns_none_for_distant() {
+        let cands = fields(&["content", "title"]);
+        assert_eq!(closest_column("xyzabc_unrelated", &cands), None);
+    }
+
+    #[test]
+    fn closest_column_handles_empty_candidates() {
+        assert_eq!(closest_column("anything", &[]), None);
+    }
 }
