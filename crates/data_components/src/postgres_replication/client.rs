@@ -249,24 +249,50 @@ fn wal_stream(
                                 .push_delete(&rel, old);
                             metrics.inc_delete();
                         }
-                        DecodedMessage::Truncate { .. } => {
+                        DecodedMessage::Truncate { relation_ids } => {
                             metrics.inc_truncate();
-                            // Push a synthetic truncate change into the txn buffer —
-                            // we fabricate a row-less change with op="t" which the
-                            // downstream `write_change` / `process_truncate` path
-                            // turns into an accelerator-level "delete all".
-                            let rel = resolve_relation_with_declared_pks(
+                            // pgoutput gives us the explicit list of relation ids
+                            // the TRUNCATE applies to. For a single-table
+                            // publication (our default), there should be exactly
+                            // one id. We error clearly on any other shape to
+                            // avoid silently applying the truncate to the wrong
+                            // table.
+                            let relation_id = match relation_ids.as_slice() {
+                                [id] => *id,
+                                [] => {
+                                    Err(StreamError::External(format!(
+                                        "pgoutput TRUNCATE for {dataset_name} did not include any relation ids"
+                                    )))?;
+                                    unreachable!();
+                                }
+                                _ => {
+                                    Err(StreamError::External(format!(
+                                        "pgoutput TRUNCATE for {dataset_name} referenced {} relations; \
+                                         this replication path requires exactly one relation per publication",
+                                        relation_ids.len()
+                                    )))?;
+                                    unreachable!();
+                                }
+                            };
+                            let rel = match resolve_relation_with_declared_pks(
                                 &decoder,
-                                // Relation id is inside the Truncate message; for
-                                // single-table publications the cached relation is
-                                // unambiguous, so we use the first cached one.
-                                decoder.relation_iter().next().map(|r| r.relation_id).unwrap_or(0),
+                                relation_id,
                                 &primary_keys,
-                            )?;
+                            ) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    Err(StreamError::External(format!(
+                                        "pgoutput TRUNCATE for {dataset_name} references relation id {relation_id} \
+                                         before its Relation message was cached: {e}"
+                                    )))?;
+                                    unreachable!();
+                                }
+                            };
                             txn.get_or_insert_with(|| TransactionBuffer::new(0))
                                 .push_truncate(&rel);
                             tracing::info!(
                                 dataset = %dataset_name,
+                                relation_id,
                                 "TRUNCATE from postgres replication queued for accelerator"
                             );
                         }

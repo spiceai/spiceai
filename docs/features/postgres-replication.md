@@ -200,7 +200,7 @@ Each Spice replica can use a different `pg_replication_slot` while sharing a pub
 
 ## Metrics
 
-Spice emits OpenTelemetry observables for every replicated Postgres dataset. Metric names follow the standard Spice pattern `dataset_postgres_<metric>` with a single `name=<dataset>` attribute, so they work unchanged with the built-in Prometheus scrape endpoint and OTLP exporter.
+Spice emits OpenTelemetry observables for every replicated Postgres dataset. Metric names follow the pattern `dataset_postgres_replication_<metric>` with a single `name=<dataset>` attribute, so they work unchanged with the built-in Prometheus scrape endpoint and OTLP exporter.
 
 ### Core freshness signals
 
@@ -380,7 +380,7 @@ Dropping or renaming columns in use by Spice will require rebuilding the acceler
 | `wal` on the source disk growing forever                                                    | An abandoned slot. Drop it with `pg_drop_replication_slot`. |
 | `UPDATE`s on Arrow-engine dataset don't replace rows                                        | Arrow does not support `on_conflict`. Switch to `duckdb`, `sqlite`, `postgres`, or `cayenne`. |
 | Huge `TEXT`/`JSONB` columns show as `NULL` after `UPDATE`                                   | Unchanged TOASTed columns are omitted by pgoutput. Run `ALTER TABLE ... REPLICA IDENTITY FULL;` if you need them in every event. |
-| Logged *`TRUNCATE received... skipping`*                                                    | `TRUNCATE` replication is not yet implemented. Either avoid truncating the source or rebuild the accelerator (see above). |
+| Logged *`TRUNCATE from postgres replication queued for accelerator`*                        | Informational. A source `TRUNCATE` is being applied — the accelerated table will be emptied. |
 
 ## Limitations (current release)
 

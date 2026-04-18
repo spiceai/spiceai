@@ -297,13 +297,18 @@ impl RefreshTask {
         let ctx = SessionContext::new();
         let session_state = ctx.state();
         let _lock_guard = self.accelerator_write_mutex.lock().await;
-        // Empty filter list = delete everything. All accelerator DeletionTableProvider
-        // impls interpret this as an unconditional full-table delete.
-        let delete_plan =
-            DeletionTableProvider::delete_from(deletion_provider.as_ref(), &session_state, &[])
-                .await
-                .map_err(find_datafusion_root)
-                .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+        // DeletionTableProvider impls treat an EMPTY filter list as a no-op
+        // (guard against accidental full-table deletes). To actually wipe the
+        // table we pass an always-true literal, which gets emitted as
+        // `DELETE FROM <table> WHERE TRUE`.
+        let delete_plan = DeletionTableProvider::delete_from(
+            deletion_provider.as_ref(),
+            &session_state,
+            &[lit(true)],
+        )
+        .await
+        .map_err(find_datafusion_root)
+        .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
         collect(delete_plan, ctx.task_ctx())
             .await
             .map_err(find_datafusion_root)

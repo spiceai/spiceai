@@ -176,7 +176,7 @@ const METRICS: &[MetricSpec] = &[
         "replication_truncates_total",
         MetricType::ObservableCounterU64,
     )
-    .description("Total TRUNCATE operations received from WAL (currently skipped)."),
+    .description("Total TRUNCATE operations received from WAL and applied to the accelerator."),
     MetricSpec::new(
         "replication_bootstrap_rows_total",
         MetricType::ObservableCounterU64,
