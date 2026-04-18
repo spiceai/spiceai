@@ -19,7 +19,7 @@ limitations under the License.
 //!
 //! Used by HTTP and Flight middleware so that cancellation fires when the
 //! response body is dropped mid-stream (client disconnect during a streaming
-//! SQL, SSE, or Flight DoGet response), and does NOT fire when the body
+//! SQL, SSE, or Flight `DoGet` response), and does NOT fire when the body
 //! completes normally.
 
 use std::pin::Pin;

@@ -194,6 +194,10 @@ pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
     sql: QueryMethod,
     tracker: Option<QueryTracker>,
+    #[expect(
+        clippy::struct_field_names,
+        reason = "query_id matches the conventional naming for the query identifier"
+    )]
     query_id: uuid::Uuid,
     /// Cancellation token for cooperative cancellation. If unset, query
     /// execution inherits the request-context cancellation token. Set this to
@@ -1189,8 +1193,6 @@ fn attach_cancellation_to_stream<G>(
 where
     G: Send + 'static,
 {
-    let schema = stream.schema();
-
     struct State<G> {
         stream: SendableRecordBatchStream,
         token: tokio_util::sync::CancellationToken,
@@ -1198,6 +1200,8 @@ where
         _guard: G,
         emitted_cancel: bool,
     }
+
+    let schema = stream.schema();
 
     let state = State {
         stream,

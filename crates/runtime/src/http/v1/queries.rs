@@ -623,7 +623,7 @@ pub(crate) async fn get_chunk(
 /// Cancel a running query.
 ///
 /// The query id is first checked against the runtime's sync query registry
-/// (covering `/v1/sql`, FlightSQL, NSQL-driven, and tool-driven synchronous
+/// (covering `/v1/sql`, `FlightSQL`, NSQL-driven, and tool-driven synchronous
 /// queries). If not found, the request is forwarded to the async job executor
 /// (which requires cluster mode with a scheduler role).
 #[cfg_attr(feature = "openapi", utoipa::path(
@@ -678,7 +678,7 @@ pub(crate) async fn cancel(
 
 /// List currently-active synchronous queries known to this runtime.
 ///
-/// This reports queries running behind `/v1/sql`, FlightSQL, NSQL, `/v1/search`,
+/// This reports queries running behind `/v1/sql`, `FlightSQL`, NSQL, `/v1/search`,
 /// and tool-driven SQL. Async jobs queries are reported via `GET /v1/queries`.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,

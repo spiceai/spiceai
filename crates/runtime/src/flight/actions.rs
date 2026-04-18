@@ -36,7 +36,7 @@ enum ActionType {
     GetAsyncQueryStatus,
     GetAsyncQueryResult,
     CancelAsyncQuery,
-    /// Cancels a synchronous query running via FlightSQL or HTTP `/v1/sql`.
+    /// Cancels a synchronous query running via `FlightSQL` or HTTP `/v1/sql`.
     /// Body: JSON `{"query_id": "<uuid>"}`.
     /// Response: JSON `{"query_id": "...", "cancelled": bool}`.
     CancelQuery,

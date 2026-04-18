@@ -17,7 +17,7 @@ limitations under the License.
 //! Runtime-wide registry of active synchronous queries, keyed by query id.
 //!
 //! The registry provides a single place for administrative cancel operations
-//! (HTTP `/v1/queries/{id}/cancel`, FlightSQL `ActionCancelQueryRequest`) to
+//! (HTTP `/v1/queries/{id}/cancel`, `FlightSQL` `ActionCancelQueryRequest`) to
 //! look up a running query's [`CancellationToken`] and signal cancellation.
 //!
 //! Each entry is installed when a query begins execution and removed when the
@@ -101,6 +101,7 @@ impl QueryCancelRegistry {
 
     /// Cancels the active query with the given id, if present. Returns `true`
     /// if an entry existed and was signalled.
+    #[must_use]
     pub fn cancel(&self, query_id: Uuid) -> bool {
         if let Some(entry) = self.entries.get(&query_id) {
             entry.token.cancel();
