@@ -48,7 +48,7 @@ use datafusion::{
 use datafusion_expr::{
     LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, binary_expr, col, ident,
 };
-#[cfg(feature = "s3_vectors")]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use futures::FutureExt;
 use itertools::Itertools;
 #[cfg(feature = "models")]
@@ -79,14 +79,18 @@ use crate::{
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 
-#[cfg(feature = "s3_vectors")]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use {
     crate::search::util::find_index_in_table_provider,
     search::index::SearchIndex,
-    search::index::chunking::ChunkedSearchIndex,
-    search::index::s3_vectors::S3Vector,
     search::provider::{SearchQueryProvider, UdtfSource},
 };
+
+#[cfg(feature = "s3_vectors")]
+use {search::index::chunking::ChunkedSearchIndex, search::index::s3_vectors::S3Vector};
+
+#[cfg(feature = "elasticsearch")]
+use search::index::elasticsearch::ElasticsearchIndex;
 
 use tokio::sync::RwLock;
 
@@ -465,37 +469,47 @@ impl VectorSearchTableFunc {
         })
     }
 
-    #[cfg(feature = "s3_vectors")]
+    #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
     fn index_based_vector_table(
         tbl: &Arc<dyn TableProvider>,
         args: &VectorSearchTableFuncArgs,
     ) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
-        let mut vector_indexes: Vec<Arc<dyn SearchIndex>> = match (
-            find_index_in_table_provider::<S3Vector>(tbl),
-            find_index_in_table_provider::<ChunkedSearchIndex>(tbl),
-        ) {
-            (Some((vector_index, _)), Some((chunked_index, _))) => {
-                let mut indexes = chunked_index
-                    .into_iter()
-                    .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>)
-                    .collect::<Vec<_>>();
-                indexes.extend(
-                    vector_index
+        let mut vector_indexes: Vec<Arc<dyn SearchIndex>> = Vec::new();
+
+        #[cfg(feature = "s3_vectors")]
+        {
+            if let Some((s3_indexes, _)) = find_index_in_table_provider::<S3Vector>(tbl) {
+                vector_indexes.extend(
+                    s3_indexes
                         .into_iter()
                         .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
                 );
-                indexes
             }
-            (None, Some((chunked_index, _))) => chunked_index
-                .into_iter()
-                .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>)
-                .collect::<Vec<_>>(),
-            (Some((vector_index, _)), None) => vector_index
-                .into_iter()
-                .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>)
-                .collect::<Vec<_>>(),
-            (None, None) => return Ok(None),
-        };
+            if let Some((chunked_indexes, _)) =
+                find_index_in_table_provider::<ChunkedSearchIndex>(tbl)
+            {
+                vector_indexes.extend(
+                    chunked_indexes
+                        .into_iter()
+                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
+                );
+            }
+        }
+
+        #[cfg(feature = "elasticsearch")]
+        {
+            if let Some((es_indexes, _)) = find_index_in_table_provider::<ElasticsearchIndex>(tbl) {
+                vector_indexes.extend(
+                    es_indexes
+                        .into_iter()
+                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
+                );
+            }
+        }
+
+        if vector_indexes.is_empty() {
+            return Ok(None);
+        }
 
         let vector_index_opt = if let Some(col) = &args.column {
             vector_indexes
@@ -514,6 +528,20 @@ impl VectorSearchTableFunc {
         let Some(vector_index) = vector_index_opt else {
             return Ok(None);
         };
+
+        // For Elasticsearch indexes, normalize the base table provider schema to match
+        // what the ES HTTP client produces (e.g. LargeUtf8 → Utf8). This ensures that
+        // HashJoinExec key types match on both sides of the join.
+        #[cfg(feature = "elasticsearch")]
+        let normalized_tbl_storage: Arc<dyn TableProvider>;
+        #[cfg(feature = "elasticsearch")]
+        let tbl: &Arc<dyn TableProvider> =
+            if let Some(es_index) = vector_index.as_any().downcast_ref::<ElasticsearchIndex>() {
+                normalized_tbl_storage = es_index.normalize_source_table(Arc::clone(tbl))?;
+                &normalized_tbl_storage
+            } else {
+                tbl
+            };
 
         Ok(Some(Arc::new(
             SearchQueryProvider::try_from_index(
@@ -558,7 +586,7 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         };
 
         // For table with a vector engine, use it.
-        #[cfg(feature = "s3_vectors")]
+        #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
         if let Some(table_provider) = Self::index_based_vector_table(&table_provider, &args)? {
             return Ok(table_provider);
         }
