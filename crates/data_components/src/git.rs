@@ -935,8 +935,26 @@ impl GitClient {
                 // payload. When `enable_lfs` is on we stat the working-tree
                 // entry and use that size both for the row's `size` column
                 // and for the `max_file_bytes` check.
+                //
+                // Security hardening: `symlink_metadata` + `is_symlink`
+                // rejects tracked symlinks so a malicious repository cannot
+                // coerce us into reading host files outside `cache_path`.
                 let lfs_on_disk_size = if let Some(root) = lfs_content_root.as_ref() {
-                    match std::fs::metadata(root.join(&full_path)) {
+                    match std::fs::symlink_metadata(root.join(&full_path)) {
+                        Ok(meta) if meta.file_type().is_symlink() => {
+                            tracing::debug!(
+                                "Skipping LFS-tracked symlink {} to avoid reading files outside the repository cache",
+                                full_path
+                            );
+                            return TreeWalkResult::Ok;
+                        }
+                        Ok(meta) if !meta.file_type().is_file() => {
+                            tracing::debug!(
+                                "Skipping LFS entry {} because it is not a regular file",
+                                full_path
+                            );
+                            return TreeWalkResult::Ok;
+                        }
                         Ok(meta) => Some(usize::try_from(meta.len()).unwrap_or(usize::MAX)),
                         Err(err) => {
                             tracing::warn!(
@@ -985,14 +1003,35 @@ impl GitClient {
 
                 let content = if fetch_content {
                     if let Some(root) = lfs_content_root.as_ref() {
-                        match std::fs::read(root.join(&full_path)) {
-                            Ok(bytes) => decode(&bytes),
-                            Err(err) => {
-                                tracing::warn!(
-                                    "Failed to read LFS-materialized content for {}: {err}. Leaving content NULL.",
-                                    full_path
-                                );
-                                None
+                        let candidate = root.join(&full_path);
+                        // Re-check symlink-ness immediately before reading to
+                        // narrow the TOCTOU window and ensure we never open a
+                        // symlink that points outside the repository cache.
+                        let follow_safe = matches!(
+                            std::fs::symlink_metadata(&candidate),
+                            Ok(meta) if meta.file_type().is_file()
+                        );
+                        let inside_root = candidate
+                            .canonicalize()
+                            .ok()
+                            .zip(root.canonicalize().ok())
+                            .is_some_and(|(abs, abs_root)| abs.starts_with(&abs_root));
+                        if !follow_safe || !inside_root {
+                            tracing::debug!(
+                                "Refusing to read {}: symlink or path escapes repository cache",
+                                full_path
+                            );
+                            None
+                        } else {
+                            match std::fs::read(&candidate) {
+                                Ok(bytes) => decode(&bytes),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "Failed to read LFS-materialized content for {}: {err}. Leaving content NULL.",
+                                        full_path
+                                    );
+                                    None
+                                }
                             }
                         }
                     } else {
@@ -1292,8 +1331,11 @@ fn ensure_git_lfs_available() -> Result<()> {
 }
 
 /// Strip sensitive substrings from subprocess output before surfacing it in
-/// an error. Redacts configured passwords/tokens/passphrases and any
-/// userinfo embedded in an HTTP(S) URL.
+/// an error. Redacts:
+/// - configured passwords/tokens/passphrases,
+/// - userinfo embedded in an HTTP(S) URL, and
+/// - any `Authorization: Basic|Bearer <value>` header string that git or its
+///   HTTP backend may have echoed via trace output.
 fn sanitize_subprocess_output(text: &str, credentials: &GitCredentials) -> String {
     let mut cleaned = text.to_string();
     for secret in [
@@ -1307,6 +1349,17 @@ fn sanitize_subprocess_output(text: &str, credentials: &GitCredentials) -> Strin
     {
         cleaned = cleaned.replace(secret, "<redacted>");
     }
+
+    // Redact any Authorization header (Basic / Bearer / custom scheme) the
+    // subprocess might have printed. The match is scoped to the remainder of
+    // the line so surrounding log context is preserved.
+    static AUTH_HEADER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)(Authorization\s*:\s*)(\S+\s+)?\S+").expect("valid regex")
+    });
+    let cleaned = AUTH_HEADER_RE
+        .replace_all(&cleaned, "${1}<redacted>")
+        .into_owned();
+
     // Redact userinfo in any URL the subprocess may have echoed.
     let mut out = String::with_capacity(cleaned.len());
     let mut rest = cleaned.as_str();
@@ -1331,6 +1384,88 @@ fn sanitize_subprocess_output(text: &str, credentials: &GitCredentials) -> Strin
     out
 }
 
+/// Environment variables that can cause `git` / `curl` / Git credential
+/// helpers to emit verbose trace output containing headers and credentials.
+/// We explicitly clear them on any subprocess we launch so sensitive
+/// material isn't echoed into our captured stderr.
+const GIT_TRACE_ENV_VARS: &[&str] = &[
+    "GIT_TRACE",
+    "GIT_TRACE_CURL",
+    "GIT_TRACE_CURL_NO_DATA",
+    "GIT_TRACE_PACKET",
+    "GIT_TRACE_PACK_ACCESS",
+    "GIT_TRACE_PERFORMANCE",
+    "GIT_TRACE_SETUP",
+    "GIT_TRACE_SHALLOW",
+    "GIT_CURL_VERBOSE",
+    "GCM_TRACE",
+];
+
+/// Ephemeral on-disk `GIT_ASKPASS`/`SSH_ASKPASS` script that echoes the
+/// connector's configured HTTP(S) credentials when git prompts for them.
+/// Command-line arguments for processes are observable via `ps` on most
+/// hosts, so we avoid embedding credentials in argv via `-c http.extraHeader`
+/// and go through ASKPASS instead. The backing temp dir is 0o700 and is
+/// removed automatically when this value drops.
+struct TempAskpass {
+    _dir: tempfile::TempDir,
+    script: PathBuf,
+}
+
+impl TempAskpass {
+    fn new(credentials: &GitCredentials) -> Result<Option<Self>> {
+        let Some((user, pass)) = basic_auth_parts(credentials) else {
+            return Ok(None);
+        };
+        let dir = tempfile::Builder::new()
+            .prefix("spice-git-askpass-")
+            .tempdir()
+            .context(IoSnafu)?;
+        let script = dir.path().join("askpass.sh");
+        let contents = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  *[Pp]assword*) printf '%s' {pass} ;;\n  *[Uu]sername*) printf '%s' {user} ;;\nesac\n",
+            pass = sh_single_quote(&pass),
+            user = sh_single_quote(&user),
+        );
+        std::fs::write(&script, contents).context(IoSnafu)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+                .context(IoSnafu)?;
+        }
+        Ok(Some(Self { _dir: dir, script }))
+    }
+
+    fn path(&self) -> &Path {
+        &self.script
+    }
+}
+
+fn basic_auth_parts(credentials: &GitCredentials) -> Option<(String, String)> {
+    if let Some(token) = credentials.token.as_deref() {
+        Some((
+            credentials
+                .username
+                .as_deref()
+                .unwrap_or("x-access-token")
+                .to_string(),
+            token.to_string(),
+        ))
+    } else if let Some(password) = credentials.password.as_deref() {
+        Some((
+            credentials.username.as_deref().unwrap_or("git").to_string(),
+            password.to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn sh_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn run_git_lfs_command(
     cache_path: &Path,
     args: &[&str],
@@ -1345,22 +1480,29 @@ fn run_git_lfs_command(
     // credentials rather than with whatever happens to be on the host.
     cmd.env("GIT_TERMINAL_PROMPT", "0");
 
-    // For HTTP(S): inject an Authorization header via a runtime-scoped `-c`
-    // override so credentials never touch the on-disk config and are never
-    // part of the URL. The full command line is only visible to the same
-    // user/container, which is the same trust boundary as reading the
-    // credentials from the spicepod params.
-    if let Some(header) = http_auth_header(credentials) {
-        cmd.arg("-c").arg(format!("http.extraHeader={header}"));
+    // Clear any ambient tracing that would echo request headers or credential
+    // helper input/output into stderr.
+    for key in GIT_TRACE_ENV_VARS {
+        cmd.env_remove(key);
     }
 
-    // For SSH: point `ssh` at the configured private key. The passphrase (if
+    // HTTP(S): route credential prompts through a temporary ASKPASS script
+    // instead of embedding the secret in argv via `-c http.extraHeader=...`,
+    // which would leak the credential to anyone able to enumerate processes
+    // on the host.
+    let askpass = TempAskpass::new(credentials)?;
+    if let Some(ref a) = askpass {
+        cmd.env("GIT_ASKPASS", a.path());
+        cmd.env("SSH_ASKPASS", a.path());
+    }
+
+    // SSH: point `ssh` at the configured private key. The passphrase (if
     // any) is expected to be cached by ssh-agent; we do not persist it to
     // disk.
     if let Some(ref key_path) = credentials.ssh_key_path {
         let ssh_cmd = format!(
             "ssh -i {} -o IdentitiesOnly=yes -o BatchMode=yes",
-            shell_escape(&key_path.to_string_lossy())
+            sh_single_quote(&key_path.to_string_lossy())
         );
         cmd.env("GIT_SSH_COMMAND", ssh_cmd);
     } else if !credentials.ssh_use_agent {
@@ -1374,6 +1516,7 @@ fn run_git_lfs_command(
     cmd.arg("lfs").args(args);
 
     let output = cmd.output().context(IoSnafu)?;
+    drop(askpass); // release the askpass temp dir before we return
 
     if output.status.success() {
         Ok(())
@@ -1388,42 +1531,6 @@ fn run_git_lfs_command(
             operation: label.to_string(),
             message,
         })
-    }
-}
-
-fn http_auth_header(credentials: &GitCredentials) -> Option<String> {
-    use base64::Engine as _;
-
-    let (user, pass) = if let Some(token) = credentials.token.as_deref() {
-        (
-            credentials
-                .username
-                .as_deref()
-                .unwrap_or("x-access-token")
-                .to_string(),
-            token.to_string(),
-        )
-    } else if let Some(password) = credentials.password.as_deref() {
-        (
-            credentials.username.as_deref().unwrap_or("git").to_string(),
-            password.to_string(),
-        )
-    } else {
-        return None;
-    };
-    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
-    Some(format!("Authorization: Basic {encoded}"))
-}
-
-/// Minimal POSIX-style quoting for an argument embedded in `GIT_SSH_COMMAND`.
-fn shell_escape(value: &str) -> String {
-    if value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
     }
 }
 

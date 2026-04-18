@@ -90,6 +90,7 @@ spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", re
     "tls",
 ], optional = true } # spiceai
 telemetry = { path = "../telemetry" }
+tempfile.workspace = true
 tiberius = { workspace = true, optional = true }
 token_provider = { path = "../token_provider" }
 tokio.workspace = true

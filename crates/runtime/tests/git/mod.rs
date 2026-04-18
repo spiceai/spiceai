@@ -82,8 +82,11 @@ fn init_test_repo(root: &Path) -> anyhow::Result<()> {
 }
 
 fn make_git_dataset(repo_path: &Path, cache_path: &Path, include: Option<&str>) -> Dataset {
-    let path_str = repo_path.to_str().expect("repo path must be UTF-8");
-    let mut dataset = Dataset::new(format!("git:file://{path_str}@main"), "git_test");
+    // Build the `file://` URL via `Url::from_file_path` so Windows paths
+    // (which use backslashes and drive letters) are encoded correctly.
+    let file_url =
+        url::Url::from_file_path(repo_path).expect("repo path must be an absolute filesystem path");
+    let mut dataset = Dataset::new(format!("git:{file_url}@main"), "git_test");
 
     let mut params = HashMap::new();
     if let Some(pattern) = include {
