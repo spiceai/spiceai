@@ -861,11 +861,25 @@ impl Builder {
                     let dataset_name = self.dataset_name.clone();
                     let federated = Arc::clone(&self.federated);
                     let wait_handle = tokio::spawn(async move {
-                        // Wait for the deferred federated table provider to resolve, which
-                        // implies the source's schema has been resolved and access verified.
-                        let _ = federated.table_provider().await;
-                        runtime_status
-                            .update_dataset(&dataset_name, status::ComponentStatus::Ready);
+                        // Wait for the deferred federated table provider to resolve. Only mark
+                        // the dataset ready if the deferred provider actually connected (its
+                        // schema was resolved and access was verified). If resolution failed
+                        // (e.g. shutdown or task panic), the federated table falls back to an
+                        // `UnavailableTableProvider`; leave the status untouched so the caller
+                        // surfaces the error through the refresh path instead of a misleading
+                        // `Ready`.
+                        let provider = federated.table_provider().await;
+                        if provider
+                            .as_any()
+                            .is::<crate::federated_table::UnavailableTableProvider>()
+                        {
+                            tracing::warn!(
+                                "Deferred federated provider for dataset {dataset_name} did not resolve successfully; leaving dataset status unchanged"
+                            );
+                        } else {
+                            runtime_status
+                                .update_dataset(&dataset_name, status::ComponentStatus::Ready);
+                        }
                     });
                     handlers.push(wait_handle);
                 }

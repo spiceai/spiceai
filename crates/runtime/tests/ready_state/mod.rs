@@ -576,12 +576,8 @@ async fn run_ready_state_test(
         (false, ReadyState::OnRegistration, Some(_)) => "federated_on_registration_duckdb",
         (false, ReadyState::OnLoad, None) => "federated_on_load_arrow",
         (false, ReadyState::OnLoad, Some(_)) => "federated_on_load_duckdb",
-        (false, ReadyState::OnSchemaResolved, None) => {
-            "federated_on_schema_resolved_arrow"
-        }
-        (false, ReadyState::OnSchemaResolved, Some(_)) => {
-            "federated_on_schema_resolved_duckdb"
-        }
+        (false, ReadyState::OnSchemaResolved, None) => "federated_on_schema_resolved_arrow",
+        (false, ReadyState::OnSchemaResolved, Some(_)) => "federated_on_schema_resolved_duckdb",
     };
 
     tracing::info!("Using dataset: {}", dataset_name);
@@ -790,8 +786,8 @@ async fn test_ready_state_on_registration_federated_duckdb_acceleration()
 
 // Test that the runtime is ready immediately with ready_state = on_schema_resolved for native provider
 #[tokio::test]
-async fn test_ready_state_on_schema_resolved_native_arrow_acceleration()
--> Result<(), anyhow::Error> {
+async fn test_ready_state_on_schema_resolved_native_arrow_acceleration() -> Result<(), anyhow::Error>
+{
     // Native provider, OnSchemaResolved, Arrow engine: readiness triggers after the federated
     // source is accessible (schema resolvable) and queries fall back to the source during initial load.
     run_ready_state_test(

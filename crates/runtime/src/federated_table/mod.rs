@@ -51,7 +51,7 @@ use crate::{
 /// Used as a fallback when the deferred provider task exits without producing
 /// a real table (e.g. during shutdown or after a task panic), so queries fail
 /// explicitly rather than silently returning zero rows.
-struct UnavailableTableProvider {
+pub(crate) struct UnavailableTableProvider {
     schema: SchemaRef,
     dataset_name: String,
 }
