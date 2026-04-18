@@ -70,32 +70,32 @@ static GIT_DISABLED_FLAGS: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
 fn shared_semaphore(key: &str, max_concurrent: usize) -> Arc<Semaphore> {
     let mut guard = GIT_CONCURRENCY_LIMITS
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match guard.get(key) {
-        Some((semaphore, existing_max)) => {
-            if *existing_max != max_concurrent {
-                tracing::warn!(
-                    repo_url = %key,
-                    existing_max,
-                    requested_max = max_concurrent,
-                    "Multiple datasets target the same Git repository with different max_concurrent_requests values. Keeping the first-seen limit ({existing_max}). Reconcile the configuration for consistent behavior."
-                );
-            }
-            Arc::clone(semaphore)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((semaphore, existing_max)) = guard.get(key) {
+        if *existing_max != max_concurrent {
+            tracing::warn!(
+                repo_url = %key,
+                existing_max,
+                requested_max = max_concurrent,
+                "Multiple datasets target the same Git repository with different max_concurrent_requests values. Keeping the first-seen limit ({existing_max}). Reconcile the configuration for consistent behavior."
+            );
         }
-        None => {
-            let semaphore = Arc::new(Semaphore::new(max_concurrent));
-            guard.insert(key.to_string(), (Arc::clone(&semaphore), max_concurrent));
-            semaphore
-        }
+        Arc::<Semaphore>::clone(semaphore)
+    } else {
+        let semaphore = Arc::new(Semaphore::new(max_concurrent));
+        guard.insert(
+            key.to_string(),
+            (Arc::<Semaphore>::clone(&semaphore), max_concurrent),
+        );
+        semaphore
     }
 }
 
 fn shared_disabled_flag(key: &str) -> Arc<AtomicBool> {
     let mut guard = GIT_DISABLED_FLAGS
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    Arc::clone(
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::<AtomicBool>::clone(
         guard
             .entry(key.to_string())
             .or_insert_with(|| Arc::new(AtomicBool::new(false))),
@@ -233,9 +233,8 @@ impl Git {
             .get("backoff_method")
             .expose()
             .ok()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "exponential".to_string());
-        let backoff = BackoffMethod::parse(&backoff_value).unwrap_or_else(|message| {
+            .unwrap_or("exponential");
+        let backoff = BackoffMethod::parse(backoff_value).unwrap_or_else(|message| {
             tracing::warn!("{message}; falling back to 'exponential'.");
             BackoffMethod::Exponential
         });

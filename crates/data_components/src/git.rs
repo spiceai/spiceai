@@ -427,7 +427,10 @@ impl std::fmt::Debug for GitClient {
 }
 
 impl GitClient {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "credentials and resilience config would otherwise clutter every call site; keeping one builder for clarity"
+    )]
     pub fn new(
         repo_url: &str,
         reference: Option<&str>,
@@ -528,20 +531,10 @@ impl GitClient {
         }
     }
 
-    /// Whether this URL is an SSH-style URL (used to decide default
-    /// authentication behavior). The anonymous `git://` protocol is
-    /// deliberately excluded — it is *not* an SSH transport and must not
-    /// trigger ssh-agent fallback.
-    fn is_ssh_url(url: &str) -> bool {
-        url.starts_with("git@") || url.starts_with("ssh://") || url.starts_with("git+ssh://")
-    }
-
     fn resolve_credentials(
         credentials: &GitCredentials,
-        _url: &str,
         username_from_url: Option<&str>,
         allowed_types: CredentialType,
-        _is_ssh: bool,
     ) -> std::result::Result<Cred, git2::Error> {
         // SSH public-key authentication is always attempted first when the
         // remote requests it — libgit2 calls the credentials callback once per
@@ -601,11 +594,8 @@ impl GitClient {
     /// Evaluate the configured retry/backoff policy and return the delay to
     /// wait before the next attempt.
     fn backoff_delay(&self, attempt: u32) -> Duration {
-        let delay = match self.resilience.backoff {
-            BackoffMethod::Exponential => {
-                let factor = 2u64.saturating_pow(attempt);
-                RETRY_INITIAL_BACKOFF.saturating_mul(factor.min(u64::from(u32::MAX)) as u32)
-            }
+        let factor_u64: u64 = match self.resilience.backoff {
+            BackoffMethod::Exponential => 2u64.saturating_pow(attempt),
             BackoffMethod::Fibonacci => {
                 let (mut a, mut b) = (1u64, 1u64);
                 for _ in 0..attempt {
@@ -613,10 +603,13 @@ impl GitClient {
                     a = b;
                     b = next;
                 }
-                RETRY_INITIAL_BACKOFF.saturating_mul(b.min(u64::from(u32::MAX)) as u32)
+                b
             }
         };
-        delay.min(RETRY_MAX_BACKOFF)
+        let factor = u32::try_from(factor_u64).unwrap_or(u32::MAX);
+        RETRY_INITIAL_BACKOFF
+            .saturating_mul(factor)
+            .min(RETRY_MAX_BACKOFF)
     }
 
     fn is_permanent_error(err: &git2::Error) -> bool {
@@ -705,7 +698,6 @@ impl GitClient {
         let repo_url = self.repo_url.clone();
         let cache_path = self.cache_path.clone();
         let credentials = self.credentials.clone();
-        let is_ssh = Self::is_ssh_url(&self.repo_url);
         let enable_lfs = self.enable_lfs;
         let reference = self.reference.clone();
 
@@ -714,13 +706,7 @@ impl GitClient {
                 let mut callbacks = RemoteCallbacks::new();
                 let creds = credentials.clone();
                 callbacks.credentials(move |_url, username_from_url, allowed_types| {
-                    Self::resolve_credentials(
-                        &creds,
-                        _url,
-                        username_from_url,
-                        allowed_types,
-                        is_ssh,
-                    )
+                    Self::resolve_credentials(&creds, username_from_url, allowed_types)
                 });
                 // Intentionally no `certificate_check` override: libgit2's
                 // default verification is used, which validates TLS
@@ -869,8 +855,8 @@ impl GitClient {
                 let mode = format!("{:o}", entry.filemode());
 
                 let content = if fetch_content {
-                    let bytes = match lfs_content_root.as_ref() {
-                        Some(root) => match std::fs::read(root.join(&full_path)) {
+                    let bytes = if let Some(root) = lfs_content_root.as_ref() {
+                        match std::fs::read(root.join(&full_path)) {
                             Ok(bytes) if bytes.len() <= max_file_bytes => bytes,
                             Ok(bytes) => {
                                 tracing::debug!(
@@ -883,20 +869,22 @@ impl GitClient {
                             Err(err) => {
                                 tracing::warn!(
                                     "Failed to read LFS-materialized content for {}: {}. Falling back to blob content.",
-                                    full_path,
-                                    err
+                                    full_path, err
                                 );
                                 blob.content().to_vec()
                             }
-                        },
-                        None => blob.content().to_vec(),
-                    };
-                    match std::str::from_utf8(&bytes) {
-                        Ok(text) => Some(text.to_string()),
-                        Err(_) => {
-                            tracing::debug!("File {} is not valid UTF-8, skipping content", full_path);
-                            None
                         }
+                    } else {
+                        blob.content().to_vec()
+                    };
+                    if let Ok(text) = std::str::from_utf8(&bytes) {
+                        Some(text.to_string())
+                    } else {
+                        tracing::debug!(
+                            "File {} is not valid UTF-8, skipping content",
+                            full_path
+                        );
+                        None
                     }
                 } else {
                     None
@@ -1277,24 +1265,6 @@ mod tests {
     }
 
     #[test]
-    fn ssh_url_detection() {
-        assert!(GitClient::is_ssh_url("git@github.com:spiceai/spiceai.git"));
-        assert!(GitClient::is_ssh_url(
-            "ssh://git@github.com/spiceai/spiceai.git"
-        ));
-        assert!(GitClient::is_ssh_url(
-            "git+ssh://github.com/spiceai/spiceai.git"
-        ));
-        assert!(!GitClient::is_ssh_url(
-            "https://github.com/spiceai/spiceai.git"
-        ));
-        // git:// is the anonymous git protocol, not SSH — must not be classified as SSH.
-        assert!(!GitClient::is_ssh_url(
-            "git://github.com/spiceai/spiceai.git"
-        ));
-    }
-
-    #[test]
     fn credentials_empty_when_unset() {
         let creds = GitCredentials::default();
         assert!(creds.is_empty());
@@ -1303,13 +1273,8 @@ mod tests {
     #[test]
     fn resolve_credentials_rejects_userpass_without_creds() {
         let creds = GitCredentials::default();
-        let result = GitClient::resolve_credentials(
-            &creds,
-            "https://github.com/spiceai/spiceai.git",
-            None,
-            CredentialType::USER_PASS_PLAINTEXT,
-            false,
-        );
+        let result =
+            GitClient::resolve_credentials(&creds, None, CredentialType::USER_PASS_PLAINTEXT);
         let err = match result {
             Err(err) => err,
             Ok(_) => panic!("expected error when no credentials are configured"),
@@ -1327,13 +1292,21 @@ mod tests {
             token: Some("ghp_token".to_string()),
             ..Default::default()
         };
-        let result = GitClient::resolve_credentials(
-            &creds,
-            "https://github.com/spiceai/spiceai.git",
-            None,
-            CredentialType::USER_PASS_PLAINTEXT,
-            false,
-        );
+        let result =
+            GitClient::resolve_credentials(&creds, None, CredentialType::USER_PASS_PLAINTEXT);
         assert!(result.is_ok(), "should produce userpass cred");
+    }
+
+    #[test]
+    fn resolve_credentials_ssh_agent_only_when_enabled() {
+        // With ssh_use_agent = false and no ssh_key_path, SSH_KEY should fall
+        // through — not auto-use the agent based on URL shape.
+        let creds = GitCredentials::default();
+        let fallthrough =
+            GitClient::resolve_credentials(&creds, Some("git"), CredentialType::SSH_KEY);
+        // The code tries SSH_KEY first, has nothing to return, and falls into
+        // the USERNAME/USER_PASS/DEFAULT branches which are not allowed here,
+        // producing an "unsupported credential type" error.
+        assert!(fallthrough.is_err(), "expected error when agent disabled");
     }
 }
