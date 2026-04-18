@@ -22,7 +22,7 @@ use crate::{
 use app::AppBuilder;
 use datafusion::{assert_batches_eq, error::DataFusionError};
 use futures::TryStreamExt;
-use rand::Rng;
+use rand::RngExt;
 
 use runtime::Runtime;
 use spicepod::{

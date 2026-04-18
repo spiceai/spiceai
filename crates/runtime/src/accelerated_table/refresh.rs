@@ -41,7 +41,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser;
 use futures::future::BoxFuture;
 use opentelemetry::KeyValue;
-use rand::Rng;
+use rand::RngExt;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::ForceCreate;
 use serde::{Deserialize, Serialize};

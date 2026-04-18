@@ -20,7 +20,7 @@ use anyhow::Result;
 use arrow::datatypes::{Field, Schema};
 use async_channel::Receiver;
 use opentelemetry::trace::TraceId;
-use rand::RngCore;
+use rand::Rng;
 use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
