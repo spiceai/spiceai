@@ -117,8 +117,8 @@ jobs:
           name: llms-integration-test-binary
           path: ./llms_integration_test
           retention-days: 3
-          # Test binary is already a compact native binary; skip artifact zip compression.
-          compression-level: 0
+          # Test binary is already a compact native binary; use minimal artifact zip compression.
+          compression-level: 1
 
   test:
     runs-on: ${{ matrix.target.runner }}
