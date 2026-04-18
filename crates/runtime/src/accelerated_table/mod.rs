@@ -840,9 +840,37 @@ impl Builder {
         }
 
         // If the table should be ready immediately, mark it as ready.
-        if self.ready_state == ReadyState::OnRegistration {
-            self.runtime_status
-                .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
+        // For `OnSchemaResolved`, the dataset is marked ready once the federated source's schema
+        // has been resolved (its `TableProvider` has been successfully resolved, which also implies
+        // access to the source has been verified). For an immediate federated table this has already
+        // occurred synchronously before the builder ran, so we can mark it ready here. For a deferred
+        // federated table we spawn a background task that waits for the deferred provider to resolve
+        // before marking the dataset ready.
+        match self.ready_state {
+            ReadyState::OnRegistration => {
+                self.runtime_status
+                    .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
+            }
+            ReadyState::OnSchemaResolved => match &*self.federated {
+                FederatedTable::Immediate(_) => {
+                    self.runtime_status
+                        .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
+                }
+                FederatedTable::Deferred(_) => {
+                    let runtime_status = Arc::clone(&self.runtime_status);
+                    let dataset_name = self.dataset_name.clone();
+                    let federated = Arc::clone(&self.federated);
+                    let wait_handle = tokio::spawn(async move {
+                        // Wait for the deferred federated table provider to resolve, which
+                        // implies the source's schema has been resolved and access verified.
+                        let _ = federated.table_provider().await;
+                        runtime_status
+                            .update_dataset(&dataset_name, status::ComponentStatus::Ready);
+                    });
+                    handlers.push(wait_handle);
+                }
+            },
+            ReadyState::OnLoad => {}
         }
 
         // For caching mode with synchronization, register the child with the parent immediately
@@ -1208,7 +1236,7 @@ impl TableProvider for AcceleratedTable {
                         SpiceExternalError::acceleration_not_ready(self.dataset_name.to_string()),
                     ));
                 }
-                ReadyState::OnRegistration => {
+                ReadyState::OnRegistration | ReadyState::OnSchemaResolved => {
                     // Getting the federated_provider should always return immediately here, because by definition an accelerated table has
                     // completed its initial load if it has a previous checkpoint.
                     let federated_provider = self.federated.table_provider().await;
