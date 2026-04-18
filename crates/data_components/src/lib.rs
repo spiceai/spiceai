@@ -37,6 +37,8 @@ pub mod duckdb;
 pub mod ducklake;
 #[cfg(feature = "dynamodb")]
 pub mod dynamodb;
+#[cfg(feature = "elasticsearch")]
+pub mod elasticsearch;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
