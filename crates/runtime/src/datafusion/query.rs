@@ -396,11 +396,11 @@ impl Query {
             let e = find_datafusion_root(e);
             return Err(Error::UnableToExecuteQuery { source: e });
         }
-        if self.read_only {
-            if let Err(e) = validate_sql_query_read_only(&plan) {
-                let e = find_datafusion_root(e);
-                return Err(Error::UnableToExecuteQuery { source: e });
-            }
+        if self.read_only
+            && let Err(e) = validate_sql_query_read_only(&plan)
+        {
+            let e = find_datafusion_root(e);
+            return Err(Error::UnableToExecuteQuery { source: e });
         }
 
         // Get the schema from the logical plan
