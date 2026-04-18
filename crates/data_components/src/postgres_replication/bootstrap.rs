@@ -47,7 +47,7 @@ use super::{
 };
 use crate::cdc::{ChangeBatch, ChangeEnvelope, StreamError, changes_schema};
 
-/// Rows-per-batch when COPY-streaming the initial snapshot.
+/// Rows per emitted batch when streaming the initial snapshot query.
 const BOOTSTRAP_BATCH_SIZE: usize = 1024;
 
 /// Input for [`snapshot_stream`]. Grouped into a struct to keep the function

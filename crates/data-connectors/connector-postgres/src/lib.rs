@@ -109,8 +109,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     ),
     ParameterSpec::component("replication_initial_snapshot")
         .description(
-            "Whether to COPY the table's existing rows on first connection, before \
-             streaming WAL changes. Default: true.",
+            "Whether to take an initial snapshot of the table's existing rows on first \
+             connection, before streaming WAL changes. Default: true.",
         )
         .default("true"),
     ParameterSpec::component("replication_temporary_slot")

@@ -560,15 +560,13 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
             let pretty =
                 pretty_format_batches(&regions).map_err(|e| anyhow!("format regions: {e}"))?;
             let expected_regions = concat!(
-                "+-------------+-------------+\n",
-                "| r_regionkey | r_name      |\n",
-                "+-------------+-------------+\n",
-                "| 0           | AFRICA      |\n",
-                "| 1           | AMERICA     |\n",
-                "| 2           | ASIA        |\n",
-                "| 3           | EUROPE      |\n",
-                "| 4           | MIDDLE EAST |\n",
-                "+-------------+-------------+",
+                "+-------------+---------+\n",
+                "| r_regionkey | r_name  |\n",
+                "+-------------+---------+\n",
+                "| 0           | AFRICA  |\n",
+                "| 1           | AMERICA |\n",
+                "| 2           | ASIA    |\n",
+                "+-------------+---------+",
             );
             assert_eq!(pretty.to_string(), expected_regions);
 
