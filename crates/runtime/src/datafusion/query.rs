@@ -317,7 +317,9 @@ impl Query {
                 sql, parameters, ..
             } => {
                 // Use the existing get_plan_or_cached which handles all cache control,
-                // stale-while-revalidate, and query tracking
+                // stale-while-revalidate, and query tracking. `read_only` is
+                // threaded through so cached results cannot bypass
+                // `validate_sql_query_read_only` below.
                 match Query::get_plan_or_cached(
                     &self.df,
                     &session,
@@ -325,6 +327,7 @@ impl Query {
                     sql,
                     parameters.clone(),
                     tracker,
+                    self.read_only,
                 )
                 .await?
                 {
@@ -602,6 +605,7 @@ impl Query {
                             sql,
                             parameters.clone(),
                             tracker,
+                            ctx.read_only,
                         )
                         .await?
                         {

@@ -24,6 +24,12 @@ use datafusion::{
 
 use crate::datafusion::DataFusion;
 
+// Re-export the single-source-of-truth list of write-capable extension node
+// names. The `cache` crate owns this list so that both the read-only validator
+// below and the SQL results-cache eligibility check in `cache` stay in lockstep
+// — any write-capable extension must be non-cacheable AND blocked by read-only.
+pub(super) use cache::WRITE_CAPABLE_EXTENSION_NAMES;
+
 /// Validates that a logical plan only performs allowed operations on datasets.
 ///
 /// Reads (SELECT queries) are allowed on all tables.
@@ -266,29 +272,6 @@ pub fn validate_sql_query_read_only(plan: &LogicalPlan) -> Result<(), DataFusion
     })?;
     Ok(())
 }
-
-/// Stable [`UserDefinedLogicalNodeCore::name`] values for every Spice logical-plan
-/// extension node that performs (or dispatches) a write, a schema mutation, or any
-/// other side-effect that must not be reachable via the read-only SQL path.
-///
-/// Keep this list in sync with:
-/// - `datafusion_ddl::DdlExtensionNode` → `"DdlExtension"`
-/// - `datafusion_dml::DmlExtensionNode` → `"DmlExtension"`
-/// - `cayenne::ddl::logical_nodes::CayenneMergeNode` → `"CayenneMerge"`
-/// - `crate::datafusion::cayenne_ddl::logical_nodes::DistributedCayenne{Insert,Update,Delete}Node`
-///   → `"CayenneInsert"` / `"CayenneUpdate"` / `"CayenneDelete"` (they reuse the non-
-///   distributed names by design)
-/// - `crate::datafusion::cayenne_ddl::logical_nodes::DistributedCayenneMergeNode`
-///   → `"DistributedCayenneMerge"`
-const WRITE_CAPABLE_EXTENSION_NAMES: &[&str] = &[
-    "DdlExtension",
-    "DmlExtension",
-    "CayenneInsert",
-    "CayenneUpdate",
-    "CayenneDelete",
-    "CayenneMerge",
-    "DistributedCayenneMerge",
-];
 
 #[cfg(test)]
 mod tests {
