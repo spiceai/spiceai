@@ -20,7 +20,7 @@ use std::{
     time::Duration,
 };
 
-use rand::Rng;
+use rand::RngExt;
 use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use spicepod::component::dataset::Dataset;
 

@@ -36,7 +36,7 @@ use aws_sdk_dynamodb::types::{
     ScalarAttributeType, StreamSpecification, StreamViewType, Tag, WriteRequest,
 };
 use futures::stream::{self, StreamExt};
-use rand::Rng;
+use rand::RngExt;
 use test_framework::anyhow::{self, Context, Result};
 use tokio::time::sleep;
 

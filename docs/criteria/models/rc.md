@@ -8,12 +8,16 @@ All criteria must be met for the model to be considered RC.
 
 | Model Type              | RC Quality | DRI Sign-off |
 | ----------------------- | ---------- | ------------ |
-| File                    | ✅         | @sgrebnov    |
-| Hugging Face            | ✅         | @Sevenannn   |
-| Spice.ai Cloud Platform | ➖         |              |
-| OpenAI                  | ✅         | @ewgenius    |
-| Azure Openai            | ➖         |              |
 | Anthropic               | ➖         |              |
+| Amazon Bedrock          | ➖         |              |
+| Azure OpenAI            | ➖         |              |
+| Databricks              | ➖         |              |
+| File                    | ✅         | @sgrebnov    |
+| Google (Gemini)         | ➖         |              |
+| Hugging Face            | ✅         | @Sevenannn   |
+| Nvidia NIM              | ➖         |              |
+| OpenAI                  | ✅         | @ewgenius    |
+| Spice.ai Cloud Platform | ➖         |              |
 | xAI (Grok)              | ➖         |              |
 
 ## RC Release Criteria
