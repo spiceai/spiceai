@@ -528,12 +528,11 @@ impl ReciprocalRankFusionArgs {
                 limit = Some(Self::parse_limit_i64(*l)?);
             }
         }
-        if include_score.is_none() {
-            if let Some(Expr::Literal(ScalarValue::Boolean(Some(b)), _)) =
+        if include_score.is_none()
+            && let Some(Expr::Literal(ScalarValue::Boolean(Some(b)), _)) =
                 named.get("include_score")
-            {
-                include_score = Some(*b);
-            }
+        {
+            include_score = Some(*b);
         }
 
         let distance_metric = match named.get("distance_metric") {

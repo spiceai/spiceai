@@ -363,20 +363,16 @@ impl TextSearchTableFunc {
                 column = Some(s.clone());
             }
         }
-        if limit.is_none() {
-            match named.get("limit") {
-                Some(Expr::Literal(scalar, _)) => {
-                    limit = Some(parse_limit_scalar(scalar)?);
-                }
-                _ => {}
-            }
+        if limit.is_none()
+            && let Some(Expr::Literal(scalar, _)) = named.get("limit")
+        {
+            limit = Some(parse_limit_scalar(scalar)?);
         }
-        if include_score.is_none() {
-            if let Some(Expr::Literal(ScalarValue::Boolean(Some(b)), _)) =
+        if include_score.is_none()
+            && let Some(Expr::Literal(ScalarValue::Boolean(Some(b)), _)) =
                 named.get("include_score")
-            {
-                include_score = Some(*b);
-            }
+        {
+            include_score = Some(*b);
         }
 
         let limit_usize = limit
