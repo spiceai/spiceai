@@ -247,8 +247,12 @@ impl Git {
             .and_then(|v| v.parse::<bool>().ok())
             .unwrap_or(true);
 
-        let semaphore = shared_semaphore(repo_url, max_concurrent_requests);
-        let disabled = shared_disabled_flag(repo_url);
+        // Use a sanitized URL as the map key so inline credentials (e.g.
+        // `https://user:token@host/repo`) do not end up as a long-lived map
+        // key in the global resilience tables.
+        let key = data_components::git::sanitize_repo_url(repo_url);
+        let semaphore = shared_semaphore(&key, max_concurrent_requests);
+        let disabled = shared_disabled_flag(&key);
 
         GitResilienceConfig {
             max_retries,

@@ -116,6 +116,23 @@ static GIT_CACHE_MUTEXES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// Strip any `userinfo` (`user[:password]@`) component from a Git URL so it
+/// is safe to log or use as a map key. Returns the original string when the
+/// input is not a parseable standard URL (e.g. `git@host:org/repo` SSH
+/// shorthand, which does not contain a password component).
+#[must_use]
+pub fn sanitize_repo_url(url: &str) -> String {
+    if let Ok(mut parsed) = Url::parse(url) {
+        let had_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
+        let _ = parsed.set_username("");
+        let _ = parsed.set_password(None);
+        if had_userinfo {
+            return parsed.to_string();
+        }
+    }
+    url.to_string()
+}
+
 fn cache_mutex_for(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
     let mut guard = GIT_CACHE_MUTEXES
         .lock()
@@ -148,8 +165,12 @@ impl BackoffMethod {
 
 /// Authentication material used to connect to a remote Git repository.
 ///
-/// All fields are optional; when none are configured the connector falls back
-/// to anonymous access (HTTPS) or the running user's SSH agent (SSH).
+/// All fields are optional. The struct's own `Default` leaves `ssh_use_agent`
+/// at `false`; the runtime connector flips that to `true` by default so an
+/// operator who configures neither an ssh key nor explicit credentials falls
+/// through to the running user's `ssh-agent`. If you construct this struct
+/// directly (for tests, or when embedding the connector programmatically),
+/// set `ssh_use_agent = true` when you want the agent-fallback behavior.
 ///
 /// The struct stores secret material (passwords, tokens, passphrases), so the
 /// `Debug` implementation is manually redacted and must never be changed to a
@@ -434,7 +455,7 @@ pub struct GitClient {
 impl std::fmt::Debug for GitClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GitClient")
-            .field("repo_url", &self.repo_url)
+            .field("repo_url", &sanitize_repo_url(&self.repo_url))
             .field("reference", &self.reference)
             .field("cache_path", &self.cache_path)
             .field("max_file_bytes", &self.max_file_bytes)
@@ -596,7 +617,9 @@ impl GitClient {
             } else if let Some(password) = credentials.password.as_deref() {
                 (credentials.username.as_deref().unwrap_or("git"), password)
             } else {
-                return Err(git2::Error::from_str(
+                return Err(git2::Error::new(
+                    git2::ErrorCode::Auth,
+                    git2::ErrorClass::Http,
                     "HTTP authentication required but no credentials were provided",
                 ));
             };
@@ -685,10 +708,12 @@ impl GitClient {
                     let is_permanent = matches!(&err, Error::AuthenticationFailed { .. })
                         || matches!(&err, Error::GitError { source } if Self::is_permanent_error(source));
 
+                    let sanitized_url = sanitize_repo_url(&self.repo_url);
+
                     if is_permanent && self.resilience.disable_on_permanent_error {
                         self.resilience.disabled.store(true, Ordering::SeqCst);
                         tracing::error!(
-                            repo_url = %self.repo_url,
+                            repo_url = %sanitized_url,
                             "Permanent error from Git remote; disabling connector. {err}"
                         );
                         return Err(err);
@@ -700,7 +725,7 @@ impl GitClient {
 
                     let delay = self.backoff_delay(attempt);
                     tracing::warn!(
-                        repo_url = %self.repo_url,
+                        repo_url = %sanitized_url,
                         attempt = attempt + 1,
                         max_retries = self.resilience.max_retries,
                         delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
@@ -1357,6 +1382,26 @@ mod tests {
             err.message().to_ascii_lowercase().contains("credentials"),
             "unexpected error message: {}",
             err.message()
+        );
+        // Missing creds must be classified as auth so the retry loop treats
+        // them as permanent, not transient.
+        assert_eq!(err.code(), git2::ErrorCode::Auth);
+    }
+
+    #[test]
+    fn sanitize_repo_url_strips_userinfo() {
+        assert_eq!(
+            sanitize_repo_url("https://user:token@github.com/owner/repo.git"),
+            "https://github.com/owner/repo.git"
+        );
+        assert_eq!(
+            sanitize_repo_url("https://github.com/owner/repo.git"),
+            "https://github.com/owner/repo.git"
+        );
+        // Non-URL shorthand (SSH `git@host:path`) passes through unchanged.
+        assert_eq!(
+            sanitize_repo_url("git@github.com:owner/repo.git"),
+            "git@github.com:owner/repo.git"
         );
     }
 
