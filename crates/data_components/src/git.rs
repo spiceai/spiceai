@@ -1353,7 +1353,9 @@ mod tests {
             BackoffMethod::parse("FIBONACCI").expect("valid"),
             BackoffMethod::Fibonacci
         );
-        assert!(BackoffMethod::parse("bogus").is_err());
+        let Err(_) = BackoffMethod::parse("bogus") else {
+            panic!("bogus backoff should error")
+        };
     }
 
     #[test]
@@ -1374,9 +1376,8 @@ mod tests {
         let creds = GitCredentials::default();
         let result =
             GitClient::resolve_credentials(&creds, None, CredentialType::USER_PASS_PLAINTEXT);
-        let err = match result {
-            Err(err) => err,
-            Ok(_) => panic!("expected error when no credentials are configured"),
+        let Err(err) = result else {
+            panic!("expected error when no credentials are configured");
         };
         assert!(
             err.message().to_ascii_lowercase().contains("credentials"),
