@@ -354,13 +354,49 @@ impl TextSearchTableFunc {
                 )));
             }
         };
+        // Merge in named args for any optional field not set positionally.
+        let (mut column, mut limit, mut include_score) = (column, limit, include_score);
+        if column.is_none() {
+            if let Some(Expr::Column(Column { name, .. })) = named.get("column") {
+                column = Some(name.clone());
+            } else if let Some(Expr::Literal(ScalarValue::Utf8(Some(s)), _)) =
+                named.get("column")
+            {
+                column = Some(s.clone());
+            }
+        }
+        if limit.is_none() {
+            match named.get("limit") {
+                Some(Expr::Literal(scalar, _)) => {
+                    limit = Some(parse_limit_scalar(scalar)?);
+                }
+                _ => {}
+            }
+        }
+        if include_score.is_none() {
+            if let Some(Expr::Literal(ScalarValue::Boolean(Some(b)), _)) =
+                named.get("include_score")
+            {
+                include_score = Some(*b);
+            }
+        }
+
+        let limit_usize = limit
+            .map(|l| {
+                usize::try_from(l).map_err(|_| {
+                    DataFusionError::Plan(format!(
+                        "text_search: limit value {l} is out of range for usize."
+                    ))
+                })
+            })
+            .transpose()?;
         Ok(TextSearchTableFuncArgs {
             tbl: tbl_ref
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
                 .into(),
             query: q.clone(),
             column,
-            limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
+            limit: limit_usize,
             include_score,
         })
     }
