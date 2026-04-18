@@ -194,7 +194,10 @@ async fn git_connector_local_repo_include_glob() -> Result<(), anyhow::Error> {
                 "SELECT path FROM git_test ORDER BY path",
                 false,
                 Some(Box::new(|batches: Vec<arrow::array::RecordBatch>| {
-                    let total: usize = batches.iter().map(arrow::array::RecordBatch::num_rows).sum();
+                    let total: usize = batches
+                        .iter()
+                        .map(arrow::array::RecordBatch::num_rows)
+                        .sum();
                     assert_eq!(total, 2, "expected 2 rust files, got {total}");
                     let paths: Vec<String> = batches
                         .iter()
