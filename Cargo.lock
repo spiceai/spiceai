@@ -43,7 +43,7 @@ dependencies = [
  "regex",
  "toml 1.0.7+spec-1.1.0",
  "windows-registry",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -330,7 +330,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -341,7 +341,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3219,36 +3219,11 @@ dependencies = [
 
 [[package]]
 name = "candle-core"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06ccf5ee3532e66868516d9b315f73aec9f34ea1a37ae98514534d458915dbf1"
-dependencies = [
- "byteorder",
- "candle-kernels 0.8.4",
- "cudarc 0.13.9",
- "gemm 0.17.1",
- "half",
- "memmap2",
- "num-traits",
- "num_cpus",
- "rand 0.9.2",
- "rand_distr 0.5.1",
- "rayon",
- "safetensors 0.4.5",
- "thiserror 1.0.69",
- "ug 0.1.0",
- "ug-cuda 0.1.0",
- "yoke 0.7.5",
- "zip 1.1.4",
-]
-
-[[package]]
-name = "candle-core"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=fab4da8172a997bc6dfb4100a51a72d1a7a37988#fab4da8172a997bc6dfb4100a51a72d1a7a37988"
+source = "git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58#7de0d9fdff7dfb6289442abfba821e8d77f57c58"
 dependencies = [
  "byteorder",
- "candle-kernels 0.10.1",
+ "candle-kernels",
  "candle-metal-kernels",
  "candle-ug",
  "cudarc 0.19.4",
@@ -3274,20 +3249,20 @@ dependencies = [
 [[package]]
 name = "candle-cublaslt"
 version = "0.2.2"
-source = "git+https://github.com/spiceai/candle-cublaslt?rev=72be72013e9b9ba69a066aa1920b13255d43959b#72be72013e9b9ba69a066aa1920b13255d43959b"
+source = "git+https://github.com/spiceai/candle-cublaslt?rev=b74d30e0a212ee1ee517b2ef2efd8d46ae7687de#b74d30e0a212ee1ee517b2ef2efd8d46ae7687de"
 dependencies = [
- "candle-core 0.8.4",
- "cudarc 0.17.8",
+ "candle-core",
+ "cudarc 0.19.4",
  "half",
 ]
 
 [[package]]
 name = "candle-flash-attn"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=fab4da8172a997bc6dfb4100a51a72d1a7a37988#fab4da8172a997bc6dfb4100a51a72d1a7a37988"
+source = "git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58#7de0d9fdff7dfb6289442abfba821e8d77f57c58"
 dependencies = [
  "anyhow",
- "candle-core 0.10.1",
+ "candle-core",
  "cudaforge",
  "half",
 ]
@@ -3295,29 +3270,16 @@ dependencies = [
 [[package]]
 name = "candle-index-select-cu"
 version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d776145d1dfa52ab0c254ec678ae7765a120ee0bab999dbfea95d648c883a47b"
+source = "git+https://github.com/spiceai/candle-index-select-cu.git?rev=397d733869484e21c61a6137f75489d0eca71f5f#397d733869484e21c61a6137f75489d0eca71f5f"
 dependencies = [
- "anyhow",
- "candle-core 0.8.4",
+ "candle-core",
  "half",
- "num_cpus",
- "rayon",
-]
-
-[[package]]
-name = "candle-kernels"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a10885bd902fad1b8518ba2b22369aaed88a3d94e123533ad3ca73db33b1c8ca"
-dependencies = [
- "bindgen_cuda",
 ]
 
 [[package]]
 name = "candle-kernels"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=fab4da8172a997bc6dfb4100a51a72d1a7a37988#fab4da8172a997bc6dfb4100a51a72d1a7a37988"
+source = "git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58#7de0d9fdff7dfb6289442abfba821e8d77f57c58"
 dependencies = [
  "cudaforge",
 ]
@@ -3325,10 +3287,10 @@ dependencies = [
 [[package]]
 name = "candle-layer-norm"
 version = "0.0.1"
-source = "git+https://github.com/spiceai/candle-layer-norm?rev=88b9ffdd7077fce11d3f6cb77bbe7093269631fe#88b9ffdd7077fce11d3f6cb77bbe7093269631fe"
+source = "git+https://github.com/spiceai/candle-layer-norm?rev=62f936a1c5c79a08008e6967297543b4c154784e#62f936a1c5c79a08008e6967297543b4c154784e"
 dependencies = [
  "anyhow",
- "candle-core 0.8.4",
+ "candle-core",
  "half",
  "num_cpus",
  "rayon",
@@ -3337,7 +3299,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=fab4da8172a997bc6dfb4100a51a72d1a7a37988#fab4da8172a997bc6dfb4100a51a72d1a7a37988"
+source = "git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58#7de0d9fdff7dfb6289442abfba821e8d77f57c58"
 dependencies = [
  "half",
  "objc2 0.6.3",
@@ -3351,9 +3313,9 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=fab4da8172a997bc6dfb4100a51a72d1a7a37988#fab4da8172a997bc6dfb4100a51a72d1a7a37988"
+source = "git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58#7de0d9fdff7dfb6289442abfba821e8d77f57c58"
 dependencies = [
- "candle-core 0.10.1",
+ "candle-core",
  "candle-metal-kernels",
  "half",
  "libc",
@@ -3368,21 +3330,21 @@ dependencies = [
 [[package]]
 name = "candle-rotary"
 version = "0.0.1"
-source = "git+https://github.com/spiceai/candle-rotary?rev=8a437f99881bd4803f61c7c16ed4367f7cab76fc#8a437f99881bd4803f61c7c16ed4367f7cab76fc"
+source = "git+https://github.com/spiceai/candle-rotary?rev=a4c4efcd5fcb2d7f750073341f663098c2a50c98#a4c4efcd5fcb2d7f750073341f663098c2a50c98"
 dependencies = [
  "anyhow",
  "bindgen_cuda",
- "candle-core 0.8.4",
+ "candle-core",
  "half",
 ]
 
 [[package]]
 name = "candle-transformers"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=fab4da8172a997bc6dfb4100a51a72d1a7a37988#fab4da8172a997bc6dfb4100a51a72d1a7a37988"
+source = "git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58#7de0d9fdff7dfb6289442abfba821e8d77f57c58"
 dependencies = [
  "byteorder",
- "candle-core 0.10.1",
+ "candle-core",
  "candle-nn",
  "fancy-regex 0.17.0",
  "num-traits",
@@ -3397,10 +3359,10 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=fab4da8172a997bc6dfb4100a51a72d1a7a37988#fab4da8172a997bc6dfb4100a51a72d1a7a37988"
+source = "git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58#7de0d9fdff7dfb6289442abfba821e8d77f57c58"
 dependencies = [
- "ug 0.5.0",
- "ug-cuda 0.5.0",
+ "ug",
+ "ug-cuda",
  "ug-metal",
 ]
 
@@ -4933,24 +4895,6 @@ dependencies = [
  "thiserror 2.0.18",
  "walkdir",
  "which 7.0.3",
-]
-
-[[package]]
-name = "cudarc"
-version = "0.12.2"
-source = "git+https://github.com/EricLBuehler/cudarc?rev=f6e5bf51153d40e34eb1262b98895ac1235b6422#f6e5bf51153d40e34eb1262b98895ac1235b6422"
-dependencies = [
- "libloading 0.8.9",
-]
-
-[[package]]
-name = "cudarc"
-version = "0.13.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "486c221362668c63a1636cfa51463b09574433b39029326cff40864b3ba12b6e"
-dependencies = [
- "half",
- "libloading 0.8.9",
 ]
 
 [[package]]
@@ -6631,7 +6575,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6826,16 +6770,6 @@ name = "dyn-hash"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15401da73a9ed8c80e3b2d4dc05fe10e7b72d7243b9f614e516a44fa99986e88"
-
-[[package]]
-name = "dyn-stack"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56e53799688f5632f364f8fb387488dd05db9fe45db7011be066fc20e7027f8b"
-dependencies = [
- "bytemuck",
- "reborrow",
-]
 
 [[package]]
 name = "dyn-stack"
@@ -7208,7 +7142,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7966,31 +7900,11 @@ dependencies = [
 
 [[package]]
 name = "gemm"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ab24cc62135b40090e31a76a9b2766a501979f3070fa27f689c27ec04377d32"
-dependencies = [
- "dyn-stack 0.10.0",
- "gemm-c32 0.17.1",
- "gemm-c64 0.17.1",
- "gemm-common 0.17.1",
- "gemm-f16 0.17.1",
- "gemm-f32 0.17.1",
- "gemm-f64 0.17.1",
- "num-complex",
- "num-traits",
- "paste",
- "raw-cpuid 10.7.0",
- "seq-macro",
-]
-
-[[package]]
-name = "gemm"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab96b703d31950f1aeddded248bc95543c9efc7ac9c4a21fda8703a83ee35451"
 dependencies = [
- "dyn-stack 0.13.2",
+ "dyn-stack",
  "gemm-c32 0.18.2",
  "gemm-c64 0.18.2",
  "gemm-common 0.18.2",
@@ -8000,7 +7914,7 @@ dependencies = [
  "num-complex",
  "num-traits",
  "paste",
- "raw-cpuid 11.6.0",
+ "raw-cpuid",
  "seq-macro",
 ]
 
@@ -8010,7 +7924,7 @@ version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa0673db364b12263d103b68337a68fbecc541d6f6b61ba72fe438654709eacb"
 dependencies = [
- "dyn-stack 0.13.2",
+ "dyn-stack",
  "gemm-c32 0.19.0",
  "gemm-c64 0.19.0",
  "gemm-common 0.19.0",
@@ -8020,22 +7934,7 @@ dependencies = [
  "num-complex",
  "num-traits",
  "paste",
- "raw-cpuid 11.6.0",
- "seq-macro",
-]
-
-[[package]]
-name = "gemm-c32"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9c030d0b983d1e34a546b86e08f600c11696fde16199f971cd46c12e67512c0"
-dependencies = [
- "dyn-stack 0.10.0",
- "gemm-common 0.17.1",
- "num-complex",
- "num-traits",
- "paste",
- "raw-cpuid 10.7.0",
+ "raw-cpuid",
  "seq-macro",
 ]
 
@@ -8045,12 +7944,12 @@ version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6db9fd9f40421d00eea9dd0770045a5603b8d684654816637732463f4073847"
 dependencies = [
- "dyn-stack 0.13.2",
+ "dyn-stack",
  "gemm-common 0.18.2",
  "num-complex",
  "num-traits",
  "paste",
- "raw-cpuid 11.6.0",
+ "raw-cpuid",
  "seq-macro",
 ]
 
@@ -8060,27 +7959,12 @@ version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "086936dbdcb99e37aad81d320f98f670e53c1e55a98bee70573e83f95beb128c"
 dependencies = [
- "dyn-stack 0.13.2",
+ "dyn-stack",
  "gemm-common 0.19.0",
  "num-complex",
  "num-traits",
  "paste",
- "raw-cpuid 11.6.0",
- "seq-macro",
-]
-
-[[package]]
-name = "gemm-c64"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbb5f2e79fefb9693d18e1066a557b4546cd334b226beadc68b11a8f9431852a"
-dependencies = [
- "dyn-stack 0.10.0",
- "gemm-common 0.17.1",
- "num-complex",
- "num-traits",
- "paste",
- "raw-cpuid 10.7.0",
+ "raw-cpuid",
  "seq-macro",
 ]
 
@@ -8090,12 +7974,12 @@ version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfcad8a3d35a43758330b635d02edad980c1e143dc2f21e6fd25f9e4eada8edf"
 dependencies = [
- "dyn-stack 0.13.2",
+ "dyn-stack",
  "gemm-common 0.18.2",
  "num-complex",
  "num-traits",
  "paste",
- "raw-cpuid 11.6.0",
+ "raw-cpuid",
  "seq-macro",
 ]
 
@@ -8105,33 +7989,13 @@ version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20c8aeeeec425959bda4d9827664029ba1501a90a0d1e6228e48bef741db3a3f"
 dependencies = [
- "dyn-stack 0.13.2",
+ "dyn-stack",
  "gemm-common 0.19.0",
  "num-complex",
  "num-traits",
  "paste",
- "raw-cpuid 11.6.0",
+ "raw-cpuid",
  "seq-macro",
-]
-
-[[package]]
-name = "gemm-common"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2e7ea062c987abcd8db95db917b4ffb4ecdfd0668471d8dc54734fdff2354e8"
-dependencies = [
- "bytemuck",
- "dyn-stack 0.10.0",
- "half",
- "num-complex",
- "num-traits",
- "once_cell",
- "paste",
- "pulp 0.18.22",
- "raw-cpuid 10.7.0",
- "rayon",
- "seq-macro",
- "sysctl 0.5.5",
 ]
 
 [[package]]
@@ -8141,7 +8005,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a352d4a69cbe938b9e2a9cb7a3a63b7e72f9349174a2752a558a8a563510d0f3"
 dependencies = [
  "bytemuck",
- "dyn-stack 0.13.2",
+ "dyn-stack",
  "half",
  "libm",
  "num-complex",
@@ -8149,10 +8013,10 @@ dependencies = [
  "once_cell",
  "paste",
  "pulp 0.21.5",
- "raw-cpuid 11.6.0",
+ "raw-cpuid",
  "rayon",
  "seq-macro",
- "sysctl 0.6.0",
+ "sysctl",
 ]
 
 [[package]]
@@ -8162,7 +8026,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88027625910cc9b1085aaaa1c4bc46bb3a36aad323452b33c25b5e4e7c8e2a3e"
 dependencies = [
  "bytemuck",
- "dyn-stack 0.13.2",
+ "dyn-stack",
  "half",
  "libm",
  "num-complex",
@@ -8170,28 +8034,10 @@ dependencies = [
  "once_cell",
  "paste",
  "pulp 0.22.2",
- "raw-cpuid 11.6.0",
+ "raw-cpuid",
  "rayon",
  "seq-macro",
- "sysctl 0.6.0",
-]
-
-[[package]]
-name = "gemm-f16"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ca4c06b9b11952071d317604acb332e924e817bd891bec8dfb494168c7cedd4"
-dependencies = [
- "dyn-stack 0.10.0",
- "gemm-common 0.17.1",
- "gemm-f32 0.17.1",
- "half",
- "num-complex",
- "num-traits",
- "paste",
- "raw-cpuid 10.7.0",
- "rayon",
- "seq-macro",
+ "sysctl",
 ]
 
 [[package]]
@@ -8200,14 +8046,14 @@ version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cff95ae3259432f3c3410eaa919033cd03791d81cebd18018393dc147952e109"
 dependencies = [
- "dyn-stack 0.13.2",
+ "dyn-stack",
  "gemm-common 0.18.2",
  "gemm-f32 0.18.2",
  "half",
  "num-complex",
  "num-traits",
  "paste",
- "raw-cpuid 11.6.0",
+ "raw-cpuid",
  "rayon",
  "seq-macro",
 ]
@@ -8218,30 +8064,15 @@ version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3df7a55202e6cd6739d82ae3399c8e0c7e1402859b30e4cb780e61525d9486e"
 dependencies = [
- "dyn-stack 0.13.2",
+ "dyn-stack",
  "gemm-common 0.19.0",
  "gemm-f32 0.19.0",
  "half",
  "num-complex",
  "num-traits",
  "paste",
- "raw-cpuid 11.6.0",
+ "raw-cpuid",
  "rayon",
- "seq-macro",
-]
-
-[[package]]
-name = "gemm-f32"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9a69f51aaefbd9cf12d18faf273d3e982d9d711f60775645ed5c8047b4ae113"
-dependencies = [
- "dyn-stack 0.10.0",
- "gemm-common 0.17.1",
- "num-complex",
- "num-traits",
- "paste",
- "raw-cpuid 10.7.0",
  "seq-macro",
 ]
 
@@ -8251,12 +8082,12 @@ version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc8d3d4385393304f407392f754cd2dc4b315d05063f62cf09f47b58de276864"
 dependencies = [
- "dyn-stack 0.13.2",
+ "dyn-stack",
  "gemm-common 0.18.2",
  "num-complex",
  "num-traits",
  "paste",
- "raw-cpuid 11.6.0",
+ "raw-cpuid",
  "seq-macro",
 ]
 
@@ -8266,27 +8097,12 @@ version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02e0b8c9da1fbec6e3e3ab2ce6bc259ef18eb5f6f0d3e4edf54b75f9fd41a81c"
 dependencies = [
- "dyn-stack 0.13.2",
+ "dyn-stack",
  "gemm-common 0.19.0",
  "num-complex",
  "num-traits",
  "paste",
- "raw-cpuid 11.6.0",
- "seq-macro",
-]
-
-[[package]]
-name = "gemm-f64"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa397a48544fadf0b81ec8741e5c0fba0043008113f71f2034def1935645d2b0"
-dependencies = [
- "dyn-stack 0.10.0",
- "gemm-common 0.17.1",
- "num-complex",
- "num-traits",
- "paste",
- "raw-cpuid 10.7.0",
+ "raw-cpuid",
  "seq-macro",
 ]
 
@@ -8296,12 +8112,12 @@ version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35b2a4f76ce4b8b16eadc11ccf2e083252d8237c1b589558a49b0183545015bd"
 dependencies = [
- "dyn-stack 0.13.2",
+ "dyn-stack",
  "gemm-common 0.18.2",
  "num-complex",
  "num-traits",
  "paste",
- "raw-cpuid 11.6.0",
+ "raw-cpuid",
  "seq-macro",
 ]
 
@@ -8311,12 +8127,12 @@ version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "056131e8f2a521bfab322f804ccd652520c79700d81209e9d9275bbdecaadc6a"
 dependencies = [
- "dyn-stack 0.13.2",
+ "dyn-stack",
  "gemm-common 0.19.0",
  "num-complex",
  "num-traits",
  "paste",
- "raw-cpuid 11.6.0",
+ "raw-cpuid",
  "seq-macro",
 ]
 
@@ -8346,8 +8162,8 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
+ "windows-link 0.1.3",
+ "windows-result 0.3.4",
 ]
 
 [[package]]
@@ -10098,7 +9914,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10171,7 +9987,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10841,7 +10657,7 @@ dependencies = [
  "bytes",
  "cache",
  "chunking",
- "cudarc 0.12.2",
+ "cudarc 0.19.4",
  "dotenvy",
  "either",
  "futures",
@@ -11448,10 +11264,10 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=9b4758762d6ebed08a42af7211c616ebc512c557#9b4758762d6ebed08a42af7211c616ebc512c557"
+source = "git+https://github.com/spiceai/mistral.rs?rev=fd241009ddac8f6043bda4019cb6359989521aa8#fd241009ddac8f6043bda4019cb6359989521aa8"
 dependencies = [
  "anyhow",
- "candle-core 0.10.1",
+ "candle-core",
  "candle-nn",
  "clap",
  "either",
@@ -11475,7 +11291,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-audio"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=9b4758762d6ebed08a42af7211c616ebc512c557#9b4758762d6ebed08a42af7211c616ebc512c557"
+source = "git+https://github.com/spiceai/mistral.rs?rev=fd241009ddac8f6043bda4019cb6359989521aa8#fd241009ddac8f6043bda4019cb6359989521aa8"
 dependencies = [
  "anyhow",
  "apodize",
@@ -11486,7 +11302,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=9b4758762d6ebed08a42af7211c616ebc512c557#9b4758762d6ebed08a42af7211c616ebc512c557"
+source = "git+https://github.com/spiceai/mistral.rs?rev=fd241009ddac8f6043bda4019cb6359989521aa8#fd241009ddac8f6043bda4019cb6359989521aa8"
 dependencies = [
  "ahash 0.8.12",
  "akin",
@@ -11498,7 +11314,7 @@ dependencies = [
  "bm25",
  "bytemuck",
  "bytemuck_derive",
- "candle-core 0.10.1",
+ "candle-core",
  "candle-flash-attn",
  "candle-metal-kernels",
  "candle-nn",
@@ -11585,7 +11401,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-macros"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=9b4758762d6ebed08a42af7211c616ebc512c557#9b4758762d6ebed08a42af7211c616ebc512c557"
+source = "git+https://github.com/spiceai/mistral.rs?rev=fd241009ddac8f6043bda4019cb6359989521aa8#fd241009ddac8f6043bda4019cb6359989521aa8"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -11596,7 +11412,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-mcp"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=9b4758762d6ebed08a42af7211c616ebc512c557#9b4758762d6ebed08a42af7211c616ebc512c557"
+source = "git+https://github.com/spiceai/mistral.rs?rev=fd241009ddac8f6043bda4019cb6359989521aa8#fd241009ddac8f6043bda4019cb6359989521aa8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11616,10 +11432,10 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=9b4758762d6ebed08a42af7211c616ebc512c557#9b4758762d6ebed08a42af7211c616ebc512c557"
+source = "git+https://github.com/spiceai/mistral.rs?rev=fd241009ddac8f6043bda4019cb6359989521aa8#fd241009ddac8f6043bda4019cb6359989521aa8"
 dependencies = [
  "anyhow",
- "candle-core 0.10.1",
+ "candle-core",
  "candle-metal-kernels",
  "cudaforge",
  "dispatch2",
@@ -11633,10 +11449,10 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=9b4758762d6ebed08a42af7211c616ebc512c557#9b4758762d6ebed08a42af7211c616ebc512c557"
+source = "git+https://github.com/spiceai/mistral.rs?rev=fd241009ddac8f6043bda4019cb6359989521aa8#fd241009ddac8f6043bda4019cb6359989521aa8"
 dependencies = [
  "byteorder",
- "candle-core 0.10.1",
+ "candle-core",
  "candle-metal-kernels",
  "candle-nn",
  "cudaforge",
@@ -11663,9 +11479,9 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.7.0"
-source = "git+https://github.com/spiceai/mistral.rs?rev=9b4758762d6ebed08a42af7211c616ebc512c557#9b4758762d6ebed08a42af7211c616ebc512c557"
+source = "git+https://github.com/spiceai/mistral.rs?rev=fd241009ddac8f6043bda4019cb6359989521aa8#fd241009ddac8f6043bda4019cb6359989521aa8"
 dependencies = [
- "candle-core 0.10.1",
+ "candle-core",
  "image 0.25.9",
  "rayon",
 ]
@@ -12256,7 +12072,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -14679,18 +14495,6 @@ dependencies = [
 
 [[package]]
 name = "pulp"
-version = "0.18.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0a01a0dc67cf4558d279f0c25b0962bd08fc6dec0137699eae304103e882fe6"
-dependencies = [
- "bytemuck",
- "libm",
- "num-complex",
- "reborrow",
-]
-
-[[package]]
-name = "pulp"
 version = "0.21.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96b86df24f0a7ddd5e4b95c94fc9ed8a98f1ca94d3b01bdce2824097e7835907"
@@ -14715,7 +14519,7 @@ dependencies = [
  "num-complex",
  "paste",
  "pulp-wasm-simd-flag",
- "raw-cpuid 11.6.0",
+ "raw-cpuid",
  "reborrow",
  "version_check",
 ]
@@ -14822,7 +14626,7 @@ dependencies = [
  "crossbeam-utils",
  "libc",
  "once_cell",
- "raw-cpuid 11.6.0",
+ "raw-cpuid",
  "wasi 0.11.1+wasi-snapshot-preview1",
  "web-sys",
  "winapi",
@@ -15214,15 +15018,6 @@ dependencies = [
  "rav1e",
  "rayon",
  "rgb",
-]
-
-[[package]]
-name = "raw-cpuid"
-version = "10.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c297679cb867470fa8c9f67dbba74a78d78e3e98d7cf2b08d6d71540f797332"
-dependencies = [
- "bitflags 1.3.2",
 ]
 
 [[package]]
@@ -16640,7 +16435,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -16741,7 +16536,7 @@ dependencies = [
  "security-framework 3.5.1",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -19029,20 +18824,6 @@ dependencies = [
 
 [[package]]
 name = "sysctl"
-version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec7dddc5f0fee506baf8b9fdb989e242f17e4b11c61dfbb0635b705217199eea"
-dependencies = [
- "bitflags 2.10.0",
- "byteorder",
- "enum-as-inner",
- "libc",
- "thiserror 1.0.69",
- "walkdir",
-]
-
-[[package]]
-name = "sysctl"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "01198a2debb237c62b6826ec7081082d951f46dbb64b0e8c7649a452230d1dfc"
@@ -19337,7 +19118,7 @@ dependencies = [
  "getrandom 0.4.1",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -19514,7 +19295,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend"
 version = "1.9.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=88b7a84a2c2ad83707555183f8f18dd201897f12#88b7a84a2c2ad83707555183f8f18dd201897f12"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3#ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3"
 dependencies = [
  "hf-hub",
  "rand 0.9.2",
@@ -19529,10 +19310,10 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend-candle"
 version = "1.9.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=88b7a84a2c2ad83707555183f8f18dd201897f12#88b7a84a2c2ad83707555183f8f18dd201897f12"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3#ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3"
 dependencies = [
  "anyhow",
- "candle-core 0.10.1",
+ "candle-core",
  "candle-cublaslt",
  "candle-index-select-cu",
  "candle-layer-norm",
@@ -19553,7 +19334,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-backend-core"
 version = "1.9.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=88b7a84a2c2ad83707555183f8f18dd201897f12#88b7a84a2c2ad83707555183f8f18dd201897f12"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3#ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3"
 dependencies = [
  "nohash-hasher",
  "serde",
@@ -19563,7 +19344,7 @@ dependencies = [
 [[package]]
 name = "text-embeddings-core"
 version = "1.9.3"
-source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=88b7a84a2c2ad83707555183f8f18dd201897f12#88b7a84a2c2ad83707555183f8f18dd201897f12"
+source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3#ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3"
 dependencies = [
  "async-channel 2.5.0",
  "hf-hub",
@@ -21048,27 +20829,6 @@ checksum = "2896d95c02a80c6d6a5d6e953d479f5ddf2dfdb6a244441010e373ac0fb88971"
 
 [[package]]
 name = "ug"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03719c61a91b51541f076dfdba45caacf750b230cefaa4b32d6f5411c3f7f437"
-dependencies = [
- "gemm 0.18.2",
- "half",
- "libloading 0.8.9",
- "memmap2",
- "num",
- "num-traits",
- "num_cpus",
- "rayon",
- "safetensors 0.4.5",
- "serde",
- "thiserror 1.0.69",
- "tracing",
- "yoke 0.7.5",
-]
-
-[[package]]
-name = "ug"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76b761acf8af3494640d826a8609e2265e19778fb43306c7f15379c78c9b05b0"
@@ -21090,19 +20850,6 @@ dependencies = [
 
 [[package]]
 name = "ug-cuda"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50758486d7941f8b0a636ba7e29455c07071f41590beac1fd307ec893e8db69a"
-dependencies = [
- "cudarc 0.13.9",
- "half",
- "serde",
- "thiserror 1.0.69",
- "ug 0.1.0",
-]
-
-[[package]]
-name = "ug-cuda"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f0a1fa748f26166778c33b8498255ebb7c6bffb472bcc0a72839e07ebb1d9b5"
@@ -21111,7 +20858,7 @@ dependencies = [
  "half",
  "serde",
  "thiserror 1.0.69",
- "ug 0.5.0",
+ "ug",
 ]
 
 [[package]]
@@ -21125,7 +20872,7 @@ dependencies = [
  "objc",
  "serde",
  "thiserror 1.0.69",
- "ug 0.5.0",
+ "ug",
 ]
 
 [[package]]
@@ -22531,7 +22278,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -23578,21 +23325,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "70b40401a28d86ce16a330b863b86fd7dbee4d7c940587ab09ab8c019f9e3fdf"
 dependencies = [
  "num-traits",
-]
-
-[[package]]
-name = "zip"
-version = "1.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cc23c04387f4da0374be4533ad1208cbb091d5c11d070dfef13676ad6497164"
-dependencies = [
- "arbitrary",
- "crc32fast",
- "crossbeam-utils",
- "displaydoc",
- "indexmap 2.13.0",
- "num_enum",
- "thiserror 1.0.69",
 ]
 
 [[package]]
