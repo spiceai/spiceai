@@ -25,6 +25,11 @@ aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-dynamodbstreams = { workspace = true, optional = true }
 aws-smithy-async = { workspace = true, optional = true }
+azure_core = { version = "0.31.0", optional = true }
+azure_data_cosmos = { version = "0.30.0", default-features = false, features = [
+    "hmac_rust",
+    "key_auth",
+], optional = true }
 base64.workspace = true
 bb8 = { workspace = true, optional = true }
 bb8-oracle = { version = "0.3", features = ["chrono"], optional = true }
@@ -116,6 +121,7 @@ rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 bench = [] # Feature for benchmarking that exposes internal functions
 adbc = ["datafusion-table-providers/adbc-federation"]
 clickhouse = ["dep:clickhouse-rs", "datafusion-table-providers/federation"]
+cosmosdb = ["dep:azure_core", "dep:azure_data_cosmos"]
 databricks = [
     "delta_lake",
     "spark_connect",

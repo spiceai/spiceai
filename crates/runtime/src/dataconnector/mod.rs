@@ -150,6 +150,8 @@ macro_rules! register_data_connector {
 pub mod abfs;
 #[cfg(feature = "adbc")]
 pub mod adbc;
+#[cfg(feature = "cosmosdb")]
+pub mod cosmosdb;
 #[cfg(feature = "debezium")]
 pub mod debezium;
 #[cfg(feature = "dynamodb")]

@@ -23,6 +23,8 @@ use datafusion::{catalog::CatalogProvider, datasource::TableProvider, sql::Table
 pub mod arrow;
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
+#[cfg(feature = "cosmosdb")]
+pub mod cosmosdb;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 #[cfg(feature = "debezium")]
