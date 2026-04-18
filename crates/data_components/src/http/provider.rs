@@ -310,6 +310,7 @@ pub struct HttpTableProvider {
     max_body_bytes: usize,
     health_probe: Option<String>,
     pagination: Option<PaginationConfig>,
+    auth: Option<Arc<dyn super::auth::HttpAuthenticator>>,
 }
 
 impl std::fmt::Debug for HttpTableProvider {
@@ -355,6 +356,7 @@ impl HttpTableProvider {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             health_probe: None,
             pagination: None,
+            auth: None,
         }
     }
 
@@ -475,6 +477,21 @@ impl HttpTableProvider {
     #[must_use]
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.custom_headers = headers;
+        self
+    }
+
+    /// Read-only access to the currently configured custom headers.
+    #[must_use]
+    pub fn custom_headers(&self) -> &HeaderMap {
+        &self.custom_headers
+    }
+
+    /// Attach an [`HttpAuthenticator`](super::auth::HttpAuthenticator) that decorates
+    /// every outgoing data request (e.g. to apply a bearer token refreshed in the
+    /// background by [`RefreshTokenAuth`](super::auth::RefreshTokenAuth)).
+    #[must_use]
+    pub fn with_auth(mut self, auth: Arc<dyn super::auth::HttpAuthenticator>) -> Self {
+        self.auth = Some(auth);
         self
     }
 
@@ -629,7 +646,7 @@ impl HttpTableProvider {
             test_url.set_path(health_probe_path);
             test_url
         } else {
-            use rand::Rng;
+            use rand::RngExt;
             use rand::distr::Alphanumeric;
 
             // Generate a random path that should return 404
@@ -900,6 +917,10 @@ impl HttpTableProvider {
 
         for (name, value) in &self.custom_headers {
             request_builder = request_builder.header(name, value);
+        }
+
+        if let Some(auth) = self.auth.as_ref() {
+            request_builder = auth.apply(request_builder);
         }
 
         let response = request_builder.send().await.map_err(|e| {

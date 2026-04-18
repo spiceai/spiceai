@@ -1004,7 +1004,6 @@ async fn forward_batches_to_executor(
 }
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use arrow::array::Int32Array;

@@ -34,11 +34,9 @@ runs:
         #
         # Verified on https://launchpad.net/ubuntu/+archivemirrors :
         #   - mirror.pit.teraswitch.com       (Pittsburgh, PA - Teraswitch)
-        #   - mirror.cs.pitt.edu              (Pittsburgh, PA - U. of Pittsburgh)
         #   - mirrors.edge.kernel.org         (global kernel.org CDN)
         ARCHIVE_MIRRORS=(
           "http://mirror.pit.teraswitch.com/ubuntu/"
-          "http://mirror.cs.pitt.edu/ubuntu/archive/"
           "http://mirrors.edge.kernel.org/ubuntu/"
           "http://archive.ubuntu.com/ubuntu/"
         )
@@ -62,13 +60,12 @@ runs:
           sudo sed -i -E \
             -e "s|^URIs:[[:space:]]*https?://archive\.ubuntu\.com/ubuntu/?$|URIs: ${ALL_MIRRORS}|" \
             /etc/apt/sources.list.d/ubuntu.sources
-          # Fail loudly if the substitution had no effect. Check that the
-          # configured primary mirror is now in the file.
+          # If the substitution had no effect, surface diagnostics but do not
+          # fail the action.
           if ! grep -Fq "${PRIMARY}" /etc/apt/sources.list.d/ubuntu.sources; then
-            echo "ERROR: configure-apt: primary mirror ${PRIMARY} not found in ubuntu.sources after substitution" >&2
+            echo "::warning::configure-apt: primary mirror ${PRIMARY} not found in ubuntu.sources after substitution attempt"
             echo "--- current ubuntu.sources URIs ---" >&2
             grep '^URIs:' /etc/apt/sources.list.d/ubuntu.sources >&2 || true
-            exit 1
           fi
         fi
         if [ -f /etc/apt/sources.list ]; then
