@@ -29,7 +29,7 @@ use arrow::array::RecordBatch;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use datafusion::assert_batches_eq;
 use futures::TryStreamExt;
-use rand::Rng as _;
+use rand::RngExt as _;
 use runtime::Runtime;
 use runtime::auth::EndpointAuth;
 use runtime::config::Config;
