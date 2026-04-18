@@ -845,7 +845,7 @@ impl GitClient {
         .context(SpawnBlockingSnafu)??;
 
         if enable_lfs {
-            run_git_lfs(&self.cache_path, reference.as_deref()).await?;
+            run_git_lfs(&self.cache_path, reference.as_deref(), &self.credentials).await?;
         }
 
         Ok(repo)
@@ -1231,15 +1231,25 @@ fn classify_remote_error(err: git2::Error, repo_url: &str) -> Error {
     }
 }
 
-async fn run_git_lfs(cache_path: &Path, reference: Option<&str>) -> Result<()> {
+async fn run_git_lfs(
+    cache_path: &Path,
+    reference: Option<&str>,
+    credentials: &GitCredentials,
+) -> Result<()> {
     let cache_path = cache_path.to_path_buf();
     let reference = reference.map(ToString::to_string);
+    let credentials = credentials.clone();
 
     task::spawn_blocking(move || -> Result<()> {
         ensure_git_lfs_available()?;
 
         // Install filters into the local repo config (idempotent).
-        run_git_lfs_command(&cache_path, &["install", "--local"], "install")?;
+        run_git_lfs_command(
+            &cache_path,
+            &["install", "--local"],
+            "install",
+            &credentials,
+        )?;
 
         // Pull LFS objects only for the ref we intend to check out. We never
         // run `git lfs fetch --all` — that can pull the repository's entire
@@ -1248,14 +1258,19 @@ async fn run_git_lfs(cache_path: &Path, reference: Option<&str>) -> Result<()> {
         // cache directory.
         match reference.as_deref() {
             Some(ref_name) => {
-                run_git_lfs_command(&cache_path, &["fetch", "origin", ref_name], "fetch")?;
+                run_git_lfs_command(
+                    &cache_path,
+                    &["fetch", "origin", ref_name],
+                    "fetch",
+                    &credentials,
+                )?;
             }
             None => {
-                run_git_lfs_command(&cache_path, &["fetch", "origin"], "fetch")?;
+                run_git_lfs_command(&cache_path, &["fetch", "origin"], "fetch", &credentials)?;
             }
         }
 
-        run_git_lfs_command(&cache_path, &["checkout"], "checkout")?;
+        run_git_lfs_command(&cache_path, &["checkout"], "checkout", &credentials)?;
         Ok(())
     })
     .await
@@ -1276,26 +1291,142 @@ fn ensure_git_lfs_available() -> Result<()> {
     }
 }
 
-fn run_git_lfs_command(cache_path: &Path, args: &[&str], label: &str) -> Result<()> {
-    let output = Command::new("git")
-        .current_dir(cache_path)
-        .arg("lfs")
-        .args(args)
-        .output()
-        .context(IoSnafu)?;
+/// Strip sensitive substrings from subprocess output before surfacing it in
+/// an error. Redacts configured passwords/tokens/passphrases and any
+/// userinfo embedded in an HTTP(S) URL.
+fn sanitize_subprocess_output(text: &str, credentials: &GitCredentials) -> String {
+    let mut cleaned = text.to_string();
+    for secret in [
+        credentials.password.as_deref(),
+        credentials.token.as_deref(),
+        credentials.ssh_passphrase.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|s| !s.is_empty())
+    {
+        cleaned = cleaned.replace(secret, "<redacted>");
+    }
+    // Redact userinfo in any URL the subprocess may have echoed.
+    let redacted = {
+        let mut out = String::with_capacity(cleaned.len());
+        let mut rest = cleaned.as_str();
+        while let Some(scheme_idx) = rest.find("://") {
+            let after_scheme = scheme_idx + 3;
+            // Look up to the first `/`, `?`, or whitespace to bound the authority.
+            let authority_end = rest[after_scheme..]
+                .find(['/', '?', ' ', '\t', '\n'])
+                .map_or(rest.len(), |i| after_scheme + i);
+            let authority = &rest[after_scheme..authority_end];
+            if let Some(at_idx) = authority.rfind('@') {
+                out.push_str(&rest[..after_scheme]);
+                out.push_str("<redacted>@");
+                out.push_str(&authority[at_idx + 1..]);
+                rest = &rest[authority_end..];
+            } else {
+                out.push_str(&rest[..authority_end]);
+                rest = &rest[authority_end..];
+            }
+        }
+        out.push_str(rest);
+        out
+    };
+    redacted
+}
+
+fn run_git_lfs_command(
+    cache_path: &Path,
+    args: &[&str],
+    label: &str,
+    credentials: &GitCredentials,
+) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(cache_path);
+
+    // Force `git` and all child processes (including `git lfs`) to operate
+    // non-interactively and to authenticate with the connector's configured
+    // credentials rather than with whatever happens to be on the host.
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+
+    // For HTTP(S): inject an Authorization header via a runtime-scoped `-c`
+    // override so credentials never touch the on-disk config and are never
+    // part of the URL. The full command line is only visible to the same
+    // user/container, which is the same trust boundary as reading the
+    // credentials from the spicepod params.
+    if let Some(header) = http_auth_header(credentials) {
+        cmd.arg("-c").arg(format!("http.extraHeader={header}"));
+    }
+
+    // For SSH: point `ssh` at the configured private key. The passphrase (if
+    // any) is expected to be cached by ssh-agent; we do not persist it to
+    // disk.
+    if let Some(ref key_path) = credentials.ssh_key_path {
+        let ssh_cmd = format!(
+            "ssh -i {} -o IdentitiesOnly=yes -o BatchMode=yes",
+            shell_escape(&key_path.to_string_lossy())
+        );
+        cmd.env("GIT_SSH_COMMAND", ssh_cmd);
+    } else if !credentials.ssh_use_agent {
+        // Reject agent-based auth if the operator explicitly disabled it.
+        cmd.env(
+            "GIT_SSH_COMMAND",
+            "ssh -o IdentitiesOnly=yes -o BatchMode=yes",
+        );
+    }
+
+    cmd.arg("lfs").args(args);
+
+    let output = cmd.output().context(IoSnafu)?;
 
     if output.status.success() {
         Ok(())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let raw_stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let message = if raw_stderr.is_empty() {
+            format!("exit code {:?}", output.status.code())
+        } else {
+            sanitize_subprocess_output(&raw_stderr, credentials)
+        };
         Err(Error::GitLfsFailed {
             operation: label.to_string(),
-            message: if stderr.is_empty() {
-                format!("exit code {:?}", output.status.code())
-            } else {
-                stderr
-            },
+            message,
         })
+    }
+}
+
+fn http_auth_header(credentials: &GitCredentials) -> Option<String> {
+    use base64::Engine as _;
+
+    let (user, pass) = if let Some(token) = credentials.token.as_deref() {
+        (
+            credentials
+                .username
+                .as_deref()
+                .unwrap_or("x-access-token")
+                .to_string(),
+            token.to_string(),
+        )
+    } else if let Some(password) = credentials.password.as_deref() {
+        (
+            credentials.username.as_deref().unwrap_or("git").to_string(),
+            password.to_string(),
+        )
+    } else {
+        return None;
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+    Some(format!("Authorization: Basic {encoded}"))
+}
+
+/// Minimal POSIX-style quoting for an argument embedded in `GIT_SSH_COMMAND`.
+fn shell_escape(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 }
 
