@@ -37,6 +37,7 @@ use crate::{
 
 #[cfg(feature = "openapi")]
 pub use routes::get_api_doc;
+pub(crate) mod cancel_guard_body;
 mod metrics;
 mod routes;
 pub mod traceparent;

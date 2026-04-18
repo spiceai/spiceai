@@ -309,6 +309,13 @@ pub(crate) async fn handle_nsql_query(
     let df = get_current_datafusion(&context);
     let headers = HeaderMap::new();
 
+    // NSQL-scoped cancellation token (child of the request token). Used for
+    // both the LLM race and as the per-query cancellation token passed to
+    // `QueryBuilder`. This way `POST /v1/queries/{id}/cancel` against the
+    // NSQL-issued query reliably cancels NSQL end-to-end (the inner query
+    // registers this same token in the cancel registry).
+    let nsql_token = context.child_cancellation_token();
+
     let Request {
         query,
         model,
@@ -408,8 +415,10 @@ pub(crate) async fn handle_nsql_query(
 
     loop {
         // Cooperative cancellation: bail out between LLM/query iterations if
-        // the request was cancelled (client disconnect or admin cancel).
-        if context.is_cancelled() {
+        // the NSQL token was cancelled (request token cancel propagates to
+        // this child, and admin cancel via the inner query id cancels this
+        // token directly).
+        if nsql_token.is_cancelled() {
             return (
                 StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT),
                 headers,
@@ -428,14 +437,14 @@ pub(crate) async fn handle_nsql_query(
         req.messages.extend(schema_messages.clone());
         req.messages.extend(sample_data_messages.clone());
 
-        // Race the LLM call against the request's cancellation token so that
-        // a long-running model inference does not pin the request after a
+        // Race the LLM call against the NSQL cancellation token so that a
+        // long-running model inference does not pin the request after a
         // cancel/disconnect. Dropping the chat_request future tears down the
         // underlying client/network resources.
         let chat_fut = nql_model.chat_request(req).instrument(span.clone());
         let resp = tokio::select! {
             biased;
-            () = context.cancellation_token().cancelled() => {
+            () = nsql_token.cancelled() => {
                 return (
                     StatusCode::from_u16(499).unwrap_or(StatusCode::REQUEST_TIMEOUT),
                     headers,
@@ -465,7 +474,8 @@ pub(crate) async fn handle_nsql_query(
 
                 // Run the SQL with table allowlist enforcement
                 let query_result = {
-                    let mut builder = QueryBuilder::new(&cleaned_query, Arc::clone(&df));
+                    let mut builder = QueryBuilder::new(&cleaned_query, Arc::clone(&df))
+                        .cancellation_token(nsql_token.clone());
                     if let Some(ref allowlist) = table_allowlist_opt {
                         builder = builder.allow_tables(allowlist.clone());
                     }

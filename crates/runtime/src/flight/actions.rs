@@ -235,9 +235,8 @@ struct CancelQueryResponse {
 /// query id in the runtime's sync query registry and signalling its
 /// cancellation token.
 fn handle_cancel_query(body: &[u8]) -> Result<Vec<u8>, Status> {
-    let req: CancelQueryRequest = serde_json::from_slice(body).map_err(|e| {
-        Status::invalid_argument(format!("Invalid CancelQuery request body: {e}"))
-    })?;
+    let req: CancelQueryRequest = serde_json::from_slice(body)
+        .map_err(|e| Status::invalid_argument(format!("Invalid CancelQuery request body: {e}")))?;
 
     let parsed = uuid::Uuid::parse_str(&req.query_id)
         .map_err(|e| Status::invalid_argument(format!("Invalid query_id (expected UUID): {e}")))?;

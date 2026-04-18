@@ -411,17 +411,23 @@ async fn track_metrics(
         .scope(async move {
             request_context.load_extensions().await;
             // Install a drop guard on the request's cancellation token so
-            // that if this future is dropped before the response completes
+            // that if the response body is dropped before the body completes
             // (for example, the client disconnects while a streaming SQL or
             // SSE response is being produced), the cancellation token fires
             // and any cooperating in-flight query terminates promptly.
             //
-            // The guard is disarmed once the response has been produced, so
-            // normal completion does not cancel the token.
+            // The guard is attached to the response body via
+            // `CancelGuardBody`, which disarms the guard once the body
+            // signals end-of-stream. This means the guard's lifetime tracks
+            // the streaming response, not just the response future.
             let cancel_guard = request_context.cancellation_token().clone().drop_guard();
             let response = next.run(req).await;
-            cancel_guard.disarm();
-            response
+            let (parts, body) = response.into_parts();
+            let body = axum::body::Body::new(super::cancel_guard_body::CancelGuardBody::new(
+                body,
+                cancel_guard,
+            ));
+            axum::response::Response::from_parts(parts, body)
         })
         .await;
 

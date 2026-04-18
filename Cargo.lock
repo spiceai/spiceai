@@ -15867,6 +15867,7 @@ dependencies = [
  "headers-accept",
  "hf-hub",
  "http 1.4.0",
+ "http-body 1.0.1",
  "http-body-util",
  "humantime",
  "hyper 1.8.1",
