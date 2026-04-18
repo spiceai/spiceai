@@ -1301,10 +1301,9 @@ impl CayenneTableProvider {
     /// - New data in this snapshot is visible (`new_snapshot_seq` > `delete_seq`)
     ///
     /// This achieves Iceberg-style sequence ordering without rewriting existing files.
-    pub(crate) async fn insert_to_new_snapshot_with_sequence(
+    pub(crate) async fn insert_to_new_snapshot(
         &self,
         stream: SendableRecordBatchStream,
-        sequence_number: i64,
     ) -> CatalogResult<u64> {
         let target_size_bytes = self.context.target_file_size_bytes();
 
@@ -1323,18 +1322,17 @@ impl CayenneTableProvider {
             chunk_count
         );
 
-        // Record the snapshot's sequence number in the catalog
+        // Get the maximum delete sequence from current deletions.
+        // This snapshot is protected from deletions with seq <= max_delete_seq.
+        let max_delete_seq = self.get_max_delete_sequence()?;
+
         self.catalog
             .set_snapshot_sequence(
                 &self.table_metadata.table_id,
                 &new_snapshot_id,
-                sequence_number,
+                max_delete_seq,
             )
             .await?;
-
-        // Get the maximum delete sequence from current deletions.
-        // This snapshot is protected from deletions with seq <= max_delete_seq.
-        let max_delete_seq = self.get_max_delete_sequence()?;
 
         // Add to protected snapshots so scan applies only NEWER deletions (seq > max_delete_seq)
         // We do NOT clear old protected snapshots because they may contain data that's still valid.
