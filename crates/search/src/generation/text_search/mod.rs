@@ -330,7 +330,12 @@ impl FullTextSearchFieldIndex {
 
         let top_docs = self
             .reader
-            .search(&q, &TopDocs::with_limit(limit).and_offset(offset))
+            .search(
+                &q,
+                &TopDocs::with_limit(limit)
+                    .and_offset(offset)
+                    .order_by_score(),
+            )
             .context(TextSearchSnafu)?
             .into_iter()
             .map(|(score, addr)| {
