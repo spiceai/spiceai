@@ -35,6 +35,15 @@ pub struct SqlToolParams {
     /// The SQL query to run. Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query
     query: String,
 }
+
+/// Default description advertised to LLMs / tool selection when the `sql` tool
+/// is in its read-only posture (the default).
+const DEFAULT_READ_ONLY_DESCRIPTION: &str = "Run a read-only SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: \"catalog\".\"schema\".\"table\". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix. DDL and write statements (INSERT/UPDATE/DELETE/COPY/CREATE/DROP) are rejected.";
+
+/// Default description advertised to LLMs / tool selection when the operator
+/// has opted the tool into writable mode via [`SqlTool::allow_writes`].
+const DEFAULT_WRITABLE_DESCRIPTION: &str = "Run an SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: \"catalog\".\"schema\".\"table\". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix. This tool accepts write statements (INSERT/UPDATE/DELETE/DDL); use with caution.";
+
 pub struct SqlTool {
     name: String,
     description: String,
@@ -61,7 +70,9 @@ impl SqlTool {
         Self {
             df,
             name: name.unwrap_or("sql").to_string(),
-            description: description.unwrap_or("Run a read-only SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: \"catalog\".\"schema\".\"table\". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix. DDL and write statements (INSERT/UPDATE/DELETE/COPY/CREATE/DROP) are rejected.").to_string(),
+            description: description
+                .unwrap_or(DEFAULT_READ_ONLY_DESCRIPTION)
+                .to_string(),
             allowed_tables,
             read_only: true,
         }
@@ -73,9 +84,18 @@ impl SqlTool {
     /// separate writable tool and understand that any LLM with tool-use access will
     /// then be able to mutate the targeted catalog/dataset without per-call
     /// confirmation. Leave the default in place unless that trade-off is acceptable.
+    ///
+    /// If the tool is still using the default read-only description, it is swapped
+    /// for the writable default so LLM/tool-selection logic is not misled by a
+    /// stale "read-only" advertisement. Operator-supplied descriptions are left
+    /// untouched — callers overriding the description are responsible for keeping
+    /// it accurate.
     #[must_use]
     pub fn allow_writes(mut self) -> Self {
         self.read_only = false;
+        if self.description == DEFAULT_READ_ONLY_DESCRIPTION {
+            self.description = DEFAULT_WRITABLE_DESCRIPTION.to_string();
+        }
         self
     }
 }

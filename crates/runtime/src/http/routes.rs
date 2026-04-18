@@ -512,9 +512,9 @@ async fn require_auth_configured(
 
     (
         http::StatusCode::UNAUTHORIZED,
-        "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured. \
-         Configure an API key provider in your Spicepod (see \
-         https://spiceai.org/docs/reference/runtime#auth) and retry with credentials.",
+        axum::Json(serde_json::json!({
+            "message": "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod (see https://spiceai.org/docs/reference/runtime#auth) and retry with credentials."
+        })),
     )
         .into_response()
 }
