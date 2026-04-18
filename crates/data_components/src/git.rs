@@ -51,7 +51,7 @@ pub enum Error {
     GitError { source: git2::Error },
 
     #[snafu(display(
-        "Authentication failed for Git repository {repo_url}. Verify the credentials and ensure the host is reachable."
+        "Authentication failed for Git repository {repo_url}: {source}. Verify the credentials and ensure the host is reachable."
     ))]
     AuthenticationFailed {
         repo_url: String,
@@ -131,7 +131,11 @@ impl BackoffMethod {
 ///
 /// All fields are optional; when none are configured the connector falls back
 /// to anonymous access (HTTPS) or the running user's SSH agent (SSH).
-#[derive(Debug, Default, Clone)]
+///
+/// The struct stores secret material (passwords, tokens, passphrases), so the
+/// `Debug` implementation is manually redacted and must never be changed to a
+/// `derive(Debug)` that would print the underlying strings.
+#[derive(Default, Clone)]
 pub struct GitCredentials {
     /// Username for HTTP(S) basic authentication.
     pub username: Option<String>,
@@ -145,6 +149,22 @@ pub struct GitCredentials {
     pub ssh_passphrase: Option<String>,
     /// When `true`, attempt authentication against the running `ssh-agent`.
     pub ssh_use_agent: bool,
+}
+
+impl std::fmt::Debug for GitCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitCredentials")
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("ssh_key_path", &self.ssh_key_path)
+            .field(
+                "ssh_passphrase",
+                &self.ssh_passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .field("ssh_use_agent", &self.ssh_use_agent)
+            .finish()
+    }
 }
 
 impl GitCredentials {
@@ -190,7 +210,6 @@ impl Default for GitResilienceConfig {
     }
 }
 
-#[derive(Debug)]
 pub struct GitTableConfig {
     pub fetch_content: bool,
     pub rate_limiter: Arc<dyn RateLimiter>,
@@ -200,6 +219,20 @@ pub struct GitTableConfig {
     pub credentials: GitCredentials,
     pub enable_lfs: bool,
     pub resilience: GitResilienceConfig,
+}
+
+impl std::fmt::Debug for GitTableConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitTableConfig")
+            .field("fetch_content", &self.fetch_content)
+            .field("cache_path", &self.cache_path)
+            .field("max_files", &self.max_files)
+            .field("max_file_bytes", &self.max_file_bytes)
+            .field("credentials", &self.credentials)
+            .field("enable_lfs", &self.enable_lfs)
+            .field("resilience", &self.resilience)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -367,7 +400,7 @@ impl TableProvider for GitTableProvider {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GitClient {
     repo_url: String,
     reference: Option<String>,
@@ -377,6 +410,20 @@ pub struct GitClient {
     credentials: GitCredentials,
     enable_lfs: bool,
     resilience: GitResilienceConfig,
+}
+
+impl std::fmt::Debug for GitClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitClient")
+            .field("repo_url", &self.repo_url)
+            .field("reference", &self.reference)
+            .field("cache_path", &self.cache_path)
+            .field("max_file_bytes", &self.max_file_bytes)
+            .field("credentials", &self.credentials)
+            .field("enable_lfs", &self.enable_lfs)
+            .field("resilience", &self.resilience)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GitClient {
@@ -481,12 +528,13 @@ impl GitClient {
     }
 
     /// Whether this URL is an SSH-style URL (used to decide default
-    /// authentication behavior).
+    /// authentication behavior). The anonymous `git://` protocol is
+    /// deliberately excluded — it is *not* an SSH transport and must not
+    /// trigger ssh-agent fallback.
     fn is_ssh_url(url: &str) -> bool {
         url.starts_with("git@")
             || url.starts_with("ssh://")
             || url.starts_with("git+ssh://")
-            || url.starts_with("git://")
     }
 
     fn resolve_credentials(
@@ -671,9 +719,9 @@ impl GitClient {
                         is_ssh,
                     )
                 });
-                callbacks.certificate_check(|_cert, _host| {
-                    Ok(git2::CertificateCheckStatus::CertificatePassthrough)
-                });
+                // Intentionally no `certificate_check` override: libgit2's
+                // default verification is used, which validates TLS
+                // certificates for HTTPS remotes.
                 callbacks
             };
 
@@ -690,7 +738,10 @@ impl GitClient {
                     let mut remote = repo.find_remote("origin").context(GitSnafu)?;
                     remote
                         .fetch(
-                            &["refs/heads/*:refs/remotes/origin/*"],
+                            &[
+                                "refs/heads/*:refs/remotes/origin/*",
+                                "refs/tags/*:refs/tags/*",
+                            ],
                             Some(&mut fetch_options),
                             None,
                         )
@@ -1057,11 +1108,18 @@ async fn run_git_lfs(cache_path: &Path, reference: Option<&str>) -> Result<()> {
         // Install filters into the local repo config (idempotent).
         run_git_lfs_command(&cache_path, &["install", "--local"], "install")?;
 
-        // Pull LFS objects for the requested ref, if supplied.
-        if let Some(ref_name) = reference.as_deref() {
-            run_git_lfs_command(&cache_path, &["fetch", "origin", ref_name], "fetch")?;
-        } else {
-            run_git_lfs_command(&cache_path, &["fetch", "--all"], "fetch")?;
+        // Pull LFS objects only for the ref we intend to check out. We never
+        // run `git lfs fetch --all` — that can pull the repository's entire
+        // LFS history, which is expensive for large repos. Users who need the
+        // full LFS history can run `git lfs fetch --all` manually against the
+        // cache directory.
+        match reference.as_deref() {
+            Some(ref_name) => {
+                run_git_lfs_command(&cache_path, &["fetch", "origin", ref_name], "fetch")?;
+            }
+            None => {
+                run_git_lfs_command(&cache_path, &["fetch", "origin"], "fetch")?;
+            }
         }
 
         run_git_lfs_command(&cache_path, &["checkout"], "checkout")?;
@@ -1190,8 +1248,12 @@ mod tests {
     fn ssh_url_detection() {
         assert!(GitClient::is_ssh_url("git@github.com:spiceai/spiceai.git"));
         assert!(GitClient::is_ssh_url("ssh://git@github.com/spiceai/spiceai.git"));
-        assert!(GitClient::is_ssh_url("git+ssh://github.com/spiceai/spiceai.git"));
+        assert!(GitClient::is_ssh_url(
+            "git+ssh://github.com/spiceai/spiceai.git"
+        ));
         assert!(!GitClient::is_ssh_url("https://github.com/spiceai/spiceai.git"));
+        // git:// is the anonymous git protocol, not SSH — must not be classified as SSH.
+        assert!(!GitClient::is_ssh_url("git://github.com/spiceai/spiceai.git"));
     }
 
     #[test]

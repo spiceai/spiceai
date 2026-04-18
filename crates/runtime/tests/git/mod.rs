@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -83,12 +83,12 @@ fn make_git_dataset(repo_path: &Path, cache_path: &Path, include: Option<&str>) 
     let mut params = HashMap::new();
     if let Some(pattern) = include {
         params.insert(
-            "git_include".to_string(),
+            "include".to_string(),
             ParamValue::String(pattern.to_string()),
         );
     }
     params.insert(
-        "git_cache_path".to_string(),
+        "cache_path".to_string(),
         ParamValue::String(cache_path.to_string_lossy().into_owned()),
     );
 

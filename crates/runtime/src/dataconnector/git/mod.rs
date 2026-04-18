@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -42,8 +42,9 @@ use tokio::sync::Semaphore;
 
 /// Per-repository concurrency semaphores. Keyed by the fully-qualified
 /// repository URL so that multiple datasets sharing the same remote share a
-/// single concurrency budget.
-static GIT_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
+/// single concurrency budget. The second tuple element records the
+/// configured limit so mismatches between datasets can be surfaced.
+static GIT_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, (Arc<Semaphore>, usize)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Per-repository disabled-state flags. Shared across the connector and its
@@ -51,15 +52,34 @@ static GIT_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> 
 static GIT_DISABLED_FLAGS: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Resolve (or create) the shared semaphore for a repository URL.
+///
+/// When multiple datasets target the same URL with different
+/// `max_concurrent_requests` values, the first configuration wins (to keep
+/// the concurrency budget deterministic) and subsequent mismatches are
+/// logged so the operator can reconcile the configuration.
 fn shared_semaphore(key: &str, max_concurrent: usize) -> Arc<Semaphore> {
     let mut guard = GIT_CONCURRENCY_LIMITS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    Arc::clone(
-        guard
-            .entry(key.to_string())
-            .or_insert_with(|| Arc::new(Semaphore::new(max_concurrent))),
-    )
+    match guard.get(key) {
+        Some((semaphore, existing_max)) => {
+            if *existing_max != max_concurrent {
+                tracing::warn!(
+                    repo_url = %key,
+                    existing_max,
+                    requested_max = max_concurrent,
+                    "Multiple datasets target the same Git repository with different max_concurrent_requests values. Keeping the first-seen limit ({existing_max}). Reconcile the configuration for consistent behavior."
+                );
+            }
+            Arc::clone(semaphore)
+        }
+        None => {
+            let semaphore = Arc::new(Semaphore::new(max_concurrent));
+            guard.insert(key.to_string(), (Arc::clone(&semaphore), max_concurrent));
+            semaphore
+        }
+    }
 }
 
 fn shared_disabled_flag(key: &str) -> Arc<AtomicBool> {
@@ -127,55 +147,53 @@ impl Git {
         }
     }
 
-    fn build_credentials(&self, dataset: &Dataset) -> GitCredentials {
-        let username = dataset
+    fn build_credentials(&self) -> GitCredentials {
+        // Credentials and tuning values are sourced exclusively from the
+        // validated, secret-resolved connector parameters. Using
+        // `self.params` guarantees:
+        //
+        // * secret-store references such as `${ env:GIT_TOKEN }` are
+        //   resolved into their real values, and
+        // * prefixed/unprefixed keys are normalized by
+        //   `ConnectorParamsBuilder`.
+        let username = self
             .params
-            .get("git_username")
-            .cloned()
-            .or_else(|| self.params.get("username").expose().ok().map(ToString::to_string));
+            .get("username")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
 
-        let password = dataset
+        let password = self
             .params
-            .get("git_password")
-            .cloned()
-            .or_else(|| self.params.get("password").ok().map(|s| s.expose_secret().to_string()));
+            .get("password")
+            .ok()
+            .map(|s| s.expose_secret().to_string());
 
-        let token = dataset
+        let token = self
             .params
-            .get("git_token")
-            .cloned()
-            .or_else(|| self.params.get("token").ok().map(|s| s.expose_secret().to_string()));
+            .get("token")
+            .ok()
+            .map(|s| s.expose_secret().to_string());
 
-        let ssh_key_path = dataset
+        let ssh_key_path = self
             .params
-            .get("git_ssh_key")
-            .cloned()
-            .or_else(|| {
-                self.params
-                    .get("ssh_key")
-                    .expose()
-                    .ok()
-                    .map(ToString::to_string)
-            })
+            .get("ssh_key")
+            .expose()
+            .ok()
             .map(PathBuf::from);
 
-        let ssh_passphrase = dataset
+        let ssh_passphrase = self
             .params
-            .get("git_ssh_passphrase")
-            .cloned()
-            .or_else(|| self.params.get("ssh_passphrase").ok().map(|s| s.expose_secret().to_string()));
+            .get("ssh_passphrase")
+            .ok()
+            .map(|s| s.expose_secret().to_string());
 
-        let ssh_use_agent = dataset
+        let ssh_use_agent = self
             .params
-            .get("git_ssh_use_agent")
+            .get("ssh_use_agent")
+            .expose()
+            .ok()
             .and_then(|v| v.parse::<bool>().ok())
-            .or_else(|| {
-                self.params
-                    .get("ssh_use_agent")
-                    .expose()
-                    .ok()
-                    .and_then(|v| v.parse::<bool>().ok())
-            })
             .unwrap_or(true);
 
         GitCredentials {
@@ -260,17 +278,19 @@ impl Git {
             reference
         );
 
-        // Parse include patterns if provided
-        let include_patterns = dataset.params.get("git_include").cloned().or_else(|| {
-            self.params
-                .get("include")
-                .expose()
-                .ok()
-                .map(ToString::to_string)
-        });
-        let include = include_patterns
+        // All runtime parameters are sourced from the validated, normalized
+        // `self.params` (produced by `ConnectorParamsBuilder`) so that
+        // secret-store references are resolved and prefix/validation rules
+        // are honored. Avoid reading these from `dataset.params` directly
+        // because that bypasses validation and would silently accept keys
+        // that are rejected by the parameter spec.
+        let include = self
+            .params
+            .get("include")
+            .expose()
+            .ok()
             .map(|patterns| {
-                parse_globs(&component, &patterns).map_err(|e| {
+                parse_globs(&component, patterns).map_err(|e| {
                     DataConnectorError::UnableToGetReadProvider {
                         dataconnector: "git".to_string(),
                         connector_component: component.clone(),
@@ -280,77 +300,49 @@ impl Git {
             })
             .transpose()?;
 
-        // Check if content fetching is enabled
-        let fetch_content = dataset
+        let fetch_content = self
             .params
-            .get("git_fetch_content")
+            .get("fetch_content")
+            .expose()
+            .ok()
             .and_then(|v| v.parse::<bool>().ok())
-            .or_else(|| {
-                self.params
-                    .get("fetch_content")
-                    .expose()
-                    .ok()
-                    .and_then(|v| v.parse::<bool>().ok())
-            })
             .unwrap_or(false);
 
-        // Get cache path if specified
-        let cache_path = dataset
+        let cache_path = self
             .params
-            .get("git_cache_path")
-            .cloned()
-            .or_else(|| {
-                self.params
-                    .get("cache_path")
-                    .expose()
-                    .ok()
-                    .map(ToString::to_string)
-            })
+            .get("cache_path")
+            .expose()
+            .ok()
             .map(PathBuf::from);
 
-        let max_files = dataset
+        let max_files = self
             .params
-            .get("git_max_files")
+            .get("max_files")
+            .expose()
+            .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .or_else(|| {
-                self.params
-                    .get("max_files")
-                    .expose()
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-            })
             .unwrap_or(DEFAULT_MAX_FILES);
 
-        let max_file_bytes = dataset
+        let max_file_bytes = self
             .params
-            .get("git_max_file_bytes")
+            .get("max_file_bytes")
+            .expose()
+            .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .or_else(|| {
-                self.params
-                    .get("max_file_bytes")
-                    .expose()
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-            })
             .unwrap_or(DEFAULT_MAX_FILE_BYTES);
 
-        let enable_lfs = dataset
+        let enable_lfs = self
             .params
-            .get("git_enable_lfs")
+            .get("enable_lfs")
+            .expose()
+            .ok()
             .and_then(|v| v.parse::<bool>().ok())
-            .or_else(|| {
-                self.params
-                    .get("enable_lfs")
-                    .expose()
-                    .ok()
-                    .and_then(|v| v.parse::<bool>().ok())
-            })
             .unwrap_or(false);
 
         // Create a no-op rate limiter (Git operations are local after initial clone)
         let rate_limiter: Arc<dyn RateLimiter> = Arc::new(NoOpRateLimiter);
 
-        let credentials = self.build_credentials(dataset);
+        let credentials = self.build_credentials();
         let resilience = self.build_resilience(&repo_url);
 
         let config = GitTableConfig {
