@@ -4038,7 +4038,7 @@ dependencies = [
 
 [[package]]
 name = "connector-elasticsearch"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.3-enterprise"
 dependencies = [
  "async-trait",
  "data_components",
@@ -6963,7 +6963,7 @@ dependencies = [
 
 [[package]]
 name = "elasticsearch"
-version = "2.0.0-unstable"
+version = "2.0.0-rc.3-enterprise"
 dependencies = [
  "async-trait",
  "reqwest 0.12.24",
