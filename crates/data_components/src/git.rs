@@ -1308,30 +1308,27 @@ fn sanitize_subprocess_output(text: &str, credentials: &GitCredentials) -> Strin
         cleaned = cleaned.replace(secret, "<redacted>");
     }
     // Redact userinfo in any URL the subprocess may have echoed.
-    let redacted = {
-        let mut out = String::with_capacity(cleaned.len());
-        let mut rest = cleaned.as_str();
-        while let Some(scheme_idx) = rest.find("://") {
-            let after_scheme = scheme_idx + 3;
-            // Look up to the first `/`, `?`, or whitespace to bound the authority.
-            let authority_end = rest[after_scheme..]
-                .find(['/', '?', ' ', '\t', '\n'])
-                .map_or(rest.len(), |i| after_scheme + i);
-            let authority = &rest[after_scheme..authority_end];
-            if let Some(at_idx) = authority.rfind('@') {
-                out.push_str(&rest[..after_scheme]);
-                out.push_str("<redacted>@");
-                out.push_str(&authority[at_idx + 1..]);
-                rest = &rest[authority_end..];
-            } else {
-                out.push_str(&rest[..authority_end]);
-                rest = &rest[authority_end..];
-            }
+    let mut out = String::with_capacity(cleaned.len());
+    let mut rest = cleaned.as_str();
+    while let Some(scheme_idx) = rest.find("://") {
+        let after_scheme = scheme_idx + 3;
+        // Look up to the first `/`, `?`, or whitespace to bound the authority.
+        let authority_end = rest[after_scheme..]
+            .find(['/', '?', ' ', '\t', '\n'])
+            .map_or(rest.len(), |i| after_scheme + i);
+        let authority = &rest[after_scheme..authority_end];
+        if let Some(at_idx) = authority.rfind('@') {
+            out.push_str(&rest[..after_scheme]);
+            out.push_str("<redacted>@");
+            out.push_str(&authority[at_idx + 1..]);
+            rest = &rest[authority_end..];
+        } else {
+            out.push_str(&rest[..authority_end]);
+            rest = &rest[authority_end..];
         }
-        out.push_str(rest);
-        out
-    };
-    redacted
+    }
+    out.push_str(rest);
+    out
 }
 
 fn run_git_lfs_command(

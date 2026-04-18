@@ -55,9 +55,11 @@ type SemaphoreEntry = (Arc<Semaphore>, usize);
 static GIT_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, SemaphoreEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Per-repository disabled-state flags. Shared across the connector and its
-/// metrics provider so observability reflects the latched state. Same memory
-/// footprint trade-off as `GIT_CONCURRENCY_LIMITS` above.
+/// Per-repository disabled-state flags. Shared across all `Git` connector
+/// instances that target the same repository so that a permanent error
+/// observed by one dataset latches the connector for every dataset pointing
+/// at the same remote. Same memory footprint trade-off as
+/// `GIT_CONCURRENCY_LIMITS` above.
 static GIT_DISABLED_FLAGS: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 

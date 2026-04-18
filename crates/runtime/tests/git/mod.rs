@@ -17,7 +17,11 @@ limitations under the License.
 use std::{collections::HashMap, path::Path, process::Command, sync::Arc};
 
 use app::AppBuilder;
-use arrow::array::Array;
+// `Array` is the trait that exposes `.len()` on concrete Arrow array types
+// (e.g. `StringArray::len`). rustc reports it as unused if we rely solely on
+// method syntax, so pull it in via an aliased import to keep both the trait
+// methods available and the lint happy.
+use arrow::array::Array as _;
 use runtime::Runtime;
 use spicepod::{
     component::dataset::Dataset,
