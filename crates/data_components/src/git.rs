@@ -133,6 +133,28 @@ pub fn sanitize_repo_url(url: &str) -> String {
     url.to_string()
 }
 
+/// RAII guard that holds the `inflight_operations` counter at +1 for its
+/// lifetime and atomically decrements it on drop. Using a guard rather than
+/// manual increment/decrement makes the metric cancellation-safe — if the
+/// surrounding future is dropped before completing, the counter still
+/// returns to its prior value.
+struct InflightGuard {
+    counter: Arc<AtomicU64>,
+}
+
+impl InflightGuard {
+    fn enter(counter: Arc<AtomicU64>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 fn cache_mutex_for(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
     let mut guard = GIT_CACHE_MUTEXES
         .lock()
@@ -676,7 +698,7 @@ impl GitClient {
             return Err(Error::ConnectorDisabled);
         }
 
-        let permit = if let Some(semaphore) = self.resilience.semaphore.clone() {
+        let _permit = if let Some(semaphore) = self.resilience.semaphore.clone() {
             Some(
                 semaphore
                     .acquire_owned()
@@ -689,14 +711,12 @@ impl GitClient {
             None
         };
 
-        self.resilience.inflight.fetch_add(1, Ordering::Relaxed);
+        // RAII inflight tracking. Using a drop-guard (rather than manual
+        // fetch_add/fetch_sub pairs) ensures the gauge is always decremented
+        // even if the future is cancelled mid-operation.
+        let _inflight = InflightGuard::enter(Arc::<AtomicU64>::clone(&self.resilience.inflight));
 
-        let result = self.get_repository_inner().await;
-
-        self.resilience.inflight.fetch_sub(1, Ordering::Relaxed);
-        drop(permit);
-
-        result
+        self.get_repository_inner().await
     }
 
     async fn get_repository_inner(&self) -> Result<Repository> {
@@ -739,16 +759,9 @@ impl GitClient {
     }
 
     async fn try_get_repository(&self) -> Result<Repository> {
-        // Serialize mutation of the on-disk cache. The per-URL
-        // `max_concurrent_requests` semaphore bounds outbound remote
-        // concurrency, but because every dataset targeting the same URL
-        // shares a single cache directory, concurrent clone/fetch/checkout
-        // operations against the same cache would corrupt the working tree.
-        // Holding this mutex across the blocking Git operations guarantees
-        // exactly one mutator per cache directory at a time.
-        let cache_lock = cache_mutex_for(&self.cache_path);
-        let _cache_guard = cache_lock.lock().await;
-
+        // The per-cache-path mutex is acquired by `fetch_files` and held
+        // across clone/fetch/checkout/LFS/scan, so every mutation of the
+        // shared on-disk cache is serialized with its corresponding read.
         let repo_url = self.repo_url.clone();
         let cache_path = self.cache_path.clone();
         let credentials = self.credentials.clone();
@@ -848,6 +861,12 @@ impl GitClient {
     ) -> Result<Vec<RecordBatch>> {
         self.rate_limiter.check_rate_limit().await.ok();
 
+        // Acquire the per-cache-path mutex once, and hold it through
+        // clone/fetch/checkout, `git lfs checkout`, and the working-tree
+        // scan so that concurrent queries against the same on-disk cache
+        // cannot interleave mutations with reads.
+        let cache_guard = cache_mutex_for(&self.cache_path).lock_owned().await;
+
         let repo = self.get_repository().await?;
         let reference = self.reference.clone();
         let max_file_bytes = self.max_file_bytes;
@@ -856,20 +875,11 @@ impl GitClient {
         // real object on disk, but the Git object in the tree is still the
         // pointer file. Reading the blob would surface the pointer's
         // metadata instead of the actual content.
-        //
-        // Hold the per-cache-path mutex for the duration of the scan so a
-        // concurrent query against a different ref cannot swap the working
-        // tree underneath us. The guard is released at the end of the
-        // `spawn_blocking` closure when this binding is dropped.
-        let lfs_guard = if self.enable_lfs {
-            Some(cache_mutex_for(&self.cache_path).lock_owned().await)
-        } else {
-            None
-        };
         let lfs_content_root = self.enable_lfs.then(|| self.cache_path.clone());
 
         let entries = task::spawn_blocking(move || {
-            let _lfs_guard = lfs_guard;
+            // Keep the cache mutex alive until the scan finishes.
+            let _cache_guard = cache_guard;
             let commit_oid = Self::resolve_reference_blocking(&repo, reference.as_deref())?;
             let commit = repo.find_commit(commit_oid).context(GitSnafu)?;
             let tree = commit.tree().context(GitSnafu)?;

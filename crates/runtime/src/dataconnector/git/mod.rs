@@ -122,32 +122,52 @@ impl Git {
     /// Parse the Git URL from the dataset path
     /// Supports formats like:
     /// - git:https://github.com/spiceai/spiceai.git
-    /// - git:git@github.com:spiceai/spiceai.git
+    /// - git:https://user:token@github.com/spiceai/spiceai.git@trunk
+    /// - git:git@github.com:spiceai/spiceai.git@v1.0.0
+    /// - git:file:///tmp/repo@main
     fn parse_git_url(path: &str) -> Result<(String, Option<String>), String> {
         let path = path.strip_prefix("git:").unwrap_or(path).trim();
         if path.is_empty() {
             return Err("Git path is empty".to_string());
         }
 
-        // Check for reference specification (e.g., @branch or @tag or @commit)
-        if let Some(at_pos) = path.rfind('@') {
-            // Check if this @ is part of git@github.com (SSH format)
-            // In SSH format, @ appears before the colon
-            if let Some(colon_pos) = path.find(':')
-                && at_pos < colon_pos
-            {
-                // This is SSH format like git@github.com:org/repo
-                // Check for a second @ for reference
-                if let Some(ref_pos) = path[at_pos + 1..].rfind('@') {
-                    let actual_ref_pos = at_pos + 1 + ref_pos;
-                    let url = path[..actual_ref_pos].to_string();
-                    let reference = path[actual_ref_pos + 1..].to_string();
+        // SSH shorthand: git@host:org/repo[@ref]
+        if path.starts_with("git@") {
+            if let Some(colon_pos) = path.find(':') {
+                let suffix = &path[colon_pos + 1..];
+                if let Some(at_rel) = suffix.rfind('@') {
+                    let at_pos = colon_pos + 1 + at_rel;
+                    let url = path[..at_pos].to_string();
+                    let reference = path[at_pos + 1..].to_string();
                     return Ok((url, Some(reference)));
                 }
-                return Ok((path.to_string(), None));
             }
+            return Ok((path.to_string(), None));
+        }
 
-            // Otherwise, @ is a reference separator
+        // Standard URL: `<scheme>://[userinfo@]authority[/path][@<ref>]`.
+        //
+        // The reference separator is the last `@` that appears *after* the
+        // start of the path component (the first `/` following `://`). This
+        // way a URL that contains userinfo (e.g. `https://user:token@host/`)
+        // is never mistaken for a `@ref` suffix.
+        if let Some(scheme_end) = path.find("://") {
+            let after_scheme = scheme_end + 3;
+            let path_start = path[after_scheme..]
+                .find('/')
+                .map_or(path.len(), |idx| after_scheme + idx);
+            if let Some(at_rel) = path[path_start..].rfind('@') {
+                let at_pos = path_start + at_rel;
+                let url = path[..at_pos].to_string();
+                let reference = path[at_pos + 1..].to_string();
+                return Ok((url, Some(reference)));
+            }
+            return Ok((path.to_string(), None));
+        }
+
+        // No scheme (bare path, etc.): fall back to treating the last `@`
+        // as the ref separator.
+        if let Some(at_pos) = path.rfind('@') {
             let url = path[..at_pos].to_string();
             let reference = path[at_pos + 1..].to_string();
             Ok((url, Some(reference)))
