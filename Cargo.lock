@@ -3223,9 +3223,9 @@ version = "0.10.1"
 source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
 dependencies = [
  "byteorder",
- "candle-kernels 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
- "candle-metal-kernels 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
- "candle-ug 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
+ "candle-kernels",
+ "candle-metal-kernels",
+ "candle-ug",
  "cudarc 0.19.4",
  "float8",
  "gemm 0.19.0",
@@ -3251,7 +3251,7 @@ name = "candle-cublaslt"
 version = "0.2.2"
 source = "git+https://github.com/spiceai/candle-cublaslt?rev=b74d30e0a212ee1ee517b2ef2efd8d46ae7687de#b74d30e0a212ee1ee517b2ef2efd8d46ae7687de"
 dependencies = [
- "candle-core 0.10.1 (git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12)",
+ "candle-core",
  "cudarc 0.19.4",
  "half",
 ]
@@ -3262,7 +3262,7 @@ version = "0.10.1"
 source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
 dependencies = [
  "anyhow",
- "candle-core 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
+ "candle-core",
  "cudaforge",
  "half",
 ]
@@ -3272,7 +3272,7 @@ name = "candle-index-select-cu"
 version = "0.0.1"
 source = "git+https://github.com/spiceai/candle-index-select-cu.git?rev=397d733869484e21c61a6137f75489d0eca71f5f#397d733869484e21c61a6137f75489d0eca71f5f"
 dependencies = [
- "candle-core 0.10.1 (git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12)",
+ "candle-core",
  "half",
 ]
 
@@ -3290,7 +3290,7 @@ version = "0.0.1"
 source = "git+https://github.com/spiceai/candle-layer-norm?rev=62f936a1c5c79a08008e6967297543b4c154784e#62f936a1c5c79a08008e6967297543b4c154784e"
 dependencies = [
  "anyhow",
- "candle-core 0.10.1 (git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12)",
+ "candle-core",
  "half",
  "num_cpus",
  "rayon",
@@ -3315,8 +3315,8 @@ name = "candle-nn"
 version = "0.10.1"
 source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
 dependencies = [
- "candle-core 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
- "candle-metal-kernels 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
+ "candle-core",
+ "candle-metal-kernels",
  "half",
  "libc",
  "num-traits",
@@ -3334,7 +3334,7 @@ source = "git+https://github.com/spiceai/candle-rotary?rev=a4c4efcd5fcb2d7f75007
 dependencies = [
  "anyhow",
  "bindgen_cuda",
- "candle-core 0.10.1 (git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12)",
+ "candle-core",
  "half",
 ]
 
@@ -3344,8 +3344,8 @@ version = "0.10.1"
 source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
 dependencies = [
  "byteorder",
- "candle-core 0.10.1 (git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12)",
- "candle-nn 0.10.1 (git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12)",
+ "candle-core",
+ "candle-nn",
  "fancy-regex 0.17.0",
  "num-traits",
  "rand 0.9.4",
@@ -11274,8 +11274,8 @@ version = "0.7.0"
 source = "git+https://github.com/spiceai/mistral.rs?rev=27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84#27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84"
 dependencies = [
  "anyhow",
- "candle-core 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
- "candle-nn 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
+ "candle-core",
+ "candle-nn",
  "clap",
  "either",
  "futures",
@@ -11321,10 +11321,10 @@ dependencies = [
  "bm25",
  "bytemuck",
  "bytemuck_derive",
- "candle-core 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
+ "candle-core",
  "candle-flash-attn",
- "candle-metal-kernels 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
- "candle-nn 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
+ "candle-metal-kernels",
+ "candle-nn",
  "cfgrammar",
  "chrono",
  "clap",
@@ -11442,8 +11442,8 @@ version = "0.7.0"
 source = "git+https://github.com/spiceai/mistral.rs?rev=27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84#27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84"
 dependencies = [
  "anyhow",
- "candle-core 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
- "candle-metal-kernels 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
+ "candle-core",
+ "candle-metal-kernels",
  "cudaforge",
  "dispatch2",
  "float8",
@@ -11459,9 +11459,9 @@ version = "0.7.0"
 source = "git+https://github.com/spiceai/mistral.rs?rev=27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84#27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84"
 dependencies = [
  "byteorder",
- "candle-core 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
- "candle-metal-kernels 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
- "candle-nn 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
+ "candle-core",
+ "candle-metal-kernels",
+ "candle-nn",
  "cudaforge",
  "dispatch2",
  "float8",
@@ -11488,7 +11488,7 @@ name = "mistralrs-vision"
 version = "0.7.0"
 source = "git+https://github.com/spiceai/mistral.rs?rev=27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84#27405ba1a1fe5d6dfc70ad8fc9ca037da85b5f84"
 dependencies = [
- "candle-core 0.10.1 (git+https://github.com/spiceai/candle.git?rev=7de0d9fdff7dfb6289442abfba821e8d77f57c58)",
+ "candle-core",
  "image 0.25.9",
  "rayon",
 ]
@@ -19328,11 +19328,11 @@ version = "1.9.3"
 source = "git+https://github.com/spiceai/text-embeddings-inference.git?rev=ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3#ae95f20fe13dfadb84ded1aa6eea76f09c9a33a3"
 dependencies = [
  "anyhow",
- "candle-core 0.10.1 (git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12)",
+ "candle-core",
  "candle-cublaslt",
  "candle-index-select-cu",
  "candle-layer-norm",
- "candle-nn 0.10.1 (git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12)",
+ "candle-nn",
  "candle-rotary",
  "candle-transformers",
  "memmap2",
