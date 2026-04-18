@@ -427,6 +427,7 @@ impl std::fmt::Debug for GitClient {
 }
 
 impl GitClient {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo_url: &str,
         reference: Option<&str>,
@@ -540,7 +541,7 @@ impl GitClient {
         _url: &str,
         username_from_url: Option<&str>,
         allowed_types: CredentialType,
-        is_ssh: bool,
+        _is_ssh: bool,
     ) -> std::result::Result<Cred, git2::Error> {
         // SSH public-key authentication is always attempted first when the
         // remote requests it — libgit2 calls the credentials callback once per
@@ -555,7 +556,12 @@ impl GitClient {
                 let passphrase = credentials.ssh_passphrase.as_deref();
                 return Cred::ssh_key(user, None, key_path.as_path(), passphrase);
             }
-            if credentials.ssh_use_agent || is_ssh {
+            // Agent fallback is controlled solely by the `ssh_use_agent`
+            // configuration. We do *not* fall back to the agent based on the
+            // URL shape alone, because that would let the host agent's
+            // identities leak in even when the operator explicitly set
+            // `ssh_use_agent = false` to require a specific key.
+            if credentials.ssh_use_agent {
                 return Cred::ssh_key_from_agent(user);
             }
         }
@@ -785,6 +791,12 @@ impl GitClient {
         let repo = self.get_repository().await?;
         let reference = self.reference.clone();
         let max_file_bytes = self.max_file_bytes;
+        // When LFS is enabled we must read file contents from the working
+        // tree rather than the blob — `git lfs checkout` materializes the
+        // real object on disk, but the Git object in the tree is still the
+        // pointer file. Reading the blob would surface the pointer's
+        // metadata instead of the actual content.
+        let lfs_content_root = self.enable_lfs.then(|| self.cache_path.clone());
 
         let entries = task::spawn_blocking(move || {
             let commit_oid = Self::resolve_reference_blocking(&repo, reference.as_deref())?;
@@ -857,11 +869,34 @@ impl GitClient {
                 let mode = format!("{:o}", entry.filemode());
 
                 let content = if fetch_content {
-                    if let Ok(text) = std::str::from_utf8(blob.content()) {
-                        Some(text.to_string())
-                    } else {
-                        tracing::debug!("File {} is not valid UTF-8, skipping content", full_path);
-                        None
+                    let bytes = match lfs_content_root.as_ref() {
+                        Some(root) => match std::fs::read(root.join(&full_path)) {
+                            Ok(bytes) if bytes.len() <= max_file_bytes => bytes,
+                            Ok(bytes) => {
+                                tracing::debug!(
+                                    "Skipping LFS content for {} because on-disk size ({} bytes) exceeds max_file_bytes",
+                                    full_path,
+                                    bytes.len()
+                                );
+                                blob.content().to_vec()
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    "Failed to read LFS-materialized content for {}: {}. Falling back to blob content.",
+                                    full_path,
+                                    err
+                                );
+                                blob.content().to_vec()
+                            }
+                        },
+                        None => blob.content().to_vec(),
+                    };
+                    match std::str::from_utf8(&bytes) {
+                        Ok(text) => Some(text.to_string()),
+                        Err(_) => {
+                            tracing::debug!("File {} is not valid UTF-8, skipping content", full_path);
+                            None
+                        }
                     }
                 } else {
                     None

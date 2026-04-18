@@ -38,15 +38,26 @@ use std::sync::{LazyLock, Mutex};
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use tokio::sync::Semaphore;
 
+/// A concurrency semaphore paired with the numeric limit it was constructed
+/// with, so that mismatches between datasets sharing the same repository URL
+/// can be detected and surfaced as a warning.
+type SemaphoreEntry = (Arc<Semaphore>, usize);
+
 /// Per-repository concurrency semaphores. Keyed by the fully-qualified
 /// repository URL so that multiple datasets sharing the same remote share a
-/// single concurrency budget. The second tuple element records the
-/// configured limit so mismatches between datasets can be surfaced.
-static GIT_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, (Arc<Semaphore>, usize)>>> =
+/// single concurrency budget.
+///
+/// Entries are never evicted during the runtime's lifetime: each slot holds an
+/// `Arc<Semaphore>` + `usize` (~40 bytes on 64-bit platforms), and typical
+/// deployments configure a bounded set of repositories. Workloads that
+/// dynamically materialize many distinct Git URLs should treat this as a
+/// known upper bound on memory use.
+static GIT_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, SemaphoreEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Per-repository disabled-state flags. Shared across the connector and its
-/// metrics provider so observability reflects the latched state.
+/// metrics provider so observability reflects the latched state. Same memory
+/// footprint trade-off as `GIT_CONCURRENCY_LIMITS` above.
 static GIT_DISABLED_FLAGS: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
