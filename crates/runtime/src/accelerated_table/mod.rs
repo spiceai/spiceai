@@ -877,8 +877,20 @@ impl Builder {
                                 "Deferred federated provider for dataset {dataset_name} did not resolve successfully; leaving dataset status unchanged"
                             );
                         } else {
-                            runtime_status
-                                .update_dataset(&dataset_name, status::ComponentStatus::Ready);
+                            // If the refresh path has already marked the dataset as `Error`
+                            // (e.g. the initial refresh failed quickly), don't overwrite it
+                            // with `Ready` — schema-resolution readiness must not mask refresh
+                            // failures that are surfaced via dataset status and metrics.
+                            let current_status = runtime_status
+                                .get_component_status(&format!("dataset:{dataset_name}"));
+                            if matches!(current_status, Some(status::ComponentStatus::Error(_))) {
+                                tracing::debug!(
+                                    "Deferred federated provider for dataset {dataset_name} resolved successfully, but dataset status is already Error; leaving dataset status unchanged"
+                                );
+                            } else {
+                                runtime_status
+                                    .update_dataset(&dataset_name, status::ComponentStatus::Ready);
+                            }
                         }
                     });
                     handlers.push(wait_handle);
@@ -1251,8 +1263,9 @@ impl TableProvider for AcceleratedTable {
                     ));
                 }
                 ReadyState::OnRegistration | ReadyState::OnSchemaResolved => {
-                    // Getting the federated_provider should always return immediately here, because by definition an accelerated table has
-                    // completed its initial load if it has a previous checkpoint.
+                    // Before the initial accelerated load completes, these ready states fall back
+                    // to the federated source. Resolving the federated provider is still
+                    // asynchronous here and may await the deferred provider becoming available.
                     let federated_provider = self.federated.table_provider().await;
                     metrics::READY_STATE_FALLBACK.add(
                         1,
