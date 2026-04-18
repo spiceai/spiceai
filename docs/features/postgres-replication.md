@@ -123,6 +123,20 @@ All replication-specific parameters live under `params:` on the dataset and star
 
 All existing `pg_host`, `pg_port`, `pg_user`, `pg_pass`, `pg_db`, `pg_sslmode`, `pg_connection_string`, etc. parameters continue to apply.
 
+#### `pg_sslmode` for WAL streaming
+
+The table below reflects how each `pg_sslmode` value behaves for the replication stream. `verify-full` is the recommended production default.
+
+| `pg_sslmode` | Replication transport | Cert chain verified | Hostname verified |
+|--------------|-----------------------|:-------------------:|:-----------------:|
+| `disable`    | plaintext             | —                   | —                 |
+| `prefer` (default) | plaintext       | —                   | —                 |
+| `require`    | TLS                   | ❌                  | ❌                |
+| `verify-ca`  | TLS                   | ✅                  | ❌                |
+| `verify-full`| TLS                   | ✅                  | ✅                |
+
+Note: `prefer` behaves as plaintext here because the replication transport does not expose a safe "try TLS, fall back to plaintext" path. Set `require`, `verify-ca`, or `verify-full` to force TLS on the WAL stream. A `tracing::warn!` is emitted at startup whenever a non-verifying mode is in effect.
+
 ### Accelerator engines
 
 | Engine        | `INSERT` | `UPDATE` | `DELETE` | Notes |

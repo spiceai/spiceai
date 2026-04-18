@@ -85,12 +85,19 @@ fn build_replication_config(input: &WalStreamInput) -> ReplicationConfig {
     // VerifyFull), so we pick the matching constructor and pass the optional
     // CA path.
     let tls = match input.params.sslmode {
-        SslMode::Disable => TlsConfig::disabled(),
-        // Prefer → Require: pgwire-replication doesn't distinguish prefer
-        // from require (prefer would mean "try TLS, fall back to plaintext",
-        // which the underlying pgoutput transport doesn't support safely).
-        // Users who want prefer-semantics should use Disable or Require.
-        SslMode::Prefer | SslMode::Require => TlsConfig::require(),
+        // Prefer maps to plaintext for WAL streaming. Rationale:
+        // pgwire-replication does not expose a safe "try TLS then fall back
+        // to plaintext" path, so the only two honest mappings are Disabled
+        // or Require. Since `Prefer` is our parsing default, silently
+        // strengthening it into Require would break non-TLS dev/test
+        // Postgres instances that the regular connector happily talks to
+        // (the setup connection uses tokio_postgres's real Prefer
+        // semantics). Matching libpq's "don't block on missing TLS" intent
+        // and staying symmetric with the setup path is the safer default —
+        // operators who want TLS on replication must pick Require,
+        // VerifyCa, or VerifyFull explicitly.
+        SslMode::Disable | SslMode::Prefer => TlsConfig::disabled(),
+        SslMode::Require => TlsConfig::require(),
         SslMode::VerifyCa => TlsConfig::verify_ca(input.params.sslrootcert.clone()),
         SslMode::VerifyFull => TlsConfig::verify_full(input.params.sslrootcert.clone()),
     };
