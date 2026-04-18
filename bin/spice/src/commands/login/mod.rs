@@ -297,7 +297,7 @@ fn get_spice_base_url() -> String {
 
 /// Generate a random 8-character auth code.
 fn generate_auth_code() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::rng();
 
