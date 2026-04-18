@@ -549,10 +549,9 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
             .await?;
 
             // Final pretty-printed snapshot of the small region table for
-            // regression sensitivity on the full row shape. Inlined rather
-            // than stored in a `.snap` file so this integration test is
-            // self-contained and doesn't depend on a separate snapshot
-            // artifact landing in the PR.
+            // regression sensitivity on the full row shape. Using an Insta
+            // named snapshot to match the rest of the runtime test suite —
+            // run `INSTA_UPDATE=1 cargo nextest run ...` to refresh.
             let regions = run_query(
                 &rt,
                 "SELECT r_regionkey, r_name FROM tpch_region ORDER BY r_regionkey",
@@ -560,16 +559,7 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
             .await?;
             let pretty =
                 pretty_format_batches(&regions).map_err(|e| anyhow!("format regions: {e}"))?;
-            let expected_regions = concat!(
-                "+-------------+---------+\n",
-                "| r_regionkey | r_name  |\n",
-                "+-------------+---------+\n",
-                "| 0           | AFRICA  |\n",
-                "| 1           | AMERICA |\n",
-                "| 2           | ASIA    |\n",
-                "+-------------+---------+",
-            );
-            assert_eq!(pretty.to_string(), expected_regions);
+            insta::assert_snapshot!("tpch_postgres_replication_regions", pretty);
 
             rt.shutdown().await;
             Ok(())
