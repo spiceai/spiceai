@@ -904,9 +904,20 @@ impl GitClient {
                 let mode = format!("{:o}", entry.filemode());
 
                 let content = if fetch_content {
+                    // `LfsLookup` captures whether the LFS branch is in play
+                    // and, if so, whether the materialized file is usable.
+                    #[derive(Clone)]
+                    enum LfsLookup {
+                        Disabled,
+                        Materialized(Vec<u8>),
+                        Skip,
+                    }
+
                     let lfs_bytes = if let Some(root) = lfs_content_root.as_ref() {
                         match std::fs::read(root.join(&full_path)) {
-                            Ok(bytes) if bytes.len() <= max_file_bytes => Some(Some(bytes)),
+                            Ok(bytes) if bytes.len() <= max_file_bytes => {
+                                LfsLookup::Materialized(bytes)
+                            }
                             Ok(bytes) => {
                                 tracing::debug!(
                                     "Skipping LFS-materialized {} because on-disk size ({} bytes) exceeds max_file_bytes",
@@ -915,44 +926,39 @@ impl GitClient {
                                 );
                                 // Signal "LFS skip" without falling back to
                                 // the pointer-file blob content.
-                                Some(None)
+                                LfsLookup::Skip
                             }
                             Err(err) => {
                                 tracing::warn!(
                                     "Failed to read LFS-materialized content for {}: {err}. Skipping content for this file.",
                                     full_path
                                 );
-                                Some(None)
+                                LfsLookup::Skip
                             }
                         }
                     } else {
-                        None
+                        LfsLookup::Disabled
                     };
+
+                    let decode = |bytes: &[u8]| -> Option<String> {
+                        if let Ok(text) = std::str::from_utf8(bytes) {
+                            Some(text.to_string())
+                        } else {
+                            tracing::debug!(
+                                "File {} is not valid UTF-8, skipping content",
+                                full_path
+                            );
+                            None
+                        }
+                    };
+
                     match lfs_bytes {
-                        Some(Some(bytes)) => match std::str::from_utf8(&bytes) {
-                            Ok(text) => Some(text.to_string()),
-                            Err(_) => {
-                                tracing::debug!(
-                                    "File {} is not valid UTF-8, skipping content",
-                                    full_path
-                                );
-                                None
-                            }
-                        },
+                        LfsLookup::Materialized(bytes) => decode(&bytes),
                         // LFS enabled but content not usable (oversize or
                         // unreadable) — leave content NULL rather than
                         // emitting the LFS pointer as "content".
-                        Some(None) => None,
-                        None => match std::str::from_utf8(blob.content()) {
-                            Ok(text) => Some(text.to_string()),
-                            Err(_) => {
-                                tracing::debug!(
-                                    "File {} is not valid UTF-8, skipping content",
-                                    full_path
-                                );
-                                None
-                            }
-                        },
+                        LfsLookup::Skip => None,
+                        LfsLookup::Disabled => decode(blob.content()),
                     }
                 } else {
                     None
