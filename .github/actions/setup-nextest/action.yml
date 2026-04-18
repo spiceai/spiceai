@@ -35,20 +35,35 @@ runs:
         New-Item -ItemType Directory -Force -Path $cargoBin | Out-Null
         $cargoBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-    - name: Cache Nextest binary (Linux)
-      if: runner.os == 'Linux'
-      id: cache-nextest-linux
+    - name: Cache Nextest binary (Linux x86_64)
+      if: runner.os == 'Linux' && runner.arch == 'X64'
+      id: cache-nextest-linux-x64
       uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
       with:
         path: ~/.cargo/bin/cargo-nextest
         key: nextest-linux-x86_64-0.9.89
 
-    - name: Install Nextest (Linux)
-      if: runner.os == 'Linux' && steps.cache-nextest-linux.outputs.cache-hit != 'true'
+    - name: Install Nextest (Linux x86_64)
+      if: runner.os == 'Linux' && runner.arch == 'X64' && steps.cache-nextest-linux-x64.outputs.cache-hit != 'true'
       shell: bash
       run: |
         mkdir -p ${CARGO_HOME:-~/.cargo}/bin
         curl -LsSf https://get.nexte.st/0.9.89/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+    - name: Cache Nextest binary (Linux aarch64)
+      if: runner.os == 'Linux' && runner.arch == 'ARM64'
+      id: cache-nextest-linux-arm64
+      uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+      with:
+        path: ~/.cargo/bin/cargo-nextest
+        key: nextest-linux-aarch64-0.9.89
+
+    - name: Install Nextest (Linux aarch64)
+      if: runner.os == 'Linux' && runner.arch == 'ARM64' && steps.cache-nextest-linux-arm64.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p ${CARGO_HOME:-~/.cargo}/bin
+        curl -LsSf https://get.nexte.st/0.9.89/linux-arm | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
     - name: Cache Nextest binary (macOS)
       if: runner.os == 'macOS'
