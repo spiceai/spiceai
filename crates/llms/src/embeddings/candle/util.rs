@@ -29,6 +29,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{self, Path, PathBuf},
+    sync::Arc,
 };
 use tei_backend::{Pool, download_safetensors};
 use tei_core::{
@@ -164,7 +165,7 @@ pub(crate) async fn download_hf_artifacts(
     revision: Option<&str>,
     hf_token: Option<&str>,
 ) -> Result<PathBuf> {
-    let api_repo = get_api(model_id, revision, hf_token)?;
+    let api_repo = Arc::new(get_api(model_id, revision, hf_token)?);
     let repo_url = api_repo.url("");
 
     tracing::trace!("Downloading artifacts for {repo_url}");
@@ -172,7 +173,7 @@ pub(crate) async fn download_hf_artifacts(
         .await
         .context(FailedWithHFApiSnafu)?;
 
-    let _ = download_safetensors(&api_repo)
+    let _ = download_safetensors(Arc::clone(&api_repo))
         .await
         .context(FailedWithHFApiSnafu)?;
 

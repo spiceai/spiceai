@@ -25,11 +25,13 @@ limitations under the License.
 //!    the AST, stored in the [`DdlExtensionStore`], and stripped before
 //!    delegating to `DataFusion`.
 //!
-//! 2. **DML interception** — DELETE and UPDATE statements targeting Cayenne
-//!    catalog tables, plus INSERT statements targeting distributed
-//!    write-through tables, are converted into [`LogicalPlan::Extension`]
-//!    nodes directly for distributed mode. Support for additional DML types
-//!    (MERGE) may be added in the future.
+//! 2. **DML interception (optional overlay)** — only statements that need
+//!    non-default behavior are rewritten to extension nodes:
+//!    - DELETE/UPDATE targeting Cayenne tables in scheduler mode,
+//!    - INSERT targeting distributed write-through tables,
+//!    - MERGE targeting Cayenne tables.
+//!
+//!    All other DML uses standard `DataFusion` planning/execution unchanged.
 //!
 //! For everything else, the planner delegates to `DataFusion`'s standard
 //! `session.statement_to_plan()` path.
@@ -178,14 +180,13 @@ pub async fn create_logical_plan(
     session.statement_to_plan(statement).await
 }
 
-/// Plan a DML statement, producing either a local or distributed extension
-/// node.
+/// Plan a DML statement with an optional distributed overlay.
 ///
 /// For local mode, returns the standard `DataFusion` plan unchanged.
 ///
-/// For distributed (scheduler) mode, wraps the plan into a distributed
-/// extension node that forwards the operation to executors when the target
-/// table supports scheduler-side routing.
+/// For distributed (scheduler) mode, rewrites only supported targets into
+/// extension nodes that forward work to executors. Non-targets keep the
+/// original `DataFusion` DML plan.
 async fn plan_distributed_dml(
     statement: Statement,
     session: &SessionState,
@@ -225,7 +226,7 @@ async fn plan_distributed_dml(
     match expected_op {
         WriteOp::Delete => delete::plan_distributed_delete(dml),
         WriteOp::Update => update::plan_distributed_update(dml),
-        WriteOp::Insert(_) => Ok(insert::plan_distributed_insert(dml)),
+        WriteOp::Insert(_) => insert::plan_distributed_insert(dml),
         WriteOp::Ctas => Err(DataFusionError::Internal(
             "CTAS should not reach DML planner".to_string(),
         )),

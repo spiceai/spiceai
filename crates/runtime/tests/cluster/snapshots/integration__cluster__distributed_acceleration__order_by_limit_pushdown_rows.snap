@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/cluster/distributed_acceleration.rs
+expression: rows_fmt
+---
++----+--------------+-------+
+| id | name         | score |
++----+--------------+-------+
+| 6  | Sarah Wilson | 94    |
+| 2  | Jane Smith   | 92    |
+| 10 | Anna Garcia  | 90    |
++----+--------------+-------+

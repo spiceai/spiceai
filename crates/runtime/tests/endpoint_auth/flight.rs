@@ -25,7 +25,7 @@ use crate::{
     utils::{register_test_connectors, test_request_context, wait_until_true},
 };
 use arrow_flight::{error::FlightError, flight_service_client::FlightServiceClient};
-use rand::Rng;
+use rand::RngExt;
 use repl::cache_control;
 use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};

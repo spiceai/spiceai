@@ -23,7 +23,7 @@ use std::{
 use app::AppBuilder;
 use arrow::{array::RecordBatch, util::pretty::pretty_format_batches};
 use futures::TryStreamExt;
-use rand::Rng;
+use rand::RngExt;
 use runtime::{Runtime, datafusion::query::QueryBuilder};
 use runtime::{auth::EndpointAuth, config::Config};
 use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};

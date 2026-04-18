@@ -20,7 +20,7 @@ use bollard::secret::HealthConfig;
 use datafusion_table_providers::{
     UnsupportedTypeAction, sql::db_connection_pool::postgrespool::PostgresConnectionPool,
 };
-use rand::Rng;
+use rand::RngExt;
 use secrecy::SecretString;
 use tracing::instrument;
 
