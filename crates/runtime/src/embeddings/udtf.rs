@@ -123,7 +123,16 @@ pub static VECTOR_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
 #[derive(Debug, PartialEq, Clone)]
 pub struct VectorSearchTableFuncArgs {
     pub tbl: TableReference,
+    /// Primary query string. For single-string queries this is the only
+    /// query; for multi-string (late-interaction) queries it is the
+    /// first element of `queries` and retained here for backward
+    /// compatibility with existing consumers that read `query` directly.
     pub query: String,
+    /// All query strings. Always contains at least one entry (mirroring
+    /// `query` for single-string mode). Length > 1 triggers the
+    /// late-interaction search path when paired with a multi-vector
+    /// column.
+    pub queries: Vec<String>,
 
     pub column: Option<String>,
     pub limit: Option<usize>,
@@ -236,10 +245,22 @@ impl VectorSearchTableFunc {
 impl VectorSearchTableFunc {
     #[must_use]
     pub fn to_expr(args: &VectorSearchTableFuncArgs) -> Vec<Expr> {
-        let mut expr = vec![
-            Expr::Column(to_column_expr(&args.tbl)),
-            Expr::Literal(ScalarValue::Utf8(Some(args.query.clone())), None),
-        ];
+        // Multi-query searches round-trip as a `make_array(...)` call;
+        // single-query stays as a bare Utf8 literal for backwards
+        // compatibility with pre-multi-query consumers.
+        let query_expr = if args.queries.len() > 1 {
+            let make_array = datafusion::functions_nested::make_array::make_array_udf();
+            Expr::ScalarFunction(ScalarFunction::new_udf(
+                make_array,
+                args.queries
+                    .iter()
+                    .map(|q| Expr::Literal(ScalarValue::Utf8(Some(q.clone())), None))
+                    .collect(),
+            ))
+        } else {
+            Expr::Literal(ScalarValue::Utf8(Some(args.query.clone())), None)
+        };
+        let mut expr = vec![Expr::Column(to_column_expr(&args.tbl)), query_expr];
 
         if let Some(col) = args.column.as_ref() {
             expr.push(Expr::Column(Column::new_unqualified(col)));
@@ -259,6 +280,40 @@ impl VectorSearchTableFunc {
         expr
     }
 
+    /// Parse the query argument of `vector_search(tbl, <query>, ...)`.
+    /// Accepts either a single Utf8 string literal, or a `make_array(...)`
+    /// (i.e. SQL `[...]` / `ARRAY[...]`) whose elements are all Utf8
+    /// literals. Returns a non-empty `Vec<String>`.
+    fn parse_query_arg(query: Option<&Expr>) -> DataFusionResult<Vec<String>> {
+        match query {
+            Some(Expr::Literal(ScalarValue::Utf8(Some(q)), None)) => Ok(vec![q.clone()]),
+            Some(Expr::ScalarFunction(ScalarFunction { func, args }))
+                if func.name().eq_ignore_ascii_case("make_array") =>
+            {
+                if args.is_empty() {
+                    return Err(DataFusionError::Plan(
+                        "Multi-query array must contain at least one query string.".to_string(),
+                    ));
+                }
+                let mut out = Vec::with_capacity(args.len());
+                for a in args {
+                    match a {
+                        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => out.push(s.clone()),
+                        other => {
+                            return Err(DataFusionError::Plan(format!(
+                                "Multi-query array elements must be string literals, got {other:?}."
+                            )));
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            other => Err(DataFusionError::Plan(format!(
+                "Second argument must be a query string or array of query strings, but got {other:?}."
+            ))),
+        }
+    }
+
     fn parse_args(args: &[Expr]) -> DataFusionResult<VectorSearchTableFuncArgs> {
         // Filter out passthrough parameters (those with spice.parameter_name metadata)
         // These are meant for table functions like RRF, not for vector_search itself
@@ -276,11 +331,12 @@ impl VectorSearchTableFunc {
         let tbl_ref = table_ref_from_column_expr(c);
 
         let query = args.next();
-        let Some(Expr::Literal(ScalarValue::Utf8(Some(q)), None)) = query else {
-            return Err(DataFusionError::Plan(format!(
-                "Second argument must be a query string, but got {query:?}."
-            )));
-        };
+        let queries = Self::parse_query_arg(query)?;
+        // `q` is used in downstream error messages + back-compat field.
+        let q = queries
+            .first()
+            .cloned()
+            .expect("parse_query_arg guarantees at least one element");
 
         let (column, limit, include_score) = match (args.next(), args.next(), args.next()) {
             // No arguments, provides defaults
@@ -347,6 +403,7 @@ impl VectorSearchTableFunc {
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
                 .into(),
             query: q.clone(),
+            queries,
             column,
             limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
             include_score,
@@ -483,7 +540,11 @@ impl TableFunctionImpl for VectorSearchTableFunc {
             })?;
 
         let (col, _) = args.get_column_and_config(&embedding_table_provider.embedded_columns)?;
-        if embedding_table_provider.is_chunked(col.as_str()) {
+        // Both chunked-scalar and multi-vector (list-typed) columns use
+        // the same UNNEST-based non-indexed search path, but with
+        // different scan modes.
+        let is_multi_vector = embedding_table_provider.is_multi_vector(col.as_str());
+        if embedding_table_provider.is_chunked(col.as_str()) || is_multi_vector {
             let state = df.ctx.state();
             let Some(embed_udf) = state.scalar_functions().get(EMBED_UDF_NAME) else {
                 return Err(DataFusionError::Plan(format!(
@@ -492,7 +553,17 @@ impl TableFunctionImpl for VectorSearchTableFunc {
             };
 
             // Unsafe: worse case is metric without dimensions.
-            let dimensions = unsafe { RequestContext::current_sync().to_dimensions() };
+            let mut dimensions = unsafe { RequestContext::current_sync().to_dimensions() };
+            if is_multi_vector {
+                dimensions.push(opentelemetry::KeyValue::new("multi_vector", true));
+                if let Some(agg) = embedding_table_provider.multi_vector_aggregation(col.as_str())
+                {
+                    dimensions.push(opentelemetry::KeyValue::new(
+                        "multi_vector_aggregation",
+                        agg.to_string(),
+                    ));
+                }
+            }
             telemetry::track_vector_search(&dimensions);
             let pks = self
                 .explicit_pks
@@ -500,17 +571,56 @@ impl TableFunctionImpl for VectorSearchTableFunc {
                 .cloned()
                 .or_else(|| get_primary_keys(&table_provider).ok());
 
-            let table = ChunkedNonIndexVectorGeneration::new(
-                &table_provider,
-                &args.tbl,
-                embed_udf,
-                embedding_table_provider
-                    .get_embedding_model_used_by(&col)
-                    .unwrap_or_default(),
-                pks.unwrap_or_default(),
-                &col,
-            )
-            .search(args.query)?;
+            let model_name = embedding_table_provider
+                .get_embedding_model_used_by(&col)
+                .unwrap_or_default();
+            let pks_vec = pks.unwrap_or_default();
+
+            let table = if is_multi_vector {
+                if args.queries.len() > 1 {
+                    // Multi-query × multi-vector → ColBERT-style
+                    // late-interaction: `SUM_{q in Q} MAX_{d in D} cos(q, d)`.
+                    ChunkedNonIndexVectorGeneration::new_late_interaction(
+                        &table_provider,
+                        &args.tbl,
+                        embed_udf,
+                        model_name,
+                        pks_vec,
+                        &col,
+                        args.queries.clone(),
+                    )
+                    .search(args.query)?
+                } else {
+                    let aggregation = embedding_table_provider
+                        .multi_vector_aggregation(col.as_str())
+                        .unwrap_or_default();
+                    ChunkedNonIndexVectorGeneration::new_list_multi(
+                        &table_provider,
+                        &args.tbl,
+                        embed_udf,
+                        model_name,
+                        pks_vec,
+                        &col,
+                        aggregation,
+                    )
+                    .search(args.query)?
+                }
+            } else {
+                if args.queries.len() > 1 {
+                    return Err(DataFusionError::Plan(format!(
+                        "Multi-query `vector_search(tbl, [q1, q2, ...], col)` requires a multi-vector (list-typed) column; column '{col}' is scalar."
+                    )));
+                }
+                ChunkedNonIndexVectorGeneration::new(
+                    &table_provider,
+                    &args.tbl,
+                    embed_udf,
+                    model_name,
+                    pks_vec,
+                    &col,
+                )
+                .search(args.query)?
+            };
             return alias_value_to_match(Arc::clone(&table));
         }
 
@@ -742,6 +852,64 @@ impl TableProvider for VectorSearchUDTFProvider {
             .build()?;
 
         state.create_physical_plan(&final_plan).await
+    }
+}
+
+#[cfg(test)]
+mod parser_tests {
+    use super::VectorSearchTableFunc;
+    use datafusion::prelude::Expr;
+    use datafusion::scalar::ScalarValue;
+    use datafusion_expr::expr::ScalarFunction;
+    use std::sync::Arc;
+
+    fn lit_utf8(s: &str) -> Expr {
+        Expr::Literal(ScalarValue::Utf8(Some(s.to_string())), None)
+    }
+
+    #[test]
+    fn test_parse_query_arg_single_string() {
+        let q = lit_utf8("hello");
+        let out = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect("ok");
+        assert_eq!(out, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_query_arg_make_array() {
+        use datafusion::functions_nested::make_array::make_array_udf;
+        let make_array = make_array_udf();
+        let q = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::clone(&make_array),
+            vec![lit_utf8("red"), lit_utf8("round")],
+        ));
+        let out = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect("ok");
+        assert_eq!(out, vec!["red".to_string(), "round".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_query_arg_make_array_non_string_element_rejected() {
+        use datafusion::functions_nested::make_array::make_array_udf;
+        let make_array = make_array_udf();
+        let q = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::clone(&make_array),
+            vec![
+                lit_utf8("red"),
+                Expr::Literal(ScalarValue::Int32(Some(42)), None),
+            ],
+        ));
+        let err =
+            VectorSearchTableFunc::parse_query_arg(Some(&q)).expect_err("expected rejection");
+        assert!(err.to_string().contains("must be string literals"));
+    }
+
+    #[test]
+    fn test_parse_query_arg_empty_make_array_rejected() {
+        use datafusion::functions_nested::make_array::make_array_udf;
+        let make_array = make_array_udf();
+        let q = Expr::ScalarFunction(ScalarFunction::new_udf(Arc::clone(&make_array), vec![]));
+        let err = VectorSearchTableFunc::parse_query_arg(Some(&q))
+            .expect_err("expected rejection");
+        assert!(err.to_string().contains("at least one query string"));
     }
 }
 
