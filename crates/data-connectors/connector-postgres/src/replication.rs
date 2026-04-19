@@ -103,19 +103,6 @@ pub fn build_changes_stream(
             )
         })
     });
-    let missing_upsert_error = (engine_supports_upsert && !has_upsert_on_pk).then(|| {
-        let pk_hint = declared_pks
-            .first()
-            .map_or_else(|| "<pk>".to_string(), Clone::clone);
-        format!(
-            "postgres replication for dataset `{dataset_name}`: `refresh_mode: changes` \
-             requires an `acceleration.on_conflict` entry keyed on the dataset's \
-             `primary_key` with an `upsert` (or `upsert_dedup*`) behavior so UPDATE \
-             events apply as upserts instead of duplicate inserts. Add: \
-             `on_conflict: {{ {pk_hint}: upsert }}` on the `{engine}` engine. \
-             (The `arrow` engine is exempt — documented append-only semantics.)"
-        )
-    });
 
     Box::pin(try_stream! {
         let table_provider = federated_table.table_provider().await;
@@ -124,7 +111,7 @@ pub fn build_changes_stream(
         let primary_keys = if declared_pks.is_empty() {
             extract_primary_keys(&table_provider)
         } else {
-            declared_pks
+            declared_pks.clone()
         };
 
         // refresh_mode: changes is useless without a PK — DELETE and UPDATE
@@ -139,7 +126,38 @@ pub fn build_changes_stream(
             )))?;
         }
 
-        if let Some(msg) = missing_upsert_error {
+        // Now that primary_keys is resolved, report the upsert-config error
+        // with a concrete PK hint. Two cases produce this error:
+        //   1. `acceleration.primary_key` is set but `on_conflict` is missing
+        //      the Upsert entry keyed on the PK.
+        //   2. `acceleration.primary_key` is unset (we're relying on the
+        //      source table's PK), in which case the user must also set
+        //      `acceleration.primary_key` — `on_conflict` can only be keyed
+        //      on a ColumnReference, and acceleration's write path consults
+        //      only its own `primary_key` / `on_conflict` config.
+        if engine_supports_upsert && !has_upsert_on_pk {
+            let pk_hint = primary_keys.first().cloned().unwrap_or_else(|| "<pk>".to_string());
+            let msg = if declared_pks.is_empty() {
+                format!(
+                    "postgres replication for dataset `{dataset_name}`: the source table's \
+                     primary key (`{pk_hint}`) is not declared on the dataset. \
+                     `refresh_mode: changes` requires BOTH `acceleration.primary_key: {pk_hint}` \
+                     AND `acceleration.on_conflict: {{ {pk_hint}: upsert }}` so UPDATE events \
+                     apply as upserts on the `{engine}` engine — without the declaration, \
+                     the accelerator's write path falls through to append and produces \
+                     duplicate rows. (The `arrow` engine is exempt — documented append-only \
+                     semantics.)"
+                )
+            } else {
+                format!(
+                    "postgres replication for dataset `{dataset_name}`: `refresh_mode: changes` \
+                     requires an `acceleration.on_conflict` entry keyed on the dataset's \
+                     `primary_key` with an `upsert` (or `upsert_dedup*`) behavior so UPDATE \
+                     events apply as upserts instead of duplicate inserts. Add: \
+                     `on_conflict: {{ {pk_hint}: upsert }}` on the `{engine}` engine. \
+                     (The `arrow` engine is exempt — documented append-only semantics.)"
+                )
+            };
             Err(StreamError::External(msg))?;
         }
 
