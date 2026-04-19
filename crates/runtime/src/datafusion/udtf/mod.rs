@@ -14,8 +14,5 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#[cfg(feature = "flatten-json-properties")]
 pub mod json_properties;
-
-#[cfg(feature = "json-tree")]
 pub mod json_tree;

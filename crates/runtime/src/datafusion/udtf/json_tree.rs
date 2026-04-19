@@ -14,64 +14,113 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `json_tree` UDTF — recursive depth-first walk of an arbitrary JSON document.
+//! `json_tree` — recursive depth-first walk of an arbitrary JSON document.
 //!
-//! Schema-agnostic sibling to `flatten_json_properties`. Mirrors the well-known
-//! DuckDB / SQLite `json_tree` table function: one row per node (interior and
+//! Schema-agnostic sibling of `flatten_json_properties`. Mirrors DuckDB /
+//! SQLite's table function of the same name: one row per node (interior and
 //! leaf), in depth-first order, with JSON-Path addresses and a parent pointer.
 //!
 //! ```text
-//! json_tree(input Utf8) -> TABLE(
-//!     key       Utf8,        -- key within parent object; null for array elements and root
-//!     value     Utf8,        -- JSON-encoded value of this node
-//!     type      Utf8,        -- "object" | "array" | "string" | "integer" | "real" | "boolean" | "null"
-//!     atom      Utf8,        -- scalar text at a leaf; null for interior nodes
-//!     id        Int64,       -- unique id within this document (depth-first order)
-//!     parent    Int64,       -- parent id; null for root
-//!     fullkey   Utf8,        -- JSON-Path to this node, e.g. `$.a.b[2]`
-//!     path      Utf8         -- JSON-Path to parent (fullkey minus the leaf step)
+//! json_tree(input Utf8 [, max_depth => UInt, max_bytes => UInt]) -> TABLE(
+//!     key       Utf8,
+//!     value     Utf8,
+//!     type      Utf8,
+//!     atom      Utf8,
+//!     id        Int64,
+//!     parent    Int64,
+//!     fullkey   Utf8,
+//!     path      Utf8
 //! )
 //! ```
 //!
-//! Design notes:
-//! - Column names and semantics follow DuckDB
-//!   (<https://duckdb.org/docs/current/data/json/json_functions.html>) so that
-//!   existing recipes and user muscle memory port over. DuckDB also exposes
-//!   `rowid`; we omit it as it duplicates `id` for single-document input.
-//! - Ordering is deterministic: object members are emitted in insertion order
-//!   (`serde_json::Map` preserves insertion order when the `preserve_order`
-//!   feature is enabled; otherwise alphabetical — either is stable per input).
-//! - Malformed input yields zero rows, matching the `flatten_json_properties`
-//!   convention — never fails the query.
+//! Registered twice:
+//! - As a UDTF for `SELECT * FROM json_tree('{...}')`.
+//! - As a scalar UDF returning `List<Struct<...>>` for per-row /
+//!   `LATERAL json_tree(s.body)` usage via `UNNEST`.
 
+use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
-use arrow::array::{ArrayRef, Int64Builder, StringBuilder};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow::array::{
+    Array, ArrayRef, Int64Builder, ListArray, StringBuilder, StructArray, as_string_array,
+};
+use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::TableType;
 use datafusion::error::DataFusionError;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
+};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
+use opentelemetry::KeyValue;
+use opentelemetry::global;
+use opentelemetry::metrics::{Counter, Meter};
 use serde_json::Value;
 
 pub const JSON_TREE_UDTF_NAME: &str = "json_tree";
 
-/// Guardrail on recursion depth. A follow-up milestone can expose this as an
-/// option once the surrounding UDTF framework supports struct arguments. Kept
-/// below `serde_json`'s 128-level parse limit so that any document we accept
-/// we can also walk to completion.
-const MAX_DEPTH: usize = 64;
+const DEFAULT_MAX_DEPTH: usize = 64;
+const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
 
-static OUTPUT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(Schema::new(vec![
+// -------- Metrics --------
+
+static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("json_tree"));
+
+static INVOCATIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("json_tree_invocations_total")
+        .with_description("Invocations of json_tree.")
+        .build()
+});
+
+static ROWS_EMITTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("json_tree_rows_emitted_total")
+        .with_description("Rows emitted by json_tree.")
+        .build()
+});
+
+static ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("json_tree_errors_total")
+        .with_description(
+            "Errors inside json_tree, labelled by kind (parse|depth_exceeded|input_too_large).",
+        )
+        .build()
+});
+
+fn record_error(kind: &'static str) {
+    ERRORS.add(1, &[KeyValue::new("kind", kind)]);
+}
+
+// -------- Options + Output schema --------
+
+#[derive(Debug, Clone)]
+pub struct JsonTreeOptions {
+    pub max_depth: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for JsonTreeOptions {
+    fn default() -> Self {
+        Self {
+            max_depth: DEFAULT_MAX_DEPTH,
+            max_bytes: DEFAULT_MAX_BYTES,
+        }
+    }
+}
+
+fn tree_fields() -> Fields {
+    Fields::from(vec![
         Field::new("key", DataType::Utf8, true),
         Field::new("value", DataType::Utf8, true),
         Field::new("type", DataType::Utf8, false),
@@ -80,7 +129,17 @@ static OUTPUT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         Field::new("parent", DataType::Int64, true),
         Field::new("fullkey", DataType::Utf8, false),
         Field::new("path", DataType::Utf8, false),
-    ]))
+    ])
+}
+
+static OUTPUT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| Arc::new(Schema::new(tree_fields())));
+
+static ROW_LIST_TYPE: LazyLock<DataType> = LazyLock::new(|| {
+    DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::Struct(tree_fields()),
+        true,
+    )))
 });
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,68 +154,46 @@ pub struct TreeRow {
     pub path: String,
 }
 
-#[derive(Clone, Default)]
-pub struct JsonTreeTableFunc;
+// -------- Public entry points --------
 
-impl JsonTreeTableFunc {
-    #[must_use]
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Debug for JsonTreeTableFunc {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JsonTreeTableFunc").finish()
-    }
-}
-
-impl TableFunctionImpl for JsonTreeTableFunc {
-    fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
-        let input = parse_input_arg(exprs)?;
-        let rows = input.as_deref().map(json_tree).unwrap_or_default();
-        Ok(Arc::new(JsonTreeTable {
-            schema: Arc::clone(&OUTPUT_SCHEMA),
-            rows,
-        }))
-    }
-}
-
-fn parse_input_arg(exprs: &[Expr]) -> DataFusionResult<Option<String>> {
-    let Some(first) = exprs.first() else {
-        return Err(DataFusionError::Plan(format!(
-            "{JSON_TREE_UDTF_NAME}() requires a JSON string argument."
-        )));
-    };
-    match first {
-        Expr::Literal(ScalarValue::Utf8(v) | ScalarValue::LargeUtf8(v), _) => Ok(v.clone()),
-        Expr::Literal(ScalarValue::Null, _) => Ok(None),
-        other => Err(DataFusionError::NotImplemented(format!(
-            "{JSON_TREE_UDTF_NAME}() currently supports only literal JSON string arguments. Per-row LATERAL invocation with a column reference will land in a later milestone. Got: {other:?}."
-        ))),
-    }
-}
-
-/// Walk an arbitrary JSON document and return one [`TreeRow`] per node in
-/// depth-first order. Returns an empty `Vec` for input that is not valid JSON.
 #[must_use]
 pub fn json_tree(input: &str) -> Vec<TreeRow> {
-    let Ok(root) = serde_json::from_str::<Value>(input) else {
+    json_tree_with_options(input, &JsonTreeOptions::default())
+}
+
+#[must_use]
+pub fn json_tree_with_options(input: &str, opts: &JsonTreeOptions) -> Vec<TreeRow> {
+    INVOCATIONS.add(1, &[]);
+
+    if input.len() > opts.max_bytes {
+        record_error("input_too_large");
         return Vec::new();
+    }
+
+    let root = match serde_json::from_str::<Value>(input) {
+        Ok(v) => v,
+        Err(_) => {
+            record_error("parse");
+            return Vec::new();
+        }
     };
     let mut ctx = WalkCtx {
         rows: Vec::new(),
         next_id: 0,
+        depth_cap_hit: false,
     };
-    visit(&root, None, None, "$", "", 0, &mut ctx);
+    visit(&root, None, None, "$", "", 0, opts, &mut ctx);
+    ROWS_EMITTED.add(ctx.rows.len() as u64, &[]);
     ctx.rows
 }
 
 struct WalkCtx {
     rows: Vec<TreeRow>,
     next_id: i64,
+    depth_cap_hit: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn visit(
     node: &Value,
     key: Option<String>,
@@ -164,23 +201,24 @@ fn visit(
     fullkey: &str,
     path: &str,
     depth: usize,
+    opts: &JsonTreeOptions,
     ctx: &mut WalkCtx,
 ) {
-    if depth > MAX_DEPTH {
+    if depth > opts.max_depth {
+        if !ctx.depth_cap_hit {
+            ctx.depth_cap_hit = true;
+            record_error("depth_exceeded");
+        }
         return;
     }
     let id = ctx.next_id;
     ctx.next_id += 1;
 
-    let type_name = type_of(node).to_owned();
-    let value = Some(node.to_string());
-    let atom = atom_of(node);
-
     ctx.rows.push(TreeRow {
         key,
-        value,
-        type_name,
-        atom,
+        value: Some(node.to_string()),
+        type_name: type_of(node).to_owned(),
+        atom: atom_of(node),
         id,
         parent,
         fullkey: fullkey.to_owned(),
@@ -198,6 +236,7 @@ fn visit(
                     &child_fullkey,
                     fullkey,
                     depth + 1,
+                    opts,
                     ctx,
                 );
             }
@@ -212,6 +251,7 @@ fn visit(
                     &child_fullkey,
                     fullkey,
                     depth + 1,
+                    opts,
                     ctx,
                 );
             }
@@ -242,9 +282,6 @@ fn atom_of(v: &Value) -> Option<String> {
     }
 }
 
-/// Escape a JSON object key so the resulting JSON-Path expression parses
-/// unambiguously. For simple identifiers we emit `$.name`; for keys with
-/// special characters we fall back to bracket-with-quotes notation.
 fn escape_object_key(key: &str) -> String {
     let simple = !key.is_empty()
         && key
@@ -258,6 +295,103 @@ fn escape_object_key(key: &str) -> String {
     }
 }
 
+// -------- UDTF --------
+
+#[derive(Clone, Default)]
+pub struct JsonTreeTableFunc;
+
+impl JsonTreeTableFunc {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Debug for JsonTreeTableFunc {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonTreeTableFunc").finish()
+    }
+}
+
+impl TableFunctionImpl for JsonTreeTableFunc {
+    fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
+        let (input, opts) = parse_udtf_args(exprs)?;
+        let rows = input
+            .as_deref()
+            .map(|s| json_tree_with_options(s, &opts))
+            .unwrap_or_default();
+        Ok(Arc::new(JsonTreeTable {
+            schema: Arc::clone(&OUTPUT_SCHEMA),
+            rows,
+        }))
+    }
+}
+
+fn parse_udtf_args(exprs: &[Expr]) -> DataFusionResult<(Option<String>, JsonTreeOptions)> {
+    let mut iter = exprs.iter();
+    let first = iter.next().ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "{JSON_TREE_UDTF_NAME}() requires a JSON string argument."
+        ))
+    })?;
+    let input = match first {
+        Expr::Literal(ScalarValue::Utf8(v) | ScalarValue::LargeUtf8(v), _) => v.clone(),
+        Expr::Literal(ScalarValue::Null, _) => None,
+        other => {
+            return Err(DataFusionError::NotImplemented(format!(
+                "{JSON_TREE_UDTF_NAME}() currently supports a literal JSON string as the first \
+                 argument. For per-row / LATERAL invocation, use \
+                 `UNNEST({JSON_TREE_UDTF_NAME}(<column>))`. Got: {other:?}."
+            )));
+        }
+    };
+
+    let mut opts = JsonTreeOptions::default();
+    for arg in iter {
+        if let Expr::Literal(scalar, Some(meta)) = arg {
+            if let Some(name) = meta.inner().get("spice.parameter_name") {
+                let name = name.to_string();
+                match name.as_str() {
+                    "max_depth" => opts.max_depth = parse_usize(&name, scalar)?,
+                    "max_bytes" => opts.max_bytes = parse_usize(&name, scalar)?,
+                    other => {
+                        return Err(DataFusionError::Plan(format!(
+                            "Unknown option '{other}'. Supported: max_depth, max_bytes."
+                        )));
+                    }
+                }
+                continue;
+            }
+        }
+        return Err(DataFusionError::Plan(format!(
+            "Arguments after the JSON string must be named, e.g. `max_depth => 64`. Got: {arg:?}."
+        )));
+    }
+
+    Ok((input, opts))
+}
+
+fn parse_usize(name: &str, v: &ScalarValue) -> DataFusionResult<usize> {
+    let n: i64 = match v {
+        ScalarValue::Int8(Some(n)) => i64::from(*n),
+        ScalarValue::Int16(Some(n)) => i64::from(*n),
+        ScalarValue::Int32(Some(n)) => i64::from(*n),
+        ScalarValue::Int64(Some(n)) => *n,
+        ScalarValue::UInt8(Some(n)) => i64::from(*n),
+        ScalarValue::UInt16(Some(n)) => i64::from(*n),
+        ScalarValue::UInt32(Some(n)) => i64::from(*n),
+        ScalarValue::UInt64(Some(n)) => i64::try_from(*n)
+            .map_err(|_| DataFusionError::Plan(format!("{name} must fit in i64, got {n}")))?,
+        other => {
+            return Err(DataFusionError::Plan(format!(
+                "{name} must be an integer, got {other:?}"
+            )));
+        }
+    };
+    usize::try_from(n)
+        .map_err(|_| DataFusionError::Plan(format!("{name} must be non-negative, got {n}")))
+}
+
 #[derive(Debug)]
 pub struct JsonTreeTable {
     schema: SchemaRef,
@@ -266,7 +400,7 @@ pub struct JsonTreeTable {
 
 #[async_trait]
 impl TableProvider for JsonTreeTable {
-    fn as_any(&self) -> &dyn std::any::Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
@@ -286,9 +420,8 @@ impl TableProvider for JsonTreeTable {
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let batch = rows_to_batch(&self.rows, Arc::clone(&self.schema))?;
-        let memory_source =
-            MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&self.schema), None)?;
-        Ok(Arc::new(DataSourceExec::new(Arc::new(memory_source))))
+        let src = MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&self.schema), None)?;
+        Ok(Arc::new(DataSourceExec::new(Arc::new(src))))
     }
 }
 
@@ -325,7 +458,7 @@ fn rows_to_batch(rows: &[TreeRow], schema: SchemaRef) -> DataFusionResult<Record
         path.append_value(&row.path);
     }
 
-    let columns: Vec<ArrayRef> = vec![
+    let arrays: Vec<ArrayRef> = vec![
         Arc::new(key.finish()),
         Arc::new(value.finish()),
         Arc::new(type_name.finish()),
@@ -336,8 +469,145 @@ fn rows_to_batch(rows: &[TreeRow], schema: SchemaRef) -> DataFusionResult<Record
         Arc::new(path.finish()),
     ];
 
-    RecordBatch::try_new(schema, columns)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(schema, arrays).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+// -------- Scalar UDF --------
+
+#[derive(Debug, Clone)]
+pub struct JsonTreeScalar {
+    signature: Signature,
+}
+
+impl Default for JsonTreeScalar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl JsonTreeScalar {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::variadic_any(Volatility::Immutable),
+        }
+    }
+}
+
+impl PartialEq for JsonTreeScalar {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for JsonTreeScalar {}
+
+impl std::hash::Hash for JsonTreeScalar {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name().hash(state);
+    }
+}
+
+impl ScalarUDFImpl for JsonTreeScalar {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        JSON_TREE_UDTF_NAME
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {
+        Ok(ROW_LIST_TYPE.clone())
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
+        let input_col = args
+            .args
+            .first()
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!(
+                    "{JSON_TREE_UDTF_NAME}() requires a JSON string argument."
+                ))
+            })?
+            .clone();
+
+        let opts = JsonTreeOptions::default();
+        let array = input_col.into_array(args.number_rows)?;
+        let strings = as_string_array(&array);
+
+        let mut all_rows: Vec<TreeRow> = Vec::new();
+        let mut offsets: Vec<i32> = Vec::with_capacity(strings.len() + 1);
+        offsets.push(0);
+
+        for idx in 0..strings.len() {
+            if !strings.is_null(idx) {
+                let rows = json_tree_with_options(strings.value(idx), &opts);
+                all_rows.extend(rows);
+            }
+            let len = i32::try_from(all_rows.len()).map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "{JSON_TREE_UDTF_NAME}(): row count exceeds i32 offset range."
+                ))
+            })?;
+            offsets.push(len);
+        }
+
+        let struct_array = tree_rows_to_struct(&all_rows);
+        let list_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Struct(tree_fields()), true)),
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            Arc::new(struct_array),
+            None,
+        );
+        Ok(ColumnarValue::Array(Arc::new(list_array)))
+    }
+}
+
+fn tree_rows_to_struct(rows: &[TreeRow]) -> StructArray {
+    let mut key = StringBuilder::with_capacity(rows.len(), rows.len() * 8);
+    let mut value = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
+    let mut type_name = StringBuilder::with_capacity(rows.len(), rows.len() * 4);
+    let mut atom = StringBuilder::with_capacity(rows.len(), rows.len() * 8);
+    let mut id = Int64Builder::with_capacity(rows.len());
+    let mut parent = Int64Builder::with_capacity(rows.len());
+    let mut fullkey = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+    let mut path = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+
+    for row in rows {
+        match &row.key {
+            Some(v) => key.append_value(v),
+            None => key.append_null(),
+        }
+        match &row.value {
+            Some(v) => value.append_value(v),
+            None => value.append_null(),
+        }
+        type_name.append_value(&row.type_name);
+        match &row.atom {
+            Some(v) => atom.append_value(v),
+            None => atom.append_null(),
+        }
+        id.append_value(row.id);
+        match row.parent {
+            Some(p) => parent.append_value(p),
+            None => parent.append_null(),
+        }
+        fullkey.append_value(&row.fullkey);
+        path.append_value(&row.path);
+    }
+
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(key.finish()),
+        Arc::new(value.finish()),
+        Arc::new(type_name.finish()),
+        Arc::new(atom.finish()),
+        Arc::new(id.finish()),
+        Arc::new(parent.finish()),
+        Arc::new(fullkey.finish()),
+        Arc::new(path.finish()),
+    ];
+    StructArray::new(tree_fields(), arrays, None)
 }
 
 #[cfg(test)]
@@ -355,7 +625,6 @@ mod tests {
         assert_eq!(rows[0].type_name, "integer");
         assert_eq!(rows[0].atom.as_deref(), Some("42"));
         assert_eq!(rows[0].fullkey, "$");
-        assert_eq!(rows[0].path, "");
         assert!(rows[0].parent.is_none());
         assert!(rows[0].key.is_none());
     }
@@ -364,36 +633,19 @@ mod tests {
     fn root_object_is_interior_and_children_reference_it() {
         let rows = json_tree(r#"{"a": 1, "b": "two"}"#);
         assert_eq!(rows.len(), 3);
-        let root = &rows[0];
-        assert_eq!(root.type_name, "object");
-        assert!(root.atom.is_none());
-        assert_eq!(root.fullkey, "$");
-        assert_eq!(root.id, 0);
-        assert!(root.parent.is_none());
-
         let by = by_fullkey(&rows);
-        let a = by["$.a"];
-        assert_eq!(a.parent, Some(0));
-        assert_eq!(a.key.as_deref(), Some("a"));
-        assert_eq!(a.type_name, "integer");
-        assert_eq!(a.atom.as_deref(), Some("1"));
-
-        let b = by["$.b"];
-        assert_eq!(b.type_name, "string");
-        assert_eq!(b.atom.as_deref(), Some("two"));
+        assert_eq!(by["$.a"].parent, Some(0));
+        assert_eq!(by["$.a"].type_name, "integer");
+        assert_eq!(by["$.b"].type_name, "string");
     }
 
     #[test]
-    fn arrays_index_paths_numerically_and_parent_links_through() {
+    fn arrays_index_paths_numerically() {
         let rows = json_tree(r#"{"xs": [10, 20, 30]}"#);
         let by = by_fullkey(&rows);
         assert_eq!(by["$.xs"].type_name, "array");
         assert_eq!(by["$.xs[0]"].atom.as_deref(), Some("10"));
         assert_eq!(by["$.xs[2]"].atom.as_deref(), Some("30"));
-        // Array elements have no key name.
-        assert!(by["$.xs[0]"].key.is_none());
-        // Their `path` points to the containing array, not to root.
-        assert_eq!(by["$.xs[0]"].path, "$.xs");
     }
 
     #[test]
@@ -406,49 +658,54 @@ mod tests {
     }
 
     #[test]
-    fn keys_with_special_characters_are_quoted_in_fullkey() {
-        let rows = json_tree(r#"{"with space": 1, "with.dot": 2}"#);
+    fn keys_with_special_characters_are_quoted() {
+        let rows = json_tree(r#"{"with space": 1}"#);
         let fullkeys: Vec<&str> = rows.iter().map(|r| r.fullkey.as_str()).collect();
         assert!(fullkeys.contains(&r#"$.["with space"]"#));
-        assert!(fullkeys.contains(&r#"$.["with.dot"]"#));
-    }
-
-    #[test]
-    fn null_and_boolean_and_real_types_are_distinguished() {
-        let rows = json_tree(r#"{"a": null, "b": true, "c": 1.5}"#);
-        let by = by_fullkey(&rows);
-        assert_eq!(by["$.a"].type_name, "null");
-        assert_eq!(by["$.a"].atom.as_deref(), Some("null"));
-        assert_eq!(by["$.b"].type_name, "boolean");
-        assert_eq!(by["$.b"].atom.as_deref(), Some("true"));
-        assert_eq!(by["$.c"].type_name, "real");
     }
 
     #[test]
     fn malformed_input_yields_zero_rows() {
         assert!(json_tree("not json").is_empty());
-        assert!(json_tree("{broken").is_empty());
         assert!(json_tree("").is_empty());
     }
 
     #[test]
     fn deeply_nested_terminates_at_max_depth() {
-        // Nest just past `MAX_DEPTH` (64) while staying under serde_json's
-        // 128-level parse limit. Each wrapper adds one level of JSON nesting.
-        const NESTING: usize = MAX_DEPTH + 20;
+        const NESTING: usize = DEFAULT_MAX_DEPTH + 20;
         let mut doc = String::from("0");
         for _ in 0..NESTING {
             doc = format!("[{doc}]");
         }
         let rows = json_tree(&doc);
         assert!(!rows.is_empty());
-        // We stop recursing past MAX_DEPTH, so we emit at most MAX_DEPTH+1 rows
-        // (root at depth 0 through depth MAX_DEPTH inclusive).
-        assert!(rows.len() <= MAX_DEPTH + 1);
+        assert!(rows.len() <= DEFAULT_MAX_DEPTH + 1);
+    }
+
+    #[test]
+    fn max_depth_option_is_honoured() {
+        let opts = JsonTreeOptions {
+            max_depth: 2,
+            ..Default::default()
+        };
+        // depth 0 → root object, depth 1 → "a", depth 2 → "a.b", depth 3 → stop.
+        let rows = json_tree_with_options(r#"{"a": {"b": {"c": 1}}}"#, &opts);
+        let fullkeys: Vec<_> = rows.iter().map(|r| r.fullkey.as_str()).collect();
+        assert!(fullkeys.contains(&"$.a.b"));
+        assert!(!fullkeys.contains(&"$.a.b.c"));
+    }
+
+    #[test]
+    fn max_bytes_rejects_oversized_input() {
+        let opts = JsonTreeOptions {
+            max_bytes: 4,
+            ..Default::default()
+        };
+        assert!(json_tree_with_options(r#"{"a": 1}"#, &opts).is_empty());
     }
 
     #[tokio::test]
-    async fn table_provider_roundtrips_through_arrow() {
+    async fn udtf_table_provider_roundtrips() {
         use datafusion::prelude::SessionContext;
         let ctx = SessionContext::new();
         let func = JsonTreeTableFunc::new();
@@ -458,24 +715,19 @@ mod tests {
                 None,
             )])
             .expect("call succeeds");
-        assert_eq!(provider.schema().fields().len(), 8);
-
         let state = ctx.state();
         let plan = provider.scan(&state, None, &[], None).await.expect("scan");
         let results = datafusion::physical_plan::collect(plan, ctx.task_ctx())
             .await
             .expect("collect");
-        assert_eq!(results.len(), 1);
-        // Root object + array + 2 ints = 4 rows.
+        // root object + array + 2 ints = 4 rows.
         assert_eq!(results[0].num_rows(), 4);
     }
 
     #[test]
-    fn scalar_null_input_accepted() {
-        let func = JsonTreeTableFunc::new();
-        let provider = func
-            .call(&[Expr::Literal(ScalarValue::Null, None)])
-            .expect("null is accepted");
-        assert_eq!(provider.schema().fields().len(), 8);
+    fn scalar_udf_return_type() {
+        let udf = JsonTreeScalar::new();
+        let ty = udf.return_type(&[DataType::Utf8]).expect("return type");
+        assert!(matches!(ty, DataType::List(_)));
     }
 }

@@ -296,9 +296,7 @@ dynamodb = [
     "dep:humantime",
 ]
 extended_tests = []
-flatten-json-properties = []
 flightsql = ["data_components/flightsql"]
-json-tree = []
 ftp = ["runtime-object-store/ftp"]
 iceberg-write = []
 imap = ["data_components/imap"]
@@ -375,3 +373,7 @@ vortex-datafusion.workspace = true
 [[bench]]
 harness = false
 name = "prepared_statement"
+
+[[bench]]
+harness = false
+name = "flatten_json_properties"

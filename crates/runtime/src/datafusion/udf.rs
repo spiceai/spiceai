@@ -17,12 +17,10 @@ limitations under the License.
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
-#[cfg(feature = "flatten-json-properties")]
 use crate::datafusion::udtf::json_properties::{
-    FLATTEN_JSON_PROPERTIES_UDTF_NAME, FlattenJsonPropertiesTableFunc,
+    FLATTEN_JSON_PROPERTIES_UDTF_NAME, FlattenJsonPropertiesScalar, FlattenJsonPropertiesTableFunc,
 };
-#[cfg(feature = "json-tree")]
-use crate::datafusion::udtf::json_tree::{JSON_TREE_UDTF_NAME, JsonTreeTableFunc};
+use crate::datafusion::udtf::json_tree::{JSON_TREE_UDTF_NAME, JsonTreeScalar, JsonTreeTableFunc};
 use crate::embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc};
 use crate::search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc};
 use crate::search::rrf;
@@ -86,14 +84,16 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         Arc::new(rrf::ReciprocalRankFusion::from_ctx(ctx)),
     );
 
-    #[cfg(feature = "flatten-json-properties")]
+    // `flatten_json_properties` / `json_tree` — JSON-Schema and generic JSON
+    // shredders. Registered as both UDTF (FROM-clause, literal input) and
+    // ScalarUDF returning `List<Struct<...>>` (per-row / LATERAL via UNNEST).
     ctx.register_udtf(
         FLATTEN_JSON_PROPERTIES_UDTF_NAME,
         Arc::new(FlattenJsonPropertiesTableFunc::new()),
     );
-
-    #[cfg(feature = "json-tree")]
+    ctx.register_udf(FlattenJsonPropertiesScalar::new().into());
     ctx.register_udtf(JSON_TREE_UDTF_NAME, Arc::new(JsonTreeTableFunc::new()));
+    ctx.register_udf(JsonTreeScalar::new().into());
 
     #[cfg(feature = "models")]
     {
