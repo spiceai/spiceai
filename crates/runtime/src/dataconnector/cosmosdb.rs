@@ -71,8 +71,7 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("An Azure Cosmos DB connection string (AccountEndpoint=...;AccountKey=...). Takes precedence over account_endpoint/account_key if set.")
         .secret(),
     ParameterSpec::component("database")
-        .description("The Cosmos DB database name. Defaults to the first segment of the dataset `from:` path ('database.container').")
-        .required(),
+        .description("The Cosmos DB database name. Defaults to the first segment of the dataset `from:` path ('database.container')."),
     ParameterSpec::runtime("query")
         .description("Cosmos SQL query used to scan the container. Defaults to 'SELECT * FROM c'.")
         .default(DEFAULT_QUERY),
@@ -127,10 +126,51 @@ impl CosmosDB {
             _ => Err(DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: CONNECTOR_NAME.to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                message: "Azure Cosmos DB requires either 'connection_string' or both 'account_endpoint' and 'account_key'.".to_string(),
+                message: "Azure Cosmos DB requires either 'cosmosdb_connection_string' or both 'cosmosdb_account_endpoint' and 'cosmosdb_account_key'.".to_string(),
             }),
         }
     }
+}
+
+/// Pure parsing helper for [`resolve_database_and_container`]. Split out so
+/// it can be exercised in unit tests without constructing a full [`Dataset`].
+fn parse_database_and_container(
+    path: &str,
+    database_param: Option<&str>,
+) -> Result<(String, String), String> {
+    // Accept either `database.container` or `database/container`, or just the
+    // container when `database` is explicitly set.
+    let (db_from_path, container) = if let Some((db, container)) = path.split_once('.') {
+        (Some(db.to_string()), container.to_string())
+    } else if let Some((db, container)) = path.split_once('/') {
+        (Some(db.to_string()), container.to_string())
+    } else {
+        (None, path.to_string())
+    };
+
+    let database = match (database_param, db_from_path) {
+        (Some(d), _) => d.to_string(),
+        (None, Some(d)) => d,
+        (None, None) => {
+            return Err(format!(
+                "Could not determine Cosmos DB database from dataset path '{path}'. Expected 'database.container' or set the 'database' parameter."
+            ));
+        }
+    };
+
+    if database.is_empty() {
+        return Err(format!(
+            "Could not determine Cosmos DB database from dataset path '{path}'. Expected 'database.container' or set the 'database' parameter."
+        ));
+    }
+
+    if container.is_empty() {
+        return Err(format!(
+            "Could not determine Cosmos DB container from dataset path '{path}'."
+        ));
+    }
+
+    Ok((database, container))
 }
 
 /// Parse `database.container` / `database/container` from the dataset path.
@@ -140,44 +180,13 @@ fn resolve_database_and_container(
     dataset: &Dataset,
     database_param: Option<&str>,
 ) -> Result<(String, String), DataConnectorError> {
-    let path = dataset.path();
-    let path_str: &str = &path;
-
-    // Accept either `database.container` or `database/container`, or just the
-    // container when `database` is explicitly set.
-    let (db_from_path, container) = if let Some((db, container)) = path_str.split_once('.') {
-        (Some(db.to_string()), container.to_string())
-    } else if let Some((db, container)) = path_str.split_once('/') {
-        (Some(db.to_string()), container.to_string())
-    } else {
-        (None, path_str.to_string())
-    };
-
-    let database = match (database_param, db_from_path) {
-        (Some(d), _) => d.to_string(),
-        (None, Some(d)) => d,
-        (None, None) => {
-            return Err(DataConnectorError::InvalidConfigurationNoSource {
-                dataconnector: CONNECTOR_NAME.to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                message: format!(
-                    "Could not determine Cosmos DB database from dataset path '{path_str}'. Expected 'database.container' or set the 'database' parameter."
-                ),
-            });
-        }
-    };
-
-    if container.is_empty() {
-        return Err(DataConnectorError::InvalidConfigurationNoSource {
+    parse_database_and_container(dataset.path(), database_param).map_err(|message| {
+        DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: CONNECTOR_NAME.to_string(),
             connector_component: ConnectorComponent::from(dataset),
-            message: format!(
-                "Could not determine Cosmos DB container from dataset path '{path_str}'."
-            ),
-        });
-    }
-
-    Ok((database, container))
+            message,
+        }
+    })
 }
 
 #[async_trait]
@@ -211,13 +220,34 @@ impl DataConnector for CosmosDB {
             .unwrap_or(DEFAULT_QUERY)
             .to_string();
 
-        let schema_infer_max_records = self
+        let schema_infer_max_records = match self
             .params
             .get("schema_infer_max_records")
             .expose()
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_SCHEMA_INFER_MAX_RECORDS);
+        {
+            Some(value) => match value.parse::<usize>() {
+                Ok(0) => {
+                    tracing::warn!(
+                        "Ignoring invalid schema_infer_max_records value '0' for dataset {}; using default value {}.",
+                        dataset.name,
+                        DEFAULT_SCHEMA_INFER_MAX_RECORDS
+                    );
+                    DEFAULT_SCHEMA_INFER_MAX_RECORDS
+                }
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::warn!(
+                        "Ignoring invalid schema_infer_max_records value '{}' for dataset {}; expected a positive integer, using default value {}.",
+                        value,
+                        dataset.name,
+                        DEFAULT_SCHEMA_INFER_MAX_RECORDS
+                    );
+                    DEFAULT_SCHEMA_INFER_MAX_RECORDS
+                }
+            },
+            None => DEFAULT_SCHEMA_INFER_MAX_RECORDS,
+        };
 
         let config = CosmosDBTableProviderConfig::new(database, container, query)
             .with_schema_infer_max_records(schema_infer_max_records);
@@ -235,3 +265,79 @@ impl DataConnector for CosmosDB {
 }
 
 register_data_connector!("cosmosdb", CosmosDBFactory);
+
+#[cfg(test)]
+mod tests {
+    use super::parse_database_and_container;
+
+    #[test]
+    fn parses_dot_delimited_path() {
+        let (db, container) = parse_database_and_container("mydb.mycontainer", None).unwrap();
+        assert_eq!(db, "mydb");
+        assert_eq!(container, "mycontainer");
+    }
+
+    #[test]
+    fn parses_slash_delimited_path() {
+        let (db, container) = parse_database_and_container("mydb/mycontainer", None).unwrap();
+        assert_eq!(db, "mydb");
+        assert_eq!(container, "mycontainer");
+    }
+
+    #[test]
+    fn uses_database_param_when_path_is_container_only() {
+        let (db, container) =
+            parse_database_and_container("mycontainer", Some("explicit_db")).unwrap();
+        assert_eq!(db, "explicit_db");
+        assert_eq!(container, "mycontainer");
+    }
+
+    #[test]
+    fn database_param_overrides_path_segment() {
+        let (db, container) =
+            parse_database_and_container("path_db.mycontainer", Some("override_db")).unwrap();
+        assert_eq!(db, "override_db");
+        assert_eq!(container, "mycontainer");
+    }
+
+    #[test]
+    fn errors_when_no_database_can_be_determined() {
+        let err = parse_database_and_container("just_container", None).unwrap_err();
+        assert!(err.contains("Could not determine Cosmos DB database"));
+    }
+
+    #[test]
+    fn errors_on_empty_container_segment() {
+        let err = parse_database_and_container("mydb.", None).unwrap_err();
+        assert!(err.contains("Could not determine Cosmos DB container"));
+
+        let err = parse_database_and_container("mydb/", None).unwrap_err();
+        assert!(err.contains("Could not determine Cosmos DB container"));
+    }
+
+    #[test]
+    fn errors_on_empty_database_segment() {
+        let err = parse_database_and_container(".mycontainer", None).unwrap_err();
+        assert!(err.contains("Could not determine Cosmos DB database"));
+
+        let err = parse_database_and_container("/mycontainer", None).unwrap_err();
+        assert!(err.contains("Could not determine Cosmos DB database"));
+    }
+
+    #[test]
+    fn dot_takes_precedence_over_slash() {
+        // Documents current behavior: the first `.` wins even when a `/` is
+        // also present. Cosmos DB names do not legally contain `.`, so this
+        // mainly matters for malformed input.
+        let (db, container) = parse_database_and_container("a/b.c", None).unwrap();
+        assert_eq!(db, "a/b");
+        assert_eq!(container, "c");
+    }
+
+    #[test]
+    fn multiple_dots_split_at_first() {
+        let (db, container) = parse_database_and_container("a.b.c", None).unwrap();
+        assert_eq!(db, "a");
+        assert_eq!(container, "b.c");
+    }
+}

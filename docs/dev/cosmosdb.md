@@ -19,9 +19,9 @@ datasets:
       # Optional: override database (otherwise taken from `from:` path)
       cosmosdb_database: mydb
       # Optional: custom Cosmos SQL query (defaults to `SELECT * FROM c`)
-      cosmosdb_query: SELECT * FROM c
+      query: SELECT * FROM c
       # Optional: sample size for schema inference (default 100)
-      cosmosdb_schema_infer_max_records: "100"
+      schema_infer_max_records: "100"
 ```
 
 The dataset path accepts `database.container`, `database/container`, or just

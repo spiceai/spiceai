@@ -55,13 +55,14 @@ pub fn strip_system_fields(value: Value) -> Value {
 /// Infer an Arrow schema from a slice of sampled Cosmos documents. Callers
 /// are expected to have already run the values through [`strip_system_fields`].
 ///
+/// Returns an empty [`Schema`] when `samples` is empty — callers should map
+/// that condition to a user-facing `EmptyContainer` error rather than letting
+/// it propagate as a successful inference.
+///
 /// # Errors
-/// Returns an error if the sample is empty or Arrow's JSON schema inference
-/// fails.
+/// Returns an error if Arrow's JSON schema inference fails.
 pub fn infer_schema(samples: &[Value]) -> Result<SchemaRef, Error> {
     if samples.is_empty() {
-        // Caller is expected to map this to a user-facing EmptyContainer
-        // error. Returning an Arrow error here keeps this helper simple.
         return Ok(Arc::new(Schema::empty()));
     }
 
@@ -73,4 +74,95 @@ pub fn infer_schema(samples: &[Value]) -> Result<SchemaRef, Error> {
     .context(SchemaInferenceSnafu)?;
 
     Ok(Arc::new(schema))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+    use serde_json::json;
+
+    #[test]
+    fn strip_system_fields_removes_all_known_system_fields() {
+        let doc = json!({
+            "_rid": "rid",
+            "_self": "self",
+            "_etag": "etag",
+            "_attachments": "attachments",
+            "_ts": 1234,
+            "id": "doc1",
+            "payload": "keep me",
+        });
+        let stripped = strip_system_fields(doc);
+        let obj = stripped.as_object().unwrap();
+        assert!(!obj.contains_key("_rid"));
+        assert!(!obj.contains_key("_self"));
+        assert!(!obj.contains_key("_etag"));
+        assert!(!obj.contains_key("_attachments"));
+        assert!(!obj.contains_key("_ts"));
+        assert_eq!(obj.get("id").and_then(Value::as_str), Some("doc1"));
+        assert_eq!(obj.get("payload").and_then(Value::as_str), Some("keep me"));
+    }
+
+    #[test]
+    fn strip_system_fields_ignores_non_object_values() {
+        assert_eq!(strip_system_fields(json!(null)), json!(null));
+        assert_eq!(strip_system_fields(json!("string")), json!("string"));
+        assert_eq!(strip_system_fields(json!(42)), json!(42));
+        assert_eq!(strip_system_fields(json!([1, 2, 3])), json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn strip_system_fields_does_not_strip_nested_occurrences() {
+        // System field stripping only applies at the top level — nested
+        // objects (user-controlled payloads) are preserved unchanged.
+        let doc = json!({
+            "_rid": "top_rid",
+            "nested": {"_rid": "nested_rid", "value": 1},
+        });
+        let stripped = strip_system_fields(doc);
+        let obj = stripped.as_object().unwrap();
+        assert!(!obj.contains_key("_rid"));
+        let nested = obj.get("nested").and_then(Value::as_object).unwrap();
+        assert_eq!(
+            nested.get("_rid").and_then(Value::as_str),
+            Some("nested_rid")
+        );
+    }
+
+    #[test]
+    fn infer_schema_returns_empty_schema_for_empty_sample() {
+        let schema = infer_schema(&[]).unwrap();
+        assert_eq!(schema.fields().len(), 0);
+    }
+
+    #[test]
+    fn infer_schema_produces_fields_from_sample_documents() {
+        let samples = vec![
+            json!({"id": "1", "count": 10}),
+            json!({"id": "2", "count": 20}),
+        ];
+        let schema = infer_schema(&samples).unwrap();
+        let id_field = schema.field_with_name("id").unwrap();
+        let count_field = schema.field_with_name("count").unwrap();
+        assert_eq!(id_field.data_type(), &DataType::Utf8);
+        assert!(matches!(
+            count_field.data_type(),
+            DataType::Int64 | DataType::Float64
+        ));
+    }
+
+    #[test]
+    fn infer_schema_unions_mixed_documents() {
+        // Documents with different field sets should merge into a single
+        // schema that contains the union of fields.
+        let samples = vec![
+            json!({"id": "1", "only_in_first": "x"}),
+            json!({"id": "2", "only_in_second": 42}),
+        ];
+        let schema = infer_schema(&samples).unwrap();
+        assert!(schema.field_with_name("id").is_ok());
+        assert!(schema.field_with_name("only_in_first").is_ok());
+        assert!(schema.field_with_name("only_in_second").is_ok());
+    }
 }
