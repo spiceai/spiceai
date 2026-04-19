@@ -309,9 +309,12 @@ mod tests {
 
         let mut parsed_stream = Box::pin(parse_sse_stream(Box::pin(stream)));
 
-        let chunk = parsed_stream.next().await;
+        let chunk = parsed_stream
+            .next()
+            .await
+            .expect("stream should yield one item");
 
-        assert!(chunk.is_none());
+        chunk.expect_err("partial chunk should be an error");
     }
 
     #[tokio::test]
