@@ -15,4 +15,7 @@ limitations under the License.
 */
 
 pub mod auth;
+pub mod json_nest;
 pub mod provider;
+
+pub use json_nest::HttpJsonNesting;
