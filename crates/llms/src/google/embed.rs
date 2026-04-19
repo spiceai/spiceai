@@ -50,6 +50,11 @@ impl Embed for EmbedGoogle {
             }
         };
 
+        if texts.is_empty() {
+            tracing::debug!("Embedding input is empty, returning empty vector");
+            return Ok(vec![]);
+        }
+
         let requests: Vec<EmbedContentRequest> = texts
             .into_iter()
             .map(|v| EmbedContentRequest {
