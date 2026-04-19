@@ -246,15 +246,7 @@ impl CayenneDataSink {
             // Write to a NEW snapshot with a higher sequence number so that:
             // - Old data filtered by deletions (delete_seq >= old_snapshot_seq)
             // - New data visible (new_snapshot_seq > delete_seq)
-            let new_sequence = self
-                .table
-                .catalog()
-                .increment_sequence_number(self.table.table_id())
-                .await?;
-
-            self.table
-                .insert_to_new_snapshot(prepared_stream)
-                .await?
+            self.table.insert_to_new_snapshot(prepared_stream).await?
         } else {
             // Write chunks to a staging directory, then move to the current snapshot.
             // This prevents partial files from appearing in the active snapshot on

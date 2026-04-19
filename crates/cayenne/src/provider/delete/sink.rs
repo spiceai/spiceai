@@ -70,8 +70,10 @@ use datafusion_expr::Expr;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use futures::StreamExt;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex as TokioMutex;
+use vortex_datafusion::VortexFormat;
 
 // Position-based deletion methods implemented in sink/position_based.rs
 mod position_based;
@@ -99,8 +101,12 @@ pub struct CayenneDeletionSink {
     pk_row_converter: Option<Arc<RowConverter>>,
     /// Indices of primary key columns in the table schema.
     pk_column_indices: Vec<usize>,
-    /// Additional listing tables from protected snapshots that should also be scanned for deletions.
-    protected_snapshot_tables: Vec<Arc<ListingTable>>,
+    /// Protected snapshots map shared with the table provider. Listing tables
+    /// are built from this inside `delete_from()` after acquiring the write lock
+    /// to avoid operating on stale snapshot state.
+    protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
+    /// Vortex file format for creating listing tables from protected snapshots.
+    vortex_format: Arc<VortexFormat>,
     /// Shared `RuntimeEnv` for S3 object store access.
     runtime_env: Arc<RuntimeEnv>,
     /// Shared write lock to prevent concurrent writes/refreshes from racing with deletions.
@@ -121,7 +127,8 @@ impl CayenneDeletionSink {
         pk_deletion_strategy: PkDeletionStrategyWithCache,
         pk_row_converter: Option<Arc<RowConverter>>,
         pk_column_indices: Vec<usize>,
-        protected_snapshot_tables: Vec<Arc<ListingTable>>,
+        protected_snapshots: Arc<RwLock<HashMap<String, i64>>>,
+        vortex_format: Arc<VortexFormat>,
         runtime_env: Arc<RuntimeEnv>,
         write_lock: Option<Arc<TokioMutex<()>>>,
     ) -> Self {
@@ -134,10 +141,53 @@ impl CayenneDeletionSink {
             pk_deletion_strategy,
             pk_row_converter,
             pk_column_indices,
-            protected_snapshot_tables,
+            protected_snapshots,
+            vortex_format,
             runtime_env,
             write_lock,
         }
+    }
+
+    /// Build listing tables for all protected snapshots.
+    ///
+    /// Must be called while holding the write lock so the protected snapshot
+    /// map is consistent with the rest of the in-memory state.
+    fn build_protected_snapshot_listing_tables(
+        &self,
+    ) -> Result<Vec<Arc<ListingTable>>, Box<dyn std::error::Error + Send + Sync>> {
+        use super::super::table::CayenneTableProvider;
+
+        let protected_snapshots = {
+            let guard = self.protected_snapshots.read().map_err(|_| Error::LockPoisoned {
+                table: self.table_metadata.table_name.clone(),
+                lock: "Protected snapshots lock poisoned",
+            })?;
+            guard.clone()
+        };
+
+        let mut tables = Vec::with_capacity(protected_snapshots.len());
+        for (snapshot_id, _) in protected_snapshots {
+            let snapshot_url = CayenneTableProvider::snapshot_dir_url(
+                &self.table_metadata.path,
+                &self.table_metadata.table_id,
+                &snapshot_id,
+            );
+
+            let listing_table = CayenneTableProvider::create_listing_table(
+                &snapshot_url,
+                Arc::clone(&self.schema),
+                &self.vortex_format,
+                &self.pk_deletion_strategy,
+            )
+            .map_err(|e| Error::Internal {
+                table: self.table_metadata.table_name.clone(),
+                message: format!(
+                    "Failed to create listing table for protected snapshot {snapshot_id}: {e}"
+                ),
+            })?;
+            tables.push(listing_table);
+        }
+        Ok(tables)
     }
 
     async fn delete_all_rows_from_tables(
@@ -798,9 +848,13 @@ impl DeletionSink for CayenneDeletionSink {
             Arc::clone(&guard)
         };
 
+        // Build protected snapshot listing tables NOW (inside the write lock) so we
+        // see the current snapshot state rather than a stale plan-time snapshot.
+        let protected_snapshot_tables = self.build_protected_snapshot_listing_tables()?;
+
         // Collect all tables to scan: main listing table + protected snapshots
         let mut all_tables = vec![Arc::clone(&listing_table)];
-        for protected_table in &self.protected_snapshot_tables {
+        for protected_table in &protected_snapshot_tables {
             all_tables.push(Arc::clone(protected_table));
         }
 

@@ -299,6 +299,12 @@ impl CatalogProvider for CayenneCatalogProvider {
 #[async_trait]
 impl RefreshableCatalogProvider for CayenneCatalogProvider {
     async fn refresh(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // // TODO: TEMPORARY — disable catalog refresh for testing +107 surplus
+        // tracing::warn!("Cayenne catalog refresh DISABLED for testing");
+        // return Ok(());
+
+        tracing::info!("[started] Refreshing Cayenne catalog from metadata source...");
+
         let table_names = self.catalog.list_table_names().await.unwrap_or_else(|e| {
             tracing::warn!("Failed to list existing Cayenne tables: {e}");
             Vec::new()
@@ -373,6 +379,8 @@ impl RefreshableCatalogProvider for CayenneCatalogProvider {
             Ok(mut schemas) => *schemas = new_schemas,
             Err(poisoned) => *poisoned.into_inner() = new_schemas,
         }
+
+        tracing::info!("[finished] Refreshing Cayenne catalog from metadata source...");
 
         Ok(())
     }
@@ -479,13 +487,16 @@ impl CayenneSchemaProvider {
         for (table_name, refreshed_provider) in refreshed_tables {
             let provider_to_use = if let Some(existing_provider) = existing_tables.get(&table_name)
             {
-                if Self::refresh_table_provider_in_place(existing_provider, &refreshed_provider)
-                    .await
-                {
-                    Arc::clone(existing_provider)
-                } else {
-                    refreshed_provider
-                }
+                // Existing providers are authoritative — their in-memory state is kept up-to-date by writes (insert, delete, etc).
+                // Reloading from the catalog is redundant and leads to unnecessary work and side effects including cache invalidations
+                Arc::clone(existing_provider)
+                // if Self::refresh_table_provider_in_place(existing_provider, &refreshed_provider)
+                //     .await
+                // {
+                //     Arc::clone(existing_provider)
+                // } else {
+                //     refreshed_provider
+                // }
             } else {
                 refreshed_provider
             };

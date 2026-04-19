@@ -660,7 +660,7 @@ impl CayenneTableProvider {
     /// # Errors
     ///
     /// Returns an error if the listing table cannot be created.
-    fn create_listing_table(
+    pub(crate) fn create_listing_table(
         snapshot_dir_url: &str,
         schema: SchemaRef,
         vortex_format: &Arc<VortexFormat>,
@@ -684,7 +684,7 @@ impl CayenneTableProvider {
     /// Only wraps the `VortexFormat` with `DeletionFilteringVortexFormat` for
     /// `PositionBased` strategy. PK-based strategies (`Int64Pk`, `RowConverterBased`)
     /// filter at the `ExecutionPlan` level, not during file reading.
-    fn create_listing_options(
+    pub(crate) fn create_listing_options(
         vortex_format: &Arc<VortexFormat>,
         strategy: &PkDeletionStrategyWithCache,
     ) -> ListingOptions {
@@ -713,7 +713,7 @@ impl CayenneTableProvider {
     /// * `table_path` - The base path for the table (local path or S3 URL)
     /// * `table_id` - The unique identifier for the table
     /// * `snapshot_id` - The snapshot identifier
-    fn snapshot_dir_url(table_path: &str, table_id: &str, snapshot_id: &str) -> String {
+    pub(crate) fn snapshot_dir_url(table_path: &str, table_id: &str, snapshot_id: &str) -> String {
         if table_path.starts_with("s3://") {
             // S3 URL: join path components with /
             let base = table_path.trim_end_matches('/');
@@ -1352,6 +1352,34 @@ impl CayenneTableProvider {
         // See the doc comment above for why we do NOT update current_snapshot.
 
         Ok(total_rows)
+    }
+
+    /// DIAGNOSTIC: Get the number of entries in the deletion cache.
+    fn diagnostic_deletion_cache_size(&self) -> usize {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { cached_deleted_pk, .. } => {
+                cached_deleted_pk.read().map(|g| g.len()).unwrap_or(0)
+            }
+            PkDeletionStrategyWithCache::RowConverterBased { cached_deleted_row_keys, .. } => {
+                cached_deleted_row_keys.read().map(|g| g.len()).unwrap_or(0)
+            }
+            PkDeletionStrategyWithCache::PositionBased { cached_deleted_row_ids } => {
+                cached_deleted_row_ids.read().map(|g| g.values().map(|b| b.len() as usize).sum()).unwrap_or(0)
+            }
+        }
+    }
+
+    /// DIAGNOSTIC: Get the number of insert records in the cache.
+    fn diagnostic_insert_records_size(&self) -> usize {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { cached_insert_records, .. } => {
+                cached_insert_records.read().map(|g| g.len()).unwrap_or(0)
+            }
+            PkDeletionStrategyWithCache::RowConverterBased { cached_insert_records, .. } => {
+                cached_insert_records.read().map(|g| g.len()).unwrap_or(0)
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => 0,
+        }
     }
 
     /// Get the maximum delete sequence number from the cached deletions.
@@ -2713,7 +2741,8 @@ impl CayenneTableProvider {
             self.pk_deletion_strategy.clone(),
             self.pk_row_converter.as_ref().map(Arc::clone),
             self.pk_column_indices.clone(),
-            Vec::new(), // Retention filters don't need to scan protected snapshots
+            Arc::clone(&self.protected_snapshots),
+            Arc::clone(self.context.file_format()),
             Arc::clone(self.context.runtime_env()),
             None, // Already under write_lock from write_all_append
         );
@@ -2982,6 +3011,18 @@ impl CayenneTableProvider {
         // Acquire the write lock so no insert/delete is in-flight while we reload state.
         let _write_guard = self.write_lock.lock().await;
 
+        // --- DIAGNOSTIC: capture pre-refresh state ---
+        let pre_deletion_count = self.diagnostic_deletion_cache_size();
+        let pre_insert_record_count = self.diagnostic_insert_records_size();
+        let pre_max_delete_seq = self.get_max_delete_sequence().unwrap_or(-1);
+        let pre_protected_snapshots = self
+            .protected_snapshots
+            .read()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let pre_snapshot_id = self.get_current_snapshot_id().unwrap_or_default();
+
         // Reload deletion vectors from the catalog (SQLite) — the source of truth.
         // This picks up any deletions committed by writes that completed after the
         // source provider was opened.
@@ -2995,6 +3036,37 @@ impl CayenneTableProvider {
             table: self.table_metadata.table_name.clone(),
             message: format!("Failed to reload deletion vectors during refresh: {e}"),
         })?;
+
+        // --- DIAGNOSTIC: capture fresh deletion state before applying ---
+        let fresh_deletion_count = match &fresh_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { cached_deleted_pk, .. } => {
+                cached_deleted_pk.read().map(|g| g.len()).unwrap_or(0)
+            }
+            PkDeletionStrategyWithCache::RowConverterBased { cached_deleted_row_keys, .. } => {
+                cached_deleted_row_keys.read().map(|g| g.len()).unwrap_or(0)
+            }
+            PkDeletionStrategyWithCache::PositionBased { cached_deleted_row_ids } => {
+                cached_deleted_row_ids.read().map(|g| g.values().map(|b| b.len() as usize).sum()).unwrap_or(0)
+            }
+        };
+        let fresh_insert_record_count = match &fresh_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { cached_insert_records, .. } => {
+                cached_insert_records.read().map(|g| g.len()).unwrap_or(0)
+            }
+            PkDeletionStrategyWithCache::RowConverterBased { cached_insert_records, .. } => {
+                cached_insert_records.read().map(|g| g.len()).unwrap_or(0)
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => 0,
+        };
+        let fresh_max_delete_seq = match &fresh_strategy {
+            PkDeletionStrategyWithCache::Int64Pk { cached_deleted_pk, .. } => {
+                cached_deleted_pk.read().ok().and_then(|g| g.values().max().copied()).unwrap_or(0)
+            }
+            PkDeletionStrategyWithCache::RowConverterBased { cached_deleted_row_keys, .. } => {
+                cached_deleted_row_keys.read().ok().and_then(|g| g.values().max().copied()).unwrap_or(0)
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => 0,
+        };
 
         self.pk_deletion_strategy
             .refresh_from(&fresh_strategy, &self.table_metadata.table_name)?;
@@ -3019,7 +3091,7 @@ impl CayenneTableProvider {
                     table: self.table_metadata.table_name.clone(),
                     lock: PROTECTED_SNAPSHOTS_LOCK_POISONED,
                 })?;
-            *guard = fresh_protected_snapshots;
+            *guard = fresh_protected_snapshots.clone();
         }
 
         // Reload the current snapshot ID from the catalog.
@@ -3036,10 +3108,68 @@ impl CayenneTableProvider {
         // Rebuild the listing table from the fresh snapshot ID on disk.
         self.refresh_listing_table()?;
 
-        tracing::debug!(
-            "Refreshed in-memory state for table {} from catalog",
-            self.table_metadata.table_name
+        // --- DIAGNOSTIC: log refresh diff ---
+        let deletion_diff = fresh_deletion_count as i64 - pre_deletion_count as i64;
+        let insert_rec_diff = fresh_insert_record_count as i64 - pre_insert_record_count as i64;
+        let ps_changed = pre_protected_snapshots != fresh_protected_snapshots;
+        let snap_changed = pre_snapshot_id != fresh_metadata.current_snapshot_id;
+
+        let state_changed = deletion_diff != 0 || insert_rec_diff != 0 || ps_changed || snap_changed;
+
+        // Always log refresh state at INFO so we can trace every refresh call
+        tracing::info!(
+            table = %self.table_metadata.table_name,
+            pre_deletions = pre_deletion_count,
+            post_deletions = fresh_deletion_count,
+            deletion_diff = deletion_diff,
+            pre_insert_records = pre_insert_record_count,
+            post_insert_records = fresh_insert_record_count,
+            insert_rec_diff = insert_rec_diff,
+            pre_max_del_seq = pre_max_delete_seq,
+            post_max_del_seq = fresh_max_delete_seq,
+            pre_snapshot = %pre_snapshot_id,
+            post_snapshot = %fresh_metadata.current_snapshot_id,
+            pre_protected_count = pre_protected_snapshots.len(),
+            post_protected_count = fresh_protected_snapshots.len(),
+            state_changed = state_changed,
+            "Refresh completed"
         );
+
+        if state_changed {
+            // Log individual protected snapshot threshold changes
+            for (snap_id, pre_thresh) in &pre_protected_snapshots {
+                match fresh_protected_snapshots.get(snap_id) {
+                    Some(post_thresh) if post_thresh != pre_thresh => {
+                        tracing::warn!(
+                            table = %self.table_metadata.table_name,
+                            snapshot_id = %snap_id,
+                            pre_threshold = pre_thresh,
+                            post_threshold = post_thresh,
+                            "Protected snapshot threshold changed on refresh"
+                        );
+                    }
+                    None => {
+                        tracing::warn!(
+                            table = %self.table_metadata.table_name,
+                            snapshot_id = %snap_id,
+                            threshold = pre_thresh,
+                            "Protected snapshot removed on refresh"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            for (snap_id, thresh) in &fresh_protected_snapshots {
+                if !pre_protected_snapshots.contains_key(snap_id) {
+                    tracing::warn!(
+                        table = %self.table_metadata.table_name,
+                        snapshot_id = %snap_id,
+                        threshold = thresh,
+                        "Protected snapshot added on refresh"
+                    );
+                }
+            }
+        }
 
         Ok(())
     }
@@ -3966,6 +4096,22 @@ impl TableProvider for CayenneTableProvider {
             )
             .await?;
 
+        // Scan-time diagnostic: log state used for this query
+        let deletion_cache_size = self.diagnostic_deletion_cache_size();
+        let insert_records_size = self.diagnostic_insert_records_size();
+        let protected_count = self.protected_snapshots.read().map(|g| g.len()).unwrap_or(0);
+        let current_snapshot = self.get_current_snapshot_id().unwrap_or_default();
+        tracing::debug!(
+            table = %self.table_metadata.table_name,
+            deletion_cache_size = deletion_cache_size,
+            insert_records_size = insert_records_size,
+            protected_snapshots = protected_count,
+            protected_plans = protected_snapshot_plans.len(),
+            snapshot_id = %current_snapshot,
+            need_pk_deletion = need_pk_deletion,
+            "Scan state"
+        );
+
         // Build the final plan:
         // - If protected snapshots exist: deletion filter on main, UNION with snapshots
         // - Otherwise: apply deletion filter directly to main plan
@@ -4245,12 +4391,6 @@ impl CayenneTableProvider {
         &self,
         filters: &[Expr],
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        let snapshot_tables: Vec<Arc<ListingTable>> = self
-            .build_protected_snapshot_listing_tables()?
-            .into_iter()
-            .map(|(_, table)| table)
-            .collect();
-
         Ok(Arc::new(DeletionExec::new(
             Arc::new(CayenneDeletionSink::new(
                 self.table_metadata.clone(),
@@ -4261,7 +4401,8 @@ impl CayenneTableProvider {
                 self.pk_deletion_strategy.clone(),
                 self.pk_row_converter.as_ref().map(Arc::clone),
                 self.pk_column_indices.clone(),
-                snapshot_tables,
+                Arc::clone(&self.protected_snapshots),
+                Arc::clone(self.context.file_format()),
                 Arc::clone(self.context.runtime_env()),
                 Some(Arc::clone(&self.write_lock)),
             )),
