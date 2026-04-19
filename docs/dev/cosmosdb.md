@@ -112,6 +112,15 @@ These parameters satisfy the "Connection Resilience" section of
 Retries honor both the standard `Retry-After` header and the Cosmos-specific
 `x-ms-retry-after-ms` header. The effective delay is `max(retry_after, backoff)`.
 
+**Retry scope:** `http_max_retries` / `backoff_method` apply to the schema
+inference pass that runs at dataset registration. Errors surfaced *during* a
+streaming scan propagate immediately to the caller — a `FeedPager` cannot be
+safely rewound once rows have been emitted, so mid-stream retry would risk
+duplicating output. Spice's dataset refresh layer handles retry at the query
+boundary. The permanent-error latch (`disable_on_permanent_error`) still
+applies on both paths, so a 401/403/404 from any request disables the
+connector account-wide.
+
 The `inflight_operations` metric is automatically registered and reports the
 current number of Cosmos requests holding a concurrency permit.
 
