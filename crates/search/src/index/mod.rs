@@ -23,6 +23,8 @@ use datafusion::{error::DataFusionError, logical_expr::LogicalPlan};
 use runtime_datafusion_index::Index;
 
 pub mod chunking;
+#[cfg(feature = "elasticsearch")]
+pub mod elasticsearch;
 #[cfg(feature = "s3_vectors")]
 pub mod s3_vectors;
 
@@ -30,6 +32,8 @@ pub mod vector_table;
 use crate::index::chunking::ChunkedVectorIndex;
 pub use vector_table::VectorScanTableProvider;
 
+#[cfg(feature = "elasticsearch")]
+use crate::index::elasticsearch::ElasticsearchIndex;
 #[cfg(feature = "s3_vectors")]
 use crate::index::s3_vectors::S3Vector;
 
@@ -72,6 +76,10 @@ pub trait SearchIndex: Index + std::fmt::Debug + Send + Sync + 'static {
 pub fn derived_columns_from_vector_index(
     index: &Arc<dyn Index + Send + Sync>,
 ) -> Option<Vec<String>> {
+    #[cfg(feature = "elasticsearch")]
+    if let Some(vec) = index.as_any().downcast_ref::<ElasticsearchIndex>() {
+        return Some(vec.derived_columns());
+    }
     #[cfg(feature = "s3_vectors")]
     if let Some(vec) = index.as_any().downcast_ref::<S3Vector>() {
         return Some(vec.derived_columns());

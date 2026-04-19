@@ -234,6 +234,16 @@ pub async fn embedding_columns_from_table(
         embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
     }
 
+    #[cfg(feature = "elasticsearch")]
+    {
+        use search::index::elasticsearch::ElasticsearchIndex;
+        if let Some((indexes, _)) =
+            find_index_in_table_provider::<ElasticsearchIndex>(&table_provider)
+        {
+            embedding_columns.extend(indexes.iter().map(|i| i.search_column()));
+        }
+    }
+
     Some(embedding_columns.into_iter().collect())
 }
 
