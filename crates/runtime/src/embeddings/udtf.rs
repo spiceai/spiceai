@@ -140,9 +140,14 @@ impl DistanceMetric {
         match s.to_ascii_lowercase().as_str() {
             "cosine" | "cos" => Ok(Self::Cosine),
             "l2" | "euclidean" | "euclid" => Ok(Self::L2),
-            "dot" | "inner" | "ip" => Ok(Self::Dot),
+            // Dot is not yet wired through the scan path; reject at parse time so
+            // users get a clear error instead of silently constructing args that
+            // will then fail with `NotImplemented` deeper in execution.
+            "dot" | "inner" | "ip" => Err(DataFusionError::Plan(format!(
+                "distance_metric '{s}' is not yet implemented for {VECTOR_SEARCH_UDTF_NAME}. Supported: 'cosine', 'l2'."
+            ))),
             other => Err(DataFusionError::Plan(format!(
-                "Unsupported distance_metric '{other}' for {VECTOR_SEARCH_UDTF_NAME}. Supported: 'cosine', 'l2', 'dot'."
+                "Unsupported distance_metric '{other}' for {VECTOR_SEARCH_UDTF_NAME}. Supported: 'cosine', 'l2'."
             ))),
         }
     }
@@ -184,7 +189,11 @@ impl VectorSearchTableFuncArgs {
         match (self.column.as_deref(), cfg) {
             (Some(col), Some(cfg)) => Ok((col.to_string(), cfg)),
             (Some(col), None) => {
-                let available: Vec<String> = embedded_columns.keys().cloned().collect();
+                // Sort for deterministic error text / tests — `HashMap::keys()` has
+                // nondeterministic iteration order, which would make error messages
+                // (and the Levenshtein suggestion) flaky across runs.
+                let mut available: Vec<String> = embedded_columns.keys().cloned().collect();
+                available.sort();
                 let suggestion = closest_column(col, &available)
                     .map(|s| format!(" Did you mean '{s}'?"))
                     .unwrap_or_default();
@@ -196,7 +205,8 @@ impl VectorSearchTableFuncArgs {
             }
             (None, _) => {
                 if embedded_columns.len() > 1 {
-                    let available: Vec<String> = embedded_columns.keys().cloned().collect();
+                    let mut available: Vec<String> = embedded_columns.keys().cloned().collect();
+                    available.sort();
                     return Err(DataFusionError::Plan(format!(
                         "User function 'vector_search' is called on table '{}' that has {} vector search columns ({}). Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`.",
                         self.tbl,
@@ -457,13 +467,22 @@ impl VectorSearchTableFunc {
                 )));
             }
         };
+        let limit_usize = limit
+            .map(|l| {
+                usize::try_from(l).map_err(|_| {
+                    DataFusionError::Plan(format!(
+                        "vector_search: limit value {l} is out of range for usize."
+                    ))
+                })
+            })
+            .transpose()?;
         Ok(VectorSearchTableFuncArgs {
             tbl: tbl_ref
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
                 .into(),
             query: q.clone(),
             column,
-            limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
+            limit: limit_usize,
             include_score,
             distance_metric,
         })

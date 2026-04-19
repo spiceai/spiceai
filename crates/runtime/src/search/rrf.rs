@@ -770,14 +770,17 @@ impl ReciprocalRankFusion {
             // column names (going through `col()`/`ident()` on the name string
             // would lose the original Column identity).
             let join_key_for_sort = join_key.clone();
-            // Only drop the synthetic row-id column if it is not the join key
-            // itself. When the user does not provide `join_key`, the inferred
-            // key *is* `__spice_rrf_row_id`, and it must survive into the
-            // final sort (and user-visible output).
+            // When the user does not provide `join_key`, the inferred key *is*
+            // `__spice_rrf_row_id`. It must survive aggregation and the
+            // secondary-sort step (so ties break deterministically), but it is
+            // a synthetic internal column and must be projected away before
+            // reaching the user-visible output.
             let join_key_is_rrf_rowid = join_key.qualified_name().1 == "__spice_rrf_row_id";
             let aggregated = joined
                 .select(columns)?
                 .aggregate(vec![join_key], agg_cols)?;
+            // When the user provided an explicit join key, the synthetic
+            // rrf row id is no longer needed and can be dropped immediately.
             let aggregated = if join_key_is_rrf_rowid {
                 aggregated
             } else {
@@ -787,6 +790,13 @@ impl ReciprocalRankFusion {
                 col("fused_score").sort(false, false),
                 join_key_for_sort.sort(true, true),
             ])?;
+            // Drop the synthetic row id after sort so it does not leak into
+            // the user-visible schema of `rrf(...)`.
+            let sorted = if join_key_is_rrf_rowid {
+                sorted.drop_columns(&["__spice_rrf_row_id"])?
+            } else {
+                sorted
+            };
 
             // Apply the RRF-level limit so `FROM rrf(..., limit => N)` alone is
             // sufficient — users don't have to add an outer LIMIT clause.
