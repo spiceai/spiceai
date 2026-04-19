@@ -31,7 +31,6 @@ limitations under the License.
 //!   the module-level documentation.
 
 use std::any::Any;
-use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -515,35 +514,20 @@ fn decode_batch(
     full_schema: &SchemaRef,
     projection: Option<&[usize]>,
 ) -> Result<RecordBatch, Error> {
-    // `arrow::json::ReaderBuilder` consumes newline-delimited JSON, so join
-    // the document stream with newlines.
-    let mut buf = Vec::with_capacity(docs.len() * 256);
-    for doc in docs {
-        serde_json::to_writer(&mut buf, doc).map_err(|e| Error::JsonDecode {
-            source: arrow::error::ArrowError::JsonError(e.to_string()),
-        })?;
-        buf.push(b'\n');
-    }
-
-    let reader = ReaderBuilder::new(Arc::clone(full_schema))
-        .with_batch_size(docs.len().max(1))
-        .build(Cursor::new(buf))
+    // Hand the Value slice directly to arrow-json's serde-aware decoder,
+    // avoiding the NDJSON serialize -> parse round-trip.
+    let mut decoder = ReaderBuilder::new(Arc::clone(full_schema))
+        .build_decoder()
         .context(JsonDecodeSnafu)?;
 
-    let mut batches = Vec::new();
-    for batch in reader {
-        batches.push(batch.context(JsonDecodeSnafu)?);
+    if !docs.is_empty() {
+        decoder.serialize(docs).context(JsonDecodeSnafu)?;
     }
 
-    let full_batch = if batches.len() == 1 {
-        batches
-            .pop()
-            .unwrap_or_else(|| RecordBatch::new_empty(Arc::clone(full_schema)))
-    } else if batches.is_empty() {
-        RecordBatch::new_empty(Arc::clone(full_schema))
-    } else {
-        arrow::compute::concat_batches(full_schema, &batches).context(JsonDecodeSnafu)?
-    };
+    let full_batch = decoder
+        .flush()
+        .context(JsonDecodeSnafu)?
+        .unwrap_or_else(|| RecordBatch::new_empty(Arc::clone(full_schema)));
 
     if let Some(indices) = projection {
         full_batch.project(indices).context(JsonDecodeSnafu)
