@@ -11,7 +11,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | ADBC                             | ➖          |              |
 | Azure BlobFS                     | ➖          |              |
 | Clickhouse                       | ➖          |              |
-| Cosmos DB (NoSQL)                | ➖          |              |
+| Cosmos DB (NoSQL)                | ✅          | @lukekim     |
 | Databricks (mode: delta_lake)    | ✅          | @Sevenannn   |
 | Databricks (mode: spark_connect) | ➖          |              |
 | Databricks (mode: sql_warehouse) | ➖          |              |

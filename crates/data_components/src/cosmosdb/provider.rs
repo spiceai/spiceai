@@ -33,9 +33,10 @@ limitations under the License.
 use std::any::Any;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::json::ReaderBuilder;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -50,15 +51,15 @@ use datafusion::physical_plan::{
     execution_plan::{Boundedness, EmissionType},
 };
 use datafusion::prelude::Expr;
+use datafusion_table_providers::UnsupportedTypeAction;
 use futures::StreamExt;
 use serde_json::Value;
 use snafu::ResultExt;
 
 use super::client::CosmosDBClient;
+use super::resilience::{CosmosResilienceConfig, ResilienceError, run_with_resilience};
 use super::schema::{infer_schema, strip_system_fields};
-use super::{
-    DEFAULT_SCHEMA_INFER_MAX_RECORDS, EmptyContainerSnafu, Error, JsonDecodeSnafu, QueryFailedSnafu,
-};
+use super::{DEFAULT_SCHEMA_INFER_MAX_RECORDS, EmptyContainerSnafu, Error, JsonDecodeSnafu};
 
 /// Number of documents emitted per `RecordBatch` when streaming results.
 const STREAM_BATCH_SIZE: usize = 1024;
@@ -75,6 +76,15 @@ pub struct CosmosDBTableProviderConfig {
     /// Optional pre-pinned schema. If supplied, schema inference is skipped
     /// entirely.
     pub schema_override: Option<SchemaRef>,
+    /// How to handle columns whose type Cosmos DB cannot represent (e.g.
+    /// all-null samples that Arrow's JSON inference returns as
+    /// [`DataType::Null`]). Defaults to
+    /// [`UnsupportedTypeAction::Warn`] — log a warning and drop the
+    /// offending column, which is the RC-mandated "don't crash" behavior in
+    /// `docs/criteria/connectors/rc.md`.
+    pub unsupported_type_action: UnsupportedTypeAction,
+    /// Concurrency + retry + permanent-error configuration.
+    pub resilience: CosmosResilienceConfig,
 }
 
 impl CosmosDBTableProviderConfig {
@@ -90,6 +100,8 @@ impl CosmosDBTableProviderConfig {
             query: query.into(),
             schema_infer_max_records: DEFAULT_SCHEMA_INFER_MAX_RECORDS,
             schema_override: None,
+            unsupported_type_action: UnsupportedTypeAction::Warn,
+            resilience: CosmosResilienceConfig::default(),
         }
     }
 
@@ -102,6 +114,18 @@ impl CosmosDBTableProviderConfig {
     #[must_use]
     pub fn with_schema_override(mut self, schema: SchemaRef) -> Self {
         self.schema_override = Some(schema);
+        self
+    }
+
+    #[must_use]
+    pub fn with_resilience(mut self, resilience: CosmosResilienceConfig) -> Self {
+        self.resilience = resilience;
+        self
+    }
+
+    #[must_use]
+    pub fn with_unsupported_type_action(mut self, action: UnsupportedTypeAction) -> Self {
+        self.unsupported_type_action = action;
         self
     }
 }
@@ -134,6 +158,7 @@ impl CosmosDBTableProvider {
                 &config.container,
                 &config.query,
                 config.schema_infer_max_records,
+                &config.resilience,
             )
             .await?;
 
@@ -145,7 +170,13 @@ impl CosmosDBTableProvider {
                 .fail();
             }
 
-            infer_schema(&samples)?
+            let inferred = infer_schema(&samples)?;
+            apply_unsupported_type_action(
+                &inferred,
+                config.unsupported_type_action,
+                &config.database,
+                &config.container,
+            )?
         };
 
         Ok(Self {
@@ -161,41 +192,111 @@ impl CosmosDBTableProvider {
     }
 }
 
+/// Apply the configured [`UnsupportedTypeAction`] to an inferred schema.
+///
+/// For Cosmos DB, the only type Arrow's JSON inference can produce that
+/// downstream query engines may refuse is [`DataType::Null`] — it appears when
+/// every sampled document has `null` for a field. The RC "Connection
+/// Resilience" gate in `docs/criteria/connectors/rc.md` requires that such
+/// columns be warn-and-skipped rather than crashing the query; the action
+/// lets operators opt into stricter or looser behavior.
+fn apply_unsupported_type_action(
+    inferred: &SchemaRef,
+    action: UnsupportedTypeAction,
+    database: &str,
+    container: &str,
+) -> Result<SchemaRef, Error> {
+    if !schema_has_unsupported_columns(inferred) {
+        return Ok(Arc::clone(inferred));
+    }
+
+    let mut kept: Vec<Arc<Field>> = Vec::with_capacity(inferred.fields().len());
+    for field in inferred.fields() {
+        if is_unsupported_cosmos_field(field) {
+            match action {
+                UnsupportedTypeAction::Error => {
+                    return Err(Error::UnsupportedColumn {
+                        database: database.to_string(),
+                        container: container.to_string(),
+                        column: field.name().to_string(),
+                        data_type: format!("{:?}", field.data_type()),
+                    });
+                }
+                UnsupportedTypeAction::Warn => {
+                    tracing::warn!(
+                        database = %database,
+                        container = %container,
+                        column = %field.name(),
+                        data_type = %format!("{:?}", field.data_type()),
+                        "Dropping column '{}' from Cosmos DB dataset {database}.{container}: Arrow inferred an unsupported data type ({:?}). All sampled documents were null for this field — populate the field or pin a schema via `columns:` to override.",
+                        field.name(),
+                        field.data_type()
+                    );
+                }
+                UnsupportedTypeAction::Ignore => {
+                    // Silently drop the column.
+                }
+                UnsupportedTypeAction::String => {
+                    kept.push(Arc::new(Field::new(
+                        field.name(),
+                        DataType::Utf8,
+                        field.is_nullable(),
+                    )));
+                }
+            }
+        } else {
+            kept.push(Arc::<Field>::clone(field));
+        }
+    }
+
+    Ok(Arc::new(Schema::new(kept)))
+}
+
+fn is_unsupported_cosmos_field(field: &Arc<Field>) -> bool {
+    matches!(field.data_type(), DataType::Null)
+}
+
+fn schema_has_unsupported_columns(schema: &SchemaRef) -> bool {
+    schema.fields().iter().any(is_unsupported_cosmos_field)
+}
+
 /// Sample up to `limit` documents from the container for schema inference.
+///
+/// Wrapped by [`run_with_resilience`] so the whole sampling operation is
+/// retried (with fresh pager construction) on transient errors, bounded by
+/// the configured retry budget.
 async fn fetch_samples(
     client: &CosmosDBClient,
     database: &str,
     container: &str,
     query: &str,
     limit: usize,
+    resilience: &CosmosResilienceConfig,
 ) -> Result<Vec<Value>, Error> {
     let container_client = client.container_client(database, container);
+    let endpoint = client.endpoint().to_string();
 
-    // `()` = cross-partition query; see CosmosClient::query_items docs.
-    let mut pager = container_client
-        .query_items::<Value>(query, (), None)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-        .context(QueryFailedSnafu {
+    run_with_resilience(resilience, &endpoint, || async {
+        let mut pager = container_client.query_items::<Value>(query, (), None)?;
+        let mut samples = Vec::with_capacity(limit.min(1024));
+        while samples.len() < limit {
+            match pager.next().await {
+                Some(Ok(doc)) => samples.push(strip_system_fields(doc)),
+                Some(Err(e)) => return Err(e),
+                None => break,
+            }
+        }
+        Ok(samples)
+    })
+    .await
+    .map_err(|e| match e {
+        ResilienceError::Disabled => Error::ConnectorDisabled { endpoint },
+        ResilienceError::Request(source) => Error::QueryFailed {
             database: database.to_string(),
             container: container.to_string(),
-        })?;
-
-    let mut samples = Vec::with_capacity(limit.min(1024));
-    while samples.len() < limit {
-        match pager.next().await {
-            Some(Ok(doc)) => samples.push(strip_system_fields(doc)),
-            Some(Err(e)) => {
-                return Err(Error::QueryFailed {
-                    database: database.to_string(),
-                    container: container.to_string(),
-                    source: Box::new(e),
-                });
-            }
-            None => break,
-        }
-    }
-
-    Ok(samples)
+            source: Box::new(source),
+        },
+    })
 }
 
 #[async_trait]
@@ -331,24 +432,73 @@ impl ExecutionPlan for CosmosDBExec {
         let projection = self.projection.clone();
 
         builder.spawn(async move {
-            let container_client = client.container_client(&config.database, &config.container);
+            // Fail fast if the connector was disabled by an earlier permanent
+            // error — prevents further queries from piling up against an
+            // authentication failure.
+            if config.resilience.disabled.load(Ordering::SeqCst) {
+                return Err(to_df_error(Error::ConnectorDisabled {
+                    endpoint: client.endpoint().to_string(),
+                }));
+            }
 
-            let query_context_error = |source: Box<dyn std::error::Error + Send + Sync>| {
-                to_df_error(Error::QueryFailed {
-                    database: config.database.clone(),
-                    container: config.container.clone(),
-                    source,
-                })
+            // Acquire a concurrency permit for the lifetime of the scan. This
+            // bounds the number of in-flight Cosmos DB queries per account
+            // endpoint (`max_concurrent_requests`). Held via a `let` binding
+            // so the permit is released when the async block returns, including
+            // on cancellation or receiver-drop.
+            let _permit = match &config.resilience.semaphore {
+                Some(s) => Some(
+                    Arc::<tokio::sync::Semaphore>::clone(s)
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| {
+                            to_df_error(Error::ConnectorDisabled {
+                                endpoint: client.endpoint().to_string(),
+                            })
+                        })?,
+                ),
+                None => None,
             };
 
+            // Drives the `inflight_operations` metric; RAII guard ensures the
+            // counter decrements even if the future is cancelled mid-stream.
+            let _inflight = crate::cosmosdb::resilience::InflightGuard::enter(
+                Arc::<AtomicU64>::clone(&config.resilience.inflight),
+            );
+
+            let container_client = client.container_client(&config.database, &config.container);
+
+            let handle_stream_error =
+                |resilience: &CosmosResilienceConfig,
+                 endpoint: &str,
+                 err: azure_core::Error|
+                 -> DataFusionError {
+                    if crate::cosmosdb::resilience::is_permanent_error(&err)
+                        && resilience.disable_on_permanent_error
+                    {
+                        resilience.disabled.store(true, Ordering::SeqCst);
+                        tracing::error!(
+                            endpoint = %endpoint,
+                            "Permanent error from Azure Cosmos DB; disabling connector. {err}"
+                        );
+                    }
+                    to_df_error(Error::QueryFailed {
+                        database: config.database.clone(),
+                        container: config.container.clone(),
+                        source: Box::new(err),
+                    })
+                };
+
+            let endpoint = client.endpoint().to_string();
             let mut pager = container_client
                 .query_items::<Value>(config.query.as_str(), (), None)
-                .map_err(|e| query_context_error(Box::new(e)))?;
+                .map_err(|e| handle_stream_error(&config.resilience, &endpoint, e))?;
 
             let mut buffer: Vec<Value> = Vec::with_capacity(STREAM_BATCH_SIZE);
 
             while let Some(item) = pager.next().await {
-                let doc = item.map_err(|e| query_context_error(Box::new(e)))?;
+                let doc =
+                    item.map_err(|e| handle_stream_error(&config.resilience, &endpoint, e))?;
 
                 buffer.push(strip_system_fields(doc));
 
@@ -498,5 +648,109 @@ mod tests {
             .unwrap();
         assert!(count_col.is_null(0));
         assert_eq!(count_col.value(1), 2);
+    }
+
+    /// Beta criterion: the connector must handle datasets whose column count
+    /// matches the source limit. Cosmos DB has no formal column cap, but
+    /// production tenants routinely store 1024+ top-level fields. Build a
+    /// synthetic schema + document of that size and verify end-to-end
+    /// JSON-to-Arrow decoding does not OOM or regress.
+    #[test]
+    fn decode_batch_handles_wide_schema() {
+        const COLS: usize = 1024;
+        let fields: Vec<Field> = (0..COLS)
+            .map(|i| Field::new(format!("col_{i}"), DataType::Int64, true))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+
+        let mut obj = serde_json::Map::with_capacity(COLS);
+        for i in 0..COLS {
+            obj.insert(format!("col_{i}"), json!(i64::try_from(i).unwrap_or(0)));
+        }
+        let docs = vec![Value::Object(obj)];
+
+        let batch = decode_batch(&docs, &schema, None).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), COLS);
+        let mid = batch
+            .column(COLS / 2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(mid.value(0), i64::try_from(COLS / 2).unwrap_or(0));
+    }
+
+    fn schema_with_null_column() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("always_null", DataType::Null, true),
+        ]))
+    }
+
+    #[test]
+    fn unsupported_type_action_warn_drops_null_columns() {
+        let schema = schema_with_null_column();
+        let projected = apply_unsupported_type_action(
+            &schema,
+            UnsupportedTypeAction::Warn,
+            "db",
+            "container",
+        )
+        .unwrap();
+        assert_eq!(projected.fields().len(), 1);
+        assert_eq!(projected.field(0).name(), "id");
+    }
+
+    #[test]
+    fn unsupported_type_action_ignore_drops_silently() {
+        let schema = schema_with_null_column();
+        let projected = apply_unsupported_type_action(
+            &schema,
+            UnsupportedTypeAction::Ignore,
+            "db",
+            "container",
+        )
+        .unwrap();
+        assert_eq!(projected.fields().len(), 1);
+    }
+
+    #[test]
+    fn unsupported_type_action_string_coerces_to_utf8() {
+        let schema = schema_with_null_column();
+        let projected = apply_unsupported_type_action(
+            &schema,
+            UnsupportedTypeAction::String,
+            "db",
+            "container",
+        )
+        .unwrap();
+        assert_eq!(projected.fields().len(), 2);
+        assert_eq!(projected.field(1).data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn unsupported_type_action_error_surfaces_to_caller() {
+        let schema = schema_with_null_column();
+        let err = apply_unsupported_type_action(
+            &schema,
+            UnsupportedTypeAction::Error,
+            "db",
+            "container",
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::UnsupportedColumn { .. }));
+    }
+
+    #[test]
+    fn unsupported_type_action_is_noop_on_clean_schema() {
+        let schema = sample_schema();
+        let projected = apply_unsupported_type_action(
+            &schema,
+            UnsupportedTypeAction::Error,
+            "db",
+            "container",
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&schema, &projected));
     }
 }

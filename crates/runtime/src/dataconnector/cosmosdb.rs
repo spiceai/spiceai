@@ -16,33 +16,156 @@ limitations under the License.
 
 //! Azure Cosmos DB (NoSQL / Core SQL API) data connector.
 //!
-//! Alpha-quality: read-only, cross-partition scan, schema inference from a
-//! sample of documents. Full RC criteria (federation push-down, streaming
-//! changes, write support, benchmarks) will be layered on incrementally.
+//! Read-only scan with schema inferred from a sample of documents, backed by
+//! RC-level connection resilience (concurrency limiting, retry with backoff,
+//! permanent-error detection) and an `inflight_operations` metric gauge.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
 use data_components::cosmosdb::{
-    CosmosDBClient, CosmosDBCredential, CosmosDBTableProvider, DEFAULT_QUERY,
+    BackoffMethod, CosmosDBClient, CosmosDBCredential, CosmosDBTableProvider,
+    CosmosResilienceConfig, DEFAULT_MAX_CONCURRENT_REQUESTS, DEFAULT_MAX_RETRIES, DEFAULT_QUERY,
     DEFAULT_SCHEMA_INFER_MAX_RECORDS, provider::CosmosDBTableProviderConfig,
 };
 use datafusion::datasource::TableProvider;
+use datafusion_table_providers::UnsupportedTypeAction as DFUnsupportedTypeAction;
+use opentelemetry::KeyValue;
+use tokio::sync::Semaphore;
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec, Parameters,
 };
+use crate::component::ComponentType;
 use crate::component::dataset::Dataset;
+use crate::component::metrics::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 
 const CONNECTOR_NAME: &str = "cosmosdb";
+
+/// Semaphore paired with the numeric limit it was constructed with, so
+/// mismatches across datasets targeting the same Cosmos account can be
+/// detected and surfaced as a warning.
+type SemaphoreEntry = (Arc<Semaphore>, usize);
+
+/// Per-account-endpoint concurrency semaphores. Datasets that hit the same
+/// Cosmos account share a single concurrency budget, matching the
+/// rate-limit model of a Cosmos DB account.
+static COSMOS_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, SemaphoreEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Per-account-endpoint disabled-state flags. A permanent error (401/403/404)
+/// observed by one dataset latches the connector for every dataset pointing
+/// at the same account.
+static COSMOS_DISABLED_FLAGS: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn shared_semaphore(endpoint: &str, max_concurrent: usize) -> Arc<Semaphore> {
+    let mut guard = COSMOS_CONCURRENCY_LIMITS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((semaphore, existing_max)) = guard.get(endpoint) {
+        if *existing_max != max_concurrent {
+            tracing::warn!(
+                endpoint = %endpoint,
+                existing_max,
+                requested_max = max_concurrent,
+                "Multiple datasets target the same Cosmos DB account with different max_concurrent_requests values. Keeping the first-seen limit ({existing_max})."
+            );
+        }
+        Arc::<Semaphore>::clone(semaphore)
+    } else {
+        let semaphore = Arc::new(Semaphore::new(max_concurrent));
+        guard.insert(
+            endpoint.to_string(),
+            (Arc::<Semaphore>::clone(&semaphore), max_concurrent),
+        );
+        semaphore
+    }
+}
+
+fn shared_disabled_flag(endpoint: &str) -> Arc<AtomicBool> {
+    let mut guard = COSMOS_DISABLED_FLAGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::<AtomicBool>::clone(
+        guard
+            .entry(endpoint.to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false))),
+    )
+}
+
+/// Metrics recorded by the Cosmos DB data connector.
+///
+/// Shared across every `CosmosDBClient` the connector builds so the metrics
+/// endpoint reports the combined in-flight load across datasets that target
+/// the same Cosmos account.
+#[derive(Debug, Default)]
+struct CosmosDBMetrics {
+    inflight_operations: Arc<AtomicU64>,
+}
+
+const COSMOSDB_METRICS: &[MetricSpec] = &[MetricSpec::new(
+    "inflight_operations",
+    MetricType::ObservableGaugeU64,
+)
+.description("Current number of Azure Cosmos DB requests holding a concurrency permit")
+.auto_register()];
+
+#[derive(Debug, Clone)]
+struct CosmosDBMetricsProvider {
+    metrics: Arc<CosmosDBMetrics>,
+}
+
+impl MetricsProvider for CosmosDBMetricsProvider {
+    fn component_type(&self) -> ComponentType {
+        ComponentType::Dataset
+    }
+
+    fn component_name(&self) -> &'static str {
+        CONNECTOR_NAME
+    }
+
+    fn available_metrics(&self) -> &'static [MetricSpec] {
+        COSMOSDB_METRICS
+    }
+
+    fn callback_to_observe_metric(
+        &self,
+        metric: &MetricSpec,
+        attributes: Vec<KeyValue>,
+    ) -> Option<ObserveMetricCallback> {
+        match metric.name {
+            "inflight_operations" => {
+                let metrics = Arc::<CosmosDBMetrics>::clone(&self.metrics);
+                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
+                    observer.observe(
+                        metrics.inflight_operations.load(Ordering::Relaxed),
+                        &attributes,
+                    );
+                })))
+            }
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct CosmosDB {
     params: Parameters,
+    /// Shared counter updated by every resilience wrapper in this connector.
+    metrics: Arc<CosmosDBMetrics>,
+    /// Action to apply when Cosmos DB returns a column whose Arrow type is
+    /// not natively supported (e.g. an all-null sample inferred as
+    /// `DataType::Null`). `None` falls through to the provider-level default
+    /// of [`DFUnsupportedTypeAction::Warn`], which drops the column and logs
+    /// a warning per RC gate #2.
+    unsupported_type_action: Option<DFUnsupportedTypeAction>,
 }
 
 #[derive(Default, Debug, Copy, Clone)]
@@ -78,6 +201,23 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("schema_infer_max_records")
         .description("Number of documents sampled during schema inference. Larger samples produce a more precise schema at the cost of additional RU consumption on dataset registration.")
         .default("100"),
+
+    // Resilience / connection tuning (RC criteria — see
+    // docs/criteria/connectors/rc.md#connection-resilience).
+    ParameterSpec::runtime("max_concurrent_requests")
+        .description("Maximum number of concurrent Azure Cosmos DB requests per account endpoint, shared across all datasets pointing at the same account.")
+        .default("4"),
+    ParameterSpec::runtime("http_max_retries")
+        .description("Maximum number of retries for transient errors (429, 5xx, network) when reading from Azure Cosmos DB. Retries use the configured backoff strategy and honor Retry-After headers.")
+        .default("3"),
+    ParameterSpec::runtime("backoff_method")
+        .description("Backoff strategy between retries on transient errors. 'exponential' doubles the delay each attempt; 'fibonacci' follows the Fibonacci sequence.")
+        .one_of(&["exponential", "fibonacci"])
+        .default("exponential"),
+    ParameterSpec::runtime("disable_on_permanent_error")
+        .description("When true, a permanent error (401/403/404) from Azure Cosmos DB latches the connector into a disabled state and short-circuits subsequent requests until Spice is restarted.")
+        .default("true")
+        .is_boolean(),
 ];
 
 impl DataConnectorFactory for CosmosDBFactory {
@@ -89,9 +229,12 @@ impl DataConnectorFactory for CosmosDBFactory {
         &self,
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        let unsupported_type_action = params.unsupported_type_action;
         Box::pin(async move {
             let conn = CosmosDB {
                 params: params.parameters,
+                metrics: Arc::new(CosmosDBMetrics::default()),
+                unsupported_type_action,
             };
             Ok(Arc::new(conn) as Arc<dyn DataConnector>)
         })
@@ -103,6 +246,10 @@ impl DataConnectorFactory for CosmosDBFactory {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    fn supports_unsupported_type_action(&self) -> bool {
+        true
     }
 }
 
@@ -128,6 +275,59 @@ impl CosmosDB {
                 connector_component: ConnectorComponent::from(dataset),
                 message: "Azure Cosmos DB requires either 'cosmosdb_connection_string' or both 'cosmosdb_account_endpoint' and 'cosmosdb_account_key'.".to_string(),
             }),
+        }
+    }
+
+    /// Materialize a resilience config from validated parameters. Per-endpoint
+    /// semaphore and disabled flag are shared across datasets that target the
+    /// same Cosmos account.
+    fn build_resilience(&self, endpoint: &str) -> CosmosResilienceConfig {
+        let max_concurrent_requests = self
+            .params
+            .get("max_concurrent_requests")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_REQUESTS)
+            .max(1);
+
+        let max_retries = self
+            .params
+            .get("http_max_retries")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_MAX_RETRIES);
+
+        let backoff_value = self
+            .params
+            .get("backoff_method")
+            .expose()
+            .ok()
+            .unwrap_or("exponential");
+        let backoff = BackoffMethod::parse(backoff_value).unwrap_or_else(|message| {
+            tracing::warn!("{message}; falling back to 'exponential'.");
+            BackoffMethod::Exponential
+        });
+
+        let disable_on_permanent_error = self
+            .params
+            .get("disable_on_permanent_error")
+            .expose()
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(true);
+
+        let semaphore = shared_semaphore(endpoint, max_concurrent_requests);
+        let disabled = shared_disabled_flag(endpoint);
+
+        CosmosResilienceConfig {
+            max_retries,
+            backoff,
+            semaphore: Some(semaphore),
+            disable_on_permanent_error,
+            inflight: Arc::<AtomicU64>::clone(&self.metrics.inflight_operations),
+            disabled,
         }
     }
 }
@@ -249,8 +449,15 @@ impl DataConnector for CosmosDB {
             None => DEFAULT_SCHEMA_INFER_MAX_RECORDS,
         };
 
-        let config = CosmosDBTableProviderConfig::new(database, container, query)
-            .with_schema_infer_max_records(schema_infer_max_records);
+        let resilience = self.build_resilience(client.endpoint());
+
+        let mut config = CosmosDBTableProviderConfig::new(database, container, query)
+            .with_schema_infer_max_records(schema_infer_max_records)
+            .with_resilience(resilience);
+
+        if let Some(action) = self.unsupported_type_action {
+            config = config.with_unsupported_type_action(action);
+        }
 
         let provider = CosmosDBTableProvider::try_new(client, config)
             .await
@@ -262,13 +469,20 @@ impl DataConnector for CosmosDB {
 
         Ok(Arc::new(provider))
     }
+
+    fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
+        Some(Arc::new(CosmosDBMetricsProvider {
+            metrics: Arc::<CosmosDBMetrics>::clone(&self.metrics),
+        }))
+    }
 }
 
 register_data_connector!("cosmosdb", CosmosDBFactory);
 
 #[cfg(test)]
 mod tests {
-    use super::parse_database_and_container;
+    use super::{parse_database_and_container, shared_disabled_flag, shared_semaphore};
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn parses_dot_delimited_path() {
@@ -339,5 +553,36 @@ mod tests {
         let (db, container) = parse_database_and_container("a.b.c", None).unwrap();
         assert_eq!(db, "a");
         assert_eq!(container, "b.c");
+    }
+
+    #[test]
+    fn shared_semaphore_returns_same_instance_for_same_endpoint() {
+        // Use a unique endpoint per test to avoid cross-test interference
+        // through the process-wide `COSMOS_CONCURRENCY_LIMITS` map.
+        let endpoint = "https://shared-semaphore-same-endpoint.documents.azure.com:443/";
+        let sem_a = shared_semaphore(endpoint, 4);
+        let sem_b = shared_semaphore(endpoint, 4);
+        assert!(std::sync::Arc::ptr_eq(&sem_a, &sem_b));
+    }
+
+    #[test]
+    fn shared_semaphore_keeps_first_seen_limit_on_mismatch() {
+        let endpoint = "https://shared-semaphore-mismatch.documents.azure.com:443/";
+        let sem_a = shared_semaphore(endpoint, 4);
+        // A conflicting request should be resolved in favor of the first-seen
+        // limit rather than silently bumping or panicking.
+        let sem_b = shared_semaphore(endpoint, 16);
+        assert!(std::sync::Arc::ptr_eq(&sem_a, &sem_b));
+        assert_eq!(sem_a.available_permits(), 4);
+    }
+
+    #[test]
+    fn shared_disabled_flag_shares_state_across_lookups() {
+        let endpoint = "https://shared-disabled-flag.documents.azure.com:443/";
+        let flag_a = shared_disabled_flag(endpoint);
+        let flag_b = shared_disabled_flag(endpoint);
+        assert!(std::sync::Arc::ptr_eq(&flag_a, &flag_b));
+        flag_a.store(true, Ordering::SeqCst);
+        assert!(flag_b.load(Ordering::SeqCst));
     }
 }

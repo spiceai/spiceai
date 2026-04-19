@@ -25,12 +25,17 @@ limitations under the License.
 
 pub mod client;
 pub mod provider;
+pub mod resilience;
 pub mod schema;
 
 use snafu::Snafu;
 
 pub use client::{CosmosDBClient, CosmosDBCredential};
 pub use provider::CosmosDBTableProvider;
+pub use resilience::{
+    BackoffMethod, CosmosResilienceConfig, DEFAULT_MAX_CONCURRENT_REQUESTS, DEFAULT_MAX_RETRIES,
+    ResilienceError,
+};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -92,4 +97,19 @@ pub enum Error {
         "Invalid dataset path '{path}'. Azure Cosmos DB dataset paths must be of the form 'database.container' or 'database/container'."
     ))]
     InvalidDatasetPath { path: String },
+
+    #[snafu(display(
+        "The Azure Cosmos DB connector at '{endpoint}' is disabled after a permanent error (401/403/404). Fix the credentials or grants, then restart Spice."
+    ))]
+    ConnectorDisabled { endpoint: String },
+
+    #[snafu(display(
+        "Column '{column}' in Azure Cosmos DB dataset '{database}.{container}' has an unsupported Arrow data type ({data_type}). Set the dataset's `unsupported_type_action` parameter to `warn`, `ignore`, or `string` to proceed."
+    ))]
+    UnsupportedColumn {
+        database: String,
+        container: String,
+        column: String,
+        data_type: String,
+    },
 }

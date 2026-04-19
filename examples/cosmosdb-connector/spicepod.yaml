@@ -1,0 +1,47 @@
+version: v2
+kind: Spicepod
+name: cosmosdb-connector-example
+
+datasets:
+  # Full-scan dataset using the default query (`SELECT * FROM c`).
+  # Schema is inferred from the first 100 documents.
+  - from: cosmosdb:store.products
+    name: products
+    description: All products, schema inferred from the first 100 documents.
+    params:
+      cosmosdb_connection_string: ${ env:COSMOSDB_CONNECTION_STRING }
+
+  # Custom Cosmos SQL query — useful when the container is large and only a
+  # subset should be surfaced as a dataset.
+  - from: cosmosdb:store.orders
+    name: active_orders
+    description: Orders whose status is 'active'.
+    params:
+      cosmosdb_connection_string: ${ env:COSMOSDB_CONNECTION_STRING }
+      query: "SELECT * FROM c WHERE c.status = 'active'"
+      # Sample more documents for a more stable schema inference.
+      schema_infer_max_records: "500"
+
+  # Pinned schema — avoids inference drift when optional fields are null in
+  # the first N sampled documents but not in general.
+  - from: cosmosdb:store.products
+    name: products_pinned
+    description: Products with an explicit Arrow schema.
+    params:
+      cosmosdb_connection_string: ${ env:COSMOSDB_CONNECTION_STRING }
+      # Resilience tuning: tighten the per-account concurrency budget when
+      # the dataset is expected to run under heavy load.
+      max_concurrent_requests: "8"
+      http_max_retries: "5"
+      backoff_method: fibonacci
+    columns:
+      - name: id
+        type: string
+      - name: name
+        type: string
+      - name: price
+        type: double
+      - name: tags
+        type: list<string>
+      - name: available
+        type: boolean
