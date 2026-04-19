@@ -362,6 +362,9 @@ fn handle_query_error(e: query::Error) -> Status {
 }
 
 fn handle_datafusion_error(e: DataFusionError) -> Status {
+    if query::is_cancellation_error(&e) {
+        return Status::cancelled(e.to_string());
+    }
     match e {
         DataFusionError::Plan(err_msg) | DataFusionError::Execution(err_msg) => {
             Status::invalid_argument(err_msg)

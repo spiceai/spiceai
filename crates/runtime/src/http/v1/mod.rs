@@ -41,7 +41,7 @@ use crate::{
     component::dataset::Dataset,
     datafusion::{
         DataFusion,
-        query::{QueryBuilder, write_to_json_string, write_to_json_value},
+        query::{QueryBuilder, is_cancellation_error, write_to_json_string, write_to_json_value},
     },
     status::ComponentStatus,
 };
@@ -208,7 +208,17 @@ pub async fn sql_to_http_response(
         Ok((data, results_cache_status)) => (data, results_cache_status),
         Err(e) => {
             tracing::debug!("Error executing query: {e}");
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+            let status = if let Some(df_err) =
+                e.downcast_ref::<datafusion::error::DataFusionError>()
+                && is_cancellation_error(df_err)
+            {
+                // 499 Client Closed Request: used for cancelled queries so
+                // clients can distinguish cancellation from a bad request.
+                StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST)
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return (status, e.to_string()).into_response();
         }
     };
 

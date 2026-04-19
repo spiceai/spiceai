@@ -17,8 +17,9 @@ limitations under the License.
 //! Runtime-wide registry of active synchronous queries, keyed by query id.
 //!
 //! The registry provides a single place for administrative cancel operations
-//! (HTTP `/v1/queries/{id}/cancel`, `FlightSQL` `ActionCancelQueryRequest`) to
-//! look up a running query's [`CancellationToken`] and signal cancellation.
+//! (HTTP `/v1/queries/{id}/cancel`, custom Flight action `CancelQuery` with a
+//! JSON body) to look up a running query's [`CancellationToken`] and signal
+//! cancellation.
 //!
 //! Each entry is installed when a query begins execution and removed when the
 //! query completes via a RAII [`ActiveQueryGuard`]. Entries carry the

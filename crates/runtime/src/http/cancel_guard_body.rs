@@ -40,12 +40,24 @@ pub struct CancelGuardBody<B> {
     guard: Option<DropGuard>,
 }
 
-impl<B> CancelGuardBody<B> {
+impl<B> CancelGuardBody<B>
+where
+    B: Body,
+{
     pub fn new(inner: B, guard: DropGuard) -> Self {
-        Self {
-            inner,
-            guard: Some(guard),
-        }
+        // If the inner body already reports end-of-stream (empty bodies,
+        // HEAD responses, or callers that short-circuit based on
+        // `Body::is_end_stream` without ever polling), the request is
+        // effectively complete before the wrapper is dropped. Disarm the
+        // guard upfront so its `Drop` impl does not spuriously cancel the
+        // request token.
+        let guard = if inner.is_end_stream() {
+            guard.disarm();
+            None
+        } else {
+            Some(guard)
+        };
+        Self { inner, guard }
     }
 }
 
@@ -80,5 +92,141 @@ where
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CancelGuardBody;
+    use std::convert::Infallible;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use futures::task::noop_waker;
+    use http_body::{Body, Frame, SizeHint};
+    use tokio_util::sync::CancellationToken;
+
+    #[derive(Debug)]
+    struct StaticBody {
+        frames: std::vec::IntoIter<Frame<&'static [u8]>>,
+        end_stream: bool,
+    }
+
+    impl StaticBody {
+        fn new(frames: Vec<Frame<&'static [u8]>>) -> Self {
+            let end_stream = frames.is_empty();
+            Self {
+                frames: frames.into_iter(),
+                end_stream,
+            }
+        }
+
+        fn with_data_chunks(chunks: Vec<&'static [u8]>) -> Self {
+            Self::new(chunks.into_iter().map(Frame::data).collect())
+        }
+    }
+
+    impl Body for StaticBody {
+        type Data = &'static [u8];
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            match self.frames.next() {
+                Some(frame) => Poll::Ready(Some(Ok(frame))),
+                None => {
+                    self.end_stream = true;
+                    Poll::Ready(None)
+                }
+            }
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.end_stream
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::default()
+        }
+    }
+
+    fn test_context() -> Context<'static> {
+        let waker = Box::leak(Box::new(noop_waker()));
+        Context::from_waker(waker)
+    }
+
+    #[test]
+    fn cancels_when_dropped_before_end_of_stream() {
+        let token = CancellationToken::new();
+        let guard = token.clone().drop_guard();
+
+        let body = StaticBody::with_data_chunks(vec![b"chunk-1", b"chunk-2"]);
+        let mut guarded = Box::pin(CancelGuardBody::new(body, guard));
+        let mut cx = test_context();
+
+        let first = guarded.as_mut().poll_frame(&mut cx);
+        assert!(matches!(first, Poll::Ready(Some(Ok(_)))));
+        assert!(!token.is_cancelled());
+
+        drop(guarded);
+
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn does_not_cancel_after_normal_end_of_stream() {
+        let token = CancellationToken::new();
+        let guard = token.clone().drop_guard();
+
+        let body = StaticBody::with_data_chunks(vec![b"chunk-1"]);
+        let mut guarded = Box::pin(CancelGuardBody::new(body, guard));
+        let mut cx = test_context();
+
+        let first = guarded.as_mut().poll_frame(&mut cx);
+        assert!(matches!(first, Poll::Ready(Some(Ok(_)))));
+        assert!(!token.is_cancelled());
+
+        let eos = guarded.as_mut().poll_frame(&mut cx);
+        assert!(matches!(eos, Poll::Ready(None)));
+
+        drop(guarded);
+
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn does_not_cancel_for_empty_body_that_reports_end_of_stream() {
+        let token = CancellationToken::new();
+        let guard = token.clone().drop_guard();
+
+        // Body reports end-of-stream immediately without ever being polled.
+        let body = StaticBody {
+            frames: Vec::new().into_iter(),
+            end_stream: true,
+        };
+        let guarded = CancelGuardBody::new(body, guard);
+
+        drop(guarded);
+
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn does_not_cancel_for_empty_body_after_end_of_stream_is_observed() {
+        let token = CancellationToken::new();
+        let guard = token.clone().drop_guard();
+
+        let body = StaticBody::new(Vec::new());
+        let mut guarded = Box::pin(CancelGuardBody::new(body, guard));
+        let mut cx = test_context();
+
+        let eos = guarded.as_mut().poll_frame(&mut cx);
+        assert!(matches!(eos, Poll::Ready(None)));
+
+        drop(guarded);
+
+        assert!(!token.is_cancelled());
     }
 }
