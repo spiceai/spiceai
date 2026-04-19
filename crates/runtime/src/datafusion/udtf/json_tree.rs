@@ -119,7 +119,7 @@ impl Default for JsonTreeOptions {
     }
 }
 
-fn tree_fields() -> Fields {
+static TREE_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     Fields::from(vec![
         Field::new("key", DataType::Utf8, true),
         Field::new("value", DataType::Utf8, true),
@@ -130,14 +130,15 @@ fn tree_fields() -> Fields {
         Field::new("fullkey", DataType::Utf8, false),
         Field::new("path", DataType::Utf8, false),
     ])
-}
+});
 
-static OUTPUT_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| Arc::new(Schema::new(tree_fields())));
+static OUTPUT_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(Schema::new(TREE_FIELDS.clone())));
 
 static ROW_LIST_TYPE: LazyLock<DataType> = LazyLock::new(|| {
     DataType::List(Arc::new(Field::new(
         "item",
-        DataType::Struct(tree_fields()),
+        DataType::Struct(TREE_FIELDS.clone()),
         true,
     )))
 });
@@ -426,6 +427,11 @@ impl TableProvider for JsonTreeTable {
 }
 
 fn rows_to_batch(rows: &[TreeRow], schema: SchemaRef) -> DataFusionResult<RecordBatch> {
+    RecordBatch::try_new(schema, build_tree_arrays(rows))
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+fn build_tree_arrays(rows: &[TreeRow]) -> Vec<ArrayRef> {
     let mut key = StringBuilder::with_capacity(rows.len(), rows.len() * 8);
     let mut value = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
     let mut type_name = StringBuilder::with_capacity(rows.len(), rows.len() * 4);
@@ -458,7 +464,7 @@ fn rows_to_batch(rows: &[TreeRow], schema: SchemaRef) -> DataFusionResult<Record
         path.append_value(&row.path);
     }
 
-    let arrays: Vec<ArrayRef> = vec![
+    vec![
         Arc::new(key.finish()),
         Arc::new(value.finish()),
         Arc::new(type_name.finish()),
@@ -467,9 +473,7 @@ fn rows_to_batch(rows: &[TreeRow], schema: SchemaRef) -> DataFusionResult<Record
         Arc::new(parent.finish()),
         Arc::new(fullkey.finish()),
         Arc::new(path.finish()),
-    ];
-
-    RecordBatch::try_new(schema, arrays).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    ]
 }
 
 // -------- Scalar UDF --------
@@ -553,61 +557,20 @@ impl ScalarUDFImpl for JsonTreeScalar {
             offsets.push(len);
         }
 
-        let struct_array = tree_rows_to_struct(&all_rows);
+        let struct_array =
+            StructArray::new(TREE_FIELDS.clone(), build_tree_arrays(&all_rows), None);
         let list_array = ListArray::new(
-            Arc::new(Field::new("item", DataType::Struct(tree_fields()), true)),
+            Arc::new(Field::new(
+                "item",
+                DataType::Struct(TREE_FIELDS.clone()),
+                true,
+            )),
             OffsetBuffer::new(ScalarBuffer::from(offsets)),
             Arc::new(struct_array),
             None,
         );
         Ok(ColumnarValue::Array(Arc::new(list_array)))
     }
-}
-
-fn tree_rows_to_struct(rows: &[TreeRow]) -> StructArray {
-    let mut key = StringBuilder::with_capacity(rows.len(), rows.len() * 8);
-    let mut value = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
-    let mut type_name = StringBuilder::with_capacity(rows.len(), rows.len() * 4);
-    let mut atom = StringBuilder::with_capacity(rows.len(), rows.len() * 8);
-    let mut id = Int64Builder::with_capacity(rows.len());
-    let mut parent = Int64Builder::with_capacity(rows.len());
-    let mut fullkey = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
-    let mut path = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
-
-    for row in rows {
-        match &row.key {
-            Some(v) => key.append_value(v),
-            None => key.append_null(),
-        }
-        match &row.value {
-            Some(v) => value.append_value(v),
-            None => value.append_null(),
-        }
-        type_name.append_value(&row.type_name);
-        match &row.atom {
-            Some(v) => atom.append_value(v),
-            None => atom.append_null(),
-        }
-        id.append_value(row.id);
-        match row.parent {
-            Some(p) => parent.append_value(p),
-            None => parent.append_null(),
-        }
-        fullkey.append_value(&row.fullkey);
-        path.append_value(&row.path);
-    }
-
-    let arrays: Vec<ArrayRef> = vec![
-        Arc::new(key.finish()),
-        Arc::new(value.finish()),
-        Arc::new(type_name.finish()),
-        Arc::new(atom.finish()),
-        Arc::new(id.finish()),
-        Arc::new(parent.finish()),
-        Arc::new(fullkey.finish()),
-        Arc::new(path.finish()),
-    ];
-    StructArray::new(tree_fields(), arrays, None)
 }
 
 #[cfg(test)]

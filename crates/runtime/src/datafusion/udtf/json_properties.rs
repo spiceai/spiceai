@@ -67,7 +67,6 @@ limitations under the License.
 //! truncated-but-valid batch — never a query-level error.
 
 use std::any::Any;
-use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
@@ -138,7 +137,7 @@ fn record_error(kind: &'static str) {
 
 // -------- Output schema --------
 
-fn property_fields() -> Fields {
+static PROPERTY_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
     let enum_item = Arc::new(Field::new("item", DataType::Utf8, true));
     Fields::from(vec![
         Field::new("path", DataType::Utf8, false),
@@ -151,15 +150,18 @@ fn property_fields() -> Fields {
         Field::new("enum_values", DataType::List(enum_item), true),
         Field::new("metadata", DataType::Utf8, true),
     ])
-}
+});
 
 static OUTPUT_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| Arc::new(Schema::new(property_fields())));
+    LazyLock::new(|| Arc::new(Schema::new(PROPERTY_FIELDS.clone())));
 
-static ROW_STRUCT_TYPE: LazyLock<DataType> = LazyLock::new(|| DataType::Struct(property_fields()));
-
-static ROW_LIST_TYPE: LazyLock<DataType> =
-    LazyLock::new(|| DataType::List(Arc::new(Field::new("item", ROW_STRUCT_TYPE.clone(), true))));
+static ROW_LIST_TYPE: LazyLock<DataType> = LazyLock::new(|| {
+    DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::Struct(PROPERTY_FIELDS.clone()),
+        true,
+    )))
+});
 
 // -------- Row + Options --------
 
@@ -266,7 +268,10 @@ pub fn flatten_with_options(input: &str, opts: &FlattenOptions) -> Vec<PropertyR
     };
 
     let mut walker = Walker::new(&root, opts);
-    walker.walk_schema(&root, "", 0);
+    // Capture the root lifetime as a free variable so `walk_schema` sees it as
+    // `&'a Value` — letting ref resolution return `&'a Value` without cloning.
+    let root_ref: &Value = &root;
+    walker.walk_schema(root_ref, "", 0);
     ROWS_EMITTED.add(walker.rows.len() as u64, &[]);
     walker.rows
 }
@@ -295,18 +300,13 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// Entry point: treat `schema` as a composite and walk its direct children
-    /// (properties, items, additionalProperties). Combinators and `$ref` are
-    /// resolved first.
-    fn walk_schema(&mut self, schema: &Value, parent_path: &str, depth: usize) {
+    fn walk_schema(&mut self, schema: &'a Value, parent_path: &str, depth: usize) {
         if self.check_caps(depth) {
             return;
         }
-        let effective = self.effective_schemas(schema, depth);
+        let effective = self.effective_schemas(schema);
 
-        // Gather `required` across all branches so that allOf/oneOf/anyOf unions
-        // correctly mark the same field as required if any branch declares it.
-        let required: HashSet<String> = effective
+        let required: HashSet<&str> = effective
             .iter()
             .flat_map(|s| {
                 s.get("required")
@@ -314,18 +314,23 @@ impl<'a> Walker<'a> {
                     .into_iter()
                     .flatten()
             })
-            .filter_map(|v| v.as_str().map(ToOwned::to_owned))
+            .filter_map(Value::as_str)
             .collect();
 
-        // Deduplicate fields across branches; first declaration wins.
-        let mut seen_names: HashSet<String> = HashSet::new();
+        let mut seen_names: HashSet<&str> = HashSet::new();
         for eff in &effective {
             if let Some(properties) = eff.get("properties").and_then(Value::as_object) {
                 for (name, spec) in properties {
-                    if !seen_names.insert(name.clone()) {
+                    if !seen_names.insert(name.as_str()) {
                         continue;
                     }
-                    self.handle_field(name, spec, parent_path, required.contains(name), depth);
+                    self.handle_field(
+                        name,
+                        spec,
+                        parent_path,
+                        required.contains(name.as_str()),
+                        depth,
+                    );
                     if self.row_cap_hit {
                         return;
                     }
@@ -334,19 +339,17 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// Emit the row for a single field and recurse into its shape.
     fn handle_field(
         &mut self,
         name: &str,
-        spec: &Value,
+        spec: &'a Value,
         parent_path: &str,
         required: bool,
         depth: usize,
     ) {
         let path = make_path(parent_path, name, self.opts.path_style);
-        let effective_specs = self.effective_schemas(spec, depth);
+        let effective_specs = self.effective_schemas(spec);
 
-        // Infer type from the merged effective schemas (first non-unknown wins).
         let type_name = effective_specs
             .iter()
             .map(|s| compute_type(s))
@@ -369,7 +372,6 @@ impl<'a> Walker<'a> {
             }
         }
 
-        // Recurse into the shape.
         match type_name.as_str() {
             "object" => {
                 for eff in &effective_specs {
@@ -385,10 +387,9 @@ impl<'a> Walker<'a> {
                 for eff in &effective_specs {
                     if let Some(items) = eff.get("items") {
                         if items.is_object() {
-                            // Items may itself be an object with properties, or
-                            // a container we need to descend into. We reuse
-                            // `walk_schema` at the same path — child fields
-                            // appear as `array.child`.
+                            // Items may itself be typed / composite; reuse
+                            // walk_schema at the same path so leaves appear as
+                            // `array.child` rather than `array[].child`.
                             self.walk_schema(items, &path, depth + 1);
                             if self.row_cap_hit {
                                 return;
@@ -415,17 +416,18 @@ impl<'a> Walker<'a> {
 
     fn emit_row(
         &mut self,
-        raw_spec: &Value,
-        effective: &[Cow<'_, Value>],
+        raw_spec: &'a Value,
+        effective: &[&'a Value],
         path: &str,
         parent_path: &str,
         name: &str,
         type_name: &str,
         required: bool,
     ) {
-        // Prefer annotations declared on the first non-empty effective schema,
-        // falling back to the raw spec (which is what users authored on the
-        // field itself, before combinator merge).
+        // `effective` contains the raw_spec when no $ref was followed, and only
+        // the resolved target(s) when one was. The `or_else` arm preserves
+        // description / format / enum annotations declared alongside a $ref
+        // (JSON Schema 2020-12 lets them coexist; earlier drafts ignored them).
         let description = first_str(effective, "description")
             .or_else(|| raw_spec.get("description").and_then(Value::as_str))
             .map(ToOwned::to_owned);
@@ -466,102 +468,52 @@ impl<'a> Walker<'a> {
     }
 
     /// Resolve `$ref`, `allOf`, `oneOf`, `anyOf` into the list of contributing
-    /// schemas. External refs and unresolvable pointers pass through unchanged
-    /// so that callers can still read shape metadata from them.
-    fn effective_schemas<'b>(&mut self, schema: &'b Value, depth: usize) -> Vec<Cow<'b, Value>> {
-        let mut out: Vec<Cow<'b, Value>> = Vec::new();
-        self.collect_effective(schema, depth, &mut out);
+    /// schemas. External and unresolvable refs pass through as-is so callers
+    /// can still read shape metadata from them.
+    fn effective_schemas(&mut self, schema: &'a Value) -> Vec<&'a Value> {
+        let mut out = Vec::new();
+        self.collect_effective(schema, &mut out);
         if out.is_empty() {
-            out.push(Cow::Borrowed(schema));
+            out.push(schema);
         }
         out
     }
 
-    fn collect_effective<'b>(
-        &mut self,
-        schema: &'b Value,
-        depth: usize,
-        out: &mut Vec<Cow<'b, Value>>,
-    ) {
-        // Resolve a local $ref and splice the target's contributions in.
+    fn collect_effective(&mut self, schema: &'a Value, out: &mut Vec<&'a Value>) {
         if let Some(ref_str) = schema.get("$ref").and_then(Value::as_str) {
             if is_local_ref(ref_str) {
                 if self.visited_refs.contains(ref_str) {
                     record_error("cycle");
                     return;
                 }
-                if let Some(target) = resolve_local_ref(self.root, ref_str) {
+                // Copy out `self.root: &'a Value` (references are Copy) so the
+                // returned `Option<&'a Value>` survives past `self`'s borrow.
+                let root: &'a Value = self.root;
+                if let Some(target) = root.pointer(ref_str.trim_start_matches('#')) {
                     self.visited_refs.insert(ref_str.to_owned());
-                    // Clone the resolved target into an owned Cow so it stays
-                    // alive past the lifetime of the `target` borrow.
-                    let target_owned = target.clone();
-                    let mut branch: Vec<Cow<'static, Value>> = Vec::new();
-                    // We recurse with the owned clone; since we can't mix
-                    // lifetimes, push owned Cows directly.
-                    self.collect_effective_owned(&target_owned, depth, &mut branch);
+                    self.collect_effective(target, out);
                     self.visited_refs.remove(ref_str);
-                    // Upgrade 'static Cows into 'b Cows (safe: owned values).
-                    for c in branch {
-                        if let Cow::Owned(v) = c {
-                            out.push(Cow::Owned(v));
-                        }
-                    }
                     return;
                 }
                 // Local ref that doesn't resolve — fall through and treat the
                 // schema itself as the contribution.
             }
-            // External ref — include the schema as-is; `compute_type` will
-            // classify it as `ref`, and emit_row captures the URI in metadata.
-            out.push(Cow::Borrowed(schema));
+            // External ref — `compute_type` will classify as `ref`; the URI
+            // remains in `metadata`. Never dereferenced.
+            out.push(schema);
             return;
         }
 
-        out.push(Cow::Borrowed(schema));
+        out.push(schema);
         for comb in ["allOf", "oneOf", "anyOf"] {
             if let Some(arr) = schema.get(comb).and_then(Value::as_array) {
                 for entry in arr {
-                    self.collect_effective(entry, depth, out);
+                    self.collect_effective(entry, out);
                 }
             }
         }
     }
 
-    fn collect_effective_owned(
-        &mut self,
-        schema: &Value,
-        depth: usize,
-        out: &mut Vec<Cow<'static, Value>>,
-    ) {
-        if let Some(ref_str) = schema.get("$ref").and_then(Value::as_str) {
-            if is_local_ref(ref_str) {
-                if self.visited_refs.contains(ref_str) {
-                    record_error("cycle");
-                    return;
-                }
-                if let Some(target) = resolve_local_ref(self.root, ref_str) {
-                    self.visited_refs.insert(ref_str.to_owned());
-                    let target_owned = target.clone();
-                    self.collect_effective_owned(&target_owned, depth, out);
-                    self.visited_refs.remove(ref_str);
-                    return;
-                }
-            }
-            out.push(Cow::Owned(schema.clone()));
-            return;
-        }
-
-        out.push(Cow::Owned(schema.clone()));
-        for comb in ["allOf", "oneOf", "anyOf"] {
-            if let Some(arr) = schema.get(comb).and_then(Value::as_array) {
-                for entry in arr {
-                    self.collect_effective_owned(entry, depth, out);
-                }
-            }
-        }
-    }
-
-    /// Returns true if a depth/row cap has been hit and the walk should stop.
     fn check_caps(&mut self, depth: usize) -> bool {
         if depth > self.opts.max_depth {
             if !self.depth_cap_hit {
@@ -583,7 +535,7 @@ impl<'a> Walker<'a> {
 
 // -------- Helpers --------
 
-fn first_str<'a>(schemas: &'a [Cow<'_, Value>], key: &str) -> Option<&'a str> {
+fn first_str<'a>(schemas: &[&'a Value], key: &str) -> Option<&'a str> {
     schemas
         .iter()
         .find_map(|s| s.get(key).and_then(Value::as_str))
@@ -591,31 +543,6 @@ fn first_str<'a>(schemas: &'a [Cow<'_, Value>], key: &str) -> Option<&'a str> {
 
 fn is_local_ref(ref_str: &str) -> bool {
     ref_str.starts_with('#')
-}
-
-/// Resolve a local JSON-Pointer `$ref` of the form `#/a/b/c` against the root.
-/// Supports `~0` (`~`) and `~1` (`/`) escaping per RFC 6901.
-fn resolve_local_ref<'a>(root: &'a Value, ref_str: &str) -> Option<&'a Value> {
-    let pointer = ref_str.trim_start_matches('#');
-    if pointer.is_empty() {
-        return Some(root);
-    }
-    if !pointer.starts_with('/') {
-        return None;
-    }
-    let mut current = root;
-    for raw in pointer.split('/').skip(1) {
-        let token = raw.replace("~1", "/").replace("~0", "~");
-        current = match current {
-            Value::Object(map) => map.get(&token)?,
-            Value::Array(arr) => {
-                let idx = token.parse::<usize>().ok()?;
-                arr.get(idx)?
-            }
-            _ => return None,
-        };
-    }
-    Some(current)
 }
 
 /// Classify a schema node into one of the emitted type labels.
@@ -1035,11 +962,11 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
         }
 
         let (struct_arrays, _) = build_property_arrays(&all_rows);
-        let struct_array = StructArray::new(property_fields(), struct_arrays, None);
+        let struct_array = StructArray::new(PROPERTY_FIELDS.clone(), struct_arrays, None);
         let list_array = ListArray::new(
             Arc::new(Field::new(
                 "item",
-                DataType::Struct(property_fields()),
+                DataType::Struct(PROPERTY_FIELDS.clone()),
                 true,
             )),
             OffsetBuffer::new(ScalarBuffer::from(offsets)),

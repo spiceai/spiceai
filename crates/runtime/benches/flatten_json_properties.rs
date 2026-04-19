@@ -1,12 +1,11 @@
 #![allow(clippy::expect_used)]
 
-//! Benchmarks for `flatten_json_properties` — see issue #10399 M3.
+//! Benchmarks for `flatten_json_properties`.
 //!
-//! Target: cold view materialization of a 10k-schema × 500-attribute synthetic
-//! catalog in <10s and <1 GiB RSS on a 4-core dev laptop. These benchmarks
-//! exercise the walker in isolation (no DataFusion plumbing) so regressions
+//! Exercises the walker in isolation (no DataFusion plumbing) so regressions
 //! attributable to the walker itself surface without noise from query planning
-//! or Arrow I/O.
+//! or Arrow I/O. `bench_catalog_simulation` approximates the typical
+//! materialization shape — 1k schemas × 50 fields per schema.
 
 use std::hint::black_box;
 
@@ -78,8 +77,6 @@ fn bench_nested_schemas(c: &mut Criterion) {
 }
 
 fn bench_catalog_simulation(c: &mut Criterion) {
-    // Simulates the M3 target: walk 10k schemas with the default options. We
-    // shrink to 1k per iteration to keep each sample well under a second.
     let opts = FlattenOptions::default();
     let doc = synthetic_schema(50);
     c.bench_function("flatten_json_properties/catalog_1k_schemas", |b| {
