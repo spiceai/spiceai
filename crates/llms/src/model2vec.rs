@@ -100,7 +100,7 @@ impl Model2Vec {
             .map_err(|e| FailedToInstantiateEmbeddingModel { source: e.into() })?;
 
         let model2vec = Self {
-            name: name.to_string(),
+            name,
             model,
             normalize,
             parallelism,
