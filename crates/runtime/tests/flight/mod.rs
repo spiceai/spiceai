@@ -29,7 +29,7 @@ use arrow_flight::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::sql::TableReference;
 use futures::{Stream, TryStreamExt as _};
-use rand::Rng as _;
+use rand::RngExt as _;
 use runtime::{
     Runtime, accelerated_table::refresh::Refresh, auth::EndpointAuth,
     component::dataset::acceleration::Acceleration, config::Config, datafusion::DataFusion,

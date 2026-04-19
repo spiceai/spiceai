@@ -76,9 +76,9 @@ impl GraphQLContext for IssuesTableArgs {
     fn query_cost(&self) -> Option<u32> {
         // issues(first: 100) could retrieve up to 100 issues
         // each query returns labels, comments and assignees which are each additional requests
-        // 1 + 100 (labels) + 100 (comments) + 100 (assignees) = 301 points
+        // 1 + 100 (labels) + 25 (comments) + 100 (assignees) = 226 points
         // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
-        Some(301)
+        Some(226)
     }
 }
 
@@ -112,7 +112,7 @@ impl GitHubTableArgs for IssuesTableArgs {
                             milestone_title: milestone {{ milestone_title: title }}
                             labels(first: 100) {{ labels: nodes {{ name }} }}
                             milestone_title: milestone {{ milestone_title: title }}
-                            comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
+                            comments(first: 25) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
                             assignees(first: 100) {{ assignees: nodes {{ login }} }}
                             type: issueType {{ type: name, type_color: color }}
                         }}
@@ -145,7 +145,7 @@ impl GitHubTableArgs for IssuesTableArgs {
                             milestone_title: milestone {{ milestone_title: title }}
                             labels(first: 100) {{ labels: nodes {{ name }} }}
                             milestone_title: milestone {{ milestone_title: title }}
-                            comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
+                            comments(first: 25) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
                             assignees(first: 100) {{ assignees: nodes {{ login }} }}
                             type: issueType {{ type: name, type_color: color }}
                         }}

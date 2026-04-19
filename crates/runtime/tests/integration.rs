@@ -70,6 +70,7 @@ mod endpoint_auth;
 mod file;
 mod flight;
 mod gcs;
+mod git;
 mod github;
 mod glue;
 mod graphql;

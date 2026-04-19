@@ -30,7 +30,7 @@ use datafusion::{
     arrow::datatypes::{DataType, Field, Schema},
     datasource::{MemTable, TableProvider},
 };
-use rand::Rng;
+use rand::RngExt;
 use runtime::{
     Runtime,
     auth::EndpointAuth,

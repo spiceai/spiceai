@@ -111,7 +111,7 @@ impl SpiceTest<NotStarted> {
                 if (0 == i || i > buffer_size) && i.is_multiple_of(5) {
                     println!(
                         "[TextToSqlWorkers]: Complete {}/{num_requests} requests",
-                        i.checked_sub(buffer_size).unwrap_or_default(),
+                        i.saturating_sub(buffer_size),
                     );
                 }
             }

@@ -8,12 +8,13 @@ All criteria must be met for the embedding component to be considered Alpha. As 
 
 |     Embedding Type      | Alpha Quality | DRI Sign-off |
 | ----------------------- | ------------- | ------------ |
+| Amazon Bedrock          | ➖            |              |
+| Azure OpenAI            | ➖            |              |
+| Databricks              | ➖            |              |
 | File                    | ✅            | @Jeadie      |
 | Hugging Face            | ✅            | @Jeadie      |
-| Spice.ai Cloud Platform | ➖            |              |
 | OpenAI                  | ✅            | @ewgenius    |
-| Azure Openai            | ➖            |              |
-| xAI (Grok)              | ➖            |              |
+| Spice.ai Cloud Platform | ➖            |              |
 
 ## Alpha Release Criteria
 

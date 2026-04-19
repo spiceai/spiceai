@@ -98,6 +98,11 @@ pub enum ReadyState {
     OnLoad,
     /// The table is ready immediately on registration, with fallback to federated table for queries until the initial load completes.
     OnRegistration,
+    /// The table is ready once the federated source's schema has been resolved (which also implies access
+    /// to the source has been verified), without waiting for the initial data refresh to complete. Queries
+    /// fall back to the federated source until the initial load completes. Subsequent refresh failures are
+    /// still reported via dataset status and metrics.
+    OnSchemaResolved,
 }
 
 /// Controls whether the federated table periodically has its availability checked.

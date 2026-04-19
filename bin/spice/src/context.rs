@@ -122,7 +122,7 @@ impl RuntimeContext {
         }
 
         if let Some(region) = cloud {
-            ctx.http_endpoint = format!("https://{region}-data.spiceai.io");
+            ctx.http_endpoint = format!("https://{region}-prod-aws-data.spiceai.io");
             ctx.cloud_region = Some(region.to_string());
         }
 
@@ -889,7 +889,10 @@ mod tests {
             .expect("with_args should succeed");
 
         assert!(ctx.is_cloud());
-        assert_eq!(ctx.http_endpoint(), "https://us-east-1-data.spiceai.io");
+        assert_eq!(
+            ctx.http_endpoint(),
+            "https://us-east-1-prod-aws-data.spiceai.io"
+        );
         assert_eq!(ctx.cloud_region(), Some("us-east-1"));
     }
 
@@ -1007,7 +1010,10 @@ mod tests {
         .expect("with_args should succeed");
 
         assert!(ctx.is_cloud());
-        assert_eq!(ctx.http_endpoint(), "https://us-west-2-data.spiceai.io");
+        assert_eq!(
+            ctx.http_endpoint(),
+            "https://us-west-2-prod-aws-data.spiceai.io"
+        );
     }
 
     #[test]
@@ -1022,7 +1028,10 @@ mod tests {
         .expect("with_args should succeed");
 
         assert!(ctx.is_cloud());
-        assert_eq!(ctx.http_endpoint(), "https://us-west-2-data.spiceai.io");
+        assert_eq!(
+            ctx.http_endpoint(),
+            "https://us-west-2-prod-aws-data.spiceai.io"
+        );
         assert_eq!(ctx.api_key(), Some("cloud-api-key-12345"));
     }
 
@@ -1069,7 +1078,10 @@ mod tests {
             .expect("with_args should succeed");
 
         // Cloud mode socket address should strip https://
-        assert_eq!(ctx.http_socket_address(), "us-east-1-data.spiceai.io");
+        assert_eq!(
+            ctx.http_socket_address(),
+            "us-east-1-prod-aws-data.spiceai.io"
+        );
     }
 
     #[test]

@@ -48,7 +48,7 @@ use crate::context::RuntimeContext;
 use crate::error::{ConnectionFailedSnafu, InvalidResponseSnafu, Result};
 use clap::Args;
 use opentelemetry::trace::TraceId;
-use rand::RngCore;
+use rand::Rng;
 use serde::Serialize;
 use snafu::ResultExt;
 use spiceai::ClientBuilder;

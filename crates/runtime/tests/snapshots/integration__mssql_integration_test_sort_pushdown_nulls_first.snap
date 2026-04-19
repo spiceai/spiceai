@@ -1,0 +1,15 @@
+---
+source: crates/runtime/tests/integration.rs
+description: "Query: SELECT col_long, col_varchar, col_decimal FROM test ORDER BY col_long DESC NULLS FIRST LIMIT 2"
+---
++---------------+----------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                               |
++---------------+----------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: test.col_long DESC NULLS FIRST, fetch=2                                                      |
+|               |   TableScan: test projection=[col_long, col_varchar, col_decimal]                                  |
+| physical_plan | SortExec: TopK(fetch=2), expr=[col_long@0 DESC], preserve_partitioning=[false]                     |
+|               |   CooperativeExec                                                                                  |
+|               |     BytesProcessedExec                                                                             |
+|               |       SqlServerExec sql=SELECT col_long, col_varchar, col_decimal FROM test ORDER BY col_long DESC |
+|               |                                                                                                    |
++---------------+----------------------------------------------------------------------------------------------------+

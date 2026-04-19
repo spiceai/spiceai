@@ -28,25 +28,27 @@ use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::{Extension, LogicalPlan};
 use datafusion_expr::DmlStatement;
 
-use crate::datafusion::cayenne_ddl::dml_planner::{extract_filter_sql, extract_update_assignments};
+use crate::datafusion::cayenne_ddl::dml_planner::{extract_filters, extract_update_assignments};
 use crate::datafusion::cayenne_ddl::logical_nodes::DistributedCayenneUpdateNode;
 
 /// Wrap a `DataFusion` `DmlStatement` (UPDATE) into a distributed Cayenne
 /// extension node for forwarding to executor nodes.
 ///
+/// This rewrite is only used for scheduler-side distributed overlay paths.
+///
 /// This is only called in distributed (scheduler) mode. In local mode,
 /// the standard `DataFusion` plan is returned unchanged by the caller.
 pub(super) fn plan_distributed_update(dml: &DmlStatement) -> DFResult<LogicalPlan> {
-    let filter_sql = extract_filter_sql(&dml.input)?;
-    let assignments_sql = extract_update_assignments(&dml.input, &dml.table_name)?;
+    let filters = extract_filters(&dml.input)?;
+    let assignments = extract_update_assignments(&dml.input, &dml.table_name)?;
 
     Ok(LogicalPlan::Extension(Extension {
         node: Arc::new(DistributedCayenneUpdateNode::new(
             dml.table_name.clone(),
             Arc::clone(&dml.input),
             Arc::clone(&dml.output_schema),
-            filter_sql,
-            assignments_sql,
+            filters,
+            assignments,
         )),
     }))
 }
