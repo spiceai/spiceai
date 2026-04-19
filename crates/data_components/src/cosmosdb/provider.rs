@@ -333,22 +333,22 @@ impl ExecutionPlan for CosmosDBExec {
         builder.spawn(async move {
             let container_client = client.container_client(&config.database, &config.container);
 
+            let query_context_error = |source: Box<dyn std::error::Error + Send + Sync>| {
+                to_df_error(Error::QueryFailed {
+                    database: config.database.clone(),
+                    container: config.container.clone(),
+                    source,
+                })
+            };
+
             let mut pager = container_client
                 .query_items::<Value>(config.query.as_str(), (), None)
-                .map_err(|e| {
-                    DataFusionError::External(
-                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                    )
-                })?;
+                .map_err(|e| query_context_error(Box::new(e)))?;
 
             let mut buffer: Vec<Value> = Vec::with_capacity(STREAM_BATCH_SIZE);
 
             while let Some(item) = pager.next().await {
-                let doc = item.map_err(|e| {
-                    DataFusionError::External(
-                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                    )
-                })?;
+                let doc = item.map_err(|e| query_context_error(Box::new(e)))?;
 
                 buffer.push(strip_system_fields(doc));
 
@@ -420,4 +420,83 @@ fn decode_batch(
 
 fn to_df_error(e: Error) -> DataFusionError {
     DataFusionError::External(Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use serde_json::json;
+
+    fn sample_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("count", DataType::Int64, true),
+        ]))
+    }
+
+    #[test]
+    fn decode_batch_decodes_multiple_documents() {
+        let schema = sample_schema();
+        let docs = vec![
+            json!({"id": "a", "count": 1}),
+            json!({"id": "b", "count": 2}),
+            json!({"id": "c", "count": 3}),
+        ];
+        let batch = decode_batch(&docs, &schema, None).unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 2);
+
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(id_col.value(0), "a");
+        assert_eq!(id_col.value(2), "c");
+
+        let count_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(count_col.value(0), 1);
+        assert_eq!(count_col.value(2), 3);
+    }
+
+    #[test]
+    fn decode_batch_applies_projection() {
+        let schema = sample_schema();
+        let docs = vec![json!({"id": "a", "count": 1})];
+        // Project only the second column (`count`).
+        let batch = decode_batch(&docs, &schema, Some(&[1])).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.schema().field(0).name(), "count");
+    }
+
+    #[test]
+    fn decode_batch_handles_empty_input() {
+        let schema = sample_schema();
+        let batch = decode_batch(&[], &schema, None).unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 2);
+    }
+
+    #[test]
+    fn decode_batch_fills_missing_fields_with_null() {
+        // Cosmos documents are schemaless — some docs may omit fields the
+        // inferred schema includes. Those cells must surface as nulls.
+        let schema = sample_schema();
+        let docs = vec![json!({"id": "a"}), json!({"id": "b", "count": 2})];
+        let batch = decode_batch(&docs, &schema, None).unwrap();
+        let count_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(count_col.is_null(0));
+        assert_eq!(count_col.value(1), 2);
+    }
 }

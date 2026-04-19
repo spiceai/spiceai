@@ -153,14 +153,14 @@ fn parse_database_and_container(
         (None, Some(d)) => d,
         (None, None) => {
             return Err(format!(
-                "Could not determine Cosmos DB database from dataset path '{path}'. Expected 'database.container' or set the 'database' parameter."
+                "Could not determine Cosmos DB database from dataset path '{path}'. Expected 'database.container' or set the 'cosmosdb_database' parameter."
             ));
         }
     };
 
     if database.is_empty() {
         return Err(format!(
-            "Could not determine Cosmos DB database from dataset path '{path}'. Expected 'database.container' or set the 'database' parameter."
+            "Could not determine Cosmos DB database from dataset path '{path}'. Expected 'database.container' or set the 'cosmosdb_database' parameter."
         ));
     }
 
