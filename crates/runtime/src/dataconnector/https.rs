@@ -808,7 +808,7 @@ impl Https {
 /// marker that enables JSON schema decomposition. Returns `None` when
 /// no column is marked, otherwise the full nesting configuration.
 ///
-/// Consistent with the DynamoDB connector: exactly one column may be
+/// Consistent with the `DynamoDB` connector: exactly one column may be
 /// marked, and the only supported marker value is `"*"`.
 fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<HttpJsonNesting>> {
     let marked: Vec<&Column> = dataset
@@ -834,18 +834,18 @@ fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<Http
     }
 
     let json_column = marked[0];
-    let Some(marker) = json_column.metadata.get("json_object") else {
+    let Some(marker_value) = json_column.metadata.get("json_object") else {
         unreachable!("json_object key existence was checked above")
     };
 
-    let is_wildcard = matches!(marker, Value::String(s) if s == "*");
+    let is_wildcard = matches!(marker_value, Value::String(s) if s == "*");
     if !is_wildcard {
         return Err(DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: "https".to_string(),
             connector_component: ConnectorComponent::from(dataset),
             message: format!(
                 "Column '{}' has invalid 'json_object' value: {:?}. Only '*' is supported.",
-                json_column.name, marker
+                json_column.name, marker_value
             ),
         });
     }

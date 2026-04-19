@@ -16,7 +16,7 @@ limitations under the License.
 
 //! JSON schema decomposition for the HTTP connector.
 //!
-//! Mirrors the DynamoDB connector's `JsonNesting` feature so that users
+//! Mirrors the `DynamoDB` connector's `JsonNesting` feature so that users
 //! can declare a set of top-level static columns plus one catch-all JSON
 //! column via the spicepod `columns:` syntax:
 //!
