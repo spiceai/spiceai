@@ -167,6 +167,11 @@ impl Embed for Model2Vec {
             }
         };
 
+        if embedding_input.is_empty() {
+            tracing::debug!("Embedding input is empty, returning empty vector");
+            return Ok(vec![]);
+        }
+
         Ok(self.model.encode_with_args(
             &embedding_input,
             self.embed_max_token_length,
