@@ -26,7 +26,7 @@ use async_openai::{
 use async_stream::stream;
 use futures::{Stream, StreamExt};
 use rand::distr::Alphanumeric;
-use rand::{Rng, rng};
+use rand::{RngExt, rng};
 use std::{pin::Pin, time::SystemTime};
 
 use crate::chat::Result;

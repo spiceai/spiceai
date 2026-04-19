@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use super::json_nest::{HttpJsonNesting, decompose_json_row};
 use arrow::{
     array::{ArrayRef, MapBuilder, MapFieldNames, RecordBatch, StringArray, StringBuilder},
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -91,6 +92,9 @@ pub enum Error {
 
     #[snafu(display("HTTP pagination error: {message}"))]
     Pagination { message: String },
+
+    #[snafu(display("Failed to decompose HTTP response row into declared columns: {source}"))]
+    JsonNesting { source: super::json_nest::Error },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -117,6 +121,9 @@ impl From<Error> for DataFusionError {
             Error::InvalidUrl { source } => DataFusionError::External(Box::new(source)),
             Error::Arrow { source } => DataFusionError::ArrowError(Box::new(source), None),
             Error::DataFusion { source } => source,
+            Error::JsonNesting { source } => {
+                DataFusionError::External(Box::new(Error::JsonNesting { source }))
+            }
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
             }
@@ -310,6 +317,11 @@ pub struct HttpTableProvider {
     max_body_bytes: usize,
     health_probe: Option<String>,
     pagination: Option<PaginationConfig>,
+    auth: Option<Arc<dyn super::auth::HttpAuthenticator>>,
+    /// When set, JSON response rows are decomposed into the declared
+    /// static columns plus a catch-all JSON column. Schema is replaced
+    /// with the user-declared columns (all `Utf8`).
+    json_nesting: Option<HttpJsonNesting>,
 }
 
 impl std::fmt::Debug for HttpTableProvider {
@@ -355,7 +367,25 @@ impl HttpTableProvider {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             health_probe: None,
             pagination: None,
+            auth: None,
+            json_nesting: None,
         }
+    }
+
+    /// Configure JSON schema decomposition. Replaces the provider's
+    /// schema with one built from the user-declared columns (all
+    /// `Utf8`, nullable). Each scanned JSON response row is decomposed
+    /// at query time via [`decompose_json_row`].
+    #[must_use]
+    pub fn with_json_nesting(mut self, nesting: HttpJsonNesting) -> Self {
+        let fields: Vec<Field> = nesting
+            .column_order
+            .iter()
+            .map(|name| Field::new(name, DataType::Utf8, true))
+            .collect();
+        self.schema = Arc::new(Schema::new(fields));
+        self.json_nesting = Some(nesting);
+        self
     }
 
     pub fn with_allowed_paths<I, S>(mut self, paths: I) -> Result<Self>
@@ -475,6 +505,21 @@ impl HttpTableProvider {
     #[must_use]
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.custom_headers = headers;
+        self
+    }
+
+    /// Read-only access to the currently configured custom headers.
+    #[must_use]
+    pub fn custom_headers(&self) -> &HeaderMap {
+        &self.custom_headers
+    }
+
+    /// Attach an [`HttpAuthenticator`](super::auth::HttpAuthenticator) that decorates
+    /// every outgoing data request (e.g. to apply a bearer token refreshed in the
+    /// background by [`RefreshTokenAuth`](super::auth::RefreshTokenAuth)).
+    #[must_use]
+    pub fn with_auth(mut self, auth: Arc<dyn super::auth::HttpAuthenticator>) -> Self {
+        self.auth = Some(auth);
         self
     }
 
@@ -629,7 +674,7 @@ impl HttpTableProvider {
             test_url.set_path(health_probe_path);
             test_url
         } else {
-            use rand::Rng;
+            use rand::RngExt;
             use rand::distr::Alphanumeric;
 
             // Generate a random path that should return 404
@@ -902,6 +947,10 @@ impl HttpTableProvider {
             request_builder = request_builder.header(name, value);
         }
 
+        if let Some(auth) = self.auth.as_ref() {
+            request_builder = auth.apply(request_builder);
+        }
+
         let response = request_builder.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {e}");
             RetryError::transient(Error::HttpRequest { source: e })
@@ -1064,8 +1113,14 @@ impl HttpTableProvider {
     ) -> DataFusionResult<SchemaRef> {
         let mut projected_schema = project_schema(schema, projection)?;
         if projected_schema.fields.is_empty() {
-            let idx = schema.index_of("content")?;
-            projected_schema = SchemaRef::from(schema.project(&[idx])?);
+            // Fall back to a single column so downstream operators
+            // (e.g. COUNT(*)) have something to scan. Prefer `content`
+            // for the default schema; otherwise use the first field
+            // (e.g. when `with_json_nesting` has replaced the schema).
+            let idx = schema.index_of("content").unwrap_or(0);
+            if !schema.fields.is_empty() {
+                projected_schema = SchemaRef::from(schema.project(&[idx])?);
+            }
         }
         Ok(projected_schema)
     }
@@ -1245,6 +1300,10 @@ impl HttpExec {
             .map_err(DataFusionError::from);
         }
 
+        if let Some(nesting) = &self.provider.json_nesting {
+            return self.create_batch_from_rows_nested(content_rows, nesting);
+        }
+
         // Store the actual values from the partition for the primary key
         let path_for_batch = path.unwrap_or("");
         let query_for_batch = query.unwrap_or("");
@@ -1335,6 +1394,63 @@ impl HttpExec {
         let batch = RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
             .map_err(DataFusionError::from)?;
         Ok(batch)
+    }
+
+    /// Create a `RecordBatch` for the user-declared columns by
+    /// decomposing each JSON response row according to the nesting
+    /// configuration. All output columns are `Utf8`.
+    ///
+    /// Takes a fast path for object rows when the catch-all column is
+    /// not part of the projection: reads static fields directly from
+    /// the parsed JSON object and skips building the catch-all map /
+    /// serializing it. Falls back to the full `decompose_json_row`
+    /// when the catch-all is needed or the row isn't a JSON object.
+    fn create_batch_from_rows_nested(
+        &self,
+        content_rows: &[String],
+        nesting: &HttpJsonNesting,
+    ) -> DataFusionResult<RecordBatch> {
+        let fields = self.projected_schema.fields();
+        let field_names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
+        let catchall_projected = field_names.contains(&nesting.json_field_name.as_str());
+
+        let mut builders: Vec<StringBuilder> = std::iter::repeat_with(StringBuilder::new)
+            .take(fields.len())
+            .collect();
+
+        for row in content_rows {
+            if !catchall_projected
+                && let Ok(serde_json::Value::Object(obj)) =
+                    serde_json::from_str::<serde_json::Value>(row)
+            {
+                for (builder, name) in builders.iter_mut().zip(field_names.iter()) {
+                    match obj.get(*name) {
+                        None | Some(serde_json::Value::Null) => builder.append_null(),
+                        Some(serde_json::Value::String(s)) => builder.append_value(s),
+                        Some(other) => builder.append_value(other.to_string()),
+                    }
+                }
+                continue;
+            }
+
+            let decomposed = decompose_json_row(row, nesting).map_err(|source| {
+                DataFusionError::External(Box::new(Error::JsonNesting { source }))
+            })?;
+            for (builder, name) in builders.iter_mut().zip(field_names.iter()) {
+                match decomposed.get(*name).and_then(|v| v.as_deref()) {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+        }
+
+        let columns: Vec<ArrayRef> = builders
+            .into_iter()
+            .map(|mut b| Arc::new(b.finish()) as ArrayRef)
+            .collect();
+
+        RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
+            .map_err(DataFusionError::from)
     }
 
     /// Parse content into individual rows
@@ -5151,5 +5267,244 @@ mod tests {
             1,
             "no duplicates: {result}"
         );
+    }
+
+    fn nested_exec(
+        column_order: &[&str],
+        json_field: &str,
+    ) -> (HttpExec, super::super::json_nest::HttpJsonNesting) {
+        let nesting = super::super::json_nest::HttpJsonNesting::new(
+            column_order.iter().map(|s| (*s).to_string()).collect(),
+            json_field.to_string(),
+        );
+        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None)], None);
+        (exec, nesting)
+    }
+
+    fn string_col(batch: &RecordBatch, name: &str) -> Vec<Option<String>> {
+        let idx = batch
+            .schema()
+            .index_of(name)
+            .expect("column should exist in batch");
+        let arr = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("column should be StringArray");
+        (0..arr.len())
+            .map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i).to_string())
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_decomposes_object_rows() {
+        let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
+        let rows = vec![
+            r#"{"id":"1","name":"alpha","extra":"x"}"#.to_string(),
+            r#"{"id":"2","name":"beta","k":42}"#.to_string(),
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 3);
+
+        assert_eq!(
+            string_col(&batch, "id"),
+            vec![Some("1".to_string()), Some("2".to_string())]
+        );
+        assert_eq!(
+            string_col(&batch, "name"),
+            vec![Some("alpha".to_string()), Some("beta".to_string())]
+        );
+        let details = string_col(&batch, "details");
+        assert_eq!(details[0].as_deref(), Some(r#"{"extra":"x"}"#));
+        assert_eq!(details[1].as_deref(), Some(r#"{"k":42}"#));
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_missing_keys_become_null() {
+        let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
+        let rows = vec![
+            r#"{"id":"1","extra":"x"}"#.to_string(),
+            r#"{"name":"beta"}"#.to_string(),
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 2);
+
+        assert_eq!(string_col(&batch, "id"), vec![Some("1".to_string()), None]);
+        assert_eq!(
+            string_col(&batch, "name"),
+            vec![None, Some("beta".to_string())]
+        );
+        // Row 0 has a non-declared key, row 1 has no extras so catch-all is NULL
+        let details = string_col(&batch, "details");
+        assert_eq!(details[0].as_deref(), Some(r#"{"extra":"x"}"#));
+        assert!(details[1].is_none());
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_non_object_rows_go_to_catchall() {
+        let (exec, nesting) = nested_exec(&["id", "details"], "details");
+        let rows = vec![
+            "[1,2,3]".to_string(),
+            "\"scalar\"".to_string(),
+            "42".to_string(),
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 3);
+        // All id values should be NULL for non-object rows
+        for v in string_col(&batch, "id") {
+            assert!(
+                v.is_none(),
+                "non-object rows should have NULL for static fields"
+            );
+        }
+        let details = string_col(&batch, "details");
+        assert_eq!(details[0].as_deref(), Some("[1,2,3]"));
+        assert_eq!(details[1].as_deref(), Some("\"scalar\""));
+        assert_eq!(details[2].as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_empty_catchall_is_null_when_all_keys_declared() {
+        let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
+        let rows = vec![r#"{"id":"1","name":"alpha"}"#.to_string()];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(string_col(&batch, "id")[0].as_deref(), Some("1"));
+        assert_eq!(string_col(&batch, "name")[0].as_deref(), Some("alpha"));
+        assert!(
+            string_col(&batch, "details")[0].is_none(),
+            "catch-all should be NULL when no non-declared keys are present"
+        );
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_fast_path_when_catchall_not_projected() {
+        // Projection keeps only a static column; the catch-all column
+        // should never be built. Verify both behavior and that wide
+        // rows don't produce extra columns.
+        let nesting = super::super::json_nest::HttpJsonNesting::new(
+            vec!["id".to_string(), "name".to_string(), "details".to_string()],
+            "details".to_string(),
+        );
+        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let full_schema = provider.schema();
+        let id_idx = full_schema.index_of("id").expect("id in schema");
+        let projected = datafusion::common::project_schema(&full_schema, Some(&vec![id_idx]))
+            .expect("project schema");
+        let exec = HttpExec::new(projected, provider, vec![(None, None, None)], None);
+        let rows = vec![
+            r#"{"id":"1","name":"alpha","huge":"x","payload":{"a":1,"b":[1,2,3]}}"#.to_string(),
+            r#"{"id":"2","payload":"y"}"#.to_string(),
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(
+            string_col(&batch, "id"),
+            vec![Some("1".to_string()), Some("2".to_string())]
+        );
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_fast_path_falls_through_on_non_object_rows() {
+        // When catch-all isn't projected but a row isn't a JSON object,
+        // the fast path must not apply blindly — decompose_json_row still
+        // runs and yields NULL for static fields.
+        let nesting = super::super::json_nest::HttpJsonNesting::new(
+            vec!["id".to_string(), "details".to_string()],
+            "details".to_string(),
+        );
+        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let full_schema = provider.schema();
+        let id_idx = full_schema.index_of("id").expect("id in schema");
+        let projected = datafusion::common::project_schema(&full_schema, Some(&vec![id_idx]))
+            .expect("project schema");
+        let exec = HttpExec::new(projected, provider, vec![(None, None, None)], None);
+        let rows = vec!["[1,2,3]".to_string(), r#"{"id":"x"}"#.to_string()];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 1);
+        let id = string_col(&batch, "id");
+        assert!(id[0].is_none(), "non-object row: id should be NULL");
+        assert_eq!(id[1].as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn create_batch_from_rows_empty_projection_nested_falls_back_to_first_column() {
+        // When DataFusion projects zero columns (e.g. COUNT(*)), `get_projected_schema`
+        // falls back to a single-column schema. For nested providers that's the first
+        // declared column. `create_batch_from_rows_nested` must produce a batch with
+        // the correct row count against that single-column schema.
+        let nesting = super::super::json_nest::HttpJsonNesting::new(
+            vec!["id".to_string(), "details".to_string()],
+            "details".to_string(),
+        );
+        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let full_schema = provider.schema();
+        let projected =
+            HttpTableProvider::get_projected_schema(&full_schema, Some(&vec![])).expect("schema");
+        assert_eq!(
+            projected.fields().len(),
+            1,
+            "empty projection should fall back to a single field"
+        );
+        let exec = HttpExec::new(projected, provider, vec![(None, None, None)], None);
+        let rows = vec![
+            r#"{"id":"1","extra":"x"}"#.to_string(),
+            r#"{"id":"2"}"#.to_string(),
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 1);
+    }
+
+    #[test]
+    fn create_batch_from_rows_dispatches_to_nested_when_configured() {
+        // End-to-end through create_batch_from_rows: a provider configured with
+        // JSON nesting should route batch construction through the nested path
+        // and ignore HTTP-metadata fields.
+        let (exec, _nesting) = nested_exec(&["id", "name", "details"], "details");
+        let rows = vec![
+            r#"{"id":"1","name":"alpha","extra":"x"}"#.to_string(),
+            r#"{"id":"2","name":"beta"}"#.to_string(),
+        ];
+        let fetch_result = HttpFetchResult {
+            content: String::new(),
+            max_age: Duration::from_secs(0),
+            detected_format: "json".to_string(),
+            response_date: None,
+            response_status: 200,
+            response_headers: Vec::new(),
+        };
+        let batch = exec
+            .create_batch_from_rows(None, None, None, &rows, &fetch_result)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 2);
+        let schema = batch.schema();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(field_names, vec!["id", "name", "details"]);
     }
 }

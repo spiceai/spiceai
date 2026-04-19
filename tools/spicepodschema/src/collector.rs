@@ -111,9 +111,15 @@ pub struct ModelSourceSchema {
 ///
 /// This function iterates over the distributed slice of data connector registrations
 /// and extracts the name, prefix, and parameters from each connector factory.
+///
+/// Results are sorted by `(name, prefix)` and de-duplicated by `name` to keep
+/// the generated schema stable across builds (distributed-slice iteration order
+/// is not guaranteed). Sorting on `(name, prefix)` ensures that when multiple
+/// registrations map to the same display name, the entry with the
+/// lexicographically-smallest prefix is retained deterministically.
 #[must_use]
 pub fn collect_data_connectors() -> Vec<ConnectorSchema> {
-    DATA_CONNECTOR_REGISTRATIONS
+    let mut connectors: Vec<ConnectorSchema> = DATA_CONNECTOR_REGISTRATIONS
         .iter()
         .map(|reg| {
             let factory = (reg.constructor)();
@@ -123,16 +129,25 @@ pub fn collect_data_connectors() -> Vec<ConnectorSchema> {
                 parameters: factory.parameters(),
             }
         })
-        .collect()
+        .collect();
+    connectors.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.prefix.cmp(b.prefix)));
+    connectors.dedup_by(|a, b| a.name == b.name);
+    connectors
 }
 
 /// Collects schema information from all registered data accelerators.
 ///
 /// This function iterates over the distributed slice of data accelerator registrations
 /// and extracts the engine name, prefix, and parameters from each accelerator.
+///
+/// Multiple registrations can share the same engine name (e.g. `duckdb` and
+/// `partitioned_duckdb` both register under `duckdb`), so results are sorted by
+/// `(name, prefix)` and de-duplicated by `name`. Sorting by `prefix` as a
+/// secondary key makes the surviving entry deterministic across builds, since
+/// distributed-slice iteration order is not guaranteed.
 #[must_use]
 pub fn collect_data_accelerators() -> Vec<ConnectorSchema> {
-    DATA_ACCELERATOR_REGISTRATIONS
+    let mut accelerators: Vec<ConnectorSchema> = DATA_ACCELERATOR_REGISTRATIONS
         .iter()
         .map(|reg| {
             let accelerator = (reg.constructor)();
@@ -143,7 +158,10 @@ pub fn collect_data_accelerators() -> Vec<ConnectorSchema> {
                 parameters: accelerator.parameters(),
             }
         })
-        .collect()
+        .collect();
+    accelerators.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.prefix.cmp(b.prefix)));
+    accelerators.dedup_by(|a, b| a.name == b.name);
+    accelerators
 }
 
 /// Collects schema information from all catalog connectors.
