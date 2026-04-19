@@ -22,7 +22,6 @@ use crate::types::{
     CachedContent, Candidate, Content, GenerationConfig, SafetySetting, Tool, ToolConfig,
     UsageMetadata,
 };
-use bytes::Bytes;
 use futures::Stream;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -189,36 +188,81 @@ impl Client {
 
         let stream = response.bytes_stream();
 
-        let parsed_stream = stream.map(|result| match result {
-            Ok(bytes) => parse_sse_chunk(&bytes),
-            Err(e) => StreamSnafu {
-                message: e.to_string(),
-            }
-            .fail(),
-        });
+        let parsed_stream = parse_sse_stream(Box::pin(stream));
 
         Ok(Box::pin(parsed_stream))
     }
 }
 
-fn parse_sse_chunk(bytes: &Bytes) -> Result<GenerateContentResponse> {
-    let text = std::str::from_utf8(bytes).map_err(|e| crate::error::Error::StreamError {
-        message: format!("Invalid UTF-8: {e}"),
-    })?;
+fn parse_sse_stream(
+    stream: Pin<Box<dyn Stream<Item = std::result::Result<bytes::Bytes, reqwest::Error>> + Send>>,
+) -> impl Stream<Item = Result<GenerateContentResponse>> + Send {
+    futures::stream::unfold(
+        (stream, String::new()),
+        |(mut stream, mut buffer)| async move {
+            loop {
+                if let Some(pos) = buffer.find("\n\n") {
+                    let event = buffer[..pos].to_string();
 
-    for line in text.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
-            if data.trim().is_empty() || data == "[DONE]" {
-                continue;
+                    buffer = buffer[pos + 2..].to_string();
+
+                    for line in event.lines() {
+                        if let Some(data) = line.strip_prefix("data: ") {
+                            if data == "[DONE]" {
+                                return None;
+                            }
+
+                            if data.trim().is_empty() {
+                                continue;
+                            }
+
+                            let result = serde_json::from_str(data).context(JsonSnafu);
+
+                            return Some((result, (stream, buffer)));
+                        }
+                    }
+                }
+
+                match stream.next().await {
+                    Some(Ok(bytes)) => {
+                        let text = std::str::from_utf8(&bytes).map_err(|e| {
+                            crate::error::Error::StreamError {
+                                message: format!("Invalid UTF-8: {e}"),
+                            }
+                        });
+
+                        match text {
+                            Ok(t) => buffer.push_str(&t.replace("\r\n", "\n")),
+                            Err(e) => return Some((Err(e), (stream, buffer))),
+                        }
+                    }
+                    Some(Err(e)) => {
+                        return Some((
+                            StreamSnafu {
+                                message: e.to_string(),
+                            }
+                            .fail(),
+                            (stream, buffer),
+                        ));
+                    }
+                    None => {
+                        if buffer.is_empty() {
+                            return None;
+                        }
+
+                        return Some((
+                            StreamSnafu {
+                                message: "Unexpected end of stream while parsing SSE event"
+                                    .to_string(),
+                            }
+                            .fail(),
+                            (stream, buffer),
+                        ));
+                    }
+                }
             }
-
-            return serde_json::from_str(data).context(JsonSnafu);
-        }
-    }
-
-    Err(crate::error::Error::StreamError {
-        message: "No data in SSE chunk".to_string(),
-    })
+        },
+    )
 }
 
 #[cfg(test)]
@@ -238,11 +282,52 @@ mod tests {
         assert!(request.generation_config.is_some());
     }
 
-    #[test]
-    fn test_parse_sse_chunk() {
-        let data =
-            r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]}}]}"#;
-        let bytes = Bytes::from(data);
-        let _result = parse_sse_chunk(&bytes).expect("Failed to parse SSE chunk");
+    #[tokio::test]
+    async fn test_parse_sse_stream() {
+        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]}}]}\r\n\r\n";
+
+        let stream =
+            futures::stream::once(async move { Ok::<_, reqwest::Error>(bytes::Bytes::from(body)) });
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(Box::pin(stream)));
+
+        let first = parsed_stream
+            .next()
+            .await
+            .expect("stream should yield one item")
+            .expect("should parse successfully");
+
+        assert_eq!(first.candidates.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_parse_sse_stream_partial_chunk() {
+        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\"";
+
+        let stream =
+            futures::stream::once(async move { Ok::<_, reqwest::Error>(bytes::Bytes::from(body)) });
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(Box::pin(stream)));
+
+        let chunk = parsed_stream.next().await;
+
+        assert!(chunk.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_parse_sse_stream_invalid_chunk() {
+        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\"\r\n\r\n";
+
+        let stream =
+            futures::stream::once(async move { Ok::<_, reqwest::Error>(bytes::Bytes::from(body)) });
+
+        let mut parsed_stream = Box::pin(parse_sse_stream(Box::pin(stream)));
+
+        let chunk = parsed_stream
+            .next()
+            .await
+            .expect("stream should yield one item");
+
+        assert!(chunk.is_err());
     }
 }
