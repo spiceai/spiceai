@@ -54,14 +54,21 @@ const CONNECTOR_NAME: &str = "cosmosdb";
 type SemaphoreEntry = (Arc<Semaphore>, usize);
 
 /// Per-account-endpoint concurrency semaphores. Datasets that hit the same
-/// Cosmos account share a single concurrency budget, matching the
-/// rate-limit model of a Cosmos DB account.
+/// Cosmos account share a single concurrency budget, matching the per-account
+/// rate-limit model of Cosmos DB.
+///
+/// Entries are never evicted during the runtime's lifetime: each slot holds an
+/// `Arc<Semaphore>` + `usize` (~40 bytes on 64-bit platforms), and typical
+/// deployments configure a bounded set of accounts. Workloads that
+/// dynamically materialize many distinct Cosmos accounts should treat this as
+/// a known upper bound on memory use.
 static COSMOS_CONCURRENCY_LIMITS: LazyLock<Mutex<HashMap<String, SemaphoreEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Per-account-endpoint disabled-state flags. A permanent error (401/403/404)
 /// observed by one dataset latches the connector for every dataset pointing
-/// at the same account.
+/// at the same account. Same memory footprint and eviction trade-off as
+/// `COSMOS_CONCURRENCY_LIMITS` above.
 static COSMOS_DISABLED_FLAGS: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -100,16 +107,6 @@ fn shared_disabled_flag(endpoint: &str) -> Arc<AtomicBool> {
     )
 }
 
-/// Metrics recorded by the Cosmos DB data connector.
-///
-/// Shared across every `CosmosDBClient` the connector builds so the metrics
-/// endpoint reports the combined in-flight load across datasets that target
-/// the same Cosmos account.
-#[derive(Debug, Default)]
-struct CosmosDBMetrics {
-    inflight_operations: Arc<AtomicU64>,
-}
-
 const COSMOSDB_METRICS: &[MetricSpec] = &[MetricSpec::new(
     "inflight_operations",
     MetricType::ObservableGaugeU64,
@@ -119,7 +116,7 @@ const COSMOSDB_METRICS: &[MetricSpec] = &[MetricSpec::new(
 
 #[derive(Debug, Clone)]
 struct CosmosDBMetricsProvider {
-    metrics: Arc<CosmosDBMetrics>,
+    inflight_operations: Arc<AtomicU64>,
 }
 
 impl MetricsProvider for CosmosDBMetricsProvider {
@@ -142,12 +139,9 @@ impl MetricsProvider for CosmosDBMetricsProvider {
     ) -> Option<ObserveMetricCallback> {
         match metric.name {
             "inflight_operations" => {
-                let metrics = Arc::<CosmosDBMetrics>::clone(&self.metrics);
+                let counter = Arc::<AtomicU64>::clone(&self.inflight_operations);
                 Some(ObserveMetricCallback::U64(Box::new(move |observer| {
-                    observer.observe(
-                        metrics.inflight_operations.load(Ordering::Relaxed),
-                        &attributes,
-                    );
+                    observer.observe(counter.load(Ordering::Relaxed), &attributes);
                 })))
             }
             _ => None,
@@ -158,13 +152,10 @@ impl MetricsProvider for CosmosDBMetricsProvider {
 #[derive(Debug)]
 pub struct CosmosDB {
     params: Parameters,
-    /// Shared counter updated by every resilience wrapper in this connector.
-    metrics: Arc<CosmosDBMetrics>,
-    /// Action to apply when Cosmos DB returns a column whose Arrow type is
-    /// not natively supported (e.g. an all-null sample inferred as
-    /// `DataType::Null`). `None` falls through to the provider-level default
-    /// of [`DFUnsupportedTypeAction::Warn`], which drops the column and logs
-    /// a warning per RC gate #2.
+    /// Drives the `inflight_operations` metric gauge. Cloned into every
+    /// [`CosmosResilienceConfig`] this connector produces so the gauge
+    /// aggregates across datasets targeting the same Cosmos account.
+    inflight_operations: Arc<AtomicU64>,
     unsupported_type_action: Option<DFUnsupportedTypeAction>,
 }
 
@@ -202,8 +193,6 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Number of documents sampled during schema inference. Larger samples produce a more precise schema at the cost of additional RU consumption on dataset registration.")
         .default("100"),
 
-    // Resilience / connection tuning (RC criteria — see
-    // docs/criteria/connectors/rc.md#connection-resilience).
     ParameterSpec::runtime("max_concurrent_requests")
         .description("Maximum number of concurrent Azure Cosmos DB requests per account endpoint, shared across all datasets pointing at the same account.")
         .default("4"),
@@ -233,7 +222,7 @@ impl DataConnectorFactory for CosmosDBFactory {
         Box::pin(async move {
             let conn = CosmosDB {
                 params: params.parameters,
-                metrics: Arc::new(CosmosDBMetrics::default()),
+                inflight_operations: Arc::new(AtomicU64::new(0)),
                 unsupported_type_action,
             };
             Ok(Arc::new(conn) as Arc<dyn DataConnector>)
@@ -326,7 +315,7 @@ impl CosmosDB {
             backoff,
             semaphore: Some(semaphore),
             disable_on_permanent_error,
-            inflight: Arc::<AtomicU64>::clone(&self.metrics.inflight_operations),
+            inflight: Arc::<AtomicU64>::clone(&self.inflight_operations),
             disabled,
         }
     }
@@ -472,7 +461,7 @@ impl DataConnector for CosmosDB {
 
     fn metrics_provider(&self) -> Option<Arc<dyn MetricsProvider>> {
         Some(Arc::new(CosmosDBMetricsProvider {
-            metrics: Arc::<CosmosDBMetrics>::clone(&self.metrics),
+            inflight_operations: Arc::<AtomicU64>::clone(&self.inflight_operations),
         }))
     }
 }

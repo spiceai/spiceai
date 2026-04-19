@@ -78,12 +78,8 @@ pub struct CosmosDBTableProviderConfig {
     pub schema_override: Option<SchemaRef>,
     /// How to handle columns whose type Cosmos DB cannot represent (e.g.
     /// all-null samples that Arrow's JSON inference returns as
-    /// [`DataType::Null`]). Defaults to
-    /// [`UnsupportedTypeAction::Warn`] — log a warning and drop the
-    /// offending column, which is the RC-mandated "don't crash" behavior in
-    /// `docs/criteria/connectors/rc.md`.
+    /// [`DataType::Null`]). Defaults to [`UnsupportedTypeAction::Warn`].
     pub unsupported_type_action: UnsupportedTypeAction,
-    /// Concurrency + retry + permanent-error configuration.
     pub resilience: CosmosResilienceConfig,
 }
 
@@ -196,10 +192,7 @@ impl CosmosDBTableProvider {
 ///
 /// For Cosmos DB, the only type Arrow's JSON inference can produce that
 /// downstream query engines may refuse is [`DataType::Null`] — it appears when
-/// every sampled document has `null` for a field. The RC "Connection
-/// Resilience" gate in `docs/criteria/connectors/rc.md` requires that such
-/// columns be warn-and-skipped rather than crashing the query; the action
-/// lets operators opt into stricter or looser behavior.
+/// every sampled document has `null` for a field.
 fn apply_unsupported_type_action(
     inferred: &SchemaRef,
     action: UnsupportedTypeAction,
@@ -432,20 +425,15 @@ impl ExecutionPlan for CosmosDBExec {
         let projection = self.projection.clone();
 
         builder.spawn(async move {
-            // Fail fast if the connector was disabled by an earlier permanent
-            // error — prevents further queries from piling up against an
-            // authentication failure.
-            if config.resilience.disabled.load(Ordering::SeqCst) {
+            if config.resilience.disabled.load(Ordering::Acquire) {
                 return Err(to_df_error(Error::ConnectorDisabled {
                     endpoint: client.endpoint().to_string(),
                 }));
             }
 
-            // Acquire a concurrency permit for the lifetime of the scan. This
-            // bounds the number of in-flight Cosmos DB queries per account
-            // endpoint (`max_concurrent_requests`). Held via a `let` binding
-            // so the permit is released when the async block returns, including
-            // on cancellation or receiver-drop.
+            // Permit + inflight guard are held as `_`-bindings so they release
+            // automatically when the async block returns — including on
+            // cancellation or receiver-drop mid-stream.
             let _permit = match &config.resilience.semaphore {
                 Some(s) => Some(
                     Arc::<tokio::sync::Semaphore>::clone(s)
@@ -459,9 +447,6 @@ impl ExecutionPlan for CosmosDBExec {
                 ),
                 None => None,
             };
-
-            // Drives the `inflight_operations` metric; RAII guard ensures the
-            // counter decrements even if the future is cancelled mid-stream.
             let _inflight = crate::cosmosdb::resilience::InflightGuard::enter(
                 Arc::<AtomicU64>::clone(&config.resilience.inflight),
             );
@@ -476,7 +461,7 @@ impl ExecutionPlan for CosmosDBExec {
                     if crate::cosmosdb::resilience::is_permanent_error(&err)
                         && resilience.disable_on_permanent_error
                     {
-                        resilience.disabled.store(true, Ordering::SeqCst);
+                        resilience.disabled.store(true, Ordering::Release);
                         tracing::error!(
                             endpoint = %endpoint,
                             "Permanent error from Azure Cosmos DB; disabling connector. {err}"
@@ -489,16 +474,15 @@ impl ExecutionPlan for CosmosDBExec {
                     })
                 };
 
-            let endpoint = client.endpoint().to_string();
             let mut pager = container_client
                 .query_items::<Value>(config.query.as_str(), (), None)
-                .map_err(|e| handle_stream_error(&config.resilience, &endpoint, e))?;
+                .map_err(|e| handle_stream_error(&config.resilience, client.endpoint(), e))?;
 
             let mut buffer: Vec<Value> = Vec::with_capacity(STREAM_BATCH_SIZE);
 
             while let Some(item) = pager.next().await {
                 let doc =
-                    item.map_err(|e| handle_stream_error(&config.resilience, &endpoint, e))?;
+                    item.map_err(|e| handle_stream_error(&config.resilience, client.endpoint(), e))?;
 
                 buffer.push(strip_system_fields(doc));
 

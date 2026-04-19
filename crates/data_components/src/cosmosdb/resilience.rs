@@ -31,7 +31,7 @@ use std::sync::{
 use std::time::Duration;
 
 use azure_core::error::ErrorKind;
-use azure_core::http::headers::{HeaderName, Headers};
+use azure_core::http::headers::{HeaderName, Headers, X_MS_RETRY_AFTER_MS};
 use tokio::sync::Semaphore;
 
 /// Default upper bound on in-flight Cosmos DB requests per account endpoint.
@@ -43,13 +43,10 @@ pub const DEFAULT_MAX_RETRIES: u32 = 3;
 const RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-/// Standard `Retry-After` header (seconds or HTTP date). Cosmos uses the
-/// integer-seconds form in practice.
+/// Standard `Retry-After` header. typespec's header registry keeps it as a
+/// standard header name but does not expose a `pub const`, so construct it
+/// locally. Cosmos uses the integer-seconds form in practice.
 const RETRY_AFTER_HEADER: HeaderName = HeaderName::from_static("retry-after");
-
-/// Cosmos-specific retry header, emitted on 429 throttles, carrying a value
-/// in milliseconds. Defined at `azure_data_cosmos-0.30.0/src/constants.rs:94`.
-const MS_RETRY_AFTER_HEADER: HeaderName = HeaderName::from_static("x-ms-retry-after-ms");
 
 /// Backoff strategy for retries on transient Cosmos DB errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,7 +177,7 @@ pub fn retry_after_from_error(err: &azure_core::Error) -> Option<Duration> {
 }
 
 fn retry_after_from_headers(headers: &Headers) -> Option<Duration> {
-    if let Some(ms_str) = headers.get_optional_str(&MS_RETRY_AFTER_HEADER)
+    if let Some(ms_str) = headers.get_optional_str(&X_MS_RETRY_AFTER_MS)
         && let Ok(ms) = ms_str.parse::<u64>()
     {
         return Some(Duration::from_millis(ms));
@@ -236,7 +233,7 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = azure_core::Result<T>>,
 {
-    if config.disabled.load(Ordering::SeqCst) {
+    if config.disabled.load(Ordering::Acquire) {
         return Err(ResilienceError::Disabled);
     }
 
@@ -260,7 +257,7 @@ where
                 let is_perm = is_permanent_error(&err);
 
                 if is_perm && config.disable_on_permanent_error {
-                    config.disabled.store(true, Ordering::SeqCst);
+                    config.disabled.store(true, Ordering::Release);
                     tracing::error!(
                         endpoint = %endpoint,
                         "Permanent error from Azure Cosmos DB; disabling connector. {err}"
@@ -439,7 +436,7 @@ mod tests {
     fn retry_after_prefers_millisecond_header() {
         let err = make_error_with_headers(
             azure_core::http::StatusCode::TooManyRequests,
-            vec![(MS_RETRY_AFTER_HEADER, "250".into())],
+            vec![(X_MS_RETRY_AFTER_MS, "250".into())],
         );
         assert_eq!(
             retry_after_from_error(&err),
@@ -487,7 +484,7 @@ mod tests {
     #[tokio::test]
     async fn run_with_resilience_short_circuits_when_disabled() {
         let config = CosmosResilienceConfig::default();
-        config.disabled.store(true, Ordering::SeqCst);
+        config.disabled.store(true, Ordering::Release);
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_clone = Arc::<AtomicUsize>::clone(&attempts);
         let result: Result<(), _> = run_with_resilience(&config, "https://x", || {
@@ -598,7 +595,7 @@ mod tests {
         assert!(matches!(result, Err(ResilienceError::Request(_))));
         // Permanent errors short-circuit without retrying.
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
-        assert!(config.disabled.load(Ordering::SeqCst));
+        assert!(config.disabled.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -620,6 +617,6 @@ mod tests {
         })
         .await;
         assert!(matches!(result, Err(ResilienceError::Request(_))));
-        assert!(!config.disabled.load(Ordering::SeqCst));
+        assert!(!config.disabled.load(Ordering::Acquire));
     }
 }

@@ -27,12 +27,31 @@ use snafu::ResultExt;
 use super::{BuildClientSnafu, Error, InvalidConnectionStringSnafu};
 
 /// Credential used to build a Cosmos client.
-#[derive(Debug, Clone)]
+///
+/// Carries account keys / full connection strings; the manual `Debug` below
+/// redacts both so tracing / panic dumps never surface them.
+#[derive(Clone)]
 pub enum CosmosDBCredential {
     /// An `AccountEndpoint=https://...;AccountKey=...;` connection string.
     ConnectionString(String),
     /// Explicit account endpoint URL plus primary/secondary key.
     Key { endpoint: String, key: String },
+}
+
+impl std::fmt::Debug for CosmosDBCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConnectionString(_) => f
+                .debug_tuple("ConnectionString")
+                .field(&"<redacted>")
+                .finish(),
+            Self::Key { endpoint, .. } => f
+                .debug_struct("Key")
+                .field("endpoint", endpoint)
+                .field("key", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 /// Owns a [`CosmosClient`] and hands out container clients.
