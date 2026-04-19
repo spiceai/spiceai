@@ -307,11 +307,22 @@ pub struct Acceleration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
 
+    /// Partition expressions used to physically partition accelerated data.
+    ///
+    /// Each item accepts either:
+    /// - a plain expression string, for example `"YEAR(created_at)"` or
+    ///   `"bucket(100, user_id)"`; or
+    /// - a single-entry mapping of a partition name to an expression, for
+    ///   example `{ year: "YEAR(created_at)" }`.
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
         serialize_with = "serialize_partition_by",
         deserialize_with = "deserialize_partition_by"
+    )]
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(with = "Vec<crate::partitioning::PartitionedBySchema>")
     )]
     pub partition_by: Vec<PartitionedBy>,
 
