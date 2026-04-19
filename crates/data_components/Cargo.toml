@@ -33,6 +33,7 @@ bytes.workspace = true
 charset = { workspace = true, optional = true }
 chrono.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
+dashmap = "6.1"
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
@@ -71,7 +72,10 @@ num_cpus = "1.16"
 object_store = { workspace = true }
 opendal.workspace = true
 oracle = { version = "0.6", optional = true }
+native-tls = { workspace = true, optional = true }
 percent-encoding.workspace = true
+pgwire-replication = { workspace = true, optional = true }
+postgres-native-tls = { workspace = true, optional = true }
 rand.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
@@ -91,6 +95,7 @@ spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", re
     "tls",
 ], optional = true } # spiceai
 telemetry = { path = "../telemetry" }
+tempfile.workspace = true
 tiberius = { workspace = true, optional = true }
 token_provider = { path = "../token_provider" }
 tokio.workspace = true
@@ -152,6 +157,9 @@ odbc = ["datafusion-table-providers/federation", "db_connection_pool/odbc"]
 oracle = ["dep:oracle", "dep:bb8", "dep:bb8-oracle", "dep:bigdecimal"]
 postgres = [
     "dep:tokio-postgres",
+    "dep:pgwire-replication",
+    "dep:native-tls",
+    "dep:postgres-native-tls",
     "datafusion-table-providers/postgres",
     "datafusion-table-providers/postgres-federation",
 ]

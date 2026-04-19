@@ -229,6 +229,7 @@ connector-mysql = { path = "../data-connectors/connector-mysql" }
 connector-oracle = { path = "../data-connectors/connector-oracle" }
 connector-postgres = { path = "../data-connectors/connector-postgres" }
 connector-scylladb = { path = "../data-connectors/connector-scylladb" }
+tokio-postgres = { workspace = true }
 connector-sftp = { path = "../data-connectors/connector-sftp" }
 connector-sharepoint = { path = "../data-connectors/connector-sharepoint" }
 connector-smb = { path = "../data-connectors/connector-smb" }
