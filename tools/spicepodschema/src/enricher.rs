@@ -1181,8 +1181,10 @@ fn update_acceleration_params(
     if let Some(Value::Object(accel_def)) = defs_obj.get_mut("Acceleration")
         && !conditionals.is_empty()
     {
-        let accelerator_names: Vec<&str> =
+        let mut accelerator_names: Vec<&str> =
             data_accelerators.iter().map(|a| a.name.as_str()).collect();
+        accelerator_names.sort_unstable();
+        accelerator_names.dedup();
 
         // Update description for params field
         if let Some(Value::Object(properties)) = accel_def.get_mut("properties")

@@ -225,6 +225,7 @@ impl Runtime {
             .collect()
     }
 
+    #[expect(clippy::result_large_err)]
     fn datasets_iter(self: Arc<Self>, app: &Arc<App>) -> impl Iterator<Item = Result<Dataset>> {
         app.datasets
             .clone()
@@ -900,14 +901,15 @@ impl Runtime {
                     partition_filters.len(),
                 );
                 initial_partition_filters = partition_filters;
-                // Clear partition_by and convert engine to unpartitioned
-                let mut ds_mod = (*ds).clone();
-                if let Some(acc) = ds_mod.acceleration.as_mut() {
-                    acc.partition_by = vec![];
-                    acc.engine = acc.engine.to_unpartitioned();
-                }
-                ds = Arc::new(ds_mod);
             }
+
+            // Clear partition_by and convert engine to unpartitioned
+            let mut ds_mod = (*ds).clone();
+            if let Some(acc) = ds_mod.acceleration.as_mut() {
+                acc.partition_by = vec![];
+                acc.engine = acc.engine.to_unpartitioned();
+            }
+            ds = Arc::new(ds_mod);
         }
 
         // ACCELERATED TABLE
