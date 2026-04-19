@@ -296,7 +296,9 @@ dynamodb = [
     "dep:humantime",
 ]
 extended_tests = []
+flatten-json-properties = []
 flightsql = ["data_components/flightsql"]
+json-tree = []
 ftp = ["runtime-object-store/ftp"]
 iceberg-write = []
 imap = ["data_components/imap"]
