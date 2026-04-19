@@ -9,18 +9,6 @@ expression: normalize_search_response(resp)
       "_score": "0.01",
       "dataset": "spice.public.qs",
       "matches": {
-        "question": [
-          "What is the effect of fibrinolysin in the reagents on the Warner-Lambert screening method for fibrinogen?"
-        ]
-      },
-      "primary_key": {
-        "id": 938
-      }
-    },
-    {
-      "_score": "0.01",
-      "dataset": "spice.public.qs",
-      "matches": {
         "answer": [
           "Relative or \"stress\" polycythaemia, which is secondary to a depletion in the plasma volume."
         ]
@@ -33,24 +21,36 @@ expression: normalize_search_response(resp)
       "_score": "0.01",
       "dataset": "spice.public.qs",
       "matches": {
-        "question": [
-          "Which compound is not an intermediate of the TCA cycle?"
+        "answer": [
+          "Pedunculagin and alchemillin have astringent and wound-healing properties, possibly due to their high tannin content."
         ]
       },
       "primary_key": {
-        "id": 1279
+        "id": 1015
       }
     },
     {
       "_score": "0.01",
       "dataset": "spice.public.qs",
       "matches": {
-        "question": [
-          "Which of the following is an intensive property of a system?"
+        "answer": [
+          "Dermatomycosis is caused by fungal infections, specifically various forms of *tinea*, such as athlete's foot (*tinea pedis*)."
         ]
       },
       "primary_key": {
-        "id": 1289
+        "id": 821
+      }
+    },
+    {
+      "_score": "0.01",
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "More than 10 years of follow-up is required, as late recurrences (beyond 12 years) have been reported in 5%–10% of patients."
+        ]
+      },
+      "primary_key": {
+        "id": 449
       }
     }
   ]

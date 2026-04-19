@@ -23,16 +23,16 @@ expression: normalize_search_response(resp)
     {
       "_score": "0.01",
       "data": {
-        "question": "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        "question": "How many multiples of 4 are there between 1 and 30? List them and count the total."
       },
       "dataset": "spice.public.qs",
       "matches": {
-        "question": [
-          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
+        "answer": [
+          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
         ]
       },
       "primary_key": {
-        "id": 361
+        "id": 468
       }
     },
     {
@@ -53,16 +53,16 @@ expression: normalize_search_response(resp)
     {
       "_score": "0.01",
       "data": {
-        "question": "How many groups of 2 are in 14?"
+        "question": "Which base number, when raised to the fifth power, equals thirty-two?"
       },
       "dataset": "spice.public.qs",
       "matches": {
-        "question": [
-          "How many groups of 2 are in 14?"
+        "answer": [
+          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
         ]
       },
       "primary_key": {
-        "id": 462
+        "id": 1277
       }
     }
   ]
