@@ -328,6 +328,6 @@ mod tests {
             .await
             .expect("stream should yield one item");
 
-        assert!(chunk.is_err());
+        chunk.expect_err("chunk should be an error");
     }
 }
