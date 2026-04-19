@@ -24,6 +24,7 @@ use crate::component::dataset::{ReadyState, TimeFormat};
 use crate::dataaccelerator::{BootstrapStatus, get_primary_keys_from_constraints};
 use crate::datafusion::error::{SpiceExternalError, format_datafusion_error};
 use crate::datafusion::is_spice_internal_dataset;
+use crate::datafusion::udf::deny_spice_specific_functions;
 use crate::federated_table::FederatedTable;
 use crate::status;
 use ::cache::Caching;
@@ -775,16 +776,11 @@ impl Builder {
 
         let (refresh_handle, refresh_trigger) =
             if matches!(self.cluster_role, Some(ClusterRole::Scheduler)) {
-                // Accelerated tables aren't accelerated on the scheduler. Don't mark
-                // the dataset as Ready yet. Register it as Initializing so it is
-                // tracked by the runtime status system and blocks /v1/ready until
-                // executors report their status back to the scheduler and
-                // evaluate_dataset_readiness promotes the distributed dataset to
-                // Ready.
-                self.runtime_status
-                    .update_dataset(&self.dataset_name, status::ComponentStatus::Initializing);
+                // Accelerated tables aren't accelerated on scheduler. Immediately ready.
                 // Set refresh_trigger to None because the receiver will be dropped
                 // (refresher.start() is not called), making the channel dead.
+                self.runtime_status
+                    .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
                 // Notify immediately so schedule creation doesn't block waiting for
                 // a refresh that will never happen locally on the scheduler.
                 on_complete_notification.notify_waiters();
@@ -844,9 +840,68 @@ impl Builder {
         }
 
         // If the table should be ready immediately, mark it as ready.
-        if self.ready_state == ReadyState::OnRegistration {
-            self.runtime_status
-                .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
+        // For `OnSchemaResolved`, the dataset is marked ready once the federated source's schema
+        // has been resolved (its `TableProvider` has been successfully resolved, which also implies
+        // access to the source has been verified). For an immediate federated table this has already
+        // occurred synchronously before the builder ran, so we can mark it ready here. For a deferred
+        // federated table we spawn a background task that waits for the deferred provider to resolve
+        // before marking the dataset ready.
+        match self.ready_state {
+            ReadyState::OnRegistration => {
+                self.runtime_status
+                    .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
+            }
+            ReadyState::OnSchemaResolved => match &*self.federated {
+                FederatedTable::Immediate(_) => {
+                    self.runtime_status
+                        .update_dataset(&self.dataset_name, status::ComponentStatus::Ready);
+                }
+                FederatedTable::Deferred(_) => {
+                    let runtime_status = Arc::clone(&self.runtime_status);
+                    let dataset_name = self.dataset_name.clone();
+                    let federated = Arc::clone(&self.federated);
+                    let wait_handle = tokio::spawn(async move {
+                        // Wait for the deferred federated table provider to resolve. Only mark
+                        // the dataset ready if the deferred provider actually connected (its
+                        // schema was resolved and access was verified). If resolution failed
+                        // (e.g. shutdown or task panic), `try_wait_table_provider` returns
+                        // `Err(FederatedResolutionError::Unavailable, ..)`; leave the status
+                        // untouched so the caller surfaces the error through the refresh path
+                        // instead of a misleading `Ready`.
+                        match federated.try_wait_table_provider().await {
+                            Err((
+                                crate::federated_table::FederatedResolutionError::Unavailable,
+                                _,
+                            )) => {
+                                tracing::warn!(
+                                    "Deferred federated provider for dataset {dataset_name} did not resolve successfully; leaving dataset status unchanged"
+                                );
+                            }
+                            Ok(_) => {
+                                // If the refresh path has already marked the dataset as `Error`
+                                // (e.g. the initial refresh failed quickly), don't overwrite it
+                                // with `Ready` — schema-resolution readiness must not mask refresh
+                                // failures that are surfaced via dataset status and metrics.
+                                let current_status = runtime_status
+                                    .get_component_status(&format!("dataset:{dataset_name}"));
+                                if matches!(current_status, Some(status::ComponentStatus::Error(_)))
+                                {
+                                    tracing::debug!(
+                                        "Deferred federated provider for dataset {dataset_name} resolved successfully, but dataset status is already Error; leaving dataset status unchanged"
+                                    );
+                                } else {
+                                    runtime_status.update_dataset(
+                                        &dataset_name,
+                                        status::ComponentStatus::Ready,
+                                    );
+                                }
+                            }
+                        }
+                    });
+                    handlers.push(wait_handle);
+                }
+            },
+            ReadyState::OnLoad => {}
         }
 
         // For caching mode with synchronization, register the child with the parent immediately
@@ -1168,7 +1223,18 @@ impl TableProvider for AcceleratedTable {
         }
 
         match self.zero_results_action {
-            ZeroResultsAction::ReturnEmpty => self.accelerator.supports_filters_pushdown(filters),
+            ZeroResultsAction::ReturnEmpty => {
+                let mut results = self.accelerator.supports_filters_pushdown(filters)?;
+                let function_support = deny_spice_specific_functions();
+                for (i, filter) in filters.iter().enumerate() {
+                    if !matches!(results[i], TableProviderFilterPushDown::Unsupported)
+                        && !function_support.supports(filter)
+                    {
+                        results[i] = TableProviderFilterPushDown::Unsupported;
+                    }
+                }
+                Ok(results)
+            }
             ZeroResultsAction::UseSource => {
                 Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
             }
@@ -1201,9 +1267,10 @@ impl TableProvider for AcceleratedTable {
                         SpiceExternalError::acceleration_not_ready(self.dataset_name.to_string()),
                     ));
                 }
-                ReadyState::OnRegistration => {
-                    // Getting the federated_provider should always return immediately here, because by definition an accelerated table has
-                    // completed its initial load if it has a previous checkpoint.
+                ReadyState::OnRegistration | ReadyState::OnSchemaResolved => {
+                    // Before the initial accelerated load completes, these ready states fall back
+                    // to the federated source. Resolving the federated provider is still
+                    // asynchronous here and may await the deferred provider becoming available.
                     let federated_provider = self.federated.table_provider().await;
                     metrics::READY_STATE_FALLBACK.add(
                         1,

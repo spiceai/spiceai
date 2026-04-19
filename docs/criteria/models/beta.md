@@ -8,12 +8,16 @@ All criteria must be met for the model to be considered Beta, with exceptions pe
 
 |     Model Type          | Beta Quality | DRI Sign-off |
 | ----------------------- | ------------ | ------------ |
-| File                    | ✅           | @Jeadie      |
-| Hugging Face            | ✅           | @Jeadie      |
-| Spice.ai Cloud Platform | ➖           |              |
-| OpenAI                  | ✅            | @ewgenius   |
-| Azure Openai            | ➖           |              |
 | Anthropic               | ➖           |              |
+| Amazon Bedrock          | ➖           |              |
+| Azure OpenAI            | ➖           |              |
+| Databricks              | ➖           |              |
+| File                    | ✅           | @Jeadie      |
+| Google (Gemini)         | ➖           |              |
+| Hugging Face            | ✅           | @Jeadie      |
+| Nvidia NIM              | ➖           |              |
+| OpenAI                  | ✅           | @ewgenius    |
+| Spice.ai Cloud Platform | ➖           |              |
 | xAI (Grok)              | ➖           |              |
 
 ## Beta Release Criteria

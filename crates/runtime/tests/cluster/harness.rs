@@ -175,6 +175,7 @@ impl ClusterHarness {
     ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         loop {
+            sleep(Duration::from_millis(200)).await;
             let count = self
                 .executor_manager
                 .get_executor_state()
@@ -199,7 +200,6 @@ impl ClusterHarness {
                     "Timed out waiting for {expected} executors; found {count}"
                 )));
             }
-            sleep(Duration::from_millis(200)).await;
         }
     }
 
@@ -343,6 +343,8 @@ impl ClusterHarnessBuilder {
             }
             () = Arc::clone(&scheduler_rt).load_components() => {}
         }
+
+        runtime_ready_check(&scheduler_rt).await;
 
         // Wait for the scheduler's cluster port to be reachable.
         wait_for_tcp(

@@ -21,7 +21,9 @@ use std::sync::Arc;
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
+    common::tree_node::TreeNode,
     error::{DataFusionError, Result as DataFusionResult},
+    logical_expr::LogicalPlan,
     physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter},
     sql::{
         TableReference,
@@ -65,6 +67,14 @@ impl SQLExecutor for FlightSQLTable {
 
     fn dialect(&self) -> Arc<dyn Dialect> {
         Arc::new(DefaultDialect {})
+    }
+
+    fn can_execute_plan(&self, logical_plan: &LogicalPlan) -> bool {
+        // FlightSQL federation currently cannot safely unparse arbitrary custom
+        // extension nodes. If any are present in the subtree, do not federate.
+        !logical_plan
+            .exists(|p| Ok(matches!(p, LogicalPlan::Extension(_))))
+            .unwrap_or(false)
     }
 
     fn execute(

@@ -146,51 +146,63 @@ jobs:
       # Upload the test archive as an artifact
       - name: Upload test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-test-archive
           path: ./integration.tar.zst
-          retention-days: 1
+          retention-days: 3
+          # Archive is already zstd-compressed; use minimal artifact zip compression.
+          compression-level: 1
 
       - name: Upload retention OOM test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-retention-oom-test-archive
           path: ./retention_oom.tar.zst
-          retention-days: 1
+          retention-days: 3
+          # Archive is already zstd-compressed; use minimal artifact zip compression.
+          compression-level: 1
 
       - name: Upload AWS SDK test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-aws-sdk-test-archive
           path: ./integration_aws_sdk.tar.zst
-          retention-days: 1
+          retention-days: 3
+          # Archive is already zstd-compressed; use minimal artifact zip compression.
+          compression-level: 1
 
       - name: Upload AWS SDK credential bridge test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-aws-sdk-credential-bridge-test-archive
           path: ./integration_aws_sdk_credential_bridge.tar.zst
-          retention-days: 1
+          retention-days: 3
+          # Archive is already zstd-compressed; use minimal artifact zip compression.
+          compression-level: 1
 
       - name: Upload partition table test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-partition-table-test-archive
           path: ./partition_table_test.tar.zst
-          retention-days: 1
+          retention-days: 3
+          # Archive is already zstd-compressed; use minimal artifact zip compression.
+          compression-level: 1
 
       - name: Upload data components test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-data-components-test-archive
           path: ./data_components_hadoop.tar.zst
-          retention-days: 1
+          retention-days: 3
+          # Archive is already zstd-compressed; use minimal artifact zip compression.
+          compression-level: 1
 
   test:
     name: Integration Tests (part ${{ matrix.label }})
@@ -262,7 +274,7 @@ jobs:
 
       - name: Set up Github Token
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v2
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v2
         id: github-app-token
         with:
           app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
@@ -284,14 +296,14 @@ jobs:
           MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           # old dbc instance
-          TEST_DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          TEST_DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
           TEST_DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          TEST_DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID }}
+          TEST_DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           # new dbc instance
-          NEW_DATABRICKS_HOST: ${{ secrets.NEW_DATABRICKS_HOST }}
-          NEW_DATABRICKS_CLUSTER_ID: ${{ secrets.NEW_DATABRICKS_CLUSTER_ID }}
+          NEW_DATABRICKS_HOST: ${{ vars.NEW_DATABRICKS_HOST }}
+          NEW_DATABRICKS_CLUSTER_ID: ${{ vars.NEW_DATABRICKS_CLUSTER_ID }}
           NEW_DATABRICKS_SP_CLIENT_ID: ${{ secrets.NEW_DATABRICKS_SP_CLIENT_ID }}
           NEW_DATABRICKS_SP_CLIENT_SECRET: ${{ secrets.NEW_DATABRICKS_SP_CLIENT_SECRET }}
           NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
@@ -344,7 +356,7 @@ jobs:
         shell: bash
       - name: Store integration snapshots artifact
         if: github.event.inputs.update_snapshots == 'always' && steps.create_snapshot_archive.outputs.created == 'true' && needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: integration-snapshots-part-${{ matrix.label }}
           path: integration-snapshots-part-${{ matrix.label }}.tar.gz
@@ -477,7 +489,7 @@ jobs:
           AWS_S3_USERNAME: ${{ secrets.AWS_S3_USERNAME }}
           AWS_S3_PASSWORD: ${{ secrets.AWS_S3_PASSWORD }}
           AWS_COGNITO_IDP_URI: ${{ vars.AWS_COGNITO_IDP_URI }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
           AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
         run: |
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_aws_sdk_credential_bridge_test/integration_aws_sdk_credential_bridge.tar.zst

@@ -194,6 +194,10 @@ pub enum ReadyState {
     OnLoad,
     /// The table is ready immediately, with fallback to federated table for queries until the initial load completes.
     OnRegistration,
+    /// The table is ready once the federated source's schema has been resolved (which also implies access
+    /// to the source has been verified), without waiting for the initial data refresh to complete. Queries
+    /// fall back to the federated source until the initial load completes.
+    OnSchemaResolved,
 }
 
 impl From<spicepod_dataset::ReadyState> for ReadyState {
@@ -201,6 +205,7 @@ impl From<spicepod_dataset::ReadyState> for ReadyState {
         match ready_state {
             spicepod_dataset::ReadyState::OnLoad => ReadyState::OnLoad,
             spicepod_dataset::ReadyState::OnRegistration => ReadyState::OnRegistration,
+            spicepod_dataset::ReadyState::OnSchemaResolved => ReadyState::OnSchemaResolved,
         }
     }
 }
@@ -210,6 +215,7 @@ impl Display for ReadyState {
         match self {
             ReadyState::OnLoad => write!(f, "on_load"),
             ReadyState::OnRegistration => write!(f, "on_registration"),
+            ReadyState::OnSchemaResolved => write!(f, "on_schema_resolved"),
         }
     }
 }

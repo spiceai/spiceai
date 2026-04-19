@@ -2,14 +2,14 @@
 source: crates/runtime/tests/cluster/distributed_acceleration.rs
 expression: plan_fmt
 ---
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| plan_type     | plan                                                                                                                                                                                       |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
-| logical_plan  | Sort: test_data.id ASC NULLS LAST                                                                                                                                                          |
-|               |   TableScan: test_data projection=[id, name, age, city, score], partial_filters=[bucket(Int64(3), id) = Utf8("0") OR bucket(Int64(3), id) = Utf8("1") OR bucket(Int64(3), id) = Utf8("2")] |
-| physical_plan | SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                                                        |
-|               |   CooperativeExec                                                                                                                                                                          |
-|               |     BytesProcessedExec                                                                                                                                                                     |
-|               |       FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data WHERE ((((bucket(3, "id") = '0') OR (bucket(3, "id") = '1')) OR (bucket(3, "id") = '2')))                         |
-|               |                                                                                                                                                                                            |
-+---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
++---------------+---------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                              |
++---------------+---------------------------------------------------------------------------------------------------+
+| logical_plan  | Sort: test_data.id ASC NULLS LAST                                                                 |
+|               |   SubqueryAlias: test_data                                                                        |
+|               |     TableScan: test_data projection=[id, name, age, city, score]                                  |
+| physical_plan | CooperativeExec                                                                                   |
+|               |   BytesProcessedExec                                                                              |
+|               |     FlightSqlExec sql=SELECT id, name, age, city, score FROM test_data ORDER BY id ASC NULLS LAST |
+|               |                                                                                                   |
++---------------+---------------------------------------------------------------------------------------------------+

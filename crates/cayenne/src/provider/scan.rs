@@ -188,15 +188,17 @@ impl ExecutionPlan for CayenneAccelerationExec {
 
     // Allow optimizer to push limits through to inputs
     fn supports_limit_pushdown(&self) -> bool {
-        true
+        self.inner.supports_limit_pushdown()
     }
 
-    fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        None
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        self.inner
+            .with_fetch(limit)
+            .map(|plan| Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>)
     }
 
     fn fetch(&self) -> Option<usize> {
-        None
+        self.inner.fetch()
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -234,9 +236,11 @@ impl ExecutionPlan for CayenneAccelerationExec {
 
     fn try_pushdown_sort(
         &self,
-        _order: &[PhysicalSortExpr],
+        order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
-        Ok(SortOrderPushdownResult::Unsupported)
+        let result = self.inner.try_pushdown_sort(order)?;
+        Ok(result
+            .map(|plan| Arc::new(CayenneAccelerationExec::new(plan)) as Arc<dyn ExecutionPlan>))
     }
 }
 

@@ -1,0 +1,21 @@
+---
+source: crates/runtime/tests/duckdb/mod.rs
+expression: pretty
+---
++---------------+-------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                  |
++---------------+-------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: score                                                                                     |
+|               |   Sort: json_test.id ASC NULLS LAST                                                                   |
+|               |     Projection: json_get_float(json_test.data, Utf8("score")) AS score, json_test.id                  |
+|               |       TableScan: json_test projection=[id, data]                                                      |
+| physical_plan | ProjectionExec: expr=[score@0 as score]                                                               |
+|               |   SortPreservingMergeExec: [id@1 ASC NULLS LAST]                                                      |
+|               |     ProjectionExec: expr=[json_get_float(data@1, score) as score, id@0 as id]                         |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1, maintains_sort_order=true |
+|               |         SchemaCastScanExec                                                                            |
+|               |           CooperativeExec                                                                             |
+|               |             BytesProcessedExec                                                                        |
+|               |               DuckSqlExec sql= SELECT "id", "data" FROM "json_test" ORDER BY "id" ASC NULLS LAST      |
+|               |                                                                                                       |
++---------------+-------------------------------------------------------------------------------------------------------+

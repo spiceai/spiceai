@@ -53,6 +53,10 @@ mod databricks_spark_catalog;
 mod databricks_spark_catalog_m2m;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark_m2m;
+#[cfg(feature = "databricks")]
+mod databricks_sql_warehouse;
+#[cfg(feature = "databricks")]
+mod databricks_sql_warehouse_permissions;
 mod dataset_availability;
 mod datasets_api;
 #[cfg(feature = "delta_lake")]
@@ -66,6 +70,7 @@ mod endpoint_auth;
 mod file;
 mod flight;
 mod gcs;
+mod git;
 mod github;
 mod glue;
 mod graphql;
@@ -110,6 +115,8 @@ mod schema_evolution;
 mod snapshot_integration;
 #[cfg(feature = "snowflake")]
 mod snowflake;
+#[cfg(feature = "snowflake")]
+mod snowflake_catalog;
 #[cfg(feature = "spark")]
 mod spark;
 mod spiceai;
