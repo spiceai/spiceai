@@ -102,6 +102,51 @@ pub async fn start_postgres_docker_container(
     Ok(running_container)
 }
 
+/// Like [`start_postgres_docker_container`] but launches Postgres with
+/// `wal_level=logical` and generous slot/sender limits so that the
+/// postgres replication tests can create multiple replication slots.
+#[instrument]
+pub async fn start_postgres_docker_container_with_logical_wal(
+    port: usize,
+) -> Result<RunningContainer<'static>, anyhow::Error> {
+    let container_name = format!("{PG_DOCKER_CONTAINER}-repl-{port}");
+    let container_name: &'static str = Box::leak(container_name.into_boxed_str());
+    let port: u16 = port
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("port {port} does not fit in u16: {e}"))?;
+
+    let running_container = ContainerRunnerBuilder::new(container_name)
+        .image(format!("{}postgres:latest", container_registry()))
+        .add_port_binding(5432, port)
+        .add_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
+        .command([
+            "postgres",
+            "-c",
+            "wal_level=logical",
+            "-c",
+            "max_replication_slots=10",
+            "-c",
+            "max_wal_senders=10",
+        ])
+        .healthcheck(HealthConfig {
+            test: Some(vec![
+                "CMD-SHELL".to_string(),
+                "pg_isready -U postgres".to_string(),
+            ]),
+            interval: Some(250_000_000),
+            timeout: Some(100_000_000),
+            retries: Some(5),
+            start_period: Some(500_000_000),
+            start_interval: None,
+        })
+        .build()?
+        .run(None)
+        .await?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+    Ok(running_container)
+}
+
 #[instrument]
 pub async fn get_postgres_connection_pool(
     port: usize,

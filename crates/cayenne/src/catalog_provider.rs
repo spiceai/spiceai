@@ -30,17 +30,14 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 
 use data_components::RefreshableCatalogProvider;
-use data_components::poly::PolyTableProvider;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use datafusion::execution::runtime_env::RuntimeEnv;
-#[cfg(feature = "partition-table-provider")]
-use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::prelude::*;
 
 use crate::catalog::CatalogError;
 use crate::metadata::{CompressionStrategy, VortexConfig};
-use crate::{CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use crate::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog};
 
 /// Configuration for constructing a [`CayenneCatalogProvider`].
 #[derive(Debug, Clone)]
@@ -337,9 +334,7 @@ impl RefreshableCatalogProvider for CayenneCatalogProvider {
                     .as_any()
                     .downcast_ref::<CayenneSchemaProvider>()
             {
-                existing_cayenne_schema
-                    .refresh_from(&refreshed_schema)
-                    .await;
+                existing_cayenne_schema.refresh_from(&refreshed_schema);
                 new_schemas.insert(ns.clone(), Arc::clone(existing_schema));
             } else {
                 new_schemas.insert(ns.clone(), Arc::new(refreshed_schema));
@@ -471,7 +466,7 @@ impl CayenneSchemaProvider {
         }
     }
 
-    async fn refresh_from(&self, source: &Self) {
+    fn refresh_from(&self, source: &Self) {
         let existing_tables = self.tables_snapshot();
         let refreshed_tables = source.tables_snapshot();
         let mut merged_tables = HashMap::with_capacity(refreshed_tables.len());
@@ -479,13 +474,9 @@ impl CayenneSchemaProvider {
         for (table_name, refreshed_provider) in refreshed_tables {
             let provider_to_use = if let Some(existing_provider) = existing_tables.get(&table_name)
             {
-                if Self::refresh_table_provider_in_place(existing_provider, &refreshed_provider)
-                    .await
-                {
-                    Arc::clone(existing_provider)
-                } else {
-                    refreshed_provider
-                }
+                // Existing providers are authoritative — their in-memory state is kept up-to-date by writes (insert, delete, etc).
+                // Reloading from the catalog is redundant and leads to unnecessary work and side effects including cache invalidations
+                Arc::clone(existing_provider)
             } else {
                 refreshed_provider
             };
@@ -494,101 +485,6 @@ impl CayenneSchemaProvider {
         }
 
         self.replace_tables(merged_tables);
-    }
-
-    async fn refresh_table_provider_in_place(
-        existing_provider: &Arc<dyn TableProvider>,
-        refreshed_provider: &Arc<dyn TableProvider>,
-    ) -> bool {
-        // Case 1: Non-partitioned CayenneTableProvider — refresh in place from the
-        // freshly-loaded provider.
-        if let Some(existing_cayenne) = Self::cayenne_table_from_provider(existing_provider) {
-            let Some(refreshed_cayenne) = Self::cayenne_table_from_provider(refreshed_provider)
-            else {
-                return false;
-            };
-
-            if let Err(err) = existing_cayenne.refresh(refreshed_cayenne).await {
-                tracing::warn!("Failed to refresh Cayenne table provider in place: {err}");
-                return false;
-            }
-
-            return true;
-        }
-
-        // Case 2: PolyTableProvider — extract the writer and check its inner type.
-        let Some(poly) = existing_provider
-            .as_any()
-            .downcast_ref::<PolyTableProvider>()
-        else {
-            return false;
-        };
-
-        let existing_writer = poly.writer();
-
-        // Case 2a: Non-partitioned CayenneTableProvider inside PolyTableProvider.
-        if let Some(existing_cayenne) = existing_writer
-            .as_any()
-            .downcast_ref::<CayenneTableProvider>()
-        {
-            let refreshed_writer = refreshed_provider
-                .as_any()
-                .downcast_ref::<PolyTableProvider>()
-                .map(PolyTableProvider::writer);
-
-            let refreshed_cayenne = refreshed_writer
-                .as_ref()
-                .and_then(|w| w.as_any().downcast_ref::<CayenneTableProvider>());
-
-            if let Some(refreshed) = refreshed_cayenne {
-                if let Err(err) = existing_cayenne.refresh(refreshed).await {
-                    tracing::warn!("Failed to refresh Cayenne table provider in place: {err}");
-                    return false;
-                }
-                return true;
-            }
-
-            return false;
-        }
-
-        // Case 2b: PartitionTableProvider inside PolyTableProvider — refresh each
-        // partition's inner CayenneTableProvider from itself (reloads deletion
-        // vectors, protected snapshots, snapshot ID, and listing table from the
-        // catalog).
-        #[cfg(feature = "partition-table-provider")]
-        if let Some(partition_provider) = existing_writer
-            .as_any()
-            .downcast_ref::<PartitionTableProvider>()
-        {
-            let providers = partition_provider.partition_table_providers().await;
-            for provider in &providers {
-                // Each partition's inner provider is a CayenneTableProvider.
-
-                use crate::CayenneTableProvider;
-                let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>() else {
-                    tracing::warn!(
-                        "Partition sub-provider is not a CayenneTableProvider, skipping refresh"
-                    );
-                    continue;
-                };
-                if let Err(err) = cayenne.refresh(cayenne).await {
-                    tracing::warn!("Failed to refresh partitioned Cayenne table in place: {err}");
-                    // Fail safely: keep the existing partitioned provider rather than
-                    // signaling failure that would cause it to be replaced by a
-                    // non-partitioned provider.
-                    return true;
-                }
-            }
-            return true;
-        }
-
-        false
-    }
-
-    fn cayenne_table_from_provider(
-        provider: &Arc<dyn TableProvider>,
-    ) -> Option<&CayenneTableProvider> {
-        provider.as_any().downcast_ref::<CayenneTableProvider>()
     }
 
     fn clear_tables(&self) {
