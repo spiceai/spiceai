@@ -611,22 +611,20 @@ async fn execute_merge(
     // matched key tuples and probe each file's rows with O(1) lookups. This
     // replaces the O(N) filter expression that the legacy path builds and
     // evaluates against every chunk of every file.
-    let delete_count =
-        match try_key_probe_delete(&target_provider, &normalized_batches, &target_key_columns)
-            .await?
-        {
-            Some(count) => count,
-            None => {
-                // Legacy path: build filter expression and push through delete_from.
-                let delete_filter = build_delete_filter(&normalized_batches, &target_key_columns)?;
-                let delete_plan = target_provider
-                    .delete_from(&session_state, vec![delete_filter])
-                    .await?;
-                let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
-                let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
-                extract_dml_count(&delete_batches)
-            }
-        };
+    let delete_count = if let Some(count) =
+        try_key_probe_delete(&target_provider, &normalized_batches, &target_key_columns).await?
+    {
+        count
+    } else {
+        // Legacy path: build filter expression and push through delete_from.
+        let delete_filter = build_delete_filter(&normalized_batches, &target_key_columns)?;
+        let delete_plan = target_provider
+            .delete_from(&session_state, vec![delete_filter])
+            .await?;
+        let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
+        let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
+        extract_dml_count(&delete_batches)
+    };
 
     // Verify the delete count matches the expected number of rows.
     if delete_count != total_rows as u64 {
@@ -861,9 +859,9 @@ fn extract_matched_key_set(
     Ok(keys)
 }
 
-/// Try the fast key-probe deletion path for PositionBased Cayenne tables.
+/// Try the fast key-probe deletion path for `PositionBased` Cayenne tables.
 ///
-/// Returns `Some(delete_count)` if the provider is a PositionBased Cayenne table
+/// Returns `Some(delete_count)` if the provider is a `PositionBased` Cayenne table
 /// (direct, adapter-wrapped, or partitioned) and the deletion succeeded.
 /// Returns `None` if the provider doesn't support the fast path, in which case
 /// the caller should fall back to the legacy filter-based deletion.
@@ -893,14 +891,13 @@ async fn try_key_probe_delete(
             .source()
             .as_any()
             .downcast_ref::<CayenneTableProvider>()
+            && cayenne.is_position_based()
         {
-            if cayenne.is_position_based() {
-                let matched_keys = extract_matched_key_set(batches, key_columns)?;
-                let count = cayenne
-                    .delete_matched_rows_by_key_probe(matched_keys, key_columns)
-                    .await?;
-                return Ok(Some(count));
-            }
+            let matched_keys = extract_matched_key_set(batches, key_columns)?;
+            let count = cayenne
+                .delete_matched_rows_by_key_probe(matched_keys, key_columns)
+                .await?;
+            return Ok(Some(count));
         }
         return Ok(None);
     }
