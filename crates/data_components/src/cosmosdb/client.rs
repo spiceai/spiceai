@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Thin wrapper around [`azure_data_cosmos::CosmosClient`] that holds the
-//! user-supplied credentials and exposes the small set of operations the
-//! table provider needs.
+//! Build a [`ContainerClient`] for a specific `(database, container)` from a
+//! user-supplied credential. Each [`CosmosDBTableProvider`] is pinned to one
+//! container, so we construct the `ContainerClient` once at connector setup
+//! and reuse it for schema inference and every subsequent scan.
+//!
+//! [`CosmosDBTableProvider`]: super::provider::CosmosDBTableProvider
 
 use std::sync::Arc;
 
@@ -54,72 +57,48 @@ impl std::fmt::Debug for CosmosDBCredential {
     }
 }
 
-/// Owns a [`CosmosClient`] and hands out container clients.
-#[derive(Clone)]
-pub struct CosmosDBClient {
-    inner: Arc<CosmosClient>,
-    endpoint: String,
-}
+/// Build a [`ContainerClient`] for the given `(database, container)` pair,
+/// returning the account endpoint alongside it (needed for resilience keying
+/// and error messages).
+///
+/// # Errors
+/// Returns an error if the credential is malformed or the underlying Azure
+/// SDK client cannot be constructed.
+pub fn build_container_client(
+    credential: CosmosDBCredential,
+    database: &str,
+    container: &str,
+) -> Result<(ContainerClient, Arc<str>), Error> {
+    let (client, endpoint) = match credential {
+        CosmosDBCredential::ConnectionString(conn_str) => {
+            let parsed: ConnectionString = conn_str
+                .parse()
+                .map_err(boxed_err)
+                .context(InvalidConnectionStringSnafu)?;
+            let endpoint = parsed.account_endpoint;
 
-impl std::fmt::Debug for CosmosDBClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CosmosDBClient")
-            .field("endpoint", &self.endpoint)
-            .finish_non_exhaustive()
-    }
-}
+            let client = CosmosClient::with_connection_string(Secret::from(conn_str), None)
+                .map_err(boxed_err)
+                .context(BuildClientSnafu {
+                    endpoint: endpoint.clone(),
+                })?;
 
-impl CosmosDBClient {
-    /// Build a new Cosmos DB client from the supplied credential.
-    ///
-    /// # Errors
-    /// Returns an error if the credential is malformed or the underlying
-    /// Azure SDK client cannot be constructed.
-    pub fn new(credential: CosmosDBCredential) -> Result<Self, Error> {
-        let (client, endpoint) = match credential {
-            CosmosDBCredential::ConnectionString(conn_str) => {
-                let parsed: ConnectionString = conn_str
-                    .parse()
-                    .map_err(boxed_err)
-                    .context(InvalidConnectionStringSnafu)?;
-                let endpoint = parsed.account_endpoint;
+            (client, endpoint)
+        }
+        CosmosDBCredential::Key { endpoint, key } => {
+            let client = CosmosClient::with_key(&endpoint, Secret::from(key), None)
+                .map_err(boxed_err)
+                .context(BuildClientSnafu {
+                    endpoint: endpoint.clone(),
+                })?;
 
-                let client = CosmosClient::with_connection_string(Secret::from(conn_str), None)
-                    .map_err(boxed_err)
-                    .context(BuildClientSnafu {
-                        endpoint: endpoint.clone(),
-                    })?;
+            (client, endpoint)
+        }
+    };
 
-                (client, endpoint)
-            }
-            CosmosDBCredential::Key { endpoint, key } => {
-                let client = CosmosClient::with_key(&endpoint, Secret::from(key), None)
-                    .map_err(boxed_err)
-                    .context(BuildClientSnafu {
-                        endpoint: endpoint.clone(),
-                    })?;
+    let container_client = client.database_client(database).container_client(container);
 
-                (client, endpoint)
-            }
-        };
-
-        Ok(Self {
-            inner: Arc::new(client),
-            endpoint,
-        })
-    }
-
-    #[must_use]
-    pub fn endpoint(&self) -> &str {
-        &self.endpoint
-    }
-
-    #[must_use]
-    pub fn container_client(&self, database: &str, container: &str) -> ContainerClient {
-        self.inner
-            .database_client(database)
-            .container_client(container)
-    }
+    Ok((container_client, Arc::from(endpoint)))
 }
 
 fn boxed_err<E>(e: E) -> Box<dyn std::error::Error + Send + Sync>

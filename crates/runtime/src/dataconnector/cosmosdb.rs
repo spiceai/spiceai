@@ -29,9 +29,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
 use data_components::cosmosdb::{
-    BackoffMethod, CosmosDBClient, CosmosDBCredential, CosmosDBTableProvider,
-    CosmosResilienceConfig, DEFAULT_MAX_CONCURRENT_REQUESTS, DEFAULT_MAX_RETRIES, DEFAULT_QUERY,
-    DEFAULT_SCHEMA_INFER_MAX_RECORDS, provider::CosmosDBTableProviderConfig,
+    BackoffMethod, CosmosDBCredential, CosmosDBTableProvider, CosmosResilienceConfig,
+    DEFAULT_MAX_CONCURRENT_REQUESTS, DEFAULT_MAX_RETRIES, DEFAULT_QUERY,
+    DEFAULT_SCHEMA_INFER_MAX_RECORDS, build_container_client,
+    provider::CosmosDBTableProviderConfig,
 };
 use datafusion::datasource::TableProvider;
 use datafusion_table_providers::UnsupportedTypeAction as DFUnsupportedTypeAction;
@@ -392,16 +393,17 @@ impl DataConnector for CosmosDB {
     ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
         let credential = self.build_credential(dataset)?;
 
-        let client = CosmosDBClient::new(credential).map_err(|e| {
-            DataConnectorError::UnableToGetReadProvider {
-                dataconnector: CONNECTOR_NAME.to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(e),
-            }
-        })?;
-
         let database_param = self.params.get("database").expose().ok();
         let (database, container) = resolve_database_and_container(dataset, database_param)?;
+
+        let (container_client, endpoint) =
+            build_container_client(credential, &database, &container).map_err(|e| {
+                DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: CONNECTOR_NAME.to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: Box::new(e),
+                }
+            })?;
 
         let query = self
             .params
@@ -440,7 +442,7 @@ impl DataConnector for CosmosDB {
             None => DEFAULT_SCHEMA_INFER_MAX_RECORDS,
         };
 
-        let resilience = self.build_resilience(client.endpoint());
+        let resilience = self.build_resilience(&endpoint);
 
         let mut config = CosmosDBTableProviderConfig::new(database, container, query)
             .with_schema_infer_max_records(schema_infer_max_records)
@@ -450,7 +452,7 @@ impl DataConnector for CosmosDB {
             config = config.with_unsupported_type_action(action);
         }
 
-        let provider = CosmosDBTableProvider::try_new(client, config)
+        let provider = CosmosDBTableProvider::try_new(container_client, endpoint, config)
             .await
             .map_err(|e| DataConnectorError::UnableToGetReadProvider {
                 dataconnector: CONNECTOR_NAME.to_string(),

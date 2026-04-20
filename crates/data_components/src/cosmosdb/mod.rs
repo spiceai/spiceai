@@ -32,7 +32,7 @@ pub mod schema;
 
 use snafu::Snafu;
 
-pub use client::{CosmosDBClient, CosmosDBCredential};
+pub use client::{CosmosDBCredential, build_container_client};
 pub use provider::CosmosDBTableProvider;
 pub use resilience::{
     BackoffMethod, CosmosResilienceConfig, DEFAULT_MAX_CONCURRENT_REQUESTS, DEFAULT_MAX_RETRIES,

@@ -58,7 +58,8 @@ use futures::StreamExt;
 use serde_json::Value;
 use snafu::ResultExt;
 
-use super::client::CosmosDBClient;
+use azure_data_cosmos::clients::ContainerClient;
+
 use super::resilience::{CosmosResilienceConfig, ResilienceError, run_with_resilience};
 use super::schema::{infer_schema, strip_system_fields};
 use super::{DEFAULT_SCHEMA_INFER_MAX_RECORDS, EmptyContainerSnafu, Error, JsonDecodeSnafu};
@@ -129,29 +130,46 @@ impl CosmosDBTableProviderConfig {
 }
 
 /// Arrow [`TableProvider`] backed by an Azure Cosmos DB container.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CosmosDBTableProvider {
-    client: CosmosDBClient,
+    container_client: ContainerClient,
+    endpoint: Arc<str>,
     config: Arc<CosmosDBTableProviderConfig>,
     schema: SchemaRef,
+}
+
+impl std::fmt::Debug for CosmosDBTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CosmosDBTableProvider")
+            .field("endpoint", &self.endpoint)
+            .field("config", &self.config)
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CosmosDBTableProvider {
     /// Build a new table provider, sampling the container for a schema if
     /// no override was supplied.
     ///
+    /// `container_client` is pre-built for the `(database, container)` pair
+    /// carried on `config`; `endpoint` is the Cosmos account endpoint used for
+    /// resilience keying and error messages.
+    ///
     /// # Errors
     /// Returns an error if the sample query fails or the container is empty
     /// and no schema override was supplied.
     pub async fn try_new(
-        client: CosmosDBClient,
+        container_client: ContainerClient,
+        endpoint: Arc<str>,
         config: CosmosDBTableProviderConfig,
     ) -> Result<Self, Error> {
         let schema = if let Some(schema) = &config.schema_override {
             Arc::clone(schema)
         } else {
             let samples = fetch_samples(
-                &client,
+                &container_client,
+                &endpoint,
                 &config.database,
                 &config.container,
                 &config.query,
@@ -178,7 +196,8 @@ impl CosmosDBTableProvider {
         };
 
         Ok(Self {
-            client,
+            container_client,
+            endpoint,
             config: Arc::new(config),
             schema,
         })
@@ -261,17 +280,15 @@ fn schema_has_unsupported_columns(schema: &SchemaRef) -> bool {
 /// retried (with fresh pager construction) on transient errors, bounded by
 /// the configured retry budget.
 async fn fetch_samples(
-    client: &CosmosDBClient,
+    container_client: &ContainerClient,
+    endpoint: &str,
     database: &str,
     container: &str,
     query: &str,
     limit: usize,
     resilience: &CosmosResilienceConfig,
 ) -> Result<Vec<Value>, Error> {
-    let container_client = client.container_client(database, container);
-    let endpoint = client.endpoint().to_string();
-
-    run_with_resilience(resilience, &endpoint, || async {
+    run_with_resilience(resilience, endpoint, || async {
         let mut pager = container_client.query_items::<Value>(query, (), None)?;
         let mut samples = Vec::with_capacity(limit.min(1024));
         while samples.len() < limit {
@@ -285,7 +302,9 @@ async fn fetch_samples(
     })
     .await
     .map_err(|e| match e {
-        ResilienceError::Disabled => Error::ConnectorDisabled { endpoint },
+        ResilienceError::Disabled => Error::ConnectorDisabled {
+            endpoint: endpoint.to_string(),
+        },
         ResilienceError::Request(source) => Error::QueryFailed {
             database: database.to_string(),
             container: container.to_string(),
@@ -318,7 +337,8 @@ impl TableProvider for CosmosDBTableProvider {
         let projected_schema = project_schema(&self.schema, projection)?;
 
         Ok(Arc::new(CosmosDBExec::new(
-            self.client.clone(),
+            self.container_client.clone(),
+            Arc::clone(&self.endpoint),
             Arc::clone(&self.config),
             Arc::clone(&self.schema),
             projected_schema,
@@ -330,7 +350,8 @@ impl TableProvider for CosmosDBTableProvider {
 /// [`ExecutionPlan`] that streams documents from a Cosmos DB container and
 /// converts them into Arrow record batches.
 struct CosmosDBExec {
-    client: CosmosDBClient,
+    container_client: ContainerClient,
+    endpoint: Arc<str>,
     config: Arc<CosmosDBTableProviderConfig>,
     /// Full (un-projected) schema used when decoding JSON.
     full_schema: SchemaRef,
@@ -342,7 +363,8 @@ struct CosmosDBExec {
 
 impl CosmosDBExec {
     fn new(
-        client: CosmosDBClient,
+        container_client: ContainerClient,
+        endpoint: Arc<str>,
         config: Arc<CosmosDBTableProviderConfig>,
         full_schema: SchemaRef,
         projected_schema: SchemaRef,
@@ -355,7 +377,8 @@ impl CosmosDBExec {
             Boundedness::Bounded,
         );
         Self {
-            client,
+            container_client,
+            endpoint,
             config,
             full_schema,
             projected_schema,
@@ -421,7 +444,8 @@ impl ExecutionPlan for CosmosDBExec {
         let mut builder = RecordBatchReceiverStream::builder(Arc::clone(&self.projected_schema), 2);
         let tx = builder.tx();
 
-        let client = self.client.clone();
+        let container_client = self.container_client.clone();
+        let endpoint = Arc::clone(&self.endpoint);
         let config = Arc::clone(&self.config);
         let full_schema = Arc::clone(&self.full_schema);
         let projection = self.projection.clone();
@@ -429,7 +453,7 @@ impl ExecutionPlan for CosmosDBExec {
         builder.spawn(async move {
             if config.resilience.disabled.load(Ordering::Acquire) {
                 return Err(to_df_error(Error::ConnectorDisabled {
-                    endpoint: client.endpoint().to_string(),
+                    endpoint: endpoint.to_string(),
                 }));
             }
 
@@ -443,7 +467,7 @@ impl ExecutionPlan for CosmosDBExec {
                         .await
                         .map_err(|_| {
                             to_df_error(Error::ConnectorDisabled {
-                                endpoint: client.endpoint().to_string(),
+                                endpoint: endpoint.to_string(),
                             })
                         })?,
                 ),
@@ -452,8 +476,6 @@ impl ExecutionPlan for CosmosDBExec {
             let _inflight = crate::cosmosdb::resilience::InflightGuard::enter(
                 Arc::<AtomicU64>::clone(&config.resilience.inflight),
             );
-
-            let container_client = client.container_client(&config.database, &config.container);
 
             let handle_stream_error = |resilience: &CosmosResilienceConfig,
                                        endpoint: &str,
@@ -477,13 +499,13 @@ impl ExecutionPlan for CosmosDBExec {
 
             let mut pager = container_client
                 .query_items::<Value>(config.query.as_str(), (), None)
-                .map_err(|e| handle_stream_error(&config.resilience, client.endpoint(), e))?;
+                .map_err(|e| handle_stream_error(&config.resilience, &endpoint, e))?;
 
             let mut buffer: Vec<Value> = Vec::with_capacity(STREAM_BATCH_SIZE);
 
             while let Some(item) = pager.next().await {
-                let doc = item
-                    .map_err(|e| handle_stream_error(&config.resilience, client.endpoint(), e))?;
+                let doc =
+                    item.map_err(|e| handle_stream_error(&config.resilience, &endpoint, e))?;
 
                 buffer.push(strip_system_fields(doc));
 
