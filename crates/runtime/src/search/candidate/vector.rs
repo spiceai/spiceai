@@ -220,13 +220,7 @@ impl ChunkedNonIndexVectorGeneration {
             let (project_cols, unnest_cols) = self.unnest_projection_and_columns();
 
             lp = lp
-                .project(
-                    [
-                        self.primary_keys.iter().map(ident).collect(),
-                        project_cols,
-                    ]
-                    .concat(),
-                )?
+                .project([self.primary_keys.iter().map(ident).collect(), project_cols].concat())?
                 // Note: `datafusion_expr::builder::unnest` does not work for complex queries
                 .unnest_columns_with_options(unnest_cols, UnnestOptions::new())?;
 
@@ -327,10 +321,7 @@ impl ChunkedNonIndexVectorGeneration {
         // Process the embedding column and offsets / list elements
         let (project_cols, unnest_cols) = self.unnest_projection_and_columns();
         let mut base_lp = lp
-            .project(
-                [project_cols, vec![col(VSS_TEMP_GEN_ID_COLUMN)]]
-                    .concat(),
-            )?
+            .project([project_cols, vec![col(VSS_TEMP_GEN_ID_COLUMN)]].concat())?
             // Note: `datafusion_expr::builder::unnest` does not work for complex queries
             .unnest_columns_with_options(unnest_cols, UnnestOptions::new())?;
 
@@ -508,10 +499,7 @@ impl ChunkedNonIndexVectorGeneration {
     /// rolled up per primary key with the configured aggregation
     /// (`max` / `mean` / `sum`). The `_match` column is the source list
     /// element that produced the best per-element score.
-    fn search_list_multi(
-        &self,
-        query: String,
-    ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+    fn search_list_multi(&self, query: String) -> Result<Arc<dyn TableProvider>, DataFusionError> {
         let (pks, score_table, additional_table) =
             self.score_cte_sql(&self.table_provider, query, &[])?;
 
@@ -615,14 +603,13 @@ impl ChunkedNonIndexVectorGeneration {
     ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
         // Reuse the first query to grab the canonical primary-key set
         // and the additional-columns plan for the final join.
-        let (pks, _primary_score_table, additional_table) = self
-            .score_cte_sql(&self.table_provider, queries[0].clone(), &[])?;
+        let (pks, _primary_score_table, additional_table) =
+            self.score_cte_sql(&self.table_provider, queries[0].clone(), &[])?;
 
         // Build one tagged sub-plan per query.
         let mut subplans: Vec<LogicalPlan> = Vec::with_capacity(queries.len());
         for (idx, q) in queries.iter().enumerate() {
-            let (_, score_table, _) =
-                self.score_cte_sql(&self.table_provider, q.clone(), &[])?;
+            let (_, score_table, _) = self.score_cte_sql(&self.table_provider, q.clone(), &[])?;
             let idx_i64 = i64::try_from(idx).unwrap_or(i64::MAX);
             let subplan = LogicalPlanBuilder::new(score_table)
                 .project(
@@ -721,10 +708,7 @@ impl ChunkedNonIndexVectorGeneration {
                         .iter()
                         .map(|pk| Column::new(Some("agg"), pk).into())
                         .collect::<Vec<LogicalExpr>>(),
-                    vec![
-                        col(SEARCH_VALUE_COLUMN_NAME),
-                        col(SEARCH_SCORE_COLUMN_NAME),
-                    ],
+                    vec![col(SEARCH_VALUE_COLUMN_NAME), col(SEARCH_SCORE_COLUMN_NAME)],
                 ]
                 .concat(),
             )?;

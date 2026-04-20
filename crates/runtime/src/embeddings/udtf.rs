@@ -333,10 +333,11 @@ impl VectorSearchTableFunc {
         let query = args.next();
         let queries = Self::parse_query_arg(query)?;
         // `q` is used in downstream error messages + back-compat field.
-        let q = queries
-            .first()
-            .cloned()
-            .expect("parse_query_arg guarantees at least one element");
+        let q = queries.first().cloned().ok_or_else(|| {
+            DataFusionError::Plan(
+                "Invalid arguments: vector_search query argument must contain at least one query value.".to_string(),
+            )
+        })?;
 
         let (column, limit, include_score) = match (args.next(), args.next(), args.next()) {
             // No arguments, provides defaults
@@ -556,8 +557,7 @@ impl TableFunctionImpl for VectorSearchTableFunc {
             let mut dimensions = unsafe { RequestContext::current_sync().to_dimensions() };
             if is_multi_vector {
                 dimensions.push(opentelemetry::KeyValue::new("multi_vector", true));
-                if let Some(agg) = embedding_table_provider.multi_vector_aggregation(col.as_str())
-                {
+                if let Some(agg) = embedding_table_provider.multi_vector_aggregation(col.as_str()) {
                     dimensions.push(opentelemetry::KeyValue::new(
                         "multi_vector_aggregation",
                         agg.to_string(),
@@ -897,8 +897,7 @@ mod parser_tests {
                 Expr::Literal(ScalarValue::Int32(Some(42)), None),
             ],
         ));
-        let err =
-            VectorSearchTableFunc::parse_query_arg(Some(&q)).expect_err("expected rejection");
+        let err = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect_err("expected rejection");
         assert!(err.to_string().contains("must be string literals"));
     }
 
@@ -907,8 +906,7 @@ mod parser_tests {
         use datafusion::functions_nested::make_array::make_array_udf;
         let make_array = make_array_udf();
         let q = Expr::ScalarFunction(ScalarFunction::new_udf(Arc::clone(&make_array), vec![]));
-        let err = VectorSearchTableFunc::parse_query_arg(Some(&q))
-            .expect_err("expected rejection");
+        let err = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect_err("expected rejection");
         assert!(err.to_string().contains("at least one query string"));
     }
 }

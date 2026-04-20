@@ -570,13 +570,25 @@ fn decompose_generic_list<O: OffsetSizeTrait>(
                 None
             } else if let Some(a) = values.as_any().downcast_ref::<StringArray>() {
                 let v = a.value(j);
-                if v.is_empty() { None } else { Some(v.to_string()) }
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
             } else if let Some(a) = values.as_any().downcast_ref::<LargeStringArray>() {
                 let v = a.value(j);
-                if v.is_empty() { None } else { Some(v.to_string()) }
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
             } else if let Some(a) = values.as_any().downcast_ref::<StringViewArray>() {
                 let v = a.value(j);
-                if v.is_empty() { None } else { Some(v.to_string()) }
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
             } else {
                 None
             };
@@ -642,32 +654,34 @@ fn build_multi_vector_list_array(
     let total_elements: usize = row_lengths.iter().sum();
 
     let mut inner_builder = FixedSizeListBuilder::with_capacity(
-        PrimitiveBuilder::<Float32Type>::with_capacity(
-            total_elements * (vector_length as usize),
-        ),
+        PrimitiveBuilder::<Float32Type>::with_capacity(total_elements * (vector_length as usize)),
         vector_length,
         total_elements,
     )
     .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
 
+    let expected_slots: usize = positions_validity
+        .iter()
+        .flat_map(|v| v.iter())
+        .filter(|&&valid| valid)
+        .count();
+    if embedded.len() != expected_slots {
+        return Err(format!(
+            "embedding count mismatch: expected {expected_slots} vectors but got {}",
+            embedded.len()
+        )
+        .into());
+    }
+
     let mut embed_ptr: usize = 0;
     for validity in positions_validity {
         for &valid in validity {
             if valid {
-                if let Some(v) = embedded.get(embed_ptr) {
-                    inner_builder.values().append_slice(v);
-                    inner_builder.append(true);
-                } else {
-                    inner_builder
-                        .values()
-                        .append_nulls(vector_length as usize);
-                    inner_builder.append(false);
-                }
+                inner_builder.values().append_slice(&embedded[embed_ptr]);
+                inner_builder.append(true);
                 embed_ptr += 1;
             } else {
-                inner_builder
-                    .values()
-                    .append_nulls(vector_length as usize);
+                inner_builder.values().append_nulls(vector_length as usize);
                 inner_builder.append(false);
             }
         }
@@ -1141,8 +1155,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_multi_vector_list_array_shapes() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    {
+    fn test_build_multi_vector_list_array_shapes()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let validity = vec![vec![true, false], vec![], vec![true]];
         let lengths = vec![2, 0, 1];
         let embedded = vec![vec![0.1, 0.2], vec![0.9, 0.8]];
@@ -1213,7 +1227,11 @@ mod tests {
         // Null/empty string element → null vector in output.
         let rows: DecomposedListOfStrings = vec![
             None,
-            Some(vec![Some("hello".to_string()), None, Some("world".to_string())]),
+            Some(vec![
+                Some("hello".to_string()),
+                None,
+                Some("world".to_string()),
+            ]),
             Some(vec![]),
         ];
         let model = MockEmbedder::default()

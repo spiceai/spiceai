@@ -109,10 +109,10 @@ impl std::fmt::Debug for EmbeddingTable {
 }
 
 /// Internal classifier for the source column's Arrow type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum SourceShape {
-    /// `Utf8` / `Utf8View` / `LargeUtf8`.
-    Scalar,
+    /// `Utf8` / `Utf8View` / `LargeUtf8` — carries the concrete type for error messages.
+    Scalar(DataType),
     /// `List<Utf8>` / `LargeList<Utf8>` (and `Utf8View`/`LargeUtf8` element variants).
     ListOfString,
 }
@@ -594,7 +594,7 @@ impl EmbeddingTable {
         let data_type = field.data_type();
         match data_type {
             DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => {
-                Ok(Some(SourceShape::Scalar))
+                Ok(Some(SourceShape::Scalar(data_type.clone())))
             }
             DataType::List(inner) | DataType::LargeList(inner)
                 if matches!(
@@ -623,13 +623,11 @@ impl EmbeddingTable {
         config: &ColumnEmbeddingConfig,
     ) -> Result<EmbeddingInputMode, Error> {
         match shape {
-            SourceShape::Scalar => {
+            SourceShape::Scalar(data_type) => {
                 if config.aggregation.is_some() || config.max_elements_per_row.is_some() {
-                    // Scalar column with multi-vector options — report the
-                    // actual type from the base schema if we have it.
                     return MultiVectorOptionsOnScalarSnafu {
                         column: column.to_string(),
-                        data_type: DataType::Utf8,
+                        data_type,
                     }
                     .fail();
                 }
@@ -1248,7 +1246,7 @@ mod tests {
     fn test_detect_source_shape_scalar_utf8() {
         let schema = Arc::new(Schema::new(vec![field("c", DataType::Utf8)]));
         let shape = EmbeddingTable::detect_source_shape("c", &schema).expect("ok");
-        assert_eq!(shape, Some(SourceShape::Scalar));
+        assert_eq!(shape, Some(SourceShape::Scalar(DataType::Utf8)));
     }
 
     #[test]
@@ -1284,7 +1282,9 @@ mod tests {
             aggregation: None,
             max_elements_per_row: None,
         };
-        let mode = EmbeddingTable::resolve_input_mode("c", SourceShape::Scalar, &cfg).expect("ok");
+        let mode =
+            EmbeddingTable::resolve_input_mode("c", SourceShape::Scalar(DataType::Utf8), &cfg)
+                .expect("ok");
         assert_eq!(mode, EmbeddingInputMode::Scalar);
     }
 
@@ -1299,8 +1299,9 @@ mod tests {
             aggregation: Some(EmbeddingAggregation::Max),
             max_elements_per_row: None,
         };
-        let err = EmbeddingTable::resolve_input_mode("c", SourceShape::Scalar, &cfg)
-            .expect_err("expected rejection");
+        let err =
+            EmbeddingTable::resolve_input_mode("c", SourceShape::Scalar(DataType::Utf8), &cfg)
+                .expect_err("expected rejection");
         assert!(matches!(err, Error::MultiVectorOptionsOnScalar { .. }));
     }
 
@@ -1315,8 +1316,8 @@ mod tests {
             aggregation: None,
             max_elements_per_row: None,
         };
-        let mode =
-            EmbeddingTable::resolve_input_mode("tags", SourceShape::ListOfString, &cfg).expect("ok");
+        let mode = EmbeddingTable::resolve_input_mode("tags", SourceShape::ListOfString, &cfg)
+            .expect("ok");
         match mode {
             EmbeddingInputMode::ListMulti {
                 aggregation,
@@ -1340,8 +1341,8 @@ mod tests {
             aggregation: Some(EmbeddingAggregation::Mean),
             max_elements_per_row: Some(64),
         };
-        let mode =
-            EmbeddingTable::resolve_input_mode("tags", SourceShape::ListOfString, &cfg).expect("ok");
+        let mode = EmbeddingTable::resolve_input_mode("tags", SourceShape::ListOfString, &cfg)
+            .expect("ok");
         assert_eq!(
             mode,
             EmbeddingInputMode::ListMulti {
@@ -1441,9 +1442,8 @@ mod tests {
             },
         )]);
 
-        let base_table: Arc<dyn TableProvider> = Arc::new(
-            datafusion::catalog::MemTable::try_new(base_schema, vec![vec![]]).unwrap(),
-        );
+        let base_table: Arc<dyn TableProvider> =
+            Arc::new(datafusion::catalog::MemTable::try_new(base_schema, vec![vec![]]).unwrap());
 
         let table = EmbeddingTable {
             base_table,
@@ -1487,9 +1487,8 @@ mod tests {
                 },
             },
         )]);
-        let base_table: Arc<dyn TableProvider> = Arc::new(
-            datafusion::catalog::MemTable::try_new(base_schema, vec![vec![]]).unwrap(),
-        );
+        let base_table: Arc<dyn TableProvider> =
+            Arc::new(datafusion::catalog::MemTable::try_new(base_schema, vec![vec![]]).unwrap());
         let table = EmbeddingTable {
             base_table,
             embedded_columns,
