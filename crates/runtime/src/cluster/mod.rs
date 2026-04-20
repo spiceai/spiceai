@@ -834,12 +834,8 @@ pub(crate) async fn initialize_cluster_scheduler_future(
             // builder setup.
             let df = rt.datafusion();
             if let Some(partition_service) = df.partition_service.as_ref() {
-                if let Err(err) = partition::initialize_partition_metadata(
-                    partition_service,
-                    &df,
-                    &app,
-                )
-                .await
+                if let Err(err) =
+                    partition::initialize_partition_metadata(partition_service, &df, &app).await
                 {
                     tracing::warn!(
                         "Failed to initialize partition metadata during scheduler startup: {err}"

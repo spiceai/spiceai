@@ -265,13 +265,8 @@ impl PartitionService {
             return Ok(());
         }
 
-        self.assign_pending(
-            &[table.clone()],
-            &executors,
-            df,
-            AssignmentLimit::Unlimited,
-        )
-        .await
+        self.assign_pending(&[table.clone()], &executors, df, AssignmentLimit::Unlimited)
+            .await
     }
 
     /// Discover, add/remove, and assign partitions for every accelerated table
