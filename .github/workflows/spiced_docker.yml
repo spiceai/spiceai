@@ -52,7 +52,7 @@ jobs:
     #   - release 'edited' only when the release is flipped to 'latest', so the
     #     ':latest' tag can be moved without re-publishing on every edit
     if: ${{ github.event_name != 'release' || github.event.action == 'published' || (github.event.action == 'edited' && github.event.changes.make_latest && github.event.changes.make_latest.to == 'true') }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       rel_version: ${{ steps.resolve.outputs.rel_version }}
       release_tag: ${{ steps.resolve.outputs.release_tag }}
@@ -339,7 +339,7 @@ jobs:
   publish:
     if: ${{ needs.setup.outputs.run_amd64 == 'true' || needs.setup.outputs.run_arm64 == 'true' }}
     needs: [setup, build-amd64, build-arm64]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     env:
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       PUBLISH: ${{ needs.setup.outputs.publish }}
