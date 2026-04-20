@@ -312,11 +312,12 @@ fn atom_of(v: &Value) -> Option<String> {
 }
 
 fn escape_object_key(key: &str) -> String {
+    // SQLite / DuckDB JSON-path shorthand (`$.a.b`) accepts identifier-style
+    // keys only — anything else, including hyphens, must be bracket-quoted so
+    // consumers can re-parse the `fullkey`.
     let simple = !key.is_empty()
-        && key
-            .chars()
-            .enumerate()
-            .all(|(i, c)| c.is_ascii_alphanumeric() || c == '_' || (i > 0 && c == '-'));
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !key.chars().next().unwrap().is_ascii_digit();
     if simple {
         key.to_owned()
     } else {
@@ -689,9 +690,14 @@ mod tests {
 
     #[test]
     fn keys_with_special_characters_are_quoted() {
-        let rows = json_tree(r#"{"with space": 1}"#);
+        let rows = json_tree(r#"{"with space": 1, "has-hyphen": 2, "_ok": 3, "plain": 4}"#);
         let fullkeys: Vec<&str> = rows.iter().map(|r| r.fullkey.as_str()).collect();
+        // Space and hyphen both force bracket-quoting so consumers can re-parse.
         assert!(fullkeys.contains(&r#"$.["with space"]"#));
+        assert!(fullkeys.contains(&r#"$.["has-hyphen"]"#));
+        // Identifier-safe keys stay in shorthand form.
+        assert!(fullkeys.contains(&"$._ok"));
+        assert!(fullkeys.contains(&"$.plain"));
     }
 
     #[test]
