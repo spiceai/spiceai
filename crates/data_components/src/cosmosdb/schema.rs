@@ -161,8 +161,8 @@ mod tests {
             json!({"id": "2", "only_in_second": 42}),
         ];
         let schema = infer_schema(&samples).unwrap();
-        assert!(schema.field_with_name("id").is_ok());
-        assert!(schema.field_with_name("only_in_first").is_ok());
-        assert!(schema.field_with_name("only_in_second").is_ok());
+        schema.field_with_name("id").unwrap();
+        schema.field_with_name("only_in_first").unwrap();
+        schema.field_with_name("only_in_second").unwrap();
     }
 }
