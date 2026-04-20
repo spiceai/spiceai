@@ -295,7 +295,7 @@ impl RefreshTask {
             .delete_from(&session_state, vec![lit(true)])
             .await
             .map_err(find_datafusion_root)
-            .context(crate::accelerated_table::AcceleratedTableDoesntSupportDeleteSnafu)?;
+            .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
         collect(delete_plan, ctx.task_ctx())
             .await
             .map_err(find_datafusion_root)
