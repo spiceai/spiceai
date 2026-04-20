@@ -358,6 +358,30 @@ impl Parameters {
 
         self.params = params.into_iter().collect();
     }
+
+    /// Returns the subset of params that map to `SpiceObjectStoreRegistry`
+    /// configuration keys, with the prefixed names (`aws_*`, `azure_storage_*`,
+    /// `google_*`) rewritten to the registry-facing names (`key`, `secret`,
+    /// `account`, etc.).
+    ///
+    /// Connector-internal params that aren't part of an object store mapping
+    /// (e.g. a Databricks workspace `endpoint`/`token`) are excluded, so this
+    /// is safe to encode directly into an object-store URL fragment.
+    #[must_use]
+    pub fn storage_registry_params(&self) -> Vec<(String, SecretString)> {
+        let map: HashMap<_, _> = self.params.iter().cloned().collect();
+        let mut out = Vec::new();
+        for (prefixed_key, registry_key) in AWS_PREFIXED_FRAGMENT_PARAMS
+            .iter()
+            .chain(AZURE_PREFIXED_FRAGMENT_PARAMS.iter())
+            .chain(GCS_PREFIXED_FRAGMENT_PARAMS.iter())
+        {
+            if let Some(value) = map.get(*prefixed_key) {
+                out.push(((*registry_key).to_string(), value.clone()));
+            }
+        }
+        out
+    }
 }
 
 #[derive(Clone)]

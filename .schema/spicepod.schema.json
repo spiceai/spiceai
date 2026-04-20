@@ -887,6 +887,13 @@
           "description": "Aggregation temporality preference for exported metrics.\n\nDefaults to `delta`, which is required by Datadog and recommended for\nmost push-based OTLP backends (`CloudWatch`, New Relic, etc.). Set to\n`cumulative` when forwarding to an `OTel` collector that feeds Prometheus\nor another cumulative-native backend. See [`OtelTemporality`] for\ndetails.",
           "$ref": "#/$defs/OtelTemporality",
           "default": "delta"
+        },
+        "prefix": {
+          "description": "Optional prefix prepended to every exported metric name.\n\nUseful for namespacing Spice metrics in shared backends so they don't\ncollide with metrics from other services. For example, with\n`prefix: \"spiceai.\"` the runtime metric `query_duration_ms` is exported\nas `spiceai.query_duration_ms`.\n\nThe prefix is applied via an `OpenTelemetry` `View` on the runtime's\n`MeterProvider`, so it affects every metric reader attached to that\nprovider (the `otel_exporter` push reader, the Prometheus scrape\nendpoint, and the cluster on-demand OTLP reader). In practice users\ntypically enable only one of these at a time, so the prefix appears on\nexactly the destination they configured it for.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false,

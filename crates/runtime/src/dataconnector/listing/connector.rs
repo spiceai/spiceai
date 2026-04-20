@@ -1217,6 +1217,47 @@ impl<T: ListingTableConnector + Display> DataConnector for T {
         }
     }
 
+    async fn register_object_stores(
+        &self,
+        dataset: &Dataset,
+        runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> DataConnectorResult<()> {
+        let url = self.get_object_store_url(dataset, None)?;
+        if url.scheme() == "file" {
+            tracing::warn!(
+                "Dataset {} has a file:// scheme and may not be resolvable on cluster executors without a shared mount.",
+                dataset.name
+            );
+            return Ok(());
+        }
+
+        let listing_url = ListingTableUrl::parse(url).boxed().context(
+            crate::dataconnector::UnableToConnectInternalSnafu {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+            },
+        )?;
+
+        // Triggers SpiceObjectStoreRegistry::get_store, which builds an object
+        // store from the URL fragment params (already secret-expanded by
+        // ConnectorParamsBuilder when the connector was created) and registers
+        // it on the runtime env keyed by the bare URL.
+        runtime_env.object_store(&listing_url).boxed().context(
+            crate::dataconnector::UnableToConnectInternalSnafu {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+            },
+        )?;
+
+        let mut redacted = <ListingTableUrl as AsRef<url::Url>>::as_ref(&listing_url).clone();
+        redacted.set_fragment(None);
+        tracing::debug!(
+            "Configured object storage for Dataset {} ({redacted})",
+            dataset.name,
+        );
+        Ok(())
+    }
+
     /// A hook that is called when an accelerated table is registered to the
     /// `DataFusion` context for this data connector.
     ///
