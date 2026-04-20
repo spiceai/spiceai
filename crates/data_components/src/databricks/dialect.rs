@@ -163,12 +163,18 @@ mod tests {
         let unparser = Unparser::new(&dialect);
 
         // utf8_cast_dtype: STRING instead of VARCHAR
-        let expr = datafusion::logical_expr::cast(datafusion::prelude::col("a"), datafusion::arrow::datatypes::DataType::Utf8);
+        let expr = datafusion::logical_expr::cast(
+            datafusion::prelude::col("a"),
+            datafusion::arrow::datatypes::DataType::Utf8,
+        );
         let actual = format!("{}", unparser.expr_to_sql(&expr)?);
         assert_eq!(actual, "CAST(`a` AS STRING)");
 
         // large_utf8_cast_dtype: STRING instead of TEXT
-        let expr = datafusion::logical_expr::cast(datafusion::prelude::col("a"), datafusion::arrow::datatypes::DataType::LargeUtf8);
+        let expr = datafusion::logical_expr::cast(
+            datafusion::prelude::col("a"),
+            datafusion::arrow::datatypes::DataType::LargeUtf8,
+        );
         let actual = format!("{}", unparser.expr_to_sql(&expr)?);
         assert_eq!(actual, "CAST(`a` AS STRING)");
 
