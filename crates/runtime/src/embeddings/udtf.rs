@@ -329,8 +329,7 @@ impl VectorSearchTableFunc {
 }
 
 impl VectorSearchTableFunc {
-    #[must_use]
-    pub fn to_expr(args: &VectorSearchTableFuncArgs) -> Vec<Expr> {
+    pub fn to_expr(args: &VectorSearchTableFuncArgs) -> DataFusionResult<Vec<Expr>> {
         use datafusion::logical_expr::expr::FieldMetadata;
         use std::collections::BTreeMap;
 
@@ -343,10 +342,12 @@ impl VectorSearchTableFunc {
             expr.push(Expr::Column(Column::new_unqualified(col)));
         }
         if let Some(limit) = args.limit {
-            expr.push(Expr::Literal(
-                ScalarValue::UInt64(Some(u64::try_from(limit).unwrap_or(u64::MAX))),
-                None,
-            ));
+            let limit_u64 = u64::try_from(limit).map_err(|_| {
+                DataFusionError::Plan(format!(
+                    "vector_search: limit value {limit} is out of range for u64."
+                ))
+            })?;
+            expr.push(Expr::Literal(ScalarValue::UInt64(Some(limit_u64)), None));
         }
         if let Some(include_score) = args.include_score {
             expr.push(Expr::Literal(
@@ -364,7 +365,7 @@ impl VectorSearchTableFunc {
                 Some(meta),
             ));
         }
-        expr
+        Ok(expr)
     }
 
     fn parse_args(args: &[Expr]) -> DataFusionResult<VectorSearchTableFuncArgs> {

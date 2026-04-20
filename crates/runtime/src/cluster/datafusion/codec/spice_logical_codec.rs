@@ -126,7 +126,7 @@ impl SpiceLogicalCodec {
                         .as_deref()
                         .map(DistanceMetric::parse)
                         .transpose()?,
-                });
+                })?;
                 udtf.call(&exprs)
             }
             Args::Rrf(rrf_args) => Self::invoke_rrf(&rrf_args, runtime),
@@ -167,18 +167,19 @@ impl SpiceLogicalCodec {
                     let Some(args) = &vs.args else {
                         return exec_err!("VectorSearch nested query missing args");
                     };
-                    let vector_exprs = VectorSearchTableFunc::to_expr(&VectorSearchTableFuncArgs {
-                        tbl: SqlTableReference::parse_str(&args.table),
-                        query: args.query.clone(),
-                        column: args.column.clone(),
-                        limit: args.limit.map(Self::limit_from_u64).transpose()?,
-                        include_score: args.include_score,
-                        distance_metric: args
-                            .distance_metric
-                            .as_deref()
-                            .map(DistanceMetric::parse)
-                            .transpose()?,
-                    });
+                    let vector_exprs =
+                        VectorSearchTableFunc::to_expr(&VectorSearchTableFuncArgs {
+                            tbl: SqlTableReference::parse_str(&args.table),
+                            query: args.query.clone(),
+                            column: args.column.clone(),
+                            limit: args.limit.map(Self::limit_from_u64).transpose()?,
+                            include_score: args.include_score,
+                            distance_metric: args
+                                .distance_metric
+                                .as_deref()
+                                .map(DistanceMetric::parse)
+                                .transpose()?,
+                        })?;
                     (vector_exprs, vs.rank_weight)
                 }
             };

@@ -59,7 +59,7 @@ impl CandidateGeneration for VectorUDTFGeneration {
             limit: None,
             include_score: Some(true),
             distance_metric: None,
-        });
+        })?;
         self.df
             .ctx
             .table_function(VECTOR_SEARCH_UDTF_NAME)?
