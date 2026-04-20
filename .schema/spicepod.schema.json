@@ -882,11 +882,36 @@
           "additionalProperties": {
             "type": "string"
           }
+        },
+        "temporality": {
+          "description": "Aggregation temporality preference for exported metrics.\n\nDefaults to `delta`, which is required by Datadog and recommended for\nmost push-based OTLP backends (`CloudWatch`, New Relic, etc.). Set to\n`cumulative` when forwarding to an `OTel` collector that feeds Prometheus\nor another cumulative-native backend. See [`OtelTemporality`] for\ndetails.",
+          "$ref": "#/$defs/OtelTemporality",
+          "default": "delta"
         }
       },
       "additionalProperties": false,
       "required": [
         "endpoint"
+      ]
+    },
+    "OtelTemporality": {
+      "description": "Aggregation temporality preference for the OTEL metrics push exporter.\n\nControls how counter and histogram values are encoded on the wire:\n\n- **`Delta`** (default): each export contains the change since the previous\n  export. Required by Datadog's OTLP intake and recommended by AWS\n  `CloudWatch`, New Relic, and most push-based `SaaS` backends. Aligns with the\n  `OpenTelemetry` guidance for push exporters.\n- **`Cumulative`**: each export carries the running total since process\n  start. Use this for `OTel` collectors that downstream into Prometheus or\n  other pull-based / cumulative-native backends.\n- **`LowMemory`**: counters use cumulative, histograms use delta. Reduces\n  the SDK's in-process state for histogram-heavy workloads.\n\nThis setting only affects the OTLP push exporter; the runtime's Prometheus\nscrape endpoint always exposes cumulative metrics regardless of this value.",
+      "oneOf": [
+        {
+          "description": "Delta temporality. Default — required by Datadog and recommended for\npush-based backends.",
+          "type": "string",
+          "const": "delta"
+        },
+        {
+          "description": "Cumulative temporality. Use for `OTel` collectors that downstream into\nPrometheus or other cumulative-native backends.",
+          "type": "string",
+          "const": "cumulative"
+        },
+        {
+          "description": "Counters use cumulative, histograms use delta.",
+          "type": "string",
+          "const": "low_memory"
+        }
       ]
     },
     "TaskHistory": {
@@ -4318,7 +4343,11 @@
         "fetch_content": {
           "description": "Whether to fetch file content. Set to 'true' to include file content in the 'content' column.",
           "type": "string",
-          "default": "false"
+          "default": "false",
+          "enum": [
+            "true",
+            "false"
+          ]
         },
         "cache_path": {
           "description": "Custom path for the local Git repository cache. If not specified, uses system temp directory.",
@@ -4332,6 +4361,105 @@
         "max_file_bytes": {
           "description": "Maximum size (bytes) for an individual file when fetching content. Files larger than this value are skipped. Default: 524288. Maximum: 5242880 (5 MiB).",
           "type": "string"
+        },
+        "git_username": {
+          "description": "Username for HTTP(S) basic authentication.",
+          "type": "string"
+        },
+        "git_password": {
+          "description": "Password or personal access token for HTTP(S) basic authentication.",
+          "type": "string",
+          "x-secret": true
+        },
+        "git_token": {
+          "description": "Personal access token used for HTTP(S) authentication. Equivalent to providing a username of 'x-access-token' with the token as the password.",
+          "type": "string",
+          "x-secret": true
+        },
+        "git_ssh_key": {
+          "description": "Absolute path to an SSH private key used to authenticate to the remote repository.",
+          "type": "string"
+        },
+        "git_ssh_passphrase": {
+          "description": "Passphrase for the SSH private key identified by 'ssh_key'.",
+          "type": "string",
+          "x-secret": true
+        },
+        "git_ssh_use_agent": {
+          "description": "When 'true', attempt to authenticate via the running ssh-agent when no explicit ssh_key is provided. Defaults to 'true'.",
+          "type": "string",
+          "default": "true",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "enable_lfs": {
+          "description": "Whether to fetch git-lfs objects after clone/fetch. Requires the 'git-lfs' CLI to be available on PATH.",
+          "type": "string",
+          "default": "false",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "max_concurrent_requests": {
+          "description": "Maximum number of concurrent Git network operations (clone/fetch) across datasets that share the same repository URL.",
+          "type": "string",
+          "default": "4"
+        },
+        "git_max_retries": {
+          "description": "Maximum number of retries when the connector encounters a transient error cloning or fetching from the remote.",
+          "type": "string",
+          "default": "3"
+        },
+        "backoff_method": {
+          "description": "Backoff strategy for retries on transient errors.",
+          "type": "string",
+          "default": "exponential",
+          "enum": [
+            "exponential",
+            "fibonacci"
+          ]
+        },
+        "disable_on_permanent_error": {
+          "description": "When true, a permanent error (authentication failure, access denied) will disable the connector to prevent a thundering herd of failed requests.",
+          "type": "string",
+          "default": "true",
+          "enum": [
+            "true",
+            "false"
+          ]
+        },
+        "git_include": {
+          "description": "**DEPRECATED**: Rename 'git_include' to 'include'.\n\n[deprecated] Use unprefixed 'include'.",
+          "type": "string",
+          "deprecated": true
+        },
+        "git_fetch_content": {
+          "description": "**DEPRECATED**: Rename 'git_fetch_content' to 'fetch_content'.\n\n[deprecated] Use unprefixed 'fetch_content'.",
+          "type": "string",
+          "deprecated": true
+        },
+        "git_cache_path": {
+          "description": "**DEPRECATED**: Rename 'git_cache_path' to 'cache_path'.\n\n[deprecated] Use unprefixed 'cache_path'.",
+          "type": "string",
+          "deprecated": true
+        },
+        "git_max_files": {
+          "description": "**DEPRECATED**: Rename 'git_max_files' to 'max_files'.\n\n[deprecated] Use unprefixed 'max_files'.",
+          "type": "string",
+          "deprecated": true
+        },
+        "git_max_file_bytes": {
+          "description": "**DEPRECATED**: Rename 'git_max_file_bytes' to 'max_file_bytes'.\n\n[deprecated] Use unprefixed 'max_file_bytes'.",
+          "type": "string",
+          "deprecated": true
+        },
+        "git_enable_lfs": {
+          "description": "**DEPRECATED**: Rename 'git_enable_lfs' to 'enable_lfs'.\n\n[deprecated] Use unprefixed 'enable_lfs'.",
+          "type": "string",
+          "deprecated": true
         }
       },
       "additionalProperties": true
@@ -4926,6 +5054,33 @@
           "description": "Number of items per page for query-parameter pagination. Must be a positive integer greater than 0. Used to expand {limit} in pagination_query_params and to detect the last page (fewer results than page_size = done).",
           "type": "string"
         },
+        "auth_token_url": {
+          "description": "OAuth2 token endpoint URL. When set together with http_auth_refresh_token, the connector exchanges the refresh token for short-lived access tokens (RFC 6749 §6) and attaches 'Authorization: Bearer <token>' to all data requests. Applies to JSON API endpoints only.",
+          "type": "string"
+        },
+        "http_auth_refresh_token": {
+          "description": "OAuth2 refresh token exchanged against auth_token_url to obtain access tokens. Required when auth_token_url is set.",
+          "type": "string",
+          "x-secret": true
+        },
+        "http_auth_client_id": {
+          "description": "OAuth2 client_id presented to the token endpoint. Required for confidential clients; optional for public clients. Paired with http_auth_client_secret.",
+          "type": "string",
+          "x-secret": true
+        },
+        "http_auth_client_secret": {
+          "description": "OAuth2 client_secret presented to the token endpoint. Required when the client is confidential; must be set together with http_auth_client_id.",
+          "type": "string",
+          "x-secret": true
+        },
+        "auth_scopes": {
+          "description": "Space-separated OAuth2 scopes to request when refreshing. Omit to inherit the scopes bound to the refresh token. Optional.",
+          "type": "string"
+        },
+        "auth_client_auth": {
+          "description": "How client credentials are sent to the token endpoint: 'basic' (HTTP Basic header, default per RFC 6749 §2.3.1) or 'body' (client_id/client_secret in the form body). Case-insensitive.",
+          "type": "string"
+        },
         "file_format": {
           "type": "string"
         },
@@ -5189,6 +5344,33 @@
         },
         "pagination_page_size": {
           "description": "Number of items per page for query-parameter pagination. Must be a positive integer greater than 0. Used to expand {limit} in pagination_query_params and to detect the last page (fewer results than page_size = done).",
+          "type": "string"
+        },
+        "auth_token_url": {
+          "description": "OAuth2 token endpoint URL. When set together with http_auth_refresh_token, the connector exchanges the refresh token for short-lived access tokens (RFC 6749 §6) and attaches 'Authorization: Bearer <token>' to all data requests. Applies to JSON API endpoints only.",
+          "type": "string"
+        },
+        "http_auth_refresh_token": {
+          "description": "OAuth2 refresh token exchanged against auth_token_url to obtain access tokens. Required when auth_token_url is set.",
+          "type": "string",
+          "x-secret": true
+        },
+        "http_auth_client_id": {
+          "description": "OAuth2 client_id presented to the token endpoint. Required for confidential clients; optional for public clients. Paired with http_auth_client_secret.",
+          "type": "string",
+          "x-secret": true
+        },
+        "http_auth_client_secret": {
+          "description": "OAuth2 client_secret presented to the token endpoint. Required when the client is confidential; must be set together with http_auth_client_id.",
+          "type": "string",
+          "x-secret": true
+        },
+        "auth_scopes": {
+          "description": "Space-separated OAuth2 scopes to request when refreshing. Omit to inherit the scopes bound to the refresh token. Optional.",
+          "type": "string"
+        },
+        "auth_client_auth": {
+          "description": "How client credentials are sent to the token endpoint: 'basic' (HTTP Basic header, default per RFC 6749 §2.3.1) or 'body' (client_id/client_secret in the form body). Case-insensitive.",
           "type": "string"
         },
         "file_format": {
