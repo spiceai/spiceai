@@ -87,6 +87,11 @@ pub enum Error {
         row_id_column: String,
         valid_columns: String,
     },
+
+    #[snafu(display(
+        "The dataset is configured with an embedding for column '{column}', but '{column}' is not present in the dataset schema. Verify the column configuration and try again.\nFor details, visit: https://spiceai.org/docs/components/embeddings"
+    ))]
+    EmbeddingColumnNotInSchema { column: String },
 }
 
 /// An [`EmbeddingTable`] is a [`TableProvider`] where some columns are augmented with associated embedding columns
@@ -340,11 +345,7 @@ impl EmbeddingTable {
                 // Source shape is required when we're computing
                 // embeddings — we can't embed a column we can't read.
                 let Some(shape) = source_shape else {
-                    // Column missing entirely from base schema: leave it
-                    // to downstream code to error, matching historical
-                    // behavior where verify_column_type_supported was a
-                    // no-op on missing columns.
-                    continue;
+                    return EmbeddingColumnNotInSchemaSnafu { column }.fail();
                 };
                 let input_mode = Self::resolve_input_mode(&column, shape, &config)?;
 
@@ -401,7 +402,7 @@ impl EmbeddingTable {
         // Check if the base column exists
         let Some((_, source_field)) = base_schema.column_with_name(column) else {
             tracing::warn!(
-                "Column '{column}' does not exist in the base table. Cannot use it create an embeddings"
+                "Column '{column}' does not exist in the base table. Cannot use it to create embeddings"
             );
             return false;
         };

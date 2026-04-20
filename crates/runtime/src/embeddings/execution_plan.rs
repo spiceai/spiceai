@@ -555,7 +555,11 @@ fn decompose_generic_list<O: OffsetSizeTrait>(
                 None
             } else {
                 let v = arr.value(j);
-                if v.is_empty() { None } else { Some(v.to_string()) }
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
             }
         })
     } else if let Some(arr) = values_any.downcast_ref::<LargeStringArray>() {
@@ -564,7 +568,11 @@ fn decompose_generic_list<O: OffsetSizeTrait>(
                 None
             } else {
                 let v = arr.value(j);
-                if v.is_empty() { None } else { Some(v.to_string()) }
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
             }
         })
     } else if let Some(arr) = values_any.downcast_ref::<StringViewArray>() {
@@ -573,7 +581,11 @@ fn decompose_generic_list<O: OffsetSizeTrait>(
                 None
             } else {
                 let v = arr.value(j);
-                if v.is_empty() { None } else { Some(v.to_string()) }
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
             }
         })
     } else {
