@@ -603,11 +603,18 @@ fn compute_type(spec: &Value) -> String {
     }
     match spec.get("type") {
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(arr)) => arr
-            .iter()
-            .find_map(Value::as_str)
-            .unwrap_or("unknown")
-            .to_owned(),
+        Some(Value::Array(arr)) => {
+            // Type unions with `"null"` express optional/nullable in JSON
+            // Schema; the "real" type is the first non-null entry. Only fall
+            // back to `"null"` (or `"unknown"`) when no other type is present.
+            let strs: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
+            strs.iter()
+                .find(|t| **t != "null")
+                .copied()
+                .or_else(|| strs.first().copied())
+                .unwrap_or("unknown")
+                .to_owned()
+        }
         _ => {
             if has_props {
                 "object".to_owned()
@@ -1019,9 +1026,15 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
                 let rows = flatten_with_options(strings.value(idx), &opts);
                 all_rows.extend(rows);
             }
-            // Walker caps bound the row count well under `i64::MAX`;
-            // saturate rather than unwrap so lint allows the conversion.
-            offsets.push(i64::try_from(all_rows.len()).unwrap_or(i64::MAX));
+            // Walker caps bound the row count well under `i64::MAX`, but if
+            // somehow they didn't, silently saturating would misalign list
+            // offsets. Fail loud instead so the condition is visible.
+            let len = i64::try_from(all_rows.len()).map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "{FLATTEN_JSON_PROPERTIES_UDTF_NAME}(): flattened row count exceeds LargeList i64 offset range."
+                ))
+            })?;
+            offsets.push(len);
         }
 
         let (struct_arrays, _) = build_property_arrays(&all_rows);
@@ -1170,6 +1183,25 @@ mod tests {
         let by = by_path(&rows);
         assert!(by["user.name"].required);
         assert_eq!(by["user.age"].type_name, "integer");
+    }
+
+    #[test]
+    fn nullable_type_union_picks_non_null() {
+        // JSON Schema expresses nullable fields as `"type": ["null", "string"]`
+        // (or any ordering). Pick the first non-null type so the output row
+        // reflects the real type rather than `"null"`.
+        let json = r#"{
+            "properties": {
+                "leading_null":  {"type": ["null", "string"]},
+                "trailing_null": {"type": ["integer", "null"]},
+                "all_null":      {"type": ["null"]}
+            }
+        }"#;
+        let rows = flatten(json);
+        let by = by_path(&rows);
+        assert_eq!(by["leading_null"].type_name, "string");
+        assert_eq!(by["trailing_null"].type_name, "integer");
+        assert_eq!(by["all_null"].type_name, "null");
     }
 
     #[test]

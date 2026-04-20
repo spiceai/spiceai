@@ -608,9 +608,15 @@ impl ScalarUDFImpl for JsonTreeScalar {
                 let rows = json_tree_with_options(strings.value(idx), &opts);
                 all_rows.extend(rows);
             }
-            // Walker caps bound the row count well under `i64::MAX`;
-            // saturate rather than unwrap so lint allows the conversion.
-            offsets.push(i64::try_from(all_rows.len()).unwrap_or(i64::MAX));
+            // Walker caps bound the row count well under `i64::MAX`, but if
+            // somehow they didn't, silently saturating would misalign list
+            // offsets. Fail loud instead so the condition is visible.
+            let len = i64::try_from(all_rows.len()).map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "{JSON_TREE_UDTF_NAME}(): flattened row count exceeds LargeList i64 offset range."
+                ))
+            })?;
+            offsets.push(len);
         }
 
         let struct_array =
