@@ -91,6 +91,11 @@ pub enum Error {
     ModelDoesNotExist { model_name: String },
 
     #[snafu(display(
+        "The specified local model path '{path}' does not exist. Verify the path and try again."
+    ))]
+    LocalModelPathDoesNotExist { path: String },
+
+    #[snafu(display(
         "The specified model, '{from}', does not support executing the task '{task}'. Select a different model or task, and try again."
     ))]
     UnsupportedTaskForModel { from: String, task: String },
