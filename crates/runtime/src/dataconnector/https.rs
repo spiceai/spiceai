@@ -24,8 +24,11 @@ use crate::dataconnector::listing::{
 use data_components::http::auth::{
     ClientAuthMethod, HttpAuthenticator, RefreshTokenAuth, RefreshTokenConfig,
 };
+use data_components::http::json_nest::HttpJsonNesting;
 use secrecy::{ExposeSecret, SecretString};
+use serde_json::Value;
 use snafu::prelude::*;
+use spicepod::semantic::Column;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
@@ -719,6 +722,10 @@ impl Https {
             source: e.into(),
         })?;
 
+        if let Some(nesting) = parse_http_json_nesting(dataset)? {
+            provider = provider.with_json_nesting(nesting);
+        }
+
         if let Some((auth_config, refresh_token)) = self.resolve_refresh_token_auth(dataset)? {
             // Fail fast if the user also set an Authorization custom header:
             // reqwest would append ours after theirs and send two Authorization
@@ -795,6 +802,60 @@ impl Https {
 
         Ok(provider)
     }
+}
+
+/// Parse `dataset.columns` looking for the `metadata.json_object: "*"`
+/// marker that enables JSON schema decomposition. Returns `None` when
+/// no column is marked, otherwise the full nesting configuration.
+///
+/// Consistent with the `DynamoDB` connector: exactly one column may be
+/// marked, and the only supported marker value is `"*"`.
+fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<HttpJsonNesting>> {
+    let marked: Vec<&Column> = dataset
+        .columns
+        .iter()
+        .filter(|col| col.metadata.contains_key("json_object"))
+        .collect();
+
+    if marked.is_empty() {
+        return Ok(None);
+    }
+
+    if marked.len() > 1 {
+        let names: Vec<&str> = marked.iter().map(|c| c.name.as_str()).collect();
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "https".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!(
+                "Multiple columns have 'json_object' metadata defined: {}. Only one column can be configured as a JSON object column.",
+                names.join(", ")
+            ),
+        });
+    }
+
+    let json_column = marked[0];
+    let Some(marker_value) = json_column.metadata.get("json_object") else {
+        unreachable!("json_object key existence was checked above")
+    };
+
+    let is_wildcard = matches!(marker_value, Value::String(s) if s == "*");
+    if !is_wildcard {
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "https".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!(
+                "Column '{}' has invalid 'json_object' value: {:?}. Only '*' is supported.",
+                json_column.name, marker_value
+            ),
+        });
+    }
+
+    let column_order: Vec<String> = dataset.columns.iter().map(|col| col.name.clone()).collect();
+
+    Ok(Some(HttpJsonNesting::new(
+        column_order,
+        json_column.name.clone(),
+    )))
 }
 
 #[async_trait]
@@ -1294,6 +1355,112 @@ mod tests {
                 assert!(
                     message.contains("http_auth_client_secret"),
                     "expected error to mention http_auth_client_secret, got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    fn column_with_marker(name: &str, marker: Value) -> Column {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("json_object".to_string(), marker);
+        Column::new(name).with_metadata(metadata)
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_returns_none_when_no_marker() {
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        let result = parse_http_json_nesting(&dataset).expect("parse should succeed");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_returns_none_when_columns_have_no_marker() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        dataset.columns = vec![Column::new("id"), Column::new("name")];
+        let result = parse_http_json_nesting(&dataset).expect("parse should succeed");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_parses_valid_wildcard_marker() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        dataset.columns = vec![
+            Column::new("id"),
+            Column::new("name"),
+            column_with_marker("data", Value::String("*".to_string())),
+        ];
+        let nesting = parse_http_json_nesting(&dataset)
+            .expect("parse should succeed")
+            .expect("expected Some(nesting) when marker is present");
+        assert_eq!(nesting.json_field_name, "data");
+        assert_eq!(nesting.column_order, vec!["id", "name", "data"]);
+        assert!(nesting.static_fields.contains("id"));
+        assert!(nesting.static_fields.contains("name"));
+        assert!(!nesting.static_fields.contains("data"));
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_rejects_multiple_markers() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        dataset.columns = vec![
+            Column::new("id"),
+            column_with_marker("data", Value::String("*".to_string())),
+            column_with_marker("extra", Value::String("*".to_string())),
+        ];
+        let error =
+            parse_http_json_nesting(&dataset).expect_err("multiple markers should be rejected");
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("Multiple columns"),
+                    "expected multiple-columns error, got: {message}"
+                );
+                assert!(message.contains("data"), "error should list 'data'");
+                assert!(message.contains("extra"), "error should list 'extra'");
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_rejects_invalid_marker_value() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        dataset.columns = vec![
+            Column::new("id"),
+            column_with_marker("data", Value::String("not-a-wildcard".to_string())),
+        ];
+        let error =
+            parse_http_json_nesting(&dataset).expect_err("non-wildcard marker should be rejected");
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("invalid 'json_object' value"),
+                    "expected invalid-value error, got: {message}"
+                );
+                assert!(
+                    message.contains("Only '*' is supported"),
+                    "expected guidance mentioning '*', got: {message}"
+                );
+            }
+            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_http_json_nesting_rejects_non_string_marker_value() {
+        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+        dataset.columns = vec![
+            Column::new("id"),
+            column_with_marker("data", Value::Bool(true)),
+        ];
+        let error =
+            parse_http_json_nesting(&dataset).expect_err("non-string marker should be rejected");
+        match error {
+            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
+                assert!(
+                    message.contains("invalid 'json_object' value"),
+                    "expected invalid-value error, got: {message}"
                 );
             }
             other => panic!("expected InvalidConfigurationNoSource, got: {other}"),

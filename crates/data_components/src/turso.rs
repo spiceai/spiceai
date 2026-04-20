@@ -2149,24 +2149,50 @@ fn scalar_value_to_turso(
 /// ```
 /// into:
 /// ```sql
-///   CAST(expr AS REAL) >= CAST(low AS REAL)
-///     AND CAST(expr AS REAL) <= CAST(high AS REAL)
+///   ROUND(expr, 10) >= ROUND(low, 10)
+///     AND ROUND(expr, 10) <= ROUND(high, 10)
 /// ```
 /// (with the obvious inversion for `NOT BETWEEN`).
+///
+/// `ROUND(..., 10)` normalizes both sides to 10 decimal places, which
+/// eliminates float arithmetic precision issues. For example, float64
+/// `0.06 + 0.01 = 0.06999...` is less than the stored `0.07`, but
+/// `ROUND(0.06 + 0.01, 10) = 0.07` matches `ROUND(0.07, 10)` exactly.
 ///
 /// Only expressions where *both* bounds appear numeric (literal numbers,
 /// unary-minus numbers, or arithmetic on numbers) are rewritten.
 struct TursoBetweenVisitor;
 
+/// Number of decimal places used by `ROUND()` to normalize float values.
+const TURSO_ROUND_DECIMAL_PLACES: u8 = 10;
+
 impl TursoBetweenVisitor {
-    /// Wrap `expr` in `CAST(expr AS REAL)`.
-    fn cast_to_real(expr: sqlast::Expr) -> sqlast::Expr {
-        sqlast::Expr::Cast {
-            kind: sqlast::CastKind::Cast,
-            expr: Box::new(expr),
-            data_type: sqlast::DataType::Real,
-            format: None,
-        }
+    /// Wrap `expr` in `ROUND(expr, N)`.
+    fn round_expr(expr: sqlast::Expr) -> sqlast::Expr {
+        sqlast::Expr::Function(sqlast::Function {
+            name: sqlast::ObjectName(vec![sqlast::ObjectNamePart::Identifier(
+                sqlast::Ident::new("ROUND"),
+            )]),
+            args: sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
+                duplicate_treatment: None,
+                args: vec![
+                    sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(expr)),
+                    sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
+                        sqlast::Expr::value(sqlast::Value::Number(
+                            TURSO_ROUND_DECIMAL_PLACES.to_string(),
+                            false,
+                        )),
+                    )),
+                ],
+                clauses: vec![],
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: vec![],
+            parameters: sqlast::FunctionArguments::None,
+            uses_odbc_syntax: false,
+        })
     }
 
     /// Returns `true` if the expression looks like a numeric value or
@@ -2201,39 +2227,39 @@ impl VisitorMut for TursoBetweenVisitor {
             && Self::is_numeric_expr(high)
         {
             let negated = *negated;
-            let cast_expr_low = Self::cast_to_real(*between_expr.clone());
-            let cast_expr_high = Self::cast_to_real(*between_expr.clone());
-            let cast_low = Self::cast_to_real(*low.clone());
-            let cast_high = Self::cast_to_real(*high.clone());
+            let round_expr_low = Self::round_expr(*between_expr.clone());
+            let round_expr_high = Self::round_expr(*between_expr.clone());
+            let round_low = Self::round_expr(*low.clone());
+            let round_high = Self::round_expr(*high.clone());
 
             if negated {
                 // NOT BETWEEN  →  expr < low OR expr > high
                 *expr = sqlast::Expr::BinaryOp {
                     left: Box::new(sqlast::Expr::BinaryOp {
-                        left: Box::new(cast_expr_low),
+                        left: Box::new(round_expr_low),
                         op: sqlast::BinaryOperator::Lt,
-                        right: Box::new(cast_low),
+                        right: Box::new(round_low),
                     }),
                     op: sqlast::BinaryOperator::Or,
                     right: Box::new(sqlast::Expr::BinaryOp {
-                        left: Box::new(cast_expr_high),
+                        left: Box::new(round_expr_high),
                         op: sqlast::BinaryOperator::Gt,
-                        right: Box::new(cast_high),
+                        right: Box::new(round_high),
                     }),
                 };
             } else {
                 // BETWEEN  →  expr >= low AND expr <= high
                 *expr = sqlast::Expr::BinaryOp {
                     left: Box::new(sqlast::Expr::BinaryOp {
-                        left: Box::new(cast_expr_low),
+                        left: Box::new(round_expr_low),
                         op: sqlast::BinaryOperator::GtEq,
-                        right: Box::new(cast_low),
+                        right: Box::new(round_low),
                     }),
                     op: sqlast::BinaryOperator::And,
                     right: Box::new(sqlast::Expr::BinaryOp {
-                        left: Box::new(cast_expr_high),
+                        left: Box::new(round_expr_high),
                         op: sqlast::BinaryOperator::LtEq,
-                        right: Box::new(cast_high),
+                        right: Box::new(round_high),
                     }),
                 };
             }
@@ -2266,12 +2292,12 @@ mod tests {
             "BETWEEN should be rewritten, got: {result}"
         );
         assert!(
-            result.contains("CAST(x AS REAL) >= CAST(0.05 AS REAL)"),
-            "should cast to REAL: {result}"
+            result.contains("ROUND(x, 10) >= ROUND(0.05, 10)"),
+            "should use ROUND: {result}"
         );
         assert!(
-            result.contains("CAST(x AS REAL) <= CAST(0.07 AS REAL)"),
-            "should cast to REAL: {result}"
+            result.contains("ROUND(x, 10) <= ROUND(0.07, 10)"),
+            "should use ROUND: {result}"
         );
     }
 
@@ -2283,7 +2309,7 @@ mod tests {
             !result.contains("BETWEEN"),
             "BETWEEN with arithmetic bounds should be rewritten, got: {result}"
         );
-        assert!(result.contains("CAST"), "should contain CAST: {result}");
+        assert!(result.contains("ROUND"), "should contain ROUND: {result}");
     }
 
     #[test]

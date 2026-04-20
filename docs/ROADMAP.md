@@ -15,56 +15,51 @@ To propose features or report issues, please [file an issue](https://github.com/
 
 ## Release Timeline
 
-### v2.0 (March 2026)
+### v2.0 (April 2026)
 
 **Focus:** Production-Grade HA.
 
 - **Spice Cayenne (GA)**: Production-ready columnar storage format for accelerated datasets.
-- **Active-Active HA (GA)**: Production-ready multi-node deployment with zero-downtime failover.
+- **Multi-Active HA (GA)**: Production-ready multi-node deployment with zero-downtime failover.
 - **Distributed Query (GA)**: Stable multi-node query execution for large-scale workloads.
-- **Backup & Point-in-Time Recovery**: Snapshot restore for accelerated datasets.
 - **Accelerated Dataset Distribution**: Replicate accelerated datasets across executor nodes.
 
 ### v2.1 (H2 2026)
 
-**Focus:** Schema Management & Search.
+**Focus:** Schema Management, Search, and Policy.
 
+- **Elasticsearch**: Integration for search and analytics workloads.
 - **Distributed Search (Alpha)**: Federated vector and full-text search across multiple nodes.
 - **Schema Registry (Initial)**: Versioning and backward compatibility checks.
+- **Schema Evolution**: Safe, non-breaking schema changes for accelerated datasets (add/drop/rename columns, type widening) with automatic migration.
 - **Hybrid Search Ranking**: Configurable fusion strategies (Reciprocal Rank Fusion (RRF) weights, learned ranking).
+- **Policy Engine (Cedar-based) Beta**:
+  - Role-based security for fine-grained access control.
+  - Data access policies to enforce compliance and governance.
 
 ### v2.2 (H2 2026)
 
 **Focus:** Reactive Actions & Event Processing.
 
-- **Actions (Drasi-based)**: Reactive event-driven actions triggered by data changes.
 - **Webhooks & Event Notifications**: Push-based data change alerts for downstream consumers.
+- **Actions (Drasi-based)**: Reactive event-driven actions triggered by data changes.
 
 ### v2.3 (H2 2026)
 
-**Focus:** Enterprise Security & Compliance.
+**Focus:** Enterprise Security, Compliance, & Governance.
 
 - **Data Masking & Anonymization**: Dynamic PII redaction at query time.
-- **OIDC Token Verification**: Validate identity tokens from enterprise providers (Okta, Azure AD, etc.).
-
-### v2.4 (2027)
-
-**Focus:** Governance.
-
-- **Policy Engine (Cedar-based)**:
-  - Role-based security for fine-grained access control.
-  - Data access policies to enforce compliance and governance.
 - **Audit Logging**: Persistent, immutable query and access logs for compliance.
 - **Resource Quotas**: Per-user/tenant query limits and throttling.
 
-### v2.5 (2027)
+### v2.4 (2027)
 
 **Focus:** Extensibility & Plugin Architecture.
 
 - **Extensible Middleware**: Pluggable extensions for dynamic customization.
 - **Custom Tool Providers**: User-defined MCP tool implementations.
 
-### v2.6 (2027)
+### v2.5 (2027)
 
 **Focus:** Encryption.
 
@@ -80,9 +75,6 @@ These are prioritized based on community demand and strategic alignment. Share y
 ### Data Connectors
 
 - **Delta Lake**: Write support for transactional data lakes.
-- **Elasticsearch**: Integration for search and analytics workloads.
-- **MotherDuck**: Hybrid cloud DuckDB connector.
-- **BigQuery**: Support for Google Cloud's data warehouse.
 - **Google Docs**: Experimental connector for collaborative data sources.
 
 ### APIs
@@ -94,7 +86,7 @@ These are prioritized based on community demand and strategic alignment. Share y
 ### AI & Analytics
 
 - **Vision Processing**: Support for image and video.
-- **Custom Model Integration**: Framework for user-defined ML models.
+- **Custom ML Model Integration**: Framework for user-defined ML models.
 - **Model Versioning & A/B Testing**: Canary deployments and version management for models.
 - **Hallucination Detection**: Fact-checking LLM responses against source data.
 
@@ -105,13 +97,6 @@ These are prioritized based on community demand and strategic alignment. Share y
 ### Data Platform
 
 - **Data Lineage**: Track data provenance and transformations across the pipeline.
-- **Schema Registry & Evolution**: Versioning and backward compatibility checks.
-
-### Platform Enhancements
-
-- **Observability**: Comprehensive metrics, logging, and tracing.
-- **CLI & SDKs**: Streamlined developer experience with improved tooling.
-- **Data Accelerators**: Additional engines for specialized workloads.
 
 ---
 

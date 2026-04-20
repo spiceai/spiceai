@@ -166,6 +166,37 @@ fn default_otel_push_interval() -> String {
     "60s".to_string()
 }
 
+/// Aggregation temporality preference for the OTEL metrics push exporter.
+///
+/// Controls how counter and histogram values are encoded on the wire:
+///
+/// - **`Delta`** (default): each export contains the change since the previous
+///   export. Required by Datadog's OTLP intake and recommended by AWS
+///   `CloudWatch`, New Relic, and most push-based `SaaS` backends. Aligns with the
+///   `OpenTelemetry` guidance for push exporters.
+/// - **`Cumulative`**: each export carries the running total since process
+///   start. Use this for `OTel` collectors that downstream into Prometheus or
+///   other pull-based / cumulative-native backends.
+/// - **`LowMemory`**: counters use cumulative, histograms use delta. Reduces
+///   the SDK's in-process state for histogram-heavy workloads.
+///
+/// This setting only affects the OTLP push exporter; the runtime's Prometheus
+/// scrape endpoint always exposes cumulative metrics regardless of this value.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub enum OtelTemporality {
+    /// Delta temporality. Default — required by Datadog and recommended for
+    /// push-based backends.
+    #[default]
+    Delta,
+    /// Cumulative temporality. Use for `OTel` collectors that downstream into
+    /// Prometheus or other cumulative-native backends.
+    Cumulative,
+    /// Counters use cumulative, histograms use delta.
+    LowMemory,
+}
+
 /// Configuration for pushing metrics to an OpenTelemetry collector.
 ///
 /// The protocol is inferred from the endpoint:
@@ -226,6 +257,16 @@ pub struct OtelExporterConfig {
     /// Values support secret replacement syntax (e.g., `${secrets:api_key}`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
+
+    /// Aggregation temporality preference for exported metrics.
+    ///
+    /// Defaults to `delta`, which is required by Datadog and recommended for
+    /// most push-based OTLP backends (`CloudWatch`, New Relic, etc.). Set to
+    /// `cumulative` when forwarding to an `OTel` collector that feeds Prometheus
+    /// or another cumulative-native backend. See [`OtelTemporality`] for
+    /// details.
+    #[serde(default)]
+    pub temporality: OtelTemporality,
 }
 
 impl OtelExporterConfig {
@@ -288,8 +329,31 @@ pub struct TelemetryConfig {
     pub enabled: bool,
     #[serde(default)]
     pub user_agent_collection: UserAgentCollection,
+    /// Custom key/value attributes attached to telemetry metrics emitted by
+    /// spiced. Applied as OpenTelemetry resource attributes on the runtime's
+    /// `MeterProvider`, so they appear as dimensions on every metric exported
+    /// via the Prometheus scrape endpoint, the cluster on-demand OTLP reader,
+    /// and the `otel_exporter` push exporter, and as labels on anonymous
+    /// usage telemetry. Currently does not affect tracing spans or logs.
+    /// Example: `{ environment: prod, region: us-west-2, team: data-platform }`.
     #[serde(default)]
     pub properties: HashMap<String, String>,
+    /// Optional prefix prepended to every exported metric name.
+    ///
+    /// Useful for namespacing Spice metrics in shared backends (e.g. Datadog,
+    /// Grafana Cloud) so they don't collide with metrics from other services.
+    /// For example, with `metric_prefix: "spiceai."` the runtime metric
+    /// `query_duration_ms` is exported as `spiceai.query_duration_ms`.
+    ///
+    /// The prefix is applied via an `OpenTelemetry` `View` on the runtime's
+    /// `MeterProvider`, so it affects every metric reader attached to that
+    /// provider — the Prometheus scrape endpoint (`--metrics`), the cluster
+    /// on-demand OTLP reader, and the `otel_exporter` push reader.
+    /// `OpenTelemetry` 0.31's SDK does not support per-reader name transforms,
+    /// so this knob is intentionally placed at the telemetry level rather
+    /// than under any single exporter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric_prefix: Option<String>,
     /// Optional configuration for pushing metrics to an OpenTelemetry collector
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otel_exporter: Option<OtelExporterConfig>,
@@ -301,6 +365,7 @@ impl Default for TelemetryConfig {
             enabled: true,
             user_agent_collection: UserAgentCollection::default(),
             properties: HashMap::new(),
+            metric_prefix: None,
             otel_exporter: None,
         }
     }
@@ -1477,6 +1542,84 @@ mod tests {
         assert_eq!(otel_config.endpoint, "otel-collector");
         assert!(!otel_config.is_http()); // gRPC: bare hostname
         assert_eq!(otel_config.push_interval, "60s"); // default
+        assert_eq!(otel_config.temporality, OtelTemporality::Delta); // default
+    }
+
+    #[test]
+    fn test_otel_exporter_temporality_default_is_delta() {
+        let yaml = r"
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        let otel_config = runtime
+            .telemetry
+            .otel_exporter
+            .expect("otel_exporter should be present");
+        assert_eq!(otel_config.temporality, OtelTemporality::Delta);
+    }
+
+    #[test]
+    fn test_otel_exporter_temporality_parsing() {
+        for (raw, expected) in [
+            ("delta", OtelTemporality::Delta),
+            ("cumulative", OtelTemporality::Cumulative),
+            ("low_memory", OtelTemporality::LowMemory),
+        ] {
+            let yaml = format!(
+                "
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector
+                    temporality: {raw}
+        "
+            );
+            let runtime: Runtime = yaml::from_str(&yaml).expect("Failed to parse Runtime");
+            let otel_config = runtime
+                .telemetry
+                .otel_exporter
+                .expect("otel_exporter should be present");
+            assert_eq!(otel_config.temporality, expected, "raw={raw}");
+        }
+    }
+
+    #[test]
+    fn test_otel_exporter_temporality_invalid_rejected() {
+        let yaml = r"
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector
+                    temporality: nonsense
+        ";
+        let result: Result<Runtime, _> = yaml::from_str(yaml);
+        assert!(
+            result.is_err(),
+            "unknown temporality value must fail to parse"
+        );
+    }
+
+    #[test]
+    fn test_metric_prefix_default_is_none() {
+        let yaml = r"
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(runtime.telemetry.metric_prefix, None);
+    }
+
+    #[test]
+    fn test_metric_prefix_parsing() {
+        let yaml = r#"
+            telemetry:
+                metric_prefix: "spiceai."
+                otel_exporter:
+                    endpoint: otel-collector
+        "#;
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(runtime.telemetry.metric_prefix.as_deref(), Some("spiceai."));
     }
 
     #[test]
@@ -1487,6 +1630,7 @@ mod tests {
             push_interval: "30s".to_string(),
             metrics: vec![],
             headers: HashMap::new(),
+            temporality: OtelTemporality::default(),
         };
         let duration = config
             .push_interval_duration()
@@ -1499,6 +1643,7 @@ mod tests {
             push_interval: "5m".to_string(),
             metrics: vec![],
             headers: HashMap::new(),
+            temporality: OtelTemporality::default(),
         };
         let duration = config_minutes
             .push_interval_duration()
@@ -1511,6 +1656,7 @@ mod tests {
             push_interval: "1h".to_string(),
             metrics: vec![],
             headers: HashMap::new(),
+            temporality: OtelTemporality::default(),
         };
         let duration = config_hours
             .push_interval_duration()
@@ -1524,6 +1670,7 @@ mod tests {
             push_interval: "500ms".to_string(),
             metrics: vec![],
             headers: HashMap::new(),
+            temporality: OtelTemporality::default(),
         };
         let duration = config_ms
             .push_interval_duration()
@@ -1539,6 +1686,7 @@ mod tests {
             push_interval: "0s".to_string(),
             metrics: vec![],
             headers: HashMap::new(),
+            temporality: OtelTemporality::default(),
         };
         let result = config.push_interval_duration();
         assert!(result.is_err());
@@ -1556,6 +1704,7 @@ mod tests {
             push_interval: "invalid".to_string(),
             metrics: vec![],
             headers: HashMap::new(),
+            temporality: OtelTemporality::default(),
         };
         let result = config.push_interval_duration();
         let _ = result.expect_err("Expected an error for invalid push_interval");
@@ -1580,6 +1729,7 @@ mod tests {
             push_interval: "60s".to_string(),
             metrics: vec![],
             headers: HashMap::new(),
+            temporality: OtelTemporality::default(),
         };
         assert!(!grpc_bare.is_http());
 
@@ -1590,6 +1740,7 @@ mod tests {
             push_interval: "60s".to_string(),
             metrics: vec![],
             headers: HashMap::new(),
+            temporality: OtelTemporality::default(),
         };
         assert!(!grpc_port.is_http());
 
@@ -1600,6 +1751,7 @@ mod tests {
             push_interval: "60s".to_string(),
             metrics: vec![],
             headers: HashMap::new(),
+            temporality: OtelTemporality::default(),
         };
         assert!(http_scheme.is_http());
 
@@ -1610,6 +1762,7 @@ mod tests {
             push_interval: "60s".to_string(),
             metrics: vec![],
             headers: HashMap::new(),
+            temporality: OtelTemporality::default(),
         };
         assert!(https_config.is_http());
 
@@ -1620,6 +1773,7 @@ mod tests {
             push_interval: "60s".to_string(),
             metrics: vec![],
             headers: HashMap::new(),
+            temporality: OtelTemporality::default(),
         };
         assert!(http_path.is_http());
     }
@@ -1633,6 +1787,7 @@ mod tests {
             push_interval: "60s".to_string(),
             metrics: vec![],
             headers: HashMap::new(),
+            temporality: OtelTemporality::default(),
         };
         assert_eq!(bare.grpc_endpoint(), "http://otel-collector:4317");
 
@@ -1643,6 +1798,7 @@ mod tests {
             push_interval: "60s".to_string(),
             metrics: vec![],
             headers: HashMap::new(),
+            temporality: OtelTemporality::default(),
         };
         assert_eq!(with_port.grpc_endpoint(), "http://otel-collector:9090");
 
@@ -1653,6 +1809,7 @@ mod tests {
             push_interval: "60s".to_string(),
             metrics: vec![],
             headers: HashMap::new(),
+            temporality: OtelTemporality::default(),
         };
         assert_eq!(localhost.grpc_endpoint(), "http://localhost:4317");
     }

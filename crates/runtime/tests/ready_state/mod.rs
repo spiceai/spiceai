@@ -570,10 +570,14 @@ async fn run_ready_state_test(
         (true, ReadyState::OnRegistration, Some(_)) => "native_on_registration_duckdb",
         (true, ReadyState::OnLoad, None) => "native_on_load_arrow",
         (true, ReadyState::OnLoad, Some(_)) => "native_on_load_duckdb",
+        (true, ReadyState::OnSchemaResolved, None) => "native_on_schema_resolved_arrow",
+        (true, ReadyState::OnSchemaResolved, Some(_)) => "native_on_schema_resolved_duckdb",
         (false, ReadyState::OnRegistration, None) => "federated_on_registration_arrow",
         (false, ReadyState::OnRegistration, Some(_)) => "federated_on_registration_duckdb",
         (false, ReadyState::OnLoad, None) => "federated_on_load_arrow",
         (false, ReadyState::OnLoad, Some(_)) => "federated_on_load_duckdb",
+        (false, ReadyState::OnSchemaResolved, None) => "federated_on_schema_resolved_arrow",
+        (false, ReadyState::OnSchemaResolved, Some(_)) => "federated_on_schema_resolved_duckdb",
     };
 
     tracing::info!("Using dataset: {}", dataset_name);
@@ -606,6 +610,73 @@ async fn run_ready_state_test(
                 return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
             }
             () = cloned_rt.load_components() => {}
+        }
+
+        // Assert dataset readiness state right after registration / load_components returns.
+        // This is the core behavior being tested: the reported readiness should reflect the
+        // configured `ReadyState` before the initial acceleration refresh completes.
+        let dataset_status_key = format!("dataset:{dataset_name}");
+        match ready_state {
+            ReadyState::OnRegistration => {
+                // `on_registration` marks the dataset ready immediately, regardless of the
+                // federated source. Poll briefly to account for scheduling races.
+                let ready_within = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    async {
+                        loop {
+                            if matches!(
+                                rt.status().get_component_status(&dataset_status_key),
+                                Some(runtime::status::ComponentStatus::Ready)
+                            ) {
+                                return;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
+                    },
+                )
+                .await;
+                assert!(
+                    ready_within.is_ok(),
+                    "Dataset {dataset_name} with ready_state=on_registration should be Ready before initial load completes, but status was {:?}",
+                    rt.status().get_component_status(&dataset_status_key)
+                );
+            }
+            ReadyState::OnSchemaResolved => {
+                // `on_schema_resolved` marks the dataset ready once the federated source's
+                // schema is resolved (access verified). For the slow-loading test sources used
+                // here, the federated provider is `Immediate` (schema is available
+                // synchronously before the builder runs), so readiness should transition to
+                // Ready before the initial refresh completes.
+                let ready_within = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    async {
+                        loop {
+                            if matches!(
+                                rt.status().get_component_status(&dataset_status_key),
+                                Some(runtime::status::ComponentStatus::Ready)
+                            ) {
+                                return;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
+                    },
+                )
+                .await;
+                assert!(
+                    ready_within.is_ok(),
+                    "Dataset {dataset_name} with ready_state=on_schema_resolved should be Ready after schema resolution and before initial load completes, but status was {:?}",
+                    rt.status().get_component_status(&dataset_status_key)
+                );
+            }
+            ReadyState::OnLoad => {
+                // `on_load` must NOT report the dataset as Ready before the initial refresh
+                // completes. The slow-loading source is wired to take ~5s.
+                let status = rt.status().get_component_status(&dataset_status_key);
+                assert!(
+                    !matches!(status, Some(runtime::status::ComponentStatus::Ready)),
+                    "Dataset {dataset_name} with ready_state=on_load should not be Ready before initial load completes, but status was {status:?}"
+                );
+            }
         }
 
         tracing::info!("Running initial query");
@@ -680,6 +751,17 @@ async fn run_ready_state_test(
         // Wait for acceleration to load
         tracing::info!("Waiting for acceleration to load");
         tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+        // After the initial refresh has completed, the dataset should be Ready for every
+        // configured `ReadyState` variant (including `on_load`).
+        assert!(
+            matches!(
+                rt.status().get_component_status(&dataset_status_key),
+                Some(runtime::status::ComponentStatus::Ready)
+            ),
+            "Dataset {dataset_name} should be Ready after initial load completes, but status was {:?}",
+            rt.status().get_component_status(&dataset_status_key)
+        );
 
         // Query again, now we should get results
         tracing::info!("Running query after loading");
@@ -776,6 +858,66 @@ async fn test_ready_state_on_registration_federated_duckdb_acceleration()
         Some("duckdb".to_string()),
         false,
         "test_ready_state_on_registration_federated_duckdb_acceleration",
+    )
+    .await
+}
+
+// Test that the runtime is ready immediately with ready_state = on_schema_resolved for native provider
+#[tokio::test]
+async fn test_ready_state_on_schema_resolved_native_arrow_acceleration() -> Result<(), anyhow::Error>
+{
+    // Native provider, OnSchemaResolved, Arrow engine: readiness triggers after the federated
+    // source is accessible (schema resolvable) and queries fall back to the source during initial load.
+    run_ready_state_test(
+        true,
+        ReadyState::OnSchemaResolved,
+        None,
+        false,
+        "test_ready_state_on_schema_resolved_native_arrow_acceleration",
+    )
+    .await
+}
+
+// Test that the runtime is ready immediately with ready_state = on_schema_resolved for native provider
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn test_ready_state_on_schema_resolved_native_duckdb_acceleration()
+-> Result<(), anyhow::Error> {
+    run_ready_state_test(
+        true,
+        ReadyState::OnSchemaResolved,
+        Some("duckdb".to_string()),
+        false,
+        "test_ready_state_on_schema_resolved_native_duckdb_acceleration",
+    )
+    .await
+}
+
+// Test that the runtime is ready immediately with ready_state = on_schema_resolved for federated provider
+#[tokio::test]
+async fn test_ready_state_on_schema_resolved_federated_arrow_acceleration()
+-> Result<(), anyhow::Error> {
+    run_ready_state_test(
+        false,
+        ReadyState::OnSchemaResolved,
+        None,
+        false,
+        "test_ready_state_on_schema_resolved_federated_arrow_acceleration",
+    )
+    .await
+}
+
+// Test that the runtime is ready immediately with ready_state = on_schema_resolved for federated provider
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn test_ready_state_on_schema_resolved_federated_duckdb_acceleration()
+-> Result<(), anyhow::Error> {
+    run_ready_state_test(
+        false,
+        ReadyState::OnSchemaResolved,
+        Some("duckdb".to_string()),
+        false,
+        "test_ready_state_on_schema_resolved_federated_duckdb_acceleration",
     )
     .await
 }
