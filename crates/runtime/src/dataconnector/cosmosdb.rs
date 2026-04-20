@@ -152,9 +152,11 @@ impl MetricsProvider for CosmosDBMetricsProvider {
 #[derive(Debug)]
 pub struct CosmosDB {
     params: Parameters,
-    /// Drives the `inflight_operations` metric gauge. Cloned into every
-    /// [`CosmosResilienceConfig`] this connector produces so the gauge
-    /// aggregates across datasets targeting the same Cosmos account.
+    /// Drives the `inflight_operations` metric gauge. Instantiated per
+    /// connector (one per dataset), so the exported value reflects in-flight
+    /// operations for that dataset rather than a shared per-account budget —
+    /// the shared concurrency budget itself is enforced via the endpoint-keyed
+    /// `COSMOS_CONCURRENCY_LIMITS` map, not this counter.
     inflight_operations: Arc<AtomicU64>,
     unsupported_type_action: Option<DFUnsupportedTypeAction>,
 }
@@ -197,10 +199,10 @@ const PARAMETERS: &[ParameterSpec] = &[
         .description("Maximum number of concurrent Azure Cosmos DB requests per account endpoint, shared across all datasets pointing at the same account.")
         .default("4"),
     ParameterSpec::runtime("http_max_retries")
-        .description("Maximum number of retries for transient errors (429, 5xx, network) when reading from Azure Cosmos DB. Retries use the configured backoff strategy and honor Retry-After headers.")
+        .description("Maximum number of retries for transient errors (429, 5xx, network) during the schema-inference sampling pass at dataset registration. Retries use the configured backoff strategy and honor Retry-After headers. Mid-stream pager errors during scan execution are not retried.")
         .default("3"),
     ParameterSpec::runtime("backoff_method")
-        .description("Backoff strategy between retries on transient errors. 'exponential' doubles the delay each attempt; 'fibonacci' follows the Fibonacci sequence.")
+        .description("Backoff strategy between schema-inference sampling retries on transient errors. 'exponential' doubles the delay each attempt; 'fibonacci' follows the Fibonacci sequence.")
         .one_of(&["exponential", "fibonacci"])
         .default("exponential"),
     ParameterSpec::runtime("disable_on_permanent_error")

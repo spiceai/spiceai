@@ -22,11 +22,14 @@ limitations under the License.
 //! schema from a sample of documents on first access, and streams the full
 //! result set into record batches via `arrow::json::ReaderBuilder`.
 //!
-//! This is an alpha-quality implementation:
+//! This is an RC-quality implementation with the following current
+//! limitations:
 //! * Read-only (no INSERT / UPDATE / DELETE).
 //! * Cross-partition scan only — no filter or projection push-down.
 //! * Schema inferred from a sample; pin the schema via the dataset
 //!   `columns:` spicepod property when stability is required.
+//! * Retries/backoff apply to the schema-inference pass only; mid-stream
+//!   pager errors during scan execution propagate directly.
 //! * Cosmos DB Rust SDK 0.30 has limited cross-partition capabilities; see
 //!   the module-level documentation.
 
