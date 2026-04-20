@@ -44,6 +44,14 @@ build-spidapter-dev:
 build-spidapter:
 	cargo build --release -p spidapter --all-features
 
+.PHONY: build-cayenne-flightsql-dev
+build-cayenne-flightsql-dev:
+	cargo build -p cayenne-flightsql --all-features
+
+.PHONY: build-cayenne-flightsql
+build-cayenne-flightsql:
+	cargo build --release -p cayenne-flightsql --all-features
+
 .PHONY: ci
 ci:
 	make -C bin/spice
@@ -95,7 +103,7 @@ lint: lint-rust
 lint-rust:
 	cargo fmt --all -- --check
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude libnfs -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,elasticsearch --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -110,7 +118,7 @@ lint-rust:
 		-Dclippy::todo \
 		-Dclippy::assertions_on_result_states \
 		-Dclippy::allow_attributes
-	cargo clippy $(CARGO_PROFILE) --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace --exclude libnfs -- \
+	cargo clippy $(CARGO_PROFILE) --tests --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,elasticsearch --workspace --exclude libnfs -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
@@ -334,6 +342,16 @@ install-spidapter-dev: build-spidapter-dev
 install-spidapter: build-spidapter
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spidapter ~/.spice/bin/spidapter
+
+.PHONY: install-cayenne-flightsql-dev
+install-cayenne-flightsql-dev: build-cayenne-flightsql-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/debug/cayenne-flightsql ~/.spice/bin/cayenne-flightsql
+
+.PHONY: install-cayenne-flightsql
+install-cayenne-flightsql: build-cayenne-flightsql
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/cayenne-flightsql ~/.spice/bin/cayenne-flightsql
 
 .PHONY: install-cli
 install-cli: build-cli
