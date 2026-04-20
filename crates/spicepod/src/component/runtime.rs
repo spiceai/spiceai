@@ -329,8 +329,31 @@ pub struct TelemetryConfig {
     pub enabled: bool,
     #[serde(default)]
     pub user_agent_collection: UserAgentCollection,
+    /// Custom key/value attributes attached to telemetry metrics emitted by
+    /// spiced. Applied as OpenTelemetry resource attributes on the runtime's
+    /// `MeterProvider`, so they appear as dimensions on every metric exported
+    /// via the Prometheus scrape endpoint, the cluster on-demand OTLP reader,
+    /// and the `otel_exporter` push exporter, and as labels on anonymous
+    /// usage telemetry. Currently does not affect tracing spans or logs.
+    /// Example: `{ environment: prod, region: us-west-2, team: data-platform }`.
     #[serde(default)]
     pub properties: HashMap<String, String>,
+    /// Optional prefix prepended to every exported metric name.
+    ///
+    /// Useful for namespacing Spice metrics in shared backends (e.g. Datadog,
+    /// Grafana Cloud) so they don't collide with metrics from other services.
+    /// For example, with `metric_prefix: "spiceai."` the runtime metric
+    /// `query_duration_ms` is exported as `spiceai.query_duration_ms`.
+    ///
+    /// The prefix is applied via an `OpenTelemetry` `View` on the runtime's
+    /// `MeterProvider`, so it affects every metric reader attached to that
+    /// provider — the Prometheus scrape endpoint (`--metrics`), the cluster
+    /// on-demand OTLP reader, and the `otel_exporter` push reader.
+    /// `OpenTelemetry` 0.31's SDK does not support per-reader name transforms,
+    /// so this knob is intentionally placed at the telemetry level rather
+    /// than under any single exporter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric_prefix: Option<String>,
     /// Optional configuration for pushing metrics to an OpenTelemetry collector
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otel_exporter: Option<OtelExporterConfig>,
@@ -342,6 +365,7 @@ impl Default for TelemetryConfig {
             enabled: true,
             user_agent_collection: UserAgentCollection::default(),
             properties: HashMap::new(),
+            metric_prefix: None,
             otel_exporter: None,
         }
     }
@@ -1629,6 +1653,29 @@ mod tests {
             result.is_err(),
             "unknown temporality value must fail to parse"
         );
+    }
+
+    #[test]
+    fn test_metric_prefix_default_is_none() {
+        let yaml = r"
+            telemetry:
+                otel_exporter:
+                    endpoint: otel-collector
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(runtime.telemetry.metric_prefix, None);
+    }
+
+    #[test]
+    fn test_metric_prefix_parsing() {
+        let yaml = r#"
+            telemetry:
+                metric_prefix: "spiceai."
+                otel_exporter:
+                    endpoint: otel-collector
+        "#;
+        let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
+        assert_eq!(runtime.telemetry.metric_prefix.as_deref(), Some("spiceai."));
     }
 
     #[test]
