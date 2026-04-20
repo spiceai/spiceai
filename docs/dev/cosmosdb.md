@@ -52,7 +52,9 @@ managed identity support is tracked as a post-RC enhancement.
   with configurable backoff, `Retry-After` / `x-ms-retry-after-ms` handling,
   permanent-error (401/403/404) detection that latches the connector disabled.
 - `inflight_operations` metric gauge, exported via the runtime metrics
-  endpoint for dashboards.
+  endpoint for dashboards. This gauge is scoped per dataset connector
+  instance, not as an account-wide aggregate across all datasets using the
+  same Cosmos account endpoint.
 - `unsupported_type_action` plumbing — all-null sampled fields (inferred as
   `DataType::Null`) are warn-and-dropped by default.
 
