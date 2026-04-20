@@ -106,6 +106,7 @@ fn athena_dialect() -> CustomDialect {
     CustomDialectBuilder::new()
         .with_interval_style(IntervalStyle::MySQL)
         .with_date_field_extract_style(DateFieldExtractStyle::Extract)
+        .with_large_utf8_cast_dtype(datafusion::sql::sqlparser::ast::DataType::Varchar(None))
         .build()
 }
 
@@ -318,6 +319,29 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::common::Result;
+    use datafusion::logical_expr::cast;
+    use datafusion::prelude::col;
+    use datafusion::sql::unparser::Unparser;
+
+    #[test]
+    fn test_athena_dialect_overrides() -> Result<()> {
+        let dialect = athena_dialect();
+        let unparser = Unparser::new(&dialect);
+
+        // large_utf8_cast_dtype: VARCHAR instead of TEXT
+        let expr = cast(col("a"), DataType::LargeUtf8);
+        let actual = format!("{}", unparser.expr_to_sql(&expr)?);
+        assert_eq!(actual, "CAST(a AS VARCHAR)");
+
+        // utf8_cast_dtype: VARCHAR
+        let expr = cast(col("a"), DataType::Utf8);
+        let actual = format!("{}", unparser.expr_to_sql(&expr)?);
+        assert_eq!(actual, "CAST(a AS VARCHAR)");
+
+        Ok(())
+    }
 
     #[test]
     fn test_odbc_driver_is_file() {
