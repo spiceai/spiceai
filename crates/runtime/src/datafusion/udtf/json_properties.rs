@@ -994,7 +994,8 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
         let normalized = if matches!(array.data_type(), DataType::Utf8) {
             array
         } else {
-            cast(&array, &DataType::Utf8).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+            cast(&array, &DataType::Utf8)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
         };
         let strings = as_string_array(&normalized);
 
