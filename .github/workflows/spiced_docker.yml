@@ -60,7 +60,6 @@ jobs:
           && (
             !contains(github.event.release.tag_name, '-')
             || contains(github.event.release.tag_name, '-rc.')
-            || contains(github.event.release.tag_name, '-rc-')
           )
         )
         || (
