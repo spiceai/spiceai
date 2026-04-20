@@ -46,12 +46,29 @@ jobs:
   setup:
     # Run on:
     #   - workflow_dispatch (manual runs)
-    #   - release 'published' (new releases, including pre-releases / RCs — the
-    #     resolve step auto-detects rc/beta/alpha versions and omits the
-    #     'latest' tag but still publishes version-tagged images)
+    #   - release 'published' ONLY for stable releases (vX.Y.Z) or RC tags
+    #     (vX.Y.Z-rc.N / vX.Y.Z-rc-N). Other pre-releases (nightly, beta,
+    #     alpha, dev, etc.) are intentionally excluded so they never get
+    #     published to DockerHub / GHCR via this workflow.
     #   - release 'edited' only when the release is flipped to 'latest', so the
-    #     ':latest' tag can be moved without re-publishing on every edit
-    if: ${{ github.event_name != 'release' || github.event.action == 'published' || (github.event.action == 'edited' && github.event.changes.make_latest && github.event.changes.make_latest.to == 'true') }}
+    #     ':latest' tag can be moved without re-publishing on every edit.
+    if: >-
+      ${{
+        github.event_name != 'release'
+        || (
+          github.event.action == 'published'
+          && (
+            !contains(github.event.release.tag_name, '-')
+            || contains(github.event.release.tag_name, '-rc.')
+            || contains(github.event.release.tag_name, '-rc-')
+          )
+        )
+        || (
+          github.event.action == 'edited'
+          && github.event.changes.make_latest
+          && github.event.changes.make_latest.to == 'true'
+        )
+      }}
     runs-on: ubuntu-24.04
     outputs:
       rel_version: ${{ steps.resolve.outputs.rel_version }}
