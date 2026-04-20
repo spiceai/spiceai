@@ -22,27 +22,17 @@ datasets:
       # Sample more documents for a more stable schema inference.
       schema_infer_max_records: "500"
 
-  # Pinned schema — avoids inference drift when optional fields are null in
-  # the first N sampled documents but not in general.
+  # Resilience-tuned dataset — raises the per-account concurrency budget
+  # (default 4) and widens the retry envelope for datasets expected to run
+  # under heavy load.
   - from: cosmosdb:store.products
-    name: products_pinned
-    description: Products with an explicit Arrow schema.
+    name: products_heavy_load
+    description: Products, tuned for heavy-load query patterns.
     params:
       cosmosdb_connection_string: ${ env:COSMOSDB_CONNECTION_STRING }
-      # Resilience tuning: raise the per-account concurrency budget (above
-      # the default of 4) and widen the retry envelope for datasets expected
-      # to run under heavy load.
       max_concurrent_requests: "8"
       http_max_retries: "5"
       backoff_method: fibonacci
-    columns:
-      - name: id
-        type: string
-      - name: name
-        type: string
-      - name: price
-        type: double
-      - name: tags
-        type: list<string>
-      - name: available
-        type: boolean
+      # Widen the sample to stabilize inference when optional fields are null
+      # in the first 100 documents but not in general.
+      schema_infer_max_records: "500"

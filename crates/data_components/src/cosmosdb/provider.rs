@@ -76,9 +76,6 @@ pub struct CosmosDBTableProviderConfig {
     pub query: String,
     /// Number of documents sampled when inferring the schema.
     pub schema_infer_max_records: usize,
-    /// Optional pre-pinned schema. If supplied, schema inference is skipped
-    /// entirely.
-    pub schema_override: Option<SchemaRef>,
     /// How to handle columns whose type Cosmos DB cannot represent (e.g.
     /// all-null samples that Arrow's JSON inference returns as
     /// [`DataType::Null`]). Defaults to [`UnsupportedTypeAction::Warn`].
@@ -98,7 +95,6 @@ impl CosmosDBTableProviderConfig {
             container: container.into(),
             query: query.into(),
             schema_infer_max_records: DEFAULT_SCHEMA_INFER_MAX_RECORDS,
-            schema_override: None,
             unsupported_type_action: UnsupportedTypeAction::Warn,
             resilience: CosmosResilienceConfig::default(),
         }
@@ -107,12 +103,6 @@ impl CosmosDBTableProviderConfig {
     #[must_use]
     pub fn with_schema_infer_max_records(mut self, n: usize) -> Self {
         self.schema_infer_max_records = n;
-        self
-    }
-
-    #[must_use]
-    pub fn with_schema_override(mut self, schema: SchemaRef) -> Self {
-        self.schema_override = Some(schema);
         self
     }
 
@@ -149,51 +139,46 @@ impl std::fmt::Debug for CosmosDBTableProvider {
 }
 
 impl CosmosDBTableProvider {
-    /// Build a new table provider, sampling the container for a schema if
-    /// no override was supplied.
+    /// Build a new table provider, inferring the schema by sampling a batch
+    /// of documents from the container.
     ///
     /// `container_client` is pre-built for the `(database, container)` pair
     /// carried on `config`; `endpoint` is the Cosmos account endpoint used for
     /// resilience keying and error messages.
     ///
     /// # Errors
-    /// Returns an error if the sample query fails or the container is empty
-    /// and no schema override was supplied.
+    /// Returns an error if the sample query fails or the container is empty.
     pub async fn try_new(
         container_client: ContainerClient,
         endpoint: Arc<str>,
         config: CosmosDBTableProviderConfig,
     ) -> Result<Self, Error> {
-        let schema = if let Some(schema) = &config.schema_override {
-            Arc::clone(schema)
-        } else {
-            let samples = fetch_samples(
-                &container_client,
-                &endpoint,
-                &config.database,
-                &config.container,
-                &config.query,
-                config.schema_infer_max_records,
-                &config.resilience,
-            )
-            .await?;
+        let samples = fetch_samples(
+            &container_client,
+            &endpoint,
+            &config.database,
+            &config.container,
+            &config.query,
+            config.schema_infer_max_records,
+            &config.resilience,
+        )
+        .await?;
 
-            if samples.is_empty() {
-                return EmptyContainerSnafu {
-                    database: config.database.clone(),
-                    container: config.container.clone(),
-                }
-                .fail();
+        if samples.is_empty() {
+            return EmptyContainerSnafu {
+                database: config.database.clone(),
+                container: config.container.clone(),
             }
+            .fail();
+        }
 
-            let inferred = infer_schema(&samples)?;
-            apply_unsupported_type_action(
-                &inferred,
-                config.unsupported_type_action,
-                &config.database,
-                &config.container,
-            )?
-        };
+        let inferred = infer_schema(&samples)?;
+        let schema = apply_unsupported_type_action(
+            &inferred,
+            config.unsupported_type_action,
+            &config.database,
+            &config.container,
+        )?;
 
         Ok(Self {
             container_client,

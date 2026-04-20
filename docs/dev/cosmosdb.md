@@ -44,8 +44,9 @@ managed identity support is tracked as a post-RC enhancement.
 - Read-only (`SELECT`) scans via Cosmos SQL.
 - Cross-partition query by default.
 - Arrow schema inferred from a sample of documents (system fields
-  `_rid`, `_self`, `_etag`, `_attachments`, `_ts` are stripped). Pin a schema
-  via the dataset `columns:` property when stability is required.
+  `_rid`, `_self`, `_etag`, `_attachments`, `_ts` are stripped). Schema
+  pinning is not currently supported — widen `schema_infer_max_records`
+  instead to stabilize inference when optional fields are sparse.
 - Standard Spice acceleration (DuckDB / SQLite / Arrow in-memory) on top of
   the connector.
 - Connection resilience: per-account concurrency semaphore, bounded retries
@@ -70,13 +71,13 @@ Cosmos stores documents as JSON. The connector samples up to
 | floating (`3.14`, `1.0e9`)  | `Float64`       |                                                                                                                                                             |
 | `true` / `false`            | `Boolean`       |                                                                                                                                                             |
 | object `{ ... }`            | `Struct`        | Nested objects are preserved as structs.                                                                                                                    |
-| array `[ ... ]`             | `List`          | The element type is inferred from the first non-null item; heterogeneous arrays may require `columns:` pinning to disambiguate.                             |
-| all-null in sample          | `Null`          | Warn-dropped by default (`unsupported_type_action=warn`). Pin via `columns:` to force a type, or set `unsupported_type_action=string` to coerce to `Utf8`.  |
+| array `[ ... ]`             | `List`          | The element type is inferred from the first non-null item; heterogeneous arrays may surface as `Utf8` or require a wider sample to disambiguate.            |
+| all-null in sample          | `Null`          | Warn-dropped by default (`unsupported_type_action=warn`). Set `unsupported_type_action=string` to coerce to `Utf8`, or widen the sample so real values appear. |
 | System fields (`_rid`, ...) | stripped        | Never appear in the dataset schema.                                                                                                                         |
 
 Cosmos does not emit `Date`, `Time`, `Timestamp`, `Decimal`, or `Binary`
-natively — they round-trip as strings. Pin those with explicit `columns:`
-declarations and use `CAST` at query time.
+natively — they round-trip as strings and should be handled with `CAST` at
+query time.
 
 ## RC exceptions
 

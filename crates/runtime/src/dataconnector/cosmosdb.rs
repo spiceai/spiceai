@@ -111,7 +111,7 @@ fn shared_disabled_flag(endpoint: &str) -> Arc<AtomicBool> {
 const COSMOSDB_METRICS: &[MetricSpec] =
     &[
         MetricSpec::new("inflight_operations", MetricType::ObservableGaugeU64)
-            .description("Current number of Azure Cosmos DB requests holding a concurrency permit")
+            .description("Azure Cosmos DB operations currently holding a concurrency permit — incremented once per operation and held across retry backoff sleeps (not a pure in-flight-HTTP counter)")
             .auto_register(),
     ];
 
@@ -495,9 +495,8 @@ mod tests {
 
     #[test]
     fn uses_database_param_when_path_is_container_only() {
-        let (db, container) =
-            parse_database_and_container("mycontainer", Some("explicit_db"))
-                .expect("container-only path with explicit db should parse");
+        let (db, container) = parse_database_and_container("mycontainer", Some("explicit_db"))
+            .expect("container-only path with explicit db should parse");
         assert_eq!(db, "explicit_db");
         assert_eq!(container, "mycontainer");
     }
@@ -545,16 +544,16 @@ mod tests {
         // Documents current behavior: the first `.` wins even when a `/` is
         // also present. Cosmos DB names do not legally contain `.`, so this
         // mainly matters for malformed input.
-        let (db, container) = parse_database_and_container("a/b.c", None)
-            .expect("dot takes precedence over slash");
+        let (db, container) =
+            parse_database_and_container("a/b.c", None).expect("dot takes precedence over slash");
         assert_eq!(db, "a/b");
         assert_eq!(container, "c");
     }
 
     #[test]
     fn multiple_dots_split_at_first() {
-        let (db, container) = parse_database_and_container("a.b.c", None)
-            .expect("multiple dots split at first");
+        let (db, container) =
+            parse_database_and_container("a.b.c", None).expect("multiple dots split at first");
         assert_eq!(db, "a");
         assert_eq!(container, "b.c");
     }
