@@ -330,7 +330,8 @@ mod tests {
 
     #[test]
     fn backoff_delay_fibonacci_grows_as_expected() {
-        // Factors follow F(attempt+1) with F(1)=F(2)=1 → 1, 2, 3, 5, 8, ...
+        // Factors follow F(attempt+2) with the conventional Fibonacci indexing
+        // F(1)=F(2)=1 → attempts 0, 1, 2, 3, 4 map to 1, 2, 3, 5, 8, ...
         assert_eq!(
             backoff_delay(BackoffMethod::Fibonacci, 0),
             RETRY_INITIAL_BACKOFF

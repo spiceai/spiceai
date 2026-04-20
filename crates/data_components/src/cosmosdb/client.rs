@@ -98,7 +98,14 @@ pub fn build_container_client(
 
     let container_client = client.database_client(database).container_client(container);
 
-    Ok((container_client, Arc::from(endpoint)))
+    Ok((container_client, Arc::from(normalize_endpoint(&endpoint))))
+}
+
+/// Normalize a Cosmos DB account endpoint so benign URL-formatting differences
+/// (trailing slash, casing) don't split the shared per-account concurrency
+/// budget across datasets that target the same account.
+fn normalize_endpoint(endpoint: &str) -> String {
+    endpoint.trim().trim_end_matches('/').to_ascii_lowercase()
 }
 
 fn boxed_err<E>(e: E) -> Box<dyn std::error::Error + Send + Sync>
@@ -106,4 +113,22 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     Box::new(e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_endpoint;
+
+    #[test]
+    fn normalize_endpoint_collapses_benign_variants() {
+        let canonical = "https://myaccount.documents.azure.com:443";
+        for variant in [
+            "https://myaccount.documents.azure.com:443",
+            "https://myaccount.documents.azure.com:443/",
+            "https://MYACCOUNT.documents.azure.com:443/",
+            "  https://myaccount.documents.azure.com:443/  ",
+        ] {
+            assert_eq!(normalize_endpoint(variant), canonical, "input: {variant:?}");
+        }
+    }
 }
