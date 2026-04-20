@@ -160,7 +160,16 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Re-export the config from spicepod for convenience
-pub use spicepod::component::runtime::OtelExporterConfig;
+pub use spicepod::component::runtime::{OtelExporterConfig, OtelTemporality};
+
+/// Map a spicepod-level [`OtelTemporality`] preference to the OpenTelemetry SDK enum.
+fn map_temporality(t: OtelTemporality) -> Temporality {
+    match t {
+        OtelTemporality::Delta => Temporality::Delta,
+        OtelTemporality::Cumulative => Temporality::Cumulative,
+        OtelTemporality::LowMemory => Temporality::LowMemory,
+    }
+}
 
 /// Creates a [`PeriodicReader`] for pushing metrics to an OTEL collector.
 ///
@@ -189,7 +198,7 @@ pub use spicepod::component::runtime::OtelExporterConfig;
 /// # Example
 ///
 /// ```ignore
-/// use runtime::otel_push_exporter::{create_otel_periodic_reader, OtelExporterConfig};
+/// use runtime::otel_push_exporter::{create_otel_periodic_reader, OtelExporterConfig, OtelTemporality};
 /// use std::collections::HashMap;
 ///
 /// let config = OtelExporterConfig {
@@ -198,6 +207,7 @@ pub use spicepod::component::runtime::OtelExporterConfig;
 ///     push_interval: "30s".to_string(),
 ///     metrics: vec![],
 ///     headers: HashMap::new(),
+///     temporality: OtelTemporality::Delta,
 /// };
 ///
 /// let otel_reader = create_otel_periodic_reader(&config, HashMap::new())?;
@@ -224,19 +234,21 @@ pub fn create_otel_periodic_reader(
             })?;
 
     let protocol = if config.is_http() { "http" } else { "grpc" };
+    let temporality = map_temporality(config.temporality);
     tracing::info!(
         endpoint = %config.endpoint,
         protocol = protocol,
         push_interval_secs = push_interval.as_secs(),
         metrics_filter = ?config.metrics,
         num_headers = resolved_headers.len(),
+        temporality = ?config.temporality,
         "Creating OTEL metrics periodic reader"
     );
 
     let inner_exporter = if config.is_http() {
-        create_http_exporter(&config.endpoint, resolved_headers)?
+        create_http_exporter(&config.endpoint, resolved_headers, temporality)?
     } else {
-        create_grpc_exporter(&config.grpc_endpoint(), &resolved_headers)?
+        create_grpc_exporter(&config.grpc_endpoint(), &resolved_headers, temporality)?
     };
 
     // Wrap with filtering exporter
@@ -252,11 +264,13 @@ pub fn create_otel_periodic_reader(
 fn create_grpc_exporter(
     endpoint: &str,
     headers: &HashMap<String, String>,
+    temporality: Temporality,
 ) -> Result<MetricExporter> {
     let mut builder = MetricExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
-        .with_protocol(Protocol::Grpc);
+        .with_protocol(Protocol::Grpc)
+        .with_temporality(temporality);
 
     if !headers.is_empty() {
         let mut metadata = tonic::metadata::MetadataMap::new();
@@ -283,6 +297,7 @@ fn create_grpc_exporter(
 fn create_http_exporter(
     endpoint: &str,
     headers: HashMap<String, String>,
+    temporality: Temporality,
 ) -> Result<MetricExporter> {
     // For HTTP, the endpoint should include the /v1/metrics path
     let full_endpoint = if endpoint.ends_with("/v1/metrics") {
@@ -303,7 +318,8 @@ fn create_http_exporter(
         .with_http()
         .with_http_client(http_client)
         .with_endpoint(full_endpoint)
-        .with_protocol(Protocol::HttpBinary);
+        .with_protocol(Protocol::HttpBinary)
+        .with_temporality(temporality);
 
     if !headers.is_empty() {
         builder = builder.with_headers(headers);
@@ -469,7 +485,11 @@ mod tests {
             ("X-Custom".to_string(), "value".to_string()),
         ]);
         // HTTP exporter with headers should build successfully
-        let result = create_http_exporter("http://localhost:4318/v1/metrics", headers);
+        let result = create_http_exporter(
+            "http://localhost:4318/v1/metrics",
+            headers,
+            Temporality::Delta,
+        );
         assert!(
             result.is_ok(),
             "HTTP exporter with headers should build: {result:?}"
@@ -479,7 +499,11 @@ mod tests {
     #[test]
     fn test_create_http_exporter_without_headers() {
         let headers = HashMap::new();
-        let result = create_http_exporter("http://localhost:4318/v1/metrics", headers);
+        let result = create_http_exporter(
+            "http://localhost:4318/v1/metrics",
+            headers,
+            Temporality::Delta,
+        );
         assert!(
             result.is_ok(),
             "HTTP exporter without headers should build: {result:?}"
@@ -495,7 +519,7 @@ mod tests {
             ("api-key".to_string(), "test-key".to_string()),
             ("x-custom-header".to_string(), "value".to_string()),
         ]);
-        let result = create_grpc_exporter("http://localhost:4317", &headers);
+        let result = create_grpc_exporter("http://localhost:4317", &headers, Temporality::Delta);
         assert!(
             result.is_ok(),
             "gRPC exporter with valid headers should build: {result:?}"
@@ -507,7 +531,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
         let _guard = rt.enter();
         let headers = HashMap::new();
-        let result = create_grpc_exporter("http://localhost:4317", &headers);
+        let result = create_grpc_exporter("http://localhost:4317", &headers, Temporality::Delta);
         assert!(
             result.is_ok(),
             "gRPC exporter without headers should build: {result:?}"
@@ -521,7 +545,7 @@ mod tests {
         let _guard = rt.enter();
         // gRPC metadata keys must be lowercase ASCII
         let headers = HashMap::from([("Invalid Key With Spaces".to_string(), "value".to_string())]);
-        let result = create_grpc_exporter("http://localhost:4317", &headers);
+        let result = create_grpc_exporter("http://localhost:4317", &headers, Temporality::Delta);
         assert!(result.is_err());
         let err = result.expect_err("should fail with invalid metadata key");
         let msg = err.to_string();

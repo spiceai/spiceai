@@ -123,7 +123,7 @@ impl TextSearchTableFuncArgs {
                     )));
                 }
                 _ => {
-                    return Err(DataFusionError::Execution(format!(
+                    return Err(DataFusionError::Plan(format!(
                         "User function 'text_search' is called on table '{tbl}' that has no associated full text search index"
                     )));
                 }
