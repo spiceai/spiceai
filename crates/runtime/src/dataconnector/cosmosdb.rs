@@ -479,14 +479,16 @@ mod tests {
 
     #[test]
     fn parses_dot_delimited_path() {
-        let (db, container) = parse_database_and_container("mydb.mycontainer", None).unwrap();
+        let (db, container) = parse_database_and_container("mydb.mycontainer", None)
+            .expect("dot-delimited path should parse");
         assert_eq!(db, "mydb");
         assert_eq!(container, "mycontainer");
     }
 
     #[test]
     fn parses_slash_delimited_path() {
-        let (db, container) = parse_database_and_container("mydb/mycontainer", None).unwrap();
+        let (db, container) = parse_database_and_container("mydb/mycontainer", None)
+            .expect("slash-delimited path should parse");
         assert_eq!(db, "mydb");
         assert_eq!(container, "mycontainer");
     }
@@ -494,7 +496,8 @@ mod tests {
     #[test]
     fn uses_database_param_when_path_is_container_only() {
         let (db, container) =
-            parse_database_and_container("mycontainer", Some("explicit_db")).unwrap();
+            parse_database_and_container("mycontainer", Some("explicit_db"))
+                .expect("container-only path with explicit db should parse");
         assert_eq!(db, "explicit_db");
         assert_eq!(container, "mycontainer");
     }
@@ -502,32 +505,38 @@ mod tests {
     #[test]
     fn database_param_overrides_path_segment() {
         let (db, container) =
-            parse_database_and_container("path_db.mycontainer", Some("override_db")).unwrap();
+            parse_database_and_container("path_db.mycontainer", Some("override_db"))
+                .expect("db param should override path segment");
         assert_eq!(db, "override_db");
         assert_eq!(container, "mycontainer");
     }
 
     #[test]
     fn errors_when_no_database_can_be_determined() {
-        let err = parse_database_and_container("just_container", None).unwrap_err();
+        let err = parse_database_and_container("just_container", None)
+            .expect_err("missing db should be an error");
         assert!(err.contains("Could not determine Cosmos DB database"));
     }
 
     #[test]
     fn errors_on_empty_container_segment() {
-        let err = parse_database_and_container("mydb.", None).unwrap_err();
+        let err = parse_database_and_container("mydb.", None)
+            .expect_err("empty container segment should be an error");
         assert!(err.contains("Could not determine Cosmos DB container"));
 
-        let err = parse_database_and_container("mydb/", None).unwrap_err();
+        let err = parse_database_and_container("mydb/", None)
+            .expect_err("empty container segment should be an error");
         assert!(err.contains("Could not determine Cosmos DB container"));
     }
 
     #[test]
     fn errors_on_empty_database_segment() {
-        let err = parse_database_and_container(".mycontainer", None).unwrap_err();
+        let err = parse_database_and_container(".mycontainer", None)
+            .expect_err("empty database segment should be an error");
         assert!(err.contains("Could not determine Cosmos DB database"));
 
-        let err = parse_database_and_container("/mycontainer", None).unwrap_err();
+        let err = parse_database_and_container("/mycontainer", None)
+            .expect_err("empty database segment should be an error");
         assert!(err.contains("Could not determine Cosmos DB database"));
     }
 
@@ -536,14 +545,16 @@ mod tests {
         // Documents current behavior: the first `.` wins even when a `/` is
         // also present. Cosmos DB names do not legally contain `.`, so this
         // mainly matters for malformed input.
-        let (db, container) = parse_database_and_container("a/b.c", None).unwrap();
+        let (db, container) = parse_database_and_container("a/b.c", None)
+            .expect("dot takes precedence over slash");
         assert_eq!(db, "a/b");
         assert_eq!(container, "c");
     }
 
     #[test]
     fn multiple_dots_split_at_first() {
-        let (db, container) = parse_database_and_container("a.b.c", None).unwrap();
+        let (db, container) = parse_database_and_container("a.b.c", None)
+            .expect("multiple dots split at first");
         assert_eq!(db, "a");
         assert_eq!(container, "b.c");
     }
