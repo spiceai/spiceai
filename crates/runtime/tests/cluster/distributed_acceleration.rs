@@ -23,6 +23,8 @@ limitations under the License.
 //! 4. The `bucket()` UDF is available in the refresh context for partition filtering
 
 use app::AppBuilder;
+use aws_sdk_s3::config::{Credentials, Region};
+use rustfs::embedded::{RustFSServer, RustFSServerBuilder, find_available_port};
 use spicepod::component::dataset::Dataset;
 use spicepod::component::runtime::{
     PartitionManagement, Runtime as SpicepodRuntime, Scheduler as SchedulerConfig,
@@ -31,14 +33,13 @@ use spicepod::{
     acceleration::{Acceleration, Mode, RefreshMode},
     partitioning::PartitionedBy,
 };
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::OnceCell;
 use tokio::time::sleep;
 use tracing_subscriber::EnvFilter;
 
-use crate::{
-    configure_test_datafusion,
-    utils::{test_request_context, verify_env_secret_exists},
-};
+use crate::{configure_test_datafusion, utils::test_request_context};
 
 use super::harness::ClusterHarness;
 
@@ -86,6 +87,23 @@ const CATEGORIES_CSV: &str = r"id,category,rating
 10,C,2.7
 ";
 
+const RUSTFS_ACCESS_KEY: &str = "rustfsadmin";
+const RUSTFS_SECRET_KEY: &str = "rustfsadmin";
+const RUSTFS_REGION: &str = "us-east-1";
+
+static RUSTFS_SERVER: OnceCell<Arc<RustfsServerContext>> = OnceCell::const_new();
+
+struct RustfsServerContext {
+    #[allow(dead_code)]
+    server: RustFSServer,
+    endpoint: String,
+}
+
+struct RustfsBucketContext {
+    bucket: String,
+    endpoint: String,
+}
+
 /// Test that distributed acceleration with `bucket()` partitioning works end to end
 /// with an executor.
 ///
@@ -105,12 +123,6 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
         .with_ansi(true)
         .try_init();
-
-    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
-        verify_env_secret_exists(env_var)
-            .await
-            .map_err(anyhow::Error::msg)?;
-    }
 
     // Keep the tempdirs alive for the duration of the test.
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
@@ -133,9 +145,12 @@ async fn test_distributed_acceleration_with_bucket_partitioning() -> Result<(), 
                     cayenne_tempdir.path(),
                 ))
                 .with_runtime(SpicepodRuntime {
-                    scheduler: Some(make_named_scheduler_config(
-                        "test_distributed_acceleration_with_bucket_partitioning",
-                    )),
+                    scheduler: Some(
+                        make_named_scheduler_config(
+                            "test_distributed_acceleration_with_bucket_partitioning",
+                        )
+                        .await?,
+                    ),
                     ..SpicepodRuntime::default()
                 })
                 .build();
@@ -197,13 +212,6 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
         .with_ansi(true)
         .try_init();
-
-    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
-        verify_env_secret_exists(env_var)
-            .await
-            .map_err(anyhow::Error::msg)?;
-    }
-
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
     tokio::fs::write(&csv_path, TEST_DATA_CSV)
@@ -225,7 +233,8 @@ async fn test_distributed_acceleration_multi_executor() -> Result<(), anyhow::Er
                         make_named_scheduler_config_with_max_partitions_per_executor(
                             "test_distributed_acceleration_multi_executor",
                             2,
-                        ),
+                        )
+                        .await?,
                     ),
                     ..SpicepodRuntime::default()
                 })
@@ -297,13 +306,6 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
         .with_ansi(true)
         .try_init();
-
-    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
-        verify_env_secret_exists(env_var)
-            .await
-            .map_err(anyhow::Error::msg)?;
-    }
-
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
     tokio::fs::write(&csv_path, TEST_DATA_CSV)
@@ -321,9 +323,12 @@ async fn test_distributed_acceleration_predicate_pushdown() -> Result<(), anyhow
                     "id",
                 ))
                 .with_runtime(SpicepodRuntime {
-                    scheduler: Some(make_named_scheduler_config(
-                        "test_distributed_acceleration_predicate_pushdown",
-                    )),
+                    scheduler: Some(
+                        make_named_scheduler_config(
+                            "test_distributed_acceleration_predicate_pushdown",
+                        )
+                        .await?,
+                    ),
                     ..SpicepodRuntime::default()
                 })
                 .build();
@@ -367,13 +372,6 @@ async fn test_distributed_acceleration_order_by_limit_pushdown() -> Result<(), a
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
         .with_ansi(true)
         .try_init();
-
-    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
-        verify_env_secret_exists(env_var)
-            .await
-            .map_err(anyhow::Error::msg)?;
-    }
-
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
     tokio::fs::write(&csv_path, TEST_DATA_CSV)
@@ -395,7 +393,8 @@ async fn test_distributed_acceleration_order_by_limit_pushdown() -> Result<(), a
                         make_named_scheduler_config_with_max_partitions_per_executor(
                             "test_distributed_acceleration_order_by_limit_pushdown",
                             2,
-                        ),
+                        )
+                        .await?,
                     ),
                     ..SpicepodRuntime::default()
                 })
@@ -469,13 +468,6 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
         .with_ansi(true)
         .try_init();
-
-    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
-        verify_env_secret_exists(env_var)
-            .await
-            .map_err(anyhow::Error::msg)?;
-    }
-
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
     tokio::fs::write(&csv_path, TEST_DATA_CSV)
@@ -493,9 +485,12 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
                     "id",
                 ))
                 .with_runtime(SpicepodRuntime {
-                    scheduler: Some(make_named_scheduler_config(
-                        "test_distributed_acceleration_executor_shutdown_and_rebalance",
-                    )),
+                    scheduler: Some(
+                        make_named_scheduler_config(
+                            "test_distributed_acceleration_executor_shutdown_and_rebalance",
+                        )
+                        .await?,
+                    ),
                     ..SpicepodRuntime::default()
                 })
                 .build();
@@ -524,7 +519,7 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
 
             // Shut down executor[0].  The scheduler's PartitionManagementTask (1s interval)
             // will detect the disconnect and reassign its buckets to executor[1].
-            harness.executors[0].shutdown().await;
+            harness.shutdown_executor(0).await?;
             harness
                 .wait_until_executor_count(1, Duration::from_secs(30))
                 .await?;
@@ -538,8 +533,8 @@ async fn test_distributed_acceleration_executor_shutdown_and_rebalance() -> Resu
             insta::assert_snapshot!("rebalance_rows", rows_fmt);
 
             // Explicit shutdown of the remaining executor before harness drop.
-            harness.executors[1].shutdown().await;
-            harness.scheduler.shutdown().await;
+            harness.shutdown_executor(1).await?;
+            harness.shutdown_scheduler().await?;
             Ok(())
         })
         .await
@@ -563,13 +558,6 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
         .with_ansi(true)
         .try_init();
-
-    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
-        verify_env_secret_exists(env_var)
-            .await
-            .map_err(anyhow::Error::msg)?;
-    }
-
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
     let data_path = csv_tempdir.path().join("test_data.csv");
     let cat_path = csv_tempdir.path().join("categories.csv");
@@ -600,7 +588,8 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                     scheduler: Some({
                         let mut cfg = make_named_scheduler_config(
                             "test_distributed_acceleration_join_two_partitioned_tables",
-                        );
+                        )
+                        .await?;
                         // Limit each executor to 2 of the 4 partitions per table so
                         // that partitions are forced to split across the 2 executors,
                         // producing a UnionExec in the query plan.
@@ -713,13 +702,6 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
         .with_env_filter(EnvFilter::new("runtime=debug,info"))
         .with_ansi(true)
         .try_init();
-
-    for env_var in ["AWS_S3_VECTORS_KEY", "AWS_S3_VECTORS_SECRET"] {
-        verify_env_secret_exists(env_var)
-            .await
-            .map_err(anyhow::Error::msg)?;
-    }
-
     let csv_tempdir = tempfile::tempdir().expect("csv tempdir");
     let csv_path = csv_tempdir.path().join("test_data.csv");
     tokio::fs::write(&csv_path, TEST_DATA_CSV)
@@ -737,9 +719,9 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
                     "id",
                 ))
                 .with_runtime(SpicepodRuntime {
-                    scheduler: Some(make_named_scheduler_config(
-                        "test_distributed_refresh_forwarding",
-                    )),
+                    scheduler: Some(
+                        make_named_scheduler_config("test_distributed_refresh_forwarding").await?,
+                    ),
                     ..SpicepodRuntime::default()
                 })
                 .build();
@@ -901,39 +883,38 @@ fn make_memory_accelerated_dataset(
     dataset
 }
 
-/// Return a `SchedulerConfig` pointing at an S3 path scoped to `test_name`.
+/// Return a `SchedulerConfig` pointing at a RustFS-backed S3 path scoped to `test_name`.
 ///
 /// `PartitionManager` uses OCC (optimistic concurrency control) which needs
 /// conditional-put support (`PutMode::Update`); the local filesystem `ObjectStore`
-/// does not support this, so S3 is required.
+/// does not support this, so S3-compatible storage is required.
 ///
-/// A UUID suffix ensures each test run starts with clean state, avoiding stale
-/// partition assignments from previous runs routing queries to dead executors.
-fn make_named_scheduler_config(test_name: &str) -> SchedulerConfig {
-    make_named_scheduler_config_with_max_partitions_per_executor(test_name, 10)
+/// We run a single in-process RustFS server for the whole test process and give each
+/// test its own bucket for isolation.
+async fn make_named_scheduler_config(test_name: &str) -> Result<SchedulerConfig, anyhow::Error> {
+    make_named_scheduler_config_with_max_partitions_per_executor(test_name, 10).await
 }
 
-fn make_named_scheduler_config_with_max_partitions_per_executor(
+async fn make_named_scheduler_config_with_max_partitions_per_executor(
     test_name: &str,
     max_partitions_per_executor: usize,
-) -> SchedulerConfig {
+) -> Result<SchedulerConfig, anyhow::Error> {
     let run_id = uuid::Uuid::new_v4();
-    SchedulerConfig {
+    let rustfs_bucket = create_scheduler_state_bucket(test_name).await?;
+
+    Ok(SchedulerConfig {
         state_location: format!(
-            "s3://spiceai-integration-tests/cluster-state/{test_name}/{run_id}/"
+            "s3://{}/cluster-state/{test_name}/{run_id}/",
+            rustfs_bucket.bucket
         ),
         params: Some(spicepod::param::Params::from_string_map(
             std::collections::HashMap::from([
-                ("s3_region".to_string(), "us-east-1".to_string()),
-                (
-                    "s3_key".to_string(),
-                    "${env:AWS_S3_VECTORS_KEY}".to_string(),
-                ),
-                (
-                    "s3_secret".to_string(),
-                    "${env:AWS_S3_VECTORS_SECRET}".to_string(),
-                ),
+                ("s3_region".to_string(), RUSTFS_REGION.to_string()),
+                ("s3_endpoint".to_string(), rustfs_bucket.endpoint),
+                ("s3_key".to_string(), RUSTFS_ACCESS_KEY.to_string()),
+                ("s3_secret".to_string(), RUSTFS_SECRET_KEY.to_string()),
                 ("s3_auth".to_string(), "key".to_string()),
+                ("allow_http".to_string(), "true".to_string()),
             ]),
         )),
         partition_management: Some(PartitionManagement {
@@ -941,5 +922,103 @@ fn make_named_scheduler_config_with_max_partitions_per_executor(
             interval: "1s".to_string(),
             ..Default::default()
         }),
+    })
+}
+
+async fn rustfs_server_context() -> Result<Arc<RustfsServerContext>, anyhow::Error> {
+    let server = RUSTFS_SERVER
+        .get_or_try_init(|| async {
+            let port = find_available_port()
+                .map_err(|e| anyhow::anyhow!("failed to allocate RustFS port: {e}"))?;
+
+            let server = RustFSServerBuilder::new()
+                .address(format!("127.0.0.1:{port}"))
+                .access_key(RUSTFS_ACCESS_KEY)
+                .secret_key(RUSTFS_SECRET_KEY)
+                .region(RUSTFS_REGION)
+                .build()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to start embedded RustFS server: {e}"))?;
+
+            Ok(Arc::new(RustfsServerContext {
+                endpoint: server.endpoint(),
+                server,
+            }))
+        })
+        .await?;
+
+    Ok(Arc::clone(server))
+}
+
+async fn create_scheduler_state_bucket(
+    test_name: &str,
+) -> Result<RustfsBucketContext, anyhow::Error> {
+    let rustfs_server = rustfs_server_context().await?;
+
+    let bucket = format!(
+        "spice-cluster-{}-{}",
+        sanitize_bucket_component(test_name),
+        uuid::Uuid::new_v4().simple()
+    );
+
+    aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::Config::builder()
+            .credentials_provider(Credentials::new(
+                RUSTFS_ACCESS_KEY,
+                RUSTFS_SECRET_KEY,
+                None,
+                None,
+                "embedded-rustfs",
+            ))
+            .region(Region::new(RUSTFS_REGION.to_string()))
+            .endpoint_url(rustfs_server.endpoint.clone())
+            .force_path_style(true)
+            .behavior_version_latest()
+            .build(),
+    )
+    .create_bucket()
+    .bucket(&bucket)
+    .send()
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to create RustFS bucket {bucket}: {e}"))?;
+
+    Ok(RustfsBucketContext {
+        bucket,
+        endpoint: rustfs_server.endpoint.clone(),
+    })
+}
+
+fn sanitize_bucket_component(input: &str) -> String {
+    let mut component: String = input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
+                c
+            } else if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    while component.contains("--") {
+        component = component.replace("--", "-");
     }
+
+    component = component.trim_matches('-').to_string();
+
+    if component.is_empty() {
+        component = "cluster".to_string();
+    }
+
+    if component.len() > 20 {
+        component.truncate(20);
+        component = component.trim_matches('-').to_string();
+        if component.is_empty() {
+            component = "cluster".to_string();
+        }
+    }
+
+    component
 }
