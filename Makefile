@@ -44,6 +44,14 @@ build-spidapter-dev:
 build-spidapter:
 	cargo build --release -p spidapter --all-features
 
+.PHONY: build-cayenne-flightsql-dev
+build-cayenne-flightsql-dev:
+	cargo build -p cayenne-flightsql --all-features
+
+.PHONY: build-cayenne-flightsql
+build-cayenne-flightsql:
+	cargo build --release -p cayenne-flightsql --all-features
+
 .PHONY: ci
 ci:
 	make -C bin/spice
@@ -335,6 +343,16 @@ install-spidapter-dev: build-spidapter-dev
 install-spidapter: build-spidapter
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spidapter ~/.spice/bin/spidapter
+
+.PHONY: install-cayenne-flightsql-dev
+install-cayenne-flightsql-dev: build-cayenne-flightsql-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/debug/cayenne-flightsql ~/.spice/bin/cayenne-flightsql
+
+.PHONY: install-cayenne-flightsql
+install-cayenne-flightsql: build-cayenne-flightsql
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/cayenne-flightsql ~/.spice/bin/cayenne-flightsql
 
 .PHONY: install-cli
 install-cli: build-cli
