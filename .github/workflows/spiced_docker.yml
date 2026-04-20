@@ -3,6 +3,13 @@ name: spiced_docker
 on:
   release:
     types:
+      # 'published' fires when a release (including a pre-release / RC) is
+      # first published, so RC tags still get pushed to DockerHub / GHCR even
+      # though they aren't marked as "latest" on GitHub.
+      - published
+      # 'edited' fires when an existing release is edited — we use this to
+      # re-run the workflow when a release is flipped to 'latest' so the
+      # :latest tag can be updated without re-publishing all images.
       - edited
   workflow_dispatch:
     inputs:
@@ -37,7 +44,14 @@ on:
 
 jobs:
   setup:
-    if: ${{ github.event_name != 'release' || (github.event.action == 'edited' && github.event.changes.make_latest && github.event.changes.make_latest.to == 'true') }}
+    # Run on:
+    #   - workflow_dispatch (manual runs)
+    #   - release 'published' (new releases, including pre-releases / RCs — the
+    #     resolve step auto-detects rc/beta/alpha versions and omits the
+    #     'latest' tag but still publishes version-tagged images)
+    #   - release 'edited' only when the release is flipped to 'latest', so the
+    #     ':latest' tag can be moved without re-publishing on every edit
+    if: ${{ github.event_name != 'release' || github.event.action == 'published' || (github.event.action == 'edited' && github.event.changes.make_latest && github.event.changes.make_latest.to == 'true') }}
     runs-on: ubuntu-22.04
     outputs:
       rel_version: ${{ steps.resolve.outputs.rel_version }}
