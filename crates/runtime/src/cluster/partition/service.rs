@@ -265,7 +265,7 @@ impl PartitionService {
             return Ok(());
         }
 
-        self.assign_pending(&[table.clone()], &executors, df, AssignmentLimit::Unlimited)
+        self.assign_pending(std::slice::from_ref(table), &executors, df, AssignmentLimit::Unlimited)
             .await
     }
 
