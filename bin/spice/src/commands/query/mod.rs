@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use tokio::select;
 use tokio::sync::mpsc;
 /// Default poll interval for checking query status.
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Spinner frames for the progress indicator.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
