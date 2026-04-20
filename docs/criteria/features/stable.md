@@ -31,6 +31,7 @@ All criteria must be met for the feature to be considered Stable, with exception
 
 - [ ] All RC documentation criteria continue to pass
 - [ ] Feature is marked as "Stable" in all public-facing documentation
+- [ ] The feature has a Deployment Guide in [spiceai/docs](https://github.com/spiceai/docs) covering production deployment topology, configuration, sizing, and operational considerations (e.g. [Databricks Deployment Guide](https://spiceai.org/docs/next/components/data-connectors/databricks/deployment))
 
 ### Operational Readiness
 

@@ -1,0 +1,11 @@
+---
+source: crates/runtime/tests/postgres/replication_tpch.rs
+expression: pretty
+---
++-------------+---------+
+| r_regionkey | r_name  |
++-------------+---------+
+| 0           | AFRICA  |
+| 1           | AMERICA |
+| 2           | ASIA    |
++-------------+---------+

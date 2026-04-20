@@ -409,8 +409,11 @@ pub enum Error {
     ))]
     UnsupportedAccelerationEngineForSnapshots,
 
-    #[snafu(display("Pre-refresh partition discovery failed for table '{table_name}': {reason}"))]
-    PreRefreshPartitionDiscoveryFailed { table_name: String, reason: String },
+    #[snafu(display("Pre-refresh partition discovery failed for table '{table_name}': {source}"))]
+    PreRefreshPartitionDiscoveryFailed {
+        table_name: String,
+        source: Box<crate::cluster::partition::service::Error>,
+    },
 }
 
 /// Validates that the acceleration engine is supported in distributed mode.
@@ -1677,7 +1680,25 @@ impl DataFusion {
 
         accelerated_table_builder.refresh_on_startup(acceleration_settings.refresh_on_startup);
 
-        accelerated_table_builder.ready_state(dataset.ready_state);
+        // If the source is deferred (e.g. a Databricks U2M connector that hasn't been triggered
+        // yet), the `FederatedTable` holds only a placeholder schema/provider — not a real
+        // access-verified source. In that case, force `OnLoad` so the dataset isn't marked ready
+        // with a fake schema. Once the deferred connector is triggered, the source will be
+        // re-initialized with a real provider.
+        let effective_ready_state = if source.as_any().is::<DeferredConnector>() {
+            if dataset.ready_state != ReadyState::OnLoad {
+                tracing::warn!(
+                    "Dataset {dataset_name}: configured ready_state '{configured}' is overridden to '{forced}' because the source connector is deferred (e.g. awaiting interactive auth); the dataset will be marked ready only after the initial load completes.",
+                    dataset_name = dataset.name,
+                    configured = dataset.ready_state,
+                    forced = ReadyState::OnLoad,
+                );
+            }
+            ReadyState::OnLoad
+        } else {
+            dataset.ready_state
+        };
+        accelerated_table_builder.ready_state(effective_ready_state);
 
         accelerated_table_builder.caching(Some(Arc::clone(&self.caching)));
 
@@ -2128,11 +2149,11 @@ impl DataFusion {
         // runs on a 30-second interval) might not have discovered new partitions yet,
         // causing executors to drop data from unassigned partitions. (fixes #10075)
         partition_service
-            .discover_and_assign_for_table(dataset_name, self.as_ref())
+            .reconcile_table(dataset_name, self.as_ref())
             .await
-            .map_err(|e| Error::PreRefreshPartitionDiscoveryFailed {
+            .map_err(|source| Error::PreRefreshPartitionDiscoveryFailed {
                 table_name: dataset_name.to_string(),
-                reason: e.to_string(),
+                source: Box::new(source),
             })?;
 
         let executor_registry = &partition_service.executor_registry;
@@ -2604,7 +2625,12 @@ impl DataFusion {
             .insert(view.name.clone());
 
         // if initial load completed, mark view as ready; otherwise, ready status will be updated by acceleration
-        if initial_load_complete || view.ready_state == ReadyState::OnRegistration {
+        if initial_load_complete
+            || matches!(
+                view.ready_state,
+                ReadyState::OnRegistration | ReadyState::OnSchemaResolved
+            )
+        {
             self.runtime_status
                 .update_view(&view.name, status::ComponentStatus::Ready);
         }
@@ -2881,7 +2907,7 @@ impl runtime_cluster::context::PartitionDiscoverer for DataFusion {
         partition_by: &[spicepod::partitioning::PartitionedBy],
     ) -> Result<Vec<runtime_cluster::PartitionValue>, Box<dyn std::error::Error + Send + Sync>>
     {
-        crate::cluster::partition::discovery::table_partition_values(table, partition_by, self)
+        crate::cluster::partition::discovery::query_source_partitions(table, partition_by, self)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }

@@ -14,10 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use app::{App, spicepod::component::runtime::Scheduler as SchedulerConfig};
 
@@ -34,11 +31,11 @@ use spicepod::partitioning::PartitionedBy;
 use tokio::{runtime::Handle, sync::RwLock};
 use tonic::transport::Channel;
 
-use super::{PartitionStore, Result};
+use super::Result;
 use crate::{
     cluster::partition::{
         MissingPartitionKeysSnafu, ObjectStoreBuildSnafu, PartitionAllocationRequestSnafu,
-        PartitionExpressionDeserializationSnafu, discovery,
+        PartitionExpressionDeserializationSnafu, service::PartitionService,
     },
     datafusion::DataFusion,
 };
@@ -67,16 +64,18 @@ pub async fn build_partition_metadata_store(
 
 /// Initialize acceleration partition metadata for all accelerated tables on scheduler startup.
 ///
-/// 1. Find all tables needing accelerated partitions
-/// 2. For each table without partition metadata:
-///    - Discover all required partitions from source
-///    - Update with all partitions marked as unassigned
+/// Delegates to [`PartitionService::seed_table`] per table, which runs the
+/// standard source-vs-store diff and writes new partitions as unassigned
+/// (no assignment, no executor notification — executors typically haven't
+/// connected yet at this point in startup).
+///
+/// Failures are logged per-table and do not abort the loop.
 pub async fn initialize_partition_metadata(
-    df: Arc<DataFusion>,
-    app: Arc<App>,
-    partition_store: &PartitionStore,
+    partition_service: &PartitionService,
+    df: &Arc<DataFusion>,
+    app: &Arc<App>,
 ) -> Result<()> {
-    let tables = accelerated_tables(&app);
+    let tables = accelerated_tables(app);
 
     if tables.is_empty() {
         tracing::debug!("No accelerated tables with partitioning configured");
@@ -88,61 +87,16 @@ pub async fn initialize_partition_metadata(
         "Initializing partition metadata for accelerated tables"
     );
 
-    // Get existing tables from partition manager
-    let existing_tables: HashSet<String> = partition_store
-        .list_tables()
-        .await
-        .map_err(|e| super::Error::PartitionMetadataInit {
-            table: "<list>".to_string(),
-            source: Box::new(e),
-        })?
-        .into_iter()
-        .collect();
-
     for (table, partitioning) in tables {
-        let table_name = runtime_cluster::metadata::normalized_table_name(&table);
-
-        if existing_tables.contains(&table_name) {
-            tracing::debug!(
-                table = %table_name,
-                "Partition metadata already exists, skipping initialization"
-            );
-            continue;
-        }
-
-        let partition_values =
-            match discovery::table_partition_values(&table, &partitioning, &df).await {
-                Ok(values) => values,
-                Err(e) => {
-                    tracing::warn!(
-                        table = %table_name,
-                        error = %e,
-                        "Failed to discover partition values, leaving blank metadata"
-                    );
-                    continue;
-                }
-            };
-
-        let partition_expressions: Vec<String> =
-            partitioning.iter().map(|p| p.expression.clone()).collect();
-
-        match partition_store
-            .set_unassigned_partitions(&table, partition_values, partition_expressions)
+        if let Err(e) = partition_service
+            .seed_table(&table, &partitioning, df.as_ref())
             .await
         {
-            Ok(()) => {
-                tracing::info!(
-                    table = %table_name,
-                    "Initialized partition metadata"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    table = %table_name,
-                    error = %e,
-                    "Failed to set unassigned partitions"
-                );
-            }
+            tracing::warn!(
+                table = %table,
+                error = %e,
+                "Failed to initialize partition metadata"
+            );
         }
     }
 

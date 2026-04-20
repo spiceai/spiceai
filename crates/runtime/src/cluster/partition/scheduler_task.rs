@@ -14,6 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Periodic partition-management background task.
+//!
+//! Core partition-management logic lives in
+//! [`crate::cluster::partition::service::PartitionService`]; this file only
+//! contains the timer-driven driver that invokes the service on an interval
+//! and reports status.
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -143,7 +150,7 @@ impl PartitionManagementTask {
     }
 
     /// Underlying logic for a single management cycle.
-    /// Delegates to [`super::service::PartitionService::discover_and_assign_all`].
+    /// Delegates to [`super::service::PartitionService::reconcile_all`].
     async fn run_management_cycle(&self) -> Result<()> {
         let Some(service) = &self.df.partition_service else {
             tracing::warn!("Partition service not initialized, skipping management cycle");
@@ -151,15 +158,16 @@ impl PartitionManagementTask {
         };
 
         service
-            .discover_and_assign_all_tables(self.df.as_ref())
+            .reconcile_all(self.df.as_ref())
             .await
             .map_err(|e| Error::AssignmentCycle { source: e })
     }
 
     /// Seed partition metadata for all accelerated tables that don't have metadata yet.
     ///
-    /// This delegates to [`super::initialize_partition_metadata`] which discovers partition
-    /// values from the federated source and writes them as unassigned in the object store.
+    /// Delegates to [`super::initialize_partition_metadata`], which loops over
+    /// `app.datasets` + `app.views` and calls
+    /// [`super::service::PartitionService::seed_table`] per table.
     async fn initialize_metadata(&self) -> std::result::Result<(), super::Error> {
         let Some(service) = &self.df.partition_service else {
             tracing::debug!("Partition service not initialized, skipping metadata seeding");
@@ -171,9 +179,6 @@ impl PartitionManagementTask {
             return Ok(());
         };
 
-        super::initialize_partition_metadata(Arc::clone(&self.df), app, &service.partition_store)
-            .await
+        super::initialize_partition_metadata(service, &self.df, &app).await
     }
 }
-
-// Partition management logic lives in `super::service::PartitionService`.

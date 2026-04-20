@@ -175,6 +175,7 @@ impl ClusterHarness {
     ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         loop {
+            sleep(Duration::from_millis(200)).await;
             let count = self
                 .executor_manager
                 .get_executor_state()
@@ -199,7 +200,6 @@ impl ClusterHarness {
                     "Timed out waiting for {expected} executors; found {count}"
                 )));
             }
-            sleep(Duration::from_millis(200)).await;
         }
     }
 
