@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -55,7 +55,11 @@ limitations under the License.
 //! - `max_depth` (UInt, default 32) — walk stops past this depth.
 //! - `max_rows` (UInt, default 100_000) — per-document row cap.
 //! - `max_bytes` (UInt, default 8_388_608) — input size limit.
-//! - `dialect` (Utf8, `"json-schema"` | `"openapi"`, default `"json-schema"`).
+//! - `dialect` (Utf8, `"json-schema"` | `"openapi"`, default `"json-schema"`) —
+//!   tags invocation metrics so operators can split `openapi` traffic from
+//!   `json-schema` traffic. The walker does not currently vary its behavior
+//!   based on dialect; OpenAPI-specific handling (e.g. `nullable: true`) is
+//!   future scope tracked with the rest of this UDTF.
 //! - `include_internal` (Bool, default `false`) — include container rows.
 //! - `path_style` (Utf8, `"dot"` | `"json-pointer"`, default `"dot"`).
 //!
@@ -76,6 +80,7 @@ use arrow::array::{
     as_string_array,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use arrow::compute::kernels::cast::cast;
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -84,7 +89,7 @@ use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::TableType;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
@@ -178,6 +183,10 @@ pub struct PropertyRow {
     pub metadata: Option<String>,
 }
 
+/// Dialect tag carried through options. Currently only affects the metric
+/// label on `flatten_json_properties_invocations_total`; walker behavior does
+/// not yet diverge. Retained so callers (and metrics) can distinguish traffic
+/// when dialect-specific behavior lands later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     JsonSchema,
@@ -372,48 +381,42 @@ impl<'a> Walker<'a> {
             }
         }
 
+        // Recurse once on the original `spec`; `walk_schema` re-expands
+        // effective branches internally with a single `seen_names` set, so
+        // overlapping `properties` across allOf/oneOf/anyOf / $ref branches
+        // are de-duplicated rather than emitted once per branch.
         match type_name.as_str() {
             "object" => {
-                for eff in &effective_specs {
-                    if eff.get("properties").is_some() {
-                        self.walk_schema(eff, &path, depth + 1);
-                        if self.row_cap_hit {
-                            return;
-                        }
-                    }
-                }
+                self.walk_schema(spec, &path, depth + 1);
             }
             "array" => {
-                for eff in &effective_specs {
-                    if let Some(items) = eff.get("items") {
-                        if items.is_object() {
-                            // Items may itself be typed / composite; reuse
-                            // walk_schema at the same path so leaves appear as
-                            // `array.child` rather than `array[].child`.
-                            self.walk_schema(items, &path, depth + 1);
-                            if self.row_cap_hit {
-                                return;
-                            }
-                        }
-                    }
+                // Items may itself be typed / composite; reuse walk_schema at
+                // the same path so leaves appear as `array.child` rather than
+                // `array[].child`. Look across effective branches so `items`
+                // declared under a combinator is still found, but use the
+                // first matching `items` as the single recursion point.
+                if let Some(items) = effective_specs
+                    .iter()
+                    .find_map(|s| s.get("items"))
+                    .filter(|v| v.is_object())
+                {
+                    self.walk_schema(items, &path, depth + 1);
                 }
             }
             "map" => {
-                for eff in &effective_specs {
-                    if let Some(ap) = eff.get("additionalProperties") {
-                        if ap.is_object() {
-                            self.walk_schema(ap, &path, depth + 1);
-                            if self.row_cap_hit {
-                                return;
-                            }
-                        }
-                    }
+                if let Some(ap) = effective_specs
+                    .iter()
+                    .find_map(|s| s.get("additionalProperties"))
+                    .filter(|v| v.is_object())
+                {
+                    self.walk_schema(ap, &path, depth + 1);
                 }
             }
             _ => {}
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_row(
         &mut self,
         raw_spec: &'a Value,
@@ -472,14 +475,26 @@ impl<'a> Walker<'a> {
     /// can still read shape metadata from them.
     fn effective_schemas(&mut self, schema: &'a Value) -> Vec<&'a Value> {
         let mut out = Vec::new();
-        self.collect_effective(schema, &mut out);
+        self.collect_effective(schema, &mut out, 0);
         if out.is_empty() {
             out.push(schema);
         }
         out
     }
 
-    fn collect_effective(&mut self, schema: &'a Value, out: &mut Vec<&'a Value>) {
+    /// `ref_depth` tracks how deep we've recursed through `$ref` and
+    /// `allOf`/`oneOf`/`anyOf` expansion at a single schema node. Capped at
+    /// `opts.max_depth` so pathological combinator / ref chains can't blow the
+    /// stack or iterate unboundedly (DoS).
+    fn collect_effective(&mut self, schema: &'a Value, out: &mut Vec<&'a Value>, ref_depth: usize) {
+        if ref_depth > self.opts.max_depth {
+            if !self.depth_cap_hit {
+                self.depth_cap_hit = true;
+                record_error("depth_exceeded");
+            }
+            out.push(schema);
+            return;
+        }
         if let Some(ref_str) = schema.get("$ref").and_then(Value::as_str) {
             if is_local_ref(ref_str) {
                 if self.visited_refs.contains(ref_str) {
@@ -491,7 +506,7 @@ impl<'a> Walker<'a> {
                 let root: &'a Value = self.root;
                 if let Some(target) = root.pointer(ref_str.trim_start_matches('#')) {
                     self.visited_refs.insert(ref_str.to_owned());
-                    self.collect_effective(target, out);
+                    self.collect_effective(target, out, ref_depth + 1);
                     self.visited_refs.remove(ref_str);
                     return;
                 }
@@ -508,7 +523,7 @@ impl<'a> Walker<'a> {
         for comb in ["allOf", "oneOf", "anyOf"] {
             if let Some(arr) = schema.get(comb).and_then(Value::as_array) {
                 for entry in arr {
-                    self.collect_effective(entry, out);
+                    self.collect_effective(entry, out, ref_depth + 1);
                 }
             }
         }
@@ -548,16 +563,19 @@ fn is_local_ref(ref_str: &str) -> bool {
 /// Classify a schema node into one of the emitted type labels.
 fn compute_type(spec: &Value) -> String {
     // External $ref → "ref"
-    if let Some(ref_str) = spec.get("$ref").and_then(Value::as_str) {
-        if !is_local_ref(ref_str) {
-            return "ref".to_owned();
-        }
+    if let Some(ref_str) = spec.get("$ref").and_then(Value::as_str)
+        && !is_local_ref(ref_str)
+    {
+        return "ref".to_owned();
     }
     // Explicit additionalProperties without own properties → map.
     let has_ap = spec
         .get("additionalProperties")
         .is_some_and(Value::is_object);
-    let has_props = spec.get("properties").is_some();
+    // Require `properties` / `items` to be well-formed before treating the node
+    // as an object/array. A non-object `properties` or a non-object/array
+    // `items` shouldn't silently flip the type.
+    let has_props = spec.get("properties").is_some_and(Value::is_object);
     if has_ap && !has_props {
         return "map".to_owned();
     }
@@ -571,7 +589,10 @@ fn compute_type(spec: &Value) -> String {
         _ => {
             if has_props {
                 "object".to_owned()
-            } else if spec.get("items").is_some() {
+            } else if spec
+                .get("items")
+                .is_some_and(|v| v.is_object() || v.is_array())
+            {
                 "array".to_owned()
             } else if let Some(first_enum) = spec
                 .get("enum")
@@ -695,10 +716,10 @@ fn literal_string(expr: &Expr) -> Result<Option<String>, String> {
 /// Recognise a `name => value` named-argument expression. DataFusion surfaces
 /// these as a literal tagged with `spice.parameter_name` metadata.
 fn named_arg(expr: &Expr) -> Option<(String, &ScalarValue)> {
-    if let Expr::Literal(scalar, Some(meta)) = expr {
-        if let Some(name) = meta.inner().get("spice.parameter_name") {
-            return Some((name.to_string(), scalar));
-        }
+    if let Expr::Literal(scalar, Some(meta)) = expr
+        && let Some(name) = meta.inner().get("spice.parameter_name")
+    {
+        return Some((name.to_string(), scalar));
     }
     None
 }
@@ -802,6 +823,10 @@ impl TableProvider for FlattenJsonPropertiesTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Single-node only: a bare `DataSourceExec(MemorySourceConfig)` is
+        // rejected by `EnsureSupportedFileScan` in cluster mode. Distributed
+        // support requires a dedicated `UdtfArgs` proto variant + codec so
+        // remote executors can re-invoke the walker; that's follow-up scope.
         let batch = rows_to_batch(&self.rows, Arc::clone(&self.schema))?;
         let src = MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&self.schema), None)?;
         Ok(Arc::new(DataSourceExec::new(Arc::new(src))))
@@ -887,7 +912,14 @@ impl FlattenJsonPropertiesScalar {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            signature: Signature::variadic_any(Volatility::Immutable),
+            signature: Signature::one_of(
+                vec![
+                    TypeSignature::Exact(vec![DataType::Utf8]),
+                    TypeSignature::Exact(vec![DataType::LargeUtf8]),
+                    TypeSignature::Exact(vec![DataType::Utf8View]),
+                ],
+                Volatility::Immutable,
+            ),
         }
     }
 }
@@ -939,7 +971,14 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
         let opts = FlattenOptions::default();
 
         let array = input_col.into_array(args.number_rows)?;
-        let strings = as_string_array(&array);
+        // Signature restricts input to Utf8/LargeUtf8/Utf8View; normalize to
+        // Utf8 so `as_string_array` below always succeeds.
+        let normalized = if matches!(array.data_type(), DataType::Utf8) {
+            array
+        } else {
+            cast(&array, &DataType::Utf8).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+        };
+        let strings = as_string_array(&normalized);
 
         // Collect all rows into a single flat vec, with offsets delineating
         // which span belongs to which input row. NULL inputs produce empty

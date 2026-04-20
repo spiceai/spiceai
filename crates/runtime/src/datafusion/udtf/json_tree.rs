@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -46,6 +46,7 @@ use arrow::array::{
     Array, ArrayRef, Int64Builder, ListArray, StringBuilder, StructArray, as_string_array,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use arrow::compute::kernels::cast::cast;
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::arrow::record_batch::RecordBatch;
@@ -54,7 +55,7 @@ use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::TableType;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
@@ -349,20 +350,20 @@ fn parse_udtf_args(exprs: &[Expr]) -> DataFusionResult<(Option<String>, JsonTree
 
     let mut opts = JsonTreeOptions::default();
     for arg in iter {
-        if let Expr::Literal(scalar, Some(meta)) = arg {
-            if let Some(name) = meta.inner().get("spice.parameter_name") {
-                let name = name.to_string();
-                match name.as_str() {
-                    "max_depth" => opts.max_depth = parse_usize(&name, scalar)?,
-                    "max_bytes" => opts.max_bytes = parse_usize(&name, scalar)?,
-                    other => {
-                        return Err(DataFusionError::Plan(format!(
-                            "Unknown option '{other}'. Supported: max_depth, max_bytes."
-                        )));
-                    }
+        if let Expr::Literal(scalar, Some(meta)) = arg
+            && let Some(name) = meta.inner().get("spice.parameter_name")
+        {
+            let name = name.to_string();
+            match name.as_str() {
+                "max_depth" => opts.max_depth = parse_usize(&name, scalar)?,
+                "max_bytes" => opts.max_bytes = parse_usize(&name, scalar)?,
+                other => {
+                    return Err(DataFusionError::Plan(format!(
+                        "Unknown option '{other}'. Supported: max_depth, max_bytes."
+                    )));
                 }
-                continue;
             }
+            continue;
         }
         return Err(DataFusionError::Plan(format!(
             "Arguments after the JSON string must be named, e.g. `max_depth => 64`. Got: {arg:?}."
@@ -420,6 +421,10 @@ impl TableProvider for JsonTreeTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Single-node only: a bare `DataSourceExec(MemorySourceConfig)` is
+        // rejected by `EnsureSupportedFileScan` in cluster mode. Distributed
+        // support requires a dedicated `UdtfArgs` proto variant + codec so
+        // remote executors can re-invoke the walker; that's follow-up scope.
         let batch = rows_to_batch(&self.rows, Arc::clone(&self.schema))?;
         let src = MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&self.schema), None)?;
         Ok(Arc::new(DataSourceExec::new(Arc::new(src))))
@@ -493,7 +498,14 @@ impl JsonTreeScalar {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            signature: Signature::variadic_any(Volatility::Immutable),
+            signature: Signature::one_of(
+                vec![
+                    TypeSignature::Exact(vec![DataType::Utf8]),
+                    TypeSignature::Exact(vec![DataType::LargeUtf8]),
+                    TypeSignature::Exact(vec![DataType::Utf8View]),
+                ],
+                Volatility::Immutable,
+            ),
         }
     }
 }
@@ -538,7 +550,15 @@ impl ScalarUDFImpl for JsonTreeScalar {
 
         let opts = JsonTreeOptions::default();
         let array = input_col.into_array(args.number_rows)?;
-        let strings = as_string_array(&array);
+        // Signature restricts input to Utf8/LargeUtf8/Utf8View; normalize to
+        // Utf8 so `as_string_array` below always succeeds.
+        let normalized = if matches!(array.data_type(), DataType::Utf8) {
+            array
+        } else {
+            cast(&array, &DataType::Utf8)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+        };
+        let strings = as_string_array(&normalized);
 
         let mut all_rows: Vec<TreeRow> = Vec::new();
         let mut offsets: Vec<i32> = Vec::with_capacity(strings.len() + 1);
