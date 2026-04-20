@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Azure Cosmos DB (NoSQL) connector integration tests.
+//! Azure Cosmos DB (`NoSQL`) connector integration tests.
 //!
 //! Tests that touch a live Cosmos account are marked `#[ignore]` and run with
 //! `cargo test --features cosmosdb -- --ignored cosmosdb_live`. They read
