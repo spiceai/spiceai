@@ -298,6 +298,8 @@ impl DataFusionBuilder {
         let mut state = SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
+            // Replace the default analyzer rules with an empty set so we can add our own predefined list later (see `AnalyzerRulesBuilder`).
+            .with_analyzer_rules(vec![])
             .with_query_planner(Arc::new(
                 ExtensionPlanQueryPlanner::from_extension_planners(default_extension_planners(
                     self.executor_registry.clone(),
@@ -679,6 +681,11 @@ pub(crate) fn default_extension_planners(
 mod tests {
     use datafusion::optimizer::Analyzer;
 
+    use super::DataFusionBuilder;
+    use crate::dataaccelerator::AcceleratorEngineRegistry;
+    use crate::status;
+    use std::sync::Arc;
+
     /// Verifies that the default analyzer rules are in the expected order.
     ///
     /// If this test fails, `DataFusion` has modified the default analyzer rules and `AnalyzerRulesBuilder::build()` should be updated.
@@ -698,5 +705,42 @@ mod tests {
                 "Default analyzer rule order has changed"
             );
         }
+    }
+
+    /// Builds a full `DataFusion` instance and verifies the analyzer rules on
+    /// the resulting `SessionContext` have the correct ordering.
+    ///
+    /// Skipped on Windows because the Cayenne DDL analyzer rule is not registered
+    /// there, resulting in a different rule list.
+    #[test]
+    #[cfg(not(windows))]
+    fn test_built_datafusion_analyzer_rule_ordering() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .build();
+
+        let state = df.ctx.state();
+        let rule_names: Vec<&str> = state.analyzer().rules.iter().map(|r| r.name()).collect();
+
+        assert_eq!(
+            rule_names,
+            vec![
+                "spice_ddl_rewrite",
+                "federation_optimizer_rule",
+                "resolve_grouping_function",
+                "type_coercion",
+                "spice_ddl_rewrite",
+            ],
+            "Analyzer rule list or ordering has changed"
+        );
     }
 }

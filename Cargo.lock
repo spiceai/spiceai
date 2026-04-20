@@ -4002,6 +4002,7 @@ dependencies = [
  "token_provider",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
