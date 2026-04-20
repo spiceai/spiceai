@@ -546,6 +546,47 @@ fn decompose_generic_list<O: OffsetSizeTrait>(
     max_elements_per_row: usize,
 ) -> DecomposedListOfStrings {
     let values = list.values();
+    let offsets = list.value_offsets();
+    let values_any = values.as_any();
+
+    if let Some(arr) = values_any.downcast_ref::<StringArray>() {
+        build_rows(list, offsets, max_elements_per_row, |j| {
+            if arr.is_null(j) {
+                None
+            } else {
+                let v = arr.value(j);
+                if v.is_empty() { None } else { Some(v.to_string()) }
+            }
+        })
+    } else if let Some(arr) = values_any.downcast_ref::<LargeStringArray>() {
+        build_rows(list, offsets, max_elements_per_row, |j| {
+            if arr.is_null(j) {
+                None
+            } else {
+                let v = arr.value(j);
+                if v.is_empty() { None } else { Some(v.to_string()) }
+            }
+        })
+    } else if let Some(arr) = values_any.downcast_ref::<StringViewArray>() {
+        build_rows(list, offsets, max_elements_per_row, |j| {
+            if arr.is_null(j) {
+                None
+            } else {
+                let v = arr.value(j);
+                if v.is_empty() { None } else { Some(v.to_string()) }
+            }
+        })
+    } else {
+        build_rows(list, offsets, max_elements_per_row, |_| None)
+    }
+}
+
+fn build_rows<O: OffsetSizeTrait>(
+    list: &GenericListArray<O>,
+    offsets: &[O],
+    max_elements_per_row: usize,
+    get_str: impl Fn(usize) -> Option<String>,
+) -> DecomposedListOfStrings {
     let mut rows = Vec::with_capacity(list.len());
     let mut any_truncated = false;
 
@@ -554,7 +595,6 @@ fn decompose_generic_list<O: OffsetSizeTrait>(
             rows.push(None);
             continue;
         }
-        let offsets = list.value_offsets();
         let start = offsets[i].as_usize();
         let end = offsets[i + 1].as_usize();
         let raw_len = end.saturating_sub(start);
@@ -566,33 +606,7 @@ fn decompose_generic_list<O: OffsetSizeTrait>(
         };
         let mut row = Vec::with_capacity(effective_end - start);
         for j in start..effective_end {
-            let s: Option<String> = if values.is_null(j) {
-                None
-            } else if let Some(a) = values.as_any().downcast_ref::<StringArray>() {
-                let v = a.value(j);
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v.to_string())
-                }
-            } else if let Some(a) = values.as_any().downcast_ref::<LargeStringArray>() {
-                let v = a.value(j);
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v.to_string())
-                }
-            } else if let Some(a) = values.as_any().downcast_ref::<StringViewArray>() {
-                let v = a.value(j);
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v.to_string())
-                }
-            } else {
-                None
-            };
-            row.push(s);
+            row.push(get_str(j));
         }
         rows.push(Some(row));
     }
@@ -673,15 +687,24 @@ fn build_multi_vector_list_array(
         .into());
     }
 
+    let expected_dims = vector_length as usize;
     let mut embed_ptr: usize = 0;
     for validity in positions_validity {
         for &valid in validity {
             if valid {
-                inner_builder.values().append_slice(&embedded[embed_ptr]);
+                let vec = &embedded[embed_ptr];
+                if vec.len() != expected_dims {
+                    return Err(format!(
+                        "embedding vector length mismatch at index {embed_ptr}: expected {expected_dims} dimensions but got {}",
+                        vec.len()
+                    )
+                    .into());
+                }
+                inner_builder.values().append_slice(vec);
                 inner_builder.append(true);
                 embed_ptr += 1;
             } else {
-                inner_builder.values().append_nulls(vector_length as usize);
+                inner_builder.values().append_nulls(expected_dims);
                 inner_builder.append(false);
             }
         }

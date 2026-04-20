@@ -96,6 +96,12 @@ use tokio::sync::RwLock;
 
 pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
 
+/// Upper bound on the number of query strings accepted by `vector_search` when
+/// invoked in late-interaction (multi-query) mode. Each query produces its own
+/// subplan that is UNIONed together, so unbounded arrays can blow up the
+/// logical plan size and runtime work.
+const VECTOR_SEARCH_MAX_QUERIES: usize = 32;
+
 /// Creates a `UserDefined` signature that allows named parameters (like `rank_weight => X`)
 /// to pass through for RRF (Reciprocal Rank Fusion) operations.
 ///
@@ -258,7 +264,12 @@ impl VectorSearchTableFunc {
                     .collect(),
             ))
         } else {
-            Expr::Literal(ScalarValue::Utf8(Some(args.query.clone())), None)
+            let q = args
+                .queries
+                .first()
+                .cloned()
+                .unwrap_or_else(|| args.query.clone());
+            Expr::Literal(ScalarValue::Utf8(Some(q)), None)
         };
         let mut expr = vec![Expr::Column(to_column_expr(&args.tbl)), query_expr];
 
@@ -294,6 +305,12 @@ impl VectorSearchTableFunc {
                     return Err(DataFusionError::Plan(
                         "Multi-query array must contain at least one query string.".to_string(),
                     ));
+                }
+                if args.len() > VECTOR_SEARCH_MAX_QUERIES {
+                    return Err(DataFusionError::Plan(format!(
+                        "Multi-query array is limited to {VECTOR_SEARCH_MAX_QUERIES} query strings, got {}.",
+                        args.len()
+                    )));
                 }
                 let mut out = Vec::with_capacity(args.len());
                 for a in args {
