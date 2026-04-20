@@ -23,7 +23,7 @@ on:
         type: boolean
         default: false
       tag_latest:
-        description: Tag as 'latest' (auto = detect from version, skips rc/beta/alpha)
+        description: "Tag as 'latest' (auto = only if the GitHub release is marked 'latest')"
         required: false
         type: choice
         options:
@@ -151,7 +151,12 @@ jobs:
               ;;
           esac
 
-          # Determine if this release should be tagged as 'latest'
+          # Determine if this release should be tagged as 'latest'.
+          #
+          # Rule: ONLY apply the ':latest' Docker tag when the GitHub release
+          # itself is marked as the repository's "latest" release. We no
+          # longer infer this from the version string — RCs, stable releases
+          # published out-of-order, etc. all respect GitHub's latest flag.
           if [ "$event_name" = "workflow_dispatch" ]; then
             tag_latest_input="${{ github.event.inputs.tag_latest }}"
           else
@@ -160,13 +165,14 @@ jobs:
           fi
 
           if [ "$tag_latest_input" = "auto" ]; then
-            # Auto-detect: stable versions get 'latest', pre-releases don't
-            if [[ "${rel_version}" == *-rc* || "${rel_version}" == *-beta* || "${rel_version}" == *-alpha* ]]; then
-              should_tag_latest="false"
-              echo "Auto-detected pre-release version (${rel_version}), skipping 'latest' tag"
-            else
+            # Query GitHub for whether this tag is currently the 'latest' release.
+            is_latest=$(gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" --json isLatest -q .isLatest 2>/dev/null || echo "false")
+            if [ "$is_latest" = "true" ]; then
               should_tag_latest="true"
-              echo "Auto-detected stable version (${rel_version}), will tag as 'latest'"
+              echo "Release ${release_tag} is marked as 'latest' on GitHub, will tag as 'latest'"
+            else
+              should_tag_latest="false"
+              echo "Release ${release_tag} is not marked as 'latest' on GitHub, skipping 'latest' tag"
             fi
           elif [ "$tag_latest_input" = "true" ]; then
             should_tag_latest="true"
