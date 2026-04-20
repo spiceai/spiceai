@@ -155,10 +155,7 @@ impl std::error::Error for ResilienceError {
 /// Classify an SDK error as permanent (authn/authz/not-found) vs. transient.
 #[must_use]
 pub fn is_permanent_error(err: &azure_core::Error) -> bool {
-    matches!(
-        err.http_status().map(u16::from),
-        Some(401 | 403 | 404)
-    )
+    matches!(err.http_status().map(u16::from), Some(401 | 403 | 404))
 }
 
 /// Extract a `Retry-After` delay from an error's raw HTTP response headers,
