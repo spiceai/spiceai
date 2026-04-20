@@ -55,6 +55,16 @@ impl Dialect for DatabricksDialect {
         IntervalStyle::MySQL
     }
 
+    /// Databricks/Spark SQL uses STRING for UTF8 strings.
+    fn utf8_cast_dtype(&self) -> ast::DataType {
+        ast::DataType::String(None)
+    }
+
+    /// Databricks/Spark SQL uses STRING for large UTF8 strings.
+    fn large_utf8_cast_dtype(&self) -> ast::DataType {
+        ast::DataType::String(None)
+    }
+
     /// Override scalar functions to translate `DataFusion` functions to Spark SQL equivalents.
     fn scalar_function_to_sql_overrides(
         &self,
@@ -145,6 +155,30 @@ mod tests {
         let dialect = create_dialect();
         assert_eq!(dialect.identifier_quote_style("test"), Some('`'));
         assert_eq!(dialect.identifier_quote_style("column_name"), Some('`'));
+    }
+
+    #[test]
+    fn test_dialect_strings_overrides() -> datafusion::common::Result<()> {
+        let dialect = create_dialect();
+        let unparser = Unparser::new(&dialect);
+
+        // utf8_cast_dtype: STRING instead of VARCHAR
+        let expr = datafusion::logical_expr::cast(
+            datafusion::prelude::col("a"),
+            datafusion::arrow::datatypes::DataType::Utf8,
+        );
+        let actual = format!("{}", unparser.expr_to_sql(&expr)?);
+        assert_eq!(actual, "CAST(`a` AS STRING)");
+
+        // large_utf8_cast_dtype: STRING instead of TEXT
+        let expr = datafusion::logical_expr::cast(
+            datafusion::prelude::col("a"),
+            datafusion::arrow::datatypes::DataType::LargeUtf8,
+        );
+        let actual = format!("{}", unparser.expr_to_sql(&expr)?);
+        assert_eq!(actual, "CAST(`a` AS STRING)");
+
+        Ok(())
     }
 
     #[test]

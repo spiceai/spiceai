@@ -567,12 +567,15 @@ pub async fn run(args: Args) -> Result<()> {
             std::collections::HashMap::new()
         };
 
+        let metric_prefix = telemetry_config.get().and_then(|c| c.metric_prefix.clone());
+
         init_metrics(
             &rt.datafusion(),
             prometheus_registry.clone(),
             otel_config,
             resolved_otel_headers,
             metrics_reader,
+            metric_prefix,
         )
         .context(UnableToInitializeMetricsSnafu)?;
     }
@@ -718,10 +721,42 @@ fn init_metrics(
     otel_config: Option<&app::spicepod::component::runtime::OtelExporterConfig>,
     resolved_otel_headers: std::collections::HashMap<String, String>,
     metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
+    metric_prefix: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let resource = Resource::builder().build();
 
     let mut provider_builder = SdkMeterProvider::builder().with_resource(resource);
+
+    // Optional metric name prefix (e.g. "spiceai.") configured under
+    // `runtime.telemetry.metric_prefix`. Applied via an OTel View on the
+    // MeterProvider, so the rename happens once at the SDK layer and is
+    // observed by every reader attached below (Prometheus scrape, cluster
+    // on-demand OTLP, OTEL push). The prefix is intentionally placed at the
+    // telemetry level rather than under any single exporter because
+    // OpenTelemetry 0.31's SDK does not support per-reader name transforms.
+    if let Some(prefix) = metric_prefix.filter(|p| !p.is_empty()) {
+        tracing::info!(prefix = %prefix, "OTEL metrics name prefix enabled");
+        provider_builder = provider_builder.with_view(
+            move |instrument: &opentelemetry_sdk::metrics::Instrument| {
+                let new_name = format!("{prefix}{}", instrument.name());
+                match opentelemetry_sdk::metrics::Stream::builder()
+                    .with_name(new_name.clone())
+                    .build()
+                {
+                    Ok(stream) => Some(stream),
+                    Err(e) => {
+                        tracing::warn!(
+                            instrument = %instrument.name(),
+                            new_name = %new_name,
+                            error = %e,
+                            "Failed to apply OTEL metric prefix; instrument will keep its original name"
+                        );
+                        None
+                    }
+                }
+            },
+        );
+    }
 
     // Case 1: Prometheus scrape
     if let Some(registry) = registry {
