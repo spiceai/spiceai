@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#[cfg(feature = "elasticsearch")]
+pub mod elasticsearch;
 #[cfg(feature = "s3_vectors")]
 pub mod s3;
 pub mod table;
