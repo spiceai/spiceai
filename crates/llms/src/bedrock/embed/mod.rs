@@ -356,6 +356,7 @@ where
         let start = std::time::Instant::now();
 
         if texts.is_empty() {
+            tracing::debug!("Embedding input is empty, returning empty vector");
             return Ok(vec![]);
         }
 
