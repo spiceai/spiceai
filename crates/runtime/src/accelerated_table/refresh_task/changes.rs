@@ -189,11 +189,7 @@ impl RefreshTask {
                     had_change = true;
                 }
                 ChangeOperationType::Truncate => {
-                    let deletion_provider = get_deletion_provider(Arc::clone(&self.accelerator))
-                        .context(
-                            crate::accelerated_table::AcceleratedTableDoesntSupportDeleteSnafu,
-                        )?;
-                    self.process_truncate(&deletion_provider).await?;
+                    self.process_truncate().await?;
                     had_change = true;
                 }
                 ChangeOperationType::Unknown => {
@@ -282,30 +278,24 @@ impl RefreshTask {
         Ok(())
     }
 
-    async fn process_truncate(
-        &self,
-        deletion_provider: &Arc<dyn DeletionTableProvider>,
-    ) -> crate::accelerated_table::Result<()> {
+    async fn process_truncate(&self) -> crate::accelerated_table::Result<()> {
         let dataset_name = &self.dataset_name;
         tracing::info!("Processing TRUNCATE for {dataset_name}");
 
         let ctx = SessionContext::new();
         let session_state = ctx.state();
         let _lock_guard = self.accelerator_write_mutex.lock().await;
-        // Some DeletionTableProvider impls (notably DuckDB, see
-        // crates/data_components/src/duckdb.rs) treat an empty filter list as
+        // Some accelerator impls (notably DuckDB) treat an empty filter list as
         // a no-op to guard against accidental full-table deletes. To get
         // uniform "wipe the whole table" semantics we pass an always-true
         // literal, which is emitted as `DELETE FROM <table> WHERE TRUE` and
         // applied consistently across engines.
-        let delete_plan = DeletionTableProvider::delete_from(
-            deletion_provider.as_ref(),
-            &session_state,
-            &[lit(true)],
-        )
-        .await
-        .map_err(find_datafusion_root)
-        .context(crate::accelerated_table::FailedToWriteDataSnafu)?;
+        let delete_plan = self
+            .accelerator
+            .delete_from(&session_state, vec![lit(true)])
+            .await
+            .map_err(find_datafusion_root)
+            .context(crate::accelerated_table::AcceleratedTableDoesntSupportDeleteSnafu)?;
         collect(delete_plan, ctx.task_ctx())
             .await
             .map_err(find_datafusion_root)
