@@ -329,6 +329,13 @@ pub struct TelemetryConfig {
     pub enabled: bool,
     #[serde(default)]
     pub user_agent_collection: UserAgentCollection,
+    /// Custom key/value attributes attached to telemetry metrics emitted by
+    /// spiced. Applied as OpenTelemetry resource attributes on the runtime's
+    /// `MeterProvider`, so they appear as dimensions on every metric exported
+    /// via the Prometheus scrape endpoint, the cluster on-demand OTLP reader,
+    /// and the `otel_exporter` push exporter, and as labels on anonymous
+    /// usage telemetry. Currently does not affect tracing spans or logs.
+    /// Example: `{ environment: prod, region: us-west-2, team: data-platform }`.
     #[serde(default)]
     pub properties: HashMap<String, String>,
     /// Optional configuration for pushing metrics to an OpenTelemetry collector

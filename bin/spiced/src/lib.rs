@@ -567,12 +567,31 @@ pub async fn run(args: Args) -> Result<()> {
             std::collections::HashMap::new()
         };
 
+        // Pre-build resource attributes from `runtime.telemetry.properties`.
+        // In standalone and scheduler modes the SetOnce is already filled at
+        // this point. In executor mode the SetOnce is resolved later, after
+        // the executor fetches the app definition from the scheduler — same
+        // as `otel_config` above. Executors emit metrics through the cluster
+        // on-demand reader and inherit attribution from the scheduler-side
+        // pipeline, so the empty-resource case here is consistent with the
+        // surrounding executor config flow.
+        let resource_attributes: Vec<KeyValue> = telemetry_config
+            .get()
+            .map(|c| {
+                c.properties
+                    .iter()
+                    .map(|(k, v)| KeyValue::new(k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         init_metrics(
             &rt.datafusion(),
             prometheus_registry.clone(),
             otel_config,
             resolved_otel_headers,
             metrics_reader,
+            resource_attributes,
         )
         .context(UnableToInitializeMetricsSnafu)?;
     }
@@ -718,8 +737,20 @@ fn init_metrics(
     otel_config: Option<&app::spicepod::component::runtime::OtelExporterConfig>,
     resolved_otel_headers: std::collections::HashMap<String, String>,
     metrics_reader: Option<runtime::metrics_reader::MetricsReader>,
+    resource_attributes: Vec<KeyValue>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let resource = Resource::builder().build();
+    // Apply user-configured `runtime.telemetry.properties` as OpenTelemetry
+    // resource attributes so they appear as dimensions/tags on every metric
+    // exported by any of the readers attached below (Prometheus scrape,
+    // cluster on-demand OTLP, OTEL push). Standard env vars such as
+    // `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` are still merged in
+    // by `Resource::builder()`; explicit attributes here take precedence over
+    // env-derived ones with the same key.
+    let mut resource_builder = Resource::builder();
+    if !resource_attributes.is_empty() {
+        resource_builder = resource_builder.with_attributes(resource_attributes);
+    }
+    let resource = resource_builder.build();
 
     let mut provider_builder = SdkMeterProvider::builder().with_resource(resource);
 
