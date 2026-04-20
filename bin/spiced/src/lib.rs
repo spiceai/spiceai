@@ -765,6 +765,7 @@ fn init_metrics(
                     endpoint = %config.endpoint,
                     protocol = protocol,
                     push_interval = %config.push_interval,
+                    temporality = ?config.temporality,
                     "OTEL metrics exporter enabled"
                 );
             }

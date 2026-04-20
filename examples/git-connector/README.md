@@ -124,9 +124,27 @@ Append `@<reference>` to query specific branches, tags, or commits:
 
 ### Parameters
 
+File selection:
+
 - `include`: Glob patterns to filter files (semicolon or comma separated)
 - `fetch_content`: Set to `"true"` to fetch file content (also automatically enabled when embeddings or full-text search is configured on the `content` column)
 - `cache_path`: Custom location for repository cache
+- `enable_lfs`: Set to `"true"` to fetch git-lfs objects after clone/fetch (requires `git-lfs` CLI on `PATH`)
+
+Authentication:
+
+- `git_username`, `git_password`: HTTP(S) basic authentication credentials
+- `git_token`: Personal access token for HTTP(S) authentication
+- `git_ssh_key`: Absolute path to an SSH private key
+- `git_ssh_passphrase`: Passphrase for the SSH private key
+- `git_ssh_use_agent`: When `"true"` (default), fall back to the host's `ssh-agent`
+
+Resilience:
+
+- `max_concurrent_requests`: Concurrency budget per repository URL (default `4`)
+- `git_max_retries`: Maximum retries on transient errors (default `3`)
+- `backoff_method`: `exponential` or `fibonacci` (default `exponential`)
+- `disable_on_permanent_error`: When `"true"` (default), a permanent error (e.g. 401) disables the connector
 
 ## Performance Tips
 
@@ -150,8 +168,19 @@ Append `@<reference>` to query specific branches, tags, or commits:
 ### Repository Not Found
 
 - Verify the URL is correct
-- For private repositories, ensure SSH keys are configured
+- For private repositories, ensure the appropriate credentials (`git_token`, `git_ssh_key`, or an active `ssh-agent`) are configured
 - Check network connectivity
+
+### Authentication Failed
+
+- HTTP(S): provide `git_token` or `git_username`/`git_password`
+- SSH: provide `git_ssh_key` + optional `git_ssh_passphrase`, or ensure `ssh-agent` has the relevant identity loaded
+- The connector disables itself after a permanent error (401/403) to prevent retry storms. Update the configuration and restart Spice after resolving the issue; set `disable_on_permanent_error: "false"` if you need the connector to keep retrying.
+
+### git-lfs Objects Not Materialized
+
+- Install `git-lfs` and ensure it is on `PATH`
+- Set `enable_lfs: "true"` in the dataset `params`
 
 ### Slow First Query
 
