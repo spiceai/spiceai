@@ -397,7 +397,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        distro: [ubuntu-24.04]
+        distro: [Ubuntu-24.04]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
