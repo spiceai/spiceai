@@ -52,15 +52,21 @@ jobs:
     #     published to DockerHub / GHCR via this workflow.
     #   - release 'edited' only when the release is flipped to 'latest', so the
     #     ':latest' tag can be moved without re-publishing on every edit.
+    #
+    # Draft releases are NEVER published from release events — the
+    # 'github.event.release.draft' guard ensures unpublished drafts can't
+    # reach DockerHub / GHCR even if 'edited' fires while in draft state.
     if: >-
       ${{
         github.event_name != 'release'
         || (
           github.event.action == 'published'
+          && !github.event.release.draft
           && contains(github.event.release.tag_name, '-rc.')
         )
         || (
           github.event.action == 'edited'
+          && !github.event.release.draft
           && github.event.changes.make_latest
           && github.event.changes.make_latest.to == 'true'
         )
@@ -116,6 +122,17 @@ jobs:
           fi
 
           rel_version="${release_tag#v}"
+
+          # Refuse to publish draft releases. Drafts have no tag in the git
+          # repo and should never be pushed to DockerHub / GHCR. We check
+          # GitHub's release metadata directly so this guards both
+          # release-event runs (defense in depth) and workflow_dispatch
+          # runs that supply a draft release's tag.
+          is_draft=$(gh release view "${release_tag}" --repo "${GITHUB_REPOSITORY}" --json isDraft -q .isDraft 2>/dev/null || echo "false")
+          if [ "$is_draft" = "true" ]; then
+            echo "Release ${release_tag} is a draft; refusing to publish." >&2
+            exit 1
+          fi
 
           run_amd64=false
           run_arm64=false
