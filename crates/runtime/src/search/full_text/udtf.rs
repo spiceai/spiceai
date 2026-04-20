@@ -133,13 +133,31 @@ impl TextSearchTableFuncArgs {
     }
 }
 
+/// Collect the sorted, deduped set of indexed column names across every FTS index on a
+/// table. Used on error paths to build "Indexed column(s): …" messages — never on the
+/// happy query path.
+fn all_indexed_fields(fts_indexes: &[&FullTextDatabaseIndex]) -> Vec<String> {
+    let mut fields: Vec<String> = fts_indexes
+        .iter()
+        .flat_map(|idx| idx.search_fields.iter().cloned())
+        .collect();
+    fields.sort();
+    fields.dedup();
+    fields
+}
+
 /// Suggest the closest indexed column for a misspelled column name using
 /// case-insensitive Levenshtein distance. Returns `None` if no column is reasonably close.
 fn suggest_column(target: &str, candidates: &[String]) -> Option<String> {
     let target_lower = target.to_lowercase();
     let (best, distance) = candidates
         .iter()
-        .map(|c| (c, levenshtein(&target_lower, &c.to_lowercase())))
+        .map(|c| {
+            (
+                c,
+                util::levenshtein::distance(&target_lower, &c.to_lowercase()),
+            )
+        })
         .min_by_key(|(_, d)| *d)?;
 
     // Only suggest if the edit distance is small relative to the target length.
@@ -150,34 +168,6 @@ fn suggest_column(target: &str, candidates: &[String]) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Compute Levenshtein edit distance between two byte strings. Operates on UTF-8
-/// code units which is sufficient for column-name typo detection.
-fn levenshtein(a: &str, b: &str) -> usize {
-    if a == b {
-        return 0;
-    }
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    if a_bytes.is_empty() {
-        return b_bytes.len();
-    }
-    if b_bytes.is_empty() {
-        return a_bytes.len();
-    }
-
-    let mut prev: Vec<usize> = (0..=b_bytes.len()).collect();
-    let mut curr: Vec<usize> = vec![0; b_bytes.len() + 1];
-    for (i, &ac) in a_bytes.iter().enumerate() {
-        curr[0] = i + 1;
-        for (j, &bc) in b_bytes.iter().enumerate() {
-            let cost = usize::from(ac != bc);
-            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    prev[b_bytes.len()]
 }
 
 #[derive(Debug)]
@@ -294,19 +284,24 @@ impl TextSearchTableFunc {
             )));
         };
 
+        // Positional parsing yields `None` for any optional arg the user did not
+        // pass positionally. That way, `include_score => false` as a named arg
+        // can override the default; if the default were baked in here as
+        // `Some(true)`, the later `include_score.is_none()` guard would never
+        // fire and the named value would be silently dropped.
         let (column, limit, include_score) = match (args.next(), args.next(), args.next()) {
-            // No arguments, provides defaults
-            (None, None, None) => (None, None, Some(true)),
+            // No arguments
+            (None, None, None) => (None, None, None),
 
             // Single argument cases
             (Some(Expr::Column(Column { name: col, .. })), None, None) => {
-                (Some(col.clone()), None, Some(true))
+                (Some(col.clone()), None, None)
             }
             (Some(Expr::Literal(scalar, None)), None, None) => {
                 if let ScalarValue::Boolean(Some(include_score)) = *scalar {
                     (None, None, Some(include_score))
                 } else {
-                    (None, Some(parse_limit_scalar(scalar)?), Some(true))
+                    (None, Some(parse_limit_scalar(scalar)?), None)
                 }
             }
 
@@ -319,11 +314,7 @@ impl TextSearchTableFunc {
                 if let ScalarValue::Boolean(Some(include_score)) = *scalar {
                     (Some(col.clone()), None, Some(include_score))
                 } else {
-                    (
-                        Some(col.clone()),
-                        Some(parse_limit_scalar(scalar)?),
-                        Some(true),
-                    )
+                    (Some(col.clone()), Some(parse_limit_scalar(scalar)?), None)
                 }
             }
             (
@@ -374,6 +365,9 @@ impl TextSearchTableFunc {
         {
             include_score = Some(*b);
         }
+        // Apply the `include_score` default once named-arg merge is done, so a
+        // user-provided `include_score => false` can still flip the default.
+        let include_score = include_score.or(Some(true));
 
         let limit_usize = limit
             .map(|l| {
@@ -427,41 +421,37 @@ impl TableFunctionImpl for TextSearchTableFunc {
             )));
         }
 
-        // Aggregate all indexed columns across every FTS index on this table so we can
-        // both match the user's requested column to the correct index and surface a
-        // helpful error that lists every searchable column.
-        let mut all_search_fields: Vec<String> = fts_indexes
-            .iter()
-            .flat_map(|idx| idx.search_fields.iter().cloned())
-            .collect();
-        all_search_fields.sort();
-        all_search_fields.dedup();
-
         // Pick the index that actually contains the user-requested column. This matters
         // when a table has multiple FTS indexes: previously we popped the last index and
         // then validated the column against only that index, producing incorrect
         // "no index on column" errors for columns that are in fact indexed.
+        //
+        // `all_search_fields` is only needed on error/disambiguation paths; defer its
+        // computation so the happy path (requested column matches the first index, or a
+        // single-index table) stays free of extra work.
         let fts_index: FullTextDatabaseIndex = if let Some(ref requested) = args.column {
-            fts_indexes
+            if let Some(idx) = fts_indexes
                 .iter()
                 .find(|idx| idx.search_fields.contains(requested))
-                .copied()
-                .cloned()
-                .ok_or_else(|| {
-                    DataFusionError::Plan(format!(
-                        "User function 'text_search' is called on table '{}' that does not have a full text search index on '{requested}' column. Indexed column(s): {}.{}",
-                        args.tbl,
-                        all_search_fields.join(", "),
-                        suggest_column(requested, &all_search_fields)
-                            .map(|s| format!(" Did you mean '{s}'?"))
-                            .unwrap_or_default()
-                    ))
-                })?
+            {
+                (*idx).clone()
+            } else {
+                let all_search_fields = all_indexed_fields(&fts_indexes);
+                return Err(DataFusionError::Plan(format!(
+                    "User function 'text_search' is called on table '{}' that does not have a full text search index on '{requested}' column. Indexed column(s): {}.{}",
+                    args.tbl,
+                    all_search_fields.join(", "),
+                    suggest_column(requested, &all_search_fields)
+                        .map(|s| format!(" Did you mean '{s}'?"))
+                        .unwrap_or_default()
+                )));
+            }
         } else if fts_indexes.len() == 1 {
             // Exactly one FTS index. Defer to `column()` which picks the single search
             // field or errors with a helpful message listing the available columns.
             fts_indexes[0].clone()
         } else {
+            let all_search_fields = all_indexed_fields(&fts_indexes);
             return Err(DataFusionError::Plan(format!(
                 "User function 'text_search' is called on table '{}' that has {} full text search column(s) ({}). Must call 'text_search' with a column parameter, e.g. `text_search(\"my table\", 'my query', my_search_col)`",
                 args.tbl,
@@ -533,7 +523,7 @@ impl ScalarUDFImpl for TextSearchTableFunc {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextSearchTableFunc, TextSearchTableFuncArgs, levenshtein, suggest_column};
+    use super::{TextSearchTableFunc, TextSearchTableFuncArgs, suggest_column};
     use datafusion::common::Column;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::prelude::Expr;
@@ -553,16 +543,6 @@ mod tests {
             limit: None,
             include_score: Some(true),
         }
-    }
-
-    #[test]
-    fn levenshtein_basic_cases() {
-        assert_eq!(levenshtein("", ""), 0);
-        assert_eq!(levenshtein("abc", "abc"), 0);
-        assert_eq!(levenshtein("", "abc"), 3);
-        assert_eq!(levenshtein("abc", ""), 3);
-        assert_eq!(levenshtein("kitten", "sitting"), 3);
-        assert_eq!(levenshtein("title", "titel"), 2);
     }
 
     #[test]
@@ -690,5 +670,29 @@ mod tests {
         let parsed = TextSearchTableFunc::parse_args(&exprs)
             .expect("Passthrough named arg should be ignored");
         assert_eq!(parsed.column.as_deref(), Some("body"));
+    }
+
+    fn named_arg(name: &str, value: ScalarValue) -> Expr {
+        let meta = FieldMetadata::new(BTreeMap::from([(
+            "spice.parameter_name".to_string(),
+            name.to_string(),
+        )]));
+        Expr::Literal(value, Some(meta))
+    }
+
+    #[test]
+    fn parse_args_named_include_score_overrides_default() {
+        // `text_search(docs, 'hello', include_score => false)` must honor the
+        // named arg. Previously, the positional matcher baked in `Some(true)`
+        // when the user omitted it positionally, so the named value was
+        // silently dropped.
+        let exprs = vec![
+            Expr::Column(Column::new_unqualified("docs")),
+            Expr::Literal(ScalarValue::Utf8(Some("hello".to_string())), None),
+            named_arg("include_score", ScalarValue::Boolean(Some(false))),
+        ];
+        let parsed = TextSearchTableFunc::parse_args(&exprs)
+            .expect("Named include_score should parse");
+        assert_eq!(parsed.include_score, Some(false));
     }
 }

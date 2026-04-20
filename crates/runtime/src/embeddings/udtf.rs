@@ -32,6 +32,7 @@ use arrow_schema::{DataType, Field, SchemaRef};
 use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::exec_err;
 use datafusion::datasource::ViewTable;
+use datafusion::logical_expr::expr::FieldMetadata;
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
@@ -60,7 +61,7 @@ use search::generation::util::get_primary_keys;
 use std::{
     any::Any,
     cmp::min,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, LazyLock, Weak},
 };
 
@@ -233,7 +234,12 @@ fn closest_column(target: &str, candidates: &[String]) -> Option<String> {
     let target_lower = target.to_lowercase();
     let (best, distance) = candidates
         .iter()
-        .map(|c| (c, levenshtein_bytes(&target_lower, &c.to_lowercase())))
+        .map(|c| {
+            (
+                c,
+                util::levenshtein::distance(&target_lower, &c.to_lowercase()),
+            )
+        })
         .min_by_key(|(_, d)| *d)?;
     let threshold = target.len().div_ceil(2).max(2);
     if distance <= threshold {
@@ -241,31 +247,6 @@ fn closest_column(target: &str, candidates: &[String]) -> Option<String> {
     } else {
         None
     }
-}
-
-fn levenshtein_bytes(a: &str, b: &str) -> usize {
-    if a == b {
-        return 0;
-    }
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    if a_bytes.is_empty() {
-        return b_bytes.len();
-    }
-    if b_bytes.is_empty() {
-        return a_bytes.len();
-    }
-    let mut prev: Vec<usize> = (0..=b_bytes.len()).collect();
-    let mut curr: Vec<usize> = vec![0; b_bytes.len() + 1];
-    for (i, &ac) in a_bytes.iter().enumerate() {
-        curr[0] = i + 1;
-        for (j, &bc) in b_bytes.iter().enumerate() {
-            let cost = usize::from(ac != bc);
-            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    prev[b_bytes.len()]
 }
 
 #[derive(Debug)]
@@ -330,9 +311,6 @@ impl VectorSearchTableFunc {
 
 impl VectorSearchTableFunc {
     pub fn to_expr(args: &VectorSearchTableFuncArgs) -> DataFusionResult<Vec<Expr>> {
-        use datafusion::logical_expr::expr::FieldMetadata;
-        use std::collections::BTreeMap;
-
         let mut expr = vec![
             Expr::Column(to_column_expr(&args.tbl)),
             Expr::Literal(ScalarValue::Utf8(Some(args.query.clone())), None),
@@ -953,20 +931,10 @@ fn alias_value_to_match(
 
 #[cfg(test)]
 mod tests {
-    use super::{closest_column, levenshtein_bytes};
+    use super::closest_column;
 
     fn fields(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| (*s).to_string()).collect()
-    }
-
-    #[test]
-    fn levenshtein_bytes_basic_cases() {
-        assert_eq!(levenshtein_bytes("", ""), 0);
-        assert_eq!(levenshtein_bytes("abc", "abc"), 0);
-        assert_eq!(levenshtein_bytes("", "abc"), 3);
-        assert_eq!(levenshtein_bytes("abc", ""), 3);
-        assert_eq!(levenshtein_bytes("kitten", "sitting"), 3);
-        assert_eq!(levenshtein_bytes("content", "contnet"), 2);
     }
 
     #[test]

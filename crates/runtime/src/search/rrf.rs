@@ -741,9 +741,6 @@ impl ReciprocalRankFusion {
 
             // The first column is the score_expr, which gets special treatment above.
             // These are unaliased, because they get flattened by coalesce() in the first select.
-            // Secondary sort by the join key makes `first_value` deterministic when
-            // fused_score ties across multiple matched rows.
-            let fv_join_key_col = join_key.clone();
             agg_cols.extend(columns.iter().skip(1).filter_map(|c| {
                 let (_, cname) = c.qualified_name();
 
@@ -752,51 +749,17 @@ impl ReciprocalRankFusion {
                     None
                 } else {
                     Some(
-                        first_value(
-                            ident(&cname),
-                            vec![
-                                col("fused_score").sort(false, false),
-                                fv_join_key_col.clone().sort(true, true),
-                            ],
-                        )
-                        .alias(&cname),
+                        first_value(ident(&cname), vec![col("fused_score").sort(false, false)])
+                            .alias(&cname),
                     )
                 }
             }));
 
-            // Secondary sort by the join key for deterministic ordering when
-            // fused_score ties. Without this, ties produce non-reproducible results.
-            // Use the join_key expression directly to preserve case-sensitive
-            // column names (going through `col()`/`ident()` on the name string
-            // would lose the original Column identity).
-            let join_key_for_sort = join_key.clone();
-            // When the user does not provide `join_key`, the inferred key *is*
-            // `__spice_rrf_row_id`. It must survive aggregation and the
-            // secondary-sort step (so ties break deterministically), but it is
-            // a synthetic internal column and must be projected away before
-            // reaching the user-visible output.
-            let join_key_is_rrf_rowid = join_key.qualified_name().1 == "__spice_rrf_row_id";
-            let aggregated = joined
+            let sorted = joined
                 .select(columns)?
-                .aggregate(vec![join_key], agg_cols)?;
-            // When the user provided an explicit join key, the synthetic
-            // rrf row id is no longer needed and can be dropped immediately.
-            let aggregated = if join_key_is_rrf_rowid {
-                aggregated
-            } else {
-                aggregated.drop_columns(&["__spice_rrf_row_id"])?
-            };
-            let sorted = aggregated.sort(vec![
-                col("fused_score").sort(false, false),
-                join_key_for_sort.sort(true, true),
-            ])?;
-            // Drop the synthetic row id after sort so it does not leak into
-            // the user-visible schema of `rrf(...)`.
-            let sorted = if join_key_is_rrf_rowid {
-                sorted.drop_columns(&["__spice_rrf_row_id"])?
-            } else {
-                sorted
-            };
+                .aggregate(vec![join_key], agg_cols)?
+                .drop_columns(&["__spice_rrf_row_id"])?
+                .sort(vec![col("fused_score").sort(false, false)])?;
 
             // Apply the RRF-level limit so `FROM rrf(..., limit => N)` alone is
             // sufficient — users don't have to add an outer LIMIT clause.

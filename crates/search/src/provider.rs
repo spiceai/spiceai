@@ -64,7 +64,7 @@ pub enum UdtfSource {
         column: Option<String>,
         limit: Option<usize>,
         include_score: Option<bool>,
-        /// Distance metric name ("cosine", "l2", or "dot"). `None` = default (cosine).
+        /// Distance metric name ("cosine" or "l2"). `None` = default (cosine).
         distance_metric: Option<String>,
     },
 }
