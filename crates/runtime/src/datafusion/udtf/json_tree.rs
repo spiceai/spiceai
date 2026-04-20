@@ -21,7 +21,7 @@ limitations under the License.
 //! leaf), in depth-first order, with JSON-Path addresses and a parent pointer.
 //!
 //! ```text
-//! json_tree(input Utf8 [, max_depth => UInt, max_bytes => UInt]) -> TABLE(
+//! json_tree(input Utf8 [, max_depth => UInt, max_rows => UInt, max_bytes => UInt]) -> TABLE(
 //!     key       Utf8,
 //!     value     Utf8,
 //!     type      Utf8,
@@ -34,9 +34,11 @@ limitations under the License.
 //! ```
 //!
 //! Registered twice:
-//! - As a UDTF for `SELECT * FROM json_tree('{...}')`.
+//! - As a UDTF for `SELECT * FROM json_tree('{...}')`. Named options
+//!   (`max_depth`, `max_rows`, `max_bytes`) are only accepted in this form.
 //! - As a scalar UDF returning `List<Struct<...>>` for per-row /
-//!   `LATERAL json_tree(s.body)` usage via `UNNEST`.
+//!   `LATERAL json_tree(s.body)` usage via `UNNEST`. The scalar form takes
+//!   only the JSON argument and always runs with default caps.
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
@@ -70,6 +72,7 @@ use serde_json::Value;
 pub const JSON_TREE_UDTF_NAME: &str = "json_tree";
 
 const DEFAULT_MAX_DEPTH: usize = 64;
+const DEFAULT_MAX_ROWS: usize = 1_000_000;
 const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 // -------- Metrics --------
@@ -94,7 +97,7 @@ static ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("json_tree_errors_total")
         .with_description(
-            "Errors inside json_tree, labelled by kind (parse|depth_exceeded|input_too_large).",
+            "Errors inside json_tree, labelled by kind (parse|depth_exceeded|input_too_large|row_cap_hit).",
         )
         .build()
 });
@@ -108,6 +111,7 @@ fn record_error(kind: &'static str) {
 #[derive(Debug, Clone)]
 pub struct JsonTreeOptions {
     pub max_depth: usize,
+    pub max_rows: usize,
     pub max_bytes: usize,
 }
 
@@ -115,6 +119,7 @@ impl Default for JsonTreeOptions {
     fn default() -> Self {
         Self {
             max_depth: DEFAULT_MAX_DEPTH,
+            max_rows: DEFAULT_MAX_ROWS,
             max_bytes: DEFAULT_MAX_BYTES,
         }
     }
@@ -185,6 +190,7 @@ pub fn json_tree_with_options(input: &str, opts: &JsonTreeOptions) -> Vec<TreeRo
         rows: Vec::new(),
         next_id: 0,
         depth_cap_hit: false,
+        row_cap_hit: false,
     };
     visit(&root, None, None, "$", None, 0, opts, &mut ctx);
     ROWS_EMITTED.add(ctx.rows.len() as u64, &[]);
@@ -195,6 +201,7 @@ struct WalkCtx {
     rows: Vec<TreeRow>,
     next_id: i64,
     depth_cap_hit: bool,
+    row_cap_hit: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -208,10 +215,20 @@ fn visit(
     opts: &JsonTreeOptions,
     ctx: &mut WalkCtx,
 ) {
+    if ctx.row_cap_hit {
+        return;
+    }
     if depth > opts.max_depth {
         if !ctx.depth_cap_hit {
             ctx.depth_cap_hit = true;
             record_error("depth_exceeded");
+        }
+        return;
+    }
+    if ctx.rows.len() >= opts.max_rows {
+        if !ctx.row_cap_hit {
+            ctx.row_cap_hit = true;
+            record_error("row_cap_hit");
         }
         return;
     }
@@ -232,6 +249,9 @@ fn visit(
     match node {
         Value::Object(map) => {
             for (child_key, child) in map {
+                if ctx.row_cap_hit {
+                    return;
+                }
                 let child_fullkey = format!("{fullkey}.{}", escape_object_key(child_key));
                 visit(
                     child,
@@ -247,6 +267,9 @@ fn visit(
         }
         Value::Array(items) => {
             for (idx, child) in items.iter().enumerate() {
+                if ctx.row_cap_hit {
+                    return;
+                }
                 let child_fullkey = format!("{fullkey}[{idx}]");
                 // DuckDB / SQLite `json_tree` sets `key` to the array index as
                 // a string so consumers can distinguish array siblings.
@@ -360,10 +383,11 @@ fn parse_udtf_args(exprs: &[Expr]) -> DataFusionResult<(Option<String>, JsonTree
             let name = name.to_string();
             match name.as_str() {
                 "max_depth" => opts.max_depth = parse_usize(&name, scalar)?,
+                "max_rows" => opts.max_rows = parse_usize(&name, scalar)?,
                 "max_bytes" => opts.max_bytes = parse_usize(&name, scalar)?,
                 other => {
                     return Err(DataFusionError::Plan(format!(
-                        "Unknown option '{other}'. Supported: max_depth, max_bytes."
+                        "Unknown option '{other}'. Supported: max_depth, max_rows, max_bytes."
                     )));
                 }
             }
@@ -567,21 +591,37 @@ impl ScalarUDFImpl for JsonTreeScalar {
         };
         let strings = as_string_array(&normalized);
 
+        // Scalar UDF returns `List<Struct<...>>` which uses i32 offsets.
+        // Truncate deterministically so the function never returns a
+        // query-level error for large inputs — matches the walker's own
+        // "cap and record a metric, never fail" contract.
+        let max_flattened_rows = i32::MAX as usize;
         let mut all_rows: Vec<TreeRow> = Vec::new();
         let mut offsets: Vec<i32> = Vec::with_capacity(strings.len() + 1);
+        let mut truncated = false;
         offsets.push(0);
 
         for idx in 0..strings.len() {
             if !strings.is_null(idx) {
                 let rows = json_tree_with_options(strings.value(idx), &opts);
-                all_rows.extend(rows);
+                let remaining = max_flattened_rows.saturating_sub(all_rows.len());
+                if rows.len() > remaining {
+                    all_rows.extend(rows.into_iter().take(remaining));
+                    truncated = true;
+                } else {
+                    all_rows.extend(rows);
+                }
             }
             let len = i32::try_from(all_rows.len()).map_err(|_| {
                 DataFusionError::Execution(format!(
-                    "{JSON_TREE_UDTF_NAME}(): row count exceeds i32 offset range."
+                    "{JSON_TREE_UDTF_NAME}(): internal offset accounting exceeded i32 range."
                 ))
             })?;
             offsets.push(len);
+        }
+
+        if truncated {
+            record_error("row_cap_hit");
         }
 
         let struct_array =
@@ -683,6 +723,18 @@ mod tests {
         let fullkeys: Vec<_> = rows.iter().map(|r| r.fullkey.as_str()).collect();
         assert!(fullkeys.contains(&"$.a.b"));
         assert!(!fullkeys.contains(&"$.a.b.c"));
+    }
+
+    #[test]
+    fn max_rows_caps_output() {
+        // 50 elements but cap of 10 → 10 rows total (cap includes root).
+        let doc = "[".to_string() + &(0..49).map(|_| "0,").collect::<String>() + "0]";
+        let opts = JsonTreeOptions {
+            max_rows: 10,
+            ..Default::default()
+        };
+        let rows = json_tree_with_options(&doc, &opts);
+        assert_eq!(rows.len(), 10);
     }
 
     #[test]

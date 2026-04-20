@@ -1001,21 +1001,38 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
         // Collect all rows into a single flat vec, with offsets delineating
         // which span belongs to which input row. NULL inputs produce empty
         // (but non-NULL) list slots so the output row count matches input.
+        //
+        // Scalar UDF returns `List<Struct<...>>` which uses i32 offsets.
+        // Truncate deterministically so the function never returns a
+        // query-level error for large inputs — matches the walker's own
+        // "cap and record a metric, never fail" contract.
+        let max_flattened_rows = i32::MAX as usize;
         let mut all_rows: Vec<PropertyRow> = Vec::new();
         let mut offsets: Vec<i32> = Vec::with_capacity(strings.len() + 1);
+        let mut truncated = false;
         offsets.push(0);
 
         for idx in 0..strings.len() {
             if !strings.is_null(idx) {
                 let rows = flatten_with_options(strings.value(idx), &opts);
-                all_rows.extend(rows);
+                let remaining = max_flattened_rows.saturating_sub(all_rows.len());
+                if rows.len() > remaining {
+                    all_rows.extend(rows.into_iter().take(remaining));
+                    truncated = true;
+                } else {
+                    all_rows.extend(rows);
+                }
             }
             let len = i32::try_from(all_rows.len()).map_err(|_| {
                 DataFusionError::Execution(format!(
-                    "{FLATTEN_JSON_PROPERTIES_UDTF_NAME}(): row count exceeds i32 offset range."
+                    "{FLATTEN_JSON_PROPERTIES_UDTF_NAME}(): internal offset accounting exceeded i32 range."
                 ))
             })?;
             offsets.push(len);
+        }
+
+        if truncated {
+            record_error("row_cap_hit");
         }
 
         let (struct_arrays, _) = build_property_arrays(&all_rows);
