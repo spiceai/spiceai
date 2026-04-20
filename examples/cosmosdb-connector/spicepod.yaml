@@ -29,8 +29,9 @@ datasets:
     description: Products with an explicit Arrow schema.
     params:
       cosmosdb_connection_string: ${ env:COSMOSDB_CONNECTION_STRING }
-      # Resilience tuning: tighten the per-account concurrency budget when
-      # the dataset is expected to run under heavy load.
+      # Resilience tuning: raise the per-account concurrency budget (above
+      # the default of 4) and widen the retry envelope for datasets expected
+      # to run under heavy load.
       max_concurrent_requests: "8"
       http_max_retries: "5"
       backoff_method: fibonacci
