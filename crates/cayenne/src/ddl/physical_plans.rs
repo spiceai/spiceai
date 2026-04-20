@@ -26,6 +26,7 @@ limitations under the License.
 //! nodes after calling the same `operations` functions.
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -44,6 +45,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, execute_stream,
 };
 
+use datafusion_common::ScalarValue;
 use datafusion_datasource::memory::MemorySourceConfig;
 
 use super::operations::{CreateTableParams, create_schema, create_table, drop_table};
@@ -603,7 +605,7 @@ async fn execute_merge(
     // per target row. We must detect this *before* any mutations — otherwise the
     // delete would commit (removing the target row) but the count verification
     // would fail, leaving permanently missing rows.
-    validate_no_duplicate_target_keys(&normalized_batches, &target_key_columns)?;
+    let matched_keys = validate_no_duplicate_target_keys(&normalized_batches, &target_key_columns)?;
 
     // Step 3+4: Delete matched rows from the target.
     //
@@ -611,8 +613,13 @@ async fn execute_merge(
     // matched key tuples and probe each file's rows with O(1) lookups. This
     // replaces the O(N) filter expression that the legacy path builds and
     // evaluates against every chunk of every file.
-    let delete_count = if let Some(count) =
-        try_key_probe_delete(&target_provider, &normalized_batches, &target_key_columns).await?
+    let delete_count = if let Some(count) = try_key_probe_delete(
+        &target_provider,
+        &normalized_batches,
+        &target_key_columns,
+        matched_keys,
+    )
+    .await?
     {
         count
     } else {
@@ -684,7 +691,7 @@ fn extract_dml_count(batches: &[RecordBatch]) -> u64 {
 fn validate_no_duplicate_target_keys(
     batches: &[RecordBatch],
     key_columns: &[String],
-) -> Result<(), DataFusionError> {
+) -> Result<HashSet<Vec<ScalarValue>>, DataFusionError> {
     use std::collections::HashSet;
 
     let mut seen = HashSet::new();
@@ -703,11 +710,9 @@ fn validate_no_duplicate_target_keys(
 
         for row_idx in 0..batch.num_rows() {
             // Build a composite key as a Vec<ScalarValue> for hashing.
-            let key: Vec<datafusion::common::ScalarValue> = col_indices
+            let key: Vec<ScalarValue> = col_indices
                 .iter()
-                .map(|&idx| {
-                    datafusion::common::ScalarValue::try_from_array(batch.column(idx), row_idx)
-                })
+                .map(|&idx| ScalarValue::try_from_array(batch.column(idx), row_idx))
                 .collect::<Result<Vec<_>, _>>()?;
 
             if !seen.insert(key) {
@@ -715,11 +720,8 @@ fn validate_no_duplicate_target_keys(
                     .iter()
                     .zip(&col_indices)
                     .map(|(name, &idx)| {
-                        let val = datafusion::common::ScalarValue::try_from_array(
-                            batch.column(idx),
-                            row_idx,
-                        )
-                        .map_or_else(|_| "?".to_string(), |v| v.to_string());
+                        let val = ScalarValue::try_from_array(batch.column(idx), row_idx)
+                            .map_or_else(|_| "?".to_string(), |v| v.to_string());
                         format!("{name}={val}")
                     })
                     .collect();
@@ -732,7 +734,7 @@ fn validate_no_duplicate_target_keys(
             }
         }
     }
-    Ok(())
+    Ok(seen)
 }
 
 /// Build a deletion filter from matched key column values.
@@ -758,7 +760,7 @@ fn build_delete_filter(
             })?;
             let array = batch.column(col_idx);
             for row_idx in 0..array.len() {
-                let scalar = datafusion::common::ScalarValue::try_from_array(array, row_idx)?;
+                let scalar = ScalarValue::try_from_array(array, row_idx)?;
                 values.push(lit(scalar));
             }
         }
@@ -796,9 +798,10 @@ fn build_delete_filter(
             // Build AND of all key column equalities for this row.
             let mut row_and: Option<datafusion::prelude::Expr> = None;
             for (key_col, indices) in &col_indices {
-                let array = batch.column(indices[batch_idx]);
-                let scalar = datafusion::common::ScalarValue::try_from_array(array, row_idx)?;
-                let eq_expr = col(key_col.as_str()).eq(lit(scalar));
+                let eq_expr = col(key_col.as_str()).eq(lit(ScalarValue::try_from_array(
+                    batch.column(indices[batch_idx]),
+                    row_idx,
+                )?));
                 row_and = Some(match row_and {
                     Some(existing) => existing.and(eq_expr),
                     None => eq_expr,
@@ -818,45 +821,11 @@ fn build_delete_filter(
     }
 
     // Combine row predicates with OR using a balanced binary tree.
-    match util::expr::combine_exprs_balanced(row_predicates, datafusion::prelude::Expr::or) {
-        Some(combined) => Ok(combined),
-        None => Err(DataFusionError::Internal(
+    util::expr::combine_exprs_balanced(row_predicates, datafusion::prelude::Expr::or).ok_or(
+        DataFusionError::Internal(
             "Failed to build delete filters: no row predicates generated".to_string(),
-        )),
-    }
-}
-
-/// Extract a `HashSet` of matched key tuples from the join output batches.
-///
-/// Each entry is a `Vec<ScalarValue>` representing one composite key tuple.
-fn extract_matched_key_set(
-    batches: &[RecordBatch],
-    key_columns: &[String],
-) -> Result<std::collections::HashSet<Vec<datafusion::common::ScalarValue>>, DataFusionError> {
-    let mut keys = std::collections::HashSet::new();
-    for batch in batches {
-        let col_indices: Vec<usize> = key_columns
-            .iter()
-            .map(|key_col| {
-                batch.schema().index_of(key_col).map_err(|e| {
-                    DataFusionError::Internal(format!(
-                        "Key column '{key_col}' not found in join output: {e}"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        for row_idx in 0..batch.num_rows() {
-            let key: Vec<datafusion::common::ScalarValue> = col_indices
-                .iter()
-                .map(|&idx| {
-                    datafusion::common::ScalarValue::try_from_array(batch.column(idx), row_idx)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            keys.insert(key);
-        }
-    }
-    Ok(keys)
+        ),
+    )
 }
 
 /// Try the fast key-probe deletion path for `PositionBased` Cayenne tables.
@@ -869,15 +838,15 @@ async fn try_key_probe_delete(
     provider: &Arc<dyn TableProvider>,
     batches: &[RecordBatch],
     key_columns: &[String],
+    matched_keys: HashSet<Vec<datafusion_common::ScalarValue>>,
 ) -> Result<Option<u64>, DataFusionError> {
     // Case 1: Direct CayenneTableProvider.
     if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>() {
         if cayenne.is_position_based() {
-            let matched_keys = extract_matched_key_set(batches, key_columns)?;
-            let count = cayenne
+            return cayenne
                 .delete_matched_rows_by_key_probe(matched_keys, key_columns)
-                .await?;
-            return Ok(Some(count));
+                .await
+                .map(Some);
         }
         return Ok(None);
     }
@@ -893,11 +862,10 @@ async fn try_key_probe_delete(
             .downcast_ref::<CayenneTableProvider>()
             && cayenne.is_position_based()
         {
-            let matched_keys = extract_matched_key_set(batches, key_columns)?;
-            let count = cayenne
+            return cayenne
                 .delete_matched_rows_by_key_probe(matched_keys, key_columns)
-                .await?;
-            return Ok(Some(count));
+                .await
+                .map(Some);
         }
         return Ok(None);
     }
@@ -907,15 +875,14 @@ async fn try_key_probe_delete(
     // checking the first partition is sufficient to decide the fast path.
     if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
         let providers = partitioned.partition_table_providers().await;
-        let first_is_position_based = providers
+        if providers
             .first()
             .and_then(unwrap_to_cayenne)
-            .is_some_and(CayenneTableProvider::is_position_based);
-        if !first_is_position_based {
+            .is_none_or(CayenneTableProvider::is_position_based)
+        {
             return Ok(None);
         }
 
-        let matched_keys = extract_matched_key_set(batches, key_columns)?;
         let mut total = 0u64;
         for pp in &providers {
             if let Some(cayenne) = unwrap_to_cayenne(pp) {

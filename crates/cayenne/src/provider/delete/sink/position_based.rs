@@ -257,6 +257,8 @@ impl CayenneDeletionSink {
 
             let vortex_session = VortexSession::default();
 
+            // Build futures with owned values to avoid lifetime issues from
+            // nested iterator adapters over `FileGroup::iter()`.
             let mut scan_futures = Vec::new();
             for fg in &file_groups {
                 for pf in fg.iter() {
@@ -278,7 +280,6 @@ impl CayenneDeletionSink {
                     });
                 }
             }
-
             let mut stream =
                 futures::stream::iter(scan_futures).buffer_unordered(*MAX_CONCURRENT_FILE_SCANS);
 
@@ -297,7 +298,10 @@ impl CayenneDeletionSink {
                         new_deletions = row_ids.len(),
                         "File has rows matching key-probe deletion"
                     );
-                    per_file_row_ids.insert(file_path, row_ids);
+                    per_file_row_ids
+                        .entry(file_path)
+                        .or_default()
+                        .extend(row_ids);
                 }
             }
 
@@ -455,9 +459,9 @@ impl CayenneDeletionSink {
     ///
     /// The scan reads **all columns** (no projection) because Vortex's `with_projection`
     /// API takes a single `Expression` and may not support mixed `data+row_idx` projections.
-    /// No `Selection::ExcludeRoaring` is applied — the manual row counter gives exact
-    /// file-local positions. Already-deleted rows that happen to match are harmless:
-    /// `persist_position_based_deletions` merges with existing bitmaps via `RoaringBitmap`.
+    /// File-local row positions are tracked with a manual row counter, and positions that are
+    /// already deleted (from the position-based cache) are skipped so this method returns only
+    /// candidates for NEW deletions.
     ///
     /// # Returns
     ///
@@ -471,6 +475,24 @@ impl CayenneDeletionSink {
         key_columns: &[String],
     ) -> crate::provider::Result<Vec<u64>> {
         let table_name = &self.table_metadata.table_name;
+
+        // Snapshot already-deleted positions for this file from the cache.
+        let already_deleted_bitmap: Option<RoaringBitmap> = {
+            let cache = self
+                .pk_deletion_strategy
+                .position_based_cache()
+                .ok_or_else(|| Error::Internal {
+                    table: table_name.clone(),
+                    message:
+                        "scan_file_for_key_matches called with incompatible PkDeletionStrategy"
+                            .to_string(),
+                })?;
+            let guard = cache.read().map_err(|_| Error::LockPoisoned {
+                table: table_name.clone(),
+                lock: DELETION_CACHE_LOCK_POISONED,
+            })?;
+            guard.get(file_path).cloned()
+        };
 
         // Open the Vortex file directly.
         let vxf = vortex_session
@@ -555,7 +577,13 @@ impl CayenneDeletionSink {
                     })
                     .collect::<crate::provider::Result<Vec<_>>>()?;
 
-                if matched_keys.contains(&key) {
+                let is_already_deleted = u32::try_from(row_position).ok().is_some_and(|pos| {
+                    already_deleted_bitmap
+                        .as_ref()
+                        .is_some_and(|bitmap| bitmap.contains(pos))
+                });
+
+                if matched_keys.contains(&key) && !is_already_deleted {
                     matching_positions.push(row_position);
                 }
                 row_position += 1;
@@ -618,29 +646,52 @@ impl CayenneDeletionSink {
 
         let writer = DeletionVectorWriter::new(&self.table_metadata);
 
-        // Track new deletion count for return value
-        let new_deletion_count: usize = row_ids.values().map(Vec::len).sum();
+        // Build write specs and precompute cache updates while counting TRUE new deletions
+        // (set difference between incoming row_ids and existing cache per file).
+        let mut new_deletion_count: usize = 0;
+        let mut specs: Vec<DeletionVectorWriteSpec> = Vec::new();
+        let mut cache_updates: HashMap<String, RoaringBitmap> = HashMap::new();
 
-        // Create one DeletionVectorWriteSpec per file with MERGED deletions
-        // (existing from cache + new from this operation)
-        let specs: Vec<DeletionVectorWriteSpec> = row_ids
-            .iter()
-            .filter(|(_, row_ids)| !row_ids.is_empty())
-            .map(|(file_path, new_row_ids)| {
-                // Start with existing deletions for this file (if any)
-                let mut combined_ids: Vec<u64> =
-                    if let Some(existing_bitmap) = existing_deletions.get(file_path) {
-                        existing_bitmap.iter().map(u64::from).collect()
-                    } else {
-                        Vec::new()
-                    };
+        for (file_path, incoming_row_ids) in row_ids.iter().filter(|(_, ids)| !ids.is_empty()) {
+            let existing_bitmap = existing_deletions
+                .get(file_path)
+                .cloned()
+                .unwrap_or_default();
 
-                // Add new deletions
-                combined_ids.extend(new_row_ids.iter().copied());
+            // Deduplicate incoming row IDs first to avoid over-counting and redundant writes.
+            let mut unique_new_row_ids = incoming_row_ids.clone();
+            unique_new_row_ids.sort_unstable();
+            unique_new_row_ids.dedup();
 
-                DeletionVectorWriteSpec::new_position_based(file_path.clone(), combined_ids)
-            })
-            .collect();
+            let newly_added_for_file = unique_new_row_ids
+                .iter()
+                .filter(|&&id| {
+                    u32::try_from(id)
+                        .ok()
+                        .map_or(true, |id32| !existing_bitmap.contains(id32))
+                })
+                .count();
+            new_deletion_count += newly_added_for_file;
+
+            // Deletion vector must contain ALL deleted positions (existing + new).
+            let mut combined_ids: Vec<u64> = existing_bitmap.iter().map(u64::from).collect();
+            combined_ids.extend(unique_new_row_ids.iter().copied());
+            combined_ids.sort_unstable();
+            combined_ids.dedup();
+            specs.push(DeletionVectorWriteSpec::new_position_based(
+                file_path.clone(),
+                combined_ids,
+            ));
+
+            // Pre-build updated cache bitmap (u32 representable positions only).
+            let mut updated_bitmap = existing_bitmap;
+            updated_bitmap.extend(
+                unique_new_row_ids
+                    .iter()
+                    .filter_map(|&id| u32::try_from(id).ok()),
+            );
+            cache_updates.insert(file_path.clone(), updated_bitmap);
+        }
 
         if specs.is_empty() {
             return Ok(0);
@@ -659,19 +710,6 @@ impl CayenneDeletionSink {
                 });
             }
         }
-
-        // Pre-build updated bitmaps OUTSIDE the write lock to minimize lock hold time.
-        let cache_updates: HashMap<String, RoaringBitmap> = row_ids
-            .iter()
-            .map(|(file_path, row_ids)| {
-                let mut bitmap = existing_deletions
-                    .get(file_path)
-                    .cloned()
-                    .unwrap_or_default();
-                bitmap.extend(row_ids.iter().filter_map(|&id| u32::try_from(id).ok()));
-                (file_path.clone(), bitmap)
-            })
-            .collect();
 
         // Quick write lock - just insert pre-built entries
         {
