@@ -41,6 +41,10 @@ use std::time::SystemTime;
 
 use super::Google;
 
+// This is a dummy thought signature that is used to skip thought signature validation.
+// ref: https://ai.google.dev/gemini-api/docs/thought-signatures#faqs
+const DUMMY_THOUGHT_SIGNATURE: &str = "skip_thought_signature_validator";
+
 #[async_trait]
 impl Chat for Google {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
@@ -124,10 +128,11 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
                     role: Some("user".to_string()),
                     parts: vec![Part::FunctionResponse {
                         function_response: FunctionResponse {
-                            id: Some(tool_call_id.clone()),
-                            name: tool_call_id, // Don't have access to name.
+                            id: None,           // tool call id is not used for google genai.
+                            name: tool_call_id, // function name is stored in the tool call id.
                             response,
                         },
+                        thought_signature: Some(DUMMY_THOUGHT_SIGNATURE.to_string()),
                     }],
                 }
             }
@@ -151,8 +156,8 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
                     for tool_call_enum in tools {
                         let async_openai::types::chat::ChatCompletionMessageToolCalls::Function(
                             ChatCompletionMessageToolCall {
-                                id,
                                 function: FunctionCall { name, arguments },
+                                ..
                             },
                         ) = tool_call_enum
                         else {
@@ -162,7 +167,7 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
                             role: Some("assistant".to_string()),
                             parts: vec![Part::FunctionCall {
                                 function_call: google_genai::types::FunctionCall {
-                                    id: Some(id),
+                                    id: Some(name.clone()), // store function name in the id.
                                     name,
                                     args:
                                         serde_json::from_str::<HashMap<String, serde_json::Value>>(
@@ -170,6 +175,7 @@ fn convert_to_google_request(req: CreateChatCompletionRequest) -> GenerateConten
                                         )
                                         .unwrap_or_default(),
                                 },
+                                thought_signature: Some(DUMMY_THOUGHT_SIGNATURE.to_string()),
                             }],
                         });
                     }
@@ -247,12 +253,12 @@ fn convert_google_response_to_openai(
                     Part::Text { text } => {
                         text_parts.push(text);
                     }
-                    Part::FunctionCall { function_call } => {
+                    Part::FunctionCall { function_call, .. } => {
                         let args = serde_json::to_string(&function_call.args)
                             .unwrap_or_else(|_| "{}".to_string());
 
                         tool_calls.push(ChatCompletionMessageToolCall {
-                            id: format!("call_{}", tool_calls.len()),
+                            id: function_call.name.clone(),
                             function: FunctionCall {
                                 name: function_call.name,
                                 arguments: args,
@@ -346,13 +352,13 @@ fn convert_google_stream_response_to_openai(
                     Part::Text { text } => {
                         text_parts.push(text);
                     }
-                    Part::FunctionCall { function_call } => {
+                    Part::FunctionCall { function_call, .. } => {
                         let args = serde_json::to_string(&function_call.args)
                             .unwrap_or_else(|_| "{}".to_string());
 
                         tool_calls.push(ChatCompletionMessageToolCallChunk {
                             index: tool_calls.len() as u32,
-                            id: Some(format!("call_{}", tool_calls.len())),
+                            id: Some(function_call.name.clone()),
                             r#type: Some(FunctionType::Function),
                             function: Some(FunctionCallStream {
                                 name: Some(function_call.name),
