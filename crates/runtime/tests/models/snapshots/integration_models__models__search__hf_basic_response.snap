@@ -1,40 +1,40 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(resp, round_scores)
+expression: "normalize_search_response(resp, round_scores)"
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.99",
+      "_score": "0.89",
       "data": {
-        "i_color": "smoke",
-        "i_item_id": "AAAAAAAADBAAAAAA"
+        "i_color": "yellow",
+        "i_item_id": "AAAAAAAAKAAAAAAA"
       },
       "dataset": "item",
       "matches": {
         "i_item_desc": [
-          "Patient"
+          "Bright rules stop. Big members alter active, true words. Methods prov"
         ]
       },
       "primary_key": {
-        "i_item_sk": 19
+        "i_item_sk": 11
       }
     },
     {
-      "_score": "0.98",
+      "_score": "0.84",
       "data": {
-        "i_color": "spring",
-        "i_item_id": "AAAAAAAAHAAAAAAA"
+        "i_color": "wheat",
+        "i_item_id": "AAAAAAAAIAAAAAAA"
       },
       "dataset": "item",
       "matches": {
         "i_item_desc": [
-          "New"
+          "Other, soviet subjects seem properly times. Only sources will not escape; keys will not know only children. Recent, f"
         ]
       },
       "primary_key": {
-        "i_item_sk": 7
+        "i_item_sk": 9
       }
     }
   ]
