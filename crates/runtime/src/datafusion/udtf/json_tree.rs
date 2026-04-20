@@ -75,6 +75,12 @@ const DEFAULT_MAX_DEPTH: usize = 64;
 const DEFAULT_MAX_ROWS: usize = 1_000_000;
 const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
 
+/// Scalar UDF ceiling across a single evaluated batch. Per-document caps
+/// already bound individual rows, but a wide input batch could still
+/// accumulate `number_rows * max_rows` entries in memory. Error out loudly
+/// past this watermark so operators see the condition rather than OOM.
+const SCALAR_BATCH_MAX_ROWS: usize = 10_000_000;
+
 // -------- Metrics --------
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("json_tree"));
@@ -607,6 +613,12 @@ impl ScalarUDFImpl for JsonTreeScalar {
             if !strings.is_null(idx) {
                 let rows = json_tree_with_options(strings.value(idx), &opts);
                 all_rows.extend(rows);
+                if all_rows.len() > SCALAR_BATCH_MAX_ROWS {
+                    record_error("batch_cap_hit");
+                    return Err(DataFusionError::Execution(format!(
+                        "{JSON_TREE_UDTF_NAME}(): batch produced more than {SCALAR_BATCH_MAX_ROWS} rows; lower `max_rows` or split the input."
+                    )));
+                }
             }
             // Walker caps bound the row count well under `i64::MAX`, but if
             // somehow they didn't, silently saturating would misalign list

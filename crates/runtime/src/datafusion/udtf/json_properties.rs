@@ -108,6 +108,12 @@ const DEFAULT_MAX_DEPTH: usize = 32;
 const DEFAULT_MAX_ROWS: usize = 100_000;
 const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
 
+/// Scalar UDF ceiling across a single evaluated batch. Per-document caps
+/// already bound individual rows, but a wide input batch could still
+/// accumulate `number_rows * max_rows` entries in memory. Error out loudly
+/// past this watermark so operators see the condition rather than OOM.
+const SCALAR_BATCH_MAX_ROWS: usize = 10_000_000;
+
 // -------- Metrics --------
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("flatten_json_properties"));
@@ -316,6 +322,17 @@ impl<'a> Walker<'a> {
         }
         let effective = self.effective_schemas(schema);
 
+        // `collect_effective` handles cycles during a single resolution
+        // pass, but once control returns here we recurse into the resolved
+        // schema's own children — any `$ref` back to this node would look
+        // "fresh" to the next `collect_effective` call. Re-insert the ref
+        // (if there was one) so the whole walk-chain sees it.
+        let chain_ref: Option<String> = schema
+            .get("$ref")
+            .and_then(Value::as_str)
+            .filter(|r| is_local_ref(r))
+            .and_then(|r| self.visited_refs.insert(r.to_owned()).then(|| r.to_owned()));
+
         let required: HashSet<&str> = effective
             .iter()
             .flat_map(|s| {
@@ -342,10 +359,17 @@ impl<'a> Walker<'a> {
                         depth,
                     );
                     if self.row_cap_hit {
+                        if let Some(r) = chain_ref {
+                            self.visited_refs.remove(&r);
+                        }
                         return;
                     }
                 }
             }
+        }
+
+        if let Some(r) = chain_ref {
+            self.visited_refs.remove(&r);
         }
     }
 
@@ -1025,6 +1049,12 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
             if !strings.is_null(idx) {
                 let rows = flatten_with_options(strings.value(idx), &opts);
                 all_rows.extend(rows);
+                if all_rows.len() > SCALAR_BATCH_MAX_ROWS {
+                    record_error("batch_cap_hit");
+                    return Err(DataFusionError::Execution(format!(
+                        "{FLATTEN_JSON_PROPERTIES_UDTF_NAME}(): batch produced more than {SCALAR_BATCH_MAX_ROWS} flattened rows; lower `max_rows` or split the input."
+                    )));
+                }
             }
             // Walker caps bound the row count well under `i64::MAX`, but if
             // somehow they didn't, silently saturating would misalign list
@@ -1252,11 +1282,13 @@ mod tests {
                 "root": {"$ref": "#/$defs/Node"}
             }
         }"##;
-        // Cycle detection must stop the walk; we don't assert row count, only
-        // that the function returns without stack overflow or hang.
         let rows = flatten(json);
-        // At minimum, the walker can descend one level via the first $ref.
-        let _ = rows;
+        let by = by_path(&rows);
+        // First resolution of Node happens at `root`; the second hop into
+        // `root.next` must recognise it's re-entering the same `$ref` chain
+        // and stop without a third level of expansion.
+        assert!(by.contains_key("root.next"));
+        assert!(!by.contains_key("root.next.next"));
     }
 
     #[test]
