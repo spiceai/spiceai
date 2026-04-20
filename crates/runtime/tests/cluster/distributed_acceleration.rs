@@ -828,9 +828,12 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
                     "city",
                 ))
                 .with_runtime(SpicepodRuntime {
-                    scheduler: Some(make_named_scheduler_config(
-                        "test_on_demand_refresh_discovers_new_partitions",
-                    )),
+                    scheduler: Some(
+                        make_named_scheduler_config_with_max_partitions_per_executor(
+                            "test_on_demand_refresh_discovers_new_partitions",
+                            20,
+                        ),
+                    ),
                     ..SpicepodRuntime::default()
                 })
                 .build();
