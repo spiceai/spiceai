@@ -527,6 +527,20 @@ impl VectorSearchTableFunc {
             return Ok(None);
         };
 
+        // Index-backed providers (S3 vectors, Elasticsearch, chunked) ignore
+        // `args.distance_metric` because their underlying `SearchIndex::query_table_provider`
+        // takes only the query string and uses the metric the index was configured with.
+        // Silently picking an index-configured metric while accepting a different one
+        // from the user would produce surprising rankings — fail fast instead.
+        if let Some(metric) = args.distance_metric {
+            return Err(DataFusionError::Plan(format!(
+                "vector_search on table '{}': distance_metric '{}' is not honored by the index-backed provider for this column ('{}'); the index uses its configured metric. Drop the distance_metric argument or remove the index to use the JIT path.",
+                args.tbl,
+                metric.as_str(),
+                vector_index.search_column(),
+            )));
+        }
+
         // For Elasticsearch indexes, normalize the base table provider schema to match
         // what the ES HTTP client produces (e.g. LargeUtf8 → Utf8). This ensures that
         // HashJoinExec key types match on both sides of the join.
