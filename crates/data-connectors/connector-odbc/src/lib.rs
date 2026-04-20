@@ -99,6 +99,8 @@ fn databricks_dialect() -> CustomDialect {
     CustomDialectBuilder::new()
         .with_identifier_quote_style('`')
         .with_interval_style(IntervalStyle::MySQL)
+        .with_utf8_cast_dtype(datafusion::sql::sqlparser::ast::DataType::String(None))
+        .with_large_utf8_cast_dtype(datafusion::sql::sqlparser::ast::DataType::String(None))
         .build()
 }
 
