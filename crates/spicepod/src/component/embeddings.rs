@@ -228,7 +228,7 @@ impl Display for EmbeddingPrefix {
 /// time the per-element similarities are combined into a single per-row
 /// score using this aggregation.
 ///
-/// `Max` is the ColBERT-style MaxSim default — a row scores as high as
+/// `Max` is the ColBERT-style `MaxSim` default — a row scores as high as
 /// its best-matching element.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -318,7 +318,7 @@ pub struct ColumnEmbeddingConfig {
 
     /// Aggregation strategy for multi-vector embeddings. Only meaningful
     /// when the underlying column is list-typed (`List<Utf8>` /
-    /// `LargeList<Utf8>`). Defaults to `max` (ColBERT-style MaxSim).
+    /// `LargeList<Utf8>`). Defaults to `max` (ColBERT-style `MaxSim`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregation: Option<EmbeddingAggregation>,
 
