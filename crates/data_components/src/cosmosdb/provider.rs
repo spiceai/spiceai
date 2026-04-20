@@ -452,26 +452,25 @@ impl ExecutionPlan for CosmosDBExec {
 
             let container_client = client.container_client(&config.database, &config.container);
 
-            let handle_stream_error =
-                |resilience: &CosmosResilienceConfig,
-                 endpoint: &str,
-                 err: azure_core::Error|
-                 -> DataFusionError {
-                    if crate::cosmosdb::resilience::is_permanent_error(&err)
-                        && resilience.disable_on_permanent_error
-                    {
-                        resilience.disabled.store(true, Ordering::Release);
-                        tracing::error!(
-                            endpoint = %endpoint,
-                            "Permanent error from Azure Cosmos DB; disabling connector. {err}"
-                        );
-                    }
-                    to_df_error(Error::QueryFailed {
-                        database: config.database.clone(),
-                        container: config.container.clone(),
-                        source: Box::new(err),
-                    })
-                };
+            let handle_stream_error = |resilience: &CosmosResilienceConfig,
+                                       endpoint: &str,
+                                       err: azure_core::Error|
+             -> DataFusionError {
+                if crate::cosmosdb::resilience::is_permanent_error(&err)
+                    && resilience.disable_on_permanent_error
+                {
+                    resilience.disabled.store(true, Ordering::Release);
+                    tracing::error!(
+                        endpoint = %endpoint,
+                        "Permanent error from Azure Cosmos DB; disabling connector. {err}"
+                    );
+                }
+                to_df_error(Error::QueryFailed {
+                    database: config.database.clone(),
+                    container: config.container.clone(),
+                    source: Box::new(err),
+                })
+            };
 
             let mut pager = container_client
                 .query_items::<Value>(config.query.as_str(), (), None)
@@ -480,8 +479,8 @@ impl ExecutionPlan for CosmosDBExec {
             let mut buffer: Vec<Value> = Vec::with_capacity(STREAM_BATCH_SIZE);
 
             while let Some(item) = pager.next().await {
-                let doc =
-                    item.map_err(|e| handle_stream_error(&config.resilience, client.endpoint(), e))?;
+                let doc = item
+                    .map_err(|e| handle_stream_error(&config.resilience, client.endpoint(), e))?;
 
                 buffer.push(strip_system_fields(doc));
 
@@ -658,13 +657,9 @@ mod tests {
     #[test]
     fn unsupported_type_action_warn_drops_null_columns() {
         let schema = schema_with_null_column();
-        let projected = apply_unsupported_type_action(
-            &schema,
-            UnsupportedTypeAction::Warn,
-            "db",
-            "container",
-        )
-        .unwrap();
+        let projected =
+            apply_unsupported_type_action(&schema, UnsupportedTypeAction::Warn, "db", "container")
+                .unwrap();
         assert_eq!(projected.fields().len(), 1);
         assert_eq!(projected.field(0).name(), "id");
     }
@@ -699,26 +694,18 @@ mod tests {
     #[test]
     fn unsupported_type_action_error_surfaces_to_caller() {
         let schema = schema_with_null_column();
-        let err = apply_unsupported_type_action(
-            &schema,
-            UnsupportedTypeAction::Error,
-            "db",
-            "container",
-        )
-        .unwrap_err();
+        let err =
+            apply_unsupported_type_action(&schema, UnsupportedTypeAction::Error, "db", "container")
+                .unwrap_err();
         assert!(matches!(err, Error::UnsupportedColumn { .. }));
     }
 
     #[test]
     fn unsupported_type_action_is_noop_on_clean_schema() {
         let schema = sample_schema();
-        let projected = apply_unsupported_type_action(
-            &schema,
-            UnsupportedTypeAction::Error,
-            "db",
-            "container",
-        )
-        .unwrap();
+        let projected =
+            apply_unsupported_type_action(&schema, UnsupportedTypeAction::Error, "db", "container")
+                .unwrap();
         assert!(Arc::ptr_eq(&schema, &projected));
     }
 }

@@ -107,12 +107,12 @@ fn shared_disabled_flag(endpoint: &str) -> Arc<AtomicBool> {
     )
 }
 
-const COSMOSDB_METRICS: &[MetricSpec] = &[MetricSpec::new(
-    "inflight_operations",
-    MetricType::ObservableGaugeU64,
-)
-.description("Current number of Azure Cosmos DB requests holding a concurrency permit")
-.auto_register()];
+const COSMOSDB_METRICS: &[MetricSpec] =
+    &[
+        MetricSpec::new("inflight_operations", MetricType::ObservableGaugeU64)
+            .description("Current number of Azure Cosmos DB requests holding a concurrency permit")
+            .auto_register(),
+    ];
 
 #[derive(Debug, Clone)]
 struct CosmosDBMetricsProvider {

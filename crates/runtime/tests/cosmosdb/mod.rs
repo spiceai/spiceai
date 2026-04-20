@@ -59,8 +59,8 @@ struct LiveConfig {
 }
 
 fn live_config_from_env() -> Option<LiveConfig> {
-    let database = env::var("COSMOSDB_INTEGRATION_DATABASE")
-        .unwrap_or_else(|_| DEFAULT_DATABASE.to_string());
+    let database =
+        env::var("COSMOSDB_INTEGRATION_DATABASE").unwrap_or_else(|_| DEFAULT_DATABASE.to_string());
     let container = env::var("COSMOSDB_INTEGRATION_CONTAINER")
         .unwrap_or_else(|_| DEFAULT_CONTAINER.to_string());
 
@@ -140,7 +140,9 @@ async fn cosmosdb_live_select_returns_rows() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             let dataset = make_live_dataset("cosmos_live", &config);
-            let app = AppBuilder::new("cosmosdb_live").with_dataset(dataset).build();
+            let app = AppBuilder::new("cosmosdb_live")
+                .with_dataset(dataset)
+                .build();
 
             configure_test_datafusion();
             let rt = Runtime::builder().with_app(app).build().await;
