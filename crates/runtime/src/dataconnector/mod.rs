@@ -569,6 +569,27 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         None
     }
 
+    /// Pre-register any object stores this connector needs in order to execute
+    /// scans for `dataset` against the supplied `runtime_env`.
+    ///
+    /// Called on cluster executor startup so that physical plans decoded from
+    /// the scheduler can resolve their object stores via
+    /// `runtime_env().object_store(url)` even when the per-scan
+    /// `parquet_file_reader_factory` (or equivalent) is dropped during proto
+    /// round-trip.
+    ///
+    /// The default implementation is a no-op. Connectors backed by per-table
+    /// object stores (object-store-style connectors, Delta on S3/Azure/GCS,
+    /// Iceberg, etc.) should override this to register the appropriate stores
+    /// using the dataset's already secret-expanded params.
+    async fn register_object_stores(
+        &self,
+        _dataset: &Dataset,
+        _runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> DataConnectorResult<()> {
+        Ok(())
+    }
+
     /// A hook that is called when an accelerated table is registered to the
     /// `DataFusion` context for this data connector.
     ///
