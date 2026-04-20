@@ -52,16 +52,16 @@ limitations under the License.
 //! - External `$ref` URIs — emitted as `type = "ref"`, never dereferenced (no IO).
 //!
 //! Options (passed as named arguments):
-//! - `max_depth` (UInt, default 32) — walk stops past this depth.
-//! - `max_rows` (UInt, default 100_000) — per-document row cap.
-//! - `max_bytes` (UInt, default 8_388_608) — input size limit.
-//! - `dialect` (Utf8, `"json-schema"` | `"openapi"`, default `"json-schema"`) —
+//! - `max_depth` (`UInt`, default `32`) — walk stops past this depth.
+//! - `max_rows` (`UInt`, default `100_000`) — per-document row cap.
+//! - `max_bytes` (`UInt`, default `8_388_608`) — input size limit.
+//! - `dialect` (`Utf8`, `"json-schema"` | `"openapi"`, default `"json-schema"`) —
 //!   tags invocation metrics so operators can split `openapi` traffic from
 //!   `json-schema` traffic. The walker does not currently vary its behavior
-//!   based on dialect; OpenAPI-specific handling (e.g. `nullable: true`) is
+//!   based on dialect; `OpenAPI`-specific handling (e.g. `nullable: true`) is
 //!   future scope tracked with the rest of this UDTF.
-//! - `include_internal` (Bool, default `false`) — include container rows.
-//! - `path_style` (Utf8, `"dot"` | `"json-pointer"`, default `"dot"`).
+//! - `include_internal` (`Bool`, default `false`) — include container rows.
+//! - `path_style` (`Utf8`, `"dot"` | `"json-pointer"`, default `"dot"`).
 //!
 //! Telemetry: the walker emits OpenTelemetry counters
 //! `flatten_json_properties_invocations_total`,
@@ -272,12 +272,9 @@ pub fn flatten_with_options(input: &str, opts: &FlattenOptions) -> Vec<PropertyR
         return Vec::new();
     }
 
-    let root = match serde_json::from_str::<Value>(input) {
-        Ok(v) => v,
-        Err(_) => {
-            record_error("parse");
-            return Vec::new();
-        }
+    let Ok(root) = serde_json::from_str::<Value>(input) else {
+        record_error("parse");
+        return Vec::new();
     };
 
     let mut walker = Walker::new(&root, opts);
@@ -438,7 +435,10 @@ impl<'a> Walker<'a> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "internal helper threads per-row metadata; splitting into a struct adds noise without clarity"
+    )]
     fn emit_row(
         &mut self,
         raw_spec: &'a Value,
@@ -507,7 +507,7 @@ impl<'a> Walker<'a> {
     /// `ref_depth` tracks how deep we've recursed through `$ref` and
     /// `allOf`/`oneOf`/`anyOf` expansion at a single schema node. Capped at
     /// `opts.max_depth` so pathological combinator / ref chains can't blow the
-    /// stack or iterate unboundedly (DoS).
+    /// stack or iterate unboundedly (`DoS`).
     fn collect_effective(&mut self, schema: &'a Value, out: &mut Vec<&'a Value>, ref_depth: usize) {
         if ref_depth > self.opts.max_depth {
             if !self.depth_cap_hit {
@@ -735,13 +735,13 @@ fn literal_string(expr: &Expr) -> Result<Option<String>, String> {
     }
 }
 
-/// Recognise a `name => value` named-argument expression. DataFusion surfaces
+/// Recognise a `name => value` named-argument expression. `DataFusion` surfaces
 /// these as a literal tagged with `spice.parameter_name` metadata.
 fn named_arg(expr: &Expr) -> Option<(String, &ScalarValue)> {
     if let Expr::Literal(scalar, Some(meta)) = expr
         && let Some(name) = meta.inner().get("spice.parameter_name")
     {
-        return Some((name.to_string(), scalar));
+        return Some((name.clone(), scalar));
     }
     None
 }
@@ -1019,7 +1019,9 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
                 let rows = flatten_with_options(strings.value(idx), &opts);
                 all_rows.extend(rows);
             }
-            offsets.push(all_rows.len() as i64);
+            // Walker caps bound the row count well under `i64::MAX`;
+            // saturate rather than unwrap so lint allows the conversion.
+            offsets.push(i64::try_from(all_rows.len()).unwrap_or(i64::MAX));
         }
 
         let (struct_arrays, _) = build_property_arrays(&all_rows);

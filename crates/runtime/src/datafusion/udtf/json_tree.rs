@@ -16,8 +16,8 @@ limitations under the License.
 
 //! `json_tree` — recursive depth-first walk of an arbitrary JSON document.
 //!
-//! Schema-agnostic sibling of `flatten_json_properties`. Mirrors DuckDB /
-//! SQLite's table function of the same name: one row per node (interior and
+//! Schema-agnostic sibling of `flatten_json_properties`. Mirrors `DuckDB` /
+//! `SQLite`'s table function of the same name: one row per node (interior and
 //! leaf), in depth-first order, with JSON-Path addresses and a parent pointer.
 //!
 //! ```text
@@ -183,12 +183,9 @@ pub fn json_tree_with_options(input: &str, opts: &JsonTreeOptions) -> Vec<TreeRo
         return Vec::new();
     }
 
-    let root = match serde_json::from_str::<Value>(input) {
-        Ok(v) => v,
-        Err(_) => {
-            record_error("parse");
-            return Vec::new();
-        }
+    let Ok(root) = serde_json::from_str::<Value>(input) else {
+        record_error("parse");
+        return Vec::new();
     };
     let mut ctx = WalkCtx {
         rows: Vec::new(),
@@ -208,7 +205,10 @@ struct WalkCtx {
     row_cap_hit: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "walker threads per-node state; collapsing into a struct adds indirection without clarity"
+)]
 fn visit(
     node: &Value,
     key: Option<String>,
@@ -319,9 +319,9 @@ fn escape_object_key(key: &str) -> String {
     // SQLite / DuckDB JSON-path shorthand (`$.a.b`) accepts identifier-style
     // keys only — anything else, including hyphens, must be bracket-quoted so
     // consumers can re-parse the `fullkey`.
-    let simple = !key.is_empty()
-        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !key.chars().next().unwrap().is_ascii_digit();
+    let first = key.chars().next();
+    let simple = first.is_some_and(|c| !c.is_ascii_digit())
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
     if simple {
         key.to_owned()
     } else {
@@ -385,7 +385,7 @@ fn parse_udtf_args(exprs: &[Expr]) -> DataFusionResult<(Option<String>, JsonTree
         if let Expr::Literal(scalar, Some(meta)) = arg
             && let Some(name) = meta.inner().get("spice.parameter_name")
         {
-            let name = name.to_string();
+            let name = name.clone();
             match name.as_str() {
                 "max_depth" => opts.max_depth = parse_usize(&name, scalar)?,
                 "max_rows" => opts.max_rows = parse_usize(&name, scalar)?,
@@ -608,7 +608,9 @@ impl ScalarUDFImpl for JsonTreeScalar {
                 let rows = json_tree_with_options(strings.value(idx), &opts);
                 all_rows.extend(rows);
             }
-            offsets.push(all_rows.len() as i64);
+            // Walker caps bound the row count well under `i64::MAX`;
+            // saturate rather than unwrap so lint allows the conversion.
+            offsets.push(i64::try_from(all_rows.len()).unwrap_or(i64::MAX));
         }
 
         let struct_array =
