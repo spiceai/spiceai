@@ -3,4 +3,4 @@ tests:
     spicepod_path: federated/odbc[athena].yaml
     query_set: tpch
     query_overrides: odbc-athena
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners

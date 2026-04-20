@@ -1,0 +1,338 @@
+name: Publish to AWS Marketplace
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Docker image tag to publish (e.g., 1.3.0-enterprise-models)'
+        required: true
+        type: string
+      repositories:
+        description: 'Target ECR repositories'
+        required: true
+        type: choice
+        options:
+          - 'spice-ai/spiceai-enterprise-byol'
+          - 'spice-ai/spiceai-enterprise-plan'
+          - 'spice-ai/spiceai-enterprise-byol,spice-ai/spiceai-enterprise-plan'
+      platforms:
+        description: 'Platforms to publish (comma separated)'
+        required: false
+        default: 'linux/amd64,linux/arm64'
+        type: string
+      publish_docker:
+        description: 'Publish Docker images'
+        required: false
+        default: true
+        type: boolean
+      publish_helm:
+        description: 'Publish Helm chart'
+        required: false
+        default: true
+        type: boolean
+      allowed_account_ids:
+        description: 'Comma-separated AWS account IDs to grant read-only pull access'
+        required: false
+        default: '334818252477,155422166461,414415349098,623717348230,297512042063,100458166471,328738246330,782858285006,903332016402,058264185180'
+        type: string
+
+env:
+  ECR_REGISTRY: 709825985650.dkr.ecr.us-east-1.amazonaws.com
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: 903332016402
+
+permissions:
+  id-token: write
+  contents: read
+  packages: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      repositories: ${{ steps.parse.outputs.repositories }}
+    steps:
+      - name: Parse repository list
+        id: parse
+        run: |
+          # Convert comma-separated repositories into a compact JSON array for matrix strategy
+          REPOS="${{ inputs.repositories }}"
+          JSON=$(echo "${REPOS}" | jq -cR 'split(",") | map(ltrimstr(" ") | rtrimstr(" "))')
+          echo "repositories=${JSON}" >> "$GITHUB_OUTPUT"
+          echo "Repositories to publish: ${JSON}"
+
+  publish-docker:
+    needs: prepare
+    environment: production
+    if: ${{ inputs.publish_docker }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repository: ${{ fromJson(needs.prepare.outputs.repositories) }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/EnterpriseImageMarketplaceUpload
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR with Docker
+        run: |
+          set -e  # Exit on error
+          echo "Logging into ECR registry with Docker..."
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Login to GitHub Package Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull, tag and push images
+        env:
+          TAG: ${{ inputs.tag }}
+          OLD_TAG: ghcr.io/spicehq/spiceai-enterprise:${{ inputs.tag }}
+          NEW_TAG: ${{ env.ECR_REGISTRY }}/${{ matrix.repository }}:${{ inputs.tag }}
+        run: |
+          set -e  # Exit on error
+
+          # Parse platforms
+          IFS=',' read -ra PLATFORMS <<< "${{ inputs.platforms }}"
+
+          # Validate that we have platforms
+          if [ ${#PLATFORMS[@]} -eq 0 ]; then
+            echo "Error: No platforms specified"
+            exit 1
+          fi
+
+          echo "Publishing tag: ${TAG}"
+          echo "Source image: ${OLD_TAG}"
+          echo "Target image: ${NEW_TAG}"
+          echo "Target repository: ${{ matrix.repository }}"
+          echo "Platforms: ${PLATFORMS[*]}"
+
+          # Create manifest arguments array
+          MANIFEST_ARGS=""
+
+          # Process each platform
+          for PLATFORM in "${PLATFORMS[@]}"; do
+            ARCH=$(echo "${PLATFORM}" | cut -d'/' -f2) # linux/amd64 -> amd64
+            ARCH_TAG="${{ env.ECR_REGISTRY }}/${{ matrix.repository }}:${TAG}-${ARCH}"
+            
+            echo "Processing platform: ${PLATFORM}, arch: ${ARCH}"
+            
+            # Pull the image for specific platform
+            echo "Pulling ${OLD_TAG} for platform ${PLATFORM}..."
+            docker pull --platform "${PLATFORM}" "${OLD_TAG}"
+            
+            # Tag for ECR
+            echo "Tagging as ${ARCH_TAG}..."
+            docker tag "${OLD_TAG}" "${ARCH_TAG}"
+            
+            # Push architecture-specific image
+            echo "Pushing ${ARCH_TAG}..."
+            docker push "${ARCH_TAG}"
+            
+            # Add to manifest arguments
+            MANIFEST_ARGS="${MANIFEST_ARGS} --amend ${ARCH_TAG}"
+          done
+
+          echo "Creating manifest with args: ${MANIFEST_ARGS}"
+
+          # Create and push manifest
+          docker manifest create "${NEW_TAG}" ${MANIFEST_ARGS}
+          docker manifest push "${NEW_TAG}"
+
+          # Verify manifest
+          echo "Verifying manifest:"
+          docker manifest inspect "${NEW_TAG}"
+
+  publish-helm:
+    needs: prepare
+    environment: production
+    if: ${{ inputs.publish_helm }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repository: ${{ fromJson(needs.prepare.outputs.repositories) }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/EnterpriseImageMarketplaceUpload
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+        with:
+          version: 'latest'
+
+      - name: Modify Helm chart for enterprise
+        working-directory: deploy/chart
+        run: |
+          set -e  # Exit on error
+
+          echo "Original Chart.yaml:"
+          cat Chart.yaml
+          echo ""
+          echo "Original values.yaml (image section):"
+          grep -A 2 "image:" values.yaml
+          echo ""
+
+          # Extract chart name from repository (e.g., spice-ai/spiceai-enterprise -> spiceai-enterprise)
+          CHART_NAME=$(echo "${{ matrix.repository }}" | cut -d'/' -f2)
+          echo "Chart name extracted from repository: ${CHART_NAME}"
+
+          # Update Chart.yaml for enterprise version
+          sed -i "s/name: spiceai-enterprise/name: ${CHART_NAME}/" Chart.yaml
+
+          # Update values.yaml to use ECR image
+          sed -i 's|repository: ghcr.io/spicehq/spiceai-enterprise|repository: ${{ env.ECR_REGISTRY }}/${{ matrix.repository }}|' values.yaml
+          sed -i 's/tag: .*/tag: ${{ inputs.tag }}/' values.yaml
+
+          echo "Modified Chart.yaml:"
+          cat Chart.yaml
+          echo ""
+          echo "Modified values.yaml (image section):"
+          grep -A 2 "image:" values.yaml
+
+      - name: Login to Amazon ECR with Helm
+        run: |
+          set -e  # Exit on error
+          echo "Logging into ECR registry with Helm..."
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | helm registry login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+
+      - name: Package and push Helm chart
+        working-directory: deploy/chart
+        run: |
+          set -e  # Exit on error
+
+          # Extract chart name from repository (e.g., spice-ai/spiceai-enterprise -> spiceai-enterprise)
+          CHART_NAME=$(echo "${{ matrix.repository }}" | cut -d'/' -f2)
+
+          # Package the chart
+          echo "Packaging Helm chart..."
+          helm package .
+
+          # List generated package
+          echo "Generated packages:"
+          ls -la *.tgz
+
+          # Validate package exists
+          CHART_PACKAGE=$(ls ${CHART_NAME}-*.tgz | head -1)
+          if [ -z "${CHART_PACKAGE}" ]; then
+            echo "Error: No chart package found"
+            exit 1
+          fi
+
+          echo "Pushing chart package: ${CHART_PACKAGE}"
+
+          # Push to ECR
+          helm push "${CHART_PACKAGE}" oci://${{ env.ECR_REGISTRY }}/spice-ai/
+
+          echo "Successfully pushed Helm chart: ${CHART_PACKAGE}"
+
+  set-ecr-pull-policy:
+    needs: [prepare, publish-docker]
+    environment: production
+    if: ${{ inputs.allowed_account_ids != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repository: ${{ fromJson(needs.prepare.outputs.repositories) }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/EnterpriseImageMarketplaceUpload
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set ECR repository policy for pull access
+        env:
+          REPO_NAME: ${{ matrix.repository }}
+          ALLOWED_ACCOUNTS: ${{ inputs.allowed_account_ids }}
+        run: |
+          set -euo pipefail
+
+          # Extract registry ID from ECR_REGISTRY URL
+          REGISTRY_ID=$(echo "${{ env.ECR_REGISTRY }}" | cut -d'.' -f1)
+
+          # Build the principals array from comma-separated account IDs
+          IFS=',' read -ra ACCOUNTS <<< "${ALLOWED_ACCOUNTS}"
+
+          if [ ${#ACCOUNTS[@]} -eq 0 ]; then
+            echo "Error: No account IDs specified"
+            exit 1
+          fi
+
+          PRINCIPALS=""
+          for ACCOUNT in "${ACCOUNTS[@]}"; do
+            ACCOUNT=$(echo "${ACCOUNT}" | xargs) # trim whitespace
+
+            # Validate account ID is a 12-digit number
+            if ! [[ "${ACCOUNT}" =~ ^[0-9]{12}$ ]]; then
+              echo "Error: Invalid AWS account ID '${ACCOUNT}'. Must be a 12-digit number."
+              exit 1
+            fi
+
+            if [ -n "${PRINCIPALS}" ]; then
+              PRINCIPALS="${PRINCIPALS},"
+            fi
+            PRINCIPALS="${PRINCIPALS}\"arn:aws:iam::${ACCOUNT}:root\""
+          done
+
+          POLICY=$(cat <<EOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Sid": "AllowCrossAccountPull",
+                "Effect": "Allow",
+                "Principal": {
+                  "AWS": [${PRINCIPALS}]
+                },
+                "Action": [
+                  "ecr:GetDownloadUrlForLayer",
+                  "ecr:BatchGetImage",
+                  "ecr:BatchCheckLayerAvailability",
+                  "ecr:DescribeImages"
+                ]
+              }
+            ]
+          }
+          EOF
+          )
+
+          # Merge with any existing repository policy to preserve other statements
+          EXISTING_POLICY=$(aws ecr get-repository-policy \
+            --registry-id "${REGISTRY_ID}" \
+            --repository-name "${REPO_NAME}" \
+            --query 'policyText' --output text 2>/dev/null || echo '')
+
+          if [ -n "${EXISTING_POLICY}" ]; then
+            echo "Merging with existing repository policy..."
+            # Remove our Sid from existing, then append our new statement
+            MERGED_POLICY=$(echo "${EXISTING_POLICY}" | jq --argjson new "${POLICY}" '
+              .Statement = ([.Statement[] | select(.Sid != "AllowCrossAccountPull")] + $new.Statement)
+            ')
+            POLICY="${MERGED_POLICY}"
+          fi
+
+          echo "Setting repository policy for ${REPO_NAME} in registry ${REGISTRY_ID}..."
+          echo "Granting pull access to: ${ALLOWED_ACCOUNTS}"
+
+          aws ecr set-repository-policy \
+            --registry-id "${REGISTRY_ID}" \
+            --repository-name "${REPO_NAME}" \
+            --policy-text "${POLICY}"
+
+          echo "Repository policy set successfully for ${REPO_NAME}"

@@ -1,0 +1,317 @@
+name: E2E Test Release Installation (AI)
+on:
+  workflow_dispatch:
+    inputs:
+      install_script_branch:
+        description: 'Branch to use for install script (leave empty to use install.spiceai.org)'
+        required: false
+        type: string
+        default: ''
+      platform_option:
+        description: 'Which platform do you want to run on? (Default is all)'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - 'macOS aarch64 (GPU M4)'
+          - 'Linux aarch64'
+          - 'macOS aarch64'
+          - 'Windows x64 (WSL)'
+        default: 'all'
+  pull_request:
+    paths:
+      - 'install/install.sh'
+      - 'install/Install.ps1'
+      - '.github/workflows/e2e_test_release_install_ai.yml'
+  push:
+    branches:
+      - trunk
+    paths:
+      - 'install/install.sh'
+      - 'install/Install.ps1'
+      - '.github/workflows/e2e_test_release_install_ai.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  setup-matrix:
+    name: Setup matrix
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.setup-matrix.outputs.result }}
+
+    steps:
+      - name: Set up matrix
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        id: setup-matrix
+        with:
+          script: |
+            const matrix = [
+              {
+                name: "macOS aarch64 (GPU M4)",
+                runner: "spiceai-macos",
+                target_os: "darwin",
+                target_arch: "aarch64",
+                tags: ["metal"]
+              },
+              {
+                name: "Linux aarch64",
+                runner: "hosted-linux-arm-runner",
+                target_os: "linux",
+                target_arch: "aarch64",
+                tags: []
+              },
+              {
+                name: "macOS aarch64",
+                runner: "macos-15",
+                target_os: "darwin",
+                target_arch: "aarch64",
+                tags: []
+              }
+            ];
+
+            const platform_option = context.payload.inputs?.platform_option || 'all';
+            let filtered = matrix;
+
+            if (platform_option !== 'all') {
+              filtered = filtered.filter(m => m.name === platform_option);
+            }
+
+            return filtered;
+
+  test-install:
+    name: ${{ matrix.target.name }}
+    runs-on: ${{ matrix.target.runner }}
+    needs: setup-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+
+    steps:
+      - name: system info
+        run: uname -m
+
+      - name: checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      # The aarch64 Linux runner does not have tools pre-installed
+      - name: Install missing tools
+        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt install jq -y
+
+      # The `windows-gpu-t4-4-core` does not have PowerShell installed
+      - name: Install PowerShell
+        if: matrix.target.runner == 'windows-gpu-t4-4-core'
+        uses: ./.github/actions/install-pwsh
+
+      # nvidia-smi is not available on windows-gpu-t4-4-core, installing CUDA Toolkit
+      - name: Install CUDA Toolkit (Windows)
+        if: matrix.target.runner == 'windows-gpu-t4-4-core'
+        uses: Jimver/cuda-toolkit@b6fc3a9f3f15256d9d94ffe1254f9c5a2565cde6 # v0.2.30
+        id: cuda-toolkit
+        with:
+          method: network
+          sub-packages: '[]'
+          cuda: '12.6.0'
+          use-github-cache: false
+          use-local-cache: false
+
+      - name: CUDA version
+        if: contains(matrix.target.tags, 'cuda')
+        run: |
+          nvidia-smi
+          nvidia-smi --query-gpu=compute_cap --format=csv
+
+      # on self-hosted runners, there is a newer dev version installed, so we need to remove it first
+      - name: remove existing release
+        if: matrix.target.runner == 'spiceai-macos'
+        run: |
+          rm -rf ~/.spice/bin/
+
+      - name: install Spice (https://install.spiceai.org)
+        if: github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl https://install.spiceai.org | /bin/bash
+
+      - name: install Spice (from branch)
+        if: github.event_name != 'workflow_dispatch' || inputs.install_script_branch != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
+          curl -sSL \
+            -H "Cache-Control: no-cache" \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/install/install.sh?ref=${BRANCH}" \
+            -o /tmp/install.sh
+          bash /tmp/install.sh
+
+      - name: add Spice bin to PATH
+        run: |
+          echo "$HOME/.spice/bin" >> $GITHUB_PATH
+
+      - name: install AI runtime version
+        run: |
+          spice install ai
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: check installation
+        run: |
+          spice version
+
+      - name: Init Spice app (OpenAI model)
+        if: "!contains(matrix.target.tags, 'metal')"
+        run: |
+          cp ./test/models/spicepod_openai.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      # acceleration is currently supported for metal target only
+      - name: Init Spice app (Huggingface model)
+        if: contains(matrix.target.tags, 'metal')
+        run: |
+          cp ./test/models/spicepod_hf.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      - name: Start Spice runtime
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICE_OPENAI_API_KEY: ${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}
+        run: |
+          spice run &> spice.log &
+
+      - name: Wait for Spice runtime is ready
+        timeout-minutes: 3
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Install expect (linux)
+        if: matrix.target.target_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+
+      - name: Install expect (macOS)
+        if: matrix.target.target_os == 'darwin'
+        run: |
+          brew install expect
+
+      - name: Test vector search
+        run: |
+          ./test/models/search_01.exp
+
+      - name: Test chat
+        run: |
+          ./test/models/chat_01_simple.exp
+
+      - name: Stop spice and check logs
+        if: always()
+        run: |
+          killall spice || true
+          cat spice.log
+
+  # The spiced AI runtime does not start reliably within a reasonable time on native Windows.
+  # Instead, we install the Spice CLI natively (via Install.ps1) then run spiced inside WSL
+  # where startup performance is consistent with Linux.
+  test-install-windows-wsl:
+    name: Windows x64 (WSL)
+    runs-on: windows-latest
+    steps:
+      - name: checkout code
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Setup WSL
+        uses: Vampire/setup-wsl@6a8db447be7ed35f2f499c02c6e60ff77ef11278 # v6.0.0
+        with:
+          distribution: Ubuntu-22.04
+          additional-packages: curl jq
+
+      - name: install Spice (https://install.spiceai.org)
+        if: github.event_name == 'workflow_dispatch' && inputs.install_script_branch == ''
+        shell: wsl-bash {0}
+        run: |
+          curl https://install.spiceai.org | /bin/bash
+
+      - name: install Spice (from branch)
+        if: github.event_name != 'workflow_dispatch' || inputs.install_script_branch != ''
+        shell: wsl-bash {0}
+        run: |
+          BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
+          # Use the GitHub Actions expression for the token directly — WSL does not inherit
+          # env vars from the Windows runner, so ${{ secrets.GITHUB_TOKEN }} is expanded
+          # by the Actions runner before the script is handed to wsl-bash.
+          curl -sSL \
+            -H "Cache-Control: no-cache" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/install/install.sh?ref=${BRANCH}" \
+            -o /tmp/install.sh
+          bash /tmp/install.sh
+
+      - name: install AI runtime version
+        shell: wsl-bash {0}
+        run: |
+          export PATH="$HOME/.spice/bin:$PATH"
+          GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}" spice install ai
+
+      - name: check installation
+        shell: wsl-bash {0}
+        run: |
+          export PATH="$HOME/.spice/bin:$PATH"
+          spice version
+
+      - name: Init Spice app (OpenAI model)
+        shell: wsl-bash {0}
+        run: |
+          cp ./test/models/spicepod_openai.yml ./spicepod.yaml
+          cat ./spicepod.yaml
+
+      - name: Install expect
+        shell: wsl-bash {0}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y expect
+
+      - name: Start Spice runtime and run AI tests
+        shell: wsl-bash {0}
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.spice/bin:$PATH"
+          export SPICE_OPENAI_API_KEY="${{ secrets.SPICE_SECRET_OPENAI_API_KEY }}"
+          export GITHUB_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+
+          cleanup() {
+            killall spice || true
+            if [ -f spice.log ]; then
+              cat spice.log
+            fi
+          }
+          trap cleanup EXIT
+
+          spice run &> spice.log &
+
+          echo "Waiting for Spice runtime to be ready..."
+          ready=false
+          for i in $(seq 1 180); do
+            if [ "$(curl -s http://localhost:8090/v1/ready)" = "ready" ]; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ready" != "true" ]; then
+            echo "Spice runtime failed to become ready"
+            exit 1
+          fi
+
+          expect ./test/models/search_01.exp
+          expect ./test/models/chat_01_simple.exp

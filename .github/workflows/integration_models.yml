@@ -99,7 +99,6 @@ jobs:
           region: us-west-1
 
       - name: Set up sccache
-        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
@@ -139,7 +138,7 @@ jobs:
           compression-level: 1
 
       - name: Kill spiceio
-        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        if: always() && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
       - name: Upload spiceio logs
@@ -415,7 +414,6 @@ jobs:
           region: us-west-1
 
       - name: Set up sccache
-        if: runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != ''
         uses: ./.github/actions/setup-sccache
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
@@ -452,7 +450,7 @@ jobs:
           compression-level: 1
 
       - name: Kill spiceio
-        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        if: always() && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
       - name: Upload spiceio logs

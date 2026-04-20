@@ -3,20 +3,20 @@ tests:
     spicepod_path: federated/databricks[catalog].yaml
     query_set: tpch
     query_overrides: databricks-catalog
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     validate_results: true
   throughput:
     spicepod_path: federated/databricks[catalog].yaml
     query_set: tpch
     query_overrides: databricks-catalog
-    runner_type: spiceai-dev-large-runners
+    runner_type: spicehq-dev-large-runners
   load:
     spicepod_path: federated/databricks[catalog].yaml
     query_set: tpch
     query_overrides: databricks-catalog
-    runner_type: spiceai-dev-large-runners
+    runner_type: spicehq-dev-large-runners
     duration: 28800
   schema:
     spicepod_path: federated/databricks[catalog].yaml
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     min_tables: 1

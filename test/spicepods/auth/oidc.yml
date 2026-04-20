@@ -1,0 +1,11 @@
+version: v2
+kind: Spicepod
+name: auth_test_oidc
+
+runtime:
+  auth:
+    oidc:
+      enabled: true
+      issuer_url: https://login.microsoftonline.com/${AZURE_TENANT_ID}/v2.0
+      audience:
+        - ${AZURE_CLIENT_ID}

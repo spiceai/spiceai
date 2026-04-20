@@ -37,7 +37,11 @@ use runtime_datafusion_udfs::{
     bucket::{BUCKET_SCALAR_UDF_NAME, Bucket},
     cosine_distance::{COSINE_DISTANCE_UDF_NAME, CosineDistance},
     digest_many::{DIGEST_UDF_NAME, INSTANCE},
+    org::{ORG_UDF_NAME, OrgUdf},
+    role::{ROLE_UDF_NAME, RoleUdf},
+    session_property::{SESSION_PROPERTY_UDF_NAME, SessionPropertyUdf},
     truncate::{TRUNCATE_SCALAR_UDF_NAME, Truncate},
+    user::{USER_UDF_NAME, UserUdf},
 };
 
 /// Register core scalar UDFs that have no runtime dependencies.
@@ -50,6 +54,10 @@ pub fn register_core_scalar_udfs(ctx: &SessionContext) {
     ctx.register_udf(CosineDistance::new().into());
     ctx.register_udf(Truncate::new().into());
     ctx.register_udf(INSTANCE.clone());
+    ctx.register_udf(UserUdf::new().into());
+    ctx.register_udf(OrgUdf::new().into());
+    ctx.register_udf(RoleUdf::new().into());
+    ctx.register_udf(SessionPropertyUdf::new().into());
 }
 
 pub async fn register_udfs(runtime: &crate::Runtime) {
@@ -101,6 +109,10 @@ static DENY_SPICE_SPECIFIC_FUNCTIONS: LazyLock<FunctionSupport> = LazyLock::new(
         #[cfg(feature = "models")]
         AI_UDF_NAME,
         DIGEST_UDF_NAME,
+        USER_UDF_NAME,
+        ORG_UDF_NAME,
+        ROLE_UDF_NAME,
+        SESSION_PROPERTY_UDF_NAME,
     ];
 
     FunctionSupport::new(

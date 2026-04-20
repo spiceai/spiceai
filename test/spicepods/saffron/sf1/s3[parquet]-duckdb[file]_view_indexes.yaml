@@ -1,0 +1,147 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-duckdb[file]_view_indexes
+
+runtime:
+  dataset_load_parallelism: 1
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: true
+    captured_plan: explain
+    min_plan_duration: 50ms
+
+refresh_check_interval: &refresh_check_interval 3m
+
+datasets:
+  - from: s3://benchmarks/saffron/v2/number_info_sf1
+    name: number_info
+    time_column: __iceberg_processed_time
+    time_format: timestamptz
+    params: &params_s3
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration:
+      enabled: true
+      retention_sql: DELETE FROM number_info WHERE __deleted != 'false'
+      refresh_check_interval: *refresh_check_interval
+      engine: duckdb
+      mode: file
+      refresh_mode: append
+      primary_key: NumberSid
+      on_conflict:
+        NumberSid: upsert
+      params:
+        duckdb_preserve_insertion_order: false
+        duckdb_memory_limit: 16GiB
+
+  - from: s3://benchmarks/saffron/v2/number_caps_sf1
+    name: number_caps
+    time_column: __iceberg_processed_time
+    time_format: timestamptz
+    params: *params_s3
+    acceleration:
+      enabled: true
+      retention_sql: DELETE FROM number_caps WHERE __deleted != 'false'
+      refresh_check_interval: *refresh_check_interval
+      engine: duckdb
+      mode: file
+      refresh_mode: append
+      primary_key: '(NumberSid, Capability)'
+      on_conflict:
+        '(NumberSid, Capability)': upsert
+      params:
+        duckdb_preserve_insertion_order: false
+        duckdb_memory_limit: 16GiB
+
+  - from: s3://benchmarks/saffron/v2/sender_info_sf1
+    name: sender_info_by_arrival
+    time_column: __iceberg_processed_time
+    time_format: timestamptz
+    params: *params_s3
+    acceleration:
+      enabled: true
+      retention_sql: DELETE FROM sender_info_by_arrival WHERE __deleted != 'false'
+      refresh_check_interval: *refresh_check_interval
+      engine: duckdb
+      mode: file
+      refresh_mode: append
+      primary_key: AutoId
+      on_conflict:
+        AutoId: upsert
+      params:
+        duckdb_preserve_insertion_order: false
+        duckdb_memory_limit: 16GiB
+
+views:
+  - name: sender_info
+    sql: |
+      select
+      AutoId,
+      AccountSid,
+      NumberPoolSid,
+      SenderSid,
+      SenderIdentity,
+      Region,
+      Rate,
+      SenderType,
+      DateCreated,
+      DateUpdated,
+      LastUsed
+      from sender_info_by_arrival
+      order by AccountSid, NumberPoolSid
+    acceleration:
+      enabled: true
+      refresh_check_interval: *refresh_check_interval
+      engine: duckdb
+      mode: file
+      refresh_on_startup: auto
+      params:
+        query_federation: disabled
+        duckdb_file: sender_info.duckdb
+        duckdb_preserve_insertion_order: true
+        duckdb_memory_limit: 6GiB
+      indexes:
+        '(AccountSid, NumberPoolSid)': enabled
+
+  - name: number_info_with_cap
+    sql: |
+      select
+      ni.DateCreated,
+      ni.DateUpdated,
+      ni.AccountSid,
+      ni.NumberPoolSid,
+      ni.NumberSid,
+      ni.MaxRate,
+      ni.NumberDid,
+      ni.NumberType,
+      ni.SupportedDestRegion,
+      ni.NumberRegion,
+      ni.CurrentRate,
+      ni.IsAvailable,
+      ni.ProviderSid,
+      ni.AreaCodeRegion,
+      ni.AvailableForNumberSelection,
+      nc.Capability
+      from number_info ni
+      inner join number_caps nc
+      on ni.NumberSid = nc.NumberSid
+      order by ni.AccountSid, ni.NumberPoolSid, nc.Capability
+    acceleration:
+      enabled: true
+      refresh_check_interval: *refresh_check_interval
+      engine: duckdb
+      mode: file
+      refresh_on_startup: auto
+      params:
+        query_federation: disabled
+        duckdb_preserve_insertion_order: true
+        duckdb_file: number_info_with_cap.duckdb
+        duckdb_memory_limit: 16GiB
+      indexes:
+        '(AccountSid, NumberPoolSid)': enabled

@@ -21,6 +21,9 @@ on:
       - 'install/Install.ps1'
       - '.github/workflows/e2e_test_release_install.yml'
 
+permissions:
+  contents: read
+
 env:
   PREVIOUS_STABLE_VERSION: v1.11.4
   PREVIEW_UPGRADE_VERSION: v2.0.0-rc.2
@@ -34,7 +37,7 @@ jobs:
       matrix:
         include:
           - name: Linux x64
-            runner: spiceai-dev-runners
+            runner: spicehq-dev-runners
             target_os: linux
             target_arch: x86_64
           - name: Linux aarch64
@@ -67,7 +70,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
-          curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${BRANCH}/install/install.sh" | /bin/bash
+          curl -sSL -H "Cache-Control: no-cache" -H "Authorization: token ${GITHUB_TOKEN}" -H "Accept: application/vnd.github.v3.raw" "https://api.github.com/repos/${{ github.repository }}/contents/install/install.sh?ref=${BRANCH}" | /bin/bash
 
       - name: add Spice bin to PATH
         run: |
@@ -269,11 +272,18 @@ jobs:
       - name: install Spice (from branch)
         if: github.event_name != 'workflow_dispatch' || inputs.install_script_branch != ''
         shell: wsl-bash {0}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="${{ inputs.install_script_branch || github.head_ref || github.ref_name }}"
-          curl -sSL -H "Cache-Control: no-cache" "https://raw.githubusercontent.com/spiceai/spiceai/${BRANCH}/install/install.sh" | /bin/bash
+          # Use the GitHub Actions expression for the token directly — WSL does not inherit
+          # env vars from the Windows runner, so ${{ secrets.GITHUB_TOKEN }} is expanded
+          # by the Actions runner before the script is handed to wsl-bash.
+          curl -sSL \
+            -H "Cache-Control: no-cache" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/install/install.sh?ref=${BRANCH}" \
+            -o /tmp/install.sh
+          bash /tmp/install.sh
 
       - name: check installation
         shell: wsl-bash {0}

@@ -549,6 +549,54 @@ impl TaskHistory {
 pub struct Auth {
     #[serde(alias = "api-key")]
     pub api_key: Option<ApiKeyAuth>,
+    pub oidc: Option<OidcAuth>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OidcAuth {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// The OIDC issuer URL (e.g. `https://accounts.google.com`).
+    /// Used for discovery of the JWKS endpoint.
+    pub issuer_url: String,
+    /// The accepted `aud` values in the JWT. A token is valid if its `aud` claim
+    /// matches any of these values.
+    pub audience: Vec<String>,
+    /// JWT claim names to extract group memberships from. Groups from all matching
+    /// claims are merged. Defaults to `["groups"]`.
+    #[serde(default = "default_groups_claims")]
+    pub groups_claims: Vec<String>,
+    /// Configurable claim mappings for extracting identity fields from JWT tokens.
+    /// Maps JWT claim names to identity context fields (`user_id`, `org_id`, `roles`).
+    #[serde(default)]
+    pub claims: OidcClaimMappings,
+}
+
+/// Maps JWT claim names to identity context fields.
+///
+/// Example YAML:
+/// ```yaml
+/// claims:
+///   user_id: sub
+///   org_id: "https://myapp.com/org_id"
+///   roles:
+///     - "https://myapp.com/roles"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OidcClaimMappings {
+    /// JWT claim to use as the primary user identifier. Defaults to `"sub"`.
+    #[serde(default = "default_user_id_claim")]
+    pub user_id: String,
+    /// JWT claim to extract the organization/tenant identifier from.
+    pub org_id: Option<String>,
+    /// JWT claim names to extract role memberships from. Roles from all matching
+    /// claims are merged.
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -614,6 +662,14 @@ pub struct CorsConfig {
     pub enabled: bool,
     #[serde(default = "default_allowed_origins")]
     pub allowed_origins: Vec<String>,
+}
+
+fn default_groups_claims() -> Vec<String> {
+    vec!["groups".to_string()]
+}
+
+fn default_user_id_claim() -> String {
+    "sub".to_string()
 }
 
 fn default_allowed_origins() -> Vec<String> {

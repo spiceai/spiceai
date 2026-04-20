@@ -1,0 +1,179 @@
+---
+name: Integration Tests (Auth)
+
+on:
+  schedule:
+    - cron: '30 2 * * *' # Daily at 02:30 UTC
+
+  workflow_dispatch:
+    inputs:
+      spiced_commit:
+        description: 'An optional commit hash to use for spiced'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  cancel-in-progress: true
+
+env:
+  SPICE_API_KEY: integration-test-key-20260415
+
+jobs:
+  # ── OIDC-only ────────────────────────────────────────────────────────
+  test-oidc:
+    name: OIDC Authentication (Entra ID)
+    runs-on: spicehq-dev-runners
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Install MinIO CLI
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        with:
+          spiced_commit: ${{ inputs.spiced_commit }}
+
+      - name: Prepare spicepod
+        env:
+          AZURE_TENANT_ID: ${{ secrets.OIDC_AZURE_TENANT_ID }}
+        run: |
+          mkdir -p test_app
+          envsubst < test/spicepods/auth/oidc.yml > test_app/spicepod.yml
+          test -s test_app/spicepod.yml
+
+      - name: Start spiced
+        working-directory: test_app
+        run: |
+          spiced &> spiced.log &
+          echo "SPICED_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for spiced to be ready
+        timeout-minutes: 2
+        run: |
+          until curl -sf http://localhost:8090/v1/ready > /dev/null 2>&1; do sleep 1; done
+
+      - name: Run OIDC auth tests
+        env:
+          AZURE_TENANT_ID: ${{ secrets.OIDC_AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.OIDC_AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.OIDC_AZURE_CLIENT_SECRET }}
+          OIDC_SCOPE: 'api://6a000e68-c1ce-4f22-ad03-a92cd42792a6/.default'
+        run: python3 test/auth/test_auth.py --mode oidc
+
+      - name: Stop spiced and show logs
+        if: always()
+        run: |
+          kill "$SPICED_PID" 2>/dev/null || true
+          echo "--- spiced.log ---"
+          cat test_app/spiced.log
+
+  # ── API key only ─────────────────────────────────────────────────────
+  test-api-key:
+    name: API Key Authentication
+    runs-on: spicehq-dev-runners
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Install MinIO CLI
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        with:
+          spiced_commit: ${{ inputs.spiced_commit }}
+
+      - name: Prepare spicepod
+        run: |
+          mkdir -p test_app
+          envsubst < test/spicepods/auth/api_key.yml > test_app/spicepod.yml
+          test -s test_app/spicepod.yml
+
+      - name: Start spiced
+        working-directory: test_app
+        run: |
+          spiced &> spiced.log &
+          echo "SPICED_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for spiced to be ready
+        timeout-minutes: 2
+        run: |
+          until curl -sf http://localhost:8090/v1/ready > /dev/null 2>&1; do sleep 1; done
+
+      - name: Run API key auth tests
+        run: python3 test/auth/test_auth.py --mode api_key
+
+      - name: Stop spiced and show logs
+        if: always()
+        run: |
+          kill "$SPICED_PID" 2>/dev/null || true
+          echo "--- spiced.log ---"
+          cat test_app/spiced.log
+
+  # ── Combined (OIDC + API key) ───────────────────────────────────────
+  test-combined:
+    name: Combined Authentication (OIDC + API Key)
+    runs-on: spicehq-dev-runners
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Install MinIO CLI
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Setup spiced
+        uses: ./.github/actions/setup-spiced
+        with:
+          spiced_commit: ${{ inputs.spiced_commit }}
+
+      - name: Prepare spicepod
+        env:
+          AZURE_TENANT_ID: ${{ secrets.OIDC_AZURE_TENANT_ID }}
+        run: |
+          mkdir -p test_app
+          envsubst < test/spicepods/auth/oidc_api_key.yml > test_app/spicepod.yml
+          test -s test_app/spicepod.yml
+
+      - name: Start spiced
+        working-directory: test_app
+        run: |
+          spiced &> spiced.log &
+          echo "SPICED_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for spiced to be ready
+        timeout-minutes: 2
+        run: |
+          until curl -sf http://localhost:8090/v1/ready > /dev/null 2>&1; do sleep 1; done
+
+      - name: Run combined auth tests
+        env:
+          AZURE_TENANT_ID: ${{ secrets.OIDC_AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.OIDC_AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.OIDC_AZURE_CLIENT_SECRET }}
+          OIDC_SCOPE: 'api://6a000e68-c1ce-4f22-ad03-a92cd42792a6/.default'
+        run: python3 test/auth/test_auth.py --mode combined
+
+      - name: Stop spiced and show logs
+        if: always()
+        run: |
+          kill "$SPICED_PID" 2>/dev/null || true
+          echo "--- spiced.log ---"
+          cat test_app/spiced.log

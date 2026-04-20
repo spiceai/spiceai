@@ -25,7 +25,6 @@ connector-sftp = { path = "../../crates/data-connectors/connector-sftp", optiona
 connector-mongodb = { path = "../../crates/data-connectors/connector-mongodb", optional = true }
 connector-mssql = { path = "../../crates/data-connectors/connector-mssql", optional = true }
 connector-mysql = { path = "../../crates/data-connectors/connector-mysql", optional = true }
-# connector-nfs requires system libnfs library - build separately with `nfs` feature
 connector-nfs = { path = "../../crates/data-connectors/connector-nfs", optional = true }
 connector-odbc = { path = "../../crates/data-connectors/connector-odbc", optional = true }
 connector-oracle = { path = "../../crates/data-connectors/connector-oracle", optional = true }
@@ -52,7 +51,7 @@ runtime-async = { path = "../../crates/runtime-async" }
 rustls.workspace = true
 yaml = { path = "../../crates/yaml" }
 snafu.workspace = true
-snmalloc-rs = { version = "0.3.6" }
+snmalloc-rs = { version = "0.3.6", optional = true }
 spice-cloud = { path = "../../crates/spice_cloud" }
 telemetry = { path = "../../crates/telemetry" }
 tikv-jemallocator = { version = "0.6.0", optional = true }
@@ -69,7 +68,7 @@ util = { path = "../../crates/util"}
 adbc = ["runtime/adbc"]
 alloc-jemalloc = ["dep:tikv-jemallocator"]
 alloc-mimalloc = ["dep:mimalloc"]
-alloc-snmalloc = []
+alloc-snmalloc = ["dep:snmalloc-rs"]
 alloc-system = []
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
@@ -91,6 +90,7 @@ default = [
     "sharepoint",
     "snapshots",
     "snowflake",
+    "snapshots",
     "spark",
     "ftp",
     "sftp",
@@ -100,16 +100,16 @@ default = [
     "mssql",
     "dynamodb",
     "imap",
-    "alloc-snmalloc",
     "oracle",
     "runtime/s3_vectors",
     "mongodb",
     "iceberg-write",
-    "turso",
     "smb",
     "pingora",
     "scylladb",
     "models",
+    "odbc",
+    "vortex",
 ]
 delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]
@@ -129,7 +129,6 @@ models = ["runtime/models"]
 mongodb = ["connector-mongodb", "runtime/mongodb"]
 mssql = ["connector-mssql", "runtime/mssql"]
 mysql = ["connector-mysql", "runtime/mysql"]
-# nfs feature requires system libnfs library and connector-nfs crate
 nfs = ["connector-nfs", "runtime/nfs"]
 odbc = ["connector-odbc"]
 oracle = ["connector-oracle", "runtime/oracle"]
@@ -149,3 +148,5 @@ sqlite = ["runtime/sqlite"]
 tpc-extension = ["dep:tpc-extension"]
 turso = ["runtime/turso"]
 vortex = ["runtime/vortex"]
+
+

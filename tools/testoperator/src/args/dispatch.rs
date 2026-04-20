@@ -290,13 +290,9 @@ impl<'de> Deserialize<'de> for LoadArgs {
 /// Represents the type of runner to use in the action
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum RunnerType {
-    #[serde(rename = "spiceai-runners")]
-    SelfHosted,
-    #[serde(rename = "spiceai-large-runners")]
-    LargeSelfHosted,
-    #[serde(rename = "spiceai-dev-runners")]
+    #[serde(rename = "spicehq-dev-runners")]
     Dev,
-    #[serde(rename = "spiceai-dev-large-runners")]
+    #[serde(rename = "spicehq-dev-large-runners")]
     DevLarge,
 }
 
@@ -442,12 +438,12 @@ tests:
     spicepod_path: s3[parquet]-turso[file].yaml
     query_set: tpch
     ready_wait: 300
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
   load:
     spicepod_path: s3[parquet]-turso[file].yaml
     query_set: tpch
     ready_wait: 300
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
     concurrency: 128
     duration: 1800
     random_param_set_count: 1000
@@ -491,7 +487,7 @@ tests:
     - spicepod_path: s3[parquet]-turso[file].yaml
       query_set: tpch
       ready_wait: 300
-      runner_type: spiceai-dev-runners
+      runner_type: spicehq-dev-runners
       concurrency: 128
       duration: 1800
       random_param_set_count: 1000
@@ -505,7 +501,7 @@ tests:
     - spicepod_path: different-spicepod.yaml
       query_set: tpch
       ready_wait: 120
-      runner_type: spiceai-dev-runners
+      runner_type: spicehq-dev-runners
       concurrency: 64
       duration: 900
       random_param_set_count: 500

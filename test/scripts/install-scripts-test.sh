@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Verification Test Suite for Spice.ai Install Scripts
-# 
+#
 # This test suite validates the install scripts across all variants, platforms,
 # and edge cases. The install scripts are the first experience developers have
 # with the product, so they must be rock solid.
@@ -74,9 +74,9 @@ log_verbose() {
 run_test() {
     local test_name="$1"
     local test_func="$2"
-    
+
     TEST_COUNT=$((TEST_COUNT + 1))
-    
+
     if $test_func; then
         PASS_COUNT=$((PASS_COUNT + 1))
         log_pass "$test_name"
@@ -91,7 +91,7 @@ run_test() {
 skip_test() {
     local test_name="$1"
     local reason="$2"
-    
+
     TEST_COUNT=$((TEST_COUNT + 1))
     SKIP_COUNT=$((SKIP_COUNT + 1))
     log_skip "$test_name - $reason"
@@ -133,7 +133,7 @@ test_shellcheck_passes() {
         log_verbose "shellcheck not installed, skipping"
         return 0  # Pass if shellcheck not available
     fi
-    
+
     # Run shellcheck with common exclusions for install scripts
     # SC2034: unused variables (often used for configuration)
     # SC2086: word splitting (often intentional)
@@ -154,14 +154,14 @@ get_spiced_artifact_name() {
     local arch="$2"
     local variant="${3:-}"
     local cuda_version="${4:-}"
-    
+
     local artifact_name="spiced"
-    
+
     # For Windows, .exe comes right after spiced
     if [[ "$os" == "windows" ]]; then
         artifact_name="${artifact_name}.exe"
     fi
-    
+
     # Add variant suffix
     if [[ -n "$variant" ]]; then
         if [[ "$variant" == "cuda" ]]; then
@@ -172,14 +172,14 @@ get_spiced_artifact_name() {
             artifact_name="${artifact_name}_${variant}"
         fi
     fi
-    
+
     echo "${artifact_name}_${os}_${arch}.tar.gz"
 }
 
 get_spice_artifact_name() {
     local os="$1"
     local arch="$2"
-    
+
     echo "spice_${os}_${arch}.tar.gz"
 }
 
@@ -298,15 +298,15 @@ test_artifacts_exist_in_latest_release() {
     if [[ "$LIVE_TESTS" != "true" ]]; then
         return 0
     fi
-    
+
     local release_assets
     release_assets=$(curl -sS "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"name":' | grep -E "spice.*\.tar\.gz" || true)
-    
+
     if [[ -z "$release_assets" ]]; then
         log_verbose "Could not fetch release assets"
         return 1
     fi
-    
+
     # Check critical artifacts exist
     local expected_artifacts=(
         "spice_linux_x86_64.tar.gz"
@@ -322,7 +322,7 @@ test_artifacts_exist_in_latest_release() {
         "spiced.exe_windows_x86_64.tar.gz"
         "spiced.exe_models_windows_x86_64.tar.gz"
     )
-    
+
     local missing=0
     for artifact in "${expected_artifacts[@]}"; do
         if ! echo "$release_assets" | grep -q "\"$artifact\""; then
@@ -330,7 +330,7 @@ test_artifacts_exist_in_latest_release() {
             missing=$((missing + 1))
         fi
     done
-    
+
     [[ $missing -eq 0 ]]
 }
 
@@ -343,9 +343,9 @@ test_download_url_format_spiced() {
     local tag="v1.10.0"
     local artifact="spiced_models_linux_x86_64.tar.gz"
     local expected_url="https://github.com/spiceai/spiceai/releases/download/${tag}/${artifact}"
-    
+
     local constructed_url="https://github.com/spiceai/spiceai/releases/download/${tag}/${artifact}"
-    
+
     [[ "$constructed_url" == "$expected_url" ]]
 }
 
@@ -353,9 +353,9 @@ test_download_url_format_spice() {
     local tag="v1.10.0"
     local artifact="spice_linux_x86_64.tar.gz"
     local expected_url="https://github.com/spiceai/spiceai/releases/download/${tag}/${artifact}"
-    
+
     local constructed_url="https://github.com/spiceai/spiceai/releases/download/${tag}/${artifact}"
-    
+
     [[ "$constructed_url" == "$expected_url" ]]
 }
 
@@ -368,7 +368,7 @@ test_variant_validation_cuda_only_linux() {
     # This tests the logic, not actual script execution
     local os="linux"
     local variant="cuda"
-    
+
     # CUDA on Linux should be valid
     [[ "$os" == "linux" ]] && [[ "$variant" == "cuda" ]]
 }
@@ -377,7 +377,7 @@ test_variant_validation_cuda_invalid_darwin() {
     # CUDA on darwin should be invalid
     local os="darwin"
     local variant="cuda"
-    
+
     # This should fail (CUDA not valid on darwin)
     ! ([[ "$os" != "linux" ]] && [[ "$variant" == "cuda" ]] && false) || \
     [[ "$os" != "linux" ]]
@@ -387,7 +387,7 @@ test_variant_validation_metal_only_darwin() {
     # Metal variants should only be valid on macOS
     local os="darwin"
     local variant="metal"
-    
+
     [[ "$os" == "darwin" ]] && [[ "$variant" == "metal" ]]
 }
 
@@ -395,7 +395,7 @@ test_variant_validation_metal_invalid_linux() {
     # Metal on Linux should be invalid
     local os="linux"
     local variant="metal"
-    
+
     [[ "$os" != "darwin" ]]
 }
 
@@ -656,7 +656,7 @@ test_live_latest_release_accessible() {
     if [[ "$LIVE_TESTS" != "true" ]]; then
         return 0
     fi
-    
+
     local response
     response=$(curl -sS -o /dev/null -w "%{http_code}" "https://api.github.com/repos/spiceai/spiceai/releases/latest")
     [[ "$response" == "200" ]]
@@ -666,21 +666,21 @@ test_live_download_url_resolves() {
     if [[ "$LIVE_TESTS" != "true" ]]; then
         return 0
     fi
-    
+
     # Get latest release tag
     local tag
     tag=$(curl -sS "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*: "\(.*\)",/\1/')
-    
+
     if [[ -z "$tag" ]]; then
         log_verbose "Could not get latest tag"
         return 1
     fi
-    
+
     # Check if a known artifact URL returns 302 (redirect to download)
     local url="https://github.com/spiceai/spiceai/releases/download/${tag}/spice_linux_x86_64.tar.gz"
     local response
     response=$(curl -sS -o /dev/null -w "%{http_code}" -L "$url" 2>/dev/null || echo "000")
-    
+
     [[ "$response" == "200" ]]
 }
 
@@ -688,18 +688,18 @@ test_live_spiced_models_linux_downloadable() {
     if [[ "$LIVE_TESTS" != "true" ]]; then
         return 0
     fi
-    
+
     local tag
     tag=$(curl -sS "https://api.github.com/repos/spiceai/spiceai/releases/latest" | grep '"tag_name"' | head -1 | sed 's/.*: "\(.*\)",/\1/')
-    
+
     if [[ -z "$tag" ]]; then
         return 1
     fi
-    
+
     local url="https://github.com/spiceai/spiceai/releases/download/${tag}/spiced_models_linux_x86_64.tar.gz"
     local response
     response=$(curl -sS -o /dev/null -w "%{http_code}" -L "$url" 2>/dev/null || echo "000")
-    
+
     [[ "$response" == "200" ]]
 }
 
@@ -828,14 +828,14 @@ run_all_tests() {
     echo "  Spice.ai Install Script Test Suite"
     echo "=========================================="
     echo ""
-    
+
     if [[ "$LIVE_TESTS" == "true" ]]; then
         log_info "Live tests enabled (will make network requests)"
     else
         log_info "Live tests disabled (use --live to enable)"
     fi
     echo ""
-    
+
     # Script Validation
     echo "--- Script Validation ---"
     run_test "Scripts exist" test_scripts_exist
@@ -844,7 +844,7 @@ run_all_tests() {
     run_test "No jq dependency" test_no_jq_dependency
     run_test "Shellcheck passes (if available)" test_shellcheck_passes
     echo ""
-    
+
     # Artifact Naming - Linux x86_64
     echo "--- Artifact Naming: Linux x86_64 ---"
     run_test "Linux x86_64 default artifact name" test_artifact_name_linux_x86_64_default
@@ -855,39 +855,39 @@ run_all_tests() {
     run_test "Linux x86_64 CUDA 86 artifact name" test_artifact_name_linux_x86_64_cuda_86
     run_test "Linux x86_64 CUDA 80 artifact name" test_artifact_name_linux_x86_64_cuda_80
     echo ""
-    
+
     # Artifact Naming - Linux aarch64
     echo "--- Artifact Naming: Linux aarch64 ---"
     run_test "Linux aarch64 default artifact name" test_artifact_name_linux_aarch64_default
     run_test "Linux aarch64 models artifact name" test_artifact_name_linux_aarch64_models
     echo ""
-    
+
     # Artifact Naming - macOS
     echo "--- Artifact Naming: macOS (darwin) ---"
     run_test "Darwin aarch64 default artifact name" test_artifact_name_darwin_aarch64_default
     run_test "Darwin aarch64 models artifact name" test_artifact_name_darwin_aarch64_models
     run_test "Darwin aarch64 metal artifact name" test_artifact_name_darwin_aarch64_metal
     echo ""
-    
+
     # Artifact Naming - Windows
     echo "--- Artifact Naming: Windows ---"
     run_test "Windows x86_64 default artifact name" test_artifact_name_windows_x86_64_default
     run_test "Windows x86_64 models artifact name" test_artifact_name_windows_x86_64_models
     echo ""
-    
+
     # Artifact Naming - Spice CLI
     echo "--- Artifact Naming: Spice CLI ---"
     run_test "Spice CLI Linux x86_64 artifact name" test_artifact_name_spice_linux_x86_64
     run_test "Spice CLI Darwin aarch64 artifact name" test_artifact_name_spice_darwin_aarch64
     run_test "Spice CLI Linux aarch64 artifact name" test_artifact_name_spice_linux_aarch64
     echo ""
-    
+
     # URL Construction
     echo "--- URL Construction ---"
     run_test "Download URL format for spiced" test_download_url_format_spiced
     run_test "Download URL format for spice" test_download_url_format_spice
     echo ""
-    
+
     # Platform Validation
     echo "--- Platform Validation ---"
     run_test "CUDA valid only on Linux" test_variant_validation_cuda_only_linux
@@ -895,7 +895,7 @@ run_all_tests() {
     run_test "Metal valid only on Darwin" test_variant_validation_metal_only_darwin
     run_test "Metal invalid on Linux" test_variant_validation_metal_invalid_linux
     echo ""
-    
+
     # Architecture Mapping
     echo "--- Architecture Mapping ---"
     run_test "arm64 maps to aarch64" test_arch_mapping_arm64_to_aarch64
@@ -903,7 +903,7 @@ run_all_tests() {
     run_test "armv7 maps to arm" test_arch_mapping_armv7_to_arm
     run_test "x86_64 unchanged" test_arch_mapping_x86_64_unchanged
     echo ""
-    
+
     # OS Detection
     echo "--- OS Detection ---"
     run_test "MINGW detected as Windows" test_os_detection_mingw_to_windows
@@ -912,7 +912,7 @@ run_all_tests() {
     run_test "Linux unchanged" test_os_detection_linux_unchanged
     run_test "Darwin unchanged" test_os_detection_darwin_unchanged
     echo ""
-    
+
     # Supported Platforms
     echo "--- Supported Platforms ---"
     run_test "Four platforms supported" test_supported_platforms_list
@@ -922,7 +922,7 @@ run_all_tests() {
     run_test "windows-x86_64 is supported" test_windows_x86_64_is_supported
     run_test "darwin-x86_64 is NOT supported" test_darwin_x86_64_is_not_supported
     echo ""
-    
+
     # CUDA Versions
     echo "--- CUDA Version Validation ---"
     run_test "CUDA version 80 valid" test_cuda_version_80_valid
@@ -932,21 +932,21 @@ run_all_tests() {
     run_test "CUDA version 90 valid" test_cuda_version_90_valid
     run_test "CUDA version 85 invalid" test_cuda_version_invalid
     echo ""
-    
+
     # Default Values
     echo "--- Default Values ---"
     run_test "Default variant is models" test_default_variant_is_models
     run_test "Variant can be overridden" test_variant_can_be_overridden
     run_test "Empty variant behavior" test_variant_can_be_empty
     echo ""
-    
+
     # Retry Logic
     echo "--- Retry Logic ---"
     run_test "Max retries is 3" test_retry_config_max_retries
     run_test "Initial delay is 2 seconds" test_retry_config_initial_delay
     run_test "Exponential backoff works" test_retry_exponential_backoff
     echo ""
-    
+
     # Script Functions
     echo "--- Script Functions ---"
     run_test "install.sh has getLatestRelease" test_install_sh_has_getLatestRelease
@@ -959,7 +959,7 @@ run_all_tests() {
     run_test "install-spiced.sh has verifySupported" test_install_spiced_sh_has_verifySupported
     run_test "install-spiced.sh has no checkJqInstalled" test_install_spiced_sh_no_checkJqInstalled
     echo ""
-    
+
     # Documentation
     echo "--- Documentation ---"
     run_test "Naming convention documented" test_spiced_naming_convention_documented
@@ -968,7 +968,7 @@ run_all_tests() {
     run_test "Metal variant documented" test_spiced_variant_metal_documented
     run_test "CUDA variant documented" test_spiced_variant_cuda_documented
     echo ""
-    
+
     # Error Handling
     echo "--- Error Handling ---"
     run_test "install.sh has error handling" test_script_has_error_handling
@@ -976,7 +976,7 @@ run_all_tests() {
     run_test "install-spiced.sh has fail_trap" test_spiced_script_has_fail_trap
     run_test "install-spiced.sh has cleanup" test_spiced_script_has_cleanup
     echo ""
-    
+
     # Live Tests (if enabled)
     if [[ "$LIVE_TESTS" == "true" ]]; then
         echo "--- Live Network Tests ---"
@@ -986,7 +986,7 @@ run_all_tests() {
         run_test "All expected artifacts exist" test_artifacts_exist_in_latest_release
         echo ""
     fi
-    
+
     # Summary
     echo "=========================================="
     echo "  Test Summary"
@@ -1003,7 +1003,7 @@ run_all_tests() {
         echo -e "  ${YELLOW}Skipped: ${SKIP_COUNT}${NC}"
     fi
     echo ""
-    
+
     if [[ $FAIL_COUNT -gt 0 ]]; then
         echo -e "${RED}Some tests failed!${NC}"
         return 1

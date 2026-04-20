@@ -80,7 +80,7 @@ jobs:
   run-bench:
     name: Run ${{ matrix.target.name }}
     timeout-minutes: 60
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     needs:
       - setup-matrix
     strategy:

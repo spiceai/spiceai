@@ -1,0 +1,70 @@
+version: v1
+kind: Spicepod
+name: s3[parquet]-duckdb[file]_indexes_with_partitioning
+
+runtime:
+  caching:
+    sql_results:
+      enabled: false
+  task_history:
+    enabled: true
+    captured_plan: explain
+    min_plan_duration: 50ms
+
+refresh_check_interval: &refresh_check_interval 3m
+
+# Uses static dataset because retention not yet supported for partitioning: https://github.com/spiceai/spiceai/issues/8233
+datasets:
+  - from: s3://benchmarks/saffron/number_info_sf1
+    name: number_info
+    time_column: DateCreated
+    time_format: timestamptz
+    params: &params_s3
+      file_format: parquet
+      allow_http: true
+      s3_auth: key
+      s3_endpoint: ${secrets:S3_ENDPOINT}
+      s3_key: ${secrets:S3_KEY}
+      s3_secret: ${secrets:S3_SECRET}
+    acceleration:
+      enabled: true
+      refresh_check_interval: *refresh_check_interval
+      engine: duckdb
+      mode: file
+      refresh_mode: append
+      params:
+        duckdb_preserve_insertion_order: false
+      indexes:
+        '(AccountSid, NumberPoolSid)': enabled
+      partition_by:
+        - bucket(32, AccountSid)
+
+  - from: s3://benchmarks/saffron/number_caps_sf1
+    name: number_caps
+    params: *params_s3
+    acceleration:
+      enabled: true
+      refresh_check_interval: *refresh_check_interval
+      engine: duckdb
+      mode: file
+      params:
+        duckdb_preserve_insertion_order: false
+      indexes:
+        NumberSid: enabled
+      partition_by:
+        - bucket(32, NumberSid)
+
+  - from: s3://benchmarks/saffron/sender_info_sf1
+    name: sender_info
+    params: *params_s3
+    acceleration:
+      enabled: true
+      refresh_check_interval: *refresh_check_interval
+      engine: duckdb
+      mode: file
+      params:
+        duckdb_preserve_insertion_order: false
+      indexes:
+        AccountSid: enabled
+      partition_by:
+        - bucket(32, AccountSid)

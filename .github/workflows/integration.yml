@@ -1,39 +1,47 @@
+# ============================================================================
+# DISABLED: This workflow comes from upstream (spiceai/spiceai).
+# The enterprise version is ent_integration.yml
+# This file is kept only to prevent merge conflicts with upstream.
+# ============================================================================
 ---
-name: integration tests
+name: 'integration tests (upstream - disabled)'
 
-on:
-  push:
-    branches:
-      - trunk
-      - release/*
-  pull_request:
-    branches:
-      - trunk
-      - release-*
-      - release/*
-      - feature-*
-  merge_group:
-    branches:
-      - trunk
-      - release-*
-      - release/*
-      - feature-*
+on: [workflow_dispatch]
 
-  workflow_dispatch:
-    inputs:
-      update_snapshots:
-        description: 'Update the snapshots?'
-        required: false
-        default: 'no'
-        type: choice
-        options:
-          - 'always'
-          - 'no'
-      run_all_tests:
-        description: 'Run all tests'
-        type: boolean
-        required: false
-        default: false
+# Original triggers and inputs preserved below for merge-conflict avoidance:
+# on:
+#   push:
+#     branches:
+#       - trunk
+#       - release/*
+#   pull_request:
+#     branches:
+#       - trunk
+#       - release-*
+#       - release/*
+#       - feature-*
+#   merge_group:
+#     branches:
+#       - trunk
+#       - release-*
+#       - release/*
+#       - feature-*
+#
+#   workflow_dispatch:
+#     inputs:
+#       update_snapshots:
+#         description: 'Update the snapshots?'
+#   required: false
+#   default: 'no'
+#   type: choice
+#   options:
+#     - 'always'
+#     - 'no'
+# run_all_tests:
+#   description: 'Run all tests'
+#   type: boolean
+#   required: false
+#   default: false
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -54,7 +62,7 @@ jobs:
   # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
   # a success when skipped).
   check_changes:
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     outputs:
       relevant_changes: ${{ steps.check.outputs.relevant_changes }}
     steps:
@@ -70,7 +78,7 @@ jobs:
   build:
     name: Build Test Binary
     needs: check_changes
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -209,7 +217,7 @@ jobs:
     needs: [build, check_changes]
     permissions:
       contents: write
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     strategy:
       fail-fast: false
       matrix:
@@ -370,7 +378,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -415,7 +423,7 @@ jobs:
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -455,7 +463,7 @@ jobs:
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -499,7 +507,7 @@ jobs:
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
     permissions: read-all
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:
@@ -529,7 +537,7 @@ jobs:
     name: Partition Table Integration Tests
     needs: [build, check_changes]
     if: needs.check_changes.outputs.relevant_changes == 'true'
-    runs-on: spiceai-dev-runners
+    runs-on: spicehq-dev-runners
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
         with:

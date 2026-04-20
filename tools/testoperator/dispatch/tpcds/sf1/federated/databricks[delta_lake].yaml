@@ -2,13 +2,13 @@ tests:
   bench:
     spicepod_path: federated/databricks[delta_lake].yaml
     query_set: tpcds
-    runner_type: spiceai-dev-runners
+    runner_type: spicehq-dev-runners
   throughput:
     spicepod_path: federated/databricks[delta_lake].yaml
     query_set: tpcds
-    runner_type: spiceai-dev-large-runners
+    runner_type: spicehq-dev-large-runners
   load:
     spicepod_path: federated/databricks[delta_lake].yaml
     query_set: tpcds
-    runner_type: spiceai-dev-large-runners
+    runner_type: spicehq-dev-large-runners
     duration: 28800

@@ -1572,6 +1572,7 @@ fn generate_adbc_spicepod(
                     key: key.to_string(),
                 }],
             }),
+            oidc: None,
         }),
         flight: Some(Flight {
             do_put_rate_limit_enabled: false,

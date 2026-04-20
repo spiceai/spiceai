@@ -9,17 +9,41 @@ ARG BINARY_VARIANT=default
 ARG TARGETOS
 ARG TARGETARCH
 ARG GITHUB_REPOSITORY=spiceai/spiceai
+ARG GITHUB_TOKEN
 
 RUN if [ -z "$REL_VERSION" ]; then echo "REL_VERSION build-arg is required" >&2; exit 1; fi
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates curl tar \
+    && apt-get install --yes --no-install-recommends ca-certificates curl tar jq \
     && rm -rf /var/lib/{apt,dpkg,cache,log}
 
 ENV REL_VERSION=${REL_VERSION}
 ENV BINARY_VARIANT=${BINARY_VARIANT}
 
 RUN set -eux; \
+    download_asset_url() { \
+      if [ -n "${GITHUB_TOKEN:-}" ]; then \
+        curl -fSL -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/octet-stream" "$1" -o /tmp/spiced.tar.gz; \
+      else \
+        curl -fSL -H "Accept: application/octet-stream" "$1" -o /tmp/spiced.tar.gz; \
+      fi; \
+    }; \
+    fetch_release_json() { \
+      if [ -n "${GITHUB_TOKEN:-}" ]; then \
+        curl -fSs -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" "$1" -o /tmp/release.json; \
+      else \
+        curl -fSs -H "Accept: application/vnd.github+json" "$1" -o /tmp/release.json; \
+      fi; \
+    }; \
+    download_via_api() { \
+      asset_id="$1"; \
+      asset_api_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"; \
+      if [ -n "${GITHUB_TOKEN:-}" ]; then \
+        curl -fSL -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/octet-stream" "${asset_api_url}" -o /tmp/spiced.tar.gz; \
+      else \
+        curl -fSL -H "Accept: application/octet-stream" "${asset_api_url}" -o /tmp/spiced.tar.gz; \
+      fi; \
+    }; \
     case "${TARGETOS}" in \
       ""|linux) os_slug=linux ;; \
       *) echo "Unsupported TARGETOS: ${TARGETOS}" >&2; exit 1 ;; \
@@ -36,17 +60,46 @@ RUN set -eux; \
       variant_slug=$(printf '%s' "${BINARY_VARIANT}" | tr '[:upper:]' '[:lower:]' | tr '-' '_'); \
       asset="spiced_${variant_slug}_${os_slug}_${arch_slug}.tar.gz"; \
     fi; \
-    base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${REL_VERSION}/${asset}"; \
-    if ! curl -fSLo /tmp/spiced.tar.gz "${base_url}"; then \
-      if [ "${BINARY_VARIANT}" = "odbc" ]; then \
-        asset="spiced_odbc_models_${os_slug}_${arch_slug}.tar.gz"; \
-        base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${REL_VERSION}/${asset}"; \
-        curl -fSLo /tmp/spiced.tar.gz "${base_url}"; \
-      else \
-        echo "Failed to download release asset from ${base_url}" >&2; \
+    set -- "${asset}"; \
+    if [ "${BINARY_VARIANT}" = "odbc" ]; then \
+      set -- "$@" "spiced_odbc_models_${os_slug}_${arch_slug}.tar.gz"; \
+    fi; \
+    release_url="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/v${REL_VERSION}"; \
+    asset_downloaded=false; \
+    if fetch_release_json "${release_url}"; then \
+      for candidate in "$@"; do \
+        asset_id=$(jq -e --arg name "${candidate}" '.assets[] | select(.name == $name) | .id' /tmp/release.json 2>/dev/null || true); \
+        if [ -n "${asset_id}" ]; then \
+          download_via_api "${asset_id}"; \
+          asset_downloaded=true; \
+          asset="${candidate}"; \
+          break; \
+        fi; \
+      done; \
+    else \
+      echo "Failed to query GitHub release API for v${REL_VERSION}, falling back to direct download URLs." >&2; \
+    fi; \
+    if [ "${asset_downloaded}" = false ]; then \
+      if [ -f /tmp/release.json ]; then \
+        echo "Available assets for v${REL_VERSION}:" >&2; \
+        jq -r '.assets[].name' /tmp/release.json >&2 || true; \
+      fi; \
+      download_success=false; \
+      for candidate in "$@"; do \
+        fallback_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${REL_VERSION}/${candidate}"; \
+        echo "Attempting direct asset URL ${fallback_url}" >&2; \
+        if download_asset_url "${fallback_url}"; then \
+          asset="${candidate}"; \
+          download_success=true; \
+          break; \
+        fi; \
+      done; \
+      if [ "${download_success}" = false ]; then \
+        echo "Failed to download release asset matching candidates for ${BINARY_VARIANT}" >&2; \
         exit 1; \
       fi; \
     fi; \
+    rm -f /tmp/release.json 2>/dev/null || true; \
     tar -C /root -xzf /tmp/spiced.tar.gz; \
     chmod +x /root/spiced; \
     rm -f /tmp/spiced.tar.gz
@@ -54,9 +107,9 @@ RUN set -eux; \
 FROM ${BASE_IMAGE} AS sandbox-setup
 
 ARG CARGO_FEATURES=default
-ARG INSTALL_ORACLE_ODPIC=false
-ARG ORACLE_INSTANTCLIENT_SHA256_AMD64=05b4c01c77521eee32c89550d3a2e2f4d9f9601a79af96da441dfdd2d2a32ec4
-ARG ORACLE_INSTANTCLIENT_SHA256_ARM64=1d27641f16df1b1384f5d61cdcbd95a5ca57ba5d25ed881edde56543f8c6d135
+ARG INSTALL_ORACLE_ODPIC=true
+ARG ORACLE_INSTANTCLIENT_SHA256_AMD64=208bc7a9372efae098ab743d6e76aeb66e6f42579dcdbb7a6a8438412481b02e
+ARG ORACLE_INSTANTCLIENT_SHA256_ARM64=390999bc623c39c065f1236b8b1331b342431564a7a5e36e4c645fe8d159fc5e
 
 # Install required packages
 RUN apt-get update \
@@ -87,8 +140,14 @@ RUN cp -r /etc/ssl/certs /spice_sandbox/etc/ssl/certs
 RUN cp -r /usr/share/zoneinfo /spice_sandbox/usr/share/zoneinfo
 
 # Copy every dependent library reported by ldd
-# The sed removes trailing colons/parens that appear in ldd output, and grep -v filters memory addresses
-RUN ldd /spice_sandbox/usr/local/bin/spiced | grep -o '/[^ ]*' | sed 's/[:)]$//' | grep -v '^/spice_sandbox' | sort -u | xargs -I '{}' sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"'
+RUN set -eux; \
+    ldd /spice_sandbox/usr/local/bin/spiced \
+    | awk '{ for (i = 1; i <= NF; i++) { if ($i ~ "^/") { path = $i; while (path ~ /[:)]$/) sub(/[:)]$/, "", path); if (path !~ "^/spice_sandbox/") print path; } } }' \
+    | sort -u \
+    | while read -r lib; do \
+        mkdir -p "/spice_sandbox$(dirname "$lib")"; \
+        cp "$lib" "/spice_sandbox$lib"; \
+      done
 
 # Copy additional required libraries
 RUN find /lib /usr/lib -name 'libpthread.so.0' -exec sh -c 'mkdir -p /spice_sandbox/$(dirname "{}") && cp "{}" "/spice_sandbox{}"' \;
@@ -97,7 +156,7 @@ RUN find /lib /usr/lib -name 'libdl.so.2' -exec sh -c 'mkdir -p /spice_sandbox/$
 
 # Preinstall Oracle ODPI-C (if enabled)
 RUN if [ "$INSTALL_ORACLE_ODPIC" = "true" ]; then \
-    set -euo pipefail; \
+    set -eu; \
     apt-get update && apt-get install -y --no-install-recommends libaio1 unzip curl; \
     ARCH=$(dpkg --print-architecture); \
     if [ "$ARCH" = "amd64" ]; then \

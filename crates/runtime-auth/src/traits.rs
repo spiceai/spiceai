@@ -17,6 +17,7 @@ limitations under the License.
 use std::sync::Arc;
 
 use crate::error::Error;
+use crate::identity::IdentityContext;
 use app::spicepod::component::runtime::ApiKey;
 use axum::http;
 
@@ -25,6 +26,13 @@ pub type AuthPrincipalRef = Arc<dyn AuthPrincipal + Sync + Send>;
 pub trait AuthPrincipal {
     fn username(&self) -> &str; // The username as presented during auth
     fn groups(&self) -> &[&str]; // Group memberships
+
+    /// Returns the rich identity context for this principal, if available.
+    ///
+    /// Default implementation returns `None` for backward compatibility.
+    fn identity_context(&self) -> Option<&IdentityContext> {
+        None
+    }
 }
 pub trait AuthRequestContext {
     /// Sets the current authentication principal for the request context.
@@ -58,6 +66,10 @@ impl AuthPrincipal for ApiKey {
             ApiKey::ReadOnly { .. } => &["read"],
             ApiKey::ReadWrite { .. } => &["read_write"],
         }
+    }
+
+    fn identity_context(&self) -> Option<&IdentityContext> {
+        None
     }
 }
 
