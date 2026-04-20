@@ -232,7 +232,7 @@ fn apply_unsupported_type_action(
                     return Err(Error::UnsupportedColumn {
                         database: database.to_string(),
                         container: container.to_string(),
-                        column: field.name().to_string(),
+                        column: field.name().clone(),
                         data_type: format!("{:?}", field.data_type()),
                     });
                 }

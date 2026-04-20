@@ -157,7 +157,7 @@ impl std::error::Error for ResilienceError {
 pub fn is_permanent_error(err: &azure_core::Error) -> bool {
     matches!(
         err.http_status().map(u16::from),
-        Some(401) | Some(403) | Some(404)
+        Some(401 | 403 | 404)
     )
 }
 
