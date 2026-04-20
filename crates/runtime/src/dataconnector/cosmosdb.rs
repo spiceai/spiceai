@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Azure Cosmos DB (NoSQL / Core SQL API) data connector.
+//! Azure Cosmos DB (`NoSQL` / Core SQL API) data connector.
 //!
 //! Read-only scan with schema inferred from a sample of documents, backed by
 //! RC-level connection resilience (concurrency limiting, retry with backoff,
