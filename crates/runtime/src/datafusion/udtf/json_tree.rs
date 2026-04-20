@@ -129,7 +129,9 @@ static TREE_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
         Field::new("id", DataType::Int64, false),
         Field::new("parent", DataType::Int64, true),
         Field::new("fullkey", DataType::Utf8, false),
-        Field::new("path", DataType::Utf8, false),
+        // `path` is the parent JSON-Path. The root row has no parent, so it's
+        // emitted as NULL (matches DuckDB / SQLite `json_tree` semantics).
+        Field::new("path", DataType::Utf8, true),
     ])
 });
 
@@ -153,7 +155,7 @@ pub struct TreeRow {
     pub id: i64,
     pub parent: Option<i64>,
     pub fullkey: String,
-    pub path: String,
+    pub path: Option<String>,
 }
 
 // -------- Public entry points --------
@@ -184,7 +186,7 @@ pub fn json_tree_with_options(input: &str, opts: &JsonTreeOptions) -> Vec<TreeRo
         next_id: 0,
         depth_cap_hit: false,
     };
-    visit(&root, None, None, "$", "", 0, opts, &mut ctx);
+    visit(&root, None, None, "$", None, 0, opts, &mut ctx);
     ROWS_EMITTED.add(ctx.rows.len() as u64, &[]);
     ctx.rows
 }
@@ -201,7 +203,7 @@ fn visit(
     key: Option<String>,
     parent: Option<i64>,
     fullkey: &str,
-    path: &str,
+    path: Option<&str>,
     depth: usize,
     opts: &JsonTreeOptions,
     ctx: &mut WalkCtx,
@@ -224,7 +226,7 @@ fn visit(
         id,
         parent,
         fullkey: fullkey.to_owned(),
-        path: path.to_owned(),
+        path: path.map(ToOwned::to_owned),
     });
 
     match node {
@@ -236,7 +238,7 @@ fn visit(
                     Some(child_key.clone()),
                     Some(id),
                     &child_fullkey,
-                    fullkey,
+                    Some(fullkey),
                     depth + 1,
                     opts,
                     ctx,
@@ -246,12 +248,14 @@ fn visit(
         Value::Array(items) => {
             for (idx, child) in items.iter().enumerate() {
                 let child_fullkey = format!("{fullkey}[{idx}]");
+                // DuckDB / SQLite `json_tree` sets `key` to the array index as
+                // a string so consumers can distinguish array siblings.
                 visit(
                     child,
-                    None,
+                    Some(idx.to_string()),
                     Some(id),
                     &child_fullkey,
-                    fullkey,
+                    Some(fullkey),
                     depth + 1,
                     opts,
                     ctx,
@@ -466,7 +470,10 @@ fn build_tree_arrays(rows: &[TreeRow]) -> Vec<ArrayRef> {
             None => parent.append_null(),
         }
         fullkey.append_value(&row.fullkey);
-        path.append_value(&row.path);
+        match &row.path {
+            Some(v) => path.append_value(v),
+            None => path.append_null(),
+        }
     }
 
     vec![

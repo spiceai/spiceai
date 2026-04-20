@@ -366,7 +366,8 @@ impl<'a> Walker<'a> {
             .unwrap_or_else(|| "unknown".to_owned());
 
         let is_container = matches!(type_name.as_str(), "object" | "array" | "map");
-        if !is_container || self.opts.include_internal {
+        let emit_container_now = !is_container || self.opts.include_internal;
+        if emit_container_now {
             self.emit_row(
                 spec,
                 &effective_specs,
@@ -385,6 +386,7 @@ impl<'a> Walker<'a> {
         // effective branches internally with a single `seen_names` set, so
         // overlapping `properties` across allOf/oneOf/anyOf / $ref branches
         // are de-duplicated rather than emitted once per branch.
+        let rows_before = self.rows.len();
         match type_name.as_str() {
             "object" => {
                 self.walk_schema(spec, &path, depth + 1);
@@ -413,6 +415,22 @@ impl<'a> Walker<'a> {
                 }
             }
             _ => {}
+        }
+
+        // Leaf-only mode would otherwise drop container fields whose children
+        // are primitives (array of strings, map of ints, empty object). If
+        // the recursion produced nothing and we haven't already emitted the
+        // container, surface it now so the field still appears in the output.
+        if is_container && !emit_container_now && self.rows.len() == rows_before {
+            self.emit_row(
+                spec,
+                &effective_specs,
+                &path,
+                parent_path,
+                name,
+                &type_name,
+                required,
+            );
         }
     }
 

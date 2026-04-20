@@ -116,6 +116,8 @@ static DENY_SPICE_SPECIFIC_FUNCTIONS: LazyLock<FunctionSupport> = LazyLock::new(
         #[cfg(feature = "models")]
         AI_UDF_NAME,
         DIGEST_UDF_NAME,
+        FLATTEN_JSON_PROPERTIES_UDTF_NAME,
+        JSON_TREE_UDTF_NAME,
     ];
 
     FunctionSupport::new(
@@ -206,6 +208,8 @@ mod tests {
             spice_udf(Bucket::new()),
             spice_udf(Truncate::new()),
             Arc::new(INSTANCE.clone()),
+            spice_udf(FlattenJsonPropertiesScalar::new()),
+            spice_udf(JsonTreeScalar::new()),
         ];
 
         for udf in spice_udfs {
