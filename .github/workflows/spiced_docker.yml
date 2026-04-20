@@ -57,10 +57,7 @@ jobs:
         github.event_name != 'release'
         || (
           github.event.action == 'published'
-          && (
-            !contains(github.event.release.tag_name, '-')
-            || contains(github.event.release.tag_name, '-rc.')
-          )
+          && contains(github.event.release.tag_name, '-rc.')
         )
         || (
           github.event.action == 'edited'
