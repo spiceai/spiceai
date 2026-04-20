@@ -76,7 +76,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{
-    Array, ArrayRef, BooleanBuilder, ListArray, ListBuilder, StringBuilder, StructArray,
+    Array, ArrayRef, BooleanBuilder, LargeListArray, ListBuilder, StringBuilder, StructArray,
     as_string_array,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
@@ -160,8 +160,12 @@ static PROPERTY_FIELDS: LazyLock<Fields> = LazyLock::new(|| {
 static OUTPUT_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(PROPERTY_FIELDS.clone())));
 
+/// Return type of the scalar UDF form. Uses `LargeList` (i64 offsets)
+/// instead of `List` so a large batch can't overflow the offset range and
+/// silently drop rows. `UNNEST` works on both variants, so the change is
+/// transparent to downstream SQL.
 static ROW_LIST_TYPE: LazyLock<DataType> = LazyLock::new(|| {
-    DataType::List(Arc::new(Field::new(
+    DataType::LargeList(Arc::new(Field::new(
         "item",
         DataType::Struct(PROPERTY_FIELDS.clone()),
         true,
@@ -1003,42 +1007,24 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
         // which span belongs to which input row. NULL inputs produce empty
         // (but non-NULL) list slots so the output row count matches input.
         //
-        // Scalar UDF returns `List<Struct<...>>` which uses i32 offsets.
-        // Truncate deterministically so the function never returns a
-        // query-level error for large inputs — matches the walker's own
-        // "cap and record a metric, never fail" contract.
-        let max_flattened_rows = i32::MAX as usize;
+        // Using `LargeListArray` (i64 offsets) so a large evaluated batch
+        // cannot overflow and silently drop rows. Per-document caps inside
+        // `flatten_with_options` still bound memory use.
         let mut all_rows: Vec<PropertyRow> = Vec::new();
-        let mut offsets: Vec<i32> = Vec::with_capacity(strings.len() + 1);
-        let mut truncated = false;
+        let mut offsets: Vec<i64> = Vec::with_capacity(strings.len() + 1);
         offsets.push(0);
 
         for idx in 0..strings.len() {
             if !strings.is_null(idx) {
                 let rows = flatten_with_options(strings.value(idx), &opts);
-                let remaining = max_flattened_rows.saturating_sub(all_rows.len());
-                if rows.len() > remaining {
-                    all_rows.extend(rows.into_iter().take(remaining));
-                    truncated = true;
-                } else {
-                    all_rows.extend(rows);
-                }
+                all_rows.extend(rows);
             }
-            let len = i32::try_from(all_rows.len()).map_err(|_| {
-                DataFusionError::Execution(format!(
-                    "{FLATTEN_JSON_PROPERTIES_UDTF_NAME}(): internal offset accounting exceeded i32 range."
-                ))
-            })?;
-            offsets.push(len);
-        }
-
-        if truncated {
-            record_error("row_cap_hit");
+            offsets.push(all_rows.len() as i64);
         }
 
         let (struct_arrays, _) = build_property_arrays(&all_rows);
         let struct_array = StructArray::new(PROPERTY_FIELDS.clone(), struct_arrays, None);
-        let list_array = ListArray::new(
+        let list_array = LargeListArray::new(
             Arc::new(Field::new(
                 "item",
                 DataType::Struct(PROPERTY_FIELDS.clone()),
@@ -1394,14 +1380,14 @@ mod tests {
     }
 
     #[test]
-    fn scalar_udf_return_type_is_list_of_struct() {
+    fn scalar_udf_return_type_is_large_list_of_struct() {
         let udf = FlattenJsonPropertiesScalar::new();
         let ty = udf.return_type(&[DataType::Utf8]).expect("return type");
         match ty {
-            DataType::List(field) => {
+            DataType::LargeList(field) => {
                 assert!(matches!(field.data_type(), DataType::Struct(_)));
             }
-            other => panic!("expected List<Struct>, got {other:?}"),
+            other => panic!("expected LargeList<Struct>, got {other:?}"),
         }
     }
 
@@ -1435,8 +1421,8 @@ mod tests {
         };
         let list = arr
             .as_any()
-            .downcast_ref::<arrow::array::ListArray>()
-            .expect("list array");
+            .downcast_ref::<arrow::array::LargeListArray>()
+            .expect("large-list array");
         assert_eq!(list.len(), 3);
         // Row 0 has 1 flattened property; row 1 has 2; row 2 is NULL-valued but
         // still emits an (empty) list slot per row.
