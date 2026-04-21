@@ -62,7 +62,7 @@ pub(crate) fn insert_write_back(
     federated: Arc<FederatedTable>,
     refresher: Arc<Refresher>,
     schema: SchemaRef,
-) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+) -> Arc<dyn ExecutionPlan> {
     let sink = Arc::new(WriteBackDataSink {
         accelerator,
         federated,
@@ -70,7 +70,7 @@ pub(crate) fn insert_write_back(
         overwrite,
         schema,
     });
-    Ok(Arc::new(DataSinkExec::new(input, sink, None)))
+    Arc::new(DataSinkExec::new(input, sink, None))
 }
 
 struct WriteBackDataSink {
