@@ -110,12 +110,12 @@ pub(crate) fn cosine_distance_to_sql(
     Ok(Some(ast_fn))
 }
 
-/// Converts `array_distance(query, embed_col)` to DuckDB `array_distance` with explicit
+/// Converts `array_distance(query, embed_col)` to `DuckDB` `array_distance` with explicit
 /// `::FLOAT[N]` casts on both arguments.
 ///
-/// DuckDB's `array_distance` requires both arguments to have the same element type. When the
+/// `DuckDB`'s `array_distance` requires both arguments to have the same element type. When the
 /// stored embedding column has type `DECIMAL(12,11)[]` and the query literal is `FLOAT[N]`,
-/// DuckDB rejects the call. Casting both sides to `FLOAT[N]` resolves the mismatch.
+/// `DuckDB` rejects the call. Casting both sides to `FLOAT[N]` resolves the mismatch.
 pub(crate) fn array_distance_to_sql(
     unparser: &datafusion::sql::unparser::Unparser,
     args: &[Expr],
@@ -147,9 +147,7 @@ pub(crate) fn array_distance_to_sql(
         .map(|arg| {
             unparser
                 .expr_to_sql(arg)
-                .map(cast_to_float_array)
-                .map_err(DataFusionError::from)
-        })
+                .map(cast_to_float_array)})
         .try_collect()?;
 
     let ast_fn = ast::Expr::Function(Function {
