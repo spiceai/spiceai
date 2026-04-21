@@ -25,7 +25,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
-use data_components::delete::{DeletionTableProvider, DeletionTableProviderAdapter};
 use datafusion::catalog::SchemaProvider;
 use datafusion::common::ToDFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -131,10 +130,7 @@ pub async fn create_table(
                     Arc::clone(&runtime_env),
                 );
                 if let Ok(provider) = builder.open(&metadata_table_name).await {
-                    let wrapped: Arc<dyn datafusion::catalog::TableProvider> =
-                        Arc::new(DeletionTableProviderAdapter::new(
-                            Arc::new(provider) as Arc<dyn DeletionTableProvider>
-                        ));
+                    let wrapped: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(provider);
                     if let Err(e) =
                         schema_provider.register_table(params.table_name.clone(), wrapped)
                     {
@@ -253,9 +249,7 @@ pub async fn create_table(
                 params.table_name
             ))
         })?;
-        Arc::new(DeletionTableProviderAdapter::new(
-            Arc::new(provider) as Arc<dyn DeletionTableProvider>
-        ))
+        Arc::new(provider) as Arc<dyn datafusion::catalog::TableProvider>
     };
 
     // ── Register in DataFusion schema provider ────────────────────────────────
@@ -394,7 +388,7 @@ fn ensure_schema_provider(
 }
 
 /// Build a partitioned table provider wrapping `CayennePartitionCreator` +
-/// `PartitionTableProvider` + `DeletionTableProviderAdapter`.
+/// `PartitionTableProvider`.
 #[expect(clippy::too_many_arguments)]
 async fn build_partitioned_provider(
     table_name: &str,
@@ -459,9 +453,7 @@ async fn build_partitioned_provider(
                 ))
             })?;
 
-    Ok(Arc::new(DeletionTableProviderAdapter::new(
-        Arc::new(partition_provider) as Arc<dyn DeletionTableProvider>,
-    )))
+    Ok(Arc::new(partition_provider) as Arc<dyn datafusion::catalog::TableProvider>)
 }
 
 /// Build a filesystem-safe label for a partition expression.

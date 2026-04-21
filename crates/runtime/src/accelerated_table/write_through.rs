@@ -22,7 +22,6 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use cayenne::{CayenneStagedAppend, CayenneTableProvider};
-use data_components::delete::DeletionTableProviderAdapter;
 use data_components::poly::PolyTableProvider;
 use datafusion::common::{DFSchema, DataFusionError};
 use datafusion::datasource::TableProvider;
@@ -442,23 +441,9 @@ async fn write_all_with_partitioned_cayenne(
     }
 }
 
-/// Attempts to downcast a partition provider to [`CayenneTableProvider`],
-/// unwrapping a [`DeletionTableProviderAdapter`] wrapper if present.
+/// Attempts to downcast a partition provider to [`CayenneTableProvider`].
 fn downcast_to_cayenne(provider: &Arc<dyn TableProvider>) -> Option<&CayenneTableProvider> {
-    provider
-        .as_any()
-        .downcast_ref::<CayenneTableProvider>()
-        .or_else(|| {
-            provider
-                .as_any()
-                .downcast_ref::<DeletionTableProviderAdapter>()
-                .and_then(|adapter| {
-                    adapter
-                        .source()
-                        .as_any()
-                        .downcast_ref::<CayenneTableProvider>()
-                })
-        })
+    provider.as_any().downcast_ref::<CayenneTableProvider>()
 }
 
 fn spawn_federated_insert(
