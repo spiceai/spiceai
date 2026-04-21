@@ -135,9 +135,7 @@ pub enum ConfigError {
 impl TryFrom<spicepod::component::runtime::Scheduler> for PartitionAssignmentConfig {
     type Error = ConfigError;
 
-    fn try_from(
-        config: spicepod::component::runtime::Scheduler,
-    ) -> Result<Self, Self::Error> {
+    fn try_from(config: spicepod::component::runtime::Scheduler) -> Result<Self, Self::Error> {
         let interval = fundu::parse_duration(&config.partition_assignment_interval).context(
             InvalidIntervalSnafu {
                 interval: &config.partition_assignment_interval,
@@ -148,11 +146,10 @@ impl TryFrom<spicepod::component::runtime::Scheduler> for PartitionAssignmentCon
             return Err(ConfigError::IntervalIsZero);
         }
 
-        let discovery_timeout = fundu::parse_duration(&config.partition_discovery_timeout).context(
-            InvalidDiscoveryTimeoutSnafu {
+        let discovery_timeout = fundu::parse_duration(&config.partition_discovery_timeout)
+            .context(InvalidDiscoveryTimeoutSnafu {
                 timeout: &config.partition_discovery_timeout,
-            },
-        )?;
+            })?;
 
         if discovery_timeout.is_zero() {
             return Err(ConfigError::DiscoveryTimeoutIsZero);
