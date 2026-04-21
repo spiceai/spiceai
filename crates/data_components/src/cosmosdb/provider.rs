@@ -597,7 +597,8 @@ mod tests {
         let schema = sample_schema();
         let docs = vec![json!({"id": "a", "count": 1})];
         // Project only the second column (`count`).
-        let batch = decode_batch(&docs, &schema, Some(&[1])).expect("decode_batch with projection failed");
+        let batch =
+            decode_batch(&docs, &schema, Some(&[1])).expect("decode_batch with projection failed");
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 1);
         assert_eq!(batch.schema().field(0).name(), "count");
