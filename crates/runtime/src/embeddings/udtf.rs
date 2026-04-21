@@ -704,39 +704,28 @@ impl TableProvider for VectorSearchUDTFProvider {
                 }
             })
             .collect();
-        let mut base_expr = final_expr.clone();
-
-        base_expr.push(
-            binary_expr(
-                lit(1.0),
-                Operator::Minus,
-                Expr::ScalarFunction(ScalarFunction {
-                    func: cosine_distance_udf,
-                    args: vec![
-                        lit(ScalarValue::FixedSizeList(Arc::new(query_vector))),
-                        ident(embedding_col!(embed_col)),
-                    ],
-                }),
-            )
-            .alias(SEARCH_SCORE_COLUMN_NAME),
+        let score_expr = binary_expr(
+            lit(1.0),
+            Operator::Minus,
+            Expr::ScalarFunction(ScalarFunction {
+                func: cosine_distance_udf,
+                args: vec![
+                    lit(ScalarValue::FixedSizeList(Arc::new(query_vector))),
+                    ident(embedding_col!(embed_col)),
+                ],
+            }),
         );
 
         // only include score in the projection if it is requested.
         // Otherwise, if the query is `SELECT a FROM vector_search(...)`, it will fail because we supplied too many columns in the response!
         if projection.is_none() || projection.is_some_and(|proj| proj.contains(&search_field_index))
         {
-            final_expr.push(col(SEARCH_SCORE_COLUMN_NAME));
+            final_expr.push(score_expr.clone().alias(SEARCH_SCORE_COLUMN_NAME));
         }
 
         let final_plan = scan
-            .project(base_expr)?
-            .sort(vec![SortExpr::new(
-                Expr::Column(Column::from_name(SEARCH_SCORE_COLUMN_NAME)),
-                false,
-                false,
-            )])?
+            .sort(vec![SortExpr::new(score_expr, false, false)])?
             .limit(0, Some(self.limit_to_use(limit)))?
-            // wrap the score calculation in a subquery before final projection, to avoid collapsing away the score calculation.
             .alias("tbl")?
             .project(final_expr)?
             .build()?;
