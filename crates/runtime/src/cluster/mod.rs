@@ -21,8 +21,6 @@ use crate::cluster::partition::{
     scheduler_task::{PartitionManagementConfig, PartitionManagementTask},
 };
 use crate::config::{ClusterConfig, ClusterRole};
-use crate::dataconnector::listing;
-use crate::dataconnector::parameters::ConnectorParamsBuilder;
 use crate::jobs::JobExecutor;
 use crate::status::ComponentStatus;
 use crate::{
@@ -55,7 +53,6 @@ use ballista_scheduler::scheduler_server::SchedulerServer;
 use ballista_scheduler::state::execution_graph::RunningTaskInfo;
 use datafusion::codec::spice_logical_codec::SpiceLogicalCodec;
 use datafusion::codec::spice_physical_codec::SpicePhysicalCodec;
-use datafusion_datasource::ListingTableUrl;
 use datafusion_expr::Expr;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use futures::future::try_join_all;
@@ -1816,8 +1813,15 @@ async fn executor_bind_app(
     Ok(())
 }
 
-/// Traverses dataset definitions and reifies `ListingTableUrl`s, triggering object store
-/// registration for each.
+/// For each registered dataset on the cluster executor, asks its data
+/// connector to register any object stores it needs against the executor's
+/// runtime env.
+///
+/// On the executor, decoded `ParquetSource` (and other file-source) plans
+/// arrive without their `parquet_file_reader_factory`, so `DataFusion` falls
+/// back to `runtime_env().object_store(url)`. This function gives each
+/// connector a chance to populate that registry using the dataset's
+/// already-secret-expanded params.
 async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
     let app = rt.app();
     let app = app.read().await;
@@ -1826,66 +1830,31 @@ async fn executor_bind_object_stores(rt: Arc<Runtime>) -> crate::Result<()> {
             source: "Runtime did not bind an App.".into(),
         });
     };
+    let runtime_env = rt.df.ctx.runtime_env();
     for dataset in Arc::clone(&rt).get_valid_datasets(app, LogErrors(true)) {
-        let mut params = ConnectorParamsBuilder::new(dataset.source().into(), (&dataset).into())
-            .build(Arc::clone(&rt.secrets), rt.tokio_io_runtime())
+        let connector = match Arc::clone(&rt)
+            .get_dataconnector_from_dataset(Arc::clone(&dataset))
             .await
-            .context(FailedToStartClusterExecutorSnafu)?;
-
-        // Either this is a URL with a scheme, or a URL with a connector name prefixing it
-        let url = match dataset.from.as_str().split_once(':') {
-            Some((_, rest)) if !rest.starts_with("//") => rest,
-            _ => dataset.from.as_str(),
+        {
+            Ok(connector) => connector,
+            Err(error) => {
+                tracing::warn!(
+                    "Skipping object store registration for dataset {}: {error}",
+                    dataset.name
+                );
+                continue;
+            }
         };
 
-        let Ok(mut parsed) = Url::parse(url) else {
-            tracing::warn!("Unable to configure Dataset URL {}", url);
-            continue;
-        };
-
-        if parsed.scheme() == "file" {
+        if let Err(error) = connector
+            .register_object_stores(&dataset, &runtime_env)
+            .await
+        {
             tracing::warn!(
-                "Dataset {} has a file:// scheme and may not be resolvable without a shared mount.",
+                "Failed to register object stores for dataset {}: {error}",
                 dataset.name
             );
-            continue;
         }
-
-        // Not all connectors have the same parameter structures for S3 -- this makes all fragment
-        // keys match the spec expected by the S3 connector and `SpiceObjectRegistry`.
-        params.parameters.canonicalize_s3_fragments();
-
-        // Canonicalize Azure parameters (e.g., `azure_storage_account_name` -> `account`)
-        // for Delta Lake and other connectors that use Azure-prefixed parameter names.
-        params.parameters.canonicalize_azure_fragments();
-
-        // Canonicalize GCS parameters (e.g., `google_service_account` -> `service_account`)
-        // for Delta Lake and other connectors that use GCS-prefixed parameter names.
-        params.parameters.canonicalize_gcs_fragments();
-
-        let unprefixed = params
-            .parameters
-            .into_iter()
-            .map(|(k, _)| k.as_str())
-            .collect::<Vec<_>>();
-
-        parsed.set_fragment(Some(
-            listing::build_fragments(&params.parameters, unprefixed).as_str(),
-        ));
-
-        let listing_table_url = ListingTableUrl::parse(parsed)
-            .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?;
-
-        let _ = rt
-            .df
-            .ctx
-            .runtime_env()
-            .object_store(listing_table_url)
-            .boxed()
-            .context(FailedToStartClusterExecutorSnafu)?;
-
-        tracing::info!("Configured object storage for Dataset {}", dataset.name);
     }
 
     Ok(())
