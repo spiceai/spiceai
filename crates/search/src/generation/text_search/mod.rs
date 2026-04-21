@@ -319,12 +319,20 @@ impl FullTextSearchFieldIndex {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Value>> {
-        let q = self
-            .query_parser()
-            .build_query_from_user_input_ast(parse_query_literal(literal))
-            .context(InvalidTextSearchQuerySnafu {
-                query: literal.to_string(),
-            })?;
+        // Prefer Tantivy's full QueryParser so operators (AND/OR/NOT), phrases
+        // ("exact match"), field-scoped queries (title:foo) and boosts (term^2)
+        // are honored. Fall back to a bag-of-words OR clause for inputs the
+        // parser rejects (e.g. unbalanced quotes, lone special characters in
+        // conversational queries).
+        let parser = self.query_parser();
+        let q = match parser.parse_query(literal) {
+            Ok(parsed) => parsed,
+            Err(_) => parser
+                .build_query_from_user_input_ast(parse_query_literal(literal))
+                .context(InvalidTextSearchQuerySnafu {
+                    query: literal.to_string(),
+                })?,
+        };
 
         let all_cols = self.all_columns();
 
@@ -482,29 +490,42 @@ fn make_stream(
         let mut remaining_limit = limit;
         let mut offset = 0;
         while remaining_limit > 0 {
-            let limit = min(remaining_limit, DEFAULT_BATCH_SIZE);
+            let page_size = min(remaining_limit, DEFAULT_BATCH_SIZE);
             let hits = match fts
-                .search_query_literal(query.as_str(), limit, offset)
+                .search_query_literal(query.as_str(), page_size, offset)
                 .map_err(|e| DataFusionError::Internal(e.to_string())) {
                     Ok(h) => h,
                     Err(e) => {yield Err(e); return}
                 };
-            offset += limit;
-            remaining_limit -= limit;
 
-            let mut decoder = match fts.tantivy_json_to_arrow_decoder(hits.as_slice())
-                .map_err(DataFusionError::from) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        yield Err(e);
-                        return
-                    }
-                };
+            // Decrement by *actual* hits returned (not the requested page size) so
+            // we stop once the index is exhausted instead of issuing further empty
+            // queries.
+            let returned = hits.len();
+            offset += returned;
+            remaining_limit = remaining_limit.saturating_sub(returned);
 
-            match decoder.flush() {
-                Ok(Some(rb)) => yield Ok(rb),
-                Ok(None) => {},
-                Err(e) => yield Err(DataFusionError::from(e))
+            if !hits.is_empty() {
+                let mut decoder = match fts.tantivy_json_to_arrow_decoder(hits.as_slice())
+                    .map_err(DataFusionError::from) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            yield Err(e);
+                            return
+                        }
+                    };
+
+                match decoder.flush() {
+                    Ok(Some(rb)) => yield Ok(rb),
+                    Ok(None) => {},
+                    Err(e) => yield Err(DataFusionError::from(e))
+                }
+            }
+
+            // Index is exhausted: a partial page (or empty page) means there are
+            // no more matching documents.
+            if returned < page_size {
+                return;
             }
         }
     }
