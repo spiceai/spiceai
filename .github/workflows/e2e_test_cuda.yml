@@ -38,6 +38,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y curl jq tar
 
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@8022558310ea543e35132143092835585f60e628 # v0.2.21
+        with:
+          cuda: '12.6.0'
+          method: network
+          use-github-cache: false
+          non-cuda-sub-packages: '["libcurand-dev", "libcublas","libcublas-dev"]'
+          sub-packages: '["nvcc","compiler","libraries","libraries-dev","cudart","cudart-dev"]'
+
       - name: Create artifact directory
         run: mkdir -p "${ARTIFACT_DIR}" "${RUNTIME_DIR}"
 
@@ -88,6 +97,7 @@ jobs:
         working-directory: ${{ env.APP_DIR }}
         env:
           SPICE_HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+          LD_LIBRARY_PATH: /usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib:${{ env.LD_LIBRARY_PATH }}
         run: |
           set -euo pipefail
           "${GITHUB_WORKSPACE}/${RUNTIME_DIR}/spiced" > spiced.log 2>&1 &
