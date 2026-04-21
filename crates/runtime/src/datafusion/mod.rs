@@ -132,6 +132,7 @@ pub mod sort_columns;
 pub(crate) mod sql_validator;
 pub mod tool_udf;
 pub mod udf;
+pub mod udtf;
 
 pub const SPICE_DEFAULT_CATALOG: &str = "spice";
 pub const SPICE_RUNTIME_SCHEMA: &str = "runtime";

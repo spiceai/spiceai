@@ -97,6 +97,19 @@ enum CacheResult {
 
 impl Query {
     /// Returns a `LogicalPlan` if the result is not cached and needs to be executed, otherwise returns a cached `QueryResult`.
+    ///
+    /// When `read_only` is true, both the SQL-keyed and plan-keyed results-cache
+    /// lookups are skipped, and the returned [`RequestCacheManager`] is forced to
+    /// [`CacheStatus::CacheDisabled`]. This is required because the read-only
+    /// contract (enforced by [`super::validate_sql_query_read_only`]) runs on the
+    /// [`LogicalPlan`] *after* `get_plan_or_cached` returns — a cache hit would
+    /// otherwise short-circuit validation and let write-capable plans served from
+    /// a prior cache-store bypass the read-only guarantee on `/v1/tools/sql` and
+    /// `/v1/nsql`. The existing cache-eligibility check
+    /// ([`cache::QueryResultsCacheProvider::cache_is_enabled_for_plan`]) only
+    /// filters the classic DDL/DML/Copy/Statement plan variants and does not
+    /// cover Spice's write-capable [`LogicalPlan::Extension`] nodes (e.g.
+    /// `DmlExtension`, `DistributedCayenneInsert`).
     pub(super) async fn get_plan_or_cached(
         df: &Arc<DataFusion>,
         session: &SessionState,
@@ -104,6 +117,7 @@ impl Query {
         sql: &str,
         parameters: Option<ParamValues>,
         tracker: Option<QueryTracker>,
+        read_only: bool,
     ) -> super::Result<PlanOrCached> {
         let cache_control = request_context.cache_control();
         let has_auth_principal = request_context.auth_principal().is_some();
@@ -123,13 +137,20 @@ impl Query {
         // text cannot reveal whether expanded views reference identity-dependent
         // UDFs like current_user_id(). The plan-level cache (below) handles
         // identity-scoped caching after the plan is fully resolved.
+        //
+        // Also skip the cache entirely when `read_only` is true so read-only
+        // validation always gets a chance to run on the freshly-planned query.
         let CacheResponse {
             tracker,
             raw_key: sql_or_client_raw_key,
             ..
-        } = if has_auth_principal {
-            CacheResponse::from(CacheResult::MissOrSkipped, CacheStatus::CacheBypass)
-                .with_query_tracker(tracker)
+        } = if has_auth_principal || read_only {
+            let status = if read_only {
+                CacheStatus::CacheDisabled
+            } else {
+                CacheStatus::CacheBypass
+            };
+            CacheResponse::from(CacheResult::MissOrSkipped, status).with_query_tracker(tracker)
         } else {
             match Self::try_get_cached_result(
                 df,
@@ -185,27 +206,33 @@ impl Query {
             None
         };
 
-        // Try to get cached results from plan
+        // Try to get cached results from plan (skipped for read-only, same
+        // reasoning as the SQL-keyed lookup above).
         let CacheResponse {
             mut tracker,
             raw_key: plan_raw_cache_key,
             status,
             ..
-        } = match Self::try_get_cached_result(
-            df,
-            &request_context,
-            tracker,
-            &CacheKey::LogicalPlan(&plan),
-            sql,
-            identity_scope.as_deref(),
-        )
-        .await?
-        {
-            CacheResponse {
-                result: CacheResult::Hit(result),
-                ..
-            } => return Ok(PlanOrCached::Cached(result)),
-            response => response,
+        } = if read_only {
+            CacheResponse::from(CacheResult::MissOrSkipped, CacheStatus::CacheDisabled)
+                .with_query_tracker(tracker)
+        } else {
+            match Self::try_get_cached_result(
+                df,
+                &request_context,
+                tracker,
+                &CacheKey::LogicalPlan(&plan),
+                sql,
+                identity_scope.as_deref(),
+            )
+            .await?
+            {
+                CacheResponse {
+                    result: CacheResult::Hit(result),
+                    ..
+                } => return Ok(PlanOrCached::Cached(result)),
+                response => response,
+            }
         };
 
         let request_raw_cache_key = match request_context.cache_control() {
@@ -224,7 +251,15 @@ impl Query {
             None => request_raw_cache_key,
         };
 
-        let cache_status = Self::should_cache_results(df, &plan, status);
+        // Read-only requests must also not populate the results cache — the
+        // plan has not yet been validated at this point, and we don't want a
+        // writable surface's cached output to leak back through a read-only
+        // caller on a later identical query.
+        let cache_status = if read_only {
+            CacheStatus::CacheDisabled
+        } else {
+            Self::should_cache_results(df, &plan, status)
+        };
         tracker = tracker.map(|t| t.results_cache_hit(false));
 
         Ok(PlanOrCached::Plan(

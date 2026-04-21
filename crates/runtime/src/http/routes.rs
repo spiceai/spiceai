@@ -265,6 +265,23 @@ pub(crate) fn routes(
     }
 
     if cfg!(feature = "models") {
+        // Tool invocation routes require authentication to be configured on the runtime.
+        // `/v1/tools/{name}` forwards the raw request body to `tool.call`, which for
+        // built-in tools like `sql` and `websearch` is equivalent to arbitrary query /
+        // egress. When no `runtime.auth` provider is attached the request would be
+        // anonymous, so we refuse these routes at the edge with a 401 rather than
+        // relying on each tool to enforce its own safety posture. Configure
+        // `runtime.auth.api_key` (or any future provider) to re-enable this surface.
+        let tools_auth_required = auth_layer.is_some();
+        let tools_router = Router::new()
+            .route("/v1/tools", get(v1::tools::list))
+            .route("/v1/tools/{*name}", post(v1::tools::post))
+            // Deprecated, use /v1/tools/:name instead
+            .route("/v1/tool/{name}", post(v1::tools::post))
+            .route_layer(middleware::from_fn(move |req, next| {
+                require_auth_configured(tools_auth_required, req, next)
+            }));
+
         authenticated_router = authenticated_router
             .route("/v1/models", get(v1::models::get))
             .route("/v1/models/{name}/predict", get(v1::inference::get))
@@ -280,10 +297,7 @@ pub(crate) fn routes(
             )
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route("/v1/search", post(v1::search::post))
-            .route("/v1/tools", get(v1::tools::list))
-            .route("/v1/tools/{*name}", post(v1::tools::post))
-            // Deprecated, use /v1/tools/:name instead
-            .route("/v1/tool/{name}", post(v1::tools::post))
+            .merge(tools_router)
             .route("/v1/workers", get(v1::workers::get))
             .layer(Extension(Arc::clone(&rt.completion_llms)))
             .layer(Extension(Arc::clone(&rt.models)))
@@ -489,4 +503,27 @@ async fn check_shutdown(
     }
 
     next.run(req).await
+}
+
+/// Reject a request with 401 unless the runtime has an authentication provider attached.
+///
+/// Used to gate routes whose behavior is unsafe anonymously (`/v1/tools/*`: the raw
+/// request body is handed to `tool.call`, which for built-ins like `sql` and
+/// `websearch` is equivalent to arbitrary query / outbound fetch).
+async fn require_auth_configured(
+    auth_configured: bool,
+    req: axum::http::Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    if auth_configured {
+        return next.run(req).await;
+    }
+
+    (
+        http::StatusCode::UNAUTHORIZED,
+        axum::Json(serde_json::json!({
+            "message": "Tool invocation (/v1/tools/*) requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod (see https://spiceai.org/docs/reference/runtime#auth) and retry with credentials."
+        })),
+    )
+        .into_response()
 }
