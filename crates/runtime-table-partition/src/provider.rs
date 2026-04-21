@@ -636,7 +636,7 @@ impl DeletionSink for PartitionedUpdateSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let mut total_updated = 0u64;
         let session_ctx = datafusion::execution::context::SessionContext::new();
-        let state = session_ctx.state();
+        let _state = session_ctx.state();
 
         for partition in &self.partitions {
             let plan = partition
