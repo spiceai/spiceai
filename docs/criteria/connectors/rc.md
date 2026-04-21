@@ -11,6 +11,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | ADBC                             | ➖          |              |
 | Azure BlobFS                     | ➖          |              |
 | Clickhouse                       | ➖          |              |
+| Cosmos DB (NoSQL)                | ✅          | @lukekim     |
 | Databricks (mode: delta_lake)    | ✅          | @Sevenannn   |
 | Databricks (mode: spark_connect) | ➖          |              |
 | Databricks (mode: sql_warehouse) | ➖          |              |
@@ -62,6 +63,7 @@ This table defines the required features and/or tests for each connector:
 | ADBC                             | ➖                     | ➖                       | ☑️                 | ➖                        | ➖                   | ☑️                          |
 | Azure BlobFS                     | ✅ (1)                 | ✅ (1)                   | ☑️                 | ➖                        | ✅                   | ☑️                          |
 | Clickhouse                       | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
+| Cosmos DB (NoSQL)                | ➖                     | ➖                       | ➖                 | ➖                        | ➖                   | ☑️                          |
 | Databricks (mode: delta_lake)    | ✅ (1)                 | ✅ (1)                   | ☑️                 | ✅                        | ✅                   | ✅                          |
 | Databricks (mode: spark_connect) | ✅ (100)               | ✅ (100)                 | ✅                 | ✅                        | ✅                   | ✅                          |
 | Databricks (mode: sql_warehouse) | ➖                     | ➖                       | ✅                 | ✅                        | ✅                   | ✅                          |
