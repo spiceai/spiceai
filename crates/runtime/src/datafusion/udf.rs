@@ -96,7 +96,10 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         Arc::new(FlattenJsonPropertiesTableFunc::new()),
     );
     ctx.register_udf(FlattenJsonPropertiesScalar::new().into());
-    ctx.register_udtf(FLATTEN_JSON_UDTF_NAME, Arc::new(FlattenJsonTableFunc::new()));
+    ctx.register_udtf(
+        FLATTEN_JSON_UDTF_NAME,
+        Arc::new(FlattenJsonTableFunc::new()),
+    );
     ctx.register_udf(FlattenJsonScalar::new().into());
     ctx.register_udtf(JSON_TREE_UDTF_NAME, Arc::new(JsonTreeTableFunc::new()));
     ctx.register_udf(JsonTreeScalar::new().into());
