@@ -136,16 +136,16 @@ FROM flatten_json_properties(
 );
 ```
 
-| option             | type | default       | notes                                                                                                                              |
-| ------------------ | ---- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `max_depth`        | UInt | `32`          | walk stops past this depth                                                                                                         |
-| `max_rows`         | UInt | `100000`      | per-document row cap                                                                                                               |
-| `max_bytes`        | UInt | `8_388_608`   | input size limit (8 MiB)                                                                                                           |
-| `dialect`          | Utf8 | `json-schema` | `json-schema` \| `openapi`                                                                                                         |
-| `include_internal` | Bool | `false`       | emit container rows (`object`, `array`, `map`)                                                                                     |
-| `path_style`       | Utf8 | `dot`         | `dot` (`a.b.c`) \| `json-pointer` (`/a/b/c`)                                                                                       |
-| `expand_maps`      | Bool | `false`       | walk through `additionalProperties` and encode the map's dynamic key as a wildcard segment in the path (JSONPath convention)       |
-| `map_wildcard`     | Utf8 | `[*]`         | wildcard segment inserted when `expand_maps = true`; must be non-empty                                                             |
+| option             | type | default       | notes                                                                                                                        |
+| ------------------ | ---- | ------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `max_depth`        | UInt | `32`          | walk stops past this depth                                                                                                   |
+| `max_rows`         | UInt | `100000`      | per-document row cap                                                                                                         |
+| `max_bytes`        | UInt | `8_388_608`   | input size limit (8 MiB)                                                                                                     |
+| `dialect`          | Utf8 | `json-schema` | `json-schema` \| `openapi`                                                                                                   |
+| `include_internal` | Bool | `false`       | emit container rows (`object`, `array`, `map`)                                                                               |
+| `path_style`       | Utf8 | `dot`         | `dot` (`a.b.c`) \| `json-pointer` (`/a/b/c`)                                                                                 |
+| `expand_maps`      | Bool | `false`       | walk through `additionalProperties` and encode the map's dynamic key as a wildcard segment in the path (JSONPath convention) |
+| `map_wildcard`     | Utf8 | `[*]`         | wildcard segment inserted when `expand_maps = true`; must be non-empty                                                       |
 
 #### Expanding maps (`Map<String, Array<Object>>` example)
 

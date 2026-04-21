@@ -59,9 +59,7 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
-use arrow::array::{
-    Array, ArrayRef, LargeListArray, StringBuilder, StructArray, as_string_array,
-};
+use arrow::array::{Array, ArrayRef, LargeListArray, StringBuilder, StructArray, as_string_array};
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::kernels::cast::cast;
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
@@ -304,8 +302,7 @@ impl Walker<'_> {
                     }
                 } else {
                     for (idx, child) in arr.iter().enumerate() {
-                        let child_path =
-                            make_array_index(path, idx, self.opts.path_style);
+                        let child_path = make_array_index(path, idx, self.opts.path_style);
                         let idx_key = format!("[{idx}]");
                         self.walk(child, &child_path, &idx_key, depth + 1);
                         if self.row_cap_hit {
@@ -402,9 +399,9 @@ fn parent_of(path: &str, style: PathStyle) -> String {
                 (None, None) => String::new(),
             }
         }
-        PathStyle::JsonPointer => {
-            path.rfind('/').map_or(String::new(), |i| path[..i].to_owned())
-        }
+        PathStyle::JsonPointer => path
+            .rfind('/')
+            .map_or(String::new(), |i| path[..i].to_owned()),
     }
 }
 
@@ -836,10 +833,7 @@ mod tests {
         assert_eq!(by[""].type_name, "object");
         assert_eq!(by["user"].type_name, "object");
         // Container rows serialize their compact JSON into `value`.
-        assert_eq!(
-            by["user"].value.as_deref(),
-            Some(r#"{"name":"Alice"}"#)
-        );
+        assert_eq!(by["user"].value.as_deref(), Some(r#"{"name":"Alice"}"#));
     }
 
     #[test]
