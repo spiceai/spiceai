@@ -506,7 +506,6 @@ where
 /// # Errors
 ///
 /// Returns an error if the JSON is malformed or contains an unsupported type.
-#[expect(clippy::cast_possible_truncation)]
 pub fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error> {
     let data_type: serde_json::Value =
         serde_json::from_str(data_type_str).map_err(|e| Error::UnableToRetrieveSchema {
@@ -515,8 +514,34 @@ pub fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error>
 
     match data_type["type"].as_str() {
         Some("FIXED") => {
-            let precision = data_type["precision"].as_u64().unwrap_or(38) as u8;
-            let scale = data_type["scale"].as_i64().unwrap_or(0) as i8;
+            // Snowflake's FIXED precision must fit in Arrow `Decimal128`
+            // (max 38). Snowflake itself also caps precision at 38, so any
+            // larger value is malformed/unexpected. Scale is bounded by the
+            // same range. Use checked conversions with clear error messages
+            // rather than `as` casts, which would silently truncate and
+            // yield wrong schemas — a data-correctness violation.
+            const MAX_DECIMAL128_PRECISION: u64 = 38;
+            let precision_raw = data_type["precision"].as_u64().unwrap_or(38);
+            if precision_raw == 0 || precision_raw > MAX_DECIMAL128_PRECISION {
+                return Err(Error::UnableToRetrieveSchema {
+                    reason: format!(
+                        "FIXED precision {precision_raw} is out of range (expected 1..={MAX_DECIMAL128_PRECISION})",
+                    ),
+                });
+            }
+            // Safe: bounded above by 38.
+            let precision =
+                u8::try_from(precision_raw).map_err(|_| Error::UnableToRetrieveSchema {
+                    reason: format!("FIXED precision {precision_raw} does not fit in u8"),
+                })?;
+            let scale_raw = data_type["scale"].as_i64().unwrap_or(0);
+            let scale = i8::try_from(scale_raw).map_err(|_| Error::UnableToRetrieveSchema {
+                reason: format!(
+                    "FIXED scale {scale_raw} is out of range (expected {}..={})",
+                    i8::MIN,
+                    i8::MAX,
+                ),
+            })?;
             Ok(DataType::Decimal128(precision, scale))
         }
         // Semi-structured types (dynamic schema per row) and structured MAP
@@ -1017,6 +1042,52 @@ mod tests {
             let got = parse_snowflake_data_type(input)
                 .unwrap_or_else(|e| panic!("Failed to parse '{input}': {e:?}"));
             assert_eq!(got, expected, "Mismatch for '{input}'");
+        }
+    }
+
+    #[test]
+    fn test_parse_snowflake_data_type_fixed_out_of_range() {
+        // Using `as` casts on precision/scale would silently truncate
+        // out-of-range values and produce a subtly wrong Arrow schema, which
+        // is a data-correctness violation. Confirm that each malformed or
+        // out-of-range descriptor returns a structured schema error instead.
+        let cases: &[(&str, &str)] = &[
+            // precision > Arrow Decimal128 max (38)
+            (
+                r#"{"type":"FIXED","precision":39,"scale":0,"nullable":true}"#,
+                "precision",
+            ),
+            // precision = 0 is nonsensical for Decimal128
+            (
+                r#"{"type":"FIXED","precision":0,"scale":0,"nullable":true}"#,
+                "precision",
+            ),
+            // precision overflows u8 dramatically
+            (
+                r#"{"type":"FIXED","precision":300,"scale":0,"nullable":true}"#,
+                "precision",
+            ),
+            // scale overflows i8
+            (
+                r#"{"type":"FIXED","precision":10,"scale":200,"nullable":true}"#,
+                "scale",
+            ),
+            // scale underflows i8
+            (
+                r#"{"type":"FIXED","precision":10,"scale":-200,"nullable":true}"#,
+                "scale",
+            ),
+        ];
+        for (input, expected_field) in cases {
+            let err = parse_snowflake_data_type(input)
+                .expect_err(&format!("Should error for malformed input '{input}'"));
+            let Error::UnableToRetrieveSchema { reason } = err else {
+                panic!("Unexpected error type for '{input}': {err:?}");
+            };
+            assert!(
+                reason.contains(expected_field),
+                "Error '{reason}' should mention '{expected_field}' for input '{input}'"
+            );
         }
     }
 
