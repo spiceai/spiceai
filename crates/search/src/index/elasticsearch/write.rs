@@ -69,7 +69,9 @@ pub enum Error {
         source: llms::embeddings::Error,
     },
 
-    #[snafu(display("Failed to bulk index documents into Elasticsearch index '{index}': {source}"))]
+    #[snafu(display(
+        "Failed to bulk index documents into Elasticsearch index '{index}': {source}"
+    ))]
     BulkIndex {
         index: String,
         source: elasticsearch::Error,
@@ -100,10 +102,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Entry point: embed the record batch, bulk-index to Elasticsearch, and return
 /// the batch with the embedding column populated (so downstream stages see a
 /// consistent schema).
-pub async fn write(
-    index: &ElasticsearchIndex,
-    record: RecordBatch,
-) -> Result<RecordBatch> {
+pub async fn write(index: &ElasticsearchIndex, record: RecordBatch) -> Result<RecordBatch> {
     let es_index = index.es_index.as_str();
 
     let Some((embedded_column_idx, _)) = record
@@ -142,12 +141,8 @@ pub async fn write(
 
     // Build all documents in a sync block so the arrow-json encoders (which are
     // `!Send`) are dropped before any subsequent `.await`.
-    let docs: Vec<(Option<String>, Value)> = build_documents(
-        index,
-        &record,
-        &embedding_vectors,
-        &primary_keys,
-    )?;
+    let docs: Vec<(Option<String>, Value)> =
+        build_documents(index, &record, &embedding_vectors, &primary_keys)?;
 
     if docs.is_empty() {
         tracing::debug!(
@@ -158,7 +153,9 @@ pub async fn write(
             .client
             .bulk_index(es_index, &docs)
             .await
-            .context(BulkIndexSnafu { index: es_index.to_string() })?;
+            .context(BulkIndexSnafu {
+                index: es_index.to_string(),
+            })?;
 
         inspect_bulk_response(&resp, es_index)?;
 
@@ -170,7 +167,12 @@ pub async fn write(
 
     // Attach the computed embedding column so downstream stages (and IndexTableScanNode's
     // schema check) see the expected dense_vector column.
-    update_embedding_column_in_batch(&record, &index.embedded_column, &embedding_vectors, index.dims)
+    update_embedding_column_in_batch(
+        &record,
+        &index.embedded_column,
+        &embedding_vectors,
+        index.dims,
+    )
 }
 
 /// Build ES `_bulk` documents from a record batch + pre-computed embeddings.
@@ -197,8 +199,10 @@ fn build_documents(
             continue;
         }
         let arr = record.column(i);
-        let encoder = make_encoder(field, arr, &encoder_options)
-            .context(IssueWithArrowProcessingSnafu { index: es_index.to_string() })?;
+        let encoder =
+            make_encoder(field, arr, &encoder_options).context(IssueWithArrowProcessingSnafu {
+                index: es_index.to_string(),
+            })?;
         column_encoders.push((field.name().clone(), encoder));
     }
 
@@ -236,9 +240,10 @@ fn build_documents(
             }
             value_buf.clear();
             encoder.encode(row, &mut value_buf);
-            let v: Value = serde_json::from_slice(&value_buf).context(
-                IssueWithJsonProcessingSnafu { index: es_index.to_string() },
-            )?;
+            let v: Value =
+                serde_json::from_slice(&value_buf).context(IssueWithJsonProcessingSnafu {
+                    index: es_index.to_string(),
+                })?;
             doc.insert(name.clone(), v);
         }
 
@@ -246,8 +251,7 @@ fn build_documents(
             embedding
                 .iter()
                 .map(|&x| {
-                    serde_json::Number::from_f64(f64::from(x))
-                        .map_or(Value::Null, Value::Number)
+                    serde_json::Number::from_f64(f64::from(x)).map_or(Value::Null, Value::Number)
                 })
                 .collect(),
         );
@@ -282,7 +286,9 @@ fn extract_primary_key(
                     .collect());
             }
             let casted = arrow::compute::cast(c, &DataType::Utf8).context(
-                IssueWithArrowProcessingSnafu { index: index.es_index.clone() },
+                IssueWithArrowProcessingSnafu {
+                    index: index.es_index.clone(),
+                },
             )?;
             let iter_opt: Option<Box<dyn Iterator<Item = Option<&str>> + Send>> =
                 convert_string_arrow_to_iterator!(casted);
@@ -312,27 +318,33 @@ fn extract_primary_key(
                 };
                 proj.push(i);
             }
-            let pk = record.project(&proj).context(IssueWithArrowProcessingSnafu {
-                index: index.es_index.clone(),
-            })?;
+            let pk = record
+                .project(&proj)
+                .context(IssueWithArrowProcessingSnafu {
+                    index: index.es_index.clone(),
+                })?;
 
             let mut writer = arrow_json::ArrayWriter::new(Vec::new());
             writer
                 .write_batches(&[&pk])
-                .context(IssueWithArrowProcessingSnafu { index: index.es_index.clone() })?;
+                .context(IssueWithArrowProcessingSnafu {
+                    index: index.es_index.clone(),
+                })?;
             writer.finish().context(IssueWithArrowProcessingSnafu {
                 index: index.es_index.clone(),
             })?;
 
-            let values: Vec<Value> =
-                serde_json::from_reader(writer.into_inner().as_slice()).context(
-                    IssueWithJsonProcessingSnafu { index: index.es_index.clone() },
-                )?;
+            let values: Vec<Value> = serde_json::from_reader(writer.into_inner().as_slice())
+                .context(IssueWithJsonProcessingSnafu {
+                    index: index.es_index.clone(),
+                })?;
             values
                 .into_iter()
                 .map(|v| serde_json::to_string(&v).map(Some))
                 .collect::<std::result::Result<Vec<_>, _>>()
-                .context(IssueWithJsonProcessingSnafu { index: index.es_index.clone() })
+                .context(IssueWithJsonProcessingSnafu {
+                    index: index.es_index.clone(),
+                })
         }
     }
 }
@@ -368,7 +380,9 @@ async fn embed_column(
     let embedded = model
         .embed(EmbeddingInput::StringArray(column))
         .await
-        .context(FailedToEmbedSnafu { index: es_index.to_string() })?;
+        .context(FailedToEmbedSnafu {
+            index: es_index.to_string(),
+        })?;
 
     Ok(distribute_nulls(embedded, nulls))
 }
@@ -477,10 +491,10 @@ fn inspect_bulk_response(resp: &Value, es_index: &str) -> Result<()> {
             if op.get("error").is_some() {
                 failures += 1;
                 if first.is_none() {
-                    first = Some(op.get("error").map_or_else(
-                        || op.to_string(),
-                        ToString::to_string,
-                    ));
+                    first = Some(
+                        op.get("error")
+                            .map_or_else(|| op.to_string(), ToString::to_string),
+                    );
                 }
             }
         }
