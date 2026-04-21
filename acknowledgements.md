@@ -6,10 +6,10 @@ Spice.ai acknowledges the following open source projects for making this project
 
 ## Rust Crates
 
-- adbc_core 0.21.0, Apache-2.0 
+- adbc_core 0.23.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-adbc
 
-- adbc_driver_manager 0.21.0, Apache-2.0 
+- adbc_driver_manager 0.23.0, Apache-2.0 
   <br/>https://github.com/apache/arrow-adbc
 
 - aegis 0.9.7, MIT 
@@ -21,7 +21,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - ahash 0.8.12, Apache-2.0 OR MIT 
   <br/>https://github.com/tkaitchuck/ahash
 
-- anyhow 1.0.100, Apache-2.0 OR MIT 
+- anyhow 1.0.102, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/anyhow
 
 - arrow 57.2.0, Apache-2.0 
@@ -84,61 +84,61 @@ Spice.ai acknowledges the following open source projects for making this project
 - async-trait 0.1.89, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/async-trait
 
-- aws-config 1.8.14, Apache-2.0 
+- aws-config 1.8.15, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-credential-types 1.2.13, Apache-2.0 
+- aws-credential-types 1.2.14, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-runtime 1.7.1, Apache-2.0 
+- aws-runtime 1.7.2, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-sdk-bedrockruntime 1.126.0, Apache-2.0 
+- aws-sdk-bedrockruntime 1.129.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-cognitoidentity 1.96.0, Apache-2.0 
+- aws-sdk-cognitoidentity 1.98.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-cognitoidentityprovider 1.110.0, Apache-2.0 
+- aws-sdk-cognitoidentityprovider 1.113.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-dynamodb 1.107.0, Apache-2.0 
+- aws-sdk-dynamodb 1.110.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-dynamodbstreams 1.96.0, Apache-2.0 
+- aws-sdk-dynamodbstreams 1.98.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-glue 1.139.0, Apache-2.0 
+- aws-sdk-glue 1.142.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-s3 1.124.0, Apache-2.0 
+- aws-sdk-s3 1.129.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-s3vectors 1.21.0, Apache-2.0 
+- aws-sdk-s3vectors 1.23.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-secretsmanager 1.101.0, Apache-2.0 
+- aws-sdk-secretsmanager 1.103.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
-- aws-sdk-sts 1.99.0, Apache-2.0 
+- aws-sdk-sts 1.101.0, Apache-2.0 
   <br/>https://github.com/awslabs/aws-sdk-rust
 
 - aws-smithy-async 1.2.14, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-smithy-runtime 1.10.2, Apache-2.0 
+- aws-smithy-runtime 1.10.3, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
 - aws-smithy-runtime-api 1.11.6, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
-- aws-smithy-types 1.4.6, Apache-2.0 
+- aws-smithy-types 1.4.7, Apache-2.0 
   <br/>https://github.com/smithy-lang/smithy-rs
 
 - axum 0.8.8, MIT 
   <br/>https://github.com/tokio-rs/axum
 
-- axum-extra 0.10.3, MIT 
+- axum-extra 0.12.5, MIT 
   <br/>https://github.com/tokio-rs/axum
 
 - azure_core 0.21.0, MIT 
@@ -201,6 +201,9 @@ Spice.ai acknowledges the following open source projects for making this project
 - bollard 0.18.1, Apache-2.0 
   <br/>https://github.com/fussybeaver/bollard
 
+- brotli 8.0.2, BSD-3-Clause AND MIT 
+  <br/>https://github.com/dropbox/rust-brotli
+
 - byte-unit 5.2.0, MIT 
   <br/>https://github.com/magiclen/byte-unit
 
@@ -225,76 +228,79 @@ Spice.ai acknowledges the following open source projects for making this project
 - clap 4.5.60, Apache-2.0 OR MIT 
   <br/>https://github.com/clap-rs/clap
 
+- clap_complete 4.6.0, Apache-2.0 OR MIT 
+  <br/>https://github.com/clap-rs/clap
+
 - clickhouse-rs 1.1.0-alpha.1, MIT 
   <br/>https://github.com/suharev7/clickhouse-rs
 
 - comfy-table 7.1.2, MIT 
   <br/>https://github.com/nukesor/comfy-table
 
-- connector-clickhouse 2.0.0-unstable, Apache-2.0 
+- connector-clickhouse 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-databricks 2.0.0-unstable, Apache-2.0 
+- connector-databricks 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-delta-lake 2.0.0-unstable, Apache-2.0 
+- connector-delta-lake 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-dremio 2.0.0-unstable, Apache-2.0 
+- connector-dremio 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-duckdb 2.0.0-unstable, Apache-2.0 
+- connector-duckdb 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-flightsql 2.0.0-unstable, Apache-2.0 
+- connector-flightsql 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-ftp 2.0.0-unstable, Apache-2.0 
+- connector-ftp 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-graphql 2.0.0-unstable, Apache-2.0 
+- connector-graphql 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-imap 2.0.0-unstable, Apache-2.0 
+- connector-imap 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-mongodb 2.0.0-unstable, Apache-2.0 
+- connector-mongodb 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-mssql 2.0.0-unstable, Apache-2.0 
+- connector-mssql 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-mysql 2.0.0-unstable, Apache-2.0 
+- connector-mysql 2.0.0-rc.3, Apache-2.0 
   <br/>
 
 - connector-nfs 1.11.0-unstable, Apache-2.0 
   <br/>
 
-- connector-odbc 2.0.0-unstable, Apache-2.0 
+- connector-odbc 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-oracle 2.0.0-unstable, Apache-2.0 
+- connector-oracle 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-postgres 2.0.0-unstable, Apache-2.0 
+- connector-postgres 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-scylladb 2.0.0-unstable, Apache-2.0 
+- connector-scylladb 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-sftp 2.0.0-unstable, Apache-2.0 
+- connector-sftp 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-sharepoint 2.0.0-unstable, Apache-2.0 
+- connector-sharepoint 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-smb 2.0.0-unstable, Apache-2.0 
+- connector-smb 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-snowflake 2.0.0-unstable, Apache-2.0 
+- connector-snowflake 2.0.0-rc.3, Apache-2.0 
   <br/>
 
-- connector-spark 2.0.0-unstable, Apache-2.0 
+- connector-spark 2.0.0-rc.3, Apache-2.0 
   <br/>
 
 - criterion 0.5.1, Apache-2.0 OR MIT 
@@ -312,58 +318,61 @@ Spice.ai acknowledges the following open source projects for making this project
 - csv 1.4.0, MIT OR Unlicense 
   <br/>https://github.com/BurntSushi/rust-csv
 
-- ctor 0.6.3, Apache-2.0 OR MIT 
+- ctor 0.8.0, Apache-2.0 OR MIT 
   <br/>https://github.com/mmastrac/rust-ctor
 
 - ctrlc 3.5.1, Apache-2.0 OR MIT 
   <br/>https://github.com/Detegr/rust-ctrlc.git
 
-- cudarc 0.12.2, Apache-2.0 OR MIT 
-  <br/>https://github.com/coreylowman/cudarc
-
 - cudarc 0.17.8, Apache-2.0 OR MIT 
   <br/>https://github.com/coreylowman/cudarc
 
-- cudarc 0.19.0, Apache-2.0 OR MIT 
+- cudarc 0.19.4, Apache-2.0 OR MIT 
   <br/>https://github.com/chelsea0x3b/cudarc
 
 - dashmap 6.1.0, MIT 
   <br/>https://github.com/xacrimon/dashmap
 
-- datafusion 52.3.0, Apache-2.0 
+- datafusion 52.5.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-catalog 52.3.0, Apache-2.0 
+- datafusion-catalog 52.5.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-common 52.3.0, Apache-2.0 
+- datafusion-common 52.5.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-datasource 52.3.0, Apache-2.0 
+- datafusion-datasource 52.5.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-execution 52.3.0, Apache-2.0 
+- datafusion-execution 52.5.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-expr 52.3.0, Apache-2.0 
+- datafusion-expr 52.5.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
 - datafusion-federation 0.4.2, Apache-2.0 
   <br/>https://github.com/datafusion-contrib/datafusion-federation
 
+- datafusion-flightsql 0.1.0, Apache-2.0 
+  <br/>
+
+- datafusion-functions 52.5.0, Apache-2.0 
+  <br/>https://github.com/apache/datafusion
+
 - datafusion-functions-json 0.52.0, Apache-2.0 
   <br/>https://github.com/datafusion-contrib/datafusion-functions-json/
 
-- datafusion-physical-expr 52.3.0, Apache-2.0 
+- datafusion-physical-expr 52.5.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-physical-plan 52.3.0, Apache-2.0 
+- datafusion-physical-plan 52.5.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-proto 52.3.0, Apache-2.0 
+- datafusion-proto 52.5.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
-- datafusion-spark 52.3.0, Apache-2.0 
+- datafusion-spark 52.5.0, Apache-2.0 
   <br/>https://github.com/apache/datafusion
 
 - datafusion-table-providers 0.1.0, Apache-2.0 
@@ -387,7 +396,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - duckdb 1.4.4, MIT 
   <br/>https://github.com/duckdb/duckdb-rs
 
-- duration-parse 2.0.0-unstable, Apache-2.0 
+- duration-parse 2.0.0-rc.3, Apache-2.0 
   <br/>
 
 - dyn-clone 1.0.20, Apache-2.0 OR MIT 
@@ -402,7 +411,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - fundu 2.0.1, MIT 
   <br/>https://github.com/fundu-rs/fundu
 
-- futures 0.3.31, Apache-2.0 OR MIT 
+- futures 0.3.32, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-lang/futures-rs
 
 - gethostname 1.1.0, Apache-2.0 
@@ -468,19 +477,22 @@ Spice.ai acknowledges the following open source projects for making this project
 - hyper-util 0.1.20, MIT 
   <br/>https://github.com/hyperium/hyper-util
 
-- iceberg 0.8.0, Apache-2.0 
+- iceberg 0.9.0, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
 
-- iceberg-catalog-glue 0.8.0, Apache-2.0 
+- iceberg-catalog-glue 0.9.0, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
 
-- iceberg-catalog-rest 0.8.0, Apache-2.0 
+- iceberg-catalog-rest 0.9.0, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
 
-- iceberg-datafusion 0.8.0, Apache-2.0 
+- iceberg-datafusion 0.9.0, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
 
-- iceberg_test_utils 0.8.0, Apache-2.0 
+- iceberg-storage-opendal 0.9.0, Apache-2.0 
+  <br/>https://github.com/apache/iceberg-rust
+
+- iceberg_test_utils 0.9.0, Apache-2.0 
   <br/>https://github.com/apache/iceberg-rust
 
 - imap 3.0.0-alpha.14, Apache-2.0 OR MIT 
@@ -534,7 +546,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - linkme 0.3.35, Apache-2.0 OR MIT 
   <br/>https://github.com/dtolnay/linkme
 
-- logos 0.16.0, Apache-2.0 OR MIT 
+- logos 0.16.1, Apache-2.0 OR MIT 
   <br/>https://github.com/maciejhirsz/logos
 
 - mailparse 0.16.1, 0BSD 
@@ -558,10 +570,10 @@ Spice.ai acknowledges the following open source projects for making this project
 - moka 0.12.13, (Apache-2.0 OR MIT) AND Apache-2.0 
   <br/>https://github.com/moka-rs/moka
 
-- mongodb 3.5.1, Apache-2.0 
+- mongodb 3.5.2, Apache-2.0 
   <br/>https://github.com/mongodb/mongo-rust-driver
 
-- mysql_async 0.36.1, Apache-2.0 OR MIT 
+- mysql_async 0.36.2, Apache-2.0 OR MIT 
   <br/>https://github.com/blackbeam/mysql_async
 
 - ndarray 0.15.6, Apache-2.0 OR MIT 
@@ -606,7 +618,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - opentelemetry-http 0.31.0, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-http
 
-- opentelemetry-otlp 0.31.0, Apache-2.0 
+- opentelemetry-otlp 0.31.1, Apache-2.0 
   <br/>https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-otlp
 
 - opentelemetry-prometheus 0.31.0, Apache-2.0 
@@ -663,7 +675,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - postcard 1.1.3, Apache-2.0 OR MIT 
   <br/>https://github.com/jamesmunns/postcard
 
-- predicates 3.1.3, Apache-2.0 OR MIT 
+- predicates 3.1.4, Apache-2.0 OR MIT 
   <br/>https://github.com/assert-rs/predicates-rs
 
 - prometheus 0.14.0, Apache-2.0 
@@ -684,7 +696,10 @@ Spice.ai acknowledges the following open source projects for making this project
 - rand 0.8.5, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-random/rand
 
-- rand 0.9.2, Apache-2.0 OR MIT 
+- rand 0.9.4, Apache-2.0 OR MIT 
+  <br/>https://github.com/rust-random/rand
+
+- rand 0.10.1, Apache-2.0 OR MIT 
   <br/>https://github.com/rust-random/rand
 
 - rayon 1.11.0, Apache-2.0 OR MIT 
@@ -798,7 +813,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - spiceai 3.2.0, Apache-2.0 
   <br/>
 
-- spicepod-validator 2.0.0-unstable, Apache-2.0 
+- spicepod-validator 2.0.0-rc.3, Apache-2.0 
   <br/>
 
 - ssh2 0.9.5, Apache-2.0 OR MIT 
@@ -813,13 +828,13 @@ Spice.ai acknowledges the following open source projects for making this project
 - sysinfo 0.36.1, MIT 
   <br/>https://github.com/GuillaumeGomez/sysinfo
 
-- sysinfo 0.37.2, MIT 
+- sysinfo 0.38.4, MIT 
   <br/>https://github.com/GuillaumeGomez/sysinfo
 
-- tantivy 0.25.0, MIT 
+- tantivy 0.26.0, MIT 
   <br/>https://github.com/quickwit-oss/tantivy
 
-- tar 0.4.44, Apache-2.0 OR MIT 
+- tar 0.4.45, Apache-2.0 OR MIT 
   <br/>https://github.com/alexcrichton/tar-rs
 
 - tempfile 3.26.0, Apache-2.0 OR MIT 
@@ -831,16 +846,16 @@ Spice.ai acknowledges the following open source projects for making this project
 - test-log 0.2.19, Apache-2.0 OR MIT 
   <br/>https://github.com/d-e-s-o/test-log.git
 
-- text-embeddings-backend 1.8.2,  
+- text-embeddings-backend 1.9.3,  
   <br/>
 
-- text-embeddings-backend-candle 1.8.2,  
+- text-embeddings-backend-candle 1.9.3,  
   <br/>
 
-- text-embeddings-backend-core 1.8.2,  
+- text-embeddings-backend-core 1.9.3,  
   <br/>
 
-- text-embeddings-core 1.8.2,  
+- text-embeddings-core 1.9.3,  
   <br/>
 
 - text-splitter 0.18.1, MIT 
@@ -864,6 +879,9 @@ Spice.ai acknowledges the following open source projects for making this project
 - tokenizers 0.21.4, Apache-2.0 
   <br/>https://github.com/huggingface/tokenizers
 
+- tokenizers 0.22.2, Apache-2.0 
+  <br/>https://github.com/huggingface/tokenizers
+
 - tokio 1.49.0, MIT 
   <br/>https://github.com/tokio-rs/tokio
 
@@ -885,7 +903,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - tokio-util 0.7.18, MIT 
   <br/>https://github.com/tokio-rs/tokio
 
-- tonic 0.14.2, MIT 
+- tonic 0.14.5, MIT 
   <br/>https://github.com/hyperium/tonic
 
 - tonic-health 0.14.2, MIT 
@@ -927,7 +945,7 @@ Spice.ai acknowledges the following open source projects for making this project
 - tract-onnx 0.22.0, Apache-2.0 OR MIT 
   <br/>https://github.com/snipsco/tract
 
-- turso 0.5.1, MIT 
+- turso 0.5.3, MIT 
   <br/>https://github.com/tursodatabase/turso
 
 - twox-hash 2.1.2, MIT 
@@ -972,14 +990,14 @@ Spice.ai acknowledges the following open source projects for making this project
 - winver 1.0.0, MIT 
   <br/>https://github.com/rhysd/winver
 
+- wiremock 0.6.5, Apache-2.0 OR MIT 
+  <br/>https://github.com/LukeMathWalker/wiremock-rs
+
 - x509-certificate 0.25.0, MPL-2.0 
   <br/>https://github.com/indygreg/cryptography-rs.git
 
 - yaml-rust2 0.11.0, Apache-2.0 OR MIT 
   <br/>https://github.com/Ethiraric/yaml-rust2
-
-- zip 1.1.4, MIT 
-  <br/>https://github.com/zip-rs/zip2.git
 
 - zip 3.0.0, MIT 
   <br/>https://github.com/zip-rs/zip2.git
@@ -992,4 +1010,7 @@ Spice.ai acknowledges the following open source projects for making this project
 
 - zip 7.4.0, MIT 
   <br/>https://github.com/zip-rs/zip2.git
+
+- zstd 0.13.3, MIT 
+  <br/>https://github.com/gyscos/zstd-rs
 
