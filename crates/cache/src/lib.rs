@@ -576,10 +576,10 @@ impl QueryResultsCacheProvider {
                 | LogicalPlan::Dml(..)
                 | LogicalPlan::Copy { .. }
                 | LogicalPlan::Statement(..) => return false,
-                LogicalPlan::Extension(ext) => {
-                    if WRITE_CAPABLE_EXTENSION_NAMES.contains(&ext.node.name()) {
-                        return false;
-                    }
+                LogicalPlan::Extension(ext)
+                    if WRITE_CAPABLE_EXTENSION_NAMES.contains(&ext.node.name()) =>
+                {
+                    return false;
                 }
                 _ => {}
             }
