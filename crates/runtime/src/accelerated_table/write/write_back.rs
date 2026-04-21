@@ -50,6 +50,7 @@ use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use datafusion_datasource::source::DataSourceExec;
 use futures::StreamExt;
+use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 
 use crate::accelerated_table::refresh::Refresher;
 use crate::federated_table::FederatedTable;
@@ -110,12 +111,13 @@ impl DataSink for WriteBackDataSink {
     async fn write_all(
         &self,
         mut data: SendableRecordBatchStream,
-        _context: &Arc<TaskContext>,
+        context: &Arc<TaskContext>,
     ) -> DataFusionResult<u64> {
         // Consume the input stream exactly once and buffer the batches so they
         // can be replayed to both the accelerator (synchronously) and the
         // federated source (asynchronously). This guarantees both sides see
         // identical data and the input plan is never executed twice.
+        let input_schema = data.schema();
         let mut batches: Vec<RecordBatch> = Vec::new();
         let mut row_count: u64 = 0;
         while let Some(batch_result) = data.next().await {
@@ -124,14 +126,17 @@ impl DataSink for WriteBackDataSink {
             batches.push(batch);
         }
 
-        // Write to the accelerator synchronously. The caller blocks until this
+        // Write to the accelerator synchronously using the caller's task
+        // context so session configuration/runtime env (object store,
+        // extensions, limits) is preserved. The caller blocks until this
         // completes, matching the "write reaches local storage before the
         // response is returned" contract of write-back caching.
         execute_insert(
             Arc::clone(&self.accelerator),
-            Arc::clone(&self.schema),
+            Arc::clone(&input_schema),
             batches.clone(),
             self.overwrite,
+            Some(Arc::clone(context)),
         )
         .await
         .map_err(|e| {
@@ -146,11 +151,12 @@ impl DataSink for WriteBackDataSink {
         // background. Failures are logged but do not affect the synchronous
         // response.
         let federated = Arc::clone(&self.federated);
-        let schema = Arc::clone(&self.schema);
         let overwrite = self.overwrite;
         tokio::spawn(async move {
             let federated_provider = federated.table_provider().await;
-            if let Err(e) = execute_insert(federated_provider, schema, batches, overwrite).await {
+            if let Err(e) =
+                execute_insert(federated_provider, input_schema, batches, overwrite, None).await
+            {
                 tracing::error!("Write-back: failed to persist write to federated source: {e}");
             }
         });
@@ -160,18 +166,24 @@ impl DataSink for WriteBackDataSink {
 }
 
 /// Builds an in-memory execution plan from buffered batches and executes
-/// an `insert_into` against the supplied table provider.
+/// an `insert_into` against the supplied table provider. The input plan is
+/// cast to the target provider's schema so differences between the
+/// accelerator and federated source schemas (extra columns, differing
+/// types) don't cause incorrect writes.
 async fn execute_insert(
     table: Arc<dyn TableProvider>,
-    schema: SchemaRef,
+    input_schema: SchemaRef,
     batches: Vec<RecordBatch>,
     overwrite: InsertOp,
+    task_context: Option<Arc<TaskContext>>,
 ) -> DataFusionResult<()> {
-    let memory_source = MemorySourceConfig::try_new(&[batches], schema, None)?;
-    let input: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(memory_source)));
+    let memory_source = MemorySourceConfig::try_new(&[batches], input_schema, None)?;
+    let source: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(memory_source)));
+    let input: Arc<dyn ExecutionPlan> = Arc::new(SchemaCastScanExec::new(source, table.schema()));
 
     let ctx = SessionContext::new();
     let plan = table.insert_into(&ctx.state(), input, overwrite).await?;
-    let _ = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+    let task_ctx = task_context.unwrap_or_else(|| ctx.task_ctx());
+    let _ = datafusion::physical_plan::collect(plan, task_ctx).await?;
     Ok(())
 }

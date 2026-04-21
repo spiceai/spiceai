@@ -256,7 +256,7 @@ pub enum Error {
     NeedToSpecifySQLView { name: String },
 
     #[snafu(display(
-        "An accelerated table was configured as read_write without setting replication.enabled = true, on_conflict, or refresh_mode = changes"
+        "An accelerated table was configured as read_write without setting replication.enabled: true, acceleration.on_conflict, or acceleration.refresh_mode: changes"
     ))]
     AcceleratedReadWriteTableWithoutReplication,
 
