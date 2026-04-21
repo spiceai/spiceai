@@ -456,7 +456,7 @@ impl TableProvider for JsonTreeTable {
     async fn scan(
         &self,
         _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
@@ -465,7 +465,7 @@ impl TableProvider for JsonTreeTable {
         // support requires a dedicated `UdtfArgs` proto variant + codec so
         // remote executors can re-invoke the walker; that's follow-up scope.
         let batch = rows_to_batch(&self.rows, Arc::clone(&self.schema))?;
-        let src = MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&self.schema), None)?;
+        let src = MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&self.schema), projection.cloned())?;
         Ok(Arc::new(DataSourceExec::new(Arc::new(src))))
     }
 }
