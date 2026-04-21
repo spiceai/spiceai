@@ -144,10 +144,7 @@ pub(crate) fn array_distance_to_sql(
 
     let ast_args: Vec<ast::Expr> = args
         .iter()
-        .map(|arg| {
-            unparser
-                .expr_to_sql(arg)
-                .map(cast_to_float_array)})
+        .map(|arg| unparser.expr_to_sql(arg).map(cast_to_float_array))
         .try_collect()?;
 
     let ast_fn = ast::Expr::Function(Function {
