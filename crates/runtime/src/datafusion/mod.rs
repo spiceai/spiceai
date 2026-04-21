@@ -1861,8 +1861,7 @@ impl DataFusion {
         // with write-back (which forwards writes to the federated source).
         if dataset.access().allows_write()
             && !has_on_conflict
-            && acceleration_settings.write_mode
-                == spicepod::acceleration::WriteMode::WriteBack
+            && acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteBack
         {
             accelerated_table_builder.write_back();
         }
