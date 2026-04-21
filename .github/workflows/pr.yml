@@ -281,7 +281,7 @@ jobs:
           fi
 
       - name: Push snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: ${{ github.event.inputs.update_snapshots == 'always' && needs.check_changes.outputs.relevant_changes == 'true' }}
         uses: ./.github/actions/push-snap-changes
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -291,7 +291,7 @@ jobs:
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
       - name: Upload spiceio logs
-        if: always()
+        if: always() && needs.check_changes.outputs.relevant_changes == 'true' && steps.setup-spiceio.outputs.pid != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiceio-build-test-logs
@@ -374,7 +374,7 @@ jobs:
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
       - name: Upload spiceio logs
-        if: always()
+        if: always() && needs.check_changes.outputs.relevant_changes == 'true' && steps.setup-spiceio.outputs.pid != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiceio-build-install-dev-logs
@@ -473,7 +473,7 @@ jobs:
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
       - name: Upload spiceio logs
-        if: always()
+        if: always() && needs.check_changes.outputs.relevant_changes == 'true' && steps.setup-spiceio.outputs.pid != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiceio-build-install-release-logs
