@@ -246,7 +246,7 @@ pem.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"] }
 repl = { path = "../repl" }
 rstest = "0.26.1"
-rustfs = { git = "https://github.com/rustfs/rustfs.git", rev = "cf6b0977f64b6551b694cd8a450272c435a8bcb7" }
+rustfs = { git = "https://github.com/Jeadie/rustfs.git", rev = "b8dbf1b9f399ad1804ba5a6377b4fb8b7808186e" }
 scopeguard = "1.2.0"
 serde_json = { workspace = true, features = ["preserve_order"] }
 spice-cloud = { path = "../spice_cloud" }
