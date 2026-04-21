@@ -75,31 +75,31 @@ jobs:
             const matrix = [
               {
                 compute_cap: "80",
-                runner: "spiceai-large-runners",
+                runner: "spiceai-dev-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "86",
-                runner: "spiceai-large-runners",
+                runner: "spiceai-dev-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "87",
-                runner: "spiceai-large-runners",
+                runner: "spiceai-dev-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "89",
-                runner: "spiceai-large-runners",
+                runner: "spiceai-dev-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "90",
-                runner: "spiceai-large-runners",
+                runner: "spiceai-dev-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
               }
