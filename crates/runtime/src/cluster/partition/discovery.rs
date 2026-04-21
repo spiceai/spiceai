@@ -14,22 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Discovery layer: query the federated source for a table's partition values
-//! and diff against the partitions currently tracked in [`PartitionStore`].
+//! Discovery layer: query the federated source for a table's current partition values.
 //!
-//! This module is deliberately side-effect-free: it reads the source and the
-//! store but never writes. The service layer ([`super::service`]) consumes the
-//! resulting [`PartitionDiff`] and performs any state transitions (adding/
-//! removing partitions, assigning executors, notifying).
+//! The only public entry point is [`query_source_partitions`], which is called by
+//! the [`runtime_cluster::context::PartitionDiscoverer`] impl on `DataFusion`. The
+//! diff-and-apply logic lives in `runtime_cluster::service::PartitionService`.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::collections::HashMap;
 
 use crate::{
     accelerated_table::AcceleratedTable,
-    cluster::partition::{Error, PartitionDiscoverySnafu, PartitionStore, PartitionValue, Result},
+    cluster::partition::{Error, PartitionDiscoverySnafu, PartitionValue, Result},
     datafusion::DataFusion,
     search::util::find_concrete_table_provider,
 };
@@ -43,102 +38,6 @@ use datafusion::{prelude::SessionContext, sql::TableReference};
 use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
 use util::session_state::builder_from_existing;
-
-/// Result of comparing the partitions currently in the source table against
-/// the partitions recorded in [`PartitionStore`].
-#[derive(Debug, Default, Clone)]
-pub struct PartitionDiff {
-    /// Partitions present in the source but not yet tracked in the store.
-    pub new: Vec<PartitionValue>,
-    /// Partitions tracked in the store but no longer present in the source.
-    pub removed: Vec<PartitionValue>,
-}
-
-impl PartitionDiff {
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.new.is_empty() && self.removed.is_empty()
-    }
-}
-
-/// Query the source and diff against the partitions recorded in [`PartitionStore`].
-///
-/// If the store has no metadata for the table, all source partitions are reported
-/// as `new` and `removed` is empty. Callers that want strict "skip if no
-/// metadata" behavior should check the store themselves before calling.
-///
-/// This function performs no writes and no assignment — see
-/// [`super::service::PartitionService`] for the state-mutating counterparts.
-pub(crate) async fn diff_table_partitions(
-    table: &TableReference,
-    partition_by: &[PartitionedBy],
-    partition_store: &PartitionStore,
-    df: &Arc<DataFusion>,
-) -> Result<PartitionDiff> {
-    let source_partitions = query_source_partitions(table, partition_by, df).await?;
-
-    let metadata = match partition_store.get_table_metadata(table).await {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            tracing::debug!(
-                table = %table,
-                count = source_partitions.len(),
-                "No partition metadata, treating all source partitions as new"
-            );
-            return Ok(PartitionDiff {
-                new: source_partitions,
-                removed: Vec::new(),
-            });
-        }
-        Err(e) => {
-            return Err(Error::PartitionDiscovery {
-                table: table.to_string(),
-                source: Box::new(e),
-            });
-        }
-    };
-
-    let existing: HashSet<Vec<(String, String)>> = metadata
-        .partitions
-        .iter()
-        .map(|p| sorted_kv(&p.partition_value))
-        .collect();
-
-    let source_set: HashSet<Vec<(String, String)>> =
-        source_partitions.iter().map(sorted_kv).collect();
-
-    let new: Vec<PartitionValue> = source_partitions
-        .iter()
-        .filter(|p| !existing.contains(&sorted_kv(p)))
-        .cloned()
-        .collect();
-
-    let removed: Vec<PartitionValue> = metadata
-        .partitions
-        .iter()
-        .filter(|p| !source_set.contains(&sorted_kv(&p.partition_value)))
-        .map(|p| p.partition_value.clone())
-        .collect();
-
-    if !new.is_empty() || !removed.is_empty() {
-        tracing::debug!(
-            table = %table,
-            new = new.len(),
-            removed = removed.len(),
-            "Computed partition diff"
-        );
-    }
-
-    Ok(PartitionDiff { new, removed })
-}
-
-/// Sort a `PartitionValue` (a `HashMap`) into a deterministic `Vec<(k, v)>`
-/// so that two partition values with the same entries hash/compare equal.
-fn sorted_kv(p: &PartitionValue) -> Vec<(String, String)> {
-    let mut v: Vec<_> = p.clone().into_iter().collect();
-    v.sort();
-    v
-}
 
 /// Query the source table for the partition values present right now.
 ///
