@@ -1185,12 +1185,12 @@
             }
           ]
         },
-        "assignment_interval": {
+        "partition_assignment_interval": {
           "description": "How often the scheduler assigns accelerated table partitions to executors.",
           "type": "string",
           "default": "30s"
         },
-        "max_assignments_per_interval": {
+        "max_partition_assignments_per_interval": {
           "description": "Maximum number of partition assignments made per assignment interval.",
           "type": "integer",
           "format": "uint",

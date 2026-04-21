@@ -819,8 +819,8 @@ mod version_tests {
             .as_ref()
             .expect("scheduler should be present");
         assert_eq!(scheduler.state_location, "s3://my-bucket/scheduler-state");
-        assert_eq!(scheduler.assignment_interval, "15s");
-        assert_eq!(scheduler.max_assignments_per_interval, 50);
+        assert_eq!(scheduler.partition_assignment_interval, "15s");
+        assert_eq!(scheduler.max_partition_assignments_per_interval, 50);
         assert_eq!(scheduler.max_partitions_per_executor, 500);
         assert_eq!(scheduler.partition_discovery_timeout, "120s");
     }
@@ -875,8 +875,8 @@ mod version_tests {
         ";
         let scheduler: component::runtime::Scheduler =
             yaml::from_str(yaml).expect("Should parse Scheduler");
-        assert_eq!(scheduler.assignment_interval, "30s");
-        assert_eq!(scheduler.max_assignments_per_interval, 100);
+        assert_eq!(scheduler.partition_assignment_interval, "30s");
+        assert_eq!(scheduler.max_partition_assignments_per_interval, 100);
         assert_eq!(scheduler.max_partitions_per_executor, 1000);
         assert_eq!(scheduler.partition_discovery_timeout, "60s");
     }

@@ -780,12 +780,12 @@ pub struct Scheduler {
     pub params: Option<Params>,
 
     /// How often the scheduler assigns accelerated table partitions to executors.
-    #[serde(default = "default_assignment_interval")]
-    pub assignment_interval: String,
+    #[serde(default = "default_partition_assignment_interval")]
+    pub partition_assignment_interval: String,
 
     /// Maximum number of partition assignments made per assignment interval.
-    #[serde(default = "default_max_assignments_per_interval")]
-    pub max_assignments_per_interval: usize,
+    #[serde(default = "default_max_partition_assignments_per_interval")]
+    pub max_partition_assignments_per_interval: usize,
 
     /// Maximum partitions assigned to a single executor (soft limit).
     #[serde(default = "default_max_partitions_per_executor")]
@@ -797,12 +797,12 @@ pub struct Scheduler {
 }
 
 #[must_use]
-pub fn default_assignment_interval() -> String {
+pub fn default_partition_assignment_interval() -> String {
     "30s".to_string()
 }
 
 #[must_use]
-pub fn default_max_assignments_per_interval() -> usize {
+pub fn default_max_partition_assignments_per_interval() -> usize {
     100
 }
 

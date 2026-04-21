@@ -602,7 +602,7 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                         // Limit each executor to 2 of the 4 partitions per table so
                         // that partitions are forced to split across the 2 executors,
                         // producing a UnionExec in the query plan.
-                        cfg.assignment_interval = "1s".to_string();
+                        cfg.partition_assignment_interval = "1s".to_string();
                         cfg.max_partitions_per_executor = 2;
                         cfg
                     }),
@@ -931,9 +931,9 @@ fn make_named_scheduler_config_with_max_partitions_per_executor(
                 ("s3_auth".to_string(), "key".to_string()),
             ]),
         )),
-        assignment_interval: "1s".to_string(),
-        max_assignments_per_interval:
-            spicepod::component::runtime::default_max_assignments_per_interval(),
+        partition_assignment_interval: "1s".to_string(),
+        max_partition_assignments_per_interval:
+            spicepod::component::runtime::default_max_partition_assignments_per_interval(),
         max_partitions_per_executor,
         partition_discovery_timeout:
             spicepod::component::runtime::default_partition_discovery_timeout(),

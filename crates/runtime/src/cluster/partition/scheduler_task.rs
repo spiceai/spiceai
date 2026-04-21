@@ -138,10 +138,11 @@ impl TryFrom<spicepod::component::runtime::Scheduler> for PartitionAssignmentCon
     fn try_from(
         config: spicepod::component::runtime::Scheduler,
     ) -> Result<Self, Self::Error> {
-        let interval =
-            fundu::parse_duration(&config.assignment_interval).context(InvalidIntervalSnafu {
-                interval: &config.assignment_interval,
-            })?;
+        let interval = fundu::parse_duration(&config.partition_assignment_interval).context(
+            InvalidIntervalSnafu {
+                interval: &config.partition_assignment_interval,
+            },
+        )?;
 
         if interval.is_zero() {
             return Err(ConfigError::IntervalIsZero);
@@ -159,7 +160,7 @@ impl TryFrom<spicepod::component::runtime::Scheduler> for PartitionAssignmentCon
 
         Ok(Self {
             interval,
-            max_assignments_per_interval: config.max_assignments_per_interval,
+            max_assignments_per_interval: config.max_partition_assignments_per_interval,
             max_partitions_per_executor: config.max_partitions_per_executor,
             discovery_timeout,
         })
