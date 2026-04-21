@@ -788,4 +788,32 @@ mod tests {
         let ty = udf.return_type(&[DataType::Utf8]).expect("return type");
         assert!(matches!(ty, DataType::LargeList(_)));
     }
+
+    #[tokio::test]
+    async fn scan_with_projection_returns_only_requested_columns() {
+        use datafusion::prelude::SessionContext;
+        let ctx = SessionContext::new();
+        let func = JsonTreeTableFunc::new();
+        let provider = func
+            .call(&[Expr::Literal(
+                ScalarValue::Utf8(Some(r#"{"a": [1, 2]}"#.to_string())),
+                None,
+            )])
+            .expect("call succeeds");
+
+        // Full schema has 8 columns; request only columns 0 (key), 2 (type), 6 (fullkey).
+        let projection = vec![0usize, 2, 6];
+        let state = ctx.state();
+        let plan = provider
+            .scan(&state, Some(&projection), &[], None)
+            .await
+            .expect("scan with projection");
+        let results = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("collect");
+        assert_eq!(results[0].num_columns(), 3, "expected 3 projected columns");
+        assert_eq!(results[0].schema().field(0).name(), "key");
+        assert_eq!(results[0].schema().field(1).name(), "type");
+        assert_eq!(results[0].schema().field(2).name(), "fullkey");
+    }
 }

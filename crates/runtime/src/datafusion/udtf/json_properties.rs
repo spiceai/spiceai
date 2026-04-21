@@ -1411,7 +1411,7 @@ mod tests {
     fn documents_without_properties_yield_zero_rows() {
         assert!(flatten(r#"{"foo": "bar"}"#).is_empty());
         assert!(flatten(r#"{"properties": {}}"#).is_empty());
-        assert!(flatten(r#"[1, 2, 3]"#).is_empty());
+        assert!(flatten(r"[1, 2, 3]").is_empty());
     }
 
     #[tokio::test]
@@ -1498,5 +1498,34 @@ mod tests {
         // still emits an (empty) list slot per row.
         assert_eq!(list.value(0).len(), 1);
         assert_eq!(list.value(1).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn scan_with_projection_returns_only_requested_columns() {
+        use datafusion::prelude::SessionContext;
+        let ctx = SessionContext::new();
+        let func = FlattenJsonPropertiesTableFunc::new();
+        let provider = func
+            .call(&[Expr::Literal(
+                ScalarValue::Utf8(Some(
+                    r#"{"properties":{"a":{"type":"string"}}}"#.to_string(),
+                )),
+                None,
+            )])
+            .expect("call succeeds");
+
+        // Full schema has 9 columns; request only columns 0 (path) and 2 (type).
+        let projection = vec![0usize, 2];
+        let state = ctx.state();
+        let plan = provider
+            .scan(&state, Some(&projection), &[], None)
+            .await
+            .expect("scan with projection");
+        let results = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .expect("collect");
+        assert_eq!(results[0].num_columns(), 2, "expected 2 projected columns");
+        assert_eq!(results[0].schema().field(0).name(), "path");
+        assert_eq!(results[0].schema().field(1).name(), "type");
     }
 }

@@ -2,7 +2,7 @@
 
 //! Benchmarks for `flatten_json_properties`.
 //!
-//! Exercises the walker in isolation (no DataFusion plumbing) so regressions
+//! Exercises the walker in isolation (no `DataFusion` plumbing) so regressions
 //! attributable to the walker itself surface without noise from query planning
 //! or Arrow I/O. `bench_catalog_simulation` approximates the typical
 //! materialization shape — 1k schemas × 50 fields per schema.
