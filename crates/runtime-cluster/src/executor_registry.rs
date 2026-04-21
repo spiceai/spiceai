@@ -206,6 +206,10 @@ impl ExecutorRegistry {
     }
 
     /// Sends a control message to a specific executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the executor is not registered or the channel send fails.
     pub async fn send_command(
         &self,
         executor_id: &str,
@@ -238,6 +242,10 @@ impl ExecutorRegistry {
     ///
     /// Returns a list of (`executor_id`, `otlp_metrics`) tuples for successful responses.
     /// If any executor fails, returns an error containing the list of failed executors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if one or more executors fail to respond with metrics.
     pub async fn request_metrics_from_all(&self) -> Result<Vec<(String, Vec<u8>)>> {
         let connections = self.connections.read().await;
 

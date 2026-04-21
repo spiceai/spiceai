@@ -63,6 +63,10 @@ impl std::error::Error for Error {}
 /// * `Ok(Vec<String>)` - List of executor IDs that together cover all required partitions
 /// * `Err(Error::MissingPartitions)` - Some required partitions are not available on any executor
 ///
+/// # Errors
+///
+/// Returns `Error::MissingPartitions` if any required partition is not covered by the available executors.
+///
 /// # Example
 ///
 /// ```ignore

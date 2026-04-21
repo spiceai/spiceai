@@ -219,6 +219,10 @@ impl PartitionService {
     /// Writes new partitions as unassigned and removes stale ones; does **not**
     /// assign to executors or send notifications. Used at scheduler startup
     /// before executors have connected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the partition store refresh, source discovery, or metadata write fails.
     pub async fn seed_table(
         &self,
         table: &TableReference,
@@ -240,6 +244,10 @@ impl PartitionService {
     /// Used by the on-demand refresh path: a `spice refresh` command calls
     /// this before forwarding the refresh to executors, ensuring any new
     /// partition values are assigned first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the partition store refresh, source discovery, metadata write, or executor notification fails.
     pub async fn reconcile_table(
         &self,
         table: &TableReference,
@@ -285,6 +293,11 @@ impl PartitionService {
     /// slow cycle can't saturate the cluster in one tick.
     ///
     /// Used by the periodic partition-management background task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the partition store refresh or executor notification fails.
+    /// Per-table diff failures are logged and skipped rather than propagated.
     pub async fn reconcile_all(&self, ops: &dyn PartitionOperations) -> Result<()> {
         let Some(app) = self.app.read().await.clone() else {
             tracing::warn!("App not initialized, skipping partition discovery");

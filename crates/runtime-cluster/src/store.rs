@@ -112,6 +112,10 @@ impl PartitionStore {
     }
 
     /// Get partition metadata for a table from object store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object store read fails.
     pub async fn get_table_metadata(
         &self,
         table: &TableReference,
@@ -136,6 +140,10 @@ impl PartitionStore {
     /// Initialize partition metadata for a table with the given partition expression SQL strings.
     ///
     /// If the file already exists, this is a no-op and returns `Ok(false)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object store write fails.
     pub async fn initialize_metadata(
         &self,
         table: &TableReference,
@@ -165,6 +173,10 @@ impl PartitionStore {
     /// This replaces the partitions list with the provided partition values.
     /// If `partition_expressions` is non-empty, it also sets the SQL expression strings
     /// (only when currently empty, to avoid overwriting values set during table creation).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object store read or write fails.
     pub async fn set_unassigned_partitions(
         &self,
         table: &TableReference,
@@ -190,6 +202,11 @@ impl PartitionStore {
     /// Allocates unassigned partitions to an executor.
     ///
     /// Uses OCC to atomically update metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata is not found, the object store write fails,
+    /// or the OCC retry limit is exceeded.
     pub async fn allocate_partitions(
         &self,
         table: &TableReference,
@@ -259,6 +276,11 @@ impl PartitionStore {
     }
 
     /// Assigns a partition to an executor in the metadata store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the partition or metadata is not found, the object store write fails,
+    /// or the OCC retry limit is exceeded.
     pub async fn assign_partition(
         &self,
         table: &TableReference,
@@ -310,6 +332,10 @@ impl PartitionStore {
     }
 
     /// List all tables with partition metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object store listing fails.
     pub async fn list_tables(&self) -> Result<Vec<String>> {
         self.state.list_keys().await.context(MetadataAccessSnafu {
             table: String::from("<list>"),
@@ -317,6 +343,10 @@ impl PartitionStore {
     }
 
     /// Refresh the local cache from object store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object store read fails.
     pub async fn refresh(&self) -> Result<()> {
         self.state.refresh().await.context(MetadataAccessSnafu {
             table: String::from("<refresh>"),
@@ -328,6 +358,11 @@ impl PartitionStore {
     /// it is assigned (or left as-is if already assigned to the same executor).
     ///
     /// `assignments` is a list of (`partition_value`, `executor_id`) tuples.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata is not found, the object store write fails,
+    /// or the OCC retry limit is exceeded.
     pub async fn add_and_assign_partitions(
         &self,
         table: &TableReference,
@@ -399,6 +434,10 @@ impl PartitionStore {
     ///
     /// If the source table has no partition metadata, this is a no-op because
     /// the source exists but is unpartitioned and there is nothing to copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata read or write fails.
     pub async fn copy_assignments(
         &self,
         source_table: &TableReference,
@@ -431,6 +470,10 @@ impl PartitionStore {
     }
 
     /// Write metadata using `insert_or_update` with conflict handling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object store write fails or a concurrent modification is detected.
     pub async fn write_metadata(
         &self,
         table: &TableReference,
