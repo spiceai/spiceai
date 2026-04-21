@@ -57,7 +57,7 @@ pub enum UdtfSource {
         limit: Option<usize>,
         include_score: Option<bool>,
     },
-    /// Created by `vector_search(tbl, query, [col], [limit], [include_score])`
+    /// Created by `vector_search(tbl, query, [col], [limit], [include_score], [distance_metric => "cosine" | "l2"])`
     VectorSearch {
         table: String,
         query: String,
