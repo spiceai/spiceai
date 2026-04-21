@@ -63,7 +63,7 @@ indexmap.workspace = true
 tempfile.workspace = true
 token_provider = { path = "../token_provider" }
 
-model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "bb09808aac1410e54fd022302b526a7c4dca9f00", optional = true }
+model2vec-rs = { git = "https://github.com/spiceai/model2vec-rs.git", rev = "f1190f1f140105f0c5ac8335fbbac402051ab072", optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true
