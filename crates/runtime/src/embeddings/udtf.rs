@@ -103,6 +103,9 @@ pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
 /// logical plan size and runtime work.
 const VECTOR_SEARCH_MAX_QUERIES: usize = 32;
 
+/// Reusing `_score` alias column can cause issues with physical optimizations during filter/limit/order pushdowns. Use internal column alias for ordering.
+const INTERNAL_SCORE_COLUMN_ALIAS: &str = "__spice_vector_search_score";
+
 /// Creates a `UserDefined` signature that allows named parameters (like `rank_weight => X`)
 /// to pass through for RRF (Reciprocal Rank Fusion) operations.
 ///
@@ -808,7 +811,7 @@ impl ScalarUDFImpl for VectorSearchTableFunc {
     }
 }
 
-/// The [`TableProvider`] produced from the [`VECTOR_SEARCH_UDTF_NAME`] UDTF.
+/// A [`TableProvider`] produced from the [`VECTOR_SEARCH_UDTF_NAME`] UDTF for tables that do not have an explicit vector index.
 ///
 /// This provider computes vector similarity scores on-the-fly using the embedding model,
 /// without relying on a pre-built vector index.
@@ -965,7 +968,6 @@ impl TableProvider for VectorSearchUDTFProvider {
                 }
             })
             .collect();
-        let mut base_expr = final_expr.clone();
 
         // Pick the scoring expression based on the requested distance metric.
         // In all cases the result is monotonically increasing with similarity
@@ -991,7 +993,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                     Operator::Minus,
                     Expr::ScalarFunction(ScalarFunction {
                         func: cosine_distance_udf,
-                        args: vec![query_lit, embed_expr],
+                        args: vec![query_lit.clone(), embed_expr.clone()],
                     }),
                 )
             }
@@ -1009,7 +1011,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                     Operator::Minus,
                     Expr::ScalarFunction(ScalarFunction {
                         func: array_distance_udf,
-                        args: vec![query_lit, embed_expr],
+                        args: vec![query_lit.clone(), embed_expr.clone()],
                     }),
                 )
             }
@@ -1022,18 +1024,24 @@ impl TableProvider for VectorSearchUDTFProvider {
             }
         };
 
-        base_expr.push(score_expr.alias(SEARCH_SCORE_COLUMN_NAME));
+        let mut base_expr = final_expr.clone();
+        base_expr.push(score_expr.alias(INTERNAL_SCORE_COLUMN_ALIAS));
 
         // Only project `_score` into the output when the caller asked for it
         // AND either asked for all columns or explicitly projected that index.
         if let Some(idx) = search_field_index
             && (projection.is_none() || projection.is_some_and(|proj| proj.contains(&idx)))
         {
-            final_expr.push(score_expr.clone().alias(SEARCH_SCORE_COLUMN_NAME));
+            final_expr.push(col(INTERNAL_SCORE_COLUMN_ALIAS).alias(SEARCH_SCORE_COLUMN_NAME));
         }
 
         let final_plan = scan
-            .sort(vec![SortExpr::new(score_expr, false, false)])?
+            .project(base_expr)?
+            .sort(vec![SortExpr::new(
+                Expr::Column(Column::from_name(INTERNAL_SCORE_COLUMN_ALIAS)),
+                false,
+                false,
+            )])?
             .limit(0, Some(self.limit_to_use(limit)))?
             .alias("tbl")?
             .project(final_expr)?
