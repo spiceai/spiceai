@@ -1306,7 +1306,8 @@ mod tests {
         let by = by_path(&rows);
         assert_eq!(by["ext"].type_name, "ref");
         let meta: serde_json::Value =
-            serde_json::from_str(by["ext"].metadata.as_ref().unwrap()).unwrap();
+            serde_json::from_str(by["ext"].metadata.as_ref().expect("ref metadata present"))
+                .expect("metadata parses as JSON");
         assert_eq!(meta["$ref"], "https://example.com/schema.json");
     }
 
@@ -1364,11 +1365,10 @@ mod tests {
             }
         }"#;
         let rows = flatten_with_options(json, &opts);
-        let paths: Vec<_> = rows.iter().map(|r| r.path.as_str()).collect();
         // We saw up to depth 2 (a.b); "a.b.c" lives at depth 3 which is capped.
         // Exact path set depends on when the cap trips, so we only assert that
         // the deepest path ("a.b.c.d") is absent.
-        assert!(!paths.contains(&"a.b.c.d"));
+        assert!(!rows.iter().any(|r| r.path == "a.b.c.d"));
     }
 
     #[test]
@@ -1487,7 +1487,7 @@ mod tests {
 
         let arr = match result {
             ColumnarValue::Array(a) => a,
-            other => panic!("expected array, got {other:?}"),
+            other @ ColumnarValue::Scalar(_) => panic!("expected array, got {other:?}"),
         };
         let list = arr
             .as_any()
