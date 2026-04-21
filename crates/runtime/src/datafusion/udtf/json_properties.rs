@@ -1514,8 +1514,10 @@ mod tests {
             )])
             .expect("call succeeds");
 
-        // Full schema has 9 columns; request only columns 0 (path) and 2 (type).
-        let projection = vec![0usize, 2];
+        // Full schema has 9 columns (path, parent_path, name, description,
+        // type, required, format, enum_values, metadata); request only
+        // columns 0 (path) and 4 (type).
+        let projection = vec![0usize, 4];
         let state = ctx.state();
         let plan = provider
             .scan(&state, Some(&projection), &[], None)
