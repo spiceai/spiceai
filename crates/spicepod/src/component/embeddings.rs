@@ -223,6 +223,41 @@ impl Display for EmbeddingPrefix {
     }
 }
 
+/// Aggregation strategy applied when a multi-vector (list-typed) column
+/// is queried. Each list element produces its own embedding; at query
+/// time the per-element similarities are combined into a single per-row
+/// score using this aggregation.
+///
+/// `Max` is the ColBERT-style `MaxSim` default — a row scores as high as
+/// its best-matching element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum EmbeddingAggregation {
+    #[default]
+    Max,
+    Mean,
+    Sum,
+}
+
+impl Display for EmbeddingAggregation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Max => write!(f, "max"),
+            Self::Mean => write!(f, "mean"),
+            Self::Sum => write!(f, "sum"),
+        }
+    }
+}
+
+/// Hard cap on multi-vector list elements embedded per row. Beyond this
+/// limit, excess elements are dropped with a warning. See
+/// `ColumnEmbeddingConfig::max_elements_per_row`.
+pub const MULTI_VECTOR_MAX_ELEMENTS_HARD_CAP: usize = 1024;
+
+/// Default cap if none specified on a multi-vector column.
+pub const MULTI_VECTOR_MAX_ELEMENTS_DEFAULT: usize = 32;
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct EmbeddingChunkConfig {
@@ -280,4 +315,16 @@ pub struct ColumnEmbeddingConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_size: Option<usize>,
+
+    /// Aggregation strategy for multi-vector embeddings. Only meaningful
+    /// when the underlying column is list-typed (`List<Utf8>` /
+    /// `LargeList<Utf8>`). Defaults to `max` (ColBERT-style `MaxSim`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregation: Option<EmbeddingAggregation>,
+
+    /// Maximum number of list elements embedded per row for multi-vector
+    /// columns. Defaults to `32`; hard-capped at `1024`. Excess elements
+    /// are dropped with a warning log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_elements_per_row: Option<usize>,
 }
