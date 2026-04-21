@@ -140,7 +140,7 @@ async fn query_count(ctx: &SessionContext, table_name: &str) -> usize {
 // Stats Tests
 // ============================================================================
 
-/// Stats are updated on each write and stored as a Vortex FileStatistics blob.
+/// Stats are updated on each write and stored as a Vortex `FileStatistics` blob.
 async fn test_stats_accumulate_across_appends(fixture: common::TestFixture) -> TestResult {
     let schema = simple_schema();
     let (table, _ctx) = create_table_no_pk(&fixture, "stats_accum", Arc::clone(&schema)).await;
@@ -280,13 +280,13 @@ async fn test_stats_with_mixed_types(fixture: common::TestFixture) -> TestResult
     Ok(())
 }
 
-/// String min/max and null_count must round-trip correctly in the statistics
+/// String min/max and `null_count` must round-trip correctly in the statistics
 /// blob. Asserts exact values (lexicographic min="apple", max="cherry") rather
 /// than just checking that the blob is non-empty — stats correctness is a
 /// data-correctness guarantee.
 async fn test_stats_min_max_correct_for_strings(fixture: common::TestFixture) -> TestResult {
-    use datafusion::common::stats::Precision;
     use datafusion::common::ScalarValue;
+    use datafusion::common::stats::Precision;
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),

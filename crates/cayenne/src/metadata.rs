@@ -319,7 +319,7 @@ pub struct TableStatistics {
     /// Table this stats entry belongs to (`UUIDv7`)
     pub table_id: String,
     /// Serialized Vortex `FileStatistics` flatbuffer bytes containing per-column
-    /// stats (min, max, null count, sum, NaN count, is_constant, etc.)
+    /// stats (min, max, null count, sum, NaN count, `is_constant`, etc.)
     pub statistics_blob: Vec<u8>,
     /// Total number of rows in the table across all files
     pub num_rows: i64,

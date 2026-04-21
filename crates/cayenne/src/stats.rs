@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Conversion utilities between DataFusion and Vortex statistics.
+//! Conversion utilities between `DataFusion` and Vortex statistics.
 //!
 //! Provides serialization/deserialization of Vortex [`FileStatistics`] and
-//! conversion between DataFusion [`ColumnStatistics`] and Vortex [`StatsSet`].
+//! conversion between `DataFusion` [`ColumnStatistics`] and Vortex [`StatsSet`].
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ use vortex::file::FileStatistics;
 use vortex::flatbuffers::WriteFlatBufferExt;
 use vortex::scalar::Scalar;
 
-/// Convert a DataFusion [`ScalarValue`] to a Vortex [`vortex::scalar::ScalarValue`].
+/// Convert a `DataFusion` [`ScalarValue`] to a Vortex [`vortex::scalar::ScalarValue`].
 ///
 /// Returns `None` for null values or unsupported types.
 fn df_scalar_to_vortex(sv: &ScalarValue) -> Option<vortex::scalar::ScalarValue> {
@@ -70,9 +70,9 @@ fn df_scalar_to_vortex(sv: &ScalarValue) -> Option<vortex::scalar::ScalarValue> 
     vortex_scalar.into_value()
 }
 
-/// Convert a Vortex stat scalar value to a DataFusion [`ScalarValue`].
+/// Convert a Vortex stat scalar value to a `DataFusion` [`ScalarValue`].
 ///
-/// Uses the Vortex [`Scalar`] type to perform the conversion via the DType.
+/// Uses the Vortex [`Scalar`] type to perform the conversion via the `DType`.
 fn vortex_stat_to_df(
     sv: &vortex::scalar::ScalarValue,
     stat: Stat,
@@ -83,7 +83,7 @@ fn vortex_stat_to_df(
     scalar_to_df(&scalar)
 }
 
-/// Convert a Vortex [`Scalar`] to a DataFusion [`ScalarValue`].
+/// Convert a Vortex [`Scalar`] to a `DataFusion` [`ScalarValue`].
 fn scalar_to_df(scalar: &Scalar) -> Option<ScalarValue> {
     match scalar.dtype() {
         DType::Bool(_) => {
@@ -123,7 +123,7 @@ fn scalar_to_df(scalar: &Scalar) -> Option<ScalarValue> {
     }
 }
 
-/// Convert a Vortex [`VortexPrecision`] to a DataFusion [`Precision`].
+/// Convert a Vortex [`VortexPrecision`] to a `DataFusion` [`Precision`].
 fn vortex_precision_to_df<T: Debug + Clone + PartialEq + Eq + PartialOrd>(
     p: VortexPrecision<T>,
 ) -> Precision<T> {
@@ -133,32 +133,32 @@ fn vortex_precision_to_df<T: Debug + Clone + PartialEq + Eq + PartialOrd>(
     }
 }
 
-/// Build a Vortex [`StatsSet`] from a DataFusion [`ColumnStatistics`].
+/// Build a Vortex [`StatsSet`] from a `DataFusion` [`ColumnStatistics`].
 ///
-/// Converts min/max/null_count from DataFusion precision types to Vortex stats.
+/// Converts min/max/`null_count` from `DataFusion` precision types to Vortex stats.
 pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
     let mut stats = StatsSet::default();
 
-    if let Some(sv) = cs.min_value.get_value() {
-        if let Some(vortex_sv) = df_scalar_to_vortex(sv) {
-            let precision = if cs.min_value.is_exact().is_some() {
-                VortexPrecision::Exact(vortex_sv)
-            } else {
-                VortexPrecision::Inexact(vortex_sv)
-            };
-            stats.set(Stat::Min, precision);
-        }
+    if let Some(sv) = cs.min_value.get_value()
+        && let Some(vortex_sv) = df_scalar_to_vortex(sv)
+    {
+        let precision = if cs.min_value.is_exact().is_some() {
+            VortexPrecision::Exact(vortex_sv)
+        } else {
+            VortexPrecision::Inexact(vortex_sv)
+        };
+        stats.set(Stat::Min, precision);
     }
 
-    if let Some(sv) = cs.max_value.get_value() {
-        if let Some(vortex_sv) = df_scalar_to_vortex(sv) {
-            let precision = if cs.max_value.is_exact().is_some() {
-                VortexPrecision::Exact(vortex_sv)
-            } else {
-                VortexPrecision::Inexact(vortex_sv)
-            };
-            stats.set(Stat::Max, precision);
-        }
+    if let Some(sv) = cs.max_value.get_value()
+        && let Some(vortex_sv) = df_scalar_to_vortex(sv)
+    {
+        let precision = if cs.max_value.is_exact().is_some() {
+            VortexPrecision::Exact(vortex_sv)
+        } else {
+            VortexPrecision::Inexact(vortex_sv)
+        };
+        stats.set(Stat::Max, precision);
     }
 
     if let Some(count) = cs.null_count.get_value() {
@@ -173,7 +173,7 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
     stats
 }
 
-/// Convert a Vortex [`StatsSet`] and column [`DType`] to DataFusion [`ColumnStatistics`].
+/// Convert a Vortex [`StatsSet`] and column [`DType`] to `DataFusion` [`ColumnStatistics`].
 pub(crate) fn stats_set_to_column_stats(stats: &StatsSet, dtype: &DType) -> ColumnStatistics {
     let min_value = stats
         .get(Stat::Min)
@@ -201,8 +201,7 @@ pub(crate) fn stats_set_to_column_stats(stats: &StatsSet, dtype: &DType) -> Colu
 
     let null_count = stats
         .get_as::<usize>(Stat::NullCount, &vortex::dtype::PType::U64.into())
-        .map(vortex_precision_to_df)
-        .unwrap_or(Precision::Absent);
+        .map_or(Precision::Absent, vortex_precision_to_df);
 
     ColumnStatistics {
         null_count,
@@ -214,9 +213,9 @@ pub(crate) fn stats_set_to_column_stats(stats: &StatsSet, dtype: &DType) -> Colu
     }
 }
 
-/// Convert a Vortex [`FileStatistics`] to DataFusion [`Statistics`].
+/// Convert a Vortex [`FileStatistics`] to `DataFusion` [`Statistics`].
 ///
-/// Maps per-column Vortex stats to DataFusion column statistics and uses the
+/// Maps per-column Vortex stats to `DataFusion` column statistics and uses the
 /// caller-provided `num_rows` as the total row count.
 ///
 /// `num_rows` must be the exact total row count for the file represented by
@@ -250,6 +249,11 @@ pub(crate) fn serialize_file_statistics(stats: &FileStatistics) -> VortexResult<
 /// Deserialize a Vortex [`FileStatistics`] from bytes.
 ///
 /// The `schema` is used to derive Vortex [`DType`]s for proper scalar deserialization.
+///
+/// # Errors
+///
+/// Returns an error if the flatbuffer bytes are malformed or do not match the
+/// expected schema.
 pub fn deserialize_file_statistics(bytes: &[u8], schema: &Schema) -> VortexResult<FileStatistics> {
     let struct_dtype = vortex_struct_dtype_from_schema(schema);
     let fb_stats = flatbuffers::root::<vortex::flatbuffers::footer::FileStatistics>(bytes)?;
@@ -274,7 +278,7 @@ pub(crate) fn build_file_statistics(
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_common::{stats::Precision as DfPrecision, ColumnStatistics, ScalarValue};
+    use datafusion_common::{ColumnStatistics, ScalarValue, stats::Precision as DfPrecision};
     use std::sync::Arc;
 
     #[test]

@@ -117,7 +117,7 @@ async fn test_stats_persisted_after_insert(
 
     let ctx = SessionContext::new();
     let table_name = "stats_insert_test";
-    let _table = CayenneTableProvider::create_table(
+    let table = CayenneTableProvider::create_table(
         Arc::clone(catalog) as Arc<dyn MetadataCatalog>,
         CreateTableOptions {
             table_name: table_name.to_string(),
@@ -149,7 +149,7 @@ async fn test_stats_persisted_after_insert(
         ],
     )?;
 
-    common::insert_batch(&_table, batch).await?;
+    common::insert_batch(&table, batch).await?;
 
     // Verify stats were persisted
     let stats = catalog.get_table_statistics(&table_id).await?;

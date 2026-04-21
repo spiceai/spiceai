@@ -233,7 +233,7 @@ async fn test_inlined_data_visible_in_scan(
 // project priority — row counts alone are not enough.
 // ============================================================================
 
-/// Helper: create a no-PK table and register it in a SessionContext.
+/// Helper: create a no-PK table and register it in a `SessionContext`.
 async fn create_table(
     fixture: &common::TestFixture,
     name: &str,
@@ -326,7 +326,17 @@ async fn test_roundtrip_preserves_values(
     for (i, expected) in ids.iter().enumerate() {
         assert_eq!(id_col.value(i), *expected, "id[{i}]");
         assert_eq!(name_col.value(i), names[i], "name[{i}]");
-        assert_eq!(score_col.value(i), scores[i], "score[{i}]");
+        // Compare score round-trip bit-exactly: Arrow IPC preserves every
+        // f64 bit pattern (including NaN / +Inf / -Inf / -0.0), so equality
+        // on raw bits is the correct assertion (avoids `clippy::float_cmp`
+        // and handles NaN, which `==` would not).
+        assert_eq!(
+            score_col.value(i).to_bits(),
+            scores[i].to_bits(),
+            "score[{i}] bits differ: got {} want {}",
+            score_col.value(i),
+            scores[i],
+        );
     }
 
     Ok(())
@@ -594,7 +604,7 @@ async fn test_roundtrip_mixed_inline_and_vortex(
     let expected_count = 5 + n;
     let expected_sum_id: i64 = (1..=5).sum::<i64>() + big_ids.iter().sum::<i64>();
     let expected_sum_val: i64 =
-        vec![10_i64, 20, 30, 40, 50].iter().sum::<i64>() + big_vals.iter().sum::<i64>();
+        [10_i64, 20, 30, 40, 50].iter().sum::<i64>() + big_vals.iter().sum::<i64>();
 
     assert_eq!(c.value(0), expected_count);
     assert_eq!(s_id.value(0), expected_sum_id);
@@ -684,7 +694,7 @@ async fn test_roundtrip_exceeds_byte_threshold(
     // ceiling but well below the 1024-row ceiling.
     let row_count: usize = 200;
     let payload = "A".repeat(8 * 1024);
-    let ids: Vec<i64> = (0..row_count as i64).collect();
+    let ids: Vec<i64> = (0..i64::try_from(row_count).expect("row_count fits in i64")).collect();
     let blobs: Vec<&str> = (0..row_count).map(|_| payload.as_str()).collect();
 
     let batch = RecordBatch::try_new(

@@ -142,9 +142,7 @@ impl ColumnStatsAccumulator {
             return;
         };
         let Ok(mut seeded) = self.columns_seeded.lock() else {
-            tracing::warn!(
-                "ColumnStatsAccumulator: seeded-mutex poisoned in update(), skipping"
-            );
+            tracing::warn!("ColumnStatsAccumulator: seeded-mutex poisoned in update(), skipping");
             return;
         };
 
@@ -184,7 +182,7 @@ impl ColumnStatsAccumulator {
         }
     }
 
-    /// Compute DataFusion `ColumnStatistics` from a single Arrow column.
+    /// Compute `DataFusion` `ColumnStatistics` from a single Arrow column.
     fn compute_column_stats(col: &dyn arrow::array::Array) -> datafusion_common::ColumnStatistics {
         use datafusion_common::stats::Precision;
 
@@ -243,8 +241,8 @@ impl ColumnStatsAccumulator {
 
         datafusion_common::ColumnStatistics {
             null_count,
-            min_value: batch_min.map(Precision::Exact).unwrap_or(Precision::Absent),
-            max_value: batch_max.map(Precision::Exact).unwrap_or(Precision::Absent),
+            min_value: batch_min.map_or(Precision::Absent, Precision::Exact),
+            max_value: batch_max.map_or(Precision::Absent, Precision::Exact),
             sum_value: Precision::Absent,
             distinct_count: Precision::Absent,
             byte_size: Precision::Absent,
