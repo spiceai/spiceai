@@ -73,7 +73,9 @@ jobs:
         with:
           script: |
             const isTaggedRelease = context.ref.startsWith('refs/tags/v');
-            const runner = isTaggedRelease ? "ubuntu-24.04-16core" : "spiceai-dev-large-runners";
+            // const runner = isTaggedRelease ? "ubuntu-24.04-16core" : "spiceai-dev-large-runners";
+            // TODO - testing runner, remove
+            const runner ="ubuntu-24.04-16core"
 
             const matrix = [
               {
