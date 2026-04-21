@@ -392,29 +392,26 @@ impl PartitionService {
         };
 
         // Diff against store metadata.
-        let metadata = match self.partition_store.get_table_metadata(table).await {
-            Ok(Some(m)) => m,
-            Ok(None) => {
-                tracing::debug!(
-                    table = %table,
-                    count = source_partitions.len(),
-                    "No partition metadata, treating all source partitions as new"
-                );
-                return Ok(PartitionDiff {
-                    new: source_partitions,
-                    removed: Vec::new(),
-                });
-            }
-            Err(e) => {
-                return Err(Error::DiscoveryFailed {
-                    table: table.to_string(),
-                    source: Box::new(e),
-                });
-            }
-        };
+        let existing_partitions: Vec<crate::PartitionMetadata> =
+            match self.partition_store.get_table_metadata(table).await {
+                Ok(Some(m)) => m.partitions,
+                Ok(None) => {
+                    tracing::debug!(
+                        table = %table,
+                        count = source_partitions.len(),
+                        "No partition metadata found, treating all source partitions as new"
+                    );
+                    Vec::new()
+                }
+                Err(e) => {
+                    return Err(Error::DiscoveryFailed {
+                        table: table.to_string(),
+                        source: Box::new(e),
+                    });
+                }
+            };
 
-        let existing: HashSet<Vec<(String, String)>> = metadata
-            .partitions
+        let existing: HashSet<Vec<(String, String)>> = existing_partitions
             .iter()
             .map(|p| sorted_kv(&p.partition_value))
             .collect();
@@ -428,8 +425,7 @@ impl PartitionService {
             .cloned()
             .collect();
 
-        let removed: Vec<PartitionValue> = metadata
-            .partitions
+        let removed: Vec<PartitionValue> = existing_partitions
             .iter()
             .filter(|p| !source_set.contains(&sorted_kv(&p.partition_value)))
             .map(|p| p.partition_value.clone())
