@@ -825,6 +825,8 @@ pub(crate) mod search {
                         chunking: None,
                         row_ids: Some(vec!["id".to_string()]),
                         vector_size: None,
+                        aggregation: None,
+                        max_elements_per_row: None,
                     }])];
 
                 let app = AppBuilder::new("search_app")
@@ -1025,6 +1027,8 @@ pub fn get_package_delivery_dataset(
             chunking: None,
             row_ids: Some(vec!["event.id".to_string()]),
             vector_size: None,
+            aggregation: None,
+            max_elements_per_row: None,
         }]),
         vectors_filterable_col("message.status"),
         vectors_filterable_col("event.created"),
