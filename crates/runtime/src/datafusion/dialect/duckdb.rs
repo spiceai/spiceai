@@ -417,7 +417,7 @@ mod tests {
     use crate::datafusion::dialect::new_duckdb_dialect;
 
     fn fixed_size_list_literal(values: Vec<f32>) -> Expr {
-        let n = values.len() as i32;
+        let n = i32::try_from(values.len()).expect("values length fits in i32");
         let inner = Arc::new(Float32Array::from(values));
         let field = Arc::new(Field::new("item", DataType::Float32, true));
         let array =
