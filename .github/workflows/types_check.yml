@@ -85,7 +85,7 @@ jobs:
           ]
         target:
           - name: 'Linux x64'
-            runner: 'ubuntu-22.04'
+            runner: 'ubuntu-24.04'
             target_os: 'linux'
             target_arch: 'x86_64'
     steps:
