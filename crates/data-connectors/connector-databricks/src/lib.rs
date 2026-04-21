@@ -35,6 +35,8 @@ use data_components::unity_catalog::{
 };
 use data_components::{Read, RefreshableCatalogProvider};
 use datafusion::datasource::TableProvider;
+use datafusion::datasource::listing::ListingTableUrl;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::sql::TableReference;
 use opentelemetry::KeyValue;
 use runtime::Runtime;
@@ -53,7 +55,6 @@ use runtime::token_providers::databricks::{
     AuthCredentials, DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
 };
 use runtime_secrets::get_params_with_secrets;
-#[cfg(feature = "spark")]
 use secrecy::ExposeSecret;
 use secrecy::SecretString;
 use snafu::prelude::*;
@@ -222,6 +223,16 @@ pub struct Databricks {
     /// Unity Catalog client for table type detection and permission checking.
     /// Present when the connector was created with enough information to call UC APIs.
     uc_client: Option<Arc<UnityCatalogClient>>,
+    /// Typed handle to the Delta read provider, present only in `delta_lake`
+    /// mode. Used by `register_object_stores` to resolve table storage
+    /// locations (which are only known after a UC round-trip) so the
+    /// underlying object store can be registered on the cluster executor's
+    /// runtime env.
+    delta_provider: Option<Arc<DatabricksDelta>>,
+    /// Original connector params, retained so `register_object_stores` can
+    /// build the storage URL fragment understood by `SpiceObjectStoreRegistry`.
+    /// Present only in `delta_lake` mode.
+    storage_params: Option<Parameters>,
 }
 
 impl std::fmt::Debug for Databricks {
@@ -313,9 +324,12 @@ impl Databricks {
                     initialization,
                     metrics,
                     uc_client,
+                    delta_provider: None,
+                    storage_params: None,
                 })
             }
             "delta_lake" => {
+                let storage_params = params.clone();
                 let storage_options = params.to_secret_map();
                 let token_provider: Arc<dyn TokenProvider> = match auth_credentials {
                     AuthCredentials::Token(token) => {
@@ -358,12 +372,15 @@ impl Databricks {
                     token_provider,
                     io_runtime,
                 );
+                let delta_provider = Arc::new(read_provider);
 
                 Ok(Self {
-                    read_provider: Arc::new(read_provider),
+                    read_provider: Arc::clone(&delta_provider) as Arc<dyn Read>,
                     initialization,
                     metrics: None,
                     uc_client,
+                    delta_provider: Some(delta_provider),
+                    storage_params: Some(storage_params),
                 })
             }
             #[cfg(feature = "spark")]
@@ -537,6 +554,8 @@ impl Databricks {
             initialization: ComponentInitialization::default(),
             metrics: None,
             uc_client: None,
+            delta_provider: None,
+            storage_params: None,
         })
     }
 
@@ -854,6 +873,78 @@ impl DataConnector for Databricks {
                 metrics: Arc::clone(m),
             }) as Arc<dyn MetricsProvider>
         })
+    }
+
+    async fn register_object_stores(
+        &self,
+        dataset: &Dataset,
+        runtime_env: &Arc<RuntimeEnv>,
+    ) -> DataConnectorResult<()> {
+        // Only `delta_lake` mode produces object-store-backed scans on the
+        // executor. `sql_warehouse` and `spark_connect` execute on Databricks
+        // and surface as Flight/Arrow streams; nothing to register.
+        let (Some(delta), Some(params)) = (&self.delta_provider, &self.storage_params) else {
+            return Ok(());
+        };
+
+        // Resolve the underlying storage location via Unity Catalog. This is
+        // the bare URL (e.g. `s3://databricks-workspace-stack-bfa88-bucket/...`)
+        // that DataFusion will look up in `runtime_env().object_store(url)`
+        // when executing the decoded `ParquetSource` on the executor.
+        let table_reference = TableReference::from(dataset.path());
+        let storage_location =
+            delta
+                .resolve_table_uri(table_reference)
+                .await
+                .map_err(|source| DataConnectorError::UnableToConnectInternal {
+                    dataconnector: "databricks".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source,
+                })?;
+
+        let mut parsed = url::Url::parse(&storage_location).map_err(|source| {
+            DataConnectorError::UnableToConnectInternal {
+                dataconnector: "databricks".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(source),
+            }
+        })?;
+
+        // Encode the connector's storage params as the URL fragment so
+        // `SpiceObjectStoreRegistry::get_store` can build the right object
+        // store. `storage_registry_params` returns just the AWS/Azure/GCS
+        // entries with their prefixed names rewritten to the registry's
+        // canonical names; Databricks-internal params (`endpoint`, `token`)
+        // are excluded.
+        let mut fragment_builder = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in params.storage_registry_params() {
+            fragment_builder.append_pair(&key, value.expose_secret());
+        }
+        parsed.set_fragment(Some(fragment_builder.finish().as_str()));
+
+        let listing_url = ListingTableUrl::parse(parsed).map_err(|source| {
+            DataConnectorError::UnableToConnectInternal {
+                dataconnector: "databricks".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(source),
+            }
+        })?;
+
+        runtime_env.object_store(&listing_url).map_err(|source| {
+            DataConnectorError::UnableToConnectInternal {
+                dataconnector: "databricks".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(source),
+            }
+        })?;
+
+        let mut redacted = <ListingTableUrl as AsRef<url::Url>>::as_ref(&listing_url).clone();
+        redacted.set_fragment(None);
+        tracing::debug!(
+            "Configured object storage for Databricks Dataset {} ({redacted})",
+            dataset.name,
+        );
+        Ok(())
     }
 }
 
@@ -1618,6 +1709,8 @@ mod tests {
                 UnityCatalogClient::new(Endpoint(endpoint), None, None)
                     .expect("mock Unity Catalog client should be created"),
             )),
+            delta_provider: None,
+            storage_params: None,
         };
         let dataset = make_dataset(dataset_from, "tpch_sf400_part").await;
 
