@@ -16,7 +16,7 @@ limitations under the License.
 
 //! JSON schema decomposition for the HTTP connector.
 //!
-//! Mirrors the `DynamoDB` connector's `JsonNesting` feature so that users
+//! Mirrors the DynamoDB connector's `JsonNesting` feature so that users
 //! can declare a set of top-level static columns plus one catch-all JSON
 //! column via the spicepod `columns:` syntax:
 //!
@@ -79,7 +79,7 @@ impl HttpJsonNesting {
     pub fn new(column_order: Vec<String>, json_field_name: String) -> Self {
         let static_fields: HashSet<String> = column_order
             .iter()
-            .filter(|c| c.as_str() != json_field_name.as_str())
+            .filter(|c| **c != json_field_name)
             .cloned()
             .collect();
         Self {

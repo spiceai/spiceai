@@ -45,7 +45,7 @@ limitations under the License.
 //! - `items.properties` (arrays of objects; leaves appear at `array.field`).
 //! - `additionalProperties` maps (the map field emits `type = "map"`, children
 //!   appear at `map.child`; with `expand_maps = true` they appear at
-//!   `map.<map_wildcard>.child` — XDM-style).
+//!   `map.<map_wildcard>.child` — JSONPath-style).
 //! - `allOf`, `oneOf`, `anyOf` merge — fields from every branch are emitted;
 //!   duplicate names across branches are deduped.
 //! - Local `$ref` pointers (`#/$defs/*`, `#/definitions/*`, `#/properties/*`)
@@ -65,7 +65,7 @@ limitations under the License.
 //! - `path_style` (`Utf8`, `"dot"` | `"json-pointer"`, default `"dot"`).
 //! - `expand_maps` (`Bool`, default `false`) — when `true`, recurse through
 //!   `additionalProperties` and emit child paths as `parent.<map_wildcard>.child`
-//!   (matches XDM / JSONPath storage conventions where a map's dynamic key is
+//!   (matches JSONPath storage conventions where a map's dynamic key is
 //!   represented by a single wildcard segment). Default `false` preserves the
 //!   original `parent.child` collapsing behavior.
 //! - `map_wildcard` (`Utf8`, default `"[*]"`) — the synthetic segment inserted
@@ -257,7 +257,7 @@ pub struct FlattenOptions {
     /// collapsing behavior for maps.
     pub expand_maps: bool,
     /// The wildcard segment inserted between a map and its value when
-    /// `expand_maps` is `true`. XDM / JSONPath storage conventions use
+    /// `expand_maps` is `true`. JSONPath storage conventions use
     /// `"[*]"`. Must be non-empty; callers that bypass the UDTF arg
     /// parser are responsible for keeping it non-empty.
     pub map_wildcard: String,
@@ -462,7 +462,7 @@ impl<'a> Walker<'a> {
                         // primitive handling reuses `handle_field`'s
                         // recursion. Child paths then emit as
                         // `parent.<map_wildcard>[...children]`, matching
-                        // XDM / JSONPath storage conventions (e.g.
+                        // JSONPath storage conventions (e.g.
                         // `identityMap.[*].id` when the map's values
                         // are arrays of objects).
                         let wildcard = self.opts.map_wildcard.clone();
@@ -1248,7 +1248,7 @@ mod tests {
     #[test]
     fn expand_maps_inserts_wildcard_segment() {
         // With `expand_maps = true`, the map's dynamic key is encoded as
-        // `[*]` between parent and value. Matches XDM / JSONPath storage
+        // `[*]` between parent and value. Matches JSONPath storage
         // conventions where any field with `additionalProperties` is a
         // Map and the path includes a wildcard segment.
         let json = r#"{
@@ -1276,9 +1276,8 @@ mod tests {
     }
 
     #[test]
-    fn expand_maps_xdm_identity_map() {
-        // The real-world XDM `identityMap` shape: map whose values are
-        // arrays of objects. Expected output paths:
+    fn expand_maps_map_of_array_of_object() {
+        // Map whose values are arrays of objects. Expected output paths:
         //   identityMap.[*].authenticatedState
         //   identityMap.[*].id
         //   identityMap.[*].primary
@@ -1287,12 +1286,10 @@ mod tests {
         // path, so a map-of-array-of-object yields exactly one `[*]`
         // segment between the map name and the inner leaves.
         let json = r#"{
-            "$id": "https://ns.adobe.com/cjmstage/schemas/identityMapExample",
             "type": "object",
             "properties": {
                 "identityMap": {
                     "type": "object",
-                    "meta:xdmType": "map",
                     "additionalProperties": {
                         "type": "array",
                         "items": {
@@ -1332,11 +1329,16 @@ mod tests {
 
     #[test]
     fn expand_maps_custom_wildcard_segment() {
+        // Use a value schema with sub-properties so the wildcard
+        // segment is observable in the emitted child paths.
         let json = r#"{
             "properties": {
                 "labels": {
                     "type": "object",
-                    "additionalProperties": {"type": "string"}
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}}
+                    }
                 }
             }
         }"#;
@@ -1348,13 +1350,16 @@ mod tests {
         };
         let rows = flatten_with_options(json, &opts);
         let by = by_path(&rows);
-        // additionalProperties here is a primitive schema with no
-        // sub-properties, so the only child row is the primitive value
-        // itself \u2014 emitted via the leaf fallback in `handle_field`.
-        assert!(by.contains_key("labels"));
-        // With `expand_maps` + a primitive value schema, the wildcard
-        // child path should still be reachable via the json-pointer
-        // path style too.
+        // Custom dot-style wildcard segment is emitted between the
+        // map and its value's child.
+        assert_eq!(by["labels"].type_name, "map");
+        assert_eq!(by["labels.*.value"].type_name, "string");
+        // Default `[*]` segment must NOT appear when overridden.
+        assert!(!by.contains_key("labels.[*].value"));
+
+        // The wildcard child path is reachable under the json-pointer
+        // path style too, with the configured wildcard segment kept
+        // verbatim (RFC 6901 doesn't escape `[`, `*`, or `]`).
         let opts_jp = FlattenOptions {
             path_style: PathStyle::JsonPointer,
             expand_maps: true,
@@ -1363,7 +1368,10 @@ mod tests {
             ..FlattenOptions::default()
         };
         let rows_jp = flatten_with_options(json, &opts_jp);
-        assert!(rows_jp.iter().any(|r| r.path == "/labels"));
+        let by_jp: std::collections::HashMap<&str, &PropertyRow> =
+            rows_jp.iter().map(|r| (r.path.as_str(), r)).collect();
+        assert_eq!(by_jp["/labels"].type_name, "map");
+        assert_eq!(by_jp["/labels/[*]/value"].type_name, "string");
     }
 
     #[test]

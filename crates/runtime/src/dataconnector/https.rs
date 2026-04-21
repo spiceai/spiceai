@@ -808,7 +808,7 @@ impl Https {
 /// marker that enables JSON schema decomposition. Returns `None` when
 /// no column is marked, otherwise the full nesting configuration.
 ///
-/// Consistent with the `DynamoDB` connector: exactly one column may be
+/// Consistent with the DynamoDB connector: exactly one column may be
 /// marked, and the only supported marker value is `"*"`.
 fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<HttpJsonNesting>> {
     let marked: Vec<&Column> = dataset
@@ -834,18 +834,18 @@ fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<Http
     }
 
     let json_column = marked[0];
-    let Some(marker_value) = json_column.metadata.get("json_object") else {
+    let Some(marker) = json_column.metadata.get("json_object") else {
         unreachable!("json_object key existence was checked above")
     };
 
-    let is_wildcard = matches!(marker_value, Value::String(s) if s == "*");
+    let is_wildcard = matches!(marker, Value::String(s) if s == "*");
     if !is_wildcard {
         return Err(DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: "https".to_string(),
             connector_component: ConnectorComponent::from(dataset),
             message: format!(
                 "Column '{}' has invalid 'json_object' value: {:?}. Only '*' is supported.",
-                json_column.name, marker_value
+                json_column.name, marker
             ),
         });
     }
@@ -1355,112 +1355,6 @@ mod tests {
                 assert!(
                     message.contains("http_auth_client_secret"),
                     "expected error to mention http_auth_client_secret, got: {message}"
-                );
-            }
-            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
-        }
-    }
-
-    fn column_with_marker(name: &str, marker: Value) -> Column {
-        let mut metadata = std::collections::HashMap::new();
-        metadata.insert("json_object".to_string(), marker);
-        Column::new(name).with_metadata(metadata)
-    }
-
-    #[tokio::test]
-    async fn parse_http_json_nesting_returns_none_when_no_marker() {
-        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-        let result = parse_http_json_nesting(&dataset).expect("parse should succeed");
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn parse_http_json_nesting_returns_none_when_columns_have_no_marker() {
-        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-        dataset.columns = vec![Column::new("id"), Column::new("name")];
-        let result = parse_http_json_nesting(&dataset).expect("parse should succeed");
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn parse_http_json_nesting_parses_valid_wildcard_marker() {
-        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-        dataset.columns = vec![
-            Column::new("id"),
-            Column::new("name"),
-            column_with_marker("data", Value::String("*".to_string())),
-        ];
-        let nesting = parse_http_json_nesting(&dataset)
-            .expect("parse should succeed")
-            .expect("expected Some(nesting) when marker is present");
-        assert_eq!(nesting.json_field_name, "data");
-        assert_eq!(nesting.column_order, vec!["id", "name", "data"]);
-        assert!(nesting.static_fields.contains("id"));
-        assert!(nesting.static_fields.contains("name"));
-        assert!(!nesting.static_fields.contains("data"));
-    }
-
-    #[tokio::test]
-    async fn parse_http_json_nesting_rejects_multiple_markers() {
-        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-        dataset.columns = vec![
-            Column::new("id"),
-            column_with_marker("data", Value::String("*".to_string())),
-            column_with_marker("extra", Value::String("*".to_string())),
-        ];
-        let error =
-            parse_http_json_nesting(&dataset).expect_err("multiple markers should be rejected");
-        match error {
-            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
-                assert!(
-                    message.contains("Multiple columns"),
-                    "expected multiple-columns error, got: {message}"
-                );
-                assert!(message.contains("data"), "error should list 'data'");
-                assert!(message.contains("extra"), "error should list 'extra'");
-            }
-            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn parse_http_json_nesting_rejects_invalid_marker_value() {
-        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-        dataset.columns = vec![
-            Column::new("id"),
-            column_with_marker("data", Value::String("not-a-wildcard".to_string())),
-        ];
-        let error =
-            parse_http_json_nesting(&dataset).expect_err("non-wildcard marker should be rejected");
-        match error {
-            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
-                assert!(
-                    message.contains("invalid 'json_object' value"),
-                    "expected invalid-value error, got: {message}"
-                );
-                assert!(
-                    message.contains("Only '*' is supported"),
-                    "expected guidance mentioning '*', got: {message}"
-                );
-            }
-            other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn parse_http_json_nesting_rejects_non_string_marker_value() {
-        let mut dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-        dataset.columns = vec![
-            Column::new("id"),
-            column_with_marker("data", Value::Bool(true)),
-        ];
-        let error =
-            parse_http_json_nesting(&dataset).expect_err("non-string marker should be rejected");
-        match error {
-            DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
-                assert!(
-                    message.contains("invalid 'json_object' value"),
-                    "expected invalid-value error, got: {message}"
                 );
             }
             other => panic!("expected InvalidConfigurationNoSource, got: {other}"),

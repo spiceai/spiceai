@@ -129,7 +129,7 @@ FROM flatten_json_properties(
     max_depth       => 16,
     max_rows        => 10000,
     include_internal => true,      -- also emit object/array/map rows
-    path_style      => 'json-pointer',
+    path_style      => 'dot',
     dialect         => 'json-schema',
     expand_maps     => true,       -- emit `parent.[*].child` for maps
     map_wildcard    => '[*]'       -- customize the wildcard segment
@@ -144,10 +144,10 @@ FROM flatten_json_properties(
 | `dialect`          | Utf8 | `json-schema` | `json-schema` \| `openapi`                                                                                                         |
 | `include_internal` | Bool | `false`       | emit container rows (`object`, `array`, `map`)                                                                                     |
 | `path_style`       | Utf8 | `dot`         | `dot` (`a.b.c`) \| `json-pointer` (`/a/b/c`)                                                                                       |
-| `expand_maps`      | Bool | `false`       | walk through `additionalProperties` and encode the map's dynamic key as a wildcard segment in the path (XDM / JSONPath convention) |
+| `expand_maps`      | Bool | `false`       | walk through `additionalProperties` and encode the map's dynamic key as a wildcard segment in the path (JSONPath convention)       |
 | `map_wildcard`     | Utf8 | `[*]`         | wildcard segment inserted when `expand_maps = true`; must be non-empty                                                             |
 
-#### Expanding maps (XDM `identityMap` example)
+#### Expanding maps (`Map<String, Array<Object>>` example)
 
 By default, `flatten_json_properties` collapses `additionalProperties` onto
 the parent path: a map field `labels` with value schema
@@ -156,14 +156,13 @@ the right answer for shallow `Map<String, Scalar>` shapes, but it hides
 structure when the map's value is itself a complex type.
 
 Turn on `expand_maps` to preserve the indirection as a wildcard segment in
-the path. Given XDM's `identityMap` (a `Map<String, Array<Object>>`):
+the path. Given a `Map<String, Array<Object>>` like an `identityMap`:
 
 ```json
 {
   "properties": {
     "identityMap": {
       "type": "object",
-      "meta:xdmType": "map",
       "additionalProperties": {
         "type": "array",
         "items": {
@@ -194,8 +193,7 @@ ORDER BY path;
 
 Arrays still collapse `items.properties.*` onto the parent path, so a
 map-of-array-of-object surfaces as one wildcard segment between the map
-name and the inner leaves — matching XDM storage paths and JSONPath-style
-addressing.
+name and the inner leaves — matching JSONPath-style addressing.
 
 ### 6. `json_tree` — generic alternative
 

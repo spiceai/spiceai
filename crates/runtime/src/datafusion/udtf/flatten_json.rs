@@ -46,7 +46,7 @@ limitations under the License.
 //!   object/array rows.
 //! - `array_wildcard` (`Bool`, default `false`) — when `true`, arrays collapse
 //!   to a single wildcard segment (`a[*]` for dot paths, `/a/[*]` for
-//!   json-pointer) instead of per-index (`a[0]`, `a[1]`, …). Matches XDM /
+//!   json-pointer) instead of per-index (`a[0]`, `a[1]`, …). Matches
 //!   JSONPath storage conventions.
 //!
 //! Telemetry: OpenTelemetry counters `flatten_json_invocations_total`,
@@ -186,7 +186,7 @@ pub struct FlattenOptions {
     pub path_style: PathStyle,
     pub include_internal: bool,
     /// When `true`, arrays collapse to a single wildcard segment instead of
-    /// per-index paths. Matches XDM / JSONPath storage conventions.
+    /// per-index paths. Matches JSONPath storage conventions.
     pub array_wildcard: bool,
 }
 
@@ -881,10 +881,11 @@ mod tests {
     }
 
     #[test]
-    fn array_wildcard_xdm_identity_map_shape() {
-        // Mirrors the `flatten_json_properties` XDM example: a map whose
-        // values are arrays of objects. With `array_wildcard = true`,
-        // every element collapses onto a single `[*]` segment.
+    fn array_wildcard_map_of_array_of_object_shape() {
+        // Mirrors the `flatten_json_properties` map-of-array-of-object
+        // example: a map whose values are arrays of objects. With
+        // `array_wildcard = true`, every element collapses onto a
+        // single `[*]` segment.
         let json = r#"{
             "identityMap": {
                 "EMAIL": [{"id":"a@b.com","primary":true}],
