@@ -160,7 +160,7 @@ jobs:
 
   setup-model-matrix:
     name: Setup model strategy matrix
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
     steps:
