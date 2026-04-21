@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
-use crate::CLUSTER_PARTITION_MANAGEMENT_TASK;
+use crate::CLUSTER_PARTITION_ASSIGNMENT_TASK;
 use crate::cluster::executor_registry::{self, ExecutorRegistry};
 use crate::cluster::partition::discovery::table_partition_values;
 use crate::cluster::partition::{
@@ -97,12 +97,12 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Clone)]
-pub struct PartitionManagementConfig {
-    /// How often to run the management cycle
+pub struct PartitionAssignmentConfig {
+    /// How often to run the assignment cycle
     pub interval: Duration,
 
-    /// Maximum partitions to assign per cycle
-    pub max_assignments_per_cycle: usize,
+    /// Maximum partitions to assign per interval
+    pub max_assignments_per_interval: usize,
 
     /// Maximum partitions per executor (soft limit)
     pub max_partitions_per_executor: usize,
@@ -113,42 +113,43 @@ pub struct PartitionManagementConfig {
 
 #[derive(Debug, Snafu)]
 pub enum ConfigError {
-    #[snafu(display("Invalid partition management interval '{interval}': {source}"))]
+    #[snafu(display("Invalid partition assignment interval '{interval}': {source}"))]
     InvalidInterval {
         interval: String,
         source: fundu::ParseError,
     },
 
-    #[snafu(display("Partition management interval must be greater than zero"))]
+    #[snafu(display("Partition assignment interval must be greater than zero"))]
     IntervalIsZero,
 
-    #[snafu(display("Invalid partition management discovery timeout '{timeout}': {source}"))]
+    #[snafu(display("Invalid partition discovery timeout '{timeout}': {source}"))]
     InvalidDiscoveryTimeout {
         timeout: String,
         source: fundu::ParseError,
     },
 
-    #[snafu(display("Partition management discovery timeout must be greater than zero"))]
+    #[snafu(display("Partition discovery timeout must be greater than zero"))]
     DiscoveryTimeoutIsZero,
 }
 
-impl TryFrom<spicepod::component::runtime::PartitionManagement> for PartitionManagementConfig {
+impl TryFrom<spicepod::component::runtime::Scheduler> for PartitionAssignmentConfig {
     type Error = ConfigError;
 
     fn try_from(
-        config: spicepod::component::runtime::PartitionManagement,
+        config: spicepod::component::runtime::Scheduler,
     ) -> Result<Self, Self::Error> {
-        let interval = fundu::parse_duration(&config.interval).context(InvalidIntervalSnafu {
-            interval: &config.interval,
-        })?;
+        let interval =
+            fundu::parse_duration(&config.assignment_interval).context(InvalidIntervalSnafu {
+                interval: &config.assignment_interval,
+            })?;
 
         if interval.is_zero() {
             return Err(ConfigError::IntervalIsZero);
         }
 
-        let discovery_timeout = fundu::parse_duration(&config.discovery_timeout).context(
+        let discovery_timeout = fundu::parse_duration(&config.partition_discovery_timeout).context(
             InvalidDiscoveryTimeoutSnafu {
-                timeout: &config.discovery_timeout,
+                timeout: &config.partition_discovery_timeout,
             },
         )?;
 
@@ -158,18 +159,18 @@ impl TryFrom<spicepod::component::runtime::PartitionManagement> for PartitionMan
 
         Ok(Self {
             interval,
-            max_assignments_per_cycle: config.max_assignments_per_cycle,
+            max_assignments_per_interval: config.max_assignments_per_interval,
             max_partitions_per_executor: config.max_partitions_per_executor,
             discovery_timeout,
         })
     }
 }
 
-impl Default for PartitionManagementConfig {
+impl Default for PartitionAssignmentConfig {
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(30),
-            max_assignments_per_cycle: 100,
+            max_assignments_per_interval: 100,
             max_partitions_per_executor: 1000,
             discovery_timeout: Duration::from_secs(60),
         }
@@ -181,7 +182,7 @@ impl Default for PartitionManagementConfig {
 /// 2. Adding new partitions to the partition metadata (initially unassigned).
 /// 3. Removing partitions that no longer exist in the source and notifying executors to unload them.
 /// 4. Assigning unassigned partitions to executors.
-pub struct PartitionManagementTask {
+pub struct PartitionAssignmentTask {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
     partition_manager: Arc<PartitionManager>,
@@ -189,7 +190,7 @@ pub struct PartitionManagementTask {
     status: Arc<RuntimeStatus>,
 
     /// Configuration
-    config: PartitionManagementConfig,
+    config: PartitionAssignmentConfig,
 
     /// Cancellation token for graceful shutdown
     cancel: CancellationToken,
@@ -229,14 +230,14 @@ struct DiscoveryResult {
     removed_partitions: Vec<(TableReference, Vec<PartitionValue>)>,
 }
 
-impl PartitionManagementTask {
+impl PartitionAssignmentTask {
     pub fn new(
         app: Arc<RwLock<Option<Arc<App>>>>,
         df: Arc<DataFusion>,
         partition_manager: Arc<PartitionManager>,
         executor_registry: Arc<ExecutorRegistry>,
         status: Arc<RuntimeStatus>,
-        config: PartitionManagementConfig,
+        config: PartitionAssignmentConfig,
         cancel: CancellationToken,
     ) -> Self {
         Self {
@@ -251,7 +252,7 @@ impl PartitionManagementTask {
     }
 
     pub async fn run(self) -> Result<()> {
-        tracing::debug!("Starting {CLUSTER_PARTITION_MANAGEMENT_TASK} in background");
+        tracing::debug!("Starting {CLUSTER_PARTITION_ASSIGNMENT_TASK} in background");
 
         // Seed partition metadata for tables that don't have it yet.
         // This runs once before the periodic loop and is cancellation-aware
@@ -282,28 +283,28 @@ impl PartitionManagementTask {
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
-            tracing::debug!("Starting {CLUSTER_PARTITION_MANAGEMENT_TASK} loop");
+            tracing::debug!("Starting {CLUSTER_PARTITION_ASSIGNMENT_TASK} loop");
             tokio::select! {
                 () = self.cancel.cancelled() => {
-                    tracing::info!("Partition management task shutting down");
+                    tracing::info!("Partition assignment task shutting down");
                     break;
                 }
                 _ = interval.tick() => {
                     let cycle_start = Instant::now();
 
-                    match self.run_management_cycle().await {
+                    match self.run_assignment_cycle().await {
                         Ok(()) => {
                             self.status.update_component_status("partition_metadata", ComponentStatus::Ready);
                         }
                         Err(e) => {
                             tracing::warn!(
                                 error = %e,
-                                "Partition management cycle failed"
+                                "Partition assignment cycle failed"
                             );
                             self.status.update_component_status(
                                 "partition_metadata",
                                 ComponentStatus::error_with_message(format!(
-                                    "Management cycle failed: {e}"
+                                    "Assignment cycle failed: {e}"
                                 )),
                             );
                         }
@@ -314,7 +315,7 @@ impl PartitionManagementTask {
                         tracing::warn!(
                             duration_ms = cycle_duration.as_millis(),
                             interval_ms = self.config.interval.as_millis(),
-                            "Partition management cycle took longer than interval"
+                            "Partition assignment cycle took longer than interval"
                         );
                     }
                 }
@@ -324,15 +325,15 @@ impl PartitionManagementTask {
         Ok(())
     }
 
-    /// Underlying logic for a single management cycle.
-    async fn run_management_cycle(&self) -> Result<()> {
-        tracing::debug!("Starting {CLUSTER_PARTITION_MANAGEMENT_TASK} task run");
+    /// Underlying logic for a single assignment cycle.
+    async fn run_assignment_cycle(&self) -> Result<()> {
+        tracing::debug!("Starting {CLUSTER_PARTITION_ASSIGNMENT_TASK} task run");
         let state = self.refresh_state().await?;
 
         let discovery_result = self.discover_and_sync_partitions(&state).await?;
 
         tracing::debug!(
-            "[{CLUSTER_PARTITION_MANAGEMENT_TASK}][task]: {} new, {} removed partitions",
+            "[{CLUSTER_PARTITION_ASSIGNMENT_TASK}][task]: {} new, {} removed partitions",
             discovery_result.new_partitions.len(),
             discovery_result.removed_partitions.len()
         );
@@ -348,13 +349,13 @@ impl PartitionManagementTask {
 
         let unassigned = self.find_unassigned_partitions(&state);
         tracing::debug!(
-            "[{CLUSTER_PARTITION_MANAGEMENT_TASK}][task]: {} Unassigned partitions",
+            "[{CLUSTER_PARTITION_ASSIGNMENT_TASK}][task]: {} Unassigned partitions",
             unassigned.len()
         );
         if !unassigned.is_empty() {
             let assignments = self.assign_unassigned_partitions(unassigned, &state);
             tracing::debug!(
-                "[{CLUSTER_PARTITION_MANAGEMENT_TASK}][task]: assignments={assignments:?}"
+                "[{CLUSTER_PARTITION_ASSIGNMENT_TASK}][task]: assignments={assignments:?}"
             );
             let CommitResult { committed, failed } = self.commit_assignments(assignments).await?;
             if !failed.is_empty() {
@@ -841,16 +842,16 @@ impl PartitionManagementTask {
         }
 
         let mut assignments = Vec::new();
-        let mut assignments_this_cycle = 0;
+        let mut assignments_this_interval = 0;
 
         // Build executor load map
         let mut executor_loads = self.build_executor_loads(state);
 
         for unassigned_partition in unassigned {
-            if assignments_this_cycle >= self.config.max_assignments_per_cycle {
+            if assignments_this_interval >= self.config.max_assignments_per_interval {
                 tracing::debug!(
-                    max_assignments = self.config.max_assignments_per_cycle,
-                    "Reached max assignments per cycle, deferring remaining partitions"
+                    max_assignments = self.config.max_assignments_per_interval,
+                    "Reached max assignments per interval, deferring remaining partitions"
                 );
                 break;
             }
@@ -879,7 +880,7 @@ impl PartitionManagementTask {
                 .or_default()
                 .partition_count += 1;
 
-            assignments_this_cycle += 1;
+            assignments_this_interval += 1;
         }
 
         tracing::info!(

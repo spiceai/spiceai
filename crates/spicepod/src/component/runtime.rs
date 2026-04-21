@@ -779,66 +779,41 @@ pub struct Scheduler {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
 
-    /// Partition management configuration
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partition_management: Option<PartitionManagement>,
-}
+    /// How often the scheduler assigns accelerated table partitions to executors.
+    #[serde(default = "default_assignment_interval")]
+    pub assignment_interval: String,
 
-impl Scheduler {
-    /// Returns the configured `max_partitions_per_executor`, falling back to
-    /// the default when no `partition_management` section is present.
-    #[must_use]
-    pub fn max_partitions_per_executor(&self) -> usize {
-        self.partition_management
-            .as_ref()
-            .map_or(default_max_partitions_per_executor(), |pm| {
-                pm.max_partitions_per_executor
-            })
-    }
-}
+    /// Maximum number of partition assignments made per assignment interval.
+    #[serde(default = "default_max_assignments_per_interval")]
+    pub max_assignments_per_interval: usize,
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-pub struct PartitionManagement {
-    #[serde(default = "default_partition_management_interval")]
-    pub interval: String,
-
-    #[serde(default = "default_max_assignments_per_cycle")]
-    pub max_assignments_per_cycle: usize,
-
+    /// Maximum partitions assigned to a single executor (soft limit).
     #[serde(default = "default_max_partitions_per_executor")]
     pub max_partitions_per_executor: usize,
 
-    #[serde(default = "default_discovery_timeout")]
-    pub discovery_timeout: String,
+    /// How long to wait for partition discovery before timing out.
+    #[serde(default = "default_partition_discovery_timeout")]
+    pub partition_discovery_timeout: String,
 }
 
-fn default_partition_management_interval() -> String {
+#[must_use]
+pub fn default_assignment_interval() -> String {
     "30s".to_string()
 }
 
-fn default_max_assignments_per_cycle() -> usize {
+#[must_use]
+pub fn default_max_assignments_per_interval() -> usize {
     100
 }
 
-fn default_max_partitions_per_executor() -> usize {
+#[must_use]
+pub fn default_max_partitions_per_executor() -> usize {
     1000
 }
 
-fn default_discovery_timeout() -> String {
+#[must_use]
+pub fn default_partition_discovery_timeout() -> String {
     "60s".to_string()
-}
-
-impl Default for PartitionManagement {
-    fn default() -> Self {
-        Self {
-            interval: default_partition_management_interval(),
-            max_assignments_per_cycle: default_max_assignments_per_cycle(),
-            max_partitions_per_executor: default_max_partitions_per_executor(),
-            discovery_timeout: default_discovery_timeout(),
-        }
-    }
 }
 
 /// Helper struct for deserializing Runtime with custom logic for handling `memory_limit`/`temp_directory` deprecation
