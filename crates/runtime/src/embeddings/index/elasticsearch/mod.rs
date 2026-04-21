@@ -277,9 +277,10 @@ async fn ensure_index_with_mapping(
         );
     }
 
-    let exists = client.index_exists(es_index).await.map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) },
-    )?;
+    let exists = client
+        .index_exists(es_index)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
     if exists {
         let body = serde_json::json!({ "properties": properties });
@@ -296,9 +297,10 @@ async fn ensure_index_with_mapping(
     }
 
     let body = serde_json::json!({ "mappings": { "properties": properties } });
-    client.create_index(es_index, &body).await.map_err(
-        |e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) },
-    )?;
+    client
+        .create_index(es_index, &body)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
     tracing::info!(
         "Created Elasticsearch index '{es_index}' with dense_vector field '{vector_field}' (dims={dims})."
     );
