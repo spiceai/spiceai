@@ -202,6 +202,7 @@ impl TablePartitionMetadata {
 /// Normalize a [`TableReference`] to a canonical string key by resolving bare/partial
 /// references with the default catalog and schema. This ensures that
 /// `my_table`, `public.my_table`, and `spice.public.my_table` all map to the same key.
+#[must_use] 
 pub fn normalized_table_name(table: &TableReference) -> String {
     table
         .clone()

@@ -270,8 +270,13 @@ impl PartitionService {
             return Ok(());
         }
 
-        self.assign_pending(std::slice::from_ref(table), &executors, ops, AssignmentLimit::Unlimited)
-            .await
+        self.assign_pending(
+            std::slice::from_ref(table),
+            &executors,
+            ops,
+            AssignmentLimit::Unlimited,
+        )
+        .await
     }
 
     /// Discover, add/remove, and assign partitions for every accelerated table

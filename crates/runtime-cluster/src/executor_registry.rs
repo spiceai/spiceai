@@ -292,7 +292,7 @@ impl ExecutorRegistry {
     }
 
     /// Resolves a table's partitions using the accelerations partition store and returns
-    /// one FlightSQL table provider per selected executor. The caller decides whether the
+    /// one `FlightSQL` table provider per selected executor. The caller decides whether the
     /// table should actually be partitioned (e.g. `AcceleratedPartitionProvider` checks
     /// `AcceleratedTable` downcast in the runtime crate).
     pub fn resolve_accelerated_partitions(
