@@ -69,7 +69,7 @@ env:
 jobs:
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -94,7 +94,7 @@ jobs:
 
             // Tagged releases use GitHub hosted runners, others use spiceai runners
             const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos";
-            const linuxRunner = isTaggedRelease ? "ubuntu-22.04" : "spiceai-dev-runners";
+            const linuxRunner = isTaggedRelease ? "ubuntu-24.04" : "spiceai-dev-runners";
 
             // Use minio for spiceai runners (trunk, release branches, manual dispatch on non-tagged)
             const useMinio = !isTaggedRelease;
@@ -394,7 +394,7 @@ jobs:
           - target_os: windows
             target_arch: x86_64
 
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
