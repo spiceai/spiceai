@@ -132,12 +132,12 @@ enum SourceShape {
 /// |-------------|---------------------------------------------|------------------------------|
 /// | Arrow       | Native Arrow in-memory                      | Transparent.                 |
 /// | Cayenne     | Native Arrow persistence                    | Transparent.                 |
-/// | DuckDB      | Native `FLOAT[D][]`                         | Transparent.                 |
-/// | SQLite      | JSON-serialized `TEXT` (via table-providers)| Functional; JSON overhead.   |
+/// | `DuckDB`      | Native `FLOAT[D][]`                         | Transparent.                 |
+/// | `SQLite`      | JSON-serialized `TEXT` (via table-providers)| Functional; JSON overhead.   |
 /// | Turso       | JSON-serialized `TEXT`                      | See `turso.rs:581-583`.      |
-/// | PostgreSQL  | Not yet supported                           | Out of scope this milestone. |
+/// | `PostgreSQL`  | Not yet supported                           | Out of scope this milestone. |
 ///
-/// SQLite / Turso JSON serialization is lossy in type fidelity (everything
+/// `SQLite` / Turso JSON serialization is lossy in type fidelity (everything
 /// round-trips as TEXT) but functionally correct. A proper side-table
 /// strategy (`<base>__<col>_mv(pk, elem_idx, vector)`) is a future
 /// optimization for those accelerators; the current behavior is the same

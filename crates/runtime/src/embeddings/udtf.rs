@@ -98,7 +98,7 @@ pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
 
 /// Upper bound on the number of query strings accepted by `vector_search` when
 /// invoked in late-interaction (multi-query) mode. Each query produces its own
-/// subplan that is UNIONed together, so unbounded arrays can blow up the
+/// subplan that is `UNIONed` together, so unbounded arrays can blow up the
 /// logical plan size and runtime work.
 const VECTOR_SEARCH_MAX_QUERIES: usize = 32;
 
@@ -420,7 +420,7 @@ impl VectorSearchTableFunc {
             tbl: tbl_ref
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
                 .into(),
-            query: q.clone(),
+            query: q,
             queries,
             column,
             limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),

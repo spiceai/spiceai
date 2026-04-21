@@ -51,7 +51,7 @@ static LIST_MULTI_MATCH_ELEMENT_ALIAS: &str = "_match_element";
 /// character offsets back into the source string.
 ///
 /// `ListMulti` — the source column is a list of strings; each list
-/// element was embedded in M2. Single-query MaxSim / Mean / Sum over
+/// element was embedded in M2. Single-query `MaxSim` / Mean / Sum over
 /// stored elements per row.
 ///
 /// `LateInteraction` — both the query and the stored column are
@@ -131,7 +131,7 @@ impl ChunkedNonIndexVectorGeneration {
 
     /// Late-interaction (multi-query × multi-element) constructor.
     /// `queries` must be non-empty. If it contains a single element the
-    /// generator falls back to single-query MaxSim over the stored
+    /// generator falls back to single-query `MaxSim` over the stored
     /// elements (semantically equivalent to the `ListMulti` path with
     /// `aggregation = max`).
     pub fn new_late_interaction(
@@ -495,7 +495,7 @@ impl ChunkedNonIndexVectorGeneration {
         Ok(Arc::new(ViewTable::new(plan.build()?, None)))
     }
 
-    /// Multi-vector (ListMulti) search: per-list-element cosine similarity
+    /// Multi-vector (`ListMulti`) search: per-list-element cosine similarity
     /// rolled up per primary key with the configured aggregation
     /// (`max` / `mean` / `sum`). The `_match` column is the source list
     /// element that produced the best per-element score.
@@ -590,7 +590,7 @@ impl ChunkedNonIndexVectorGeneration {
     /// column with a multi-string query.
     ///
     /// Scoring: for each query string `q_k`, compute the best per-row
-    /// cosine similarity against any stored element (MaxSim). Sum those
+    /// cosine similarity against any stored element (`MaxSim`). Sum those
     /// per-query bests into the final row score.
     ///
     /// Implementation: one sub-plan per query (reusing `score_cte_sql`'s
