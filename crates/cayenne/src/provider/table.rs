@@ -94,6 +94,11 @@ type DeletedRowKeysMap = HashMap<Box<[u8]>, i64>;
 pub(crate) struct ColumnStatsAccumulator {
     /// Per-column accumulated stats as Vortex `StatsSet`
     columns: std::sync::Mutex<Vec<vortex::array::stats::StatsSet>>,
+    /// Per-column "has any batch been merged yet" flag. The first batch is
+    /// assigned directly (not merged) because `StatsSet::default()` represents
+    /// "unknown" — and `merge_unordered(unknown, known) == unknown`, which
+    /// would silently drop the first batch's stats.
+    columns_seeded: std::sync::Mutex<Vec<bool>>,
     /// Column dtypes (Vortex types, derived from Arrow schema)
     dtypes: Vec<vortex::dtype::DType>,
     /// Total accumulated row count across all batches
@@ -123,6 +128,7 @@ impl ColumnStatsAccumulator {
             .collect();
         Self {
             columns: std::sync::Mutex::new(columns),
+            columns_seeded: std::sync::Mutex::new(vec![false; num_cols]),
             dtypes,
             row_count: std::sync::atomic::AtomicI64::new(0),
             schema: schema.clone(),
@@ -133,6 +139,12 @@ impl ColumnStatsAccumulator {
     pub(crate) fn update(&self, batch: &RecordBatch) {
         let Ok(mut cols) = self.columns.lock() else {
             tracing::warn!("ColumnStatsAccumulator: mutex poisoned in update(), skipping");
+            return;
+        };
+        let Ok(mut seeded) = self.columns_seeded.lock() else {
+            tracing::warn!(
+                "ColumnStatsAccumulator: seeded-mutex poisoned in update(), skipping"
+            );
             return;
         };
 
@@ -148,7 +160,7 @@ impl ColumnStatsAccumulator {
         );
 
         for (i, col) in batch.columns().iter().enumerate() {
-            if i >= cols.len() || i >= self.dtypes.len() {
+            if i >= cols.len() || i >= self.dtypes.len() || i >= seeded.len() {
                 continue;
             }
 
@@ -156,9 +168,19 @@ impl ColumnStatsAccumulator {
             let batch_stats =
                 crate::stats::column_stats_to_stats_set(&Self::compute_column_stats(col));
 
-            // Merge into the accumulated stats using unordered merge
-            let existing = std::mem::take(&mut cols[i]);
-            cols[i] = existing.merge_unordered(&batch_stats, &self.dtypes[i]);
+            // For the first batch, seed directly. `StatsSet::default()` is
+            // treated by Vortex as "unknown" — and `merge_unordered(unknown,
+            // known) == unknown`, which would otherwise silently drop the
+            // first batch's stats. On subsequent batches, merge using the
+            // commutative unordered merge so statistics stay correct
+            // regardless of the order batches arrive in.
+            if seeded[i] {
+                let existing = std::mem::take(&mut cols[i]);
+                cols[i] = existing.merge_unordered(&batch_stats, &self.dtypes[i]);
+            } else {
+                cols[i] = batch_stats;
+                seeded[i] = true;
+            }
         }
     }
 
@@ -3431,7 +3453,7 @@ impl CayenneTableProvider {
 
         let sequence_number = self
             .catalog
-            .get_sequence_number(&self.table_metadata.table_id)
+            .increment_sequence_number(&self.table_metadata.table_id)
             .await?;
 
         self.catalog
@@ -4522,25 +4544,32 @@ impl TableProvider for CayenneTableProvider {
         _state: &dyn Session,
         filters: Vec<Expr>,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        // Flush any inlined data to Vortex files before deletion.
-        // Deletion operates on the listing table, so inlined data must be
-        // materialized first to be visible to the deletion executor.
-        let inlined_count = self
-            .catalog
-            .get_inlined_data_count(&self.table_metadata.table_id)
-            .await
-            .map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to get inlined data count for table {}: {e}",
-                    self.table_metadata.table_name
-                ))
-            })?;
-        if inlined_count > 0 {
-            self.checkpoint_inlined_data().await.map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "Failed to checkpoint inlined data before delete: {e}"
-                ))
-            })?;
+        // Flush any inlined data to Vortex files before deletion. Deletion
+        // operates on the listing table, so inlined data must be materialized
+        // first to be visible to the deletion executor.
+        //
+        // Hold the table's write lock around the count+checkpoint so that
+        // concurrent inserts/checkpoints cannot race and leave the metastore
+        // and listing table in an inconsistent state.
+        {
+            let _guard = self.write_lock.lock().await;
+            let inlined_count = self
+                .catalog
+                .get_inlined_data_count(&self.table_metadata.table_id)
+                .await
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to get inlined data count for table {}: {e}",
+                        self.table_metadata.table_name
+                    ))
+                })?;
+            if inlined_count > 0 {
+                self.checkpoint_inlined_data().await.map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "Failed to checkpoint inlined data before delete: {e}"
+                    ))
+                })?;
+            }
         }
 
         if self.file_based_deletes_preferred(&filters) {

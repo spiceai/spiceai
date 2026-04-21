@@ -223,7 +223,8 @@ pub(crate) fn stats_set_to_column_stats(stats: &StatsSet, dtype: &DType) -> Colu
 /// `file_stats`. Negative values (which can occur if an upstream writer failed
 /// to track row counts correctly) are reported as `Precision::Absent` rather
 /// than silently wrapped into a bogus `usize`.
-pub(crate) fn file_statistics_to_df(file_stats: &FileStatistics, num_rows: i64) -> Statistics {
+#[must_use]
+pub fn file_statistics_to_df(file_stats: &FileStatistics, num_rows: i64) -> Statistics {
     let column_statistics: Vec<ColumnStatistics> = file_stats
         .into_iter()
         .map(|(stats, dtype)| stats_set_to_column_stats(stats, dtype))
@@ -267,4 +268,47 @@ pub(crate) fn build_file_statistics(
 ) -> FileStatistics {
     let struct_dtype = vortex_struct_dtype_from_schema(schema);
     FileStatistics::new_with_dtype(Arc::from(column_stats.into_boxed_slice()), &struct_dtype)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::{stats::Precision as DfPrecision, ColumnStatistics, ScalarValue};
+    use std::sync::Arc;
+
+    #[test]
+    fn utf8_min_max_roundtrip_through_file_statistics() {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+        let cs = ColumnStatistics {
+            null_count: DfPrecision::Exact(0),
+            min_value: DfPrecision::Exact(ScalarValue::Utf8(Some("apple".into()))),
+            max_value: DfPrecision::Exact(ScalarValue::Utf8(Some("cherry".into()))),
+            sum_value: DfPrecision::Absent,
+            distinct_count: DfPrecision::Absent,
+            byte_size: DfPrecision::Absent,
+        };
+        let set = column_stats_to_stats_set(&cs);
+        // Pre-serialize sanity: StatsSet has Utf8 min/max.
+        let min_pre = set.get(Stat::Min).expect("min present in StatsSet");
+        let max_pre = set.get(Stat::Max).expect("max present in StatsSet");
+        println!("pre min={min_pre:?} max={max_pre:?}");
+
+        let file_stats = build_file_statistics(vec![set], &schema);
+        let bytes = serialize_file_statistics(&file_stats).expect("serialize ok");
+        let rt = deserialize_file_statistics(&bytes, &schema).expect("deserialize ok");
+
+        let df = file_statistics_to_df(&rt, 3);
+        let col = &df.column_statistics[0];
+        println!("df col: {col:?}");
+        assert_eq!(col.null_count, DfPrecision::Exact(0));
+        assert_eq!(
+            col.min_value,
+            DfPrecision::Exact(ScalarValue::Utf8(Some("apple".into())))
+        );
+        assert_eq!(
+            col.max_value,
+            DfPrecision::Exact(ScalarValue::Utf8(Some("cherry".into())))
+        );
+    }
 }

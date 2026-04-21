@@ -49,9 +49,9 @@ test_with_backends!(test_stats_min_max_correct_for_strings);
 
 test_with_backends!(test_large_insert_bypasses_inline);
 test_with_backends!(test_multiple_small_inserts_accumulate_inline);
-test_with_backends!(test_checkpoint_flushes_inline_to_vortex);
+test_with_backends!(test_scan_unions_inlined_and_vortex);
 test_with_backends!(test_overwrite_clears_inlined_data);
-test_with_backends!(test_inline_data_checkpointed_before_delete);
+test_with_backends!(test_delete_removes_row_from_pk_table);
 
 // ============================================================================
 // Helpers
@@ -280,8 +280,14 @@ async fn test_stats_with_mixed_types(fixture: common::TestFixture) -> TestResult
     Ok(())
 }
 
-/// String min/max should be captured in the statistics blob.
+/// String min/max and null_count must round-trip correctly in the statistics
+/// blob. Asserts exact values (lexicographic min="apple", max="cherry") rather
+/// than just checking that the blob is non-empty — stats correctness is a
+/// data-correctness guarantee.
 async fn test_stats_min_max_correct_for_strings(fixture: common::TestFixture) -> TestResult {
+    use datafusion::common::stats::Precision;
+    use datafusion::common::ScalarValue;
+
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("name", DataType::Utf8, false),
@@ -299,21 +305,38 @@ async fn test_stats_min_max_correct_for_strings(fixture: common::TestFixture) ->
     )?;
     common::insert_batch(&table, batch).await?;
 
-    let stats = fixture.catalog.get_table_statistics(&table_id).await?;
-    assert!(stats.is_some(), "Stats should exist after insert");
-    let stats = stats.expect("stats");
+    let stats = fixture
+        .catalog
+        .get_table_statistics(&table_id)
+        .await?
+        .expect("stats should exist after insert");
     assert_eq!(stats.num_rows, 3);
-    assert!(
-        !stats.statistics_blob.is_empty(),
-        "statistics_blob should be non-empty"
-    );
+    assert!(!stats.statistics_blob.is_empty());
 
-    // Deserialize and verify the stats round-trip correctly
-    let file_stats =
-        cayenne::stats::deserialize_file_statistics(&stats.statistics_blob, &schema).ok();
-    assert!(
-        file_stats.is_some(),
-        "FileStatistics should be deserializable"
+    // Deserialize the blob and project into DataFusion Statistics so we can
+    // assert exact min/max values (not just that it deserialized).
+    let file_stats = cayenne::stats::deserialize_file_statistics(&stats.statistics_blob, &schema)
+        .expect("FileStatistics should deserialize");
+    let df_stats = cayenne::stats::file_statistics_to_df(&file_stats, stats.num_rows);
+
+    assert_eq!(df_stats.num_rows, Precision::Exact(3));
+    assert_eq!(df_stats.column_statistics.len(), 2, "one entry per column");
+
+    let name_stats = &df_stats.column_statistics[1];
+    assert_eq!(
+        name_stats.min_value,
+        Precision::Exact(ScalarValue::Utf8(Some("apple".into()))),
+        "min should be lexicographic minimum",
+    );
+    assert_eq!(
+        name_stats.max_value,
+        Precision::Exact(ScalarValue::Utf8(Some("cherry".into()))),
+        "max should be lexicographic maximum",
+    );
+    assert_eq!(
+        name_stats.null_count,
+        Precision::Exact(0),
+        "no NULL names in the input batch",
     );
 
     Ok(())
@@ -386,12 +409,16 @@ async fn test_multiple_small_inserts_accumulate_inline(fixture: common::TestFixt
     Ok(())
 }
 
-/// Inlined data followed by a large insert should result in all rows being queryable.
-/// The large insert goes through the Vortex path while inlined data stays in the metastore.
-async fn test_checkpoint_flushes_inline_to_vortex(fixture: common::TestFixture) -> TestResult {
+/// Scans that span both the inlined (metastore) path and the Vortex (file) path
+/// must surface every row exactly once without asserting a checkpoint occurred.
+///
+/// This test intentionally does NOT exceed the auto-checkpoint threshold
+/// (`10_000` inlined rows); see `test_inline_data_still_inlined_after_large_insert`
+/// below for the checkpoint-trigger assertion.
+async fn test_scan_unions_inlined_and_vortex(fixture: common::TestFixture) -> TestResult {
     let schema = simple_schema();
-    let (table, ctx) = create_table_no_pk(&fixture, "inline_ckpt", Arc::clone(&schema)).await;
-    let table_id = fixture.catalog.get_table("inline_ckpt").await?.table_id;
+    let (table, ctx) = create_table_no_pk(&fixture, "inline_union", Arc::clone(&schema)).await;
+    let table_id = fixture.catalog.get_table("inline_union").await?.table_id;
 
     // Insert small batch (inlined)
     let batch = RecordBatch::try_new(
@@ -418,9 +445,17 @@ async fn test_checkpoint_flushes_inline_to_vortex(fixture: common::TestFixture) 
     )?;
     common::insert_batch(&table, large_batch).await?;
 
-    // All rows should be queryable: 5 inlined + 1101 from Vortex
-    ctx.register_table("inline_ckpt", Arc::new(table))?;
-    assert_eq!(query_count(&ctx, "inline_ckpt").await, 1106);
+    // The large insert does NOT flush inlined data — it went straight to Vortex.
+    // Inlined blobs from the first insert should still be present.
+    assert_eq!(
+        fixture.catalog.get_inlined_data_count(&table_id).await?,
+        5,
+        "small-then-large insert should not trigger checkpoint (below 10K threshold)",
+    );
+
+    // All rows should be queryable: 5 inlined + 1101 from Vortex.
+    ctx.register_table("inline_union", Arc::new(table))?;
+    assert_eq!(query_count(&ctx, "inline_union").await, 1106);
 
     Ok(())
 }
@@ -465,8 +500,15 @@ async fn test_overwrite_clears_inlined_data(fixture: common::TestFixture) -> Tes
     Ok(())
 }
 
-/// DELETE on a table with inlined data should checkpoint first, then delete.
-async fn test_inline_data_checkpointed_before_delete(fixture: common::TestFixture) -> TestResult {
+/// DELETE on a PK table must remove exactly the matching row.
+///
+/// Note: PK tables bypass the inlining fast-path (see
+/// `provider::sink::can_inline`), so this test covers DELETE correctness on a
+/// Vortex-backed table. Checkpoint-before-delete behavior for inlined data is
+/// exercised by
+/// `data_inlining_test::test_roundtrip_across_reopen` / the `delete_from`
+/// implementation in `provider::table`.
+async fn test_delete_removes_row_from_pk_table(fixture: common::TestFixture) -> TestResult {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("value", DataType::Int64, false),
