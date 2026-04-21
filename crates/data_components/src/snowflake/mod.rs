@@ -314,9 +314,21 @@ fn map_snowflake_sql_type(sql_type: &str, precision: Option<u8>, scale: Option<i
                 DataType::Decimal128(p, s)
             }
         }
-        "VARCHAR" | "CHAR" | "CHARACTER" | "STRING" | "TEXT" | "VARIANT" | "OBJECT" | "ARRAY" => {
+        "VARCHAR" | "CHAR" | "CHARACTER" | "STRING" | "TEXT" | "VARIANT" | "OBJECT" | "ARRAY"
+        // Structured MAP collapses to JSON text here because
+        // `information_schema.columns` does not expose key/value types.
+        | "MAP"
+        // GEOGRAPHY/GEOMETRY are serialized by Snowflake as WKT/GeoJSON/WKB
+        // text over the wire; Utf8 is the correct lossless mapping.
+        | "GEOGRAPHY" | "GEOMETRY"
+        // UUID and FILE are textual representations in Snowflake's wire format.
+        | "UUID" | "FILE" => {
             DataType::Utf8
         }
+        // DECFLOAT uses a dynamic base-10 exponent with up to 38 significant
+        // digits, which cannot be losslessly represented by a fixed-scale
+        // Arrow Decimal. Fall back to Utf8 to preserve exact values.
+        "DECFLOAT" => DataType::Utf8,
         "BINARY" | "VARBINARY" => DataType::Binary,
         "BOOLEAN" => DataType::Boolean,
         "DATE" => DataType::Date32,
@@ -376,5 +388,140 @@ impl Read for SnowflakeTableFactory {
         );
 
         Ok(table_provider)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every Snowflake `information_schema.columns` `DATA_TYPE` we support, paired
+    /// with its expected Arrow mapping. Covers integer/decimal/float variants,
+    /// string/semi-structured types (including `OBJECT`), binary, boolean,
+    /// date/time, and all timestamp variants.
+    #[test]
+    fn test_map_snowflake_sql_type_all_types() {
+        let cases: &[(&str, Option<u8>, Option<i8>, DataType)] = &[
+            // Numeric: NUMBER always decimal; precision/scale honored
+            ("NUMBER", Some(38), Some(0), DataType::Decimal128(38, 0)),
+            ("NUMBER", Some(12), Some(4), DataType::Decimal128(12, 4)),
+            ("NUMBER", None, None, DataType::Decimal128(38, 0)),
+            ("DECIMAL", Some(10), Some(2), DataType::Decimal128(10, 2)),
+            ("NUMERIC", Some(10), Some(2), DataType::Decimal128(10, 2)),
+            // Integer aliases collapse to Decimal128 with provided precision/scale
+            ("INT", Some(38), Some(0), DataType::Decimal128(38, 0)),
+            ("INTEGER", Some(38), Some(0), DataType::Decimal128(38, 0)),
+            ("BIGINT", Some(38), Some(0), DataType::Decimal128(38, 0)),
+            ("SMALLINT", Some(38), Some(0), DataType::Decimal128(38, 0)),
+            ("TINYINT", Some(38), Some(0), DataType::Decimal128(38, 0)),
+            ("BYTEINT", Some(38), Some(0), DataType::Decimal128(38, 0)),
+            // Float family
+            ("FLOAT", None, None, DataType::Float32),
+            ("FLOAT4", None, None, DataType::Float32),
+            ("REAL", None, None, DataType::Float32),
+            ("FLOAT8", None, None, DataType::Float64),
+            ("DOUBLE", None, None, DataType::Float64),
+            ("DOUBLE PRECISION", None, None, DataType::Float64),
+            // String-like
+            ("VARCHAR", None, None, DataType::Utf8),
+            ("CHAR", None, None, DataType::Utf8),
+            ("CHARACTER", None, None, DataType::Utf8),
+            ("STRING", None, None, DataType::Utf8),
+            ("TEXT", None, None, DataType::Utf8),
+            // Semi-structured: JSON-serialized strings from Snowflake
+            ("VARIANT", None, None, DataType::Utf8),
+            ("OBJECT", None, None, DataType::Utf8),
+            ("ARRAY", None, None, DataType::Utf8),
+            // Binary
+            ("BINARY", None, None, DataType::Binary),
+            ("VARBINARY", None, None, DataType::Binary),
+            // Boolean / Date / Time
+            ("BOOLEAN", None, None, DataType::Boolean),
+            ("DATE", None, None, DataType::Date32),
+            ("TIME", None, None, DataType::Time64(TimeUnit::Nanosecond)),
+            // Timestamps
+            (
+                "DATETIME",
+                None,
+                None,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            (
+                "TIMESTAMP",
+                None,
+                None,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            (
+                "TIMESTAMP_NTZ",
+                None,
+                None,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            (
+                "TIMESTAMP_LTZ",
+                None,
+                None,
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            (
+                "TIMESTAMP_TZ",
+                None,
+                None,
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            ),
+        ];
+
+        for (sql_type, precision, scale, expected) in cases {
+            let got = map_snowflake_sql_type(sql_type, *precision, *scale);
+            assert_eq!(
+                got, *expected,
+                "Mismatch for SQL type '{sql_type}' (precision={precision:?}, scale={scale:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_map_snowflake_sql_type_is_case_insensitive() {
+        assert_eq!(map_snowflake_sql_type("object", None, None), DataType::Utf8);
+        assert_eq!(map_snowflake_sql_type("Object", None, None), DataType::Utf8);
+        assert_eq!(
+            map_snowflake_sql_type("varchar", None, None),
+            DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn test_map_snowflake_sql_type_unknown_falls_back_to_utf8() {
+        // Unknown/future types must not crash the connector; fall back to Utf8
+        // (lossless text representation) while logging a warning.
+        assert_eq!(
+            map_snowflake_sql_type("SOMETHING_NEW", None, None),
+            DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn test_map_snowflake_sql_type_extended_types() {
+        // Explicit coverage for Snowflake types beyond the "classic" SQL set:
+        // - Geospatial (GEOGRAPHY, GEOMETRY) — text-serialized WKT/GeoJSON/WKB.
+        // - Semi-structured MAP — dynamic, collapses to JSON text.
+        // - UUID / FILE — textual wire representations.
+        // - DECFLOAT — dynamic-scale decimal with no lossless fixed-scale
+        //   Arrow mapping; intentionally mapped to Utf8 to preserve exact values.
+        for (sql_type, expected) in [
+            ("GEOGRAPHY", DataType::Utf8),
+            ("GEOMETRY", DataType::Utf8),
+            ("MAP", DataType::Utf8),
+            ("UUID", DataType::Utf8),
+            ("FILE", DataType::Utf8),
+            ("DECFLOAT", DataType::Utf8),
+        ] {
+            assert_eq!(
+                map_snowflake_sql_type(sql_type, None, None),
+                expected,
+                "Mismatch for {sql_type}"
+            );
+        }
     }
 }
