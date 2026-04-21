@@ -35,12 +35,28 @@ pub struct SqlToolParams {
     /// The SQL query to run. Double quote all select columns and never select columns ending in '_embedding'. The `table_catalog` is 'spice'. Always use it in the query
     query: String,
 }
+
+/// Default description advertised to LLMs / tool selection when the `sql` tool
+/// is in its read-only posture (the default).
+const DEFAULT_READ_ONLY_DESCRIPTION: &str = "Run a read-only SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: \"catalog\".\"schema\".\"table\". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix. DDL and write statements (INSERT/UPDATE/DELETE/COPY/CREATE/DROP) are rejected, as are session-mutating statements (PREPARE/EXECUTE/DEALLOCATE).";
+
+/// Default description advertised to LLMs / tool selection when the operator
+/// has opted the tool into writable mode via [`SqlTool::allow_writes`].
+const DEFAULT_WRITABLE_DESCRIPTION: &str = "Run an SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: \"catalog\".\"schema\".\"table\". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix. This tool accepts write statements (INSERT/UPDATE/DELETE/DDL); use with caution.";
+
 pub struct SqlTool {
     name: String,
     description: String,
     df: Arc<DataFusion>,
 
     allowed_tables: Option<ResolvedTableAwareAllowlist>,
+    /// When true (the default), the tool rejects any DDL, DML, COPY, or
+    /// `LogicalPlan::Statement` plan (including PREPARE/EXECUTE/DEALLOCATE) at
+    /// execution time. This prevents LLM- or caller-supplied SQL from mutating data
+    /// or session state via the `/v1/tools/sql` surface, even when a referenced
+    /// catalog/dataset is configured writable. Operators that need write access from
+    /// a tool should configure a distinct writable tool rather than flipping this flag.
+    read_only: bool,
 }
 
 impl SqlTool {
@@ -54,9 +70,33 @@ impl SqlTool {
         Self {
             df,
             name: name.unwrap_or("sql").to_string(),
-            description: description.unwrap_or("Run an SQL query on the data source. Columns with capitals must be quoted. When needed quote each part of catalog.schema.table: \"catalog\".\"schema\".\"table\". Avoid 'SELECT *', and columns with `_offset` or `_embedding` suffix.").to_string(),
-            allowed_tables
+            description: description
+                .unwrap_or(DEFAULT_READ_ONLY_DESCRIPTION)
+                .to_string(),
+            allowed_tables,
+            read_only: true,
         }
+    }
+
+    /// Allow write statements (INSERT/UPDATE/DELETE/DDL). Defaults to off.
+    ///
+    /// This is an escape hatch for operators who have deliberately configured a
+    /// separate writable tool and understand that any LLM with tool-use access will
+    /// then be able to mutate the targeted catalog/dataset without per-call
+    /// confirmation. Leave the default in place unless that trade-off is acceptable.
+    ///
+    /// If the tool is still using the default read-only description, it is swapped
+    /// for the writable default so LLM/tool-selection logic is not misled by a
+    /// stale "read-only" advertisement. Operator-supplied descriptions are left
+    /// untouched — callers overriding the description are responsible for keeping
+    /// it accurate.
+    #[must_use]
+    pub fn allow_writes(mut self) -> Self {
+        self.read_only = false;
+        if self.description == DEFAULT_READ_ONLY_DESCRIPTION {
+            self.description = DEFAULT_WRITABLE_DESCRIPTION.to_string();
+        }
+        self
     }
 }
 
@@ -79,7 +119,7 @@ impl SpiceModelTool for SqlTool {
         let tool_use_result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
             let req: SqlToolParams = serde_json::from_str(arg)?;
 
-            let mut query_builder = self.df.query_builder(&req.query);
+            let mut query_builder = self.df.query_builder(&req.query).read_only(self.read_only);
             if let Some(ref allowlist) = self.allowed_tables {
                 query_builder = query_builder.allow_tables(allowlist.clone());
             }

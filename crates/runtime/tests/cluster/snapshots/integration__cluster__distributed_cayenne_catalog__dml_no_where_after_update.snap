@@ -1,0 +1,16 @@
+---
+source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
+assertion_line: 1767
+expression: plan
+---
++---------------+----------------------------------------------------------------------------+
+| plan_type     | plan                                                                       |
++---------------+----------------------------------------------------------------------------+
+| logical_plan  | Sort: nwd.s.t.id ASC NULLS LAST                                            |
+|               |   SubqueryAlias: nwd.s.t                                                   |
+|               |     TableScan: nwd.s.t projection=[id, v]                                  |
+| physical_plan | CooperativeExec                                                            |
+|               |   BytesProcessedExec                                                       |
+|               |     FlightSqlExec sql=SELECT id, v FROM nwd.s.t ORDER BY id ASC NULLS LAST |
+|               |                                                                            |
++---------------+----------------------------------------------------------------------------+
