@@ -205,15 +205,17 @@ fn build_documents(
     let mut docs: Vec<(Option<String>, Value)> = Vec::with_capacity(record.num_rows());
     let mut value_buf: Vec<u8> = Vec::with_capacity(256);
 
+    let expected_dims = usize::try_from(index.dims.max(0)).unwrap_or(0);
+
     for row in 0..record.num_rows() {
         let Some(embedding) = embedding_vectors[row].as_ref() else {
             continue;
         };
 
-        if embedding.len() != index.dims as usize {
+        if embedding.len() != expected_dims {
             return Err(Error::EmbeddingDimensionMismatch {
                 index: es_index.to_string(),
-                expected: index.dims as usize,
+                expected: expected_dims,
                 actual: embedding.len(),
                 row_index: row,
             });
