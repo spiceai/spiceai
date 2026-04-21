@@ -351,11 +351,13 @@ impl ChunkedNonIndexVectorGeneration {
         let score_arg = col(SEARCH_SCORE_COLUMN_NAME);
 
         let aggregation = match &self.mode {
-            VectorScanMode::ChunkedScalar => EmbeddingAggregation::Max,
             VectorScanMode::ListMulti { aggregation } => *aggregation,
+            // ChunkedScalar uses Max (single chunk wins per row).
             // Late-interaction builds its own aggregation pipeline and
             // does not go through this helper; `Max` is an inert default.
-            VectorScanMode::LateInteraction { .. } => EmbeddingAggregation::Max,
+            VectorScanMode::ChunkedScalar | VectorScanMode::LateInteraction { .. } => {
+                EmbeddingAggregation::Max
+            }
         };
 
         let agg = match aggregation {
