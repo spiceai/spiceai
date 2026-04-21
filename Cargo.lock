@@ -4034,9 +4034,11 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "secrecy",
  "snafu",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
