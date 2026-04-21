@@ -26,7 +26,7 @@ use datafusion::{
     config::ConfigOptions,
     datasource::TableType,
     error::DataFusionError,
-    execution::{SendableRecordBatchStream, TaskContext},
+    execution::{SendableRecordBatchStream, SessionState, TaskContext},
     logical_expr::{BinaryExpr, Operator, TableProviderFilterPushDown, dml::InsertOp},
     physical_expr::{OrderingRequirements, PhysicalSortExpr},
     physical_plan::{
@@ -492,6 +492,16 @@ impl TableProvider for PartitionTableProvider {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let session_state = state
+            .as_any()
+            .downcast_ref::<SessionState>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "Session is not a SessionState in PartitionTableProvider::update".to_string(),
+                )
+            })?
+            .clone();
+
         let partitions = self.partitions.read().await;
         let partition_list: Vec<_> = partitions.values().cloned().collect();
         drop(partitions);
@@ -501,6 +511,7 @@ impl TableProvider for PartitionTableProvider {
             assignments,
             filters,
             state.task_ctx(),
+            session_state,
         ));
 
         Ok(Arc::new(DeletionExec::new(update_sink, &self.schema)))
@@ -516,6 +527,17 @@ impl DeletionTableProvider for PartitionTableProvider {
         state: &dyn Session,
         filters: &[Expr],
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let session_state = state
+            .as_any()
+            .downcast_ref::<SessionState>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "Session is not a SessionState in PartitionTableProvider::delete_from"
+                        .to_string(),
+                )
+            })?
+            .clone();
+
         // Collect all partitions that need deletion
         let partitions = self.partitions.read().await;
         let partition_list: Vec<_> = partitions.values().cloned().collect();
@@ -526,6 +548,7 @@ impl DeletionTableProvider for PartitionTableProvider {
             partition_list,
             filters.to_vec(),
             state.task_ctx(),
+            session_state,
         ));
 
         Ok(Arc::new(DeletionExec::new(deletion_sink, &self.schema)))
@@ -537,14 +560,21 @@ struct PartitionedDeletionSink {
     partitions: Vec<Partition>,
     filters: Vec<Expr>,
     task_ctx: Arc<TaskContext>,
+    session_state: SessionState,
 }
 
 impl PartitionedDeletionSink {
-    fn new(partitions: Vec<Partition>, filters: Vec<Expr>, task_ctx: Arc<TaskContext>) -> Self {
+    fn new(
+        partitions: Vec<Partition>,
+        filters: Vec<Expr>,
+        task_ctx: Arc<TaskContext>,
+        session_state: SessionState,
+    ) -> Self {
         Self {
             partitions,
             filters,
             task_ctx,
+            session_state,
         }
     }
 }
@@ -555,30 +585,20 @@ impl DeletionSink for PartitionedDeletionSink {
         let mut total_deleted = 0u64;
 
         for partition in &self.partitions {
-            // Try to downcast the partition's table provider to DeletionTableProvider
-            // The partition's table provider might be a CayenneTableProvider or similar
-            // that implements DeletionTableProvider
             let deletion_provider = data_components::delete::get_deletion_provider(Arc::clone(
                 &partition.table_provider,
             ));
 
             if let Some(deletion_provider) = deletion_provider {
-                // Create a simple session state for executing the deletion
-                let session_ctx = datafusion::execution::context::SessionContext::new();
-                let state = session_ctx.state();
-
-                // Execute deletion on this partition
                 let plan = DeletionTableProvider::delete_from(
                     deletion_provider.as_ref(),
-                    &state,
+                    &self.session_state,
                     &self.filters,
                 )
                 .await?;
 
-                // Execute the deletion plan
                 let results = collect(plan, Arc::clone(&self.task_ctx)).await?;
 
-                // Extract the count from results
                 for batch in results {
                     if let Some(count_col) = batch.column_by_name("count")
                         && let Some(uint_array) = count_col.as_any().downcast_ref::<UInt64Array>()
@@ -608,6 +628,7 @@ struct PartitionedUpdateSink {
     assignments: Vec<(String, Expr)>,
     filters: Vec<Expr>,
     task_ctx: Arc<TaskContext>,
+    session_state: SessionState,
 }
 
 impl PartitionedUpdateSink {
@@ -616,12 +637,14 @@ impl PartitionedUpdateSink {
         assignments: Vec<(String, Expr)>,
         filters: Vec<Expr>,
         task_ctx: Arc<TaskContext>,
+        session_state: SessionState,
     ) -> Self {
         Self {
             partitions,
             assignments,
             filters,
             task_ctx,
+            session_state,
         }
     }
 }
@@ -632,12 +655,13 @@ impl DeletionSink for PartitionedUpdateSink {
         let mut total_updated = 0u64;
 
         for partition in &self.partitions {
-            let session_ctx = datafusion::execution::context::SessionContext::new();
-            let state = session_ctx.state();
-
             let plan = partition
                 .table_provider
-                .update(&state, self.assignments.clone(), self.filters.clone())
+                .update(
+                    &self.session_state,
+                    self.assignments.clone(),
+                    self.filters.clone(),
+                )
                 .await?;
 
             let results = collect(plan, Arc::clone(&self.task_ctx)).await?;
