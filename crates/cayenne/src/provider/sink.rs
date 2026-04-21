@@ -282,7 +282,7 @@ impl CayenneDataSink {
                     stats_acc.update(&single_batch);
                     self.table.persist_table_stats(&stats_acc).await;
 
-                    // Auto-checkpoint when accumulated inline data exceeds 10K rows
+                    // Auto-checkpoint when accumulated inline data reaches 10K rows
                     let inlined_count = match self
                         .table
                         .catalog()
@@ -298,7 +298,7 @@ impl CayenneDataSink {
                             i64::MAX
                         }
                     };
-                    if inlined_count > 10_000
+                    if inlined_count >= 10_000
                         && let Err(e) = self.table.checkpoint_inlined_data().await
                     {
                         tracing::warn!(
