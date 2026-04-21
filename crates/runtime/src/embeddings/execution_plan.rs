@@ -1187,7 +1187,7 @@ mod tests {
         // column.
         use arrow::array::{Int32Array, ListArray};
         use arrow::buffer::OffsetBuffer;
-        use arrow_schema::Field;
+        use arrow_schema::{DataType, Field};
         let values = Int32Array::from(vec![Some(1), Some(2), Some(3)]);
         let offsets = OffsetBuffer::<i32>::from_lengths([3usize]);
         let field = Arc::new(Field::new("item", DataType::Int32, true));
@@ -1219,19 +1219,25 @@ mod tests {
 
         assert_eq!(out.len(), 3);
         // Row 0: two elements, second is null
-        let row0 = out.value(0);
-        let fsl0 = row0.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let out_row0 = out.value(0);
+        let fsl0 = out_row0
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
         assert_eq!(fsl0.len(), 2);
         assert!(!fsl0.is_null(0));
         assert!(fsl0.is_null(1));
 
         // Row 1: empty list
-        let row1 = out.value(1);
-        assert_eq!(row1.len(), 0);
+        let out_row1 = out.value(1);
+        assert_eq!(out_row1.len(), 0);
 
         // Row 2: single element
-        let row2 = out.value(2);
-        let fsl2 = row2.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let out_row2 = out.value(2);
+        let fsl2 = out_row2
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
         assert_eq!(fsl2.len(), 1);
         assert!(!fsl2.is_null(0));
 
@@ -1252,8 +1258,11 @@ mod tests {
         let out = get_vectors_per_list_element(rows, &model, 2).await?;
 
         assert_eq!(out.len(), 2);
-        let row0 = out.value(0);
-        let fsl0 = row0.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let out_row0 = out.value(0);
+        let fsl0 = out_row0
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
         assert_eq!(fsl0.len(), 2);
         let v0 = fsl0.value(0);
         let p0 = v0.as_primitive::<Float32Type>();
@@ -1264,8 +1273,11 @@ mod tests {
         assert_eq!(p1.value(0), 0.3);
         assert_eq!(p1.value(1), 0.4);
 
-        let row1 = out.value(1);
-        let fsl1 = row1.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let out_row1 = out.value(1);
+        let fsl1 = out_row1
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
         assert_eq!(fsl1.len(), 1);
         let v2 = fsl1.value(0);
         let p2 = v2.as_primitive::<Float32Type>();
@@ -1298,8 +1310,11 @@ mod tests {
         // Row 0: null source → empty list
         assert_eq!(out.value(0).len(), 0);
         // Row 1: 3 elements, middle is null
-        let row1 = out.value(1);
-        let fsl1 = row1.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let out_row1 = out.value(1);
+        let fsl1 = out_row1
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
         assert_eq!(fsl1.len(), 3);
         assert!(!fsl1.is_null(0));
         assert!(fsl1.is_null(1));
