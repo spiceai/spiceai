@@ -4290,11 +4290,7 @@ impl CayenneTableProvider {
     ) -> datafusion_common::Result<u64> {
         let _write_guard = self.write_lock.lock().await;
 
-        let ctx = datafusion::execution::context::SessionContext::new_with_config_rt(
-            SessionConfig::default(),
-            Arc::clone(self.context.runtime_env()),
-        );
-
+        let ctx = self.create_session_context();
         let listing_table = {
             let guard = self.listing_table.read().map_err(|_| {
                 datafusion_common::DataFusionError::Internal(format!(
@@ -4305,8 +4301,7 @@ impl CayenneTableProvider {
             Arc::clone(&guard)
         };
 
-        // PositionBased tables have no protected snapshots (table.rs:3373-3375),
-        // so we only scan the main listing table.
+        // PositionBased tables have no protected snapshots, so we only scan the main listing table.
         let all_tables = vec![listing_table];
 
         // Build the deletion sink with write_lock=None (we already hold it).

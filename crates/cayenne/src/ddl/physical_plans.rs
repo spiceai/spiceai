@@ -613,13 +613,8 @@ async fn execute_merge(
     // matched key tuples and probe each file's rows with O(1) lookups. This
     // replaces the O(N) filter expression that the legacy path builds and
     // evaluates against every chunk of every file.
-    let delete_count = if let Some(count) = try_key_probe_delete(
-        &target_provider,
-        &normalized_batches,
-        &target_key_columns,
-        matched_keys,
-    )
-    .await?
+    let delete_count = if let Some(count) =
+        try_key_probe_delete(&target_provider, &target_key_columns, matched_keys).await?
     {
         count
     } else {
@@ -836,7 +831,6 @@ fn build_delete_filter(
 /// the caller should fall back to the legacy filter-based deletion.
 async fn try_key_probe_delete(
     provider: &Arc<dyn TableProvider>,
-    batches: &[RecordBatch],
     key_columns: &[String],
     matched_keys: HashSet<Vec<datafusion_common::ScalarValue>>,
 ) -> Result<Option<u64>, DataFusionError> {
@@ -878,7 +872,7 @@ async fn try_key_probe_delete(
         if providers
             .first()
             .and_then(unwrap_to_cayenne)
-            .is_none_or(CayenneTableProvider::is_position_based)
+            .is_none_or(|cayenne| !cayenne.is_position_based())
         {
             return Ok(None);
         }
