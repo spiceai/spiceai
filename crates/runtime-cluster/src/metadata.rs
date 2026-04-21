@@ -160,7 +160,7 @@ impl TablePartitionMetadata {
     ///
     /// # Errors
     ///
-    /// Returns an error if the schema cannot be converted to a DataFusion schema or
+    /// Returns an error if the schema cannot be converted to a `DataFusion` schema or
     /// a partition expression cannot be parsed.
     pub fn all_executor_partitions(
         &self,
