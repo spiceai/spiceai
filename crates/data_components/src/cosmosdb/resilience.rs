@@ -292,18 +292,18 @@ mod tests {
     #[test]
     fn backoff_method_parse_accepts_canonical_values() {
         assert_eq!(
-            BackoffMethod::parse("exponential").unwrap(),
+            BackoffMethod::parse("exponential").expect("should parse 'exponential'"),
             BackoffMethod::Exponential
         );
         assert_eq!(
-            BackoffMethod::parse("Fibonacci").unwrap(),
+            BackoffMethod::parse("Fibonacci").expect("should parse 'Fibonacci'"),
             BackoffMethod::Fibonacci
         );
     }
 
     #[test]
     fn backoff_method_parse_rejects_unknown_values() {
-        let err = BackoffMethod::parse("linear").unwrap_err();
+        let err = BackoffMethod::parse("linear").expect_err("'linear' should be rejected");
         assert!(err.contains("invalid backoff_method"));
     }
 
@@ -529,7 +529,7 @@ mod tests {
         )
         .await
         .expect("future did not time out");
-        assert_eq!(result.unwrap(), 42);
+        assert_eq!(result.expect("operation should succeed after retries"), 42);
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
     }
 

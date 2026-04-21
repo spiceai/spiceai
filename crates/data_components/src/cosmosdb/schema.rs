@@ -94,7 +94,7 @@ mod tests {
             "payload": "keep me",
         });
         let stripped = strip_system_fields(doc);
-        let obj = stripped.as_object().unwrap();
+        let obj = stripped.as_object().expect("result should be a JSON object");
         assert!(!obj.contains_key("_rid"));
         assert!(!obj.contains_key("_self"));
         assert!(!obj.contains_key("_etag"));
@@ -121,9 +121,9 @@ mod tests {
             "nested": {"_rid": "nested_rid", "value": 1},
         });
         let stripped = strip_system_fields(doc);
-        let obj = stripped.as_object().unwrap();
+        let obj = stripped.as_object().expect("result should be a JSON object");
         assert!(!obj.contains_key("_rid"));
-        let nested = obj.get("nested").and_then(Value::as_object).unwrap();
+        let nested = obj.get("nested").and_then(Value::as_object).expect("nested field should be an object");
         assert_eq!(
             nested.get("_rid").and_then(Value::as_str),
             Some("nested_rid")
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn infer_schema_returns_empty_schema_for_empty_sample() {
-        let schema = infer_schema(&[]).unwrap();
+        let schema = infer_schema(&[]).expect("infer_schema on empty input should succeed");
         assert_eq!(schema.fields().len(), 0);
     }
 
@@ -142,9 +142,9 @@ mod tests {
             json!({"id": "1", "count": 10}),
             json!({"id": "2", "count": 20}),
         ];
-        let schema = infer_schema(&samples).unwrap();
-        let id_field = schema.field_with_name("id").unwrap();
-        let count_field = schema.field_with_name("count").unwrap();
+        let schema = infer_schema(&samples).expect("infer_schema should succeed");
+        let id_field = schema.field_with_name("id").expect("schema should have 'id' field");
+        let count_field = schema.field_with_name("count").expect("schema should have 'count' field");
         assert_eq!(id_field.data_type(), &DataType::Utf8);
         assert!(matches!(
             count_field.data_type(),
@@ -160,9 +160,9 @@ mod tests {
             json!({"id": "1", "only_in_first": "x"}),
             json!({"id": "2", "only_in_second": 42}),
         ];
-        let schema = infer_schema(&samples).unwrap();
-        schema.field_with_name("id").unwrap();
-        schema.field_with_name("only_in_first").unwrap();
-        schema.field_with_name("only_in_second").unwrap();
+        let schema = infer_schema(&samples).expect("infer_schema should succeed");
+        schema.field_with_name("id").expect("schema should have 'id' field");
+        schema.field_with_name("only_in_first").expect("schema should have 'only_in_first' field");
+        schema.field_with_name("only_in_second").expect("schema should have 'only_in_second' field");
     }
 }

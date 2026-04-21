@@ -571,7 +571,7 @@ mod tests {
             json!({"id": "b", "count": 2}),
             json!({"id": "c", "count": 3}),
         ];
-        let batch = decode_batch(&docs, &schema, None).unwrap();
+        let batch = decode_batch(&docs, &schema, None).expect("decode_batch failed");
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.num_columns(), 2);
 
@@ -579,7 +579,7 @@ mod tests {
             .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
-            .unwrap();
+            .expect("column 0 should be StringArray");
         assert_eq!(id_col.value(0), "a");
         assert_eq!(id_col.value(2), "c");
 
@@ -587,7 +587,7 @@ mod tests {
             .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap();
+            .expect("column 1 should be Int64Array");
         assert_eq!(count_col.value(0), 1);
         assert_eq!(count_col.value(2), 3);
     }
@@ -597,7 +597,7 @@ mod tests {
         let schema = sample_schema();
         let docs = vec![json!({"id": "a", "count": 1})];
         // Project only the second column (`count`).
-        let batch = decode_batch(&docs, &schema, Some(&[1])).unwrap();
+        let batch = decode_batch(&docs, &schema, Some(&[1])).expect("decode_batch with projection failed");
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 1);
         assert_eq!(batch.schema().field(0).name(), "count");
@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn decode_batch_handles_empty_input() {
         let schema = sample_schema();
-        let batch = decode_batch(&[], &schema, None).unwrap();
+        let batch = decode_batch(&[], &schema, None).expect("decode_batch on empty input failed");
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), 2);
     }
@@ -617,12 +617,12 @@ mod tests {
         // inferred schema includes. Those cells must surface as nulls.
         let schema = sample_schema();
         let docs = vec![json!({"id": "a"}), json!({"id": "b", "count": 2})];
-        let batch = decode_batch(&docs, &schema, None).unwrap();
+        let batch = decode_batch(&docs, &schema, None).expect("decode_batch failed");
         let count_col = batch
             .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap();
+            .expect("column 1 should be Int64Array");
         assert!(count_col.is_null(0));
         assert_eq!(count_col.value(1), 2);
     }
@@ -646,14 +646,14 @@ mod tests {
         }
         let docs = vec![Value::Object(obj)];
 
-        let batch = decode_batch(&docs, &schema, None).unwrap();
+        let batch = decode_batch(&docs, &schema, None).expect("decode_batch on wide schema failed");
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), COLS);
         let mid = batch
             .column(COLS / 2)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap();
+            .expect("middle column should be Int64Array");
         assert_eq!(mid.value(0), i64::try_from(COLS / 2).unwrap_or(0));
     }
 
@@ -669,7 +669,7 @@ mod tests {
         let schema = schema_with_null_column();
         let projected =
             apply_unsupported_type_action(&schema, UnsupportedTypeAction::Warn, "db", "container")
-                .unwrap();
+                .expect("Warn action should succeed");
         assert_eq!(projected.fields().len(), 1);
         assert_eq!(projected.field(0).name(), "id");
     }
@@ -683,7 +683,7 @@ mod tests {
             "db",
             "container",
         )
-        .unwrap();
+        .expect("Ignore action should succeed");
         assert_eq!(projected.fields().len(), 1);
     }
 
@@ -696,7 +696,7 @@ mod tests {
             "db",
             "container",
         )
-        .unwrap();
+        .expect("String action should succeed");
         assert_eq!(projected.fields().len(), 2);
         assert_eq!(projected.field(1).data_type(), &DataType::Utf8);
     }
@@ -706,7 +706,7 @@ mod tests {
         let schema = schema_with_null_column();
         let err =
             apply_unsupported_type_action(&schema, UnsupportedTypeAction::Error, "db", "container")
-                .unwrap_err();
+                .expect_err("Error action should fail on unsupported column");
         assert!(matches!(err, Error::UnsupportedColumn { .. }));
     }
 
@@ -715,7 +715,7 @@ mod tests {
         let schema = sample_schema();
         let projected =
             apply_unsupported_type_action(&schema, UnsupportedTypeAction::Error, "db", "container")
-                .unwrap();
+                .expect("Error action on clean schema should succeed");
         assert!(Arc::ptr_eq(&schema, &projected));
     }
 }
