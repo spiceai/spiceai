@@ -22,6 +22,6 @@ description: "Query: clickbench_q34"
 |               |                     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1 |
 |               |                       CooperativeExec                                                     |
 |               |                         BytesProcessedExec                                                |
-|               |                           DuckSqlExec sql= SELECT "URL" FROM hits                         |
+|               |                           DuckSqlExec sql= SELECT "URL" FROM "hits"                       |
 |               |                                                                                           |
 +---------------+-------------------------------------------------------------------------------------------+
