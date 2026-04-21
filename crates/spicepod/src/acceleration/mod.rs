@@ -389,6 +389,7 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
+#[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_default_write_mode(mode: &WriteMode) -> bool {
     *mode == WriteMode::WriteThrough
 }

@@ -44,11 +44,11 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::metrics::MetricsSet;
-use datafusion::physical_plan::source::DataSourceExec;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
+use datafusion_datasource::source::DataSourceExec;
 use futures::StreamExt;
 
 use crate::accelerated_table::refresh::Refresher;
