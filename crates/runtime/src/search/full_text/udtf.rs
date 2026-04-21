@@ -691,8 +691,8 @@ mod tests {
             Expr::Literal(ScalarValue::Utf8(Some("hello".to_string())), None),
             named_arg("include_score", ScalarValue::Boolean(Some(false))),
         ];
-        let parsed = TextSearchTableFunc::parse_args(&exprs)
-            .expect("Named include_score should parse");
+        let parsed =
+            TextSearchTableFunc::parse_args(&exprs).expect("Named include_score should parse");
         assert_eq!(parsed.include_score, Some(false));
     }
 }
