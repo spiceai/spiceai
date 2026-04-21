@@ -491,7 +491,7 @@ jobs:
   publish-cuda:
     needs: [setup, build-cuda]
     if: ${{ needs.setup.outputs.run_cuda == 'true' }}
-    runs-on: 'ubuntu-gpu-t4-4-core'
+    runs-on: ubuntu-24.04
     env:
       REL_VERSION: ${{ needs.setup.outputs.rel_version }}
       PUBLISH: ${{ needs.setup.outputs.publish }}
