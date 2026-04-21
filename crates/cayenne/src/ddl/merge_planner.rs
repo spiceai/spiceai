@@ -103,7 +103,9 @@ impl CatalogDmlHandler for CayenneDmlHandler {
 /// Prepared local MERGE input for the generic [`datafusion_dml::DmlExtensionNode`].
 #[derive(Debug)]
 pub struct LocalMergePlanInput {
+    /// Typed MERGE metadata consumed by the generic DML extension pipeline.
     pub params: MergeParams,
+    /// Joined and projected logical input whose rows match the target schema.
     pub projected_input: LogicalPlan,
 }
 
