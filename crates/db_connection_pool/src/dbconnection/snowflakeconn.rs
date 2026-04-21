@@ -529,14 +529,17 @@ pub fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error>
         Some("BINARY") => Ok(DataType::Binary),
         Some("BOOLEAN") => Ok(DataType::Boolean),
         Some("DATE") => Ok(DataType::Date32),
-        Some("TIMESTAMP_NTZ") => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        Some("TIMESTAMP_NTZ" | "TIMESTAMP_LTZ") => {
+            // TIMESTAMP_NTZ has no time zone. TIMESTAMP_LTZ stores an
+            // absolute instant (UTC-backed) that is rendered in the session
+            // time zone. Mirror the `information_schema` path, which maps
+            // both to a timezone-less Arrow Timestamp so schema discovery is
+            // consistent across paths. TIMESTAMP_TZ (below) stores an
+            // explicit offset per value and is represented with a UTC
+            // timezone.
+            Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
+        }
         Some("TIME") => Ok(DataType::Time64(TimeUnit::Nanosecond)),
-        // TIMESTAMP_LTZ stores an absolute instant (UTC-backed) that is
-        // rendered in the session time zone. Mirror the `information_schema`
-        // path, which maps both NTZ and LTZ to a timezone-less Arrow Timestamp
-        // so schema discovery is consistent across paths. TIMESTAMP_TZ stores
-        // an explicit offset per value and is represented with a UTC timezone.
-        Some("TIMESTAMP_LTZ") => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
         Some("TIMESTAMP_TZ") => Ok(DataType::Timestamp(
             TimeUnit::Nanosecond,
             Some("UTC".into()),
@@ -551,9 +554,19 @@ pub fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error>
                 .ok_or_else(|| Error::UnableToRetrieveSchema {
                     reason: "VECTOR type missing or invalid 'dimension'".to_string(),
                 })?;
+            // Snowflake VECTOR values are dense numeric arrays; a zero or
+            // negative dimension is not a valid Snowflake type and would
+            // produce a meaningless FixedSizeList. Reject it with a clear
+            // error so schema discovery fails loudly instead of silently
+            // yielding a wrong type.
+            if dimension <= 0 {
+                return Err(Error::UnableToRetrieveSchema {
+                    reason: format!("VECTOR type has non-positive 'dimension': {dimension}"),
+                });
+            }
             let element_type = match data_type["elementType"].as_str() {
-                Some("FLOAT") | Some("FLOAT32") => DataType::Float32,
-                Some("INT") | Some("INT32") => DataType::Int32,
+                Some("FLOAT" | "FLOAT32") => DataType::Float32,
+                Some("INT" | "INT32") => DataType::Int32,
                 Some(other) => {
                     return Err(Error::UnableToRetrieveSchema {
                         reason: format!("Unsupported VECTOR element type: {other}"),
@@ -565,8 +578,11 @@ pub fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error>
                     });
                 }
             };
+            // Individual elements of a Snowflake VECTOR are never null — the
+            // whole vector value is either present or SQL NULL. Mark the
+            // inner `item` field non-nullable to model this accurately.
             Ok(DataType::FixedSizeList(
-                Arc::new(Field::new("item", element_type, true)),
+                Arc::new(Field::new("item", element_type, false)),
                 dimension,
             ))
         }
@@ -914,14 +930,16 @@ mod tests {
 
     #[test]
     fn test_parse_snowflake_data_type_vector() {
-        // VECTOR<FLOAT, N> → FixedSizeList<Float32, N>
+        // VECTOR<FLOAT, N> → FixedSizeList<Float32, N>. The inner `item`
+        // field is non-nullable because Snowflake VECTOR elements are
+        // always present (only the entire vector value can be SQL NULL).
         let got = parse_snowflake_data_type(
             r#"{"type":"VECTOR","dimension":128,"elementType":"FLOAT","nullable":true}"#,
         )
         .expect("Should parse VECTOR<FLOAT, 128>");
         assert_eq!(
             got,
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 128)
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 128)
         );
 
         // VECTOR<INT, N> → FixedSizeList<Int32, N>
@@ -931,24 +949,32 @@ mod tests {
         .expect("Should parse VECTOR<INT, 4>");
         assert_eq!(
             got,
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 4)
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 4)
         );
 
         // Missing dimension must fail clearly rather than produce a wrong type.
-        let err = parse_snowflake_data_type(
-            r#"{"type":"VECTOR","elementType":"FLOAT","nullable":true}"#,
-        )
-        .expect_err("Should error when dimension is missing");
+        let err =
+            parse_snowflake_data_type(r#"{"type":"VECTOR","elementType":"FLOAT","nullable":true}"#)
+                .expect_err("Should error when dimension is missing");
         assert!(
             matches!(err, Error::UnableToRetrieveSchema { ref reason } if reason.contains("dimension")),
             "Expected missing dimension error, got: {err:?}"
         );
 
-        // Missing elementType must fail clearly.
+        // Zero or negative dimensions are not valid Snowflake VECTOR types;
+        // reject them so schema discovery fails loudly.
         let err = parse_snowflake_data_type(
-            r#"{"type":"VECTOR","dimension":4,"nullable":true}"#,
+            r#"{"type":"VECTOR","dimension":0,"elementType":"FLOAT","nullable":true}"#,
         )
-        .expect_err("Should error when elementType is missing");
+        .expect_err("Should error when dimension is zero");
+        assert!(
+            matches!(err, Error::UnableToRetrieveSchema { ref reason } if reason.contains("dimension")),
+            "Expected non-positive dimension error, got: {err:?}"
+        );
+
+        // Missing elementType must fail clearly.
+        let err = parse_snowflake_data_type(r#"{"type":"VECTOR","dimension":4,"nullable":true}"#)
+            .expect_err("Should error when elementType is missing");
         assert!(
             matches!(err, Error::UnableToRetrieveSchema { ref reason } if reason.contains("elementType")),
             "Expected missing elementType error, got: {err:?}"
@@ -1184,10 +1210,7 @@ mod tests {
             ),
             (
                 "c_vector",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    4,
-                ),
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 4),
                 true,
             ),
         ];
@@ -1214,7 +1237,7 @@ mod tests {
         // as Utf8 JSON strings and must pass through schema_cast unchanged,
         // preserving both type and values (data correctness).
         let json_object = r#"{"k":"v","n":42}"#;
-        let json_array = r#"[1,2,3]"#;
+        let json_array = r"[1,2,3]";
         let json_variant = r#""hello""#;
 
         let object_array = Arc::new(StringArray::from(vec![Some(json_object), None])) as ArrayRef;

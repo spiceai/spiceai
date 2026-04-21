@@ -306,8 +306,16 @@ fn map_snowflake_sql_type(sql_type: &str, precision: Option<u8>, scale: Option<i
             let s = scale.unwrap_or(0);
             if s == 0 && upper != "NUMBER" {
                 match upper.as_str() {
-                    "FLOAT" | "FLOAT4" | "REAL" => DataType::Float32,
-                    "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" => DataType::Float64,
+                    // Snowflake documents that FLOAT, FLOAT4, FLOAT8, REAL, DOUBLE,
+                    // and DOUBLE PRECISION are all stored internally as 64-bit
+                    // double-precision floats (see "Summary of data types"
+                    // footnote [1]). Mapping any of these to Float32 would be
+                    // lossy and would also disagree with the `SHOW COLUMNS` path
+                    // that maps "REAL" to Float64. Use Float64 for the entire
+                    // float family to keep both discovery paths consistent.
+                    "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "REAL" => {
+                        DataType::Float64
+                    }
                     _ => DataType::Decimal128(p, s),
                 }
             } else {
@@ -416,9 +424,12 @@ mod tests {
             ("TINYINT", Some(38), Some(0), DataType::Decimal128(38, 0)),
             ("BYTEINT", Some(38), Some(0), DataType::Decimal128(38, 0)),
             // Float family
-            ("FLOAT", None, None, DataType::Float32),
-            ("FLOAT4", None, None, DataType::Float32),
-            ("REAL", None, None, DataType::Float32),
+            // Float family: Snowflake stores all float variants as 64-bit
+            // DOUBLE internally, so every variant maps to Float64 to avoid
+            // lossy narrowing and to agree with the SHOW COLUMNS path.
+            ("FLOAT", None, None, DataType::Float64),
+            ("FLOAT4", None, None, DataType::Float64),
+            ("REAL", None, None, DataType::Float64),
             ("FLOAT8", None, None, DataType::Float64),
             ("DOUBLE", None, None, DataType::Float64),
             ("DOUBLE PRECISION", None, None, DataType::Float64),
