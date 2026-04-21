@@ -881,7 +881,11 @@ impl TableProvider for FlattenJsonPropertiesTable {
         // support requires a dedicated `UdtfArgs` proto variant + codec so
         // remote executors can re-invoke the walker; that's follow-up scope.
         let batch = rows_to_batch(&self.rows, Arc::clone(&self.schema))?;
-        let src = MemorySourceConfig::try_new(&[vec![batch]], Arc::clone(&self.schema), projection.cloned())?;
+        let src = MemorySourceConfig::try_new(
+            &[vec![batch]],
+            Arc::clone(&self.schema),
+            projection.cloned(),
+        )?;
         Ok(Arc::new(DataSourceExec::new(Arc::new(src))))
     }
 }
