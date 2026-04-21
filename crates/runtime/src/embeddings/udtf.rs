@@ -872,6 +872,27 @@ impl TableProvider for VectorSearchUDTFProvider {
     }
 }
 
+/// Create a new [`TableProvider`] where columns named `value` are aliased to `match`.
+///
+/// This is used in chunked table providers which expose 'value' for [`CandidateGeneration`], but match in [`VECTOR_SEARCH_UDTF_NAME`] UDTF.
+fn alias_value_to_match(
+    tbl: Arc<dyn TableProvider>,
+) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+    let bldr = LogicalPlanBuilder::scan("tbl", Arc::new(DefaultTableSource::new(tbl)), None)?;
+    let cols = Arc::clone(bldr.schema())
+        .columns()
+        .into_iter()
+        .map(|c| {
+            if c.name() == "value" {
+                Expr::Column(c).alias("_match")
+            } else {
+                Expr::Column(c)
+            }
+        })
+        .collect::<Vec<Expr>>();
+    Ok(Arc::new(ViewTable::new(bldr.project(cols)?.build()?, None)))
+}
+
 #[cfg(test)]
 mod parser_tests {
     use super::VectorSearchTableFunc;
@@ -926,25 +947,4 @@ mod parser_tests {
         let err = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect_err("expected rejection");
         assert!(err.to_string().contains("at least one query string"));
     }
-}
-
-/// Create a new [`TableProvider`] where columns named `value` are aliased to `match`.
-///
-/// This is used in chunked table providers which expose 'value' for [`CandidateGeneration`], but match in [`VECTOR_SEARCH_UDTF_NAME`] UDTF.
-fn alias_value_to_match(
-    tbl: Arc<dyn TableProvider>,
-) -> Result<Arc<dyn TableProvider>, DataFusionError> {
-    let bldr = LogicalPlanBuilder::scan("tbl", Arc::new(DefaultTableSource::new(tbl)), None)?;
-    let cols = Arc::clone(bldr.schema())
-        .columns()
-        .into_iter()
-        .map(|c| {
-            if c.name() == "value" {
-                Expr::Column(c).alias("_match")
-            } else {
-                Expr::Column(c)
-            }
-        })
-        .collect::<Vec<Expr>>();
-    Ok(Arc::new(ViewTable::new(bldr.project(cols)?.build()?, None)))
 }

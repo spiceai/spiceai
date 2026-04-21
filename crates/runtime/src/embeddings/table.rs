@@ -1507,7 +1507,7 @@ mod tests {
             Field::new("item", DataType::Utf8, true),
             true,
         ));
-        let base_schema = Arc::new(Schema::new(vec![tags_field.clone()]));
+        let base_schema = Arc::new(Schema::new(vec![tags_field]));
         let embedded_columns = HashMap::from([(
             "tags".to_string(),
             EmbeddingColumnConfig {
