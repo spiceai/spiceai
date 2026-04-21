@@ -446,8 +446,11 @@ async fn test_multiple_small_inserts_accumulate_inline(fixture: common::TestFixt
 /// must surface every row exactly once without asserting a checkpoint occurred.
 ///
 /// This test intentionally does NOT exceed the auto-checkpoint threshold
-/// (`10_000` inlined rows); see `test_inline_data_still_inlined_after_large_insert`
-/// below for the checkpoint-trigger assertion.
+/// (`10_000` inlined rows) — the small + large inserts stay below it so the
+/// inlined rows remain in the metastore even after the large Vortex write,
+/// and the scan must union both sources. Auto-checkpoint behavior itself is
+/// exercised by the provider-level unit/integration tests under
+/// `provider::tests` rather than by this edge-case suite.
 async fn test_scan_unions_inlined_and_vortex(fixture: common::TestFixture) -> TestResult {
     let schema = simple_schema();
     let (table, ctx) = create_table_no_pk(&fixture, "inline_union", Arc::clone(&schema)).await;
