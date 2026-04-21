@@ -1326,6 +1326,252 @@ async fn cayenne_catalog_merge_into() -> Result<(), String> {
 }
 
 // =============================================================================
+// Test: MERGE INTO on an unpartitioned position-based Cayenne table
+// =============================================================================
+
+#[tokio::test]
+async fn cayenne_catalog_merge_into_unpartitioned_position_tracking() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            let catalog = make_cayenne_catalog(
+                "cat_merge_direct",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let app = AppBuilder::new("cayenne_merge_into_unpartitioned")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
+                .with_runtime_config(Config::default().with_caching_disabled())
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err("Timeout waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check_with_timeout(&rt, Duration::from_secs(30)).await;
+
+            exec(&rt, "CREATE SCHEMA cat_merge_direct.s").await?;
+
+            exec(
+                &rt,
+                "CREATE TABLE cat_merge_direct.s.inventory (
+                    id BIGINT NOT NULL,
+                    name VARCHAR NOT NULL,
+                    qty BIGINT NOT NULL
+                )",
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "CREATE TABLE cat_merge_direct.s.updates (
+                    id BIGINT NOT NULL,
+                    name VARCHAR NOT NULL,
+                    qty BIGINT NOT NULL
+                )",
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "INSERT INTO cat_merge_direct.s.inventory VALUES
+                    (1, 'apple', 10),
+                    (2, 'banana', 20),
+                    (3, 'cherry', 30)",
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "INSERT INTO cat_merge_direct.s.updates VALUES
+                    (1, 'apple', 50),
+                    (3, 'cherry', 100)",
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "MERGE INTO cat_merge_direct.s.inventory AS t
+                 USING cat_merge_direct.s.updates AS s
+                 ON t.id = s.id
+                 WHEN MATCHED THEN UPDATE SET qty = s.qty + 5",
+            )
+            .await?;
+
+            let batches = run_query(
+                &rt,
+                "SELECT id, name, qty FROM cat_merge_direct.s.inventory ORDER BY id",
+            )
+            .await?;
+
+            assert_batches_eq!(
+                &[
+                    "+----+--------+-----+",
+                    "| id | name   | qty |",
+                    "+----+--------+-----+",
+                    "| 1  | apple  | 55  |",
+                    "| 2  | banana | 20  |",
+                    "| 3  | cherry | 105 |",
+                    "+----+--------+-----+",
+                ],
+                &batches
+            );
+
+            let count =
+                query_scalar_i64(&rt, "SELECT COUNT(*) FROM cat_merge_direct.s.inventory").await?;
+            assert_eq!(count, 3, "Row count should remain unchanged after MERGE");
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn cayenne_catalog_merge_into_unpartitioned_position_tracking_large() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    let temp_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let data_dir = temp_dir.path().join("data");
+    let metadata_dir = temp_dir.path().join("metadata");
+
+    test_request_context()
+        .scope(async {
+            let catalog = make_cayenne_catalog(
+                "cat_merge_direct_large",
+                &data_dir.to_string_lossy(),
+                &metadata_dir.to_string_lossy(),
+            );
+
+            let app = AppBuilder::new("cayenne_merge_into_unpartitioned_large")
+                .with_catalog(catalog)
+                .build();
+
+            configure_test_datafusion();
+            let rt = Runtime::builder()
+                .with_app(app)
+                .with_resolved_cluster_config(test_cluster_config())
+                .with_runtime_config(Config::default().with_caching_disabled())
+                .build()
+                .await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err("Timeout waiting for components to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+            runtime_ready_check_with_timeout(&rt, Duration::from_secs(30)).await;
+
+            exec(&rt, "CREATE SCHEMA cat_merge_direct_large.s").await?;
+
+            exec(
+                &rt,
+                "CREATE TABLE cat_merge_direct_large.s.inventory (
+                    id BIGINT NOT NULL,
+                    name VARCHAR NOT NULL,
+                    qty BIGINT NOT NULL
+                )",
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "CREATE TABLE cat_merge_direct_large.s.updates (
+                    id BIGINT NOT NULL,
+                    name VARCHAR NOT NULL,
+                    qty BIGINT NOT NULL
+                )",
+            )
+            .await?;
+
+            for range in [(1_i64, 170_i64), (171, 340), (341, 512)] {
+                let inventory_values = (range.0..=range.1)
+                    .map(|id| format!("({id}, 'item-{id}', {})", id * 10))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                exec(
+                    &rt,
+                    &format!(
+                        "INSERT INTO cat_merge_direct_large.s.inventory VALUES {inventory_values}"
+                    ),
+                )
+                .await?;
+            }
+
+            let updated_ids = [3_i64, 64, 129, 257, 511];
+            let updates_values = updated_ids
+                .iter()
+                .map(|id| format!("({id}, 'item-{id}', {})", id * 1000))
+                .collect::<Vec<_>>()
+                .join(", ");
+            exec(
+                &rt,
+                &format!("INSERT INTO cat_merge_direct_large.s.updates VALUES {updates_values}"),
+            )
+            .await?;
+
+            exec(
+                &rt,
+                "MERGE INTO cat_merge_direct_large.s.inventory AS t
+                 USING cat_merge_direct_large.s.updates AS s
+                 ON t.id = s.id
+                 WHEN MATCHED THEN UPDATE SET qty = s.qty",
+            )
+            .await?;
+
+            let count = query_scalar_i64(
+                &rt,
+                "SELECT COUNT(*) FROM cat_merge_direct_large.s.inventory",
+            )
+            .await?;
+            assert_eq!(count, 512, "Row count should remain unchanged after MERGE");
+
+            let batches = run_query(
+                &rt,
+                "SELECT id, qty FROM cat_merge_direct_large.s.inventory WHERE id IN (3, 64, 129, 257, 511) ORDER BY id",
+            )
+            .await?;
+
+            assert_batches_eq!(
+                &[
+                    "+-----+--------+",
+                    "| id  | qty    |",
+                    "+-----+--------+",
+                    "| 3   | 3000   |",
+                    "| 64  | 64000  |",
+                    "| 129 | 129000 |",
+                    "| 257 | 257000 |",
+                    "| 511 | 511000 |",
+                    "+-----+--------+",
+                ],
+                &batches
+            );
+
+            Ok(())
+        })
+        .await
+}
+
+// =============================================================================
 // Test: MERGE INTO with partition key different from join key
 // =============================================================================
 

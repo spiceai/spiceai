@@ -45,6 +45,7 @@ use datafusion::datasource::listing::{
 use datafusion::datasource::sink::DataSinkExec;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_catalog::{Session, TableProvider};
 use datafusion_common::{Constraints, DFSchema};
@@ -75,6 +76,7 @@ use vortex_datafusion::VortexFormat;
 
 use super::context::CayenneContext;
 use super::deletion_strategy::{PkDeletionStrategy, PkDeletionStrategyWithCache};
+use super::position_tracking::CayennePositionTrackingExec;
 use super::vortex_format::DeletionFilteringVortexFormat;
 
 /// Maps serialized primary key bytes to their maximum delete sequence number.
@@ -667,15 +669,12 @@ impl CayenneTableProvider {
         strategy: &PkDeletionStrategyWithCache,
     ) -> Result<Arc<ListingTable>> {
         let table_url = ListingTableUrl::parse(snapshot_dir_url)?;
-
         let listing_options = Self::create_listing_options(vortex_format, strategy);
-
         let config = ListingTableConfig::new(table_url)
             .with_listing_options(listing_options)
             .with_schema(schema);
 
         let listing_table = ListingTable::try_new(config)?;
-
         Ok(Arc::new(listing_table))
     }
 
@@ -2665,37 +2664,44 @@ impl CayenneTableProvider {
         )
     }
 
-    /// Wrap a plan with a `FilterExec` that enforces the retention filter.
+    /// Wrap a plan with a `FilterExec` for a logical filter expression.
     ///
     /// `ListingTable::scan()` drops non-partition filters — they only influence
     /// the file-limit heuristic, not the actual scan. Adding a `FilterExec`
-    /// above `DataSourceExec` allows `DataFusion`'s physical optimizer to push
-    /// the predicate into `VortexSource::try_pushdown_filters`, enabling
-    /// file-level pruning via min/max stats and row-level filtering.
-    fn wrap_plan_with_retention_filter(
+    /// above the scan preserves correctness and still gives the optimizer a
+    /// chance to push supported predicates down into lower layers.
+    fn wrap_plan_with_logical_filter(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        retention_filter: &Expr,
+        filter: &Expr,
+        label: &str,
     ) -> std::result::Result<Arc<dyn ExecutionPlan>, datafusion_common::DataFusionError> {
         let arrow_schema = plan.schema();
         let df_schema = DFSchema::try_from(arrow_schema.as_ref().clone())?;
         let execution_props = ExecutionProps::new();
 
-        let physical_filter = datafusion_physical_expr::create_physical_expr(
-            retention_filter,
-            &df_schema,
-            &execution_props,
-        )?;
+        let physical_filter =
+            datafusion_physical_expr::create_physical_expr(filter, &df_schema, &execution_props)?;
 
         let filter_exec = FilterExec::try_new(physical_filter, plan)?;
 
         tracing::trace!(
             table = %self.table_metadata.table_name,
-            filter = %retention_filter,
-            "Applied retention_filter FilterExec at scan time"
+            filter = %filter,
+            filter_label = label,
+            "Applied FilterExec at scan time"
         );
 
         Ok(Arc::new(filter_exec))
+    }
+
+    /// Wrap a plan with a `FilterExec` that enforces the retention filter.
+    fn wrap_plan_with_retention_filter(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        retention_filter: &Expr,
+    ) -> std::result::Result<Arc<dyn ExecutionPlan>, datafusion_common::DataFusionError> {
+        self.wrap_plan_with_logical_filter(plan, retention_filter, "retention")
     }
 
     pub(crate) async fn apply_retention_filters(&self) -> CatalogResult<u64> {
@@ -4269,6 +4275,143 @@ impl CayenneTableProvider {
             )),
             &self.table_metadata.schema,
         )))
+    }
+
+    /// Build a scan plan that appends source file paths and physical file row indices.
+    ///
+    /// This is used by `MERGE INTO` on `PositionBased` tables to carry row
+    /// provenance through the join, allowing matched rows to be deleted by
+    /// pre-computed `(file_path, row_idx)` tuples instead of re-scanning the
+    /// target table during deletion.
+    pub(crate) async fn scan_position_tracking(
+        &self,
+        state: &dyn Session,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        if !self.pk_deletion_strategy.is_position_based() {
+            return Err(datafusion_common::DataFusionError::Internal(format!(
+                "Position tracking is only supported for position-based Cayenne tables ('{}')",
+                self.table_metadata.table_name
+            )));
+        }
+
+        let retention_keep_filter = if let Some(ref builder) = self.time_retention_filter_builder {
+            let filter = builder.keep_filter();
+            let filter = util::expr::simplify_expr(filter, &self.table_metadata.schema)?;
+            Some(filter)
+        } else {
+            None
+        };
+
+        let effective_filters: Vec<Expr>;
+        let scan_filters = if let Some(ref keep_filter) = retention_keep_filter {
+            effective_filters = filters
+                .iter()
+                .cloned()
+                .chain(std::iter::once(keep_filter.clone()))
+                .collect();
+            &effective_filters
+        } else {
+            filters
+        };
+
+        let listing_table = {
+            let guard = self.listing_table.read().map_err(|_| {
+                datafusion_common::DataFusionError::Execution(
+                    LISTING_TABLE_LOCK_POISONED.to_string(),
+                )
+            })?;
+            Arc::clone(&guard)
+        };
+
+        let list_result = listing_table
+            .list_files_for_scan(state, scan_filters, limit)
+            .await?;
+        let object_store_url = listing_table
+            .table_paths()
+            .first()
+            .map(ListingTableUrl::object_store)
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(format!(
+                    "Listing table for '{}' has no paths",
+                    self.table_metadata.table_name
+                ))
+            })?;
+
+        let mut plan: Arc<dyn ExecutionPlan> = if list_result.file_groups.is_empty() {
+            Arc::new(EmptyExec::new(
+                crate::provider::position_tracking::tracked_schema(&self.table_metadata.schema),
+            ))
+        } else {
+            Arc::new(CayennePositionTrackingExec::new(
+                list_result.file_groups,
+                object_store_url,
+                Arc::clone(&self.table_metadata.schema),
+            ))
+        };
+
+        if let Some(filter) = util::expr::combine_exprs_balanced(
+            scan_filters.to_vec(),
+            datafusion::prelude::Expr::and,
+        ) {
+            plan = self.wrap_plan_with_logical_filter(plan, &filter, "position_tracking")?;
+        }
+
+        if let Some(limit) = limit {
+            plan = Arc::new(datafusion::physical_plan::limit::GlobalLimitExec::new(
+                plan, limit, None,
+            ));
+        }
+
+        Ok(Arc::new(CayenneAccelerationExec::new(plan)))
+    }
+
+    /// Returns the current listing table URL/prefix used for file scans.
+    pub(crate) fn current_listing_table_url(&self) -> datafusion_common::Result<String> {
+        let guard = self.listing_table.read().map_err(|_| {
+            datafusion_common::DataFusionError::Execution(LISTING_TABLE_LOCK_POISONED.to_string())
+        })?;
+
+        guard
+            .table_paths()
+            .first()
+            .map(|url| url.as_str().to_string())
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(format!(
+                    "Listing table for '{}' has no paths",
+                    self.table_metadata.table_name
+                ))
+            })
+    }
+
+    /// Persist pre-computed position-based deletions.
+    ///
+    /// Fast path for `MERGE INTO` on `PositionBased` tables once the join output
+    /// already carries `(file_path, row_idx)` pairs.
+    pub async fn persist_position_deletions(
+        &self,
+        positions: HashMap<String, Vec<u64>>,
+    ) -> datafusion_common::Result<u64> {
+        let _write_guard = self.write_lock.lock().await;
+
+        let sink = CayenneDeletionSink::new(
+            self.table_metadata.clone(),
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.listing_table),
+            Arc::clone(&self.table_metadata.schema),
+            &[],
+            self.pk_deletion_strategy.clone(),
+            self.pk_row_converter.as_ref().map(Arc::clone),
+            self.pk_column_indices.clone(),
+            Vec::new(),
+            Arc::clone(self.context.runtime_env()),
+            None,
+        );
+
+        sink.persist_position_based_deletions(positions)
+            .await
+            .map_err(|e| datafusion_common::DataFusionError::External(Box::new(e)))
     }
 
     /// Delete rows by hash-probing key columns against a set of matched keys.

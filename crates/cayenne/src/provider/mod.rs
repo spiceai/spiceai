@@ -46,6 +46,7 @@ pub(crate) mod context;
 pub(crate) mod delete;
 pub mod deletion_index;
 pub(crate) mod deletion_strategy;
+pub(crate) mod position_tracking;
 pub(crate) mod retention;
 pub(crate) mod scan;
 pub(crate) mod sink;

@@ -33,6 +33,10 @@ use datafusion_dml::{CatalogDmlHandler, MergeParams};
 
 use super::logical_nodes::CayenneMergeNode;
 use super::physical_plans::CayenneMergeExec;
+use crate::provider::position_tracking::{
+    CayennePositionTrackingTable, POSITION_FILE_PATH_COLUMN, POSITION_ROW_IDX_COLUMN,
+    is_position_based_cayenne,
+};
 
 /// Catalog DML handler for local (single-node) Cayenne operations.
 ///
@@ -180,12 +184,18 @@ async fn build_local_merge_input(
     let target_qualifier = merge.target_qualifier.as_str();
     let source_qualifier = merge.source_qualifier.as_str();
 
-    let target_scan = LogicalPlanBuilder::scan(
-        target_qualifier,
-        provider_as_source(Arc::clone(&target_provider)),
-        None,
-    )?
-    .build()?;
+    let track_positions = is_position_based_cayenne(&target_provider).await;
+    let scan_provider: Arc<dyn datafusion::datasource::TableProvider> = if track_positions {
+        Arc::new(CayennePositionTrackingTable::try_new(Arc::clone(
+            &target_provider,
+        ))?)
+    } else {
+        Arc::clone(&target_provider)
+    };
+
+    let target_scan =
+        LogicalPlanBuilder::scan(target_qualifier, provider_as_source(scan_provider), None)?
+            .build()?;
     let source_scan = LogicalPlanBuilder::scan(
         source_qualifier,
         provider_as_source(Arc::clone(&source_provider)),
@@ -238,7 +248,7 @@ async fn build_local_merge_input(
         .map(|(column, expr)| (column.as_str(), expr))
         .collect();
 
-    let project_exprs: Vec<Expr> = target_schema
+    let mut project_exprs: Vec<Expr> = target_schema
         .fields()
         .iter()
         .map(|field| {
@@ -251,6 +261,23 @@ async fn build_local_merge_input(
             Ok(expr.alias(col_name))
         })
         .collect::<DFResult<Vec<_>>>()?;
+
+    if track_positions {
+        project_exprs.push(
+            col(Column::new(
+                Some(target_qualifier.to_string()),
+                POSITION_FILE_PATH_COLUMN,
+            ))
+            .alias(POSITION_FILE_PATH_COLUMN),
+        );
+        project_exprs.push(
+            col(Column::new(
+                Some(target_qualifier.to_string()),
+                POSITION_ROW_IDX_COLUMN,
+            ))
+            .alias(POSITION_ROW_IDX_COLUMN),
+        );
+    }
 
     let projected = LogicalPlanBuilder::from(joined)
         .project(project_exprs)?

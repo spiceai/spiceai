@@ -26,11 +26,11 @@ limitations under the License.
 //! nodes after calling the same `operations` functions.
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
+use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use datafusion::catalog::CatalogProviderList;
@@ -51,6 +51,7 @@ use datafusion_datasource::memory::MemorySourceConfig;
 use super::operations::{CreateTableParams, create_schema, create_table, drop_table};
 use crate::ddl::get_cayenne_provider;
 use crate::provider::CayenneTableProvider;
+use crate::provider::position_tracking::{POSITION_FILE_PATH_COLUMN, POSITION_ROW_IDX_COLUMN};
 use data_components::delete::DeletionTableProviderAdapter;
 use runtime_table_partition::provider::PartitionTableProvider;
 
@@ -591,41 +592,67 @@ async fn execute_merge(
         )])?);
     }
 
-    // Normalize output to match the target table schema (including nullability).
     let target_schema = target_provider.schema();
-    let normalized_batches = updated_batches
-        .into_iter()
-        .map(|batch| arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema)))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(DataFusionError::from)?;
+    let has_positions = updated_batches.first().is_some_and(|batch| {
+        batch
+            .schema()
+            .column_with_name(POSITION_ROW_IDX_COLUMN)
+            .is_some()
+    });
 
-    // Step 2: Validate no duplicate target keys in join output.
-    // Per SQL MERGE semantics, each target row must match at most one source row.
-    // If source has duplicate keys, the INNER JOIN produces multiple output rows
-    // per target row. We must detect this *before* any mutations — otherwise the
-    // delete would commit (removing the target row) but the count verification
-    // would fail, leaving permanently missing rows.
-    let matched_keys = validate_no_duplicate_target_keys(&normalized_batches, &target_key_columns)?;
+    let delete_count;
+    let normalized_batches = if has_positions {
+        let positions = extract_deletion_positions(&updated_batches)?;
+        let clean_batches = strip_position_columns(&updated_batches, &target_schema)?;
 
-    // Step 3+4: Delete matched rows from the target.
-    //
-    // For PositionBased Cayenne tables, use the fast path: build a HashSet of
-    // matched key tuples and probe each file's rows with O(1) lookups. This
-    // replaces the O(N) filter expression that the legacy path builds and
-    // evaluates against every chunk of every file.
-    let delete_count = if let Some(count) =
-        try_key_probe_delete(&target_provider, &target_key_columns, matched_keys).await?
-    {
-        count
+        // Per SQL MERGE semantics, each target row must match at most one source row.
+        validate_no_duplicate_target_keys(&clean_batches, &target_key_columns)?;
+
+        delete_count = delete_by_positions(&target_provider, positions).await?;
+
+        clean_batches
+            .into_iter()
+            .map(|batch| arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DataFusionError::from)?
     } else {
-        // Legacy path: build filter expression and push through delete_from.
-        let delete_filter = build_delete_filter(&normalized_batches, &target_key_columns)?;
-        let delete_plan = target_provider
-            .delete_from(&session_state, vec![delete_filter])
-            .await?;
-        let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
-        let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
-        extract_dml_count(&delete_batches)
+        // Normalize output to match the target table schema (including nullability).
+        let normalized_batches = updated_batches
+            .into_iter()
+            .map(|batch| arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DataFusionError::from)?;
+
+        // Step 2: Validate no duplicate target keys in join output.
+        // Per SQL MERGE semantics, each target row must match at most one source row.
+        // If source has duplicate keys, the INNER JOIN produces multiple output rows
+        // per target row. We must detect this *before* any mutations — otherwise the
+        // delete would commit (removing the target row) but the count verification
+        // would fail, leaving permanently missing rows.
+        let matched_keys =
+            validate_no_duplicate_target_keys(&normalized_batches, &target_key_columns)?;
+
+        // Step 3+4: Delete matched rows from the target.
+        //
+        // For PositionBased Cayenne tables, use the key-probe fast path when the
+        // join output does not carry row positions. This still avoids the giant
+        // O(N) delete filter, but re-scans target files to recover row positions.
+        delete_count = if let Some(count) =
+            try_key_probe_delete(&target_provider, &target_key_columns, matched_keys).await?
+        {
+            count
+        } else {
+            // Legacy path: build filter expression and push through delete_from.
+            let delete_filter = build_delete_filter(&normalized_batches, &target_key_columns)?;
+            let delete_plan = target_provider
+                .delete_from(&session_state, vec![delete_filter])
+                .await?;
+            let delete_stream = execute_stream(delete_plan, Arc::clone(&context))?;
+            let delete_batches: Vec<RecordBatch> = delete_stream.try_collect().await?;
+            extract_dml_count(&delete_batches)
+        };
+
+        normalized_batches
     };
 
     // Verify the delete count matches the expected number of rows.
@@ -823,6 +850,150 @@ fn build_delete_filter(
     )
 }
 
+fn extract_deletion_positions(
+    batches: &[RecordBatch],
+) -> Result<HashMap<String, Vec<u64>>, DataFusionError> {
+    let mut positions: HashMap<String, Vec<u64>> = HashMap::new();
+
+    for batch in batches {
+        let file_paths = batch
+            .column_by_name(POSITION_FILE_PATH_COLUMN)
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "Missing '{POSITION_FILE_PATH_COLUMN}' in MERGE join output"
+                ))
+            })?;
+        let row_indices = batch
+            .column_by_name(POSITION_ROW_IDX_COLUMN)
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "Missing '{POSITION_ROW_IDX_COLUMN}' in MERGE join output"
+                ))
+            })?;
+
+        for row_idx in 0..batch.num_rows() {
+            if file_paths.is_null(row_idx) || row_indices.is_null(row_idx) {
+                return Err(DataFusionError::Internal(
+                    "MERGE join output contained NULL position-tracking metadata".to_string(),
+                ));
+            }
+
+            positions
+                .entry(file_paths.value(row_idx).to_string())
+                .or_default()
+                .push(row_indices.value(row_idx));
+        }
+    }
+
+    Ok(positions)
+}
+
+fn strip_position_columns(
+    batches: &[RecordBatch],
+    target_schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>, DataFusionError> {
+    batches
+        .iter()
+        .map(|batch| {
+            for field in target_schema.fields() {
+                if batch.column_by_name(field.name()).is_none() {
+                    return Err(DataFusionError::Internal(format!(
+                        "MERGE join output missing target column '{}'",
+                        field.name()
+                    )));
+                }
+            }
+
+            let projected_indices: Vec<usize> = batch
+                .schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, field)| {
+                    (field.name() != POSITION_FILE_PATH_COLUMN
+                        && field.name() != POSITION_ROW_IDX_COLUMN)
+                        .then_some(idx)
+                })
+                .collect();
+
+            batch
+                .project(&projected_indices)
+                .map_err(DataFusionError::from)
+        })
+        .collect()
+}
+
+async fn delete_by_positions(
+    provider: &Arc<dyn TableProvider>,
+    mut positions: HashMap<String, Vec<u64>>,
+) -> Result<u64, DataFusionError> {
+    if let Some(cayenne) = provider.as_any().downcast_ref::<CayenneTableProvider>() {
+        return cayenne.persist_position_deletions(positions).await;
+    }
+
+    if let Some(adapter) = provider
+        .as_any()
+        .downcast_ref::<DeletionTableProviderAdapter>()
+        && let Some(cayenne) = adapter
+            .source()
+            .as_any()
+            .downcast_ref::<CayenneTableProvider>()
+    {
+        return cayenne.persist_position_deletions(positions).await;
+    }
+
+    if let Some(partitioned) = provider.as_any().downcast_ref::<PartitionTableProvider>() {
+        let partition_providers = partitioned.partition_table_providers().await;
+        let mut total = 0u64;
+
+        for partition_provider in &partition_providers {
+            let Some(cayenne) = unwrap_to_cayenne(partition_provider) else {
+                continue;
+            };
+            let prefix = cayenne.current_listing_table_url()?;
+            let matched_paths: Vec<String> = positions
+                .keys()
+                .filter(|path| path.starts_with(&prefix))
+                .cloned()
+                .collect();
+
+            if matched_paths.is_empty() {
+                continue;
+            }
+
+            let mut provider_positions = HashMap::with_capacity(matched_paths.len());
+            for path in matched_paths {
+                if let Some(row_ids) = positions.remove(&path) {
+                    provider_positions.insert(path, row_ids);
+                }
+            }
+
+            total = total.saturating_add(
+                cayenne
+                    .persist_position_deletions(provider_positions)
+                    .await?,
+            );
+        }
+
+        if !positions.is_empty() {
+            let unmatched: Vec<_> = positions.keys().cloned().collect();
+            return Err(DataFusionError::Internal(format!(
+                "MERGE position delete routing failed to match {} file(s) to a Cayenne partition provider: {}",
+                unmatched.len(),
+                unmatched.join(", ")
+            )));
+        }
+
+        return Ok(total);
+    }
+
+    Err(DataFusionError::Internal(
+        "delete_by_positions: provider is not a Cayenne table".to_string(),
+    ))
+}
+
 /// Try the fast key-probe deletion path for `PositionBased` Cayenne tables.
 ///
 /// Returns `Some(delete_count)` if the provider is a `PositionBased` Cayenne table
@@ -911,4 +1082,71 @@ fn unwrap_to_cayenne(provider: &Arc<dyn TableProvider>) -> Option<&CayenneTableP
                         .downcast_ref::<CayenneTableProvider>()
                 })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+
+    fn merge_output_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new(POSITION_FILE_PATH_COLUMN, DataType::Utf8, false),
+            Field::new(POSITION_ROW_IDX_COLUMN, DataType::UInt64, false),
+        ]));
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+                Arc::new(StringArray::from(vec!["file-a", "file-a", "file-b"])),
+                Arc::new(UInt64Array::from(vec![5, 6, 1])),
+            ],
+        )
+        .expect("valid merge output batch")
+    }
+
+    #[test]
+    fn extract_deletion_positions_groups_rows_by_file() {
+        let positions =
+            extract_deletion_positions(&[merge_output_batch()]).expect("positions extracted");
+
+        assert_eq!(positions.get("file-a"), Some(&vec![5, 6]));
+        assert_eq!(positions.get("file-b"), Some(&vec![1]));
+    }
+
+    #[test]
+    fn strip_position_columns_restores_target_schema() {
+        let target_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+
+        let batches = strip_position_columns(&[merge_output_batch()], &target_schema)
+            .expect("position columns stripped");
+        let batch = &batches[0];
+
+        assert_eq!(batch.schema().fields().len(), 2);
+        assert!(
+            batch
+                .schema()
+                .column_with_name(POSITION_FILE_PATH_COLUMN)
+                .is_none()
+        );
+        assert!(
+            batch
+                .schema()
+                .column_with_name(POSITION_ROW_IDX_COLUMN)
+                .is_none()
+        );
+
+        let ids = batch
+            .column_by_name("id")
+            .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+            .expect("id column");
+        assert_eq!(ids.values(), &[1, 2, 3]);
+    }
 }
