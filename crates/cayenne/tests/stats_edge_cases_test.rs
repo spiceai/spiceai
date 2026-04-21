@@ -37,7 +37,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 // Column Statistics Edge Cases
 // ============================================================================
 
-test_with_backends!(test_stats_accumulate_across_appends);
+test_with_backends!(test_stats_reflect_latest_write_only);
 test_with_backends!(test_stats_correct_after_overwrite);
 test_with_backends!(test_stats_with_all_null_column);
 test_with_backends!(test_stats_with_mixed_types);
@@ -150,7 +150,7 @@ async fn query_count(ctx: &SessionContext, table_name: &str) -> usize {
 /// asserts the actual observed behavior with exact values so any regression
 /// (e.g. dropping a stat, mis-typing a precision, breaking
 /// `ColumnStatsAccumulator` seeding) fails loudly.
-async fn test_stats_accumulate_across_appends(fixture: common::TestFixture) -> TestResult {
+async fn test_stats_reflect_latest_write_only(fixture: common::TestFixture) -> TestResult {
     use datafusion::common::ScalarValue;
     use datafusion::common::stats::Precision;
 

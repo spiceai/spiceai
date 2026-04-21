@@ -3531,9 +3531,12 @@ impl CayenneTableProvider {
         let stream = datafusion_physical_plan::execute_stream(mem_exec, ctx.task_ctx())?;
 
         let target_size_bytes = self.context.target_file_size_bytes();
-        let (_rows, _ops, _stats) = self
+        let (_rows, _ops, stats) = self
             .write_to_snapshot(stream, target_size_bytes, &self.get_current_snapshot_id()?)
             .await?;
+
+        // Persist table stats from the checkpoint write (best-effort; logs on error).
+        self.persist_table_stats(&stats).await;
 
         // Clear inlined data from metastore after successful write
         self.catalog
