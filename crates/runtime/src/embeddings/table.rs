@@ -1460,7 +1460,7 @@ mod tests {
             Field::new("item", DataType::Utf8, true),
             true,
         ));
-        let base_schema = Arc::new(Schema::new(vec![tags_field.clone()]));
+        let base_schema = Arc::new(Schema::new(vec![Arc::clone(&tags_field)]));
 
         let embedded_columns = HashMap::from([(
             "tags".to_string(),
@@ -1476,8 +1476,10 @@ mod tests {
             },
         )]);
 
-        let base_table: Arc<dyn TableProvider> =
-            Arc::new(datafusion::catalog::MemTable::try_new(base_schema, vec![vec![]]).unwrap());
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(base_schema, vec![vec![]])
+                .expect("valid schema"),
+        );
 
         let table = EmbeddingTable {
             base_table,
@@ -1521,8 +1523,10 @@ mod tests {
                 },
             },
         )]);
-        let base_table: Arc<dyn TableProvider> =
-            Arc::new(datafusion::catalog::MemTable::try_new(base_schema, vec![vec![]]).unwrap());
+        let base_table: Arc<dyn TableProvider> = Arc::new(
+            datafusion::catalog::MemTable::try_new(base_schema, vec![vec![]])
+                .expect("valid schema"),
+        );
         let table = EmbeddingTable {
             base_table,
             embedded_columns,

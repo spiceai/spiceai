@@ -1118,10 +1118,13 @@ mod tests {
         let rows = decompose_list_of_strings(&arr, 32).expect("list-of-strings supported");
         assert_eq!(rows.len(), 2);
         assert_eq!(
-            rows[0].as_ref().unwrap(),
+            rows[0].as_ref().expect("row 0 should be Some"),
             &vec![Some("red".to_string()), Some("round".to_string())]
         );
-        assert_eq!(rows[1].as_ref().unwrap(), &vec![Some("blue".to_string())]);
+        assert_eq!(
+            rows[1].as_ref().expect("row 1 should be Some"),
+            &vec![Some("blue".to_string())]
+        );
     }
 
     #[test]
@@ -1139,7 +1142,7 @@ mod tests {
         // the row so the embedder isn't asked to embed them.
         let arr = mk_list_array(&[Some(vec![Some("x"), Some(""), None, Some("y")])]);
         let rows = decompose_list_of_strings(&arr, 32).expect("ok");
-        let row = rows[0].as_ref().unwrap();
+        let row = rows[0].as_ref().expect("row 0 should be Some");
         assert_eq!(
             row,
             &vec![Some("x".to_string()), None, None, Some("y".to_string())]
@@ -1156,7 +1159,7 @@ mod tests {
             Some("e"),
         ])]);
         let rows = decompose_list_of_strings(&arr, 2).expect("ok");
-        let row = rows[0].as_ref().unwrap();
+        let row = rows[0].as_ref().expect("row 0 should be Some");
         assert_eq!(row.len(), 2);
         assert_eq!(row[0], Some("a".to_string()));
         assert_eq!(row[1], Some("b".to_string()));
@@ -1168,7 +1171,7 @@ mod tests {
         let arr = mk_large_list_array(&[Some(vec![Some("red"), Some("green")])]);
         let rows = decompose_list_of_strings(&arr, 32).expect("LargeList supported");
         assert_eq!(
-            rows[0].as_ref().unwrap(),
+            rows[0].as_ref().expect("row 0 should be Some"),
             &vec![Some("red".to_string()), Some("green".to_string())]
         );
     }
@@ -1223,7 +1226,7 @@ mod tests {
         let fsl0 = out_row0
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
-            .unwrap();
+            .expect("row 0 should be FixedSizeListArray");
         assert_eq!(fsl0.len(), 2);
         assert!(!fsl0.is_null(0));
         assert!(fsl0.is_null(1));
@@ -1237,7 +1240,7 @@ mod tests {
         let fsl2 = out_row2
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
-            .unwrap();
+            .expect("row 2 should be FixedSizeListArray");
         assert_eq!(fsl2.len(), 1);
         assert!(!fsl2.is_null(0));
 
@@ -1262,7 +1265,7 @@ mod tests {
         let fsl0 = out_row0
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
-            .unwrap();
+            .expect("row 0 should be FixedSizeListArray");
         assert_eq!(fsl0.len(), 2);
         let v0 = fsl0.value(0);
         let p0 = v0.as_primitive::<Float32Type>();
@@ -1277,7 +1280,7 @@ mod tests {
         let fsl1 = out_row1
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
-            .unwrap();
+            .expect("row 1 should be FixedSizeListArray");
         assert_eq!(fsl1.len(), 1);
         let v2 = fsl1.value(0);
         let p2 = v2.as_primitive::<Float32Type>();
@@ -1314,7 +1317,7 @@ mod tests {
         let fsl1 = out_row1
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
-            .unwrap();
+            .expect("row 1 should be FixedSizeListArray");
         assert_eq!(fsl1.len(), 3);
         assert!(!fsl1.is_null(0));
         assert!(fsl1.is_null(1));
