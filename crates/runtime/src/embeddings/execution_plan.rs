@@ -533,10 +533,10 @@ fn decompose_list_of_strings(
     max_elements_per_row: usize,
 ) -> Option<DecomposedListOfStrings> {
     if let Some(list) = arr.as_any().downcast_ref::<ListArray>() {
-        return Some(decompose_generic_list(list, max_elements_per_row));
+        return decompose_generic_list(list, max_elements_per_row);
     }
     if let Some(list) = arr.as_any().downcast_ref::<LargeListArray>() {
-        return Some(decompose_generic_list(list, max_elements_per_row));
+        return decompose_generic_list(list, max_elements_per_row);
     }
     None
 }
@@ -544,13 +544,13 @@ fn decompose_list_of_strings(
 fn decompose_generic_list<O: OffsetSizeTrait>(
     list: &GenericListArray<O>,
     max_elements_per_row: usize,
-) -> DecomposedListOfStrings {
+) -> Option<DecomposedListOfStrings> {
     let values = list.values();
     let offsets = list.value_offsets();
     let values_any = values.as_any();
 
     if let Some(arr) = values_any.downcast_ref::<StringArray>() {
-        build_rows(list, offsets, max_elements_per_row, |j| {
+        Some(build_rows(list, offsets, max_elements_per_row, |j| {
             if arr.is_null(j) {
                 None
             } else {
@@ -561,9 +561,9 @@ fn decompose_generic_list<O: OffsetSizeTrait>(
                     Some(v.to_string())
                 }
             }
-        })
+        }))
     } else if let Some(arr) = values_any.downcast_ref::<LargeStringArray>() {
-        build_rows(list, offsets, max_elements_per_row, |j| {
+        Some(build_rows(list, offsets, max_elements_per_row, |j| {
             if arr.is_null(j) {
                 None
             } else {
@@ -574,22 +574,22 @@ fn decompose_generic_list<O: OffsetSizeTrait>(
                     Some(v.to_string())
                 }
             }
-        })
-    } else if let Some(arr) = values_any.downcast_ref::<StringViewArray>() {
-        build_rows(list, offsets, max_elements_per_row, |j| {
-            if arr.is_null(j) {
-                None
-            } else {
-                let v = arr.value(j);
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v.to_string())
-                }
-            }
-        })
+        }))
     } else {
-        build_rows(list, offsets, max_elements_per_row, |_| None)
+        values_any.downcast_ref::<StringViewArray>().map(|arr| {
+            build_rows(list, offsets, max_elements_per_row, |j| {
+                if arr.is_null(j) {
+                    None
+                } else {
+                    let v = arr.value(j);
+                    if v.is_empty() {
+                        None
+                    } else {
+                        Some(v.to_string())
+                    }
+                }
+            })
+        })
     }
 }
 
@@ -716,7 +716,12 @@ fn build_multi_vector_list_array(
                 inner_builder.append(true);
                 embed_ptr += 1;
             } else {
-                inner_builder.values().append_nulls(expected_dims);
+                // The inner Float32 field is declared non-nullable; the
+                // outer FixedSizeList slot encodes nullness. Append
+                // placeholder zeros and mark only the parent slot null.
+                for _ in 0..expected_dims {
+                    inner_builder.values().append_value(0.0);
+                }
                 inner_builder.append(false);
             }
         }
@@ -1173,6 +1178,21 @@ mod tests {
         let arr: ArrayRef = Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3]));
         let res = decompose_list_of_strings(&arr, 32);
         assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_decompose_list_of_non_strings_rejected() {
+        // A `List<Int32>` column must be rejected at the decomposition
+        // boundary, not silently treated as an all-null multi-vector
+        // column.
+        use arrow::array::{Int32Array, ListArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow_schema::Field;
+        let values = Int32Array::from(vec![Some(1), Some(2), Some(3)]);
+        let offsets = OffsetBuffer::<i32>::from_lengths([3usize]);
+        let field = Arc::new(Field::new("item", DataType::Int32, true));
+        let list: ArrayRef = Arc::new(ListArray::new(field, offsets, Arc::new(values), None));
+        assert!(decompose_list_of_strings(&list, 32).is_none());
     }
 
     #[test]

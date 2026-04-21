@@ -429,14 +429,29 @@ impl EmbeddingTable {
                 )
         );
 
+        // Multi-vector mode must have a doubly-nested embedding column
+        // (`List<FixedSizeList<...>>` or similar). Otherwise treating a
+        // scalar embedding as precomputed leads to UNNEST planning errors
+        // downstream.
+        let embedding_is_doubly_nested = matches!(
+            embedding_field.data_type(),
+            DataType::List(inner)
+            | DataType::LargeList(inner)
+            | DataType::FixedSizeList(inner, _)
+                if matches!(inner.data_type(), DataType::FixedSizeList(_, _))
+        );
+
+        if source_is_list_of_string && !embedding_is_doubly_nested {
+            tracing::warn!(
+                "Column '{column}' is list-typed (multi-vector) but the precomputed embedding column '{}' is not doubly-nested (`List<FixedSizeList<...>>`). Will recompute embeddings.",
+                embedding_col!(column).as_str()
+            );
+            return false;
+        }
+
         // Otherwise, if the embedding is doubly nested (chunked scalar),
         // require the offsets column too.
-        if !source_is_list_of_string
-            && let DataType::List(inner)
-            | DataType::LargeList(inner)
-            | DataType::FixedSizeList(inner, _) = embedding_field.data_type()
-            && let DataType::FixedSizeList(_, _) = inner.data_type()
-        {
+        if !source_is_list_of_string && embedding_is_doubly_nested {
             let Some((_, offsets_field)) =
                 base_schema.column_with_name(offset_col!(column).as_str())
             else {
@@ -1085,6 +1100,24 @@ mod tests {
                         "item",
                         DataType::FixedSizeList(field("item", DataType::Utf8), 2),
                     )),
+                ),
+            ])),
+            "c"
+        ));
+    }
+
+    #[test]
+    fn test_list_source_with_scalar_embedding_rejected() {
+        // Multi-vector source (`List<Utf8>`) paired with a singly-nested
+        // (scalar) embedding column is a shape mismatch: the runtime
+        // cannot UNNEST stored vectors per-element from a
+        // `FixedSizeList<Float32>` alone.
+        assert!(!EmbeddingTable::base_table_has_embedding_column(
+            &Arc::new(Schema::new(vec![
+                field("c", DataType::List(field("item", DataType::Utf8))),
+                field(
+                    "c_embedding",
+                    DataType::FixedSizeList(field("item", DataType::Float32), 4),
                 ),
             ])),
             "c"
