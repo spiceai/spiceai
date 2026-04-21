@@ -100,7 +100,7 @@ jobs:
               },
               {
                 compute_cap: "90",
-                runner: runners,
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               }
