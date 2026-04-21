@@ -74,6 +74,12 @@ pub(crate) enum WriteMode {
     /// Writes go only to the local accelerator (not replicated to the source).
     /// Used when `on_conflict` is configured or for internal tables.
     AcceleratorOnly,
+    /// Writes go to the local accelerator first, returning immediately to the caller.
+    /// The write is then asynchronously forwarded to the federated source. Faster response
+    /// times, but the source may lag behind the accelerator briefly.
+    WriteBack {
+        federated: Arc<FederatedTable>,
+    },
     /// Writes go simultaneously to both the federated source and the local Cayenne
     /// accelerator using staged append/commit/rollback semantics.
     WriteThrough {

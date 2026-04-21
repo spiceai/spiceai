@@ -138,7 +138,7 @@ oracle = ["connector-oracle", "runtime/oracle"]
 pingora = ["runtime/pingora"]
 postgres = ["connector-postgres", "runtime/postgres"]
 postgres-accel = ["runtime/postgres-accel"]
-postgres-write = ["runtime/postgres-write"]
+
 release = []
 scylladb = ["connector-scylladb", "runtime/scylladb"]
 sftp = ["connector-sftp", "runtime/sftp"]

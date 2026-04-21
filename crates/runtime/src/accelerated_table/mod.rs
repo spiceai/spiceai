@@ -35,9 +35,11 @@ use data_components::cdc::ChangesStream;
 use datafusion::catalog::Session;
 use datafusion::common::Constraints;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::execution::TaskContext;
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use datafusion::{
     datasource::{TableProvider, TableType},
@@ -326,6 +328,7 @@ pub struct Builder {
     disable_federation: bool,
     write_to_accelerator_only: bool,
     write_through: bool,
+    write_back: bool,
     refresh_semaphore: Option<Arc<Semaphore>>,
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
@@ -375,6 +378,7 @@ impl Builder {
             disable_federation: false,
             write_to_accelerator_only: false,
             write_through: false,
+            write_back: false,
             initial_load_complete: false,
             refresh_semaphore: None,
             snapshot_creation_config: None,
@@ -447,6 +451,13 @@ impl Builder {
     /// and the local Cayenne accelerator using staged append/commit/rollback semantics.
     pub fn write_through(&mut self) -> &mut Self {
         self.write_through = true;
+        self
+    }
+
+    /// Enable write-back mode: writes go to the local accelerator first (fast path),
+    /// then asynchronously forwarded to the federated source.
+    pub fn write_back(&mut self) -> &mut Self {
+        self.write_back = true;
         self
     }
 
@@ -956,6 +967,10 @@ impl Builder {
 
         let write_mode = if self.write_through {
             WriteMode::resolve_write_through(&self.accelerator, &self.federated)?
+        } else if self.write_back {
+            WriteMode::WriteBack {
+                federated: Arc::clone(&self.federated),
+            }
         } else if self.write_to_accelerator_only {
             WriteMode::AcceleratorOnly
         } else {
@@ -1392,6 +1407,44 @@ impl TableProvider for AcceleratedTable {
                 // mechanism will pick up the new data on its next cycle.
                 let federated_table = self.federated.table_provider().await;
                 federated_table.insert_into(state, input, overwrite).await
+            }
+            WriteMode::WriteBack { federated } => {
+                // Write to the local accelerator first (fast path), then
+                // asynchronously forward the write to the federated source.
+                let accelerated_insert_plan = self
+                    .accelerator
+                    .insert_into(state, Arc::clone(&input), overwrite)
+                    .await?;
+                self.refresher().set_initial_load_completed(true);
+
+                let federated = Arc::clone(federated);
+                tokio::spawn(async move {
+                    let federated_provider = federated.table_provider().await;
+                    let ctx = SessionContext::new();
+                    let state = ctx.state();
+                    match federated_provider
+                        .insert_into(&state, input, overwrite)
+                        .await
+                    {
+                        Ok(plan) => {
+                            let task_ctx = Arc::new(TaskContext::default());
+                            if let Err(e) =
+                                datafusion::physical_plan::collect(plan, task_ctx).await
+                            {
+                                tracing::error!(
+                                    "Write-back: failed to persist write to federated source: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Write-back: failed to create insert plan for federated source: {e}"
+                            );
+                        }
+                    }
+                });
+
+                Ok(accelerated_insert_plan)
             }
             WriteMode::WriteThrough {
                 cayenne_target,

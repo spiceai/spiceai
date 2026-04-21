@@ -1856,6 +1856,14 @@ impl DataFusion {
             accelerated_table_builder.write_to_accelerator_only();
         }
 
+        // Configure write caching mode for read-write accelerated datasets.
+        if dataset.access().allows_write()
+            && acceleration_settings.write_mode
+                == spicepod::acceleration::WriteMode::WriteBack
+        {
+            accelerated_table_builder.write_back();
+        }
+
         accelerated_table_builder.bootstrap_status(bootstrap_status);
 
         // Check if this is an S3 Express One Zone acceleration (Cayenne with S3 Express config)

@@ -923,9 +923,17 @@ impl Runtime {
 
         // Allow ReadWrite access when:
         // 1. Replication is enabled (changes are synced back to source), OR
-        // 2. on_conflict is configured (accelerator supports local writes via upsert/drop)
+        // 2. on_conflict is configured (accelerator supports local writes via upsert/drop), OR
+        // 3. refresh_mode is `changes` (CDC/WAL stream replicates writes back to the accelerator)
         let has_on_conflict = !acceleration_settings.on_conflict.is_empty();
-        if ds.access() == AccessMode::ReadWrite && !replicate && !has_on_conflict {
+        let has_changes_refresh = acceleration_settings
+            .refresh_mode
+            .is_some_and(|mode| matches!(mode, RefreshMode::Changes));
+        if ds.access() == AccessMode::ReadWrite
+            && !replicate
+            && !has_on_conflict
+            && !has_changes_refresh
+        {
             AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
         }
 

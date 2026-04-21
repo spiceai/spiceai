@@ -35,6 +35,25 @@ pub enum RefreshMode {
     Caching,
 }
 
+/// Controls the write behavior for accelerated read-write datasets.
+///
+/// - `write_through` (default): Writes go to the federated source (e.g. Postgres)
+///   synchronously. The user receives confirmation after a full ACID commit to the
+///   source. The local accelerator is updated via the normal refresh mechanism
+///   (e.g. WAL replication with `refresh_mode: changes`).
+///
+/// - `write_back`: Writes go to the local accelerator first, returning immediately
+///   to the user. The write is then asynchronously forwarded to the federated source.
+///   Faster response times, but the source may lag behind the accelerator briefly.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WriteMode {
+    #[default]
+    WriteThrough,
+    WriteBack,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]
@@ -304,6 +323,11 @@ pub struct Acceleration {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub on_conflict: HashMap<String, OnConflictBehavior>,
 
+    /// Controls write behavior for read-write accelerated datasets.
+    /// Only applies when `access: read_write` and the dataset is accelerated.
+    #[serde(default, skip_serializing_if = "is_default_write_mode")]
+    pub write_mode: WriteMode,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
 
@@ -365,6 +389,10 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
+fn is_default_write_mode(mode: &WriteMode) -> bool {
+    *mode == WriteMode::WriteThrough
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -397,6 +425,7 @@ impl Default for Acceleration {
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
+            write_mode: WriteMode::default(),
             metrics: None,
             partition_by: vec![],
             snapshots: SnapshotBehavior::Disabled,
