@@ -1100,11 +1100,9 @@ fn alias_value_to_match(
 
 #[cfg(test)]
 mod tests {
-    use super::{VectorSearchTableFunc, closest_column};
+    use super::{VectorSearchTableFunc, VectorSearchTableFuncArgs, closest_column};
     use crate::embeddings::udtf::VectorSearchUDTFProvider;
     use crate::model::EmbeddingModelStore;
-
-    use super::{VectorSearchTableFunc, VectorSearchTableFuncArgs};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::catalog::TableProvider;
     use datafusion::datasource::MemTable;
@@ -1210,6 +1208,7 @@ mod tests {
                 column: None,
                 limit: Some(5),
                 include_score: Some(true),
+                distance_metric: None,
             },
             underlying,
             embedded_columns: HashMap::new(),
