@@ -95,16 +95,23 @@ jobs:
 
       - name: Wait for runtime readiness
         working-directory: ${{ env.APP_DIR }}
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           set -euo pipefail
 
-          for i in $(seq 1 120); do
+          for i in $(seq 1 60); do
             if curl -sf http://localhost:8090/v1/ready | grep -q '^ready$'; then
               echo "Spice runtime is ready"
               exit 0
             fi
-            sleep 2
+
+            if [ $((i % 3)) -eq 0 ] && [ -f spiced.log ]; then
+              echo "===== spiced.log after $((i * 10)) seconds ====="
+              cat spiced.log
+              echo "===== end spiced.log ====="
+            fi
+
+            sleep 10
           done
 
           echo "Runtime did not become ready in time"
@@ -151,7 +158,7 @@ jobs:
             exit 1
           fi
 
-      - name: Stop runtime and print logs
+      - name: Stop runtime
         if: always()
         working-directory: ${{ env.APP_DIR }}
         run: |
@@ -161,6 +168,12 @@ jobs:
             pkill -x spiced || true
           fi
 
+      - name: Print final spiced logs
+        if: always()
+        working-directory: ${{ env.APP_DIR }}
+        run: |
           if [ -f spiced.log ]; then
+            echo "===== final spiced.log ====="
             cat spiced.log
+            echo "===== end final spiced.log ====="
           fi
