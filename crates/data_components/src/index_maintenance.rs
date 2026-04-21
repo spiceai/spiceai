@@ -63,16 +63,6 @@ pub async fn perform_index_maintenance(
         return Ok(true);
     }
 
-    // Handle DeletionTableProviderAdapter wrapping an IndexedMemTable
-    if let Some(adapter) = any.downcast_ref::<crate::delete::DeletionTableProviderAdapter>() {
-        // Try to get the inner provider and perform maintenance on it
-        let inner_any = adapter.source().as_any();
-        if let Some(provider) = inner_any.downcast_ref::<crate::arrow::IndexedMemTable>() {
-            provider.perform_maintenance().await?;
-            return Ok(true);
-        }
-    }
-
     // Add additional concrete types here as they implement IndexMaintenanceProvider
     // if let Some(provider) = any.downcast_ref::<SomeOtherType>() {
     //     provider.perform_maintenance().await?;
