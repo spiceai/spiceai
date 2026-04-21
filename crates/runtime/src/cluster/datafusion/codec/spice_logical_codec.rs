@@ -117,6 +117,7 @@ impl SpiceLogicalCodec {
                 );
                 let exprs = VectorSearchTableFunc::to_expr(&VectorSearchTableFuncArgs {
                     tbl: SqlTableReference::parse_str(&vector_args.table),
+                    queries: vec![vector_args.query.clone()],
                     query: vector_args.query,
                     column: vector_args.column,
                     limit: vector_args.limit.map(Self::limit_from_u64).transpose()?,
@@ -170,6 +171,7 @@ impl SpiceLogicalCodec {
                     let vector_exprs =
                         VectorSearchTableFunc::to_expr(&VectorSearchTableFuncArgs {
                             tbl: SqlTableReference::parse_str(&args.table),
+                            queries: vec![args.query.clone()],
                             query: args.query.clone(),
                             column: args.column.clone(),
                             limit: args.limit.map(Self::limit_from_u64).transpose()?,

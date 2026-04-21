@@ -138,6 +138,8 @@ pub(crate) async fn prepare_view(
                             primary_keys: emb.row_ids.clone(),
                             chunking: emb.chunking.clone(),
                             vector_size: emb.vector_size,
+                            aggregation: emb.aggregation,
+                            max_elements_per_row: emb.max_elements_per_row,
                         })
                     })
                     .collect(),

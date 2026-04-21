@@ -1208,6 +1208,7 @@ mod tests {
                 vector_size: 64,
                 in_base_table: true,
                 chunker: None,
+                input_mode: crate::embeddings::table::EmbeddingInputMode::Scalar,
             },
         );
 

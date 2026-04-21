@@ -74,6 +74,7 @@ alloc-system = []
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 clickhouse = ["connector-clickhouse", "runtime/clickhouse"]
+cosmosdb = ["runtime/cosmosdb"]
 cuda = ["runtime/cuda"]
 databricks = ["connector-databricks", "runtime/databricks"]
 debezium = ["runtime/debezium"]
@@ -88,6 +89,7 @@ default = [
     "databricks",
     "dremio",
     "clickhouse",
+    "cosmosdb",
     "sharepoint",
     "snapshots",
     "snowflake",
