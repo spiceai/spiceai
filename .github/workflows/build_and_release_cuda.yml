@@ -72,34 +72,37 @@ jobs:
         id: setup-matrix
         with:
           script: |
+            const isTaggedRelease = context.ref.startsWith('refs/tags/v');
+            const runner = isTaggedRelease ? "ubuntu-24.04" : "spiceai-large-runners";
+
             const matrix = [
               {
                 compute_cap: "80",
-                runner: "spiceai-dev-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "86",
-                runner: "spiceai-dev-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "87",
-                runner: "spiceai-dev-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "89",
-                runner: "spiceai-dev-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "90",
-                runner: "spiceai-dev-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               }
