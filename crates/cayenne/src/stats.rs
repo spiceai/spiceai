@@ -162,7 +162,19 @@ pub(crate) fn column_stats_to_stats_set(cs: &ColumnStatistics) -> StatsSet {
     }
 
     if let Some(count) = cs.null_count.get_value() {
-        let vortex_sv = vortex::scalar::ScalarValue::from(*count as u64);
+        // `usize -> u64` is lossless on all currently supported targets
+        // (cayenne requires \u2265 64-bit pointers per project policy), but use
+        // `try_from` so that a future >64-bit pointer width either succeeds
+        // exactly or skips persisting the stat rather than silently
+        // truncating to a wrong value.
+        let Ok(count_u64) = u64::try_from(*count) else {
+            tracing::warn!(
+                "column_stats_to_stats_set: null_count {} exceeds u64::MAX; skipping stat",
+                count,
+            );
+            return stats;
+        };
+        let vortex_sv = vortex::scalar::ScalarValue::from(count_u64);
         if cs.null_count.is_exact().is_some() {
             stats.set(Stat::NullCount, VortexPrecision::Exact(vortex_sv));
         } else {
