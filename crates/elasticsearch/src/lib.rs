@@ -224,6 +224,67 @@ impl Client {
         resp.json().await.context(JsonParseSnafu)
     }
 
+    // ── Index Management ───────────────────────────────────────────────
+
+    /// Check whether an index exists via `HEAD /<index>`.
+    pub async fn index_exists(&self, index: &str) -> Result<bool> {
+        let url = format!("{}/{}", self.base_url, index);
+        let resp = self
+            .auth(self.http.head(&url))
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(true);
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .replace(['\n', '\r'], " ");
+        Err(Error::ElasticsearchError {
+            message: format!("HTTP {status}: {}", body.trim()),
+        })
+    }
+
+    /// Create an index with the provided mapping/settings body via `PUT /<index>`.
+    pub async fn create_index(
+        &self,
+        index: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}/{}", self.base_url, index);
+        let resp = self
+            .auth(self.http.put(&url))
+            .json(body)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        let resp = check_status(resp).await?;
+        resp.json().await.context(JsonParseSnafu)
+    }
+
+    /// Update the mapping of an existing index via `PUT /<index>/_mapping`.
+    pub async fn put_mapping(
+        &self,
+        index: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}/{}/_mapping", self.base_url, index);
+        let resp = self
+            .auth(self.http.put(&url))
+            .json(body)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        let resp = check_status(resp).await?;
+        resp.json().await.context(JsonParseSnafu)
+    }
+
     // ── Document CRUD ──────────────────────────────────────────────────
 
     /// Index (upsert) a single document.
@@ -328,6 +389,17 @@ pub trait Elasticsearch: std::fmt::Debug + Send + Sync {
     async fn get_mapping(&self, index: &str) -> Result<MappingResponse>;
     async fn search(&self, index: &str, body: &SearchRequest) -> Result<SearchResponse>;
     async fn search_raw(&self, index: &str, body: &serde_json::Value) -> Result<SearchResponse>;
+    async fn index_exists(&self, index: &str) -> Result<bool>;
+    async fn create_index(
+        &self,
+        index: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value>;
+    async fn put_mapping(
+        &self,
+        index: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value>;
     async fn index_document(
         &self,
         index: &str,
@@ -353,6 +425,26 @@ impl Elasticsearch for Client {
 
     async fn search_raw(&self, index: &str, body: &serde_json::Value) -> Result<SearchResponse> {
         self.search_raw(index, body).await
+    }
+
+    async fn index_exists(&self, index: &str) -> Result<bool> {
+        self.index_exists(index).await
+    }
+
+    async fn create_index(
+        &self,
+        index: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.create_index(index, body).await
+    }
+
+    async fn put_mapping(
+        &self,
+        index: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.put_mapping(index, body).await
     }
 
     async fn index_document(

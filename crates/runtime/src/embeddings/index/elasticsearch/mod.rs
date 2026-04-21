@@ -210,6 +210,19 @@ pub async fn try_from_table(
         inner_schema.metadata().clone(),
     ));
 
+    // Ensure the Elasticsearch index exists with the correct dense_vector mapping
+    // for our vector field. This makes the ES vector engine "bring-your-own" friendly:
+    // if the user has already created and populated the index, we leave it alone;
+    // otherwise we create it so writes during refresh succeed.
+    ensure_index_with_mapping(
+        client.as_ref(),
+        &es_index,
+        &vector_field,
+        dims,
+        &text_fields,
+    )
+    .await?;
+
     Ok(ElasticsearchIndex {
         client,
         es_index,
@@ -221,6 +234,68 @@ pub async fn try_from_table(
         dims,
         source_schema,
     })
+}
+
+/// Create the ES index with a `dense_vector` mapping for `vector_field` if the index
+/// does not already exist. If the index exists, add/update the mapping so the vector
+/// field is searchable via kNN. This is idempotent.
+async fn ensure_index_with_mapping(
+    client: &dyn Elasticsearch,
+    es_index: &str,
+    vector_field: &str,
+    dims: i32,
+    text_fields: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        vector_field.to_string(),
+        serde_json::json!({
+            "type": "dense_vector",
+            "dims": dims,
+            "index": true,
+            "similarity": "cosine",
+        }),
+    );
+    for t in text_fields {
+        // Skip the vector field if a text column happens to share the name.
+        if t == vector_field {
+            continue;
+        }
+        properties.insert(
+            t.clone(),
+            serde_json::json!({
+                "type": "text",
+                "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } },
+            }),
+        );
+    }
+
+    let exists = client.index_exists(es_index).await.map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) },
+    )?;
+
+    if exists {
+        let body = serde_json::json!({ "properties": properties });
+        if let Err(e) = client.put_mapping(es_index, &body).await {
+            // If the field already exists with an incompatible mapping, ES returns 400.
+            // Surface the error but don't panic — a user may have pre-created the index
+            // with a specific mapping they want preserved; log and proceed.
+            tracing::warn!(
+                "Elasticsearch index '{es_index}' exists but mapping update failed (continuing; \
+                existing mapping will be used): {e}"
+            );
+        }
+        return Ok(());
+    }
+
+    let body = serde_json::json!({ "mappings": { "properties": properties } });
+    client.create_index(es_index, &body).await.map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) },
+    )?;
+    tracing::info!(
+        "Created Elasticsearch index '{es_index}' with dense_vector field '{vector_field}' (dims={dims})."
+    );
+    Ok(())
 }
 
 /// Normalize an Arrow [`DataType`] to match what the Elasticsearch HTTP client produces.

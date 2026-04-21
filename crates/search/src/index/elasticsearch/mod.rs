@@ -20,6 +20,8 @@ limitations under the License.
 //! with the Spice search pipeline, enabling hybrid search via `vector_search`,
 //! `text_search`, and `rrf` UDTFs.
 
+mod write;
+
 use std::any::Any;
 use std::sync::Arc;
 
@@ -32,6 +34,7 @@ use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion_expr::LogicalPlanBuilder;
 use elasticsearch::Elasticsearch;
+use futures::future::try_join_all;
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
 
@@ -107,10 +110,9 @@ impl SearchIndex for ElasticsearchIndex {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        // Elasticsearch indexes are typically populated by the source system;
-        // for now, writes from the Spice pipeline are a pass-through.
-        // A full implementation would bulk-index documents here.
-        Ok(record)
+        write::write(self, record)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
     }
 
     fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
@@ -228,7 +230,26 @@ impl Index for ElasticsearchIndex {
     fn required_columns(&self) -> Vec<String> {
         let mut cols: Vec<_> = self.primary_key.iter().map(|f| f.name().clone()).collect();
         cols.push(self.embedded_column.clone());
+        for t in &self.text_fields {
+            if !cols.contains(t) {
+                cols.push(t.clone());
+            }
+        }
         cols
+    }
+
+    async fn compute_index(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+        let futs = batches
+            .into_iter()
+            .map(|rb| async move {
+                write::write(self, rb)
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))
+            });
+        try_join_all(futs).await
     }
 }
 
