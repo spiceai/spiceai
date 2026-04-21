@@ -47,7 +47,7 @@ limitations under the License.
 //! - `array_wildcard` (`Bool`, default `false`) — when `true`, arrays collapse
 //!   to a single wildcard segment (`a[*]` for dot paths, `/a/[*]` for
 //!   json-pointer) instead of per-index (`a[0]`, `a[1]`, …). Matches
-//!   JSONPath storage conventions.
+//!   `JSONPath` storage conventions.
 //!
 //! Telemetry: OpenTelemetry counters `flatten_json_invocations_total`,
 //! `flatten_json_rows_emitted_total`, and
@@ -184,7 +184,7 @@ pub struct FlattenOptions {
     pub path_style: PathStyle,
     pub include_internal: bool,
     /// When `true`, arrays collapse to a single wildcard segment instead of
-    /// per-index paths. Matches JSONPath storage conventions.
+    /// per-index paths. Matches `JSONPath` storage conventions.
     pub array_wildcard: bool,
 }
 
