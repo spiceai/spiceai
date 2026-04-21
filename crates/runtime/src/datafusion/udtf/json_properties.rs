@@ -44,7 +44,8 @@ limitations under the License.
 //! - `properties` recursion (object → nested objects).
 //! - `items.properties` (arrays of objects; leaves appear at `array.field`).
 //! - `additionalProperties` maps (the map field emits `type = "map"`, children
-//!   appear at `map.child`).
+//!   appear at `map.child`; with `expand_maps = true` they appear at
+//!   `map.<map_wildcard>.child` — XDM-style).
 //! - `allOf`, `oneOf`, `anyOf` merge — fields from every branch are emitted;
 //!   duplicate names across branches are deduped.
 //! - Local `$ref` pointers (`#/$defs/*`, `#/definitions/*`, `#/properties/*`)
@@ -62,6 +63,13 @@ limitations under the License.
 //!   future scope tracked with the rest of this UDTF.
 //! - `include_internal` (`Bool`, default `false`) — include container rows.
 //! - `path_style` (`Utf8`, `"dot"` | `"json-pointer"`, default `"dot"`).
+//! - `expand_maps` (`Bool`, default `false`) — when `true`, recurse through
+//!   `additionalProperties` and emit child paths as `parent.<map_wildcard>.child`
+//!   (matches XDM / JSONPath storage conventions where a map's dynamic key is
+//!   represented by a single wildcard segment). Default `false` preserves the
+//!   original `parent.child` collapsing behavior.
+//! - `map_wildcard` (`Utf8`, default `"[*]"`) — the synthetic segment inserted
+//!   between a map and its value when `expand_maps = true`. Must be non-empty.
 //!
 //! Telemetry: the walker emits OpenTelemetry counters
 //! `flatten_json_properties_invocations_total`,
@@ -243,6 +251,16 @@ pub struct FlattenOptions {
     pub dialect: Dialect,
     pub include_internal: bool,
     pub path_style: PathStyle,
+    /// When `true`, walk into `additionalProperties` and emit the map's
+    /// dynamic key as a synthetic wildcard segment (see `map_wildcard`).
+    /// Defaults to `false` to preserve the original `parent.child`
+    /// collapsing behavior for maps.
+    pub expand_maps: bool,
+    /// The wildcard segment inserted between a map and its value when
+    /// `expand_maps` is `true`. XDM / JSONPath storage conventions use
+    /// `"[*]"`. Must be non-empty; callers that bypass the UDTF arg
+    /// parser are responsible for keeping it non-empty.
+    pub map_wildcard: String,
 }
 
 impl Default for FlattenOptions {
@@ -254,6 +272,8 @@ impl Default for FlattenOptions {
             dialect: Dialect::JsonSchema,
             include_internal: false,
             path_style: PathStyle::Dot,
+            expand_maps: false,
+            map_wildcard: "[*]".to_owned(),
         }
     }
 }
@@ -436,7 +456,22 @@ impl<'a> Walker<'a> {
                     .find_map(|s| s.get("additionalProperties"))
                     .filter(|v| v.is_object())
                 {
-                    self.walk_schema(ap, &path, depth + 1);
+                    if self.opts.expand_maps {
+                        // Treat the map's value schema as a synthetic
+                        // field named `map_wildcard` so array/object/
+                        // primitive handling reuses `handle_field`'s
+                        // recursion. Child paths then emit as
+                        // `parent.<map_wildcard>[...children]`, matching
+                        // XDM / JSONPath storage conventions (e.g.
+                        // `identityMap.[*].id` when the map's values
+                        // are arrays of objects).
+                        let wildcard = self.opts.map_wildcard.clone();
+                        self.handle_field(&wildcard, ap, &path, false, depth + 1);
+                    } else {
+                        // Legacy behavior: collapse map children onto
+                        // the map's own path (e.g. `labels.value`).
+                        self.walk_schema(ap, &path, depth + 1);
+                    }
                 }
             }
             _ => {}
@@ -803,10 +838,20 @@ fn apply_named_option(
                 ))
             })?;
         }
+        "expand_maps" => opts.expand_maps = parse_bool(name, value)?,
+        "map_wildcard" => {
+            let s = parse_utf8(name, value)?;
+            if s.is_empty() {
+                return Err(DataFusionError::Plan(
+                    "map_wildcard must be a non-empty string (e.g. '[*]').".to_owned(),
+                ));
+            }
+            opts.map_wildcard = s;
+        }
         other => {
             return Err(DataFusionError::Plan(format!(
                 "Unknown option '{other}'. Supported: max_depth, max_rows, max_bytes, dialect, \
-                 include_internal, path_style."
+                 include_internal, path_style, expand_maps, map_wildcard."
             )));
         }
     }
@@ -1198,6 +1243,127 @@ mod tests {
         assert_eq!(by["labels"].type_name, "map");
         // Child properties under additionalProperties are emitted at labels.value.
         assert_eq!(by["labels.value"].type_name, "string");
+    }
+
+    #[test]
+    fn expand_maps_inserts_wildcard_segment() {
+        // With `expand_maps = true`, the map's dynamic key is encoded as
+        // `[*]` between parent and value. Matches XDM / JSONPath storage
+        // conventions where any field with `additionalProperties` is a
+        // Map and the path includes a wildcard segment.
+        let json = r#"{
+            "properties": {
+                "labels": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}}
+                    }
+                }
+            }
+        }"#;
+        let opts = FlattenOptions {
+            expand_maps: true,
+            include_internal: true,
+            ..FlattenOptions::default()
+        };
+        let rows = flatten_with_options(json, &opts);
+        let by = by_path(&rows);
+        assert_eq!(by["labels"].type_name, "map");
+        assert_eq!(by["labels.[*].value"].type_name, "string");
+        // Old collapsed path must NOT be emitted when expansion is on.
+        assert!(!by.contains_key("labels.value"));
+    }
+
+    #[test]
+    fn expand_maps_xdm_identity_map() {
+        // The real-world XDM `identityMap` shape: map whose values are
+        // arrays of objects. Expected output paths:
+        //   identityMap.[*].authenticatedState
+        //   identityMap.[*].id
+        //   identityMap.[*].primary
+        //
+        // Arrays already collapse `items.properties.*` onto the parent
+        // path, so a map-of-array-of-object yields exactly one `[*]`
+        // segment between the map name and the inner leaves.
+        let json = r#"{
+            "$id": "https://ns.adobe.com/cjmstage/schemas/identityMapExample",
+            "type": "object",
+            "properties": {
+                "identityMap": {
+                    "type": "object",
+                    "meta:xdmType": "map",
+                    "additionalProperties": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "authenticatedState": {
+                                    "type": "string",
+                                    "enum": ["ambiguous", "authenticated", "loggedOut"]
+                                },
+                                "id":      {"type": "string"},
+                                "primary": {"type": "boolean"}
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let opts = FlattenOptions {
+            expand_maps: true,
+            ..FlattenOptions::default()
+        };
+        let rows = flatten_with_options(json, &opts);
+        let by = by_path(&rows);
+        assert_eq!(by["identityMap.[*].authenticatedState"].type_name, "string");
+        assert_eq!(by["identityMap.[*].id"].type_name, "string");
+        assert_eq!(by["identityMap.[*].primary"].type_name, "boolean");
+        // Sanity-check that enum/format annotations survive the
+        // wildcard detour.
+        assert_eq!(
+            by["identityMap.[*].authenticatedState"]
+                .enum_values
+                .as_ref()
+                .map(Vec::len),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn expand_maps_custom_wildcard_segment() {
+        let json = r#"{
+            "properties": {
+                "labels": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"}
+                }
+            }
+        }"#;
+        let opts = FlattenOptions {
+            expand_maps: true,
+            include_internal: true,
+            map_wildcard: "*".to_owned(),
+            ..FlattenOptions::default()
+        };
+        let rows = flatten_with_options(json, &opts);
+        let by = by_path(&rows);
+        // additionalProperties here is a primitive schema with no
+        // sub-properties, so the only child row is the primitive value
+        // itself \u2014 emitted via the leaf fallback in `handle_field`.
+        assert!(by.contains_key("labels"));
+        // With `expand_maps` + a primitive value schema, the wildcard
+        // child path should still be reachable via the json-pointer
+        // path style too.
+        let opts_jp = FlattenOptions {
+            path_style: PathStyle::JsonPointer,
+            expand_maps: true,
+            include_internal: true,
+            map_wildcard: "[*]".to_owned(),
+            ..FlattenOptions::default()
+        };
+        let rows_jp = flatten_with_options(json, &opts_jp);
+        assert!(rows_jp.iter().any(|r| r.path == "/labels"));
     }
 
     #[test]
