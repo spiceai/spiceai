@@ -306,9 +306,8 @@ mod tests {
         };
         let set = column_stats_to_stats_set(&cs);
         // Pre-serialize sanity: StatsSet has Utf8 min/max.
-        let min_pre = set.get(Stat::Min).expect("min present in StatsSet");
-        let max_pre = set.get(Stat::Max).expect("max present in StatsSet");
-        println!("pre min={min_pre:?} max={max_pre:?}");
+        assert!(set.get(Stat::Min).is_some(), "min present in StatsSet");
+        assert!(set.get(Stat::Max).is_some(), "max present in StatsSet");
 
         let file_stats = build_file_statistics(vec![set], &schema);
         let bytes = serialize_file_statistics(&file_stats).expect("serialize ok");
@@ -316,7 +315,6 @@ mod tests {
 
         let df = file_statistics_to_df(&rt, 3);
         let col = &df.column_statistics[0];
-        println!("df col: {col:?}");
         assert_eq!(col.null_count, DfPrecision::Exact(0));
         assert_eq!(
             col.min_value,
