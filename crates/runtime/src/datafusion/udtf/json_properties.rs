@@ -65,7 +65,7 @@ limitations under the License.
 //! - `path_style` (`Utf8`, `"dot"` | `"json-pointer"`, default `"dot"`).
 //! - `expand_maps` (`Bool`, default `false`) — when `true`, recurse through
 //!   `additionalProperties` and emit child paths as `parent.<map_wildcard>.child`
-//!   (matches JSONPath storage conventions where a map's dynamic key is
+//!   (matches `JSONPath` storage conventions where a map's dynamic key is
 //!   represented by a single wildcard segment). Default `false` preserves the
 //!   original `parent.child` collapsing behavior.
 //! - `map_wildcard` (`Utf8`, default `"[*]"`) — the synthetic segment inserted
@@ -257,7 +257,7 @@ pub struct FlattenOptions {
     /// collapsing behavior for maps.
     pub expand_maps: bool,
     /// The wildcard segment inserted between a map and its value when
-    /// `expand_maps` is `true`. JSONPath storage conventions use
+    /// `expand_maps` is `true`. `JSONPath` storage conventions use
     /// `"[*]"`. Must be non-empty; callers that bypass the UDTF arg
     /// parser are responsible for keeping it non-empty.
     pub map_wildcard: String,
