@@ -150,6 +150,8 @@ macro_rules! register_data_connector {
 pub mod abfs;
 #[cfg(feature = "adbc")]
 pub mod adbc;
+#[cfg(feature = "cosmosdb")]
+pub mod cosmosdb;
 #[cfg(feature = "debezium")]
 pub mod debezium;
 #[cfg(feature = "dynamodb")]
@@ -565,6 +567,27 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         _dataset: &Dataset,
     ) -> Option<DataConnectorResult<Arc<dyn TableProvider>>> {
         None
+    }
+
+    /// Pre-register any object stores this connector needs in order to execute
+    /// scans for `dataset` against the supplied `runtime_env`.
+    ///
+    /// Called on cluster executor startup so that physical plans decoded from
+    /// the scheduler can resolve their object stores via
+    /// `runtime_env().object_store(url)` even when the per-scan
+    /// `parquet_file_reader_factory` (or equivalent) is dropped during proto
+    /// round-trip.
+    ///
+    /// The default implementation is a no-op. Connectors backed by per-table
+    /// object stores (object-store-style connectors, Delta on S3/Azure/GCS,
+    /// Iceberg, etc.) should override this to register the appropriate stores
+    /// using the dataset's already secret-expanded params.
+    async fn register_object_stores(
+        &self,
+        _dataset: &Dataset,
+        _runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> DataConnectorResult<()> {
+        Ok(())
     }
 
     /// A hook that is called when an accelerated table is registered to the

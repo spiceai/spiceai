@@ -122,6 +122,8 @@ impl EmbeddingConnector {
                     chunking: e.chunking.clone(),
                     primary_keys: e.row_ids.clone(),
                     vector_size: e.vector_size,
+                    aggregation: e.aggregation,
+                    max_elements_per_row: e.max_elements_per_row,
                 })
             })
             .collect_vec();

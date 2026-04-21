@@ -30,7 +30,7 @@ env:
 
 jobs:
   check_commits:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       has_new_commits: ${{ steps.check_commits.outputs.has_new_commits }}
 
@@ -63,7 +63,7 @@ jobs:
     needs: check_commits
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       rel_version: ${{ steps.set_version.outputs.rel_version }}
       nightly_label: ${{ steps.set_version.outputs.nightly_label }}
@@ -91,7 +91,7 @@ jobs:
     needs: [check_commits, setup]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
       CARGO_TERM_COLOR: always
@@ -376,7 +376,7 @@ jobs:
     needs: [check_commits, setup, build-linux-x64]
     if: needs.check_commits.outputs.has_new_commits == 'true'
 
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
@@ -421,7 +421,7 @@ jobs:
     needs: [check_commits, setup, build-docker-amd64, build-docker-arm64]
     if: needs.check_commits.outputs.has_new_commits == 'true' && (github.event_name == 'schedule' || inputs.publish)
 
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6

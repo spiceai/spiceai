@@ -99,6 +99,7 @@ runtime:
       enabled: true
       endpoint: http://localhost:4317
       push_interval: 60s
+      temporality: delta # delta (default, required by Datadog), cumulative, or low_memory
       metrics:
         - runtime.query_duration_ms
         - runtime.memory_usage_bytes
@@ -322,7 +323,7 @@ datasets:
     time_format: timestamp # timestamp, timestamptz, unix_seconds, unix_millis, ISO8601
     time_partition_column: partition_date
     time_partition_format: ISO8601
-    ready_state: on_load # on_load, on_registration
+    ready_state: on_load # on_load, on_registration, on_schema_resolved
     check_availability: auto # auto, disabled
     unsupported_type_action: warn # error, warn, ignore, string
     replication:

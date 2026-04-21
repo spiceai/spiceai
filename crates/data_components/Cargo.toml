@@ -25,6 +25,11 @@ aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-dynamodbstreams = { workspace = true, optional = true }
 aws-smithy-async = { workspace = true, optional = true }
+azure_core = { version = "0.31.0", optional = true }
+azure_data_cosmos = { version = "0.30.0", default-features = false, features = [
+    "hmac_rust",
+    "key_auth",
+], optional = true }
 base64.workspace = true
 bb8 = { workspace = true, optional = true }
 bb8-oracle = { version = "0.3", features = ["chrono"], optional = true }
@@ -33,6 +38,7 @@ bytes.workspace = true
 charset = { workspace = true, optional = true }
 chrono.workspace = true
 clickhouse-rs = { workspace = true, optional = true }
+dashmap = "6.1"
 dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
@@ -71,13 +77,17 @@ num_cpus = "1.16"
 object_store = { workspace = true }
 opendal.workspace = true
 oracle = { version = "0.6", optional = true }
+native-tls = { workspace = true, optional = true }
 percent-encoding.workspace = true
+pgwire-replication = { workspace = true, optional = true }
+postgres-native-tls = { workspace = true, optional = true }
 rand.workspace = true
 rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
 reqwest.workspace = true
 runtime-rate-control = { path = "../runtime-rate-control" }
 rusqlite = { workspace = true, optional = true }
+elasticsearch = { path = "../elasticsearch", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 s3_vectors_metadata_filter = { path = "../s3_vectors_metadata_filter", optional = true }
 scylla = { workspace = true, optional = true }
@@ -90,6 +100,7 @@ spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", re
     "tls",
 ], optional = true } # spiceai
 telemetry = { path = "../telemetry" }
+tempfile.workspace = true
 tiberius = { workspace = true, optional = true }
 token_provider = { path = "../token_provider" }
 tokio.workspace = true
@@ -115,6 +126,7 @@ rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 bench = [] # Feature for benchmarking that exposes internal functions
 adbc = ["datafusion-table-providers/adbc-federation"]
 clickhouse = ["dep:clickhouse-rs", "datafusion-table-providers/federation"]
+cosmosdb = ["dep:azure_core", "dep:azure_data_cosmos"]
 databricks = [
     "delta_lake",
     "spark_connect",
@@ -123,6 +135,7 @@ databricks = [
 debezium = ["dep:rdkafka"]
 default = []
 delta_lake = ["dep:delta_kernel"]
+elasticsearch = ["dep:elasticsearch"]
 duckdb = [
     "dep:duckdb",
     "db_connection_pool/duckdb",
@@ -150,6 +163,9 @@ odbc = ["datafusion-table-providers/federation", "db_connection_pool/odbc"]
 oracle = ["dep:oracle", "dep:bb8", "dep:bb8-oracle", "dep:bigdecimal"]
 postgres = [
     "dep:tokio-postgres",
+    "dep:pgwire-replication",
+    "dep:native-tls",
+    "dep:postgres-native-tls",
     "datafusion-table-providers/postgres",
     "datafusion-table-providers/postgres-federation",
 ]

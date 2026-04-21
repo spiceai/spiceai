@@ -80,7 +80,7 @@ jobs:
       # Cache Cargo dependencies
       - name: Cache Cargo registry
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -151,8 +151,8 @@ jobs:
           name: integration-test-archive
           path: ./integration.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; skip artifact zip compression.
-          compression-level: 0
+          # Archive is already zstd-compressed; use minimal artifact zip compression.
+          compression-level: 1
 
       - name: Upload retention OOM test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -161,8 +161,8 @@ jobs:
           name: integration-retention-oom-test-archive
           path: ./retention_oom.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; skip artifact zip compression.
-          compression-level: 0
+          # Archive is already zstd-compressed; use minimal artifact zip compression.
+          compression-level: 1
 
       - name: Upload AWS SDK test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -171,8 +171,8 @@ jobs:
           name: integration-aws-sdk-test-archive
           path: ./integration_aws_sdk.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; skip artifact zip compression.
-          compression-level: 0
+          # Archive is already zstd-compressed; use minimal artifact zip compression.
+          compression-level: 1
 
       - name: Upload AWS SDK credential bridge test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -181,8 +181,8 @@ jobs:
           name: integration-aws-sdk-credential-bridge-test-archive
           path: ./integration_aws_sdk_credential_bridge.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; skip artifact zip compression.
-          compression-level: 0
+          # Archive is already zstd-compressed; use minimal artifact zip compression.
+          compression-level: 1
 
       - name: Upload partition table test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -191,8 +191,8 @@ jobs:
           name: integration-partition-table-test-archive
           path: ./partition_table_test.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; skip artifact zip compression.
-          compression-level: 0
+          # Archive is already zstd-compressed; use minimal artifact zip compression.
+          compression-level: 1
 
       - name: Upload data components test archive
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -201,8 +201,8 @@ jobs:
           name: integration-data-components-test-archive
           path: ./data_components_hadoop.tar.zst
           retention-days: 3
-          # Archive is already zstd-compressed; skip artifact zip compression.
-          compression-level: 0
+          # Archive is already zstd-compressed; use minimal artifact zip compression.
+          compression-level: 1
 
   test:
     name: Integration Tests (part ${{ matrix.label }})

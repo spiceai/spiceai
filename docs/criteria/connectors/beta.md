@@ -11,6 +11,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 | ADBC                             | ➖           |                 |
 | Azure BlobFS                     | ➖           |                 |
 | Clickhouse                       | ➖           |                 |
+| Cosmos DB (NoSQL)                | ✅           | @lukekim        |
 | Databricks (mode: delta_lake)    | ✅           | @Sevenannn      |
 | Databricks (mode: spark_connect) | ✅           | @Sevenannn      |
 | Databricks (mode: sql_warehouse) | ➖           |                 |
@@ -24,6 +25,7 @@ All criteria must be met for the connector to be considered Beta, with exception
 | FlightSQL                        | ➖           |                 |
 | FTP/SFTP                         | ➖           |                 |
 | GCS                              | ➖           |                 |
+| Git                              | ✅           | @lukekim        |
 | GitHub                           | ✅           | @peasee         |
 | Glue                             | ➖           |                 |
 | GraphQL                          | ➖           |                 |
@@ -61,6 +63,7 @@ This table defines the required features and/or tests for each connector:
 | ADBC                             | ➖                    | ➖             | ➖                | ➖                       | ➖                  | ☑️                         |
 | Azure BlobFS                     | ✅ (1)                | ➖             | ➖                | ➖                       | ✅                  | ☑️                         |
 | Clickhouse                       | ✅ (100)              | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
+| Cosmos DB (NoSQL)                | ➖                    | ➖             | ➖                | ➖                       | ➖                  | ☑️                         |
 | Databricks (mode: delta_lake)    | ✅ (1)                | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
 | Databricks (mode: spark_connect) | ✅ (100)              | ➖             | ☑️                | ➖                       | ➖                  | ➖                         |
 | Databricks (mode: sql_warehouse) | ➖                    | ➖             | ☑️                | ➖                       | ✅                  | ➖                         |
@@ -73,6 +76,7 @@ This table defines the required features and/or tests for each connector:
 | File                             | ✅ (1)                | ➖             | ➖                | ➖                       | ✅                  | ☑️                         |
 | FTP/SFTP                         | ➖                    | ➖             | ➖                | ➖                       | ➖                  | ☑️                         |
 | GCS                              | ✅ (1)                | ➖             | ➖                | ➖                       | ✅                  | ☑️                         |
+| Git                              | ➖                    | ➖             | ☑️                | ➖                       | ➖                  | ☑️                         |
 | GitHub                           | ➖                    | ➖             | ➖                | ➖                       | ➖                  | ☑️                         |
 | Glue                             | ➖                    | ➖             | ☑️                | ➖                       | ✅                  | ✅                         |
 | GraphQL                          | ➖                    | ➖             | ➖                | ➖                       | ➖                  | ☑️                         |

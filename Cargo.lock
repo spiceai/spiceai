@@ -2195,10 +2195,12 @@ dependencies = [
  "azure_core_macros",
  "bytes",
  "futures",
+ "hmac 0.12.1",
  "pin-project",
  "rustc_version",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tracing",
  "typespec",
  "typespec_client_core",
@@ -2214,6 +2216,22 @@ dependencies = [
  "quote",
  "syn 2.0.114",
  "tracing",
+]
+
+[[package]]
+name = "azure_data_cosmos"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "196ab882f9a566826713e52ab6bd3a744c4942699f20970565194a81a268ce93"
+dependencies = [
+ "async-lock",
+ "async-trait",
+ "azure_core 0.31.0",
+ "futures",
+ "serde",
+ "serde_json",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -3470,6 +3488,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cayenne-flightsql"
+version = "2.0.0-unstable"
+dependencies = [
+ "cayenne",
+ "clap",
+ "data_components",
+ "datafusion",
+ "datafusion-flightsql",
+ "snafu",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "util",
+]
+
+[[package]]
 name = "cbc"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3986,6 +4021,7 @@ dependencies = [
  "token_provider",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -4035,6 +4071,22 @@ dependencies = [
  "paste",
  "runtime",
  "snafu",
+]
+
+[[package]]
+name = "connector-elasticsearch"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "data_components",
+ "datafusion",
+ "elasticsearch",
+ "linkme",
+ "paste",
+ "runtime",
+ "secrecy",
+ "snafu",
+ "tracing",
 ]
 
 [[package]]
@@ -4192,14 +4244,19 @@ dependencies = [
 name = "connector-postgres"
 version = "2.0.0-unstable"
 dependencies = [
+ "async-stream",
  "async-trait",
+ "data_components",
  "datafusion",
  "datafusion-table-providers",
- "linkme",
- "paste",
+ "fundu",
+ "futures",
+ "opentelemetry",
  "runtime",
  "secrecy",
  "snafu",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]
@@ -5217,6 +5274,8 @@ dependencies = [
  "aws-sdk-dynamodbstreams",
  "aws-smithy-async",
  "aws-smithy-types",
+ "azure_core 0.31.0",
+ "azure_data_cosmos",
  "base64 0.22.1",
  "bb8",
  "bb8-oracle",
@@ -5228,6 +5287,7 @@ dependencies = [
  "clickhouse-rs",
  "criterion 0.7.0",
  "ctor",
+ "dashmap",
  "dataformat-json",
  "datafusion",
  "datafusion-datasource",
@@ -5238,6 +5298,7 @@ dependencies = [
  "document_parse",
  "duckdb",
  "dynamodb-streams",
+ "elasticsearch",
  "flate2",
  "flight_client",
  "futures",
@@ -5259,12 +5320,15 @@ dependencies = [
  "logos",
  "mailparse",
  "mysql_async",
+ "native-tls",
  "num_cpus",
  "object_store",
  "opendal",
  "oracle",
  "parquet",
  "percent-encoding",
+ "pgwire-replication",
+ "postgres-native-tls",
  "rand 0.10.1",
  "rdkafka",
  "regex",
@@ -5281,6 +5345,7 @@ dependencies = [
  "snowflake-api",
  "spark-connect-rs",
  "telemetry",
+ "tempfile",
  "tiberius",
  "token_provider",
  "tokio",
@@ -6928,6 +6993,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "elasticsearch"
+version = "2.0.0-unstable"
+dependencies = [
+ "async-trait",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "elliptic-curve"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7450,7 +7529,7 @@ checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
 dependencies = [
  "cfg-if",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8181,7 +8260,7 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.1.3",
+ "windows-link 0.2.1",
  "windows-result 0.4.1",
 ]
 
@@ -13544,6 +13623,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgwire-replication"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb5dafc8338ae6dd3949b367c9afd1d4004300ae2dc84af5b883303e424822e7"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "hmac 0.12.1",
+ "rand 0.9.4",
+ "rustls 0.23.36",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tokio-util",
+ "tracing",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "phf"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13814,7 +13914,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3aa964c4e12e6328388b7059c93aac37b052be7962bbb70dd239b515532be4bf"
 dependencies = [
  "arrayvec",
- "hashbrown 0.5.0",
+ "hashbrown 0.16.1",
  "parking_lot 0.12.5",
  "rand 0.8.5",
 ]
@@ -14353,7 +14453,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -15857,6 +15957,7 @@ dependencies = [
  "document_parse",
  "duckdb",
  "dynamodb-streams",
+ "elasticsearch",
  "event_stream",
  "flight_client",
  "fundu",
@@ -15958,6 +16059,7 @@ dependencies = [
  "tiberius",
  "token_provider",
  "tokio",
+ "tokio-postgres",
  "tokio-rusqlite",
  "tokio-rustls 0.26.4",
  "tokio-stream",
@@ -16429,7 +16531,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -16983,6 +17085,7 @@ dependencies = [
  "datafusion-expr",
  "datafusion-functions-json",
  "datafusion-optimizer-rules",
+ "elasticsearch",
  "futures",
  "insta",
  "itertools 0.14.0",
@@ -17827,7 +17930,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.114",
@@ -18099,6 +18202,7 @@ dependencies = [
  "connector-delta-lake",
  "connector-dremio",
  "connector-duckdb",
+ "connector-elasticsearch",
  "connector-flightsql",
  "connector-ftp",
  "connector-graphql",
@@ -18434,7 +18538,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.52.0",
  "windows-sys 0.59.0",
 ]
 

@@ -27,7 +27,10 @@ limitations under the License.
 //! Unlike the `AcceleratedTable` struct, this struct does not implement the `TableProvider` trait itself.
 //! It only provides a way to get the underlying table provider and schema.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use arrow::datatypes::SchemaRef;
 use arrow_tools::schema::schema_difference;
@@ -120,8 +123,25 @@ enum DeferredState {
 pub struct DeferredTableProvider {
     state: RwLock<DeferredState>,
     table: OnceLock<Arc<dyn TableProvider>>,
+    /// True when the deferred task failed to produce a real provider (e.g. was
+    /// cancelled during shutdown or panicked) and [`FederatedTable::table_provider`]
+    /// returned an [`UnavailableTableProvider`] as a fallback. Readiness paths can
+    /// use [`FederatedTable::try_wait_table_provider`] to distinguish this case
+    /// from a successful schema resolution without downcasting to the private
+    /// fallback provider type.
+    resolved_unavailable: AtomicBool,
     schema: SchemaRef,
     dataset_name: String,
+}
+
+/// Indicates why [`FederatedTable::try_wait_table_provider`] could not return a
+/// successfully resolved federated [`TableProvider`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FederatedResolutionError {
+    /// The deferred task finished without producing a real provider (cancelled
+    /// during shutdown or panicked). Callers should treat this as "resolution
+    /// did not succeed" rather than a live schema-resolved state.
+    Unavailable,
 }
 
 impl DeferredTableProvider {
@@ -218,16 +238,43 @@ impl FederatedTable {
     }
 
     pub async fn table_provider(&self) -> Arc<dyn TableProvider> {
+        match self.try_wait_table_provider().await {
+            Ok(table_provider) | Err((FederatedResolutionError::Unavailable, table_provider)) => {
+                table_provider
+            }
+        }
+    }
+
+    /// Resolves the federated [`TableProvider`], distinguishing successful
+    /// resolution from the fallback case where the deferred task did not
+    /// produce a real provider.
+    ///
+    /// For [`FederatedTable::Immediate`] this always returns `Ok`. For
+    /// [`FederatedTable::Deferred`] it awaits the deferred task and returns
+    /// `Ok` only if a real [`TableProvider`] was produced; otherwise it
+    /// returns `Err((FederatedResolutionError::Unavailable, provider))`,
+    /// where `provider` is the fallback that errors on scan. The fallback
+    /// provider is still returned in the `Err` variant so callers that just
+    /// want a provider (e.g. query scan paths) can fall through to it.
+    pub async fn try_wait_table_provider(
+        &self,
+    ) -> Result<Arc<dyn TableProvider>, (FederatedResolutionError, Arc<dyn TableProvider>)> {
         let deferred_table_provider = match self {
-            Self::Immediate(table_provider) => return Arc::clone(table_provider),
+            Self::Immediate(table_provider) => return Ok(Arc::clone(table_provider)),
             Self::Deferred(deferred_table_provider) => deferred_table_provider,
         };
 
-        // If the table provider is not available immediately, see if we already have it from the deferred task.
-
-        // If the table provider is available now, return it.
+        // If the table provider is available now, return it (respecting any prior fallback).
         if let Some(table_provider) = deferred_table_provider.table.get() {
-            return Arc::clone(table_provider);
+            let provider = Arc::clone(table_provider);
+            return if deferred_table_provider
+                .resolved_unavailable
+                .load(Ordering::Acquire)
+            {
+                Err((FederatedResolutionError::Unavailable, provider))
+            } else {
+                Ok(provider)
+            };
         }
 
         // If the table provider is not available immediately, see if we already have it from the deferred task.
@@ -245,7 +292,7 @@ impl FederatedTable {
                         .table
                         .set(Arc::clone(&table_provider));
                     *deferred_state_guard = DeferredState::Done;
-                    table_provider
+                    Ok(table_provider)
                 } else {
                     // The deferred task was cancelled (e.g. during shutdown) or panicked
                     // without sending a provider. Return a provider that errors on scan
@@ -256,8 +303,11 @@ impl FederatedTable {
                             deferred_table_provider.dataset_name.clone(),
                         ));
                     let _ = deferred_table_provider.table.set(Arc::clone(&unavailable));
+                    deferred_table_provider
+                        .resolved_unavailable
+                        .store(true, Ordering::Release);
                     *deferred_state_guard = DeferredState::Done;
-                    unavailable
+                    Err((FederatedResolutionError::Unavailable, unavailable))
                 }
             }
             DeferredState::InProgress | DeferredState::Done => {
@@ -344,6 +394,7 @@ impl FederatedTable {
             state: RwLock::new(DeferredState::Waiting(rx)),
             schema,
             table: OnceLock::new(),
+            resolved_unavailable: AtomicBool::new(false),
             dataset_name: dataset_name_str,
         }
     }

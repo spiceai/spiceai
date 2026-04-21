@@ -145,6 +145,7 @@ runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
+elasticsearch = { path = "../elasticsearch", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
@@ -227,6 +228,7 @@ connector-mysql = { path = "../data-connectors/connector-mysql" }
 connector-oracle = { path = "../data-connectors/connector-oracle" }
 connector-postgres = { path = "../data-connectors/connector-postgres" }
 connector-scylladb = { path = "../data-connectors/connector-scylladb" }
+tokio-postgres = { workspace = true }
 connector-sftp = { path = "../data-connectors/connector-sftp" }
 connector-sharepoint = { path = "../data-connectors/connector-sharepoint" }
 connector-smb = { path = "../data-connectors/connector-smb" }
@@ -263,6 +265,7 @@ adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "dep:blake3", "dep:sha2", "d
 aws-secrets-manager = ["dep:aws-sdk-sts", "runtime-secrets/aws-secrets-manager"]
 bedrock = []
 clickhouse = ["db_connection_pool/clickhouse", "data_components/clickhouse"]
+cosmosdb = ["data_components/cosmosdb"]
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["kafka", "data_components/debezium"]
@@ -275,6 +278,11 @@ default = [
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []
+elasticsearch = [
+    "data_components/elasticsearch",
+    "dep:elasticsearch",
+    "search/elasticsearch",
+]
 duckdb = [
     "dep:duckdb",
     "db_connection_pool/duckdb",
@@ -366,3 +374,7 @@ vortex-datafusion.workspace = true
 [[bench]]
 harness = false
 name = "prepared_statement"
+
+[[bench]]
+harness = false
+name = "flatten_json_properties"

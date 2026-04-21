@@ -16,6 +16,7 @@ connector-databricks = { path = "../../crates/data-connectors/connector-databric
 connector-delta-lake = { path = "../../crates/data-connectors/connector-delta-lake", optional = true }
 connector-dremio = { path = "../../crates/data-connectors/connector-dremio", optional = true }
 connector-duckdb = { path = "../../crates/data-connectors/connector-duckdb", optional = true }
+connector-elasticsearch = { path = "../../crates/data-connectors/connector-elasticsearch", optional = true }
 connector-flightsql = { path = "../../crates/data-connectors/connector-flightsql", optional = true }
 connector-ftp = { path = "../../crates/data-connectors/connector-ftp", optional = true }
 connector-graphql = { path = "../../crates/data-connectors/connector-graphql" }
@@ -73,6 +74,7 @@ alloc-system = []
 anonymous_telemetry = ["telemetry/anonymous_telemetry"]
 aws-secrets-manager = ["runtime/aws-secrets-manager"]
 clickhouse = ["connector-clickhouse", "runtime/clickhouse"]
+cosmosdb = ["runtime/cosmosdb"]
 cuda = ["runtime/cuda"]
 databricks = ["connector-databricks", "runtime/databricks"]
 debezium = ["runtime/debezium"]
@@ -87,6 +89,7 @@ default = [
     "databricks",
     "dremio",
     "clickhouse",
+    "cosmosdb",
     "sharepoint",
     "snapshots",
     "snowflake",
@@ -113,6 +116,7 @@ default = [
 delta_lake = ["connector-delta-lake", "runtime/delta_lake"]
 dev = ["runtime/dev"]
 dremio = ["connector-dremio", "runtime/dremio"]
+elasticsearch = ["connector-elasticsearch", "runtime/elasticsearch"]
 duckdb = ["connector-duckdb", "runtime/duckdb"]
 dynamodb = ["runtime/dynamodb"]
 flightsql = ["connector-flightsql", "runtime/flightsql"]
