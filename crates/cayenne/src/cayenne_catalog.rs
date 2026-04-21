@@ -1571,7 +1571,7 @@ impl MetadataCatalog for CayenneCatalog {
                 source: Box::new(e),
             })?;
 
-        // 8. Delete inlined deletes
+        // 7. Delete inlined deletes
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "DELETE FROM cayenne_inlined_delete WHERE table_id = ?1",
@@ -1583,7 +1583,7 @@ impl MetadataCatalog for CayenneCatalog {
                 source: Box::new(e),
             })?;
 
-        // 9. Finally delete the table itself
+        // 8. Finally delete the table itself
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "DELETE FROM cayenne_table WHERE table_id = ?1",

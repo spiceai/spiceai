@@ -84,7 +84,7 @@ type DeletedRowKeysMap = HashMap<Box<[u8]>, i64>;
 /// Accumulates per-column statistics across multiple `RecordBatch`es during a write.
 ///
 /// Builds Vortex [`StatsSet`] objects per column (min, max, null count) and tracks
-/// the total row count. After the write completes, call [`to_file_statistics`] to
+/// the total row count. After the write completes, call [`to_file_statistics_blob`] to
 /// produce a serialized Vortex `FileStatistics` blob for metastore persistence.
 ///
 /// Thread-safe: guarded by `Mutex` when shared across stream tasks.
@@ -137,9 +137,14 @@ impl ColumnStatsAccumulator {
         };
 
         let num_rows = batch.num_rows();
-        self.row_count.fetch_add(
-            i64::try_from(num_rows).unwrap_or(i64::MAX),
+        // Use saturating addition at i64::MAX so overflow on extremely long-lived
+        // accumulators surfaces as a clamped row count rather than wrapping to
+        // a negative value that would get persisted as a bogus `num_rows`.
+        let delta = i64::try_from(num_rows).unwrap_or(i64::MAX);
+        let _ = self.row_count.fetch_update(
             std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| Some(current.saturating_add(delta)),
         );
 
         for (i, col) in batch.columns().iter().enumerate() {

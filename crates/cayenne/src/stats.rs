@@ -110,6 +110,15 @@ fn scalar_to_df(scalar: &Scalar) -> Option<ScalarValue> {
             let v: String = scalar.try_into().ok()?;
             Some(ScalarValue::Utf8(Some(v)))
         }
+        DType::Extension(_) => {
+            // Temporal types (Date/Time/Timestamp) are represented as Vortex
+            // extension types. Round-trip through Arrow so DataFusion
+            // `ScalarValue` gets the correct logical type (preserving time
+            // unit / time zone).
+            let datum: Arc<dyn arrow::array::Datum> = scalar.try_into().ok()?;
+            let (array, _is_scalar) = datum.get();
+            ScalarValue::try_from_array(array, 0).ok()
+        }
         _ => None,
     }
 }
@@ -207,16 +216,25 @@ pub(crate) fn stats_set_to_column_stats(stats: &StatsSet, dtype: &DType) -> Colu
 
 /// Convert a Vortex [`FileStatistics`] to DataFusion [`Statistics`].
 ///
-/// Maps per-column Vortex stats to DataFusion column statistics and computes
-/// the total row count from the per-column null counts and schema information.
+/// Maps per-column Vortex stats to DataFusion column statistics and uses the
+/// caller-provided `num_rows` as the total row count.
+///
+/// `num_rows` must be the exact total row count for the file represented by
+/// `file_stats`. Negative values (which can occur if an upstream writer failed
+/// to track row counts correctly) are reported as `Precision::Absent` rather
+/// than silently wrapped into a bogus `usize`.
 pub(crate) fn file_statistics_to_df(file_stats: &FileStatistics, num_rows: i64) -> Statistics {
     let column_statistics: Vec<ColumnStatistics> = file_stats
         .into_iter()
         .map(|(stats, dtype)| stats_set_to_column_stats(stats, dtype))
         .collect();
 
+    let num_rows = usize::try_from(num_rows)
+        .map(Precision::Exact)
+        .unwrap_or(Precision::Absent);
+
     Statistics {
-        num_rows: Precision::Exact(num_rows as usize),
+        num_rows,
         total_byte_size: Precision::Absent,
         column_statistics,
     }
