@@ -175,17 +175,13 @@ impl DataAccelerator for PostgresAccelerator {
         let postgres_writer = Arc::new(postgres_writer.clone());
 
         // Wrap with upsert deduplication if needed
-        let (write_provider, delete_provider) = upsert_dedup::wrap_with_upsert_dedup_if_needed(
+        let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
             postgres_writer,
             &cmd.options,
             cmd.constraints.clone(),
         );
 
-        let table_provider = Arc::new(PolyTableProvider::new(
-            write_provider,
-            delete_provider,
-            read_provider,
-        ));
+        let table_provider = Arc::new(PolyTableProvider::new(write_provider, read_provider));
 
         Ok(table_provider)
     }
