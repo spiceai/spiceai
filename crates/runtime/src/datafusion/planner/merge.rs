@@ -24,8 +24,7 @@ limitations under the License.
 //! WHEN MATCHED THEN UPDATE SET col1 = expr1, ...
 //! ```
 //!
-//! Both source and target must be Cayenne catalog tables. Single-node
-//! execution only (distributed mode returns an error). Target must not
+//! Both source and target must be Cayenne catalog tables. Target must not
 //! have `primary_key` or `on_conflict` configured.
 
 use std::sync::Arc;
@@ -39,17 +38,16 @@ use datafusion::sql::sqlparser::ast::{
     AssignmentTarget, BinaryOperator, Expr as SQLExpr, MergeAction, MergeClause, MergeClauseKind,
     Statement as SQLStatement, TableFactor,
 };
+use datafusion_dml::{DmlExtensionNode, DmlNodeOp};
 
-use super::logical_nodes::CayenneMergeNode;
 use super::{PlannerContext, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, is_cayenne_table};
 use crate::config::ClusterRole;
-use crate::datafusion::cayenne_ddl::logical_nodes::DistributedCayenneMergeNode;
 
-/// Plan a `MERGE INTO` statement for local Cayenne execution.
+/// Plan a `MERGE INTO` statement for Cayenne execution.
 ///
 /// Parses the AST, validates phase 1 constraints, normalizes the ON clause
-/// into bare `(target_col, source_col)` key pairs, and produces a
-/// `CayenneMergeNode` extension node.
+/// into bare `(target_col, source_col)` key pairs, builds typed `MergeParams`,
+/// and produces a generic `DmlExtensionNode`.
 pub(super) async fn plan_merge(
     statement: Statement,
     session: &SessionState,
@@ -81,7 +79,6 @@ pub(super) async fn plan_merge(
         ));
     }
 
-    // --- Extract target and source tables ---
     let (target_name, target_alias) = extract_table_ref(&table, "target")?;
     let target_ref = TableReference::parse_str(&target_name);
     let target_qualifier = target_alias
@@ -94,7 +91,6 @@ pub(super) async fn plan_merge(
         .clone()
         .unwrap_or_else(|| source_ref.table().to_string());
 
-    // --- Validate both are Cayenne tables ---
     if !is_cayenne_table(session, &target_ref) {
         return Err(DataFusionError::Plan(format!(
             "MERGE target '{target_name}' is not a Cayenne catalog table"
@@ -106,11 +102,8 @@ pub(super) async fn plan_merge(
         )));
     }
 
-    // --- Validate target has no primary_key / on_conflict ---
     validate_target_metadata(session, &target_ref, &target_name).await?;
 
-    // --- Parse ON clause into normalized (target_col, source_col) pairs ---
-    // Aliases are used here for disambiguation then discarded.
     let target_qualifiers: Vec<&str> = std::iter::once(target_ref.table())
         .chain(target_alias.as_deref())
         .collect();
@@ -125,44 +118,43 @@ pub(super) async fn plan_merge(
         ));
     }
 
-    // --- Validate exactly one WHEN MATCHED THEN UPDATE SET clause ---
     if clauses.len() != 1 {
         return Err(DataFusionError::Plan(format!(
             "MERGE currently supports exactly one WHEN clause, got {}",
             clauses.len()
         )));
     }
-    let assignments =
+    let assignment_sql =
         validate_and_extract_assignments(&clauses[0], target_ref.table(), target_alias.as_deref())?;
 
-    // Distributed (scheduler) mode: produce forwarding node with original SQL.
-    if matches!(ctx.cluster_role, Some(ClusterRole::Scheduler)) {
-        let node = DistributedCayenneMergeNode::try_new(
-            target_ref,
-            source_ref,
-            target_qualifier,
-            source_qualifier,
-            on_keys,
-            assignments,
-            original_sql.to_string(),
-        )?;
-        return Ok(LogicalPlan::Extension(Extension {
-            node: Arc::new(node),
-        }));
-    }
+    let mut merge_input = cayenne::ddl::build_local_merge_plan_input(
+        session,
+        SPICE_DEFAULT_CATALOG,
+        SPICE_DEFAULT_SCHEMA,
+        &target_ref,
+        &source_ref,
+        &target_qualifier,
+        &source_qualifier,
+        &on_keys,
+        &assignment_sql,
+    )
+    .await?;
+    merge_input.params.original_sql = matches!(ctx.cluster_role, Some(ClusterRole::Scheduler))
+        .then(|| original_sql.to_string());
 
-    // Local mode: produce local execution node.
-    let node = CayenneMergeNode::try_new(
-        target_ref,
-        source_ref,
-        target_qualifier,
-        source_qualifier,
-        on_keys,
-        assignments,
-    )?;
+    let handler = ctx.cayenne_dml_handler()?;
+    let inputs = if matches!(ctx.cluster_role, Some(ClusterRole::Scheduler)) {
+        Vec::new()
+    } else {
+        vec![Arc::new(merge_input.projected_input)]
+    };
 
     Ok(LogicalPlan::Extension(Extension {
-        node: Arc::new(node),
+        node: Arc::new(DmlExtensionNode::new_with_count_output(
+            DmlNodeOp::Merge(Box::new(merge_input.params)),
+            handler,
+            inputs,
+        )),
     }))
 }
 
