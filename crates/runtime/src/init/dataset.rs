@@ -937,6 +937,19 @@ impl Runtime {
             AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
         }
 
+        // `on_conflict` forces writes to the accelerator only, which is
+        // incompatible with `write_mode: write_back` (which forwards writes
+        // to the federated source). Reject the combination explicitly to
+        // prevent surprising partial writes.
+        if has_on_conflict
+            && acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteBack
+        {
+            crate::AcceleratedWriteBackWithOnConflictSnafu {
+                dataset_name: ds.name.to_string(),
+            }
+            .fail()?;
+        }
+
         self.accelerator_engine_registry
             .get_accelerator_engine(acceleration_settings.engine)
             .await

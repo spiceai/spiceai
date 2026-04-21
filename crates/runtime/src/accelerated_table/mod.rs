@@ -1404,17 +1404,14 @@ impl TableProvider for AcceleratedTable {
                 let federated_table = self.federated.table_provider().await;
                 federated_table.insert_into(state, input, overwrite).await
             }
-            WriteMode::WriteBack => {
-                write::write_back::insert_write_back(
-                    state,
-                    input,
-                    overwrite,
-                    &self.accelerator,
-                    &self.federated,
-                    &self.refresher,
-                )
-                .await
-            }
+            WriteMode::WriteBack => write::write_back::insert_write_back(
+                input,
+                overwrite,
+                Arc::clone(&self.accelerator),
+                Arc::clone(&self.federated),
+                Arc::clone(&self.refresher),
+                self.schema(),
+            ),
             WriteMode::WriteThrough {
                 cayenne_target,
                 federated_provider,
