@@ -14,6 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Write-through execution path for [`WriteMode::WriteThrough`].
+//!
+//! Writes are applied simultaneously to the Cayenne accelerator (via staged
+//! append) and the federated source. On success both sides commit; on
+//! failure the accelerator stage is rolled back and the error is surfaced
+//! synchronously. Supports both non-partitioned and partitioned Cayenne
+//! accelerators.
+//!
+//! [`WriteMode::WriteThrough`]: super::WriteMode::WriteThrough
+
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,7 +53,6 @@ use crate::accelerated_table::refresh;
 use crate::dataaccelerator::cayenne::CayennePartitionCreator;
 use crate::dataaccelerator::upsert_dedup::UpsertDedupTableProvider;
 use crate::dataupdate::StreamingDataUpdateExecutionPlan;
-use crate::federated_table::FederatedTable;
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_table_partition::insert::partition_batch_composite;
 use runtime_table_partition::provider::PartitionTableProvider;
@@ -61,70 +70,6 @@ impl Clone for CayenneWriteTarget {
             Self::Staged(provider) => Self::Staged(Box::new(provider.clone_for_write_operations())),
             Self::Partitioned(provider) => Self::Partitioned(Arc::clone(provider)),
         }
-    }
-}
-
-/// Controls where writes (INSERT INTO) are directed for an `AcceleratedTable`.
-#[derive(Debug, Clone)]
-pub(crate) enum WriteMode {
-    /// Writes go to the federated source only. The acceleration refresh mechanism
-    /// picks up new data on its next cycle. This is the default.
-    FederatedOnly,
-    /// Writes go only to the local accelerator (not replicated to the source).
-    /// Used when `on_conflict` is configured or for internal tables.
-    AcceleratorOnly,
-    /// Writes go to the local accelerator first, returning immediately to the caller.
-    /// The write is then asynchronously forwarded to the federated source. Faster response
-    /// times, but the source may lag behind the accelerator briefly.
-    WriteBack {
-        federated: Arc<FederatedTable>,
-    },
-    /// Writes go simultaneously to both the federated source and the local Cayenne
-    /// accelerator using staged append/commit/rollback semantics.
-    WriteThrough {
-        cayenne_target: Box<CayenneWriteTarget>,
-        federated_provider: Arc<dyn TableProvider>,
-    },
-}
-
-impl WriteMode {
-    /// Returns `true` if this is a write-through mode.
-    #[must_use]
-    pub fn is_write_through(&self) -> bool {
-        matches!(self, Self::WriteThrough { .. })
-    }
-
-    /// Resolves a write-through mode from the accelerator and federated table.
-    pub(crate) fn resolve_write_through(
-        accelerator: &Arc<dyn TableProvider>,
-        federated: &Arc<FederatedTable>,
-    ) -> Result<Self, super::AcceleratedTableBuilderError> {
-        let cayenne_target = extract_cayenne_write_target(accelerator).ok_or_else(|| {
-            super::AcceleratedTableBuilderError::AcceleratedTableError {
-                source: super::Error::FailedToWriteData {
-                    source: DataFusionError::Execution(
-                        "Write-through acceleration currently requires the Cayenne accelerator"
-                            .to_string(),
-                    ),
-                },
-            }
-        })?;
-
-        let federated_provider = federated.try_table_provider_sync().ok_or_else(|| {
-            super::AcceleratedTableBuilderError::AcceleratedTableError {
-                source: super::Error::FailedToWriteData {
-                    source: DataFusionError::Execution(
-                        "Write-through acceleration requires an immediately available federated table provider"
-                            .to_string(),
-                    ),
-                },
-            }
-        })?;
-
-        Ok(Self::WriteThrough {
-            cayenne_target: Box::new(cayenne_target),
-            federated_provider,
-        })
     }
 }
 
@@ -541,7 +486,7 @@ async fn join_partitioned_staged_tasks(
     })
 }
 
-fn extract_cayenne_write_target(
+pub(crate) fn extract_cayenne_write_target(
     table_provider: &Arc<dyn TableProvider>,
 ) -> Option<CayenneWriteTarget> {
     if let Some(cayenne) = table_provider

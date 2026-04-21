@@ -35,11 +35,9 @@ use data_components::cdc::ChangesStream;
 use datafusion::catalog::Session;
 use datafusion::common::Constraints;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::execution::TaskContext;
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::SessionContext;
 use datafusion::sql::TableReference;
 use datafusion::{
     datasource::{TableProvider, TableType},
@@ -71,9 +69,9 @@ pub(crate) mod sink;
 mod snapshots;
 mod synchronized_table;
 mod timestamp_metrics_utils;
-pub mod write_through;
+pub mod write;
 
-pub(crate) use write_through::WriteMode;
+pub(crate) use write::WriteMode;
 
 pub use refresh_task_runner::RefreshTaskRunner;
 pub use snapshots::SnapshotCreationConfig;
@@ -968,9 +966,7 @@ impl Builder {
         let write_mode = if self.write_through {
             WriteMode::resolve_write_through(&self.accelerator, &self.federated)?
         } else if self.write_back {
-            WriteMode::WriteBack {
-                federated: Arc::clone(&self.federated),
-            }
+            WriteMode::WriteBack
         } else if self.write_to_accelerator_only {
             WriteMode::AcceleratorOnly
         } else {
@@ -1408,48 +1404,21 @@ impl TableProvider for AcceleratedTable {
                 let federated_table = self.federated.table_provider().await;
                 federated_table.insert_into(state, input, overwrite).await
             }
-            WriteMode::WriteBack { federated } => {
-                // Write to the local accelerator first (fast path), then
-                // asynchronously forward the write to the federated source.
-                let accelerated_insert_plan = self
-                    .accelerator
-                    .insert_into(state, Arc::clone(&input), overwrite)
-                    .await?;
-                self.refresher().set_initial_load_completed(true);
-
-                let federated = Arc::clone(federated);
-                tokio::spawn(async move {
-                    let federated_provider = federated.table_provider().await;
-                    let ctx = SessionContext::new();
-                    let state = ctx.state();
-                    match federated_provider
-                        .insert_into(&state, input, overwrite)
-                        .await
-                    {
-                        Ok(plan) => {
-                            let task_ctx = Arc::new(TaskContext::default());
-                            if let Err(e) =
-                                datafusion::physical_plan::collect(plan, task_ctx).await
-                            {
-                                tracing::error!(
-                                    "Write-back: failed to persist write to federated source: {e}"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Write-back: failed to create insert plan for federated source: {e}"
-                            );
-                        }
-                    }
-                });
-
-                Ok(accelerated_insert_plan)
+            WriteMode::WriteBack => {
+                write::write_back::insert_write_back(
+                    state,
+                    input,
+                    overwrite,
+                    &self.accelerator,
+                    &self.federated,
+                    &self.refresher,
+                )
+                .await
             }
             WriteMode::WriteThrough {
                 cayenne_target,
                 federated_provider,
-            } => write_through::insert_write_through(
+            } => write::write_through::insert_write_through(
                 input,
                 overwrite,
                 cayenne_target.as_ref(),
