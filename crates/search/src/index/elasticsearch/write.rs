@@ -169,6 +169,7 @@ pub async fn write(index: &ElasticsearchIndex, record: RecordBatch) -> Result<Re
     // schema check) see the expected dense_vector column.
     update_embedding_column_in_batch(
         &record,
+        es_index,
         &index.embedded_column,
         &embedding_vectors,
         index.dims,
@@ -228,6 +229,13 @@ fn build_documents(
         if embedding.iter().all(|&x| x == 0.0 || x.is_nan()) {
             tracing::warn!(
                 "Skipping record for Elasticsearch index '{es_index}': embedding vector is all zeros or NaN."
+            );
+            continue;
+        }
+
+        if embedding.iter().any(|x| !x.is_finite()) {
+            tracing::warn!(
+                "Skipping record for Elasticsearch index '{es_index}': embedding vector contains non-finite values (NaN or infinity) which would be rejected by Elasticsearch dense_vector mapping."
             );
             continue;
         }
@@ -389,6 +397,7 @@ async fn embed_column(
 
 fn update_embedding_column_in_batch(
     record: &RecordBatch,
+    es_index: &str,
     embedded_column_name: &str,
     embedding_vectors: &[Option<Vec<f32>>],
     dimension: i32,
@@ -398,7 +407,7 @@ fn update_embedding_column_in_batch(
     let schema = record.schema();
     let mut columns = record.columns().to_vec();
 
-    let embedding_array = create_embedding_array(embedding_vectors, dimension)?;
+    let embedding_array = create_embedding_array(es_index, embedding_vectors, dimension)?;
 
     let target_schema = if let Some((idx, _)) = schema.column_with_name(&embedding_column_name) {
         columns[idx] = embedding_array;
@@ -418,12 +427,13 @@ fn update_embedding_column_in_batch(
     };
 
     RecordBatch::try_new(target_schema, columns).context(IssueWithArrowProcessingSnafu {
-        index: embedded_column_name.to_string(),
+        index: es_index.to_string(),
     })
 }
 
 #[expect(clippy::cast_sign_loss)]
 fn create_embedding_array(
+    es_index: &str,
     embedding_vectors: &[Option<Vec<f32>>],
     dimension: i32,
 ) -> Result<Arc<dyn Array>> {
@@ -454,7 +464,7 @@ fn create_embedding_array(
             }
             Some(v) => {
                 return Err(Error::EmbeddingDimensionMismatch {
-                    index: String::new(),
+                    index: es_index.to_string(),
                     expected,
                     actual: v.len(),
                     row_index: row,

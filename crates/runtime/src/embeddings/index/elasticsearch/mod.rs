@@ -246,6 +246,13 @@ async fn ensure_index_with_mapping(
     dims: i32,
     text_fields: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if dims <= 0 {
+        return Err(format!(
+            "Failed to prepare Elasticsearch index '{es_index}': embedding dimension must be positive, got {dims}. Check that the embedding model reports a valid output dimension."
+        )
+        .into());
+    }
+
     let mut properties = serde_json::Map::new();
     properties.insert(
         vector_field.to_string(),
