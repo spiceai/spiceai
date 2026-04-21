@@ -73,7 +73,7 @@ jobs:
         with:
           script: |
             const isTaggedRelease = context.ref.startsWith('refs/tags/v');
-            const runner = isTaggedRelease ? "ubuntu-24.04" : "spiceai-large-runners";
+            const runner = isTaggedRelease ? "ubuntu-24.04" : "spiceai-dev-large-runners";
 
             const matrix = [
               {
