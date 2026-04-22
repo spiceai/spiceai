@@ -148,7 +148,7 @@ impl ScalarUDFImpl for QueryVectorExpr {
         self
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "query_vector"
     }
 
