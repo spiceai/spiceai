@@ -132,12 +132,18 @@ pub async fn build_local_merge_plan_input(
     on_keys: &[(String, String)],
     assignment_sql: &[(String, String)],
 ) -> DFResult<LocalMergePlanInput> {
-    let target_provider = resolve_table(session_state, target_table, default_catalog, default_schema)
-        .await
-        .ok_or(DataFusionError::Plan(format!("Table {target_table} not found")))?;
-    let source_provider = resolve_table(session_state, source_table, default_catalog, default_schema)
-        .await
-        .ok_or(DataFusionError::Plan(format!("Table {source_table} not found")))?;
+    let target_provider =
+        resolve_table(session_state, target_table, default_catalog, default_schema)
+            .await
+            .ok_or(DataFusionError::Plan(format!(
+                "Table {target_table} not found"
+            )))?;
+    let source_provider =
+        resolve_table(session_state, source_table, default_catalog, default_schema)
+            .await
+            .ok_or(DataFusionError::Plan(format!(
+                "Table {source_table} not found"
+            )))?;
 
     let target_scan = LogicalPlanBuilder::scan(
         target_qualifier,

@@ -31,9 +31,7 @@ pub mod dml_planner;
 pub mod handler;
 pub mod physical_plans;
 
-pub use dml_planner::{
-    DistributedCayenneDmlHandler, extract_filters, extract_update_assignments,
-};
+pub use dml_planner::{DistributedCayenneDmlHandler, extract_filters, extract_update_assignments};
 pub use handler::DistributedCayenneDdlHandler;
 
 use datafusion::catalog::CatalogProvider;

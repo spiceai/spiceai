@@ -27,28 +27,30 @@ limitations under the License.
 //! Both source and target must be Cayenne catalog tables. Target must not
 //! have `primary_key` or `on_conflict` configured.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{Extension, LogicalPlan};
-use datafusion::sql::TableReference;
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::{
     AssignmentTarget, BinaryOperator, Expr as SQLExpr, MergeAction, MergeClause, MergeClauseKind,
     Statement as SQLStatement, TableFactor,
 };
-use datafusion_dml::{DmlExtensionNode, DmlNodeOp};
+use datafusion::sql::{ResolvedTableReference, TableReference};
+use datafusion_dml::{DmlExtensionNode, DmlNodeOp, MergeParams};
+use datafusion_expr::Expr;
 
 use super::{PlannerContext, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, is_cayenne_table};
-use crate::config::ClusterRole;
 
 /// Plan a `MERGE INTO` statement for Cayenne execution.
 ///
 /// Parses the AST, validates phase 1 constraints, normalizes the ON clause
 /// into bare `(target_col, source_col)` key pairs, builds typed `MergeParams`,
 /// and produces a generic `DmlExtensionNode`.
-pub(super) async fn plan_merge(
+pub(super) async fn plan_distributed_merge(
     statement: Statement,
     session: &SessionState,
     ctx: &PlannerContext,
@@ -81,6 +83,7 @@ pub(super) async fn plan_merge(
 
     let (target_name, target_alias) = extract_table_ref(&table, "target")?;
     let target_ref = TableReference::parse_str(&target_name);
+
     let target_qualifier = target_alias
         .clone()
         .unwrap_or_else(|| target_ref.table().to_string());
@@ -126,34 +129,35 @@ pub(super) async fn plan_merge(
     }
     let assignment_sql =
         validate_and_extract_assignments(&clauses[0], target_ref.table(), target_alias.as_deref())?;
+    let assignments: Vec<(String, Expr)> = assignment_sql
+        .iter()
+        .map(|(column, value_sql)| {
+            let expr = session.create_logical_expr(value_sql, &target_schema)?;
+            Ok((column.clone(), expr))
+        })
+        .collect::<DFResult<Vec<_>>>()?;
 
-    let mut merge_input = cayenne::ddl::build_local_merge_plan_input(
-        session,
-        SPICE_DEFAULT_CATALOG,
-        SPICE_DEFAULT_SCHEMA,
-        &target_ref,
-        &source_ref,
-        &target_qualifier,
-        &source_qualifier,
-        &on_keys,
-        &assignment_sql,
-    )
-    .await?;
-    merge_input.params.original_sql = matches!(ctx.cluster_role, Some(ClusterRole::Scheduler))
-        .then(|| original_sql.to_string());
+    let Some(target_schema) = resolve_table_schema(session, &target_ref).await else {
+        return Err(DataFusionError::Plan(
+            "MERGE target '{target_name}' is not found".to_string(),
+        ));
+    };
 
     let handler = ctx.cayenne_dml_handler()?;
-    let inputs = if matches!(ctx.cluster_role, Some(ClusterRole::Scheduler)) {
-        Vec::new()
-    } else {
-        vec![Arc::new(merge_input.projected_input)]
-    };
 
     Ok(LogicalPlan::Extension(Extension {
         node: Arc::new(DmlExtensionNode::new_with_count_output(
-            DmlNodeOp::Merge(Box::new(merge_input.params)),
+            DmlNodeOp::Merge(Box::new(MergeParams {
+                target_table: target_ref.clone(),
+                source_table: source_ref.clone(),
+                target_qualifier: target_qualifier.to_string(),
+                source_qualifier: source_qualifier.to_string(),
+                on_keys: on_keys.to_vec(),
+                assignments,
+                original_sql: None,
+            })),
             handler,
-            inputs,
+            Vec::new(), // Since this is on scheduler side.
         )),
     }))
 }
@@ -230,6 +234,23 @@ async fn validate_target_metadata(
     }
 
     Ok(())
+}
+
+async fn resolve_table_schema(
+    session_state: &SessionState,
+    table_ref: &TableReference,
+) -> Option<DFSchema> {
+    let ResolvedTableReference {
+        catalog,
+        schema,
+        table,
+    } = table_ref
+        .clone()
+        .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+    let catalog = session_state.catalog_list().catalog(&catalog)?;
+    let schema = catalog.schema(&schema)?;
+    let table_schema = schema.table(&table).await.ok()??.schema();
+    DFSchema::from_unqualified_fields(table_schema.fields.clone(), HashMap::default()).ok()
 }
 
 // ---------------------------------------------------------------------------

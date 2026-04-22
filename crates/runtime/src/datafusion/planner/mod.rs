@@ -115,23 +115,17 @@ impl PlannerContext {
                     ));
                 };
 
-                let handler: Arc<dyn CatalogDmlHandler> = Arc::new(
+                Ok(Arc::new(
                     crate::datafusion::cayenne_ddl::DistributedCayenneDmlHandler::new(
                         Arc::clone(executor_registry),
                         Some(self.io_runtime.clone()),
                     ),
-                );
-                Ok(handler)
+                ) as Arc<dyn CatalogDmlHandler>)
             }
-            _ => {
-                let handler: Arc<dyn CatalogDmlHandler> = Arc::new(
-                    cayenne::ddl::CayenneDmlHandler::new(
-                        SPICE_DEFAULT_CATALOG,
-                        SPICE_DEFAULT_SCHEMA,
-                    ),
-                );
-                Ok(handler)
-            }
+            _ => Ok(Arc::new(cayenne::ddl::CayenneDmlHandler::new(
+                SPICE_DEFAULT_CATALOG,
+                SPICE_DEFAULT_SCHEMA,
+            )) as Arc<dyn CatalogDmlHandler>),
         }
     }
 }
@@ -187,7 +181,7 @@ pub async fn create_logical_plan(
                 .await;
             }
             SQLStatement::Merge { .. } if ctx.catalog_mode == CatalogMode::Cayenne => {
-                return merge::plan_merge(statement, session, ctx, sql).await;
+                return merge::plan_distributed_merge(statement, session, ctx, sql).await;
             }
             _ => {}
         }
@@ -253,10 +247,6 @@ fn is_cayenne_table(session: &SessionState, table_name: &TableReference) -> bool
 }
 
 async fn is_distributed_insert_table(session: &SessionState, table_name: &TableReference) -> bool {
-    if is_cayenne_table(session, table_name) {
-        return true;
-    }
-
     let catalog_name = table_name.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
     let schema_name = table_name.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
 
