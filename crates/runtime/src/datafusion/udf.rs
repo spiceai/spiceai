@@ -17,6 +17,9 @@ limitations under the License.
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
+use crate::datafusion::udtf::flatten_json::{
+    FLATTEN_JSON_UDTF_NAME, FlattenJsonScalar, FlattenJsonTableFunc,
+};
 use crate::datafusion::udtf::json_properties::{
     FLATTEN_JSON_PROPERTIES_UDTF_NAME, FlattenJsonPropertiesScalar, FlattenJsonPropertiesTableFunc,
 };
@@ -93,14 +96,20 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         Arc::new(rrf::ReciprocalRankFusion::from_ctx(ctx)),
     );
 
-    // `flatten_json_properties` / `json_tree` — JSON-Schema and generic JSON
-    // shredders. Registered as both UDTF (FROM-clause, literal input) and
-    // ScalarUDF returning `List<Struct<...>>` (per-row / LATERAL via UNNEST).
+    // `flatten_json_properties` / `flatten_json` / `json_tree` — JSON-Schema
+    // and generic JSON shredders. Registered as both UDTF (FROM-clause,
+    // literal input) and ScalarUDF returning `List<Struct<...>>` (per-row /
+    // LATERAL via UNNEST).
     ctx.register_udtf(
         FLATTEN_JSON_PROPERTIES_UDTF_NAME,
         Arc::new(FlattenJsonPropertiesTableFunc::new()),
     );
     ctx.register_udf(FlattenJsonPropertiesScalar::new().into());
+    ctx.register_udtf(
+        FLATTEN_JSON_UDTF_NAME,
+        Arc::new(FlattenJsonTableFunc::new()),
+    );
+    ctx.register_udf(FlattenJsonScalar::new().into());
     ctx.register_udtf(JSON_TREE_UDTF_NAME, Arc::new(JsonTreeTableFunc::new()));
     ctx.register_udf(JsonTreeScalar::new().into());
 
@@ -130,6 +139,7 @@ static DENY_SPICE_SPECIFIC_FUNCTIONS: LazyLock<FunctionSupport> = LazyLock::new(
         AI_UDF_NAME,
         DIGEST_UDF_NAME,
         FLATTEN_JSON_PROPERTIES_UDTF_NAME,
+        FLATTEN_JSON_UDTF_NAME,
         JSON_TREE_UDTF_NAME,
     ];
 
@@ -222,6 +232,7 @@ mod tests {
             spice_udf(Truncate::new()),
             Arc::new(INSTANCE.clone()),
             spice_udf(FlattenJsonPropertiesScalar::new()),
+            spice_udf(FlattenJsonScalar::new()),
             spice_udf(JsonTreeScalar::new()),
         ];
 

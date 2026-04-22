@@ -80,17 +80,17 @@ The `schemas` dataset reads `sample_schemas.json` as-is, exposing `id`,
 `flatten_json_properties(body)` walks each schema's `properties` tree and
 emits one row per field with these columns:
 
-| column        | type         | description                                        |
-|---------------|--------------|----------------------------------------------------|
-| `path`        | Utf8         | Dotted path, e.g. `user.address.street`            |
-| `parent_path` | Utf8         | Everything but the leaf                            |
-| `name`        | Utf8         | Leaf field name                                    |
-| `description` | Utf8         | From the field's `description` annotation          |
-| `type`        | Utf8         | `string`, `integer`, `object`, `array`, `map`, `ref`, … |
-| `required`    | Boolean      | Inferred from the ancestor's `required:[...]`       |
-| `format`      | Utf8         | e.g. `date-time`, `uuid`                           |
-| `enum_values` | List<Utf8>   | Present when the field declares `enum`             |
-| `metadata`    | Utf8         | Full field spec JSON — query with `json_get(metadata, '$.x-custom')` |
+| column        | type       | description                                                          |
+| ------------- | ---------- | -------------------------------------------------------------------- |
+| `path`        | Utf8       | Dotted path, e.g. `user.address.street`                              |
+| `parent_path` | Utf8       | Everything but the leaf                                              |
+| `name`        | Utf8       | Leaf field name                                                      |
+| `description` | Utf8       | From the field's `description` annotation                            |
+| `type`        | Utf8       | `string`, `integer`, `object`, `array`, `map`, `ref`, …              |
+| `required`    | Boolean    | Inferred from the ancestor's `required:[...]`                        |
+| `format`      | Utf8       | e.g. `date-time`, `uuid`                                             |
+| `enum_values` | List<Utf8> | Present when the field declares `enum`                               |
+| `metadata`    | Utf8       | Full field spec JSON — query with `json_get(metadata, '$.x-custom')` |
 
 The function handles `items.properties` (arrays of objects),
 `additionalProperties` maps, `allOf` / `oneOf` / `anyOf` merge, and local
@@ -129,19 +129,71 @@ FROM flatten_json_properties(
     max_depth       => 16,
     max_rows        => 10000,
     include_internal => true,      -- also emit object/array/map rows
-    path_style      => 'json-pointer',
-    dialect         => 'json-schema'
+    path_style      => 'dot',
+    dialect         => 'json-schema',
+    expand_maps     => true,       -- emit `parent.[*].child` for maps (dot style)
+    map_wildcard    => '[*]'       -- customize the wildcard segment
 );
 ```
 
-| option             | type   | default       | notes                                          |
-|--------------------|--------|---------------|-----------------------------------------------|
-| `max_depth`        | UInt   | `32`          | walk stops past this depth                    |
-| `max_rows`         | UInt   | `100000`      | per-document row cap                          |
-| `max_bytes`        | UInt   | `8_388_608`   | input size limit (8 MiB)                      |
-| `dialect`          | Utf8   | `json-schema` | `json-schema` \| `openapi`                    |
-| `include_internal` | Bool   | `false`       | emit container rows (`object`, `array`, `map`) |
-| `path_style`       | Utf8   | `dot`         | `dot` (`a.b.c`) \| `json-pointer` (`/a/b/c`)  |
+| option             | type | default       | notes                                                                                                                        |
+| ------------------ | ---- | ------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `max_depth`        | UInt | `32`          | walk stops past this depth                                                                                                   |
+| `max_rows`         | UInt | `100000`      | per-document row cap                                                                                                         |
+| `max_bytes`        | UInt | `8_388_608`   | input size limit (8 MiB)                                                                                                     |
+| `dialect`          | Utf8 | `json-schema` | `json-schema` \| `openapi`                                                                                                   |
+| `include_internal` | Bool | `false`       | emit container rows (`object`, `array`, `map`)                                                                               |
+| `path_style`       | Utf8 | `dot`         | `dot` (`a.b.c`) \| `json-pointer` (`/a/b/c`)                                                                                 |
+| `expand_maps`      | Bool | `false`       | walk through `additionalProperties` and encode the map's dynamic key as a wildcard segment in the path (JSONPath convention) |
+| `map_wildcard`     | Utf8 | `[*]`         | wildcard segment inserted when `expand_maps = true`; must be non-empty                                                       |
+
+#### Expanding maps (`Map<String, Array<Object>>` example)
+
+By default, `flatten_json_properties` collapses `additionalProperties` onto
+the parent path: a map field `labels` with value schema
+`{properties: {value: string}}` emits a single leaf at `labels.value`. That's
+the right answer for shallow `Map<String, Scalar>` shapes, but it hides
+structure when the map's value is itself a complex type.
+
+Turn on `expand_maps` to preserve the indirection as a wildcard segment in
+the path. Given a `Map<String, Array<Object>>` like an `identityMap`:
+
+```json
+{
+  "properties": {
+    "identityMap": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "authenticatedState": {"type": "string"},
+            "id":                 {"type": "string"},
+            "primary":            {"type": "boolean"}
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+```sql
+SELECT path, type
+FROM flatten_json_properties(:schema, expand_maps => true)
+ORDER BY path;
+```
+
+| path                                 | type    |
+| ------------------------------------ | ------- |
+| `identityMap.[*].authenticatedState` | string  |
+| `identityMap.[*].id`                 | string  |
+| `identityMap.[*].primary`            | boolean |
+
+Arrays still collapse `items.properties.*` onto the parent path, so a
+map-of-array-of-object surfaces as one wildcard segment between the map
+name and the inner leaves — matching JSONPath-style addressing.
 
 ### 6. `json_tree` — generic alternative
 

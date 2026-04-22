@@ -14,5 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod flatten_json;
 pub mod json_properties;
 pub mod json_tree;
