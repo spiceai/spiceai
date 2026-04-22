@@ -395,11 +395,8 @@ pub trait Elasticsearch: std::fmt::Debug + Send + Sync {
         index: &str,
         body: &serde_json::Value,
     ) -> Result<serde_json::Value>;
-    async fn put_mapping(
-        &self,
-        index: &str,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value>;
+    async fn put_mapping(&self, index: &str, body: &serde_json::Value)
+    -> Result<serde_json::Value>;
     async fn index_document(
         &self,
         index: &str,
