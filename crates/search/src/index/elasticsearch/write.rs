@@ -201,6 +201,11 @@ fn build_documents(
     embedding_vectors: &[Option<Vec<f32>>],
     primary_keys: &[Option<String>],
 ) -> Result<Vec<(Option<String>, Value)>> {
+    // Aggregate per-row skip reasons into batch-level counts (plus a small
+    // sample of row indices) to avoid high-volume per-row logs on large
+    // batches with many NULLs or invalid embeddings.
+    const SAMPLE_LIMIT: usize = 5;
+
     let es_index = index.es_index.as_str();
     let schema = record.schema();
     let embedding_col_name = embedding_col(&index.embedded_column);
@@ -239,10 +244,6 @@ fn build_documents(
     let mut docs: Vec<(Option<String>, Value)> = Vec::with_capacity(record.num_rows());
     let mut value_buf: Vec<u8> = Vec::with_capacity(256);
 
-    // Aggregate per-row skip reasons into batch-level counts (plus a small
-    // sample of row indices) to avoid high-volume per-row logs on large
-    // batches with many NULLs or invalid embeddings.
-    const SAMPLE_LIMIT: usize = 5;
     let mut null_pk_skips: usize = 0;
     let mut null_pk_samples: Vec<usize> = Vec::new();
     let mut zero_or_nan_skips: usize = 0;
