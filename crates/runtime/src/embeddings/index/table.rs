@@ -31,7 +31,6 @@ use {
     arrow_schema::{Schema, SchemaRef},
     chunking::ChunkingConfig,
     runtime_datafusion_index::{Index, IndexedTableProvider},
-    search::generation::util::get_primary_keys,
     search::index::{SearchIndex, VectorScanTableProvider, chunking::ChunkedSearchIndex},
     search::metadata::MetadataColumn,
     snafu::ResultExt,
@@ -43,6 +42,7 @@ use {
 use {
     datafusion::common::ToDFSchema as _,
     runtime_table_partition::expression::partition_by_expressions,
+    search::generation::util::get_primary_keys,
     search::index::{VectorIndex, s3_vectors::S3Vector},
 };
 
@@ -383,11 +383,10 @@ async fn wrap_table_as_index_elasticsearch(
             let vector_index = Arc::clone(&idx) as Arc<dyn search::index::VectorIndex>;
 
             provider.underlying = Arc::new(
-                search::index::VectorScanTableProvider::try_new(provider.underlying, &vector_index)
+                VectorScanTableProvider::try_new(provider.underlying, &vector_index)
                     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
             ) as Arc<dyn TableProvider>;
-            provider =
-                provider.add_index(Arc::clone(&idx) as Arc<dyn runtime_datafusion_index::Index>);
+            provider = provider.add_index(Arc::clone(&idx) as Arc<dyn Index>);
         }
     }
 
@@ -400,14 +399,13 @@ async fn wrap_table_as_index_elasticsearch(
 
 #[cfg(feature = "elasticsearch")]
 async fn construct_elasticsearch_chunked_vector_index(
-    mut provider: runtime_datafusion_index::IndexedTableProvider,
+    mut provider: IndexedTableProvider,
     embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
     chunking: &EmbeddingChunkConfig,
     mut es_index: super::elasticsearch::ElasticsearchIndex,
     model_name: &str,
     file_format: Option<&str>,
-) -> Result<runtime_datafusion_index::IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>>
-{
+) -> Result<IndexedTableProvider, Box<dyn std::error::Error + Send + Sync>> {
     let chunker = construct_chunker(
         model_name,
         &ChunkingConfig {
@@ -431,9 +429,9 @@ async fn construct_elasticsearch_chunked_vector_index(
 
     if let Some(vector_index) = Arc::clone(&chunked_idx).as_vector_index() {
         provider.underlying = Arc::new(
-            search::index::VectorScanTableProvider::try_new(provider.underlying, &vector_index)
+            VectorScanTableProvider::try_new(provider.underlying, &vector_index)
                 .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
         ) as Arc<dyn TableProvider>;
     }
-    Ok(provider.add_index(Arc::clone(&chunked_idx) as Arc<dyn runtime_datafusion_index::Index>))
+    Ok(provider.add_index(Arc::clone(&chunked_idx) as Arc<dyn Index>))
 }

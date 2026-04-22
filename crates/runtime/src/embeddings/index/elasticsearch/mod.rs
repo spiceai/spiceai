@@ -26,7 +26,7 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use elasticsearch::{Client, Elasticsearch};
 use search::generation::util::get_primary_keys;
-use search::index::elasticsearch::ElasticsearchIndex;
+pub(crate) use search::index::elasticsearch::ElasticsearchIndex;
 use spicepod::{
     param::Params,
     semantic::{Column, ColumnLevelEmbeddingConfig},
