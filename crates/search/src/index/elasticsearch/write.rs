@@ -217,6 +217,17 @@ fn build_documents(
             continue;
         };
 
+        // Skip rows with NULL primary keys when a primary key is configured.
+        // Without an `_id`, Elasticsearch would auto-generate one, making
+        // re-indexing the same row non-idempotent (producing duplicates on
+        // refresh/CDC writes).
+        if !index.primary_key.is_empty() && primary_keys[row].is_none() {
+            tracing::warn!(
+                "Skipping record for Elasticsearch index '{es_index}': row {row} has NULL primary key value(s); would produce a non-idempotent auto-generated document ID."
+            );
+            continue;
+        }
+
         if embedding.len() != expected_dims {
             return Err(Error::EmbeddingDimensionMismatch {
                 index: es_index.to_string(),
