@@ -5385,14 +5385,15 @@ mod tests {
     #[test]
     fn create_batch_from_rows_nested_non_object_row_goes_to_catchall() {
         let (exec, nesting) = nested_exec(&["id", "details"], "details");
-        let rows = vec![r#""just a string""#.to_string()];
+        let row = r#""just a string""#.to_string();
+        let rows = vec![row.clone()];
         let batch = exec
             .create_batch_from_rows_nested(&rows, &nesting)
             .expect("batch should be created");
         assert_eq!(string_col(&batch, "id"), vec![None]);
         // Non-object rows are placed verbatim in the catch-all column.
         let details = string_col(&batch, "details");
-        assert!(details[0].is_some());
+        assert_eq!(details[0].as_deref(), Some(row.as_str()));
     }
 
     #[test]

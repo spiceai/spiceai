@@ -239,10 +239,23 @@ fn build_documents(
     let mut docs: Vec<(Option<String>, Value)> = Vec::with_capacity(record.num_rows());
     let mut value_buf: Vec<u8> = Vec::with_capacity(256);
 
+    // Aggregate per-row skip reasons into batch-level counts (plus a small
+    // sample of row indices) to avoid high-volume per-row logs on large
+    // batches with many NULLs or invalid embeddings.
+    const SAMPLE_LIMIT: usize = 5;
+    let mut null_pk_skips: usize = 0;
+    let mut null_pk_samples: Vec<usize> = Vec::new();
+    let mut zero_or_nan_skips: usize = 0;
+    let mut zero_or_nan_samples: Vec<usize> = Vec::new();
+    let mut non_finite_skips: usize = 0;
+    let mut non_finite_samples: Vec<usize> = Vec::new();
+    let mut missing_embedding_skips: usize = 0;
+
     let expected_dims = usize::try_from(index.dims.max(0)).unwrap_or(0);
 
     for row in 0..record.num_rows() {
         let Some(embedding) = embedding_vectors[row].as_ref() else {
+            missing_embedding_skips += 1;
             continue;
         };
 
@@ -251,9 +264,10 @@ fn build_documents(
         // re-indexing the same row non-idempotent (producing duplicates on
         // refresh/CDC writes).
         if !index.primary_key.is_empty() && primary_keys[row].is_none() {
-            tracing::warn!(
-                "Skipping record for Elasticsearch index '{es_index}': row {row} has NULL primary key value(s); would produce a non-idempotent auto-generated document ID."
-            );
+            null_pk_skips += 1;
+            if null_pk_samples.len() < SAMPLE_LIMIT {
+                null_pk_samples.push(row);
+            }
             continue;
         }
 
@@ -267,16 +281,18 @@ fn build_documents(
         }
 
         if embedding.iter().all(|&x| x == 0.0 || x.is_nan()) {
-            tracing::warn!(
-                "Skipping record for Elasticsearch index '{es_index}': embedding vector is all zeros or NaN."
-            );
+            zero_or_nan_skips += 1;
+            if zero_or_nan_samples.len() < SAMPLE_LIMIT {
+                zero_or_nan_samples.push(row);
+            }
             continue;
         }
 
         if embedding.iter().any(|x| !x.is_finite()) {
-            tracing::warn!(
-                "Skipping record for Elasticsearch index '{es_index}': embedding vector contains non-finite values (NaN or infinity) which would be rejected by Elasticsearch dense_vector mapping."
-            );
+            non_finite_skips += 1;
+            if non_finite_samples.len() < SAMPLE_LIMIT {
+                non_finite_samples.push(row);
+            }
             continue;
         }
 
@@ -306,6 +322,27 @@ fn build_documents(
         doc.insert(index.vector_field.clone(), vec_json);
 
         docs.push((primary_keys[row].clone(), Value::Object(doc)));
+    }
+
+    if null_pk_skips > 0 {
+        tracing::warn!(
+            "Skipped {null_pk_skips} record(s) for Elasticsearch index '{es_index}': NULL primary key value(s) (would produce non-idempotent auto-generated document IDs). Sample row indices: {null_pk_samples:?}"
+        );
+    }
+    if zero_or_nan_skips > 0 {
+        tracing::warn!(
+            "Skipped {zero_or_nan_skips} record(s) for Elasticsearch index '{es_index}': embedding vector is all zeros or NaN. Sample row indices: {zero_or_nan_samples:?}"
+        );
+    }
+    if non_finite_skips > 0 {
+        tracing::warn!(
+            "Skipped {non_finite_skips} record(s) for Elasticsearch index '{es_index}': embedding vector contains non-finite values (NaN or infinity). Sample row indices: {non_finite_samples:?}"
+        );
+    }
+    if missing_embedding_skips > 0 {
+        tracing::debug!(
+            "Skipped {missing_embedding_skips} record(s) for Elasticsearch index '{es_index}': no embedding generated (expected when embedded column is NULL)."
+        );
     }
 
     Ok(docs)

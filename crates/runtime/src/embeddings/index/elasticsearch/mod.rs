@@ -284,9 +284,10 @@ async fn ensure_index_with_mapping(
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
 
+    let mapping_body = serde_json::json!({ "properties": properties });
+
     if exists {
-        let body = serde_json::json!({ "properties": properties });
-        if let Err(e) = client.put_mapping(es_index, &body).await {
+        if let Err(e) = client.put_mapping(es_index, &mapping_body).await {
             // If the field already exists with an incompatible mapping, ES returns 400.
             // Surface the error but don't panic — a user may have pre-created the index
             // with a specific mapping they want preserved; log and proceed.
@@ -298,15 +299,46 @@ async fn ensure_index_with_mapping(
         return Ok(());
     }
 
-    let body = serde_json::json!({ "mappings": { "properties": properties } });
-    client
-        .create_index(es_index, &body)
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
-    tracing::info!(
-        "Created Elasticsearch index '{es_index}' with dense_vector field '{vector_field}' (dims={dims})."
-    );
-    Ok(())
+    let create_body = serde_json::json!({ "mappings": { "properties": properties } });
+    match client.create_index(es_index, &create_body).await {
+        Ok(_) => {
+            tracing::info!(
+                "Created Elasticsearch index '{es_index}' with dense_vector field '{vector_field}' (dims={dims})."
+            );
+            Ok(())
+        }
+        // TOCTOU: another runtime instance may have created the index between our
+        // `index_exists` check and `create_index` call. Treat that as success and
+        // best-effort apply the mapping update to match the `exists` branch above.
+        Err(e) if is_index_already_exists_error(&e) => {
+            tracing::info!(
+                "Elasticsearch index '{es_index}' was created concurrently by another runtime instance; applying mapping updates."
+            );
+            if let Err(mapping_error) = client.put_mapping(es_index, &mapping_body).await {
+                tracing::warn!(
+                    "Elasticsearch index '{es_index}' exists after concurrent creation but mapping update failed (continuing; existing mapping will be used): {mapping_error}"
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+    }
+}
+
+/// Check whether an error from `create_index` indicates the index already exists
+/// (e.g. because another runtime instance created it concurrently).
+fn is_index_already_exists_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(err) = current {
+        let message = err.to_string();
+        if message.contains("resource_already_exists_exception")
+            || message.contains("already exists")
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
 }
 
 /// Normalize an Arrow [`DataType`] to match what the Elasticsearch HTTP client produces.
