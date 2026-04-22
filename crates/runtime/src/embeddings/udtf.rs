@@ -104,7 +104,9 @@ pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
 /// logical plan size and runtime work.
 const VECTOR_SEARCH_MAX_QUERIES: usize = 32;
 
-/// Reusing `_score` alias column can cause issues with physical optimizations during filter/limit/order pushdowns. Use internal column alias for ordering.
+// Reusing `_score` alias column can cause issues with physical optimizations
+// during filter/limit/order pushdowns. Use an internal column alias for
+// ordering.
 const INTERNAL_SCORE_COLUMN_ALIAS: &str = "__spice_vector_search_score";
 
 /// Creates a `UserDefined` signature that allows named parameters (like `rank_weight => X`)
@@ -1071,6 +1073,11 @@ impl TableProvider for VectorSearchUDTFProvider {
                 false,
             )])?
             .limit(0, Some(self.limit_to_use(limit)))?
+            // Keep this alias: it creates a subquery boundary between the
+            // sort/limit stage (which uses the internal score alias) and the
+            // final projection (which may rename or omit `_score`). Without
+            // this boundary, optimizer/projection collapsing can remove or
+            // rename the computed score column and break planning.
             .alias("tbl")?
             .project(final_expr)?
             .build()?;
