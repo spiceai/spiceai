@@ -62,8 +62,6 @@ where
 /// Scalar similarity kernel for a single pair of equal-length f32 slices.
 #[derive(Clone, Copy)]
 pub(crate) enum Kernel {
-    /// Cosine distance in `[0, 2]` — matches the simsimd definition `1 - cos_sim`.
-    CosineRaw,
     /// Dot product (inner product).
     Dot,
     /// Squared L2 distance. Sqrt is left to the caller when true L2 is needed.
@@ -73,7 +71,6 @@ pub(crate) enum Kernel {
 impl Kernel {
     fn apply(self, a: &[f32], b: &[f32]) -> Option<f64> {
         match self {
-            Self::CosineRaw => f32::cosine(a, b),
             Self::Dot => f32::dot(a, b),
             Self::L2Squared => f32::l2sq(a, b),
         }
@@ -314,26 +311,6 @@ mod tests {
     use super::*;
     use arrow::array::AsArray;
     use arrow::datatypes::Float64Type;
-
-    #[test]
-    fn cosine_raw_identical_is_zero() {
-        let a = testing::fsl_f32(&[&[1.0, 2.0, 3.0]]);
-        let b = testing::fsl_f32(&[&[1.0, 2.0, 3.0]]);
-        let out =
-            compute_fsl_f32(&[a as ArrayRef, b as ArrayRef], Kernel::CosineRaw, |v| v).expect("ok");
-        let out = out.as_primitive::<Float64Type>();
-        assert!((out.value(0) - 0.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn cosine_raw_opposite_is_two() {
-        let a = testing::fsl_f32(&[&[1.0, 2.0, 3.0]]);
-        let b = testing::fsl_f32(&[&[-1.0, -2.0, -3.0]]);
-        let out =
-            compute_fsl_f32(&[a as ArrayRef, b as ArrayRef], Kernel::CosineRaw, |v| v).expect("ok");
-        let out = out.as_primitive::<Float64Type>();
-        assert!((out.value(0) - 2.0).abs() < 1e-5);
-    }
 
     #[test]
     fn dot_basic() {

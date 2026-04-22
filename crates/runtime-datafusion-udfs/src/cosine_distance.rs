@@ -33,10 +33,7 @@ use datafusion::{
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::vector_simd::{
-    Kernel, compute_fsl_f32, is_fixed_size_list_f32, make_scalar_function,
-    matching_fixed_size_list_f32,
-};
+use crate::vector_simd::make_scalar_function;
 
 pub static COSINE_DISTANCE_UDF_NAME: &str = "cosine_distance";
 
@@ -95,11 +92,6 @@ impl ScalarUDFImpl for CosineDistance {
         if arg_types.len() != 2 {
             return exec_err!("{COSINE_DISTANCE_UDF_NAME} expects exactly two arguments");
         }
-        // Fast path: keep matching FixedSizeList<Float32, N> as-is so the SIMD kernel
-        // can operate over the zero-copy flat buffer.
-        if matching_fixed_size_list_f32(&arg_types[0], &arg_types[1]).is_some() {
-            return Ok(vec![arg_types[0].clone(), arg_types[1].clone()]);
-        }
         let mut result = Vec::new();
         for arg_type in arg_types {
             match arg_type {
@@ -125,13 +117,6 @@ impl ScalarUDFImpl for CosineDistance {
 fn cosine_distance_inner(args: &[ArrayRef]) -> DataFusionResult<ArrayRef> {
     if args.len() != 2 {
         return exec_err!("{COSINE_DISTANCE_UDF_NAME} expects exactly two arguments");
-    }
-
-    // Fast path: both args are FixedSizeList<Float32, N> with matching N.
-    if is_fixed_size_list_f32(args[0].data_type()) && is_fixed_size_list_f32(args[1].data_type()) {
-        // simsimd's `f32::cosine` returns `1 - cos_sim` in `[0, 2]`.
-        // The original Spice convention rescales to `[0, 1]`.
-        return compute_fsl_f32(args, Kernel::CosineRaw, |v| v / 2.0);
     }
 
     match (&args[0].data_type(), &args[1].data_type()) {
