@@ -47,7 +47,8 @@ use datafusion::{
 };
 
 use datafusion_expr::{
-    LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, binary_expr, col, ident,
+    LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, TableProviderFilterPushDown,
+    binary_expr, col, ident,
 };
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use futures::FutureExt;
@@ -61,7 +62,7 @@ use search::generation::util::get_primary_keys;
 use std::{
     any::Any,
     cmp::min,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, LazyLock, Weak},
 };
 
@@ -901,6 +902,33 @@ impl TableProvider for VectorSearchUDTFProvider {
         TableType::View
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        let schema = self.underlying.schema();
+        let base_field_names: HashSet<&str> =
+            schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        filters
+            .iter()
+            .map(|f| {
+                // Only push down filters whose columns all exist in the underlying table.
+                // Filters on computed columns (e.g. _score) are not pushable.
+                let pushable = f
+                    .column_refs()
+                    .iter()
+                    .all(|c| base_field_names.contains(c.name()));
+
+                Ok(if pushable {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                })
+            })
+            .collect()
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -1077,11 +1105,22 @@ fn alias_value_to_match(
 
 #[cfg(test)]
 mod tests {
-    use super::{VectorSearchTableFunc, closest_column};
+    use super::{VectorSearchTableFunc, VectorSearchTableFuncArgs, closest_column};
+    use crate::embeddings::udtf::VectorSearchUDTFProvider;
+    use crate::model::EmbeddingModelStore;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::TableProvider;
+    use datafusion::datasource::MemTable;
     use datafusion::prelude::Expr;
     use datafusion::scalar::ScalarValue;
+    use datafusion::sql::TableReference;
+    use datafusion_expr::TableProviderFilterPushDown;
     use datafusion_expr::expr::ScalarFunction;
+    use datafusion_expr::{col, lit};
+    use search::SEARCH_SCORE_COLUMN_NAME;
+    use std::collections::HashMap;
     use std::sync::Arc;
+    use tokio::sync::RwLock;
 
     fn fields(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| (*s).to_string()).collect()
@@ -1159,5 +1198,119 @@ mod tests {
         let q = Expr::ScalarFunction(ScalarFunction::new_udf(Arc::clone(&make_array), vec![]));
         let err = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect_err("expected rejection");
         assert!(err.to_string().contains("at least one query string"));
+    }
+
+    /// Create a minimal `VectorSearchUDTFProvider` with the given underlying schema for testing.
+    fn make_provider(schema: Schema) -> VectorSearchUDTFProvider {
+        let schema = Arc::new(schema);
+        let underlying: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("valid MemTable"));
+        VectorSearchUDTFProvider {
+            args: VectorSearchTableFuncArgs {
+                tbl: TableReference::bare("test_table"),
+                query: "test query".to_string(),
+                queries: vec!["test query".to_string()],
+                column: None,
+                limit: Some(5),
+                include_score: Some(true),
+                distance_metric: None,
+            },
+            underlying,
+            embedded_columns: HashMap::new(),
+            embedding_models: Arc::new(RwLock::new(EmbeddingModelStore::default())),
+        }
+    }
+
+    #[test]
+    fn test_filter_pushdown_base_column() {
+        let provider = make_provider(Schema::new(vec![
+            Field::new("review_date", DataType::Date32, false),
+            Field::new("review_body", DataType::Utf8, false),
+        ]));
+
+        let filter = col("review_date").gt(lit("2015-08-30"));
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(result, vec![TableProviderFilterPushDown::Exact]);
+    }
+
+    #[test]
+    fn test_filter_pushdown_computed_column_unsupported() {
+        let provider = make_provider(Schema::new(vec![Field::new(
+            "review_date",
+            DataType::Date32,
+            false,
+        )]));
+
+        let filter = col(SEARCH_SCORE_COLUMN_NAME).gt(lit(0.5));
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(result, vec![TableProviderFilterPushDown::Unsupported]);
+    }
+
+    #[test]
+    fn test_filter_pushdown_mixed_filters() {
+        let provider = make_provider(Schema::new(vec![
+            Field::new("review_date", DataType::Date32, false),
+            Field::new("star_rating", DataType::Int32, false),
+        ]));
+
+        let base_filter = col("review_date").gt(lit("2015-08-30"));
+        let score_filter = col(SEARCH_SCORE_COLUMN_NAME).gt(lit(0.5));
+        let multi_base_filter = col("star_rating").gt_eq(lit(4));
+
+        let result = provider
+            .supports_filters_pushdown(&[&base_filter, &score_filter, &multi_base_filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(
+            result,
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_filter_pushdown_mixed_column_expr_unsupported() {
+        let provider = make_provider(Schema::new(vec![Field::new(
+            "review_date",
+            DataType::Date32,
+            false,
+        )]));
+
+        // A filter referencing both a base column and a computed column should not be pushed down.
+        let filter = col("review_date")
+            .gt(lit("2015-08-30"))
+            .and(col(SEARCH_SCORE_COLUMN_NAME).gt(lit(0.5)));
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(result, vec![TableProviderFilterPushDown::Unsupported]);
+    }
+
+    #[test]
+    fn test_filter_pushdown_constant_expr_exact() {
+        let provider = make_provider(Schema::new(vec![Field::new(
+            "review_date",
+            DataType::Date32,
+            false,
+        )]));
+
+        // A constant expression with no column refs (e.g. `WHERE true`) references no computed
+        // columns, so it is safe to push down — consistent with EmbeddingTable behavior.
+        let filter = lit(true);
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(result, vec![TableProviderFilterPushDown::Exact]);
     }
 }
