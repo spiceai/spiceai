@@ -16,7 +16,7 @@ expression: resp?
   {
     "id": 948,
     "_match": "\\times 2 \\times 2 \\times 2 = 32\\)",
-    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.556
+    "trunc(vector_search(qs_view, Utf8(\"second\"))._score,Int64(3))": 0.557
   },
   {
     "id": 1277,
