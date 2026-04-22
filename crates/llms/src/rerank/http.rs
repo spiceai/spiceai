@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 
 use super::{Error, ModelCallFailedSnafu, Rerank, Result};
+use crate::provider::create_http_client;
 use snafu::ResultExt;
 
 /// Shared Cohere-compatible rerank response. Providers that deviate (e.g.
@@ -109,7 +110,7 @@ impl HttpReranker {
     #[must_use]
     pub fn new(name: impl Into<String>, endpoint: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: create_http_client().unwrap_or_default(),
             endpoint: endpoint.into(),
             name: name.into(),
             model_id: None,

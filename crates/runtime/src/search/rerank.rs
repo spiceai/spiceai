@@ -90,8 +90,11 @@ pub const RERANK_SCORE_COLUMN: &str = "rerank_score";
 
 /// Upper bound on the number of candidate rows a single `rerank()` invocation
 /// will score. Guards the bare-table path (`FROM rerank(tbl, ...)`) against
-/// accidentally dispatching tens of thousands of remote LLM calls. Callers who
-/// deliberately want a larger pool must set `limit => N` explicitly.
+/// accidentally dispatching tens of thousands of remote LLM calls, and acts as
+/// a defensive ceiling for nested search UDTFs whose `limit =>` isn't set.
+/// The rerank's own `limit =>` governs output size only — it intentionally does
+/// not shrink the candidate pool, so the recall-then-rerank workflow can pass
+/// a larger inner `limit =>` and a smaller outer `limit =>`.
 const DEFAULT_MAX_CANDIDATES: usize = 1000;
 
 /// Parsed form of a `rerank(...)` invocation, with auto-propagation resolved.
@@ -208,7 +211,7 @@ fn is_named_arg(e: &Expr) -> bool {
     }
 }
 
-fn named_param<'a>(e: &'a Expr) -> Option<(&'a str, &'a Expr)> {
+fn named_param(e: &Expr) -> Option<(&str, &Expr)> {
     match e {
         Expr::Literal(_, Some(meta)) => meta
             .inner()
@@ -413,6 +416,7 @@ impl TableFunctionImpl for RerankTableFunc {
         // delegate to the session's table-function registry — exactly how
         // `rrf` composes its children, so any future search UDTF is picked up
         // for free.
+        let input_is_nested = matches!(&parsed.input, RerankInput::NestedUdtf(_));
         let input_provider: Arc<dyn TableProvider> = match &parsed.input {
             RerankInput::NestedUdtf(sf) => self
                 .session_context
@@ -426,6 +430,7 @@ impl TableFunctionImpl for RerankTableFunc {
         Ok(Arc::new(RerankUDTFProvider {
             args: parsed,
             input: input_provider,
+            input_is_nested,
             rerankers: Arc::clone(&self.rerankers),
             chat_models: Arc::clone(&self.chat_models),
         }))
@@ -463,6 +468,13 @@ impl ScalarUDFImpl for RerankTableFunc {
 pub struct RerankUDTFProvider {
     args: RerankTableFuncArgs,
     input: Arc<dyn TableProvider>,
+    /// True when `args.input` was a nested search UDTF (`vector_search`,
+    /// `text_search`, `rrf`). The UDTF already caps its own output via its
+    /// `limit` argument, so we let it decide the candidate pool size rather
+    /// than pushing the rerank's `limit` (which is an *output* cap) into the
+    /// inner scan. Bare-table inputs have no such cap, so we apply
+    /// `DEFAULT_MAX_CANDIDATES` defensively.
+    input_is_nested: bool,
     rerankers: Arc<RwLock<RerankerModelStore>>,
     chat_models: Arc<RwLock<ChatModelStore>>,
 }
@@ -627,25 +639,33 @@ impl TableProvider for RerankUDTFProvider {
             ))
         })?;
 
-        // Cap the candidate pool fed into the reranker. Reranking is O(N) in
-        // remote calls / token cost, so an unbounded input — e.g.
-        // `rerank(big_table, ...)` with no `limit =>` — could accidentally
-        // dispatch tens of thousands of requests. Use the caller-supplied
-        // `limit` as the pool size when present; otherwise fall back to
-        // `DEFAULT_MAX_CANDIDATES` (which the user-visible `limit` further
-        // constrains after reranking). Push the cap into the input scan as an
-        // optimizer hint — index-backed providers (vector/fts) can honor it;
-        // the MemTable output wrapper still enforces it post-rerank.
-        let pool_limit = self.args.limit.unwrap_or(DEFAULT_MAX_CANDIDATES);
-        let input_plan = self.input.scan(state, None, &[], Some(pool_limit)).await?;
+        // Size the candidate pool fed into the reranker. Reranking is O(N) in
+        // remote calls / token cost, so the bare-table path needs a defensive
+        // cap — `rerank(big_table, ...)` with no cap could accidentally
+        // dispatch tens of thousands of requests. For nested search UDTFs the
+        // inner UDTF already caps via its own `limit =>` argument (the whole
+        // "recall then rerank" workflow relies on that: ask vector_search for
+        // K candidates, then rerank down to top-N where N < K), so we must
+        // NOT push the rerank's own `limit` into the inner scan — that would
+        // shrink the candidate pool to the output cap and defeat the recall
+        // stage. `DEFAULT_MAX_CANDIDATES` is still enforced defensively after
+        // materialization in case a nested UDTF returns an unbounded stream.
+        let push_down_limit = if self.input_is_nested {
+            None
+        } else {
+            Some(DEFAULT_MAX_CANDIDATES)
+        };
+        let input_plan = self.input.scan(state, None, &[], push_down_limit).await?;
         let stream = datafusion::physical_plan::execute_stream(input_plan, state.task_ctx())?;
         let mut input_batches: Vec<RecordBatch> = stream.try_collect().await?;
 
-        // Defensive hard cap on materialized candidates, in case the input
-        // provider didn't honor the pushed-down limit.
+        // Defensive hard cap on materialized candidates. Applies to both
+        // nested and bare-table inputs in case the underlying provider
+        // ignored the pushed-down limit (nested UDTFs are only capped by
+        // their own `limit =>`, which may be unset).
         let total: usize = input_batches.iter().map(RecordBatch::num_rows).sum();
-        if total > pool_limit {
-            input_batches = truncate_batches(input_batches, pool_limit);
+        if total > DEFAULT_MAX_CANDIDATES {
+            input_batches = truncate_batches(input_batches, DEFAULT_MAX_CANDIDATES);
         }
 
         // Concatenate for a single pass through the reranker.

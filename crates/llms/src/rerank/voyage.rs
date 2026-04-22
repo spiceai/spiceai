@@ -27,6 +27,7 @@ use std::fmt::Debug;
 
 use super::http::{CohereLikeResult, scores_from_results};
 use super::{Error, ModelCallFailedSnafu, Rerank, Result};
+use crate::provider::create_http_client;
 use snafu::ResultExt;
 
 const DEFAULT_ENDPOINT: &str = "https://api.voyageai.com/v1/rerank";
@@ -66,7 +67,7 @@ impl VoyageReranker {
     #[must_use]
     pub fn new(name: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: create_http_client().unwrap_or_default(),
             endpoint: DEFAULT_ENDPOINT.to_string(),
             name: name.into(),
             model_id: DEFAULT_MODEL.to_string(),

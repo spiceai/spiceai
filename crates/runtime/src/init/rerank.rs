@@ -21,7 +21,14 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use crate::{Runtime, model::try_to_rerank_model, status};
+use opentelemetry::KeyValue;
+
+use crate::{
+    Runtime, metrics,
+    model::{ENABLE_MODEL_SUPPORT_MESSAGE, rerank::HealthFailedSnafu, try_to_rerank_model},
+    status,
+};
+use snafu::ResultExt;
 
 impl Runtime {
     pub(crate) async fn load_rerankers(&self) {
@@ -33,19 +40,38 @@ impl Runtime {
             return;
         }
 
+        if !cfg!(feature = "models") {
+            tracing::error!(
+                "Cannot load rerankers without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}"
+            );
+            return;
+        }
+
         for reranker in &app.rerankers {
             self.status
-                .update_embedding(&reranker.name, status::ComponentStatus::Initializing);
-            match try_to_rerank_model(reranker, Arc::clone(&self.secrets)).await {
+                .update_reranker(&reranker.name, status::ComponentStatus::Initializing);
+            let load_result = async {
+                let rr = try_to_rerank_model(reranker, Arc::clone(&self.secrets)).await?;
+                rr.health().await.context(HealthFailedSnafu {
+                    name: reranker.name.clone(),
+                })?;
+                Ok::<_, crate::model::rerank::Error>(rr)
+            }
+            .await;
+
+            match load_result {
                 Ok(r) => {
                     let mut rerankers = self.rerankers.write().await;
                     rerankers.insert(reranker.name.clone(), r);
                     tracing::info!("Reranker Model {} ready", reranker.name);
+                    metrics::rerankers::COUNT
+                        .add(1, &[KeyValue::new("reranker", reranker.name.clone())]);
                     self.status
-                        .update_embedding(&reranker.name, status::ComponentStatus::Ready);
+                        .update_reranker(&reranker.name, status::ComponentStatus::Ready);
                 }
                 Err(e) => {
-                    self.status.update_embedding(
+                    metrics::rerankers::LOAD_ERROR.add(1, &[]);
+                    self.status.update_reranker(
                         &reranker.name,
                         status::ComponentStatus::error_with_message(e.to_string()),
                     );
