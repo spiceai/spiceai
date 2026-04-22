@@ -44,6 +44,14 @@ build-spidapter-dev:
 build-spidapter:
 	cargo build --release -p spidapter --all-features
 
+.PHONY: build-cayenne-flightsql-dev
+build-cayenne-flightsql-dev:
+	cargo build -p cayenne-flightsql --all-features
+
+.PHONY: build-cayenne-flightsql
+build-cayenne-flightsql:
+	cargo build --release -p cayenne-flightsql --all-features
+
 .PHONY: ci
 ci:
 	make -C bin/spice
@@ -199,6 +207,7 @@ check-rust-features:
 	cargo check $(CARGO_PROFILE) --no-default-features --features delta_lake
 	cargo check $(CARGO_PROFILE) --no-default-features --features dremio
 	cargo check $(CARGO_PROFILE) --no-default-features --features clickhouse
+	cargo check $(CARGO_PROFILE) --no-default-features --features cosmosdb
 	cargo check $(CARGO_PROFILE) --no-default-features --features debezium
 	cargo check $(CARGO_PROFILE) --no-default-features --features runtime/openapi
 	cargo check $(CARGO_PROFILE) --no-default-features --features dynamodb
@@ -245,7 +254,7 @@ display-deps:
 # Default install includes models. Use -data suffix variants to build without models.
 # Data-only features (default features minus models)
 # Note: postgres-accel enables the PostgreSQL data accelerator (separate from postgres connector)
-SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,pingora,scylladb
+SPICED_DATA_FEATURES := duckdb,postgres,postgres-accel,sqlite,mysql,flightsql,delta_lake,databricks,dremio,clickhouse,cosmosdb,sharepoint,snapshots,snowflake,spark,ftp,sftp,debezium,kafka,anonymous_telemetry,mssql,dynamodb,imap,alloc-snmalloc,oracle,runtime/s3_vectors,mongodb,iceberg-write,turso,smb,pingora,scylladb
 
 .PHONY: install
 install: build
@@ -334,6 +343,16 @@ install-spidapter-dev: build-spidapter-dev
 install-spidapter: build-spidapter
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spidapter ~/.spice/bin/spidapter
+
+.PHONY: install-cayenne-flightsql-dev
+install-cayenne-flightsql-dev: build-cayenne-flightsql-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/debug/cayenne-flightsql ~/.spice/bin/cayenne-flightsql
+
+.PHONY: install-cayenne-flightsql
+install-cayenne-flightsql: build-cayenne-flightsql
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/cayenne-flightsql ~/.spice/bin/cayenne-flightsql
 
 .PHONY: install-cli
 install-cli: build-cli

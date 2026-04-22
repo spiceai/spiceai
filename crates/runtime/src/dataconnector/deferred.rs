@@ -65,6 +65,16 @@ impl DataConnector for DeferredConnector {
         Ok(Arc::new(self.clone()))
     }
 
+    async fn register_object_stores(
+        &self,
+        dataset: &Dataset,
+        runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> super::DataConnectorResult<()> {
+        self.inner
+            .register_object_stores(dataset, runtime_env)
+            .await
+    }
+
     fn initialization(&self) -> ComponentInitialization {
         ComponentInitialization::OnTrigger
     }

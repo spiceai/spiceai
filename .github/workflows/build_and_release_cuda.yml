@@ -62,7 +62,7 @@ on:
 jobs:
   setup-matrix:
     name: Setup CUDA matrix
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
@@ -72,34 +72,37 @@ jobs:
         id: setup-matrix
         with:
           script: |
+            const isTaggedRelease = context.ref.startsWith('refs/tags/v');
+            const runner = isTaggedRelease ? "ubuntu-24.04-16core" : "spiceai-dev-large-runners";
+
             const matrix = [
               {
                 compute_cap: "80",
-                runner: "spiceai-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "86",
-                runner: "spiceai-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "87",
-                runner: "spiceai-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "89",
-                runner: "spiceai-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               },
               {
                 compute_cap: "90",
-                runner: "spiceai-large-runners",
+                runner: runner,
                 target_os: "linux",
                 target_arch: "x86_64"
               }
@@ -233,7 +236,7 @@ jobs:
       ARTIFACT_DIR: ./release
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 

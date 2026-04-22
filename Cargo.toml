@@ -65,6 +65,7 @@ members = [
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
     "tools/flight-cookie-server/",
+    "tools/cayenne-flightsql/",
     "tools/otelpublisher/",
     "tools/spicepodschema/",
     "tools/spiceschema",

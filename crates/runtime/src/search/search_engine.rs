@@ -149,8 +149,11 @@ impl SearchEngine {
                 });
             };
 
-            // Use UDTF for non-chunked `EmbeddingTable`.
-            if !embedding_table.is_chunked(embedding_column) {
+            // Use UDTF for scalar non-chunked `EmbeddingTable`. Both
+            // chunked-scalar and multi-vector (list-typed) sources need
+            // the UNNEST-based non-indexed search path.
+            let is_multi_vector = embedding_table.is_multi_vector(embedding_column);
+            if !embedding_table.is_chunked(embedding_column) && !is_multi_vector {
                 return Ok(Arc::new(VectorUDTFGeneration::new(
                     &self.df,
                     tbl,
@@ -175,14 +178,29 @@ impl SearchEngine {
                 });
             };
 
-            Ok(Arc::new(ChunkedNonIndexVectorGeneration::new(
-                &table_provider,
-                tbl,
-                embed_udf,
-                model_name,
-                primary_keys.to_vec(),
-                embedding_column,
-            )))
+            if is_multi_vector {
+                let aggregation = embedding_table
+                    .multi_vector_aggregation(embedding_column)
+                    .unwrap_or_default();
+                Ok(Arc::new(ChunkedNonIndexVectorGeneration::new_list_multi(
+                    &table_provider,
+                    tbl,
+                    embed_udf,
+                    model_name,
+                    primary_keys.to_vec(),
+                    embedding_column,
+                    aggregation,
+                )))
+            } else {
+                Ok(Arc::new(ChunkedNonIndexVectorGeneration::new(
+                    &table_provider,
+                    tbl,
+                    embed_udf,
+                    model_name,
+                    primary_keys.to_vec(),
+                    embedding_column,
+                )))
+            }
         }
     }
 

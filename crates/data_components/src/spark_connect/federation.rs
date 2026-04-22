@@ -70,6 +70,8 @@ impl SQLExecutor for SparkConnectTableProvider {
             CustomDialectBuilder::new()
                 .with_interval_style(datafusion::sql::unparser::dialect::IntervalStyle::SQLStandard)
                 .with_identifier_quote_style('`')
+                .with_utf8_cast_dtype(datafusion::sql::sqlparser::ast::DataType::String(None))
+                .with_large_utf8_cast_dtype(datafusion::sql::sqlparser::ast::DataType::String(None))
                 .build(),
         )
     }
