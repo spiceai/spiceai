@@ -413,6 +413,19 @@ fn extract_primary_key(
                     index: index.es_index.clone(),
                 })?;
 
+            // A row with any NULL component in a composite key has no stable
+            // identity. Mark those rows as `None` so the null-PK skip logic
+            // (which already handles single-column keys) applies here too.
+            let num_rows = pk.num_rows();
+            let mut row_is_null: Vec<bool> = vec![false; num_rows];
+            for col in pk.columns() {
+                for (i, is_null) in row_is_null.iter_mut().enumerate() {
+                    if col.is_null(i) {
+                        *is_null = true;
+                    }
+                }
+            }
+
             let mut writer = arrow_json::ArrayWriter::new(Vec::new());
             writer
                 .write_batches(&[&pk])
@@ -429,7 +442,14 @@ fn extract_primary_key(
                 })?;
             values
                 .into_iter()
-                .map(|v| serde_json::to_string(&v).map(Some))
+                .enumerate()
+                .map(|(i, v)| {
+                    if row_is_null.get(i).copied().unwrap_or(false) {
+                        Ok(None)
+                    } else {
+                        serde_json::to_string(&v).map(Some)
+                    }
+                })
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .context(IssueWithJsonProcessingSnafu {
                     index: index.es_index.clone(),
@@ -576,8 +596,22 @@ fn create_embedding_array(
 /// The bulk API returns HTTP 200 even when individual documents fail, so we must
 /// inspect `errors` and the per-item `error` fields to surface problems.
 fn inspect_bulk_response(resp: &Value, es_index: &str) -> Result<()> {
-    if resp.get("errors").and_then(Value::as_bool) != Some(true) {
-        return Ok(());
+    // ES _bulk response MUST include a boolean `errors` field. A missing or
+    // non-boolean `errors` indicates an unexpected response shape (e.g. a
+    // truncated response or a proxy layer interfering) — treat that as a
+    // failure rather than silently succeeding.
+    match resp.get("errors").and_then(Value::as_bool) {
+        Some(false) => return Ok(()),
+        Some(true) => {}
+        None => {
+            return Err(Error::BulkIndexItemErrors {
+                index: es_index.to_string(),
+                failures: 1,
+                first: format!(
+                    "Elasticsearch bulk response is missing a boolean `errors` field; got: {resp}"
+                ),
+            });
+        }
     }
 
     let items = resp.get("items").and_then(Value::as_array);
