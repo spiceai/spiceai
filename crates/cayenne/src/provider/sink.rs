@@ -141,7 +141,7 @@ impl DataSink for CayenneDataSink {
     async fn write_all(
         &self,
         data: SendableRecordBatchStream,
-        _context: &Arc<TaskContext>,
+        context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
         // Acquire write lock to serialize all writes (append and overwrite) and
         // prevent concurrent races on catalog state, snapshot IDs, and listing table.
@@ -150,7 +150,9 @@ impl DataSink for CayenneDataSink {
         if self.overwrite == InsertOp::Overwrite {
             self.write_all_overwrite(data).await.map_err(Into::into)
         } else {
-            self.write_all_append(data).await.map_err(Into::into)
+            self.write_all_append(data, context)
+                .await
+                .map_err(Into::into)
         }
     }
 }
@@ -176,7 +178,11 @@ impl CayenneDataSink {
     /// # Errors
     ///
     /// Returns an error if the data cannot be inserted.
-    async fn write_all_append(&self, data: SendableRecordBatchStream) -> super::Result<u64> {
+    async fn write_all_append(
+        &self,
+        data: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+    ) -> super::Result<u64> {
         // Ensure no incomplete write from a previous crash before proceeding.
         // A leftover staging WAL indicates an interrupted file-move operation,
         // meaning the table may contain partial data. Block all writes until resolved.
@@ -320,9 +326,8 @@ impl CayenneDataSink {
                 Arc::clone(&schema),
                 None,
             )?;
-            let ctx = datafusion::prelude::SessionContext::new();
             let buffered_stream =
-                datafusion_physical_plan::execute_stream(buffered_exec, ctx.task_ctx())?;
+                datafusion_physical_plan::execute_stream(buffered_exec, Arc::clone(context))?;
 
             // Chain: yield buffered batches first, then the remaining un-read stream
             let chained_stream =
