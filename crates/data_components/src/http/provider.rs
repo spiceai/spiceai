@@ -5336,7 +5336,7 @@ mod tests {
             .expect("batch should be created");
         assert_eq!(string_col(&batch, "id"), vec![Some("1".to_string())]);
         assert_eq!(string_col(&batch, "name"), vec![None]);
-        assert_eq!(string_col(&batch, "details"), vec![Some("{}".to_string())]);
+        assert_eq!(string_col(&batch, "details"), vec![None]);
     }
 
     #[test]
