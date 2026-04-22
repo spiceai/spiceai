@@ -1,0 +1,896 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+//! `rerank(input, model => 'name', document => 'col', ...)` — a UDTF that
+//! reorders a scored result set by a reranker model's relevance judgements.
+//!
+//! Accepts either a scored search result (nested `vector_search`,
+//! `text_search`, or `rrf` invocation) or a bare table reference. When the
+//! input is a nested search UDTF, the query string is auto-propagated to the
+//! reranker; otherwise the caller must pass `query => '...'` explicitly.
+//!
+//! Model resolution falls back gracefully:
+//!  1. `rerankers` store — used for native cross-encoder providers (Cohere,
+//!     Voyage, Jina, local BGE). Empty on first boot; populated as native
+//!     provider support lands.
+//!  2. `chat_models` store — any registered chat model can be used as a
+//!     reranker via [`llms::rerank::LlmRerank`] with a built-in listwise
+//!     prompt template. No extra configuration required.
+//!
+//! Output schema: `schema(input) ∪ {rerank_score}` (after dropping the input's
+//! `_score`/`fused_score` to avoid confusion). Rows are sorted by
+//! `rerank_score DESC` and limited to the requested `limit` (or all rows).
+
+use std::any::Any;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Weak};
+
+use arrow::array::{Array, ArrayRef, Float32Array, LargeStringArray, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use async_trait::async_trait;
+use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
+use datafusion::common::{Column, exec_err};
+use datafusion::datasource::{MemTable, TableType};
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::prelude::{Expr, SessionContext};
+use datafusion::scalar::ScalarValue;
+use datafusion::sql::TableReference;
+use datafusion_expr::expr::ScalarFunction;
+use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
+use futures::TryStreamExt;
+use llms::rerank::{LlmRerank, LlmStrategy, Rerank, RerankerModelStore};
+use tokio::sync::RwLock;
+
+use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use crate::embeddings::udtf::VECTOR_SEARCH_UDTF_NAME;
+use crate::model::LLMChatCompletionsModelStore as ChatModelStore;
+use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
+use crate::search::rrf::RRF_UDF_NAME;
+use crate::search::util::table_ref_from_column_expr;
+
+pub static RERANK_UDTF_NAME: &str = "rerank";
+
+/// Signature accepts a variadic positional input plus named arguments.
+/// Parameter names are declared so DataFusion v51+ named-arg syntax works.
+pub static RERANK_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
+    let param_names = vec![
+        "input".to_string(),
+        "model".to_string(),
+        "document".to_string(),
+        "query".to_string(),
+        "limit".to_string(),
+        "strategy".to_string(),
+        "prompt_template".to_string(),
+    ];
+    match Signature::user_defined(Volatility::Volatile).with_parameter_names(param_names) {
+        Ok(sig) => sig,
+        Err(_) => Signature::variadic_any(Volatility::Volatile),
+    }
+});
+
+/// Output column for reranker scores. Chosen distinct from `_score` /
+/// `fused_score` so downstream callers can reason about which stage produced
+/// which score (and so `rerank(rrf(...))` preserves `fused_score` for
+/// debugging).
+pub const RERANK_SCORE_COLUMN: &str = "rerank_score";
+
+/// Parsed form of a `rerank(...)` invocation, with auto-propagation resolved.
+#[derive(Debug, Clone)]
+pub struct RerankTableFuncArgs {
+    /// The input provider expression (either a nested search UDTF call or a
+    /// table reference). Resolution happens lazily in `TableFunctionImpl::call`
+    /// so parse errors surface independently of table-existence errors.
+    pub input: RerankInput,
+    /// Reranker model name. Optional when exactly one model is registered.
+    pub model: Option<String>,
+    /// Column containing the text to score. Required.
+    pub document: String,
+    /// Query string. Auto-propagated from a nested search UDTF if omitted.
+    pub query: Option<String>,
+    /// Max rows to return.
+    pub limit: Option<usize>,
+    /// LLM strategy when using an LLM-as-reranker (ignored by native rerankers).
+    pub strategy: Option<LlmStrategy>,
+    /// Optional override of the built-in prompt template for LLM rerankers.
+    pub prompt_template: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RerankInput {
+    /// Nested UDTF call (`vector_search`, `text_search`, or `rrf`). Stored as
+    /// the raw ScalarFunction expression so we can delegate to the session's
+    /// table-function registry — same mechanism `rrf` uses for its children.
+    NestedUdtf(ScalarFunction),
+    /// Bare table reference.
+    Table(TableReference),
+}
+
+/// Scan `input_expr` for a `Utf8` literal we can use as the reranker query.
+///
+/// The traversal matches the nesting rules `rerank` accepts: one level for
+/// search UDTFs, an additional level through `rrf`. Anything else returns
+/// `None` and the caller must supply `query => '...'` explicitly.
+fn extract_query_literal(input_expr: &Expr) -> Option<String> {
+    let Expr::ScalarFunction(sf) = input_expr else {
+        return None;
+    };
+    match sf.func.name() {
+        name if name == VECTOR_SEARCH_UDTF_NAME || name == TEXT_SEARCH_UDTF_NAME => {
+            // vector_search/text_search: 2nd positional is the query literal.
+            // Skip any named args (carrying spice.parameter_name metadata) on
+            // the way to the 2nd positional slot; otherwise `rerank(
+            // vector_search(docs, 'q', distance_metric => 'l2'))` would miss
+            // the query when the named arg lands at index 1.
+            let mut positional = sf.args.iter().filter(|a| !is_named_arg(a));
+            let _tbl = positional.next()?;
+            match positional.next()? {
+                Expr::Literal(ScalarValue::Utf8(Some(q)), _) => Some(q.clone()),
+                _ => None,
+            }
+        }
+        name if name == RRF_UDF_NAME => {
+            // rrf: find the first inner scalar-function and recurse. Alias
+            // wrappers (DataFusion v51+ for named args) are unwrapped first.
+            for arg in &sf.args {
+                let unwrapped = match arg {
+                    Expr::Alias(a) => a.expr.as_ref(),
+                    other => other,
+                };
+                if matches!(unwrapped, Expr::ScalarFunction(_))
+                    && let Some(q) = extract_query_literal(unwrapped)
+                {
+                    return Some(q);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn is_named_arg(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(_, Some(meta)) => meta.inner().contains_key("spice.parameter_name"),
+        Expr::Alias(alias) => alias
+            .metadata
+            .as_ref()
+            .is_some_and(|m| m.inner().contains_key("spice.parameter_name")),
+        _ => false,
+    }
+}
+
+fn named_param<'a>(e: &'a Expr) -> Option<(&'a str, &'a Expr)> {
+    match e {
+        Expr::Literal(_, Some(meta)) => meta
+            .inner()
+            .get("spice.parameter_name")
+            .map(|n| (n.as_str(), e)),
+        Expr::Alias(alias) => alias
+            .metadata
+            .as_ref()
+            .and_then(|m| m.inner().get("spice.parameter_name"))
+            .map(|n| (n.as_str(), alias.expr.as_ref())),
+        _ => None,
+    }
+}
+
+fn parse_limit_scalar(scalar: &ScalarValue) -> DataFusionResult<usize> {
+    match scalar {
+        ScalarValue::Int64(Some(v)) => usize::try_from(*v).map_err(|_| {
+            DataFusionError::Plan(format!(
+                "{RERANK_UDTF_NAME}: limit value {v} is out of range (must be non-negative)."
+            ))
+        }),
+        ScalarValue::UInt64(Some(v)) => usize::try_from(*v).map_err(|_| {
+            DataFusionError::Plan(format!(
+                "{RERANK_UDTF_NAME}: limit value {v} exceeds usize range."
+            ))
+        }),
+        ScalarValue::Int32(Some(v)) => usize::try_from(*v).map_err(|_| {
+            DataFusionError::Plan(format!(
+                "{RERANK_UDTF_NAME}: limit value {v} is out of range (must be non-negative)."
+            ))
+        }),
+        ScalarValue::UInt32(Some(v)) => Ok(*v as usize),
+        _ => Err(DataFusionError::Plan(format!(
+            "{RERANK_UDTF_NAME}: 'limit' must be a non-negative integer, got: {scalar}"
+        ))),
+    }
+}
+
+impl RerankTableFuncArgs {
+    pub fn from_udtf_args(args: &[Expr]) -> DataFusionResult<Self> {
+        let mut named: HashMap<&str, &Expr> = HashMap::new();
+        let mut positional: Vec<&Expr> = Vec::with_capacity(args.len());
+        for a in args {
+            if let Some((name, inner)) = named_param(a) {
+                named.insert(name, inner);
+            } else {
+                positional.push(a);
+            }
+        }
+
+        let input_expr = positional.first().ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "{RERANK_UDTF_NAME} requires an input as the first argument (a search result or table reference)."
+            ))
+        })?;
+
+        let (input, auto_query) = match input_expr {
+            Expr::ScalarFunction(sf) => {
+                let q = extract_query_literal(input_expr);
+                (RerankInput::NestedUdtf(sf.clone()), q)
+            }
+            Expr::Column(c) => {
+                let tbl_ref = table_ref_from_column_expr(c)
+                    .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                    .into();
+                (RerankInput::Table(tbl_ref), None)
+            }
+            other => {
+                return Err(DataFusionError::Plan(format!(
+                    "{RERANK_UDTF_NAME}: first argument must be a search UDTF call (e.g. vector_search, text_search, rrf) or a table reference, got: {other:?}"
+                )));
+            }
+        };
+
+        let model = extract_string_named(&named, "model");
+        let document = extract_string_named(&named, "document").ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "{RERANK_UDTF_NAME}: 'document => <column>' is required (the text column to score against the query)."
+            ))
+        })?;
+        let query_override = extract_string_named(&named, "query");
+        let query = query_override.or(auto_query);
+
+        let limit = match named.get("limit") {
+            Some(Expr::Literal(scalar, _)) => Some(parse_limit_scalar(scalar)?),
+            Some(other) => {
+                return Err(DataFusionError::Plan(format!(
+                    "{RERANK_UDTF_NAME}: 'limit' must be a literal integer, got: {other:?}"
+                )));
+            }
+            None => None,
+        };
+
+        let strategy = match extract_string_named(&named, "strategy") {
+            Some(s) => Some(LlmStrategy::parse(&s).map_err(DataFusionError::Plan)?),
+            None => None,
+        };
+
+        let prompt_template = extract_string_named(&named, "prompt_template");
+
+        Ok(Self {
+            input,
+            model,
+            document,
+            query,
+            limit,
+            strategy,
+            prompt_template,
+        })
+    }
+}
+
+fn extract_string_named(named: &HashMap<&str, &Expr>, key: &str) -> Option<String> {
+    match named.get(key) {
+        Some(Expr::Literal(ScalarValue::Utf8(Some(s)), _)) => Some(s.clone()),
+        // `column` / `strategy` accept identifiers too (`document => content`),
+        // which the Spice DataFusion fork wraps as an Expr::Column under the
+        // named-arg metadata.
+        Some(Expr::Column(Column { name, .. })) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// The UDTF scaffold. Analogous to [`VectorSearchTableFunc`] — holds a weak
+/// reference to the [`DataFusion`] instance plus the model stores needed to
+/// resolve the requested reranker at scan time.
+pub struct RerankTableFunc {
+    df: Weak<DataFusion>,
+    df_ptr: u64,
+    rerankers: Arc<RwLock<RerankerModelStore>>,
+    chat_models: Arc<RwLock<ChatModelStore>>,
+    session_context: Arc<SessionContext>,
+}
+
+impl std::fmt::Debug for RerankTableFunc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RerankTableFunc")
+            .field("df_ptr", &self.df_ptr)
+            .finish()
+    }
+}
+
+impl PartialEq for RerankTableFunc {
+    fn eq(&self, other: &Self) -> bool {
+        self.df_ptr == other.df_ptr
+    }
+}
+
+impl Eq for RerankTableFunc {}
+
+impl std::hash::Hash for RerankTableFunc {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.df_ptr.hash(state);
+    }
+}
+
+impl RerankTableFunc {
+    #[must_use]
+    pub fn new(
+        df: Weak<DataFusion>,
+        session_context: Arc<SessionContext>,
+        rerankers: Arc<RwLock<RerankerModelStore>>,
+        chat_models: Arc<RwLock<ChatModelStore>>,
+    ) -> Self {
+        let df_ptr = df.as_ptr().addr() as u64;
+        Self {
+            df,
+            df_ptr,
+            rerankers,
+            chat_models,
+            session_context,
+        }
+    }
+
+    fn scalar_invocation_error<T>() -> DataFusionResult<T> {
+        exec_err!("{RERANK_UDTF_NAME} does not support scalar invocation.")
+    }
+}
+
+impl TableFunctionImpl for RerankTableFunc {
+    fn call(&self, args: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
+        let parsed = RerankTableFuncArgs::from_udtf_args(args)?;
+
+        let df = self.df.upgrade().ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "{RERANK_UDTF_NAME}: DataFusion instance has been dropped."
+            ))
+        })?;
+
+        // Resolve the input to a concrete TableProvider. For nested UDTFs,
+        // delegate to the session's table-function registry — exactly how
+        // `rrf` composes its children, so any future search UDTF is picked up
+        // for free.
+        let input_provider: Arc<dyn TableProvider> = match &parsed.input {
+            RerankInput::NestedUdtf(sf) => self
+                .session_context
+                .table_function(sf.func.name())
+                .and_then(|udtf| udtf.create_table_provider(&sf.args))?,
+            RerankInput::Table(tbl) => df.get_table_sync(tbl).ok_or_else(|| {
+                DataFusionError::Plan(format!("{RERANK_UDTF_NAME}: table '{tbl}' does not exist."))
+            })?,
+        };
+
+        Ok(Arc::new(RerankUDTFProvider {
+            args: parsed,
+            input: input_provider,
+            rerankers: Arc::clone(&self.rerankers),
+            chat_models: Arc::clone(&self.chat_models),
+        }))
+    }
+}
+
+/// Scalar stub so `rerank(...)` can nest inside other UDTFs (same trick
+/// `vector_search`/`text_search`/`rrf` use for their scalar projection).
+impl ScalarUDFImpl for RerankTableFunc {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        RERANK_UDTF_NAME
+    }
+    fn signature(&self) -> &Signature {
+        &RERANK_SIGNATURE
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> DataFusionResult<DataType> {
+        Self::scalar_invocation_error()
+    }
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
+        Self::scalar_invocation_error()
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> DataFusionResult<Vec<DataType>> {
+        Ok(arg_types.to_vec())
+    }
+}
+
+/// Materialization provider: scans the input, calls the reranker, and returns
+/// an in-memory table sorted by `rerank_score DESC`. Materialization is the
+/// right boundary for reranking — callers have already narrowed candidates
+/// with a recall stage, and rerankers need to see the full candidate set
+/// (listwise) or issue one call per candidate (pointwise).
+pub struct RerankUDTFProvider {
+    args: RerankTableFuncArgs,
+    input: Arc<dyn TableProvider>,
+    rerankers: Arc<RwLock<RerankerModelStore>>,
+    chat_models: Arc<RwLock<ChatModelStore>>,
+}
+
+impl std::fmt::Debug for RerankUDTFProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RerankUDTFProvider")
+            .field("args", &self.args)
+            .finish()
+    }
+}
+
+impl RerankUDTFProvider {
+    /// Build the output schema: input schema, minus `_score` / `fused_score`
+    /// (they'd be confusing alongside `rerank_score`), plus `rerank_score`.
+    fn output_schema(input: &SchemaRef) -> SchemaRef {
+        let mut fields: Vec<Field> = input
+            .fields()
+            .iter()
+            .filter(|f| f.name() != "_score" && f.name() != "fused_score")
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields.push(Field::new(RERANK_SCORE_COLUMN, DataType::Float32, false));
+        Arc::new(Schema::new(fields))
+    }
+
+    /// Pick the reranker model to use. Checks the rerankers store first, then
+    /// falls back to wrapping a chat model in `LlmRerank`.
+    async fn resolve_reranker(&self) -> DataFusionResult<Arc<dyn Rerank>> {
+        // 1. Explicit model name.
+        if let Some(name) = &self.args.model {
+            let rerankers = self.rerankers.read().await;
+            if let Some(rr) = rerankers.get(name) {
+                return Ok(Arc::clone(rr));
+            }
+            drop(rerankers);
+            let chats = self.chat_models.read().await;
+            if let Some(chat) = chats.get(name) {
+                let mut adapter = LlmRerank::new(name, Arc::clone(chat));
+                if let Some(strategy) = self.args.strategy {
+                    adapter = adapter.with_strategy(strategy);
+                }
+                if let Some(tpl) = &self.args.prompt_template {
+                    adapter = adapter.with_prompt_template(Some(tpl.clone()));
+                }
+                return Ok(Arc::new(adapter));
+            }
+            return Err(DataFusionError::Plan(format!(
+                "{RERANK_UDTF_NAME}: model '{name}' not found in rerankers or chat_models."
+            )));
+        }
+
+        // 2. No model name — auto-pick if exactly one is available.
+        let rerankers = self.rerankers.read().await;
+        let chats = self.chat_models.read().await;
+        let total = rerankers.len() + chats.len();
+        match total {
+            0 => Err(DataFusionError::Plan(format!(
+                "{RERANK_UDTF_NAME}: no rerankers or chat models configured. Add one to your Spicepod and reference it via `model => '<name>'`."
+            ))),
+            1 => {
+                if let Some((name, rr)) = rerankers.iter().next() {
+                    let _ = name;
+                    Ok(Arc::clone(rr))
+                } else if let Some((name, chat)) = chats.iter().next() {
+                    let mut adapter = LlmRerank::new(name, Arc::clone(chat));
+                    if let Some(strategy) = self.args.strategy {
+                        adapter = adapter.with_strategy(strategy);
+                    }
+                    if let Some(tpl) = &self.args.prompt_template {
+                        adapter = adapter.with_prompt_template(Some(tpl.clone()));
+                    }
+                    Ok(Arc::new(adapter))
+                } else {
+                    unreachable!("total == 1 but both stores empty")
+                }
+            }
+            _ => Err(DataFusionError::Plan(format!(
+                "{RERANK_UDTF_NAME}: multiple models configured. Specify which with `model => '<name>'`."
+            ))),
+        }
+    }
+
+    /// Extract the configured document column from a record batch as strings.
+    /// Chunked/list-typed columns aren't yet supported — the nested search
+    /// UDTF handles chunking internally, so by the time results reach
+    /// `rerank` the document column is scalar.
+    fn extract_documents(batch: &RecordBatch, document_col: &str) -> DataFusionResult<Vec<String>> {
+        let idx = batch.schema().index_of(document_col).map_err(|_| {
+            DataFusionError::Plan(format!(
+                "{RERANK_UDTF_NAME}: document column '{document_col}' not found in input schema. Available columns: {}.",
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+        let col = batch.column(idx);
+        if let Some(strings) = col.as_any().downcast_ref::<StringArray>() {
+            return Ok((0..strings.len())
+                .map(|i| {
+                    if strings.is_null(i) {
+                        String::new()
+                    } else {
+                        strings.value(i).to_string()
+                    }
+                })
+                .collect());
+        }
+        if let Some(strings) = col.as_any().downcast_ref::<LargeStringArray>() {
+            return Ok((0..strings.len())
+                .map(|i| {
+                    if strings.is_null(i) {
+                        String::new()
+                    } else {
+                        strings.value(i).to_string()
+                    }
+                })
+                .collect());
+        }
+        Err(DataFusionError::Plan(format!(
+            "{RERANK_UDTF_NAME}: document column '{document_col}' must be Utf8 or LargeUtf8, got {:?}.",
+            col.data_type()
+        )))
+    }
+}
+
+#[async_trait]
+impl TableProvider for RerankUDTFProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Self::output_schema(&self.input.schema())
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Temporary
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let query = self.args.query.clone().ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "{RERANK_UDTF_NAME}: query string is required. Either pass a nested search UDTF (e.g. vector_search/text_search/rrf) whose query we can auto-propagate, or set `query => '<text>'` explicitly."
+            ))
+        })?;
+
+        // Scan the input at its native schema (no projection/filters pushed
+        // down yet — the rerank stage inspects the document column so it must
+        // be present, and filters applied before reranking would skew scores
+        // for the caller). Projection/filter/limit on rerank's *output* are
+        // handled after materialization via the MemTable delegate below.
+        let input_plan = self.input.scan(state, None, &[], None).await?;
+        let stream = datafusion::physical_plan::execute_stream(input_plan, state.task_ctx())?;
+        let input_batches: Vec<RecordBatch> = stream.try_collect().await?;
+
+        // Concatenate and extract documents. Reranking is O(candidates) so a
+        // single concatenated batch is fine — callers shouldn't be reranking
+        // millions of rows.
+        let input_schema = self.input.schema();
+        let concatenated = if input_batches.is_empty() {
+            RecordBatch::new_empty(Arc::clone(&input_schema))
+        } else {
+            arrow::compute::concat_batches(&input_schema, input_batches.iter())
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+        };
+
+        let documents = Self::extract_documents(&concatenated, &self.args.document)?;
+
+        let reranker = self.resolve_reranker().await?;
+        let scores = if documents.is_empty() {
+            Vec::new()
+        } else {
+            reranker
+                .rerank(&query, &documents)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+        };
+
+        if scores.len() != documents.len() {
+            return Err(DataFusionError::Execution(format!(
+                "{RERANK_UDTF_NAME}: reranker returned {} scores for {} documents.",
+                scores.len(),
+                documents.len()
+            )));
+        }
+
+        // Build output schema + batch: drop _score/fused_score, append rerank_score.
+        let output_schema = Self::output_schema(&input_schema);
+        let drop_cols: Vec<usize> = input_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| {
+                if f.name() == "_score" || f.name() == "fused_score" {
+                    None
+                } else {
+                    Some(i)
+                }
+            })
+            .collect();
+        let mut columns: Vec<ArrayRef> = drop_cols
+            .iter()
+            .map(|&i| Arc::clone(concatenated.column(i)))
+            .collect();
+        columns.push(Arc::new(Float32Array::from(scores.clone())) as ArrayRef);
+
+        let unsorted = RecordBatch::try_new(Arc::clone(&output_schema), columns)?;
+
+        // Sort by rerank_score DESC and apply the user-supplied limit. Doing
+        // this before handing off to MemTable avoids an unnecessary round-trip
+        // through DataFusion's sort operator for what is a one-column sort of
+        // a small materialized set.
+        let sorted = sort_by_rerank_score_desc(&unsorted, self.args.limit)?;
+
+        // Delegate projection/filter/outer-limit to MemTable so `SELECT col1,
+        // col2 FROM rerank(...) WHERE ...` pushes down naturally.
+        let mem = MemTable::try_new(output_schema, vec![vec![sorted]])?;
+        mem.scan(state, projection, filters, limit).await
+    }
+}
+
+fn sort_by_rerank_score_desc(
+    batch: &RecordBatch,
+    limit: Option<usize>,
+) -> DataFusionResult<RecordBatch> {
+    use arrow::compute::{SortOptions, sort_to_indices, take};
+
+    let score_idx = batch
+        .schema()
+        .index_of(RERANK_SCORE_COLUMN)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+    let indices = sort_to_indices(
+        batch.column(score_idx),
+        Some(SortOptions {
+            descending: true,
+            nulls_first: false,
+        }),
+        limit,
+    )
+    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+
+    let sorted_columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .map(|c| {
+            take(c, &indices, None).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        })
+        .collect::<DataFusionResult<Vec<_>>>()?;
+
+    RecordBatch::try_new(batch.schema(), sorted_columns)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::logical_expr::expr::FieldMetadata;
+    use datafusion::logical_expr::{Volatility, create_udf};
+    use std::collections::BTreeMap;
+
+    fn lit_utf8(s: &str) -> Expr {
+        Expr::Literal(ScalarValue::Utf8(Some(s.to_string())), None)
+    }
+
+    fn named_lit_utf8(name: &str, value: &str) -> Expr {
+        let meta = FieldMetadata::new(BTreeMap::from([(
+            "spice.parameter_name".to_string(),
+            name.to_string(),
+        )]));
+        Expr::Literal(ScalarValue::Utf8(Some(value.to_string())), Some(meta))
+    }
+
+    fn stub_udf(name: &str) -> Arc<datafusion::logical_expr::ScalarUDF> {
+        Arc::new(create_udf(
+            name,
+            vec![],
+            DataType::Utf8,
+            Volatility::Stable,
+            Arc::new(|_| Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some("x".into()))))),
+        ))
+    }
+
+    fn vector_search_call(query: &str) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf(VECTOR_SEARCH_UDTF_NAME),
+            vec![
+                Expr::Column(Column::new_unqualified("docs")),
+                lit_utf8(query),
+            ],
+        ))
+    }
+
+    fn text_search_call(query: &str) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf(TEXT_SEARCH_UDTF_NAME),
+            vec![
+                Expr::Column(Column::new_unqualified("docs")),
+                lit_utf8(query),
+            ],
+        ))
+    }
+
+    fn rrf_call(children: Vec<Expr>) -> Expr {
+        Expr::ScalarFunction(ScalarFunction::new_udf(stub_udf(RRF_UDF_NAME), children))
+    }
+
+    #[test]
+    fn extract_query_from_vector_search() {
+        let q = extract_query_literal(&vector_search_call("ocelots"));
+        assert_eq!(q.as_deref(), Some("ocelots"));
+    }
+
+    #[test]
+    fn extract_query_from_text_search() {
+        let q = extract_query_literal(&text_search_call("ferrets"));
+        assert_eq!(q.as_deref(), Some("ferrets"));
+    }
+
+    #[test]
+    fn extract_query_from_rrf_uses_first_child() {
+        let q = extract_query_literal(&rrf_call(vec![
+            vector_search_call("badgers"),
+            text_search_call("badgers"),
+        ]));
+        assert_eq!(q.as_deref(), Some("badgers"));
+    }
+
+    #[test]
+    fn extract_query_skips_named_args_in_vector_search() {
+        // vector_search(docs, distance_metric => 'l2', 'pangolins')
+        // — named arg lands at index 1 in the raw arg list, but the query
+        // is still the Utf8 literal at the 2nd positional slot.
+        let named = named_lit_utf8("distance_metric", "l2");
+        let expr = Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf(VECTOR_SEARCH_UDTF_NAME),
+            vec![
+                Expr::Column(Column::new_unqualified("docs")),
+                named,
+                lit_utf8("pangolins"),
+            ],
+        ));
+        assert_eq!(extract_query_literal(&expr).as_deref(), Some("pangolins"));
+    }
+
+    #[test]
+    fn extract_query_returns_none_for_non_search_call() {
+        let unknown = Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf("some_other_fn"),
+            vec![lit_utf8("x")],
+        ));
+        assert_eq!(extract_query_literal(&unknown), None);
+    }
+
+    #[test]
+    fn extract_query_returns_none_for_column_ref() {
+        let col = Expr::Column(Column::new_unqualified("docs"));
+        assert_eq!(extract_query_literal(&col), None);
+    }
+
+    #[test]
+    fn parse_args_requires_document() {
+        let args = vec![vector_search_call("q"), named_lit_utf8("model", "my_model")];
+        let err =
+            RerankTableFuncArgs::from_udtf_args(&args).expect_err("must require document column");
+        assert!(err.to_string().contains("'document =>"));
+    }
+
+    #[test]
+    fn parse_args_auto_propagates_query() {
+        let args = vec![
+            vector_search_call("llamas"),
+            named_lit_utf8("document", "content"),
+            named_lit_utf8("model", "my_model"),
+        ];
+        let parsed = RerankTableFuncArgs::from_udtf_args(&args).expect("parse ok");
+        assert_eq!(parsed.query.as_deref(), Some("llamas"));
+        assert_eq!(parsed.model.as_deref(), Some("my_model"));
+        assert_eq!(parsed.document, "content");
+    }
+
+    #[test]
+    fn parse_args_explicit_query_overrides_auto() {
+        let args = vec![
+            vector_search_call("auto_query"),
+            named_lit_utf8("document", "content"),
+            named_lit_utf8("query", "explicit_query"),
+        ];
+        let parsed = RerankTableFuncArgs::from_udtf_args(&args).expect("parse ok");
+        assert_eq!(parsed.query.as_deref(), Some("explicit_query"));
+    }
+
+    #[test]
+    fn parse_args_bare_table_needs_explicit_query_at_scan() {
+        // A bare Column is a valid input, but `query` stays None until
+        // explicitly provided. Scan-time enforcement is where the error
+        // surfaces; parse-time just records what we have.
+        let args = vec![
+            Expr::Column(Column::new_unqualified("tickets")),
+            named_lit_utf8("document", "body"),
+        ];
+        let parsed = RerankTableFuncArgs::from_udtf_args(&args).expect("parse ok");
+        assert!(matches!(parsed.input, RerankInput::Table(_)));
+        assert_eq!(parsed.query, None);
+    }
+
+    #[test]
+    fn parse_args_parses_strategy() {
+        let args = vec![
+            vector_search_call("q"),
+            named_lit_utf8("document", "content"),
+            named_lit_utf8("strategy", "pointwise"),
+        ];
+        let parsed = RerankTableFuncArgs::from_udtf_args(&args).expect("parse ok");
+        assert_eq!(parsed.strategy, Some(LlmStrategy::Pointwise));
+    }
+
+    #[test]
+    fn parse_args_parses_limit() {
+        let meta = FieldMetadata::new(BTreeMap::from([(
+            "spice.parameter_name".to_string(),
+            "limit".to_string(),
+        )]));
+        let args = vec![
+            vector_search_call("q"),
+            named_lit_utf8("document", "content"),
+            Expr::Literal(ScalarValue::UInt64(Some(10)), Some(meta)),
+        ];
+        let parsed = RerankTableFuncArgs::from_udtf_args(&args).expect("parse ok");
+        assert_eq!(parsed.limit, Some(10));
+    }
+
+    #[test]
+    fn output_schema_drops_score_columns_and_adds_rerank_score() {
+        let input_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("content", DataType::Utf8, false),
+            Field::new("_score", DataType::Float32, true),
+            Field::new("fused_score", DataType::Float64, true),
+        ]));
+        let out = RerankUDTFProvider::output_schema(&input_schema);
+        let names: Vec<&str> = out.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["id", "content", RERANK_SCORE_COLUMN]);
+    }
+
+    #[test]
+    fn sort_by_rerank_score_orders_desc_and_applies_limit() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(RERANK_SCORE_COLUMN, DataType::Float32, false),
+        ]));
+        let ids = Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef;
+        let scores = Arc::new(Float32Array::from(vec![0.1, 0.9, 0.5])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![ids, scores]).expect("batch");
+
+        let sorted = sort_by_rerank_score_desc(&batch, Some(2)).expect("sort");
+        assert_eq!(sorted.num_rows(), 2);
+        let id_col = sorted
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("strings");
+        assert_eq!(id_col.value(0), "b");
+        assert_eq!(id_col.value(1), "c");
+    }
+}
