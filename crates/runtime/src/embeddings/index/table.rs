@@ -32,9 +32,7 @@ use {
     chunking::ChunkingConfig,
     runtime_datafusion_index::{Index, IndexedTableProvider},
     search::generation::util::get_primary_keys,
-    search::index::{
-        SearchIndex, VectorScanTableProvider, chunking::ChunkedSearchIndex,
-    },
+    search::index::{SearchIndex, VectorScanTableProvider, chunking::ChunkedSearchIndex},
     search::metadata::MetadataColumn,
     snafu::ResultExt,
     spicepod::component::embeddings::EmbeddingChunkConfig,
@@ -385,14 +383,11 @@ async fn wrap_table_as_index_elasticsearch(
             let vector_index = Arc::clone(&idx) as Arc<dyn search::index::VectorIndex>;
 
             provider.underlying = Arc::new(
-                search::index::VectorScanTableProvider::try_new(
-                    provider.underlying,
-                    &vector_index,
-                )
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
+                search::index::VectorScanTableProvider::try_new(provider.underlying, &vector_index)
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
             ) as Arc<dyn TableProvider>;
-            provider = provider
-                .add_index(Arc::clone(&idx) as Arc<dyn runtime_datafusion_index::Index>);
+            provider =
+                provider.add_index(Arc::clone(&idx) as Arc<dyn runtime_datafusion_index::Index>);
         }
     }
 
