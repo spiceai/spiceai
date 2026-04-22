@@ -201,25 +201,25 @@ async fn databricks_permissions_pro_warehouse() -> Result<(), anyhow::Error> {
                 ))
                 // Case 5: Foreign, full access
                 .with_dataset(make_sp_dataset(
-                    "neon_pg_foreign_viktor.public.test_schema_repro",
+                    "spiceai_sandbox_via_serverless.tpch.region",
                     "foreign_full_access",
                     true,
                 ))
                 // Case 6: Foreign, infoschema but no table access
                 .with_dataset(make_sp_dataset(
-                    "neon_pg_foreign_viktor.public.test_schema_repro_2",
+                    "spiceai_sandbox_via_serverless.tpch.nation",
                     "foreign_infoschema_only",
                     true,
                 ))
                 // Case 7: Foreign, table but no infoschema access
                 .with_dataset(make_sp_dataset(
-                    "neon_pg_foreign_viktor.public.test_schema_repro",
+                    "spiceai_sandbox_via_serverless.tpch.region",
                     "foreign_table_only",
                     false,
                 ))
                 // Case 8: Foreign, no access
                 .with_dataset(make_sp_dataset(
-                    "neon_pg_foreign_viktor.public.test_schema_repro_2",
+                    "spiceai_sandbox_via_serverless.tpch.nation",
                     "foreign_no_access",
                     false,
                 ))
@@ -266,7 +266,7 @@ async fn databricks_permissions_classic_foreign_table() -> Result<(), anyhow::Er
         .scope(async {
             let app = AppBuilder::new("databricks_permissions_classic_foreign")
                 .with_dataset(make_classic_dataset(
-                    "neon_pg_foreign_viktor.public.test_schema_repro",
+                    "spiceai_sandbox_via_serverless.tpch.region",
                     "foreign_on_classic",
                 ))
                 .build();
