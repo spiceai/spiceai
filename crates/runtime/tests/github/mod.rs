@@ -241,7 +241,8 @@ fn assert_positive_row_count_at_most_pagination_limit(row_count: usize) {
 
 fn assert_crosses_commits_pagination_boundary(row_count: usize) {
     assert!(
-        row_count > GITHUB_COMMITS_MIN_EXPECTED_PAGE_ROWS && row_count <= GITHUB_COMMITS_PAGINATION_LIMIT,
+        row_count > GITHUB_COMMITS_MIN_EXPECTED_PAGE_ROWS
+            && row_count <= GITHUB_COMMITS_PAGINATION_LIMIT,
         "expected {GITHUB_COMMITS_MIN_EXPECTED_PAGE_ROWS} < num_rows <= {GITHUB_COMMITS_PAGINATION_LIMIT}, got {row_count}"
     );
 }
