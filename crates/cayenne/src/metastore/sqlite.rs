@@ -258,11 +258,12 @@ impl SqliteMetastore {
 
     /// Schema for the `cayenne_table_statistics` table.
     ///
-    /// Stores table-level aggregate statistics as a serialized Vortex `FileStatistics`
-    /// flatbuffer blob. One row per table containing per-column stats (min, max,
-    /// null count, sum, etc.) aggregated across all files. Used by the query optimizer
-    /// for join ordering, aggregation strategies, partition pruning, and distributed
-    /// query planning without needing to access the underlying Vortex files.
+    /// Stores a single row per table holding a serialized Vortex `FileStatistics`
+    /// flatbuffer blob. The row is upserted on every write and currently reflects
+    /// the accumulator from the most recent write (min, max, null count) — a
+    /// last-write-wins snapshot, not an aggregate across every file. Consumers
+    /// must treat these values as optimization hints until cross-write merging
+    /// lands.
     const TABLE_STATISTICS_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_table_statistics (
             table_id TEXT NOT NULL PRIMARY KEY,

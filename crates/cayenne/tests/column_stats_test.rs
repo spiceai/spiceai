@@ -16,10 +16,13 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
-//! Tests for table-level aggregate statistics in the Cayenne metastore.
+//! Tests for table-level statistics in the Cayenne metastore.
 //!
-//! Statistics are stored as serialized Vortex `FileStatistics` blobs,
-//! containing per-column stats (min, max, null count, etc.).
+//! Statistics are stored as serialized Vortex `FileStatistics` blobs
+//! containing per-column min, max, and null count. The row in
+//! `cayenne_table_statistics` is keyed by `table_id` and upserted on every
+//! write, so it currently captures the accumulator from the most recent
+//! write (last-write-wins) rather than an aggregate across every file.
 
 mod common;
 

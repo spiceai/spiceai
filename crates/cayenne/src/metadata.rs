@@ -321,8 +321,10 @@ pub struct CreateTableOptions {
 pub struct TableStatistics {
     /// Table this stats entry belongs to (`UUIDv7`)
     pub table_id: String,
-    /// Serialized Vortex `FileStatistics` flatbuffer bytes containing per-column
-    /// stats (min, max, null count, sum, NaN count, `is_constant`, etc.)
+    /// Serialized Vortex `FileStatistics` flatbuffer bytes. Today the write
+    /// path populates only min, max, and null count per column; other fields
+    /// supported by the Vortex format (sum, NaN count, `is_constant`, etc.)
+    /// remain `Absent` until future writer work fills them in.
     pub statistics_blob: Vec<u8>,
     /// Row count captured by the most recent write's accumulator (not an
     /// aggregate across every file ever produced — see the struct docs).
