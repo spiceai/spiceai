@@ -39,12 +39,9 @@ pub trait PartitionExprResolver: Send + Sync {
     ) -> Result<Expr, DataFusionError>;
 }
 
-/// Queries the source table for its current partition values.
+/// Discovers the values a `table` can have for a given `partition_by` expression.
 ///
-/// Implemented in the runtime crate by wrapping
-/// `cluster::partition::discovery::table_partition_values`, which unwraps the
-/// `AcceleratedTable` source and runs a `SELECT DISTINCT` against the federated
-/// source table.
+/// For >1 `partition_by` value, the cartesian product of individual options is returned.
 #[async_trait]
 pub trait PartitionDiscoverer: Send + Sync {
     async fn table_partition_values(

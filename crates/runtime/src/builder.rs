@@ -19,8 +19,7 @@ use crate::cluster::ExecutorRegistry;
 use crate::cluster::PartitionStore;
 use crate::cluster::ResolvedClusterConfig;
 use crate::cluster::partition;
-use crate::cluster::partition::scheduler_task::PartitionManagementConfig;
-use crate::cluster::partition::service::{AssignmentConfig, PartitionService};
+use crate::cluster::partition::service::PartitionService;
 use crate::config::ClusterRole;
 use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
@@ -284,22 +283,9 @@ impl RuntimeBuilder {
                         PartitionStore::new(Arc::clone(&store)).with_prefix("catalog/partitions/"),
                     ),
                 ));
-                let assignment_config = shared_app
-                    .read()
-                    .await
-                    .as_ref()
-                    .and_then(|app| app.runtime.scheduler.as_ref())
-                    .and_then(|scheduler| scheduler.partition_management.clone())
-                    .and_then(|pm| PartitionManagementConfig::try_from(pm).ok())
-                    .map_or_else(AssignmentConfig::default, |pm_config| AssignmentConfig {
-                        max_assignments_per_cycle: pm_config.max_assignments_per_cycle,
-                        max_partitions_per_executor: pm_config.max_partitions_per_executor,
-                        discovery_timeout: pm_config.discovery_timeout,
-                    });
                 let partition_service = Arc::new(PartitionService::new(
                     Arc::clone(&partition_store),
                     Arc::clone(&executor_registry),
-                    assignment_config,
                     Arc::clone(&shared_app),
                 ));
 

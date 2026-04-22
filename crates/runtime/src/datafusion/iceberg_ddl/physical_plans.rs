@@ -38,7 +38,7 @@ use spicepod::acceleration::Acceleration;
 
 use super::acceleration_options::DatasetOptions;
 use crate::accelerated_table::AcceleratedTable;
-use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::cluster::ExecutorRegistry;
 use crate::datafusion::DataFusion;
 use crate::datafusion::composed_catalog::ComposedCatalogProvider;
 use data_components::RefreshableCatalogProvider;

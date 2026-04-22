@@ -32,7 +32,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use super::get_cayenne_provider;
-use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::cluster::ExecutorRegistry;
 use arrow::array::{RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::ddl::operations::{self, create_schema, create_table, drop_table};

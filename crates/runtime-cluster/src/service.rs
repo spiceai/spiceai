@@ -48,6 +48,7 @@ use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 use crate::context::PartitionOperations;
 use crate::executor_registry::{self, ExecutorRegistry};
+use crate::scheduler_task_config::PartitionManagementConfig;
 use crate::{PartitionMetadata, PartitionStore, PartitionValue, partition_value_to_bytes, store};
 
 #[derive(Debug, Snafu)]
@@ -183,14 +184,12 @@ struct CommitResult {
 
 /// Shared partition infrastructure for discovery and assignment operations.
 ///
-/// Holds the [`PartitionStore`], executor registry, app reference, and
-/// assignment configuration. Public methods are `seed_table`, `reconcile_table`,
+/// Holds the [`PartitionStore`], executor registry, and app reference. Public methods are `seed_table`, `reconcile_table`,
 /// and `reconcile_all`; everything else is an internal composition helper.
 /// Methods take `&dyn PartitionOperations` to avoid a concrete `DataFusion` dependency.
 pub struct PartitionService {
     pub partition_store: Arc<PartitionStore>,
     pub executor_registry: Arc<ExecutorRegistry>,
-    pub config: AssignmentConfig,
     pub app: Arc<RwLock<Option<Arc<App>>>>,
 }
 
@@ -199,14 +198,36 @@ impl PartitionService {
     pub fn new(
         partition_store: Arc<PartitionStore>,
         executor_registry: Arc<ExecutorRegistry>,
-        config: AssignmentConfig,
         app: Arc<RwLock<Option<Arc<App>>>>,
     ) -> Self {
         Self {
             partition_store,
             executor_registry,
-            config,
             app,
+        }
+    }
+
+    fn config_from_app(app: &App) -> AssignmentConfig {
+        let Some(pm) = app
+            .runtime
+            .scheduler
+            .as_ref()
+            .and_then(|s| s.partition_management.clone())
+        else {
+            return AssignmentConfig::default();
+        };
+        match PartitionManagementConfig::try_from(pm) {
+            Ok(pm_config) => AssignmentConfig {
+                max_assignments_per_cycle: pm_config.max_assignments_per_cycle,
+                max_partitions_per_executor: pm_config.max_partitions_per_executor,
+                discovery_timeout: pm_config.discovery_timeout,
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "Invalid runtime.scheduler.partition_management config; using defaults: {e}"
+                );
+                AssignmentConfig::default()
+            }
         }
     }
 
@@ -229,11 +250,16 @@ impl PartitionService {
         partition_by: &[PartitionedBy],
         ops: &dyn PartitionOperations,
     ) -> Result<()> {
+        let config = {
+            let app = self.app.read().await.clone();
+            app.as_deref()
+                .map_or_else(AssignmentConfig::default, Self::config_from_app)
+        };
         self.partition_store
             .refresh()
             .await
             .context(PartitionStoreRefreshSnafu)?;
-        self.record_diff(table, partition_by, ops).await?;
+        self.record_diff(table, partition_by, ops, &config).await?;
         Ok(())
     }
 
@@ -259,13 +285,14 @@ impl PartitionService {
         let Some(partition_by) = get_partition_config(&app, table) else {
             return Ok(());
         };
+        let config = Self::config_from_app(&app);
 
         self.partition_store
             .refresh()
             .await
             .context(PartitionStoreRefreshSnafu)?;
 
-        self.record_diff(table, &partition_by, ops).await?;
+        self.record_diff(table, &partition_by, ops, &config).await?;
 
         self.partition_store
             .refresh()
@@ -283,6 +310,7 @@ impl PartitionService {
             &executors,
             ops,
             AssignmentLimit::Unlimited,
+            &config,
         )
         .await
     }
@@ -303,6 +331,7 @@ impl PartitionService {
             tracing::warn!("App not initialized, skipping partition discovery");
             return Ok(());
         };
+        let config = Self::config_from_app(&app);
 
         self.partition_store
             .refresh()
@@ -341,7 +370,7 @@ impl PartitionService {
 
         let mut reconciled_tables: Vec<TableReference> = Vec::new();
         for (table, partition_by) in tables {
-            match self.record_diff(&table, &partition_by, ops).await {
+            match self.record_diff(&table, &partition_by, ops, &config).await {
                 Ok(_) => reconciled_tables.push(table),
                 Err(e) => {
                     tracing::warn!(table = %table, error = %e, "Per-table diff failed, continuing");
@@ -368,6 +397,7 @@ impl PartitionService {
             &executors,
             ops,
             AssignmentLimit::PerCycleCap,
+            &config,
         )
         .await
     }
@@ -387,10 +417,11 @@ impl PartitionService {
         table: &TableReference,
         partition_by: &[PartitionedBy],
         ops: &dyn PartitionOperations,
+        config: &AssignmentConfig,
     ) -> Result<PartitionDiff> {
         // Query source partitions via the trait (with timeout).
         let source_partitions = match timeout(
-            self.config.discovery_timeout,
+            config.discovery_timeout,
             ops.table_partition_values(table, partition_by),
         )
         .await
@@ -503,6 +534,7 @@ impl PartitionService {
         executors: &[String],
         ops: &dyn PartitionOperations,
         limit: AssignmentLimit,
+        config: &AssignmentConfig,
     ) -> Result<()> {
         let state = CycleState {
             executor_ids: executors.to_vec(),
@@ -518,7 +550,7 @@ impl PartitionService {
             unassigned,
             &state,
             &self.partition_store,
-            &self.config,
+            config,
             limit,
         );
         let CommitResult { committed, failed } =

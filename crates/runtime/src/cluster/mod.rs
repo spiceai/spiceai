@@ -406,17 +406,11 @@ mod scheduler_registry;
 mod servers;
 mod service;
 
-// Re-export executor registry types from `runtime-cluster` so in-crate callers can keep
-// importing them from `crate::cluster` (the executor_registry module moved out of runtime).
-pub mod executor_registry {
-    pub use runtime_cluster::executor_registry::*;
-}
-
 use crate::cluster::partition::service::PartitionService;
 pub use accelerated_partition_provider::AcceleratedPartitionProvider;
 pub use control_stream_client::ControlStreamManager;
 pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
-pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider};
+pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
 pub use scheduler_registry::start_scheduler_registry;
 pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
@@ -824,7 +818,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     };
 
     if let Some(config) = app.runtime.scheduler.clone() {
-        if let Some(_partition_store) = rt.partition_store() {
+        if rt.partition_store().is_some() {
             // Validate all accelerated datasets/views have partition keys
             // for distributed partition management.
             partition::validate_partition_keys(&app).map_err(|e| {
@@ -837,15 +831,14 @@ pub(crate) async fn initialize_cluster_scheduler_future(
             // PartitionService to have been wired onto `DataFusion` during
             // builder setup.
             let df = rt.datafusion();
-            if let Some(partition_service) = df.partition_service.as_ref() {
-                if let Err(err) =
+            if let Some(partition_service) = df.partition_service.as_ref()
+                && let Err(err) =
                     partition::initialize_partition_metadata(partition_service, &df, &app).await
-                {
-                    tracing::warn!(
-                        "Failed to initialize partition metadata during scheduler startup: {err}"
-                    );
-                }
-            } else {
+            {
+                tracing::warn!(
+                    "Failed to initialize partition metadata during scheduler startup: {err}"
+                );
+            } else if df.partition_service.is_none() {
                 tracing::warn!(
                     "PartitionService not initialized on DataFusion; skipping partition metadata seeding"
                 );

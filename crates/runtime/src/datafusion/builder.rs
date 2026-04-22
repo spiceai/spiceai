@@ -25,7 +25,7 @@ use super::{
     SPICE_RUNTIME_SCHEMA,
 };
 use crate::cluster::ResolvedClusterConfig;
-use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::cluster::ExecutorRegistry;
 use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, status};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;

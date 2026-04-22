@@ -2146,9 +2146,9 @@ impl DataFusion {
         // Run on-demand partition discovery before forwarding the refresh command.
         // This ensures that any new partition values in the source data are discovered,
         // assigned to executors, and executors are notified -- before they receive the
-        // refresh command. Without this, the periodic partition management task (which
-        // runs on a 30-second interval) might not have discovered new partitions yet,
-        // causing executors to drop data from unassigned partitions. (fixes #10075)
+        // refresh command. Without this, the periodic partition management task might
+        // not have discovered new partitions yet, causing executors to ignore data from
+        // unassigned partitions. (fixes #10075)
         partition_service
             .reconcile_table(dataset_name, self.as_ref())
             .await
