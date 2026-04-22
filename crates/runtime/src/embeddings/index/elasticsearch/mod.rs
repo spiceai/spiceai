@@ -511,7 +511,17 @@ async fn ensure_index_with_mapping(
             let indexable = matches!(c, MetadataColumn::Filterable(_));
             obj.insert("index".to_string(), serde_json::Value::Bool(indexable));
             if !indexable {
-                obj.insert("doc_values".to_string(), serde_json::Value::Bool(false));
+                // `doc_values` is not supported on `text` fields in Elasticsearch;
+                // attempting to set it causes mapping creation/updates to fail.
+                // For `text` mappings (and other field types that don't support
+                // doc_values), skip the override — `_source` retrieval still works.
+                let field_type = obj
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if field_type != "text" {
+                    obj.insert("doc_values".to_string(), serde_json::Value::Bool(false));
+                }
             }
         }
         properties.insert(name, mapping);

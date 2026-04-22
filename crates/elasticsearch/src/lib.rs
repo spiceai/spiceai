@@ -21,6 +21,7 @@ limitations under the License.
 //! Provides typed access to the Elasticsearch APIs needed by the data connector:
 //! index mappings, search (query DSL, kNN, full-text), and bulk operations.
 
+use bytes::Bytes;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -417,7 +418,11 @@ impl Client {
             ndjson.push('\n');
         }
         let url_ref = &url;
-        let ndjson_ref = &ndjson;
+        // Freeze the NDJSON payload into `Bytes` so retries reuse the same
+        // underlying buffer (cheap refcount clone) instead of copying the
+        // entire payload on every attempt.
+        let ndjson_bytes = Bytes::from(ndjson);
+        let ndjson_ref = &ndjson_bytes;
         self.with_retry("bulk_index", |c| async move {
             let resp = c
                 .auth(c.http.post(url_ref))
