@@ -18,7 +18,10 @@ mod discovery;
 pub mod executor_selection;
 mod manager;
 mod metadata;
-pub use manager::CopyAssignmentsResult;
+pub use manager::{
+    AccelerationsPartitions, AllocationResult, AssignmentRequest, CatalogPartitions,
+    CopyAssignmentsResult, PartitionManager,
+};
 pub mod scheduler_task;
 mod startup;
 pub(crate) mod write_through;
@@ -27,23 +30,17 @@ use std::collections::HashMap;
 
 use datafusion::sql::TableReference;
 use datafusion_expr::Expr;
-pub use manager::PartitionManager;
 pub use metadata::{
     PartitionMetadata, PartitionValue, TablePartitionMetadata, partition_value_to_bytes,
 };
 use snafu::Snafu;
 pub use startup::{
-    accelerated_tables, build_partition_metadata_store, executor_request_initial_partitions,
-    initialize_partition_metadata, validate_partition_keys,
+    accelerated_tables, executor_request_initial_partitions, initialize_partition_metadata,
+    validate_partition_keys,
 };
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to build object store for partition metadata: {source}"))]
-    ObjectStoreBuild {
-        source: crate::cluster::scheduler_registry::Error,
-    },
-
     #[snafu(display("Failed to initialize partition metadata for table {table}: {source}"))]
     PartitionMetadataInit {
         table: String,
