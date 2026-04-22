@@ -8,6 +8,21 @@ expression: normalize_search_response(resp)
     {
       "_score": "0.01",
       "data": {
+        "question": "Simplify the expression according to the order of operations.\na) $-|-9|$  \nb) $-(-9)$  \nc) $2-(-6)$  \nd) $2-|-6|$"
+      },
+      "dataset": "spice.public.qs",
+      "matches": {
+        "answer": [
+          "a) $-|-9| = -9$  \nb) $-(-9) = 9$  \nc) $2-(-6) = 2 + 6 = 8$  \nd) $2-|-6| = 2 - 6 = -4$"
+        ]
+      },
+      "primary_key": {
+        "id": 708
+      }
+    },
+    {
+      "_score": "0.01",
+      "data": {
         "question": "In a group of 3 machines where 2 are faulty, what is the probability that the first two machines tested are both faulty?"
       },
       "dataset": "spice.public.qs",
@@ -18,21 +33,6 @@ expression: normalize_search_response(resp)
       },
       "primary_key": {
         "id": 525
-      }
-    },
-    {
-      "_score": "0.01",
-      "data": {
-        "question": "How many multiples of 4 are there between 1 and 30? List them and count the total."
-      },
-      "dataset": "spice.public.qs",
-      "matches": {
-        "answer": [
-          "The multiples of 4 between 1 and 30 are 4, 8, 12, 16, 20, 24, and 28. Counting these, there are $\\boxed{7}$ multiples."
-        ]
-      },
-      "primary_key": {
-        "id": 468
       }
     },
     {
@@ -53,16 +53,16 @@ expression: normalize_search_response(resp)
     {
       "_score": "0.01",
       "data": {
-        "question": "Which base number, when raised to the fifth power, equals thirty-two?"
+        "question": "Evaluate the function \\( h(x) = -3x - 4 \\) at the given values:\na. \\( h(7) \\)\nb. \\( h(-4) \\)"
       },
       "dataset": "spice.public.qs",
       "matches": {
         "answer": [
-          "The base number is \\(\\boxed{2}\\), because \\(2^5 = 2 \\times 2 \\times 2 \\times 2 \\times 2 = 32\\)."
+          "a. \\( h(7) = -3(7) - 4 = -21 - 4 = \\boxed{-25} \\)\nb. \\( h(-4) = -3(-4) - 4 = 12 - 4 = \\boxed{8} \\)"
         ]
       },
       "primary_key": {
-        "id": 1277
+        "id": 255
       }
     }
   ]
