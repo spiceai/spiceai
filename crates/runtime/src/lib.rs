@@ -1243,6 +1243,7 @@ impl Runtime {
 
         // Must be loaded before datasets
         self.load_embeddings().await;
+        self.load_rerankers().await;
 
         // Spawn each component load in its own task to run in parallel
         let task_history = tokio::spawn({

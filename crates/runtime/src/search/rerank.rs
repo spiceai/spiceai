@@ -83,10 +83,16 @@ pub static RERANK_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
 });
 
 /// Output column for reranker scores. Chosen distinct from `_score` /
-/// `fused_score` so downstream callers can reason about which stage produced
-/// which score (and so `rerank(rrf(...))` preserves `fused_score` for
-/// debugging).
+/// `fused_score` so downstream callers can tell which stage produced which
+/// score. The reranker output drops the upstream score columns and keeps only
+/// `rerank_score` — the fresh relevance judgement is what matters.
 pub const RERANK_SCORE_COLUMN: &str = "rerank_score";
+
+/// Upper bound on the number of candidate rows a single `rerank()` invocation
+/// will score. Guards the bare-table path (`FROM rerank(tbl, ...)`) against
+/// accidentally dispatching tens of thousands of remote LLM calls. Callers who
+/// deliberately want a larger pool must set `limit => N` explicitly.
+const DEFAULT_MAX_CANDIDATES: usize = 1000;
 
 /// Parsed form of a `rerank(...)` invocation, with auto-propagation resolved.
 #[derive(Debug, Clone)]
@@ -119,28 +125,26 @@ pub enum RerankInput {
     Table(TableReference),
 }
 
-/// Scan `input_expr` for a `Utf8` literal we can use as the reranker query.
+/// Scan `input_expr` for a query string we can reuse as the reranker query.
 ///
 /// The traversal matches the nesting rules `rerank` accepts: one level for
-/// search UDTFs, an additional level through `rrf`. Anything else returns
-/// `None` and the caller must supply `query => '...'` explicitly.
+/// search UDTFs, an additional level through `rrf`. For `vector_search`, the
+/// 2nd positional slot may be a plain `Utf8` literal (single-query) or a
+/// `make_array(...)` / `List` literal (multi-query / late-interaction); in
+/// both cases we pick the first string. Anything else returns `None` and the
+/// caller must supply `query => '...'` explicitly.
 fn extract_query_literal(input_expr: &Expr) -> Option<String> {
     let Expr::ScalarFunction(sf) = input_expr else {
         return None;
     };
     match sf.func.name() {
         name if name == VECTOR_SEARCH_UDTF_NAME || name == TEXT_SEARCH_UDTF_NAME => {
-            // vector_search/text_search: 2nd positional is the query literal.
-            // Skip any named args (carrying spice.parameter_name metadata) on
-            // the way to the 2nd positional slot; otherwise `rerank(
-            // vector_search(docs, 'q', distance_metric => 'l2'))` would miss
-            // the query when the named arg lands at index 1.
+            // Skip named args (carrying spice.parameter_name metadata) when
+            // counting positional slots so `vector_search(docs, 'q',
+            // distance_metric => 'l2')` still surfaces `q` at the 2nd slot.
             let mut positional = sf.args.iter().filter(|a| !is_named_arg(a));
             let _tbl = positional.next()?;
-            match positional.next()? {
-                Expr::Literal(ScalarValue::Utf8(Some(q)), _) => Some(q.clone()),
-                _ => None,
-            }
+            extract_first_utf8(positional.next()?)
         }
         name if name == RRF_UDF_NAME => {
             // rrf: find the first inner scalar-function and recurse. Alias
@@ -157,6 +161,37 @@ fn extract_query_literal(input_expr: &Expr) -> Option<String> {
                 }
             }
             None
+        }
+        _ => None,
+    }
+}
+
+/// Extract the first string from a query argument. Handles the single-string
+/// form (`'q'`), the `make_array(...)` form (SQL `ARRAY[...]`), and the
+/// `ScalarValue::List` form that a literal array parses into. For multi-query
+/// arrays we pick the first element — the reranker needs a single query and
+/// the first query is the semantically primary one (matching how
+/// `VectorSearchTableFuncArgs.query` is populated).
+fn extract_first_utf8(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Literal(ScalarValue::Utf8(Some(q)), _) => Some(q.clone()),
+        Expr::ScalarFunction(inner) if inner.func.name().eq_ignore_ascii_case("make_array") => {
+            inner.args.iter().find_map(|a| match a {
+                Expr::Literal(ScalarValue::Utf8(Some(q)), _) => Some(q.clone()),
+                _ => None,
+            })
+        }
+        Expr::Literal(ScalarValue::List(arr), _) => {
+            if arr.is_empty() {
+                return None;
+            }
+            let inner = arr.value(0);
+            let strings = inner.as_any().downcast_ref::<StringArray>()?;
+            if strings.is_empty() || strings.is_null(0) {
+                None
+            } else {
+                Some(strings.value(0).to_string())
+            }
         }
         _ => None,
     }
@@ -229,6 +264,17 @@ impl RerankTableFuncArgs {
                 "{RERANK_UDTF_NAME} requires an input as the first argument (a search result or table reference)."
             ))
         })?;
+        // Reject extra positional args. Every optional parameter uses named
+        // syntax (`document => ...`, `model => ...`, etc.); a second
+        // positional slot means the caller misspelled a param name or forgot
+        // the `=>` — silently dropping it would produce confusingly wrong
+        // results. Fail fast with the list of recognized named args.
+        if positional.len() > 1 {
+            return Err(DataFusionError::Plan(format!(
+                "{RERANK_UDTF_NAME} only accepts one positional argument (the input); additional parameters must be named. Got {} positional arg(s). Recognized named args: model, document, query, limit, strategy, prompt_template.",
+                positional.len()
+            )));
+        }
 
         let (input, auto_query) = match input_expr {
             Expr::ScalarFunction(sf) => {
@@ -500,11 +546,18 @@ impl RerankUDTFProvider {
         }
     }
 
-    /// Extract the configured document column from a record batch as strings.
-    /// Chunked/list-typed columns aren't yet supported — the nested search
-    /// UDTF handles chunking internally, so by the time results reach
-    /// `rerank` the document column is scalar.
-    fn extract_documents(batch: &RecordBatch, document_col: &str) -> DataFusionResult<Vec<String>> {
+    /// Extract the configured document column from a record batch. Returns a
+    /// vector aligned with the batch rows — `None` for NULL cells so the
+    /// caller can skip them in the reranker call and preserve NULL semantics
+    /// instead of silently turning NULL into `""`.
+    ///
+    /// Chunked/list-typed columns aren't supported: the nested search UDTF
+    /// handles chunking internally, so by the time results reach `rerank` the
+    /// document column is scalar.
+    fn extract_documents(
+        batch: &RecordBatch,
+        document_col: &str,
+    ) -> DataFusionResult<Vec<Option<String>>> {
         let idx = batch.schema().index_of(document_col).map_err(|_| {
             DataFusionError::Plan(format!(
                 "{RERANK_UDTF_NAME}: document column '{document_col}' not found in input schema. Available columns: {}.",
@@ -522,9 +575,9 @@ impl RerankUDTFProvider {
             return Ok((0..strings.len())
                 .map(|i| {
                     if strings.is_null(i) {
-                        String::new()
+                        None
                     } else {
-                        strings.value(i).to_string()
+                        Some(strings.value(i).to_string())
                     }
                 })
                 .collect());
@@ -533,9 +586,9 @@ impl RerankUDTFProvider {
             return Ok((0..strings.len())
                 .map(|i| {
                     if strings.is_null(i) {
-                        String::new()
+                        None
                     } else {
-                        strings.value(i).to_string()
+                        Some(strings.value(i).to_string())
                     }
                 })
                 .collect());
@@ -574,18 +627,28 @@ impl TableProvider for RerankUDTFProvider {
             ))
         })?;
 
-        // Scan the input at its native schema (no projection/filters pushed
-        // down yet — the rerank stage inspects the document column so it must
-        // be present, and filters applied before reranking would skew scores
-        // for the caller). Projection/filter/limit on rerank's *output* are
-        // handled after materialization via the MemTable delegate below.
-        let input_plan = self.input.scan(state, None, &[], None).await?;
+        // Cap the candidate pool fed into the reranker. Reranking is O(N) in
+        // remote calls / token cost, so an unbounded input — e.g.
+        // `rerank(big_table, ...)` with no `limit =>` — could accidentally
+        // dispatch tens of thousands of requests. Use the caller-supplied
+        // `limit` as the pool size when present; otherwise fall back to
+        // `DEFAULT_MAX_CANDIDATES` (which the user-visible `limit` further
+        // constrains after reranking). Push the cap into the input scan as an
+        // optimizer hint — index-backed providers (vector/fts) can honor it;
+        // the MemTable output wrapper still enforces it post-rerank.
+        let pool_limit = self.args.limit.unwrap_or(DEFAULT_MAX_CANDIDATES);
+        let input_plan = self.input.scan(state, None, &[], Some(pool_limit)).await?;
         let stream = datafusion::physical_plan::execute_stream(input_plan, state.task_ctx())?;
-        let input_batches: Vec<RecordBatch> = stream.try_collect().await?;
+        let mut input_batches: Vec<RecordBatch> = stream.try_collect().await?;
 
-        // Concatenate and extract documents. Reranking is O(candidates) so a
-        // single concatenated batch is fine — callers shouldn't be reranking
-        // millions of rows.
+        // Defensive hard cap on materialized candidates, in case the input
+        // provider didn't honor the pushed-down limit.
+        let total: usize = input_batches.iter().map(RecordBatch::num_rows).sum();
+        if total > pool_limit {
+            input_batches = truncate_batches(input_batches, pool_limit);
+        }
+
+        // Concatenate for a single pass through the reranker.
         let input_schema = self.input.schema();
         let concatenated = if input_batches.is_empty() {
             RecordBatch::new_empty(Arc::clone(&input_schema))
@@ -594,24 +657,41 @@ impl TableProvider for RerankUDTFProvider {
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
         };
 
-        let documents = Self::extract_documents(&concatenated, &self.args.document)?;
+        let docs_opt = Self::extract_documents(&concatenated, &self.args.document)?;
+
+        // NULL document rows bypass the reranker and get a fixed `0.0` score
+        // — preserving NULL semantics rather than silently treating NULL as
+        // an empty string, which would otherwise produce garbage rankings
+        // when the reranker assigns non-zero relevance to "".
+        let (non_null_indices, non_null_docs): (Vec<usize>, Vec<String>) = docs_opt
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| d.as_ref().map(|s| (i, s.clone())))
+            .unzip();
 
         let reranker = self.resolve_reranker().await?;
-        let scores = if documents.is_empty() {
+        let non_null_scores = if non_null_docs.is_empty() {
             Vec::new()
         } else {
             reranker
-                .rerank(&query, &documents)
+                .rerank(&query, &non_null_docs)
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?
         };
 
-        if scores.len() != documents.len() {
+        if non_null_scores.len() != non_null_docs.len() {
             return Err(DataFusionError::Execution(format!(
                 "{RERANK_UDTF_NAME}: reranker returned {} scores for {} documents.",
-                scores.len(),
-                documents.len()
+                non_null_scores.len(),
+                non_null_docs.len()
             )));
+        }
+
+        // Scatter non-null scores back into full-row positions; NULL rows
+        // keep their default 0.0.
+        let mut scores = vec![0.0_f32; docs_opt.len()];
+        for (idx, score) in non_null_indices.iter().zip(non_null_scores.iter()) {
+            scores[*idx] = *score;
         }
 
         // Build output schema + batch: drop _score/fused_score, append rerank_score.
@@ -632,7 +712,7 @@ impl TableProvider for RerankUDTFProvider {
             .iter()
             .map(|&i| Arc::clone(concatenated.column(i)))
             .collect();
-        columns.push(Arc::new(Float32Array::from(scores.clone())) as ArrayRef);
+        columns.push(Arc::new(Float32Array::from(scores)) as ArrayRef);
 
         let unsorted = RecordBatch::try_new(Arc::clone(&output_schema), columns)?;
 
@@ -647,6 +727,29 @@ impl TableProvider for RerankUDTFProvider {
         let mem = MemTable::try_new(output_schema, vec![vec![sorted]])?;
         mem.scan(state, projection, filters, limit).await
     }
+}
+
+/// Keep only the first `limit` rows across a sequence of batches. Drops
+/// whole batches once the budget is exhausted, and slices the last partial
+/// batch. Used as a defensive hard cap when the input provider doesn't honor
+/// a pushed-down scan limit.
+fn truncate_batches(batches: Vec<RecordBatch>, limit: usize) -> Vec<RecordBatch> {
+    let mut remaining = limit;
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        if remaining == 0 {
+            break;
+        }
+        let n = batch.num_rows();
+        if n <= remaining {
+            remaining -= n;
+            out.push(batch);
+        } else {
+            out.push(batch.slice(0, remaining));
+            remaining = 0;
+        }
+    }
+    out
 }
 
 fn sort_by_rerank_score_desc(
@@ -892,5 +995,104 @@ mod tests {
             .expect("strings");
         assert_eq!(id_col.value(0), "b");
         assert_eq!(id_col.value(1), "c");
+    }
+
+    #[test]
+    fn parse_args_rejects_extra_positional_args() {
+        // `rerank(vs, 'not_named', document => 'content')` — the second
+        // positional looks like a typoed/forgotten `=>`; silently dropping it
+        // would produce misleading output. Fail fast.
+        let args = vec![
+            vector_search_call("q"),
+            lit_utf8("not_named"),
+            named_lit_utf8("document", "content"),
+        ];
+        let err = RerankTableFuncArgs::from_udtf_args(&args)
+            .expect_err("extra positional arg should be rejected");
+        assert!(
+            err.to_string()
+                .contains("only accepts one positional argument"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_query_handles_make_array() {
+        // `vector_search(docs, make_array('a', 'b'))` — multi-query path;
+        // auto-propagation should pick the first string.
+        use datafusion::functions_nested::make_array::make_array_udf;
+        let make_array = make_array_udf();
+        let multi_query = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::clone(&make_array),
+            vec![lit_utf8("red"), lit_utf8("round")],
+        ));
+        let expr = Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf(VECTOR_SEARCH_UDTF_NAME),
+            vec![Expr::Column(Column::new_unqualified("docs")), multi_query],
+        ));
+        assert_eq!(extract_query_literal(&expr).as_deref(), Some("red"));
+    }
+
+    #[test]
+    fn extract_query_handles_list_literal() {
+        // SQL `ARRAY['a', 'b']` parses as ScalarValue::List.
+        use arrow::datatypes::DataType as ArrowDataType;
+        let scalars = vec![
+            ScalarValue::Utf8(Some("climate".to_string())),
+            ScalarValue::Utf8(Some("economy".to_string())),
+        ];
+        let arr = ScalarValue::new_list_nullable(&scalars, &ArrowDataType::Utf8);
+        let multi_query = Expr::Literal(ScalarValue::List(arr), None);
+        let expr = Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf(VECTOR_SEARCH_UDTF_NAME),
+            vec![Expr::Column(Column::new_unqualified("docs")), multi_query],
+        ));
+        assert_eq!(extract_query_literal(&expr).as_deref(), Some("climate"));
+    }
+
+    #[test]
+    fn extract_documents_preserves_nulls() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "content",
+            DataType::Utf8,
+            true,
+        )]));
+        let col = Arc::new(StringArray::from(vec![Some("hello"), None, Some("world")])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![col]).expect("batch");
+        let docs = RerankUDTFProvider::extract_documents(&batch, "content").expect("extract");
+        assert_eq!(docs.len(), 3);
+        assert_eq!(docs[0].as_deref(), Some("hello"));
+        assert!(
+            docs[1].is_none(),
+            "NULL row must stay None, not become an empty string"
+        );
+        assert_eq!(docs[2].as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn truncate_batches_caps_at_limit() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, false)]));
+        let batch = |vals: &[&str]| -> RecordBatch {
+            let col = Arc::new(StringArray::from(vals.to_vec())) as ArrayRef;
+            RecordBatch::try_new(Arc::clone(&schema), vec![col]).expect("batch")
+        };
+
+        // Two 3-row batches, cap at 4 rows → first batch fully, second sliced
+        // to one row, total 4.
+        let out = truncate_batches(vec![batch(&["a", "b", "c"]), batch(&["d", "e", "f"])], 4);
+        let total: usize = out.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, 4);
+        assert_eq!(out[0].num_rows(), 3);
+        assert_eq!(out[1].num_rows(), 1);
+
+        // Cap at 0 → no batches returned.
+        let none = truncate_batches(vec![batch(&["a"])], 0);
+        assert!(none.is_empty());
+
+        // Cap ≥ total → all batches returned unchanged.
+        let all = truncate_batches(vec![batch(&["a"]), batch(&["b"])], 10);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].num_rows(), 1);
+        assert_eq!(all[1].num_rows(), 1);
     }
 }

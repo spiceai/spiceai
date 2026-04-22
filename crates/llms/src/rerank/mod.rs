@@ -41,6 +41,16 @@ use std::sync::Arc;
 use crate::chat as llms_chat_module;
 use llms_chat_module::Chat;
 
+pub mod cohere;
+pub mod http;
+pub mod jina;
+pub mod voyage;
+
+pub use cohere::CohereReranker;
+pub use http::HttpReranker;
+pub use jina::JinaReranker;
+pub use voyage::VoyageReranker;
+
 /// Name → reranker map. Holds native rerankers (e.g. Cohere, Voyage, BGE) once
 /// provider support lands. Users can also use any chat model as a reranker
 /// today via the `LlmRerank` adapter, so this store may be empty even in a
@@ -80,10 +90,14 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A reranker scores documents against a query. Higher score == more relevant.
 ///
-/// Implementations must preserve input order: `rerank(query, &docs)[i]` is the
-/// score for `docs[i]`. Returning fewer or more scores than input documents is
-/// a contract violation and will surface as [`Error::MismatchedScoreCount`]
-/// when invoked through the UDTF.
+/// Implementations must return exactly `documents.len()` scores, in the same
+/// order as the input: `rerank(query, &docs)[i]` is the score for `docs[i]`.
+/// Any mismatch surfaces as [`Error::MismatchedScoreCount`].
+///
+/// Note: the built-in [`LlmRerank`] adapter is deliberately lenient with
+/// partial LLM output — missing ids in a listwise response default to `0.0`
+/// (least relevant) rather than erroring — because models occasionally skip
+/// entries. Native rerankers are expected to score every document.
 #[async_trait]
 pub trait Rerank: Send + Sync + Debug {
     async fn rerank(&self, query: &str, documents: &[String]) -> Result<Vec<f32>>;
@@ -214,9 +228,10 @@ impl LlmRerank {
             .map(|(i, d)| format!("{}. {}", i + 1, d))
             .collect::<Vec<_>>()
             .join("\n");
-        template
-            .replace("{query}", query)
-            .replace("{documents}", &docs_block)
+        render_template(
+            template,
+            &[("{query}", query), ("{documents}", &docs_block)],
+        )
     }
 
     fn format_pointwise(&self, query: &str, document: &str) -> String {
@@ -224,9 +239,7 @@ impl LlmRerank {
             .prompt_template
             .as_deref()
             .unwrap_or(DEFAULT_POINTWISE_PROMPT);
-        template
-            .replace("{query}", query)
-            .replace("{document}", document)
+        render_template(template, &[("{query}", query), ("{document}", document)])
     }
 
     async fn call_chat(&self, prompt: String) -> Result<String> {
@@ -296,6 +309,38 @@ impl Rerank for LlmRerank {
         // for concurrency purposes is the right default.
         true
     }
+}
+
+/// Single-pass placeholder substitution. Unlike chained `String::replace`,
+/// this walks the template once and only substitutes `{query}` / `{documents}`
+/// at template positions — if a user-supplied query or document happens to
+/// contain the literal string `{documents}`, it is preserved verbatim rather
+/// than being re-processed as a placeholder on a later pass.
+fn render_template(template: &str, placeholders: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    'outer: while !rest.is_empty() {
+        // Find the earliest placeholder occurrence among the registered ones.
+        let mut best: Option<(usize, usize, &str)> = None;
+        for (marker, value) in placeholders {
+            if let Some(pos) = rest.find(marker) {
+                let len = marker.len();
+                let value_ref: &str = value;
+                if best.is_none_or(|(p, _, _)| pos < p) {
+                    best = Some((pos, len, value_ref));
+                }
+            }
+        }
+        if let Some((pos, len, value)) = best {
+            out.push_str(&rest[..pos]);
+            out.push_str(value);
+            rest = &rest[pos + len..];
+            continue 'outer;
+        }
+        out.push_str(rest);
+        break;
+    }
+    out
 }
 
 /// Strip common LLM response wrappers (fenced ```json blocks, leading/trailing
@@ -505,5 +550,44 @@ mod tests {
         // The raw placeholder should no longer appear.
         assert!(!formatted.contains("{query}"));
         assert!(!formatted.contains("{documents}"));
+    }
+
+    #[test]
+    fn render_template_substitutes_once() {
+        // Basic substitution works.
+        let out = render_template(
+            "Q: {query} / D: {document}",
+            &[("{query}", "hi"), ("{document}", "doc")],
+        );
+        assert_eq!(out, "Q: hi / D: doc");
+    }
+
+    #[test]
+    fn render_template_preserves_placeholder_tokens_in_user_values() {
+        // The classic chained-.replace() bug: if the query contains
+        // `{document}`, a later .replace("{document}", ...) would mutate the
+        // inserted query. render_template does a single pass so user values
+        // are preserved verbatim.
+        let out = render_template(
+            "Query: {query}\nDoc: {document}",
+            &[
+                ("{query}", "what is {document}?"),
+                ("{document}", "the actual doc"),
+            ],
+        );
+        assert_eq!(out, "Query: what is {document}?\nDoc: the actual doc");
+    }
+
+    #[test]
+    fn render_template_handles_missing_placeholder() {
+        // Template that doesn't use a placeholder leaves user value unused.
+        let out = render_template("just text", &[("{query}", "hi")]);
+        assert_eq!(out, "just text");
+    }
+
+    #[test]
+    fn render_template_multiple_occurrences() {
+        let out = render_template("{query} and again {query}", &[("{query}", "X")]);
+        assert_eq!(out, "X and again X");
     }
 }
