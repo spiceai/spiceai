@@ -147,6 +147,7 @@ mod tests {
             column: None,
             limit: Some(5),
             include_score: None,
+            distance_metric: Some("l2".to_string()),
         });
         let bytes = args.encode_to_vec();
         let deserialized = UdtfArgs::decode(bytes.as_slice()).expect("decode");
@@ -157,6 +158,7 @@ mod tests {
             assert_eq!(vector_args.column, None);
             assert_eq!(vector_args.limit, Some(5));
             assert_eq!(vector_args.include_score, None);
+            assert_eq!(vector_args.distance_metric, Some("l2".to_string()));
         } else {
             panic!("Expected VectorSearch variant");
         }
@@ -183,6 +185,7 @@ mod tests {
                         column: Some("embedding".to_string()),
                         limit: Some(10),
                         include_score: Some(true),
+                        distance_metric: None,
                     },
                     Some(2.0),
                 ),
@@ -194,6 +197,7 @@ mod tests {
             decay_constant: None,
             decay_scale_secs: None,
             decay_window_secs: None,
+            limit: None,
         });
         let bytes = args.encode_to_vec();
         let deserialized = UdtfArgs::decode(bytes.as_slice()).expect("decode");

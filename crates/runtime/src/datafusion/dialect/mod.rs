@@ -40,6 +40,10 @@ pub fn new_duckdb_dialect() -> Arc<dyn Dialect> {
             Box::new(duckdb::cosine_distance_to_sql) as ScalarFnToSqlHandler,
         ),
         (
+            "array_distance",
+            Box::new(duckdb::array_distance_to_sql) as ScalarFnToSqlHandler,
+        ),
+        (
             "rand",
             Box::new(duckdb::rand_to_random) as ScalarFnToSqlHandler,
         ),
