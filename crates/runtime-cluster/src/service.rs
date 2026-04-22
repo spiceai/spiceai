@@ -546,13 +546,8 @@ impl PartitionService {
             return Ok(());
         }
 
-        let assignments = assign_unassigned_partitions(
-            unassigned,
-            &state,
-            &self.partition_store,
-            config,
-            limit,
-        );
+        let assignments =
+            assign_unassigned_partitions(unassigned, &state, &self.partition_store, config, limit);
         let CommitResult { committed, failed } =
             commit_assignments(&self.partition_store, assignments).await?;
         if !failed.is_empty() {
