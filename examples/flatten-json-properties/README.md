@@ -131,7 +131,7 @@ FROM flatten_json_properties(
     include_internal => true,      -- also emit object/array/map rows
     path_style      => 'dot',
     dialect         => 'json-schema',
-    expand_maps     => true,       -- emit `parent.[*].child` for maps
+    expand_maps     => true,       -- emit `parent.[*].child` for maps (dot style)
     map_wildcard    => '[*]'       -- customize the wildcard segment
 );
 ```

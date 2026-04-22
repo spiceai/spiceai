@@ -244,6 +244,7 @@ pub fn flatten_with_options(input: &str, opts: &FlattenOptions) -> Vec<JsonRow> 
         opts,
         rows: Vec::new(),
         row_cap_hit: false,
+        depth_cap_hit: false,
     };
     walker.walk(&root, "", "", 0);
     ROWS_EMITTED.add(walker.rows.len() as u64, &[]);
@@ -256,6 +257,7 @@ struct Walker<'a> {
     opts: &'a FlattenOptions,
     rows: Vec<JsonRow>,
     row_cap_hit: bool,
+    depth_cap_hit: bool,
 }
 
 impl Walker<'_> {
@@ -264,7 +266,12 @@ impl Walker<'_> {
             return;
         }
         if depth > self.opts.max_depth {
-            record_error("depth_exceeded");
+            // Only record once per invocation so deeply-nested inputs
+            // don't inflate the `depth_exceeded` counter by O(nodes).
+            if !self.depth_cap_hit {
+                record_error("depth_exceeded");
+                self.depth_cap_hit = true;
+            }
             return;
         }
 
