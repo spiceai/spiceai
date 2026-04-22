@@ -49,7 +49,8 @@ use super::{PlannerContext, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, is_caye
 ///
 /// Parses the AST, validates phase 1 constraints, normalizes the ON clause
 /// into bare `(target_col, source_col)` key pairs, builds typed `MergeParams`,
-/// and produces a generic `DmlExtensionNode`.
+/// and produces a generic `DmlExtensionNode` for distributed DML (no inputs,
+/// expects to be forwarded).
 pub(super) async fn plan_distributed_merge(
     statement: Statement,
     session: &SessionState,
@@ -129,6 +130,11 @@ pub(super) async fn plan_distributed_merge(
     }
     let assignment_sql =
         validate_and_extract_assignments(&clauses[0], target_ref.table(), target_alias.as_deref())?;
+    let Some(target_schema) = resolve_table_schema(session, &target_ref).await else {
+        return Err(DataFusionError::Plan(format!(
+            "MERGE target '{target_name}' is not found"
+        )));
+    };
     let assignments: Vec<(String, Expr)> = assignment_sql
         .iter()
         .map(|(column, value_sql)| {
@@ -136,12 +142,6 @@ pub(super) async fn plan_distributed_merge(
             Ok((column.clone(), expr))
         })
         .collect::<DFResult<Vec<_>>>()?;
-
-    let Some(target_schema) = resolve_table_schema(session, &target_ref).await else {
-        return Err(DataFusionError::Plan(
-            "MERGE target '{target_name}' is not found".to_string(),
-        ));
-    };
 
     let handler = ctx.cayenne_dml_handler()?;
 
@@ -154,7 +154,7 @@ pub(super) async fn plan_distributed_merge(
                 source_qualifier: source_qualifier.to_string(),
                 on_keys: on_keys.to_vec(),
                 assignments,
-                original_sql: None,
+                original_sql: Some(original_sql.to_string()),
             })),
             handler,
             Vec::new(), // Since this is on scheduler side.
