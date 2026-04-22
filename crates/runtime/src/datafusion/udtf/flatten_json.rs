@@ -26,7 +26,10 @@ limitations under the License.
 //!     path         Utf8,
 //!     parent_path  Utf8,
 //!     key          Utf8,
-//!     value        Utf8,   -- leaf value as string; NULL for JSON null; compact JSON for containers (with include_internal)
+//!     value        Utf8,   -- leaf value as string; NULL for JSON null;
+//!                          -- containers emit compact JSON when
+//!                          -- `include_internal` / empty-container
+//!                          -- fallbacks surface them as rows
 //!     type         Utf8    -- "object"|"array"|"string"|"number"|"integer"|"boolean"|"null"
 //! )
 //! ```
@@ -59,15 +62,19 @@ limitations under the License.
 //! `flatten_json_rows_emitted_total`, and
 //! `flatten_json_errors_total{kind}`. For the UDTF entry point, malformed
 //! input or a hit cap emits an error-kind metric and yields an empty /
-//! truncated batch — never a query-level error. The scalar UDF variant
-//! returns `DataFusionError::Execution` when `SCALAR_BATCH_MAX_ROWS` is
-//! exceeded (the per-document `max_rows` cap is not configurable there).
+//! truncated batch instead of a query-level error. The scalar UDF entry
+//! point additionally returns `DataFusionError::Execution` if a single
+//! batch would exceed `SCALAR_BATCH_MAX_ROWS` flattened rows or if the
+//! resulting `LargeList` offsets would overflow `i64`; callers in those
+//! paths should reduce `max_rows` or split the input.
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
-use arrow::array::{Array, ArrayRef, LargeListArray, StringBuilder, StructArray, as_string_array};
+use arrow::array::{
+    Array, ArrayRef, LargeListArray, StringBuilder, StructArray, as_largestring_array,
+};
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::kernels::cast::cast;
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
@@ -239,6 +246,7 @@ pub fn flatten_with_options(input: &str, opts: &FlattenOptions) -> Vec<JsonRow> 
         opts,
         rows: Vec::new(),
         row_cap_hit: false,
+        depth_cap_hit: false,
     };
     walker.walk(&root, "", "", 0);
     ROWS_EMITTED.add(walker.rows.len() as u64, &[]);
@@ -251,6 +259,7 @@ struct Walker<'a> {
     opts: &'a FlattenOptions,
     rows: Vec<JsonRow>,
     row_cap_hit: bool,
+    depth_cap_hit: bool,
 }
 
 impl Walker<'_> {
@@ -259,7 +268,12 @@ impl Walker<'_> {
             return;
         }
         if depth > self.opts.max_depth {
-            record_error("depth_exceeded");
+            // Only record once per invocation so deeply-nested inputs
+            // don't inflate the `depth_exceeded` counter by O(nodes).
+            if !self.depth_cap_hit {
+                record_error("depth_exceeded");
+                self.depth_cap_hit = true;
+            }
             return;
         }
 
@@ -311,7 +325,15 @@ impl Walker<'_> {
                 } else {
                     for (idx, child) in arr.iter().enumerate() {
                         let child_path = make_array_index(path, idx, self.opts.path_style);
-                        let idx_key = format!("[{idx}]");
+                        // Match the last path segment: bracketed for dot
+                        // paths (`[0]`), bare index for json-pointer
+                        // (`0`). Keeps `key` consistent with the trailing
+                        // segment of `path` so callers can reconstruct
+                        // `path` from `parent_path` + `key`.
+                        let idx_key = match self.opts.path_style {
+                            PathStyle::JsonPointer => idx.to_string(),
+                            PathStyle::Dot => format!("[{idx}]"),
+                        };
                         self.walk(child, &child_path, &idx_key, depth + 1);
                         if self.row_cap_hit {
                             return;
@@ -639,6 +661,10 @@ impl TableProvider for FlattenJsonTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Single-node only: a bare `DataSourceExec(MemorySourceConfig)` is
+        // rejected by `EnsureSupportedFileScan` in cluster mode. Distributed
+        // support requires a dedicated `UdtfArgs` proto variant + codec so
+        // remote executors can re-invoke the walker; that's follow-up scope.
         let batch = rows_to_batch(&self.rows, Arc::clone(&self.schema))?;
         let src = MemorySourceConfig::try_new(
             &[vec![batch]],
@@ -757,13 +783,17 @@ impl ScalarUDFImpl for FlattenJsonScalar {
         let opts = FlattenOptions::default();
 
         let array = input_col.into_array(args.number_rows)?;
-        let normalized = if matches!(array.data_type(), DataType::Utf8) {
+        // Normalize to `LargeUtf8` rather than `Utf8` so inputs whose
+        // cumulative string bytes exceed the 32-bit offset limit still
+        // work (casting `LargeUtf8` -> `Utf8` can fail for truly large
+        // inputs even though the UDF signature advertises `LargeUtf8`).
+        let normalized = if matches!(array.data_type(), DataType::LargeUtf8) {
             array
         } else {
-            cast(&array, &DataType::Utf8)
+            cast(&array, &DataType::LargeUtf8)
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
         };
-        let strings = as_string_array(&normalized);
+        let strings = as_largestring_array(&normalized);
 
         let mut all_rows: Vec<JsonRow> = Vec::new();
         let mut offsets: Vec<i64> = Vec::with_capacity(strings.len() + 1);
@@ -999,7 +1029,7 @@ mod tests {
             ..FlattenOptions::default()
         };
         let rows = flatten_with_options(json, &opts);
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len()https://github.com/spiceai/spiceai/pull/10453, 3);
     }
 
     #[test]
