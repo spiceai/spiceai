@@ -95,6 +95,15 @@ pub enum Error {
         actual: usize,
         row_index: usize,
     },
+
+    #[snafu(display(
+        "Failed to write to Elasticsearch index '{index}': embedded column '{column}' has non-string type {data_type}; expected a Utf8/LargeUtf8/Utf8View column to generate embeddings."
+    ))]
+    EmbeddedColumnNotString {
+        index: String,
+        column: String,
+        data_type: String,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -120,6 +129,7 @@ pub async fn write(index: &ElasticsearchIndex, record: RecordBatch) -> Result<Re
     let embedding_vectors = embed_column(
         &record,
         embedded_column_idx,
+        index.embedded_column.as_str(),
         Arc::clone(&index.compute_query),
         es_index,
     )
@@ -371,6 +381,7 @@ fn extract_primary_key(
 async fn embed_column(
     rb: &RecordBatch,
     column_idx: usize,
+    column_name: &str,
     model: Arc<dyn Embed>,
     es_index: &str,
 ) -> Result<Vec<Option<Vec<f32>>>> {
@@ -378,7 +389,16 @@ async fn embed_column(
     let iter_opt: Option<Box<dyn Iterator<Item = Option<&str>> + Send>> =
         convert_string_arrow_to_iterator!(column_arr);
     let Some(data) = iter_opt else {
-        return Ok(vec![None; rb.num_rows()]);
+        // The embedded column is expected to be a string-like Arrow array.
+        // Silently returning "no embeddings" would make writes a no-op and
+        // corrupt the vector index; fail loudly so the mis-configuration
+        // surfaces at the first write.
+        return EmbeddedColumnNotStringSnafu {
+            index: es_index.to_string(),
+            column: column_name.to_string(),
+            data_type: column_arr.data_type().to_string(),
+        }
+        .fail();
     };
 
     let mut nulls = Vec::new();
