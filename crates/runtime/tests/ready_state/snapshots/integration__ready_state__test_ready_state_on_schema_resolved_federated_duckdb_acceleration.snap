@@ -2,11 +2,15 @@
 source: crates/runtime/tests/ready_state/mod.rs
 expression: explain_str
 ---
-+---------------+----------------------------------------------------------------+
-| plan_type     | plan                                                           |
-+---------------+----------------------------------------------------------------+
-| logical_plan  | TableScan: federated_on_schema_resolved_duckdb projection=[id] |
-| physical_plan | BytesProcessedExec                                             |
-|               |   DataSourceExec: partitions=1, partition_sizes=[1]            |
-|               |                                                                |
-+---------------+----------------------------------------------------------------+
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                 |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Federated                                                                                                                                                                            |
+|               |  Projection: federated_on_schema_resolved_duckdb.id                                                                                                                                  |
+|               |   TableScan: federated_on_schema_resolved_duckdb projection=[id]                                                                                                                     |
+| physical_plan | SchemaCastScanExec                                                                                                                                                                   |
+|               |   CooperativeExec                                                                                                                                                                    |
+|               |     BytesProcessedExec                                                                                                                                                               |
+|               |       VirtualExecutionPlan name=mock_sql_executor compute_context=mock_context base_sql=SELECT "federated_on_schema_resolved_duckdb"."id" FROM "federated_on_schema_resolved_duckdb" |
+|               |                                                                                                                                                                                      |
++---------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
