@@ -25,7 +25,7 @@ use datafusion::functions_aggregate::expr_fn::{avg, first_value, max, sum};
 use datafusion::functions_window::expr_fn::row_number;
 use datafusion::prelude::{array_element, substring};
 use datafusion::sql::TableReference;
-use datafusion_expr::expr::ScalarFunction;
+use datafusion_expr::expr::{ScalarFunction, WindowFunction, WindowFunctionDefinition};
 use datafusion_expr::{
     Expr as LogicalExpr, ExprFunctionExt, JoinType, LogicalPlan, LogicalPlanBuilder, Operator,
     ScalarUDF, binary_expr, col, ident, lit,
@@ -366,10 +366,21 @@ impl ChunkedNonIndexVectorGeneration {
             EmbeddingAggregation::Sum => sum(score_arg),
         };
 
-        Ok(agg
-            .partition_by(partition)
-            .build()?
-            .alias(AGG_SCORE_COLUMN_NAME))
+        // ExprFunctionExt::partition_by only accepts Expr::WindowFunction.
+        // Convert the aggregate to a window expression (AGG() OVER (PARTITION BY ...))
+        // before applying the partition clause.
+        let LogicalExpr::AggregateFunction(agg_fn) = agg else {
+            return datafusion::common::exec_err!(
+                "Expected AggregateFunction expression for score aggregation"
+            );
+        };
+        Ok(LogicalExpr::WindowFunction(Box::new(WindowFunction::new(
+            WindowFunctionDefinition::AggregateUDF(agg_fn.func),
+            agg_fn.params.args,
+        )))
+        .partition_by(partition)
+        .build()?
+        .alias(AGG_SCORE_COLUMN_NAME))
     }
 }
 
@@ -552,7 +563,8 @@ impl ChunkedNonIndexVectorGeneration {
         let agg_window = self.aggregate_score_expr(&pks)?;
 
         plan = plan
-            .window(vec![rank_window, agg_window])?
+            .window(vec![rank_window])?
+            .window(vec![agg_window])?
             .alias("rank")?
             .filter(col("chunk_rank").eq(lit(1)))?
             .sort(vec![
@@ -716,5 +728,88 @@ impl ChunkedNonIndexVectorGeneration {
             )?;
 
         Ok(Arc::new(ViewTable::new(plan.build()?, None)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::catalog::TableProvider;
+    use datafusion::sql::TableReference;
+    use datafusion_expr::expr::WindowFunctionDefinition;
+    use spicepod::component::embeddings::EmbeddingAggregation;
+
+    fn make_list_multi_gen(aggregation: EmbeddingAggregation) -> ChunkedNonIndexVectorGeneration {
+        use datafusion::logical_expr::{Volatility, create_udf};
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("_score", arrow_schema::DataType::Float32, true),
+        ]));
+        let provider: Arc<dyn TableProvider> = Arc::new(
+            datafusion::datasource::empty::EmptyTable::new(Arc::clone(&schema)),
+        );
+        let embed = Arc::new(create_udf(
+            "embed",
+            vec![],
+            arrow_schema::DataType::Null,
+            Volatility::Volatile,
+            Arc::new(|_| unimplemented!()),
+        ));
+        ChunkedNonIndexVectorGeneration::with_mode(
+            &provider,
+            &TableReference::bare("t"),
+            &embed,
+            "model".to_string(),
+            vec!["id".to_string()],
+            "_score",
+            VectorScanMode::ListMulti { aggregation },
+        )
+    }
+
+    fn unwrap_alias(expr: &LogicalExpr) -> &LogicalExpr {
+        match expr {
+            LogicalExpr::Alias(a) => &*a.expr,
+            other => other,
+        }
+    }
+
+    #[test]
+    fn aggregate_score_expr_max_produces_window_function() {
+        let candidate = make_list_multi_gen(EmbeddingAggregation::Max);
+        let expr = candidate
+            .aggregate_score_expr(&["id".to_string()])
+            .expect("should not error");
+        assert!(
+            matches!(
+                unwrap_alias(&expr),
+                LogicalExpr::WindowFunction(wf)
+                    if matches!(wf.fun, WindowFunctionDefinition::AggregateUDF(_))
+            ),
+            "expected WindowFunction(AggregateUDF), got {expr:?}"
+        );
+    }
+
+    #[test]
+    fn aggregate_score_expr_mean_produces_window_function() {
+        let cand = make_list_multi_gen(EmbeddingAggregation::Mean);
+        let expr = cand
+            .aggregate_score_expr(&["id".to_string()])
+            .expect("should not error");
+        assert!(
+            matches!(unwrap_alias(&expr), LogicalExpr::WindowFunction(_)),
+            "expected WindowFunction, got {expr:?}"
+        );
+    }
+
+    #[test]
+    fn aggregate_score_expr_sum_produces_window_function() {
+        let cand = make_list_multi_gen(EmbeddingAggregation::Sum);
+        let expr = cand
+            .aggregate_score_expr(&["id".to_string()])
+            .expect("should not error");
+        assert!(
+            matches!(unwrap_alias(&expr), LogicalExpr::WindowFunction(_)),
+            "expected WindowFunction, got {expr:?}"
+        );
     }
 }
