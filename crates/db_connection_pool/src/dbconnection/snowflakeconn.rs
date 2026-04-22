@@ -506,7 +506,6 @@ where
 /// # Errors
 ///
 /// Returns an error if the JSON is malformed or contains an unsupported type.
-#[expect(clippy::cast_possible_truncation)]
 pub fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error> {
     let data_type: serde_json::Value =
         serde_json::from_str(data_type_str).map_err(|e| Error::UnableToRetrieveSchema {
@@ -515,21 +514,103 @@ pub fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error>
 
     match data_type["type"].as_str() {
         Some("FIXED") => {
-            let precision = data_type["precision"].as_u64().unwrap_or(38) as u8;
-            let scale = data_type["scale"].as_i64().unwrap_or(0) as i8;
+            // Snowflake's FIXED precision must fit in Arrow `Decimal128`
+            // (max 38). Snowflake itself also caps precision at 38, so any
+            // larger value is malformed/unexpected. Scale is bounded by the
+            // same range. Use checked conversions with clear error messages
+            // rather than `as` casts, which would silently truncate and
+            // yield wrong schemas — a data-correctness violation.
+            const MAX_DECIMAL128_PRECISION: u64 = 38;
+            let precision_raw = data_type["precision"].as_u64().unwrap_or(38);
+            if precision_raw == 0 || precision_raw > MAX_DECIMAL128_PRECISION {
+                return Err(Error::UnableToRetrieveSchema {
+                    reason: format!(
+                        "FIXED precision {precision_raw} is out of range (expected 1..={MAX_DECIMAL128_PRECISION})",
+                    ),
+                });
+            }
+            // Safe: bounded above by 38.
+            let precision =
+                u8::try_from(precision_raw).map_err(|_| Error::UnableToRetrieveSchema {
+                    reason: format!("FIXED precision {precision_raw} does not fit in u8"),
+                })?;
+            let scale_raw = data_type["scale"].as_i64().unwrap_or(0);
+            let scale = i8::try_from(scale_raw).map_err(|_| Error::UnableToRetrieveSchema {
+                reason: format!(
+                    "FIXED scale {scale_raw} is out of range (expected {}..={})",
+                    i8::MIN,
+                    i8::MAX,
+                ),
+            })?;
             Ok(DataType::Decimal128(precision, scale))
         }
-        Some("TEXT" | "VARIANT" | "ARRAY") => Ok(DataType::Utf8),
+        // Semi-structured types (dynamic schema per row) and structured MAP
+        // arrive as JSON-serialized strings. Geospatial types are serialized as
+        // WKT/GeoJSON/WKB text. Utf8 is the correct lossless Arrow mapping.
+        Some("TEXT" | "VARIANT" | "ARRAY" | "OBJECT" | "MAP" | "GEOGRAPHY" | "GEOMETRY") => {
+            Ok(DataType::Utf8)
+        }
         Some("REAL") => Ok(DataType::Float64),
         Some("BINARY") => Ok(DataType::Binary),
         Some("BOOLEAN") => Ok(DataType::Boolean),
         Some("DATE") => Ok(DataType::Date32),
-        Some("TIMESTAMP_NTZ") => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        Some("TIMESTAMP_NTZ" | "TIMESTAMP_LTZ") => {
+            // TIMESTAMP_NTZ has no time zone. TIMESTAMP_LTZ stores an
+            // absolute instant (UTC-backed) that is rendered in the session
+            // time zone. Mirror the `information_schema` path, which maps
+            // both to a timezone-less Arrow Timestamp so schema discovery is
+            // consistent across paths. TIMESTAMP_TZ (below) stores an
+            // explicit offset per value and is represented with a UTC
+            // timezone.
+            Ok(DataType::Timestamp(TimeUnit::Nanosecond, None))
+        }
         Some("TIME") => Ok(DataType::Time64(TimeUnit::Nanosecond)),
         Some("TIMESTAMP_TZ") => Ok(DataType::Timestamp(
             TimeUnit::Nanosecond,
             Some("UTC".into()),
         )),
+        // VECTOR is a fixed-length numeric array. Snowflake's type descriptor
+        // embeds `dimension` and `elementType` (FLOAT or INT); map to the
+        // corresponding Arrow FixedSizeList for lossless representation.
+        Some("VECTOR") => {
+            let dimension = data_type["dimension"]
+                .as_u64()
+                .and_then(|n| i32::try_from(n).ok())
+                .ok_or_else(|| Error::UnableToRetrieveSchema {
+                    reason: "VECTOR type missing or invalid 'dimension'".to_string(),
+                })?;
+            // Snowflake VECTOR values are dense numeric arrays; a zero or
+            // negative dimension is not a valid Snowflake type and would
+            // produce a meaningless FixedSizeList. Reject it with a clear
+            // error so schema discovery fails loudly instead of silently
+            // yielding a wrong type.
+            if dimension <= 0 {
+                return Err(Error::UnableToRetrieveSchema {
+                    reason: format!("VECTOR type has non-positive 'dimension': {dimension}"),
+                });
+            }
+            let element_type = match data_type["elementType"].as_str() {
+                Some("FLOAT" | "FLOAT32") => DataType::Float32,
+                Some("INT" | "INT32") => DataType::Int32,
+                Some(other) => {
+                    return Err(Error::UnableToRetrieveSchema {
+                        reason: format!("Unsupported VECTOR element type: {other}"),
+                    });
+                }
+                None => {
+                    return Err(Error::UnableToRetrieveSchema {
+                        reason: "VECTOR type missing 'elementType'".to_string(),
+                    });
+                }
+            };
+            // Individual elements of a Snowflake VECTOR are never null — the
+            // whole vector value is either present or SQL NULL. Mark the
+            // inner `item` field non-nullable to model this accurately.
+            Ok(DataType::FixedSizeList(
+                Arc::new(Field::new("item", element_type, false)),
+                dimension,
+            ))
+        }
         Some(t) => Err(Error::UnableToRetrieveSchema {
             reason: format!("Unsupported Snowflake data type: {t}"),
         }),
@@ -815,6 +896,7 @@ mod tests {
             ),
             (r#"{"type":"VARIANT","nullable":true}"#, DataType::Utf8),
             (r#"{"type":"ARRAY","nullable":true}"#, DataType::Utf8),
+            (r#"{"type":"OBJECT","nullable":true}"#, DataType::Utf8),
         ];
 
         for (input, expected) in test_cases {
@@ -826,6 +908,462 @@ mod tests {
                 "Mismatch for input: {input}"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_snowflake_data_type_semi_structured() {
+        // Semi-structured Snowflake types (OBJECT, VARIANT, ARRAY) and
+        // structured MAP are returned as JSON-serialized strings in
+        // Snowflake's Arrow wire format and have dynamic, per-row shapes.
+        // Utf8 is the correct lossless Arrow mapping.
+        for input in [
+            r#"{"type":"OBJECT","nullable":true}"#,
+            r#"{"type":"OBJECT","nullable":false}"#,
+            r#"{"type":"VARIANT","nullable":true}"#,
+            r#"{"type":"ARRAY","nullable":true}"#,
+            r#"{"type":"MAP","nullable":true}"#,
+        ] {
+            let got = parse_snowflake_data_type(input)
+                .unwrap_or_else(|e| panic!("Failed to parse '{input}': {e:?}"));
+            assert_eq!(got, DataType::Utf8, "Expected Utf8 for '{input}'");
+        }
+    }
+
+    #[test]
+    fn test_parse_snowflake_data_type_geospatial() {
+        // GEOGRAPHY/GEOMETRY arrive as WKT/GeoJSON/WKB text strings.
+        for input in [
+            r#"{"type":"GEOGRAPHY","nullable":true}"#,
+            r#"{"type":"GEOMETRY","nullable":false}"#,
+        ] {
+            let got = parse_snowflake_data_type(input)
+                .unwrap_or_else(|e| panic!("Failed to parse '{input}': {e:?}"));
+            assert_eq!(got, DataType::Utf8, "Expected Utf8 for '{input}'");
+        }
+    }
+
+    #[test]
+    fn test_parse_snowflake_data_type_timestamp_ltz() {
+        // TIMESTAMP_LTZ must map consistently with the information_schema
+        // path (Timestamp(ns, None)) so schema discovery agrees across paths.
+        let got = parse_snowflake_data_type(
+            r#"{"type":"TIMESTAMP_LTZ","precision":0,"scale":9,"nullable":true}"#,
+        )
+        .expect("Should parse TIMESTAMP_LTZ");
+        assert_eq!(got, DataType::Timestamp(TimeUnit::Nanosecond, None));
+    }
+
+    #[test]
+    fn test_parse_snowflake_data_type_vector() {
+        // VECTOR<FLOAT, N> → FixedSizeList<Float32, N>. The inner `item`
+        // field is non-nullable because Snowflake VECTOR elements are
+        // always present (only the entire vector value can be SQL NULL).
+        let got = parse_snowflake_data_type(
+            r#"{"type":"VECTOR","dimension":128,"elementType":"FLOAT","nullable":true}"#,
+        )
+        .expect("Should parse VECTOR<FLOAT, 128>");
+        assert_eq!(
+            got,
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 128)
+        );
+
+        // VECTOR<INT, N> → FixedSizeList<Int32, N>
+        let got = parse_snowflake_data_type(
+            r#"{"type":"VECTOR","dimension":4,"elementType":"INT","nullable":true}"#,
+        )
+        .expect("Should parse VECTOR<INT, 4>");
+        assert_eq!(
+            got,
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 4)
+        );
+
+        // Missing dimension must fail clearly rather than produce a wrong type.
+        let err =
+            parse_snowflake_data_type(r#"{"type":"VECTOR","elementType":"FLOAT","nullable":true}"#)
+                .expect_err("Should error when dimension is missing");
+        assert!(
+            matches!(err, Error::UnableToRetrieveSchema { ref reason } if reason.contains("dimension")),
+            "Expected missing dimension error, got: {err:?}"
+        );
+
+        // Zero or negative dimensions are not valid Snowflake VECTOR types;
+        // reject them so schema discovery fails loudly.
+        let err = parse_snowflake_data_type(
+            r#"{"type":"VECTOR","dimension":0,"elementType":"FLOAT","nullable":true}"#,
+        )
+        .expect_err("Should error when dimension is zero");
+        assert!(
+            matches!(err, Error::UnableToRetrieveSchema { ref reason } if reason.contains("dimension")),
+            "Expected non-positive dimension error, got: {err:?}"
+        );
+
+        // Missing elementType must fail clearly.
+        let err = parse_snowflake_data_type(r#"{"type":"VECTOR","dimension":4,"nullable":true}"#)
+            .expect_err("Should error when elementType is missing");
+        assert!(
+            matches!(err, Error::UnableToRetrieveSchema { ref reason } if reason.contains("elementType")),
+            "Expected missing elementType error, got: {err:?}"
+        );
+
+        // Unknown elementType must fail clearly.
+        let err = parse_snowflake_data_type(
+            r#"{"type":"VECTOR","dimension":4,"elementType":"DOUBLE","nullable":true}"#,
+        )
+        .expect_err("Should error for unsupported elementType");
+        assert!(
+            matches!(err, Error::UnableToRetrieveSchema { ref reason } if reason.contains("DOUBLE")),
+            "Expected unsupported elementType error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_snowflake_data_type_fixed_variants() {
+        // FIXED honors precision/scale and falls back to (38, 0) when absent.
+        let cases = [
+            (
+                r#"{"type":"FIXED","precision":38,"scale":0,"nullable":true}"#,
+                DataType::Decimal128(38, 0),
+            ),
+            (
+                r#"{"type":"FIXED","precision":18,"scale":9,"nullable":false}"#,
+                DataType::Decimal128(18, 9),
+            ),
+            (
+                r#"{"type":"FIXED","precision":5,"scale":-2,"nullable":true}"#,
+                DataType::Decimal128(5, -2),
+            ),
+            (
+                // Missing precision/scale: defaults to (38, 0).
+                r#"{"type":"FIXED","nullable":true}"#,
+                DataType::Decimal128(38, 0),
+            ),
+        ];
+        for (input, expected) in cases {
+            let got = parse_snowflake_data_type(input)
+                .unwrap_or_else(|e| panic!("Failed to parse '{input}': {e:?}"));
+            assert_eq!(got, expected, "Mismatch for '{input}'");
+        }
+    }
+
+    #[test]
+    fn test_parse_snowflake_data_type_fixed_out_of_range() {
+        // Using `as` casts on precision/scale would silently truncate
+        // out-of-range values and produce a subtly wrong Arrow schema, which
+        // is a data-correctness violation. Confirm that each malformed or
+        // out-of-range descriptor returns a structured schema error instead.
+        let cases: &[(&str, &str)] = &[
+            // precision > Arrow Decimal128 max (38)
+            (
+                r#"{"type":"FIXED","precision":39,"scale":0,"nullable":true}"#,
+                "precision",
+            ),
+            // precision = 0 is nonsensical for Decimal128
+            (
+                r#"{"type":"FIXED","precision":0,"scale":0,"nullable":true}"#,
+                "precision",
+            ),
+            // precision overflows u8 dramatically
+            (
+                r#"{"type":"FIXED","precision":300,"scale":0,"nullable":true}"#,
+                "precision",
+            ),
+            // scale overflows i8
+            (
+                r#"{"type":"FIXED","precision":10,"scale":200,"nullable":true}"#,
+                "scale",
+            ),
+            // scale underflows i8
+            (
+                r#"{"type":"FIXED","precision":10,"scale":-200,"nullable":true}"#,
+                "scale",
+            ),
+        ];
+        for (input, expected_field) in cases {
+            let err = parse_snowflake_data_type(input)
+                .expect_err(&format!("Should error for malformed input '{input}'"));
+            let Error::UnableToRetrieveSchema { reason } = err else {
+                panic!("Unexpected error type for '{input}': {err:?}");
+            };
+            assert!(
+                reason.contains(expected_field),
+                "Error '{reason}' should mention '{expected_field}' for input '{input}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_schema_from_json_covers_all_types() {
+        // Simulates a `SHOW COLUMNS` JSON response containing every supported
+        // Snowflake type, verifying the end-to-end schema discovery round-trip:
+        // SHOW COLUMNS row -> JSON type descriptor -> Arrow Field.
+        //
+        // SHOW COLUMNS rows are positional arrays where index 2 is the column
+        // name, index 3 is the type descriptor JSON, and index 4 is nullability.
+        let rows = serde_json::json!([
+            [
+                "db",
+                "schema",
+                "c_fixed",
+                r#"{"type":"FIXED","precision":38,"scale":0,"nullable":true}"#,
+                "TRUE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_decimal",
+                r#"{"type":"FIXED","precision":12,"scale":4,"nullable":false}"#,
+                "FALSE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_text",
+                r#"{"type":"TEXT","length":16777216,"nullable":true,"fixed":false}"#,
+                "TRUE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_real",
+                r#"{"type":"REAL","nullable":true}"#,
+                "TRUE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_binary",
+                r#"{"type":"BINARY","length":8388608,"nullable":true,"fixed":true}"#,
+                "TRUE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_bool",
+                r#"{"type":"BOOLEAN","nullable":false}"#,
+                "FALSE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_date",
+                r#"{"type":"DATE","nullable":true}"#,
+                "TRUE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_ts_ntz",
+                r#"{"type":"TIMESTAMP_NTZ","precision":0,"scale":9,"nullable":true}"#,
+                "TRUE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_ts_tz",
+                r#"{"type":"TIMESTAMP_TZ","precision":0,"scale":9,"nullable":true}"#,
+                "TRUE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_time",
+                r#"{"type":"TIME","precision":0,"scale":9,"nullable":true}"#,
+                "TRUE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_variant",
+                r#"{"type":"VARIANT","nullable":true}"#,
+                "TRUE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_array",
+                r#"{"type":"ARRAY","nullable":true}"#,
+                "TRUE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_object",
+                r#"{"type":"OBJECT","nullable":true}"#,
+                "TRUE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_map",
+                r#"{"type":"MAP","nullable":true}"#,
+                "TRUE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_geography",
+                r#"{"type":"GEOGRAPHY","nullable":true}"#,
+                "TRUE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_geometry",
+                r#"{"type":"GEOMETRY","nullable":true}"#,
+                "TRUE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_ts_ltz",
+                r#"{"type":"TIMESTAMP_LTZ","precision":0,"scale":9,"nullable":true}"#,
+                "TRUE",
+                ""
+            ],
+            [
+                "db",
+                "schema",
+                "c_vector",
+                r#"{"type":"VECTOR","dimension":4,"elementType":"FLOAT","nullable":true}"#,
+                "TRUE",
+                ""
+            ],
+        ]);
+
+        let schema =
+            parse_schema_from_json(&rows).expect("Should parse SHOW COLUMNS JSON into a Schema");
+
+        let expected: Vec<(&str, DataType, bool)> = vec![
+            ("c_fixed", DataType::Decimal128(38, 0), true),
+            ("c_decimal", DataType::Decimal128(12, 4), false),
+            ("c_text", DataType::Utf8, true),
+            ("c_real", DataType::Float64, true),
+            ("c_binary", DataType::Binary, true),
+            ("c_bool", DataType::Boolean, false),
+            ("c_date", DataType::Date32, true),
+            (
+                "c_ts_ntz",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+            (
+                "c_ts_tz",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+            ("c_time", DataType::Time64(TimeUnit::Nanosecond), true),
+            ("c_variant", DataType::Utf8, true),
+            ("c_array", DataType::Utf8, true),
+            ("c_object", DataType::Utf8, true),
+            ("c_map", DataType::Utf8, true),
+            ("c_geography", DataType::Utf8, true),
+            ("c_geometry", DataType::Utf8, true),
+            (
+                "c_ts_ltz",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+            (
+                "c_vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 4),
+                true,
+            ),
+        ];
+
+        assert_eq!(
+            schema.fields().len(),
+            expected.len(),
+            "Field count mismatch"
+        );
+        for (field, (name, dtype, nullable)) in schema.fields().iter().zip(expected.iter()) {
+            assert_eq!(field.name(), name, "Name mismatch");
+            assert_eq!(field.data_type(), dtype, "Type mismatch for {name}");
+            assert_eq!(
+                field.is_nullable(),
+                *nullable,
+                "Nullability mismatch for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_snowflake_schema_cast_passes_through_semi_structured() {
+        // Semi-structured columns (OBJECT/VARIANT/ARRAY) arrive from Snowflake
+        // as Utf8 JSON strings and must pass through schema_cast unchanged,
+        // preserving both type and values (data correctness).
+        let json_object = r#"{"k":"v","n":42}"#;
+        let json_array = r"[1,2,3]";
+        let json_variant = r#""hello""#;
+
+        let object_array = Arc::new(StringArray::from(vec![Some(json_object), None])) as ArrayRef;
+        let array_array =
+            Arc::new(StringArray::from(vec![Some(json_array), Some("[]")])) as ArrayRef;
+        let variant_array =
+            Arc::new(StringArray::from(vec![Some(json_variant), Some("null")])) as ArrayRef;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("obj", DataType::Utf8, true),
+            Field::new("arr", DataType::Utf8, false),
+            Field::new("var", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::clone(&object_array),
+                Arc::clone(&array_array),
+                Arc::clone(&variant_array),
+            ],
+        )
+        .expect("Should build record batch");
+
+        let out = snowflake_schema_cast(&batch).expect("schema_cast should succeed");
+
+        assert_eq!(out.num_columns(), 3);
+        assert_eq!(out.num_rows(), 2);
+        for (i, name) in ["obj", "arr", "var"].iter().enumerate() {
+            assert_eq!(out.schema().field(i).name(), name);
+            assert_eq!(out.schema().field(i).data_type(), &DataType::Utf8);
+        }
+
+        let obj_out = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Should be StringArray");
+        assert_eq!(obj_out.value(0), json_object);
+        assert!(obj_out.is_null(1));
+
+        let arr_out = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Should be StringArray");
+        assert_eq!(arr_out.value(0), json_array);
+        assert_eq!(arr_out.value(1), "[]");
+
+        let var_out = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Should be StringArray");
+        assert_eq!(var_out.value(0), json_variant);
+        assert_eq!(var_out.value(1), "null");
     }
 
     #[test]
