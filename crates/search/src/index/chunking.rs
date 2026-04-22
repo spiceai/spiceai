@@ -344,10 +344,10 @@ impl SearchIndex for ChunkedSearchIndex {
 
         let offsets = Self::chunking_offset_col(self.search_column().as_str());
         if let Some(arr) = inner_rb.column_by_name(&offsets) {
-            let f = Arc::new(Field::new("item", arr.data_type().clone(), true));
-            let arr = Arc::new(
+            let item_field = Arc::new(Field::new("item", arr.data_type().clone(), true));
+            let list_arr = Arc::new(
                 ListArray::try_new(
-                    Arc::clone(&f),
+                    Arc::clone(&item_field),
                     OffsetBuffer::from_lengths(repeats.iter().copied()),
                     Arc::clone(arr),
                     None,
@@ -355,19 +355,19 @@ impl SearchIndex for ChunkedSearchIndex {
                 .boxed()?,
             );
             if let Some((i, _)) = schema.column_with_name(&offsets) {
-                arrs[i] = arr;
+                arrs[i] = list_arr;
             } else {
-                arrs.push(arr);
-                fields.push(f);
+                arrs.push(list_arr);
+                fields.push(Arc::new(Field::new_list(&offsets, Arc::unwrap_or_clone(item_field), false)));
             }
         }
 
         let embeddings = embedding_col(&self.search_column());
         if let Some(arr) = inner_rb.column_by_name(&embeddings) {
-            let f = Arc::new(Field::new("item", arr.data_type().clone(), true));
-            let arr = Arc::new(
+            let item_field = Arc::new(Field::new("item", arr.data_type().clone(), true));
+            let list_arr = Arc::new(
                 ListArray::try_new(
-                    Arc::clone(&f),
+                    Arc::clone(&item_field),
                     OffsetBuffer::from_lengths(repeats.iter().copied()),
                     Arc::clone(arr),
                     None,
@@ -375,10 +375,10 @@ impl SearchIndex for ChunkedSearchIndex {
                 .boxed()?,
             );
             if let Some((i, _)) = schema.column_with_name(&embeddings) {
-                arrs[i] = arr;
+                arrs[i] = list_arr;
             } else {
-                arrs.push(arr);
-                fields.push(f);
+                arrs.push(list_arr);
+                fields.push(Arc::new(Field::new_list(&embeddings, Arc::unwrap_or_clone(item_field), false)));
             }
         }
         RecordBatch::try_new(Arc::new(Schema::new(fields)), arrs).boxed()
@@ -414,6 +414,7 @@ impl SearchIndex for ChunkedSearchIndex {
                 !pk_names.contains(f.name())
                     && f.name() != CHUNKED_INDEX_FULL_SEARCH_FIELD
                     && *f.name() != self.search_column()
+                    && f.name() != CHUNKED_INDEX_CHUNK_KEY
             })
             .map(|f| {
                 first_value(

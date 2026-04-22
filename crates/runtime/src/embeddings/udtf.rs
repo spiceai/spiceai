@@ -89,7 +89,10 @@ use {
 };
 
 #[cfg(feature = "s3_vectors")]
-use {search::index::chunking::ChunkedSearchIndex, search::index::s3_vectors::S3Vector};
+use search::index::s3_vectors::S3Vector;
+
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+use search::index::chunking::ChunkedSearchIndex;
 
 #[cfg(feature = "elasticsearch")]
 use search::index::elasticsearch::ElasticsearchIndex;
@@ -575,6 +578,18 @@ impl VectorSearchTableFunc {
             if let Some((es_indexes, _)) = find_index_in_table_provider::<ElasticsearchIndex>(tbl) {
                 vector_indexes.extend(
                     es_indexes
+                        .into_iter()
+                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
+                );
+            }
+            // A chunked Elasticsearch index is registered as a ChunkedSearchIndex wrapping
+            // an ElasticsearchIndex. Search for it here so `vector_search()` works when the
+            // dataset has chunking enabled with an Elasticsearch engine.
+            if let Some((chunked_indexes, _)) =
+                find_index_in_table_provider::<ChunkedSearchIndex>(tbl)
+            {
+                vector_indexes.extend(
+                    chunked_indexes
                         .into_iter()
                         .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
                 );

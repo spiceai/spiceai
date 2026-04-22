@@ -40,6 +40,7 @@ use runtime_datafusion_index::Index;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
 use crate::index::{SearchIndex, VectorIndex, embedding_col};
+use crate::index::chunking::{ChunkedSearchIndex, CHUNKED_INDEX_CHUNK_KEY};
 use crate::metadata::MetadataColumns;
 use data_components::elasticsearch::search_table::{
     ElasticsearchKnnTable, ElasticsearchTextSearchTable, QueryEmbedder,
@@ -262,8 +263,20 @@ impl Index for ElasticsearchIndex {
 
 impl ElasticsearchIndex {
     /// Schema for `query_table_provider` results: primary keys + embedding + `_score`.
+    ///
+    /// `_spice.chunk_id` is excluded even when present in `self.primary_key` (added by
+    /// [`ChunkedSearchIndex::augment_primary_key`]). It is an internal ordering key used
+    /// only inside `list_table_provider`'s aggregation — it is never stored in ES `_source`
+    /// as a retrievable field, so `knn_hits_to_batch` would fill it with nulls and violate
+    /// the non-nullable declaration ("Column '_spice.chunk_id' is declared as non-nullable
+    /// but contains null values").
     fn query_result_schema(&self) -> SchemaRef {
-        let mut fields: Vec<Field> = self.primary_key.clone();
+        let mut fields: Vec<Field> = self
+            .primary_key
+            .iter()
+            .filter(|f| f.name() != CHUNKED_INDEX_CHUNK_KEY)
+            .cloned()
+            .collect();
         fields.push(Field::new(
             embedding_col(&self.embedded_column),
             DataType::FixedSizeList(
@@ -280,7 +293,14 @@ impl ElasticsearchIndex {
         Arc::new(Schema::new(fields))
     }
 
-    /// Schema for `list_table_provider` results: primary keys + embedding.
+    /// Schema for `list_table_provider` results: primary keys + embedding + offset.
+    ///
+    /// The offset column (`{embedded_column}_offset`) is included so that when this
+    /// index is wrapped by [`ChunkedSearchIndex`] / [`super::chunking::ChunkedVectorIndex`],
+    /// the aggregation query built in `ChunkedVectorIndex::list_table_provider` can
+    /// reference it. The column is always emitted by the chunking write path into the
+    /// inner-index batch, so Elasticsearch stores it even though the schema was previously
+    /// not advertising it—causing "Schema error: No field named content_offset".
     fn list_result_schema(&self) -> SchemaRef {
         let mut fields: Vec<Field> = self.primary_key.clone();
         fields.push(Field::new(
@@ -290,6 +310,14 @@ impl ElasticsearchIndex {
                 self.dims,
             ),
             true,
+        ));
+        fields.push(Field::new(
+            ChunkedSearchIndex::chunking_offset_col(&self.embedded_column),
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Int32, false)),
+                2,
+            ),
+            false,
         ));
         Arc::new(Schema::new(fields))
     }
