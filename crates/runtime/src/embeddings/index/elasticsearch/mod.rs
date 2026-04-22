@@ -53,6 +53,36 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("vector_field").description(
         "Name of the dense_vector field in Elasticsearch. Defaults to the embedding column name.",
     ),
+    ParameterSpec::component("distance_metric")
+        .description(
+            "Vector similarity metric for kNN search. One of: cosine | l2_norm | dot_product | max_inner_product.",
+        )
+        .one_of(&["cosine", "l2_norm", "dot_product", "max_inner_product"]),
+    ParameterSpec::component("hnsw_m").description(
+        "HNSW graph parameter m (links per node). Higher = better recall, more memory. ES default: 16.",
+    ),
+    ParameterSpec::component("hnsw_ef_construction").description(
+        "HNSW graph build parameter ef_construction (candidate list size at build time). ES default: 100.",
+    ),
+    ParameterSpec::runtime("client_timeout").description(
+        "Total request timeout for the Elasticsearch HTTP client, in time unit format (e.g. 30s, 1m). Default: 30s.",
+    ),
+    ParameterSpec::runtime("connect_timeout").description(
+        "Connect timeout for the Elasticsearch HTTP client, in time unit format (e.g. 10s). Default: 10s.",
+    ),
+    ParameterSpec::component("max_retries").description(
+        "Maximum number of retry attempts for transient Elasticsearch errors (HTTP 429 / 5xx). Default: 3.",
+    ),
+    ParameterSpec::component("retry_initial_backoff").description(
+        "Initial backoff duration between retries, in time unit format (e.g. 100ms, 1s). Default: 200ms.",
+    ),
+    ParameterSpec::component("batch_write_rows").description(
+        "Maximum number of rows to include in a single Elasticsearch _bulk request. Used to control memory usage and payload size during writes. Default: 1000.",
+    ),
+    ParameterSpec::component("partition_by")
+        .description("Not yet supported for the Elasticsearch vector engine."),
+    ParameterSpec::component("spill_writes")
+        .description("Not yet supported for the Elasticsearch vector engine."),
 ];
 
 /// Attempt to construct an [`ElasticsearchIndex`] for the provided dataset/view on the given column.
