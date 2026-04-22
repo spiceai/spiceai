@@ -811,18 +811,18 @@ impl Https {
 /// Consistent with the `DynamoDB` connector: exactly one column may be
 /// marked, and the only supported marker value is `"*"`.
 fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<HttpJsonNesting>> {
-    let marked: Vec<&Column> = dataset
+    let marked_columns: Vec<&Column> = dataset
         .columns
         .iter()
         .filter(|col| col.metadata.contains_key("json_object"))
         .collect();
 
-    if marked.is_empty() {
+    if marked_columns.is_empty() {
         return Ok(None);
     }
 
-    if marked.len() > 1 {
-        let names: Vec<&str> = marked.iter().map(|c| c.name.as_str()).collect();
+    if marked_columns.len() > 1 {
+        let names: Vec<&str> = marked_columns.iter().map(|c| c.name.as_str()).collect();
         return Err(DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: "https".to_string(),
             connector_component: ConnectorComponent::from(dataset),
@@ -833,19 +833,19 @@ fn parse_http_json_nesting(dataset: &Dataset) -> DataConnectorResult<Option<Http
         });
     }
 
-    let json_column = marked[0];
-    let Some(marker_value) = json_column.metadata.get("json_object") else {
+    let json_column = marked_columns[0];
+    let Some(marker) = json_column.metadata.get("json_object") else {
         unreachable!("json_object key existence was checked above")
     };
 
-    let is_wildcard = matches!(marker_value, Value::String(s) if s == "*");
+    let is_wildcard = matches!(marker, Value::String(s) if s == "*");
     if !is_wildcard {
         return Err(DataConnectorError::InvalidConfigurationNoSource {
             dataconnector: "https".to_string(),
             connector_component: ConnectorComponent::from(dataset),
             message: format!(
                 "Column '{}' has invalid 'json_object' value: {:?}. Only '*' is supported.",
-                json_column.name, marker_value
+                json_column.name, marker
             ),
         });
     }
@@ -1361,6 +1361,31 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn resolve_refresh_token_auth_parses_full_config() {
+        let connector = test_connector_with(&[
+            ("auth_token_url", "https://example.com/oauth/token"),
+            ("http_auth_refresh_token", "rt-seed"),
+            ("http_auth_client_id", "cid"),
+            ("http_auth_client_secret", "csec"),
+            ("auth_scopes", "read:data offline_access"),
+            ("auth_client_auth", "body"),
+        ])
+        .await;
+        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
+
+        let (config, _refresh_token) = connector
+            .resolve_refresh_token_auth(&dataset)
+            .expect("full config should parse")
+            .expect("expected Some(config) when auth params are set");
+
+        assert_eq!(config.token_url, "https://example.com/oauth/token");
+        assert_eq!(config.client_id.as_deref(), Some("cid"));
+        assert!(config.client_secret.is_some());
+        assert_eq!(config.scopes.as_deref(), Some("read:data offline_access"));
+        assert_eq!(config.client_auth, ClientAuthMethod::Body);
+    }
+
     fn column_with_marker(name: &str, marker: Value) -> Column {
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("json_object".to_string(), marker);
@@ -1465,30 +1490,5 @@ mod tests {
             }
             other => panic!("expected InvalidConfigurationNoSource, got: {other}"),
         }
-    }
-
-    #[tokio::test]
-    async fn resolve_refresh_token_auth_parses_full_config() {
-        let connector = test_connector_with(&[
-            ("auth_token_url", "https://example.com/oauth/token"),
-            ("http_auth_refresh_token", "rt-seed"),
-            ("http_auth_client_id", "cid"),
-            ("http_auth_client_secret", "csec"),
-            ("auth_scopes", "read:data offline_access"),
-            ("auth_client_auth", "body"),
-        ])
-        .await;
-        let dataset = test_dataset("http://example.com/api", RefreshMode::Append, None).await;
-
-        let (config, _refresh_token) = connector
-            .resolve_refresh_token_auth(&dataset)
-            .expect("full config should parse")
-            .expect("expected Some(config) when auth params are set");
-
-        assert_eq!(config.token_url, "https://example.com/oauth/token");
-        assert_eq!(config.client_id.as_deref(), Some("cid"));
-        assert!(config.client_secret.is_some());
-        assert_eq!(config.scopes.as_deref(), Some("read:data offline_access"));
-        assert_eq!(config.client_auth, ClientAuthMethod::Body);
     }
 }

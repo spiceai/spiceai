@@ -22,7 +22,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::Error};
 use serde_json::Value;
 
-use crate::component::embeddings::EmbeddingChunkConfig;
+use crate::component::embeddings::{EmbeddingAggregation, EmbeddingChunkConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -133,6 +133,16 @@ pub struct ColumnLevelEmbeddingConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_size: Option<usize>,
+
+    /// Aggregation strategy for multi-vector embeddings. Only meaningful
+    /// when the underlying column is list-typed. Defaults to `max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregation: Option<EmbeddingAggregation>,
+
+    /// Maximum number of list elements embedded per row for multi-vector
+    /// columns. Defaults to `32`; hard-capped at `1024`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_elements_per_row: Option<usize>,
 }
 
 impl ColumnLevelEmbeddingConfig {
@@ -143,7 +153,21 @@ impl ColumnLevelEmbeddingConfig {
             chunking: None,
             row_ids: None,
             vector_size: None,
+            aggregation: None,
+            max_elements_per_row: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_aggregation(mut self, aggregation: EmbeddingAggregation) -> Self {
+        self.aggregation = Some(aggregation);
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_elements_per_row(mut self, n: usize) -> Self {
+        self.max_elements_per_row = Some(n);
+        self
     }
 
     #[must_use]

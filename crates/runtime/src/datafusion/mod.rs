@@ -132,6 +132,7 @@ pub mod secrets_context_extension;
 pub mod sort_columns;
 pub(crate) mod sql_validator;
 pub mod udf;
+pub mod udtf;
 
 pub use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 

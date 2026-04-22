@@ -1,0 +1,78 @@
+[
+  {
+    "id": "user-v1",
+    "title": "User",
+    "body": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "User",
+      "type": "object",
+      "required": ["id", "email"],
+      "properties": {
+        "id":    {"type": "string", "format": "uuid", "description": "Stable user identifier"},
+        "email": {"type": "string", "format": "email", "description": "Primary contact email"},
+        "name":  {"type": "string", "description": "Full legal name"},
+        "created_at": {"type": "string", "format": "date-time", "description": "When the account was created"},
+        "status": {"type": "string", "enum": ["active", "pending", "disabled"], "description": "Account lifecycle status"},
+        "preferences": {
+          "type": "object",
+          "additionalProperties": {"type": "string"},
+          "description": "Arbitrary user preferences as key-value pairs"
+        }
+      }
+    }
+  },
+  {
+    "id": "order-v1",
+    "title": "Order",
+    "body": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "Order",
+      "type": "object",
+      "required": ["id", "customer_id", "line_items"],
+      "properties": {
+        "id":          {"type": "string", "format": "uuid", "description": "Order identifier"},
+        "customer_id": {"type": "string", "format": "uuid", "description": "Reference to the User that placed this order"},
+        "total_cents": {"type": "integer", "description": "Order grand total in cents"},
+        "line_items": {
+          "type": "array",
+          "description": "Line items on this order",
+          "items": {
+            "type": "object",
+            "required": ["sku"],
+            "properties": {
+              "sku":       {"type": "string", "description": "Stock keeping unit identifier"},
+              "quantity":  {"type": "integer", "description": "Units ordered"},
+              "unit_price_cents": {"type": "integer", "description": "Per-unit price at time of order"}
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "address-v1",
+    "title": "Address",
+    "body": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "Address",
+      "$defs": {
+        "Country": {
+          "type": "object",
+          "properties": {
+            "code": {"type": "string", "description": "ISO 3166-1 alpha-2 country code"},
+            "name": {"type": "string", "description": "Country name in English"}
+          }
+        }
+      },
+      "type": "object",
+      "properties": {
+        "street":   {"type": "string", "description": "Street address, first line"},
+        "street_2": {"type": "string", "description": "Street address, second line"},
+        "city":     {"type": "string", "description": "City or municipality"},
+        "region":   {"type": "string", "description": "State, province, or administrative region"},
+        "postal":   {"type": "string", "description": "Postal or ZIP code"},
+        "country":  {"$ref": "#/$defs/Country", "description": "Country reference"}
+      }
+    }
+  }
+]

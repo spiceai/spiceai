@@ -248,7 +248,7 @@ message TextSearchArgs {
     optional bool include_score = 5;
 }
 
-// Arguments for vector_search(tbl, query, [col], [limit], [include_score]).
+// Arguments for vector_search(tbl, query, [col], [limit], [include_score], [distance_metric]).
 message VectorSearchArgs {
     // The table reference as a string.
     string table = 1;
@@ -260,6 +260,8 @@ message VectorSearchArgs {
     optional uint64 limit = 4;
     // Whether to include the score column in results (default: true).
     optional bool include_score = 5;
+    // Distance metric: "cosine" (default) or "l2".
+    optional string distance_metric = 6;
 }
 
 // Arguments for rrf(query1, query2, ..., [k], [join_key], [time_column], ...).
@@ -280,6 +282,9 @@ message RrfArgs {
     optional double decay_scale_secs = 7;
     // Window size for linear decay function (default: 86400).
     optional double decay_window_secs = 8;
+    // Optional upper bound on result rows. When set, also propagated to any nested
+    // search query that does not specify its own limit.
+    optional uint64 limit = 9;
 }
 
 // A nested query within an RRF invocation.

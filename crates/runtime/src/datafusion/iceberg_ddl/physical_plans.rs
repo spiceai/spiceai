@@ -548,11 +548,8 @@ impl ExecutionPlan for IcebergCreateTableExec {
                                 table_name.clone(),
                                 provider,
                             );
-                        let adapted: Arc<dyn datafusion::datasource::TableProvider> =
-                            Arc::new(data_components::delete::DeletionTableProviderAdapter::new(
-                                Arc::new(deletion_provider),
-                            ));
-                        schema_provider.register_table(table_name.clone(), adapted)?;
+                        schema_provider
+                            .register_table(table_name.clone(), Arc::new(deletion_provider))?;
                         message = format!("Table '{table_name}' already exists");
                     }
 
@@ -636,9 +633,7 @@ impl ExecutionPlan for IcebergCreateTableExec {
                             raw_provider,
                         );
                     let adapted: Arc<dyn datafusion::datasource::TableProvider> =
-                        Arc::new(data_components::delete::DeletionTableProviderAdapter::new(
-                            Arc::new(deletion_provider),
-                        ));
+                        Arc::new(deletion_provider);
                     schema_provider.register_table(table_name.clone(), adapted)?;
                     Ok(())
                 };

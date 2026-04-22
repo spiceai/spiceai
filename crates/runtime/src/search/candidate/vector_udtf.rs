@@ -54,11 +54,13 @@ impl CandidateGeneration for VectorUDTFGeneration {
     fn search(&self, query: String) -> Result<Arc<dyn TableProvider>, DataFusionError> {
         let udtf_args = VectorSearchTableFunc::to_expr(&VectorSearchTableFuncArgs {
             tbl: self.tbl.clone(),
+            queries: vec![query.clone()],
             query,
             column: Some(self.embedding_column.clone()),
             limit: None,
             include_score: Some(true),
-        });
+            distance_metric: None,
+        })?;
         self.df
             .ctx
             .table_function(VECTOR_SEARCH_UDTF_NAME)?

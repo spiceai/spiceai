@@ -37,6 +37,8 @@ mod cayenne_catalog_ddl;
 mod clickbench;
 mod cluster;
 mod cors;
+#[cfg(feature = "cosmosdb")]
+mod cosmosdb;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
