@@ -26,7 +26,7 @@ limitations under the License.
 //!     path         Utf8,
 //!     parent_path  Utf8,
 //!     key          Utf8,
-//!     value        Utf8,   -- leaf value as string; NULL for JSON null and containers
+//!     value        Utf8,   -- leaf value as string; NULL for JSON null; compact JSON for containers (with include_internal)
 //!     type         Utf8    -- "object"|"array"|"string"|"number"|"integer"|"boolean"|"null"
 //! )
 //! ```
@@ -57,9 +57,11 @@ limitations under the License.
 //!
 //! Telemetry: OpenTelemetry counters `flatten_json_invocations_total`,
 //! `flatten_json_rows_emitted_total`, and
-//! `flatten_json_errors_total{kind}`. Malformed input or a hit cap emits
-//! an error-kind metric and yields an empty / truncated batch — never a
-//! query-level error.
+//! `flatten_json_errors_total{kind}`. For the UDTF entry point, malformed
+//! input or a hit cap emits an error-kind metric and yields an empty /
+//! truncated batch — never a query-level error. The scalar UDF variant
+//! returns `DataFusionError::Execution` when `SCALAR_BATCH_MAX_ROWS` is
+//! exceeded (the per-document `max_rows` cap is not configurable there).
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
@@ -774,7 +776,7 @@ impl ScalarUDFImpl for FlattenJsonScalar {
                 if all_rows.len() > SCALAR_BATCH_MAX_ROWS {
                     record_error("batch_cap_hit");
                     return Err(DataFusionError::Execution(format!(
-                        "{FLATTEN_JSON_UDTF_NAME}(): batch produced more than {SCALAR_BATCH_MAX_ROWS} flattened rows; lower `max_rows` or split the input."
+                        "{FLATTEN_JSON_UDTF_NAME}(): batch produced more than {SCALAR_BATCH_MAX_ROWS} flattened rows; split the input or use the UDTF form with `max_rows => N`."
                     )));
                 }
             }

@@ -1397,31 +1397,54 @@ impl HttpExec {
     /// Create a `RecordBatch` for the user-declared columns by
     /// decomposing each JSON response row according to the nesting
     /// configuration. All output columns are `Utf8`.
+    ///
+    /// Takes a fast path for object rows when the catch-all column is
+    /// not part of the projection: reads static fields directly from
+    /// the parsed JSON object and skips building the catch-all map /
+    /// serializing it. Falls back to the full `decompose_json_row`
+    /// when the catch-all is needed or the row isn't a JSON object.
     fn create_batch_from_rows_nested(
         &self,
         content_rows: &[String],
         nesting: &HttpJsonNesting,
     ) -> DataFusionResult<RecordBatch> {
-        // Decompose every row up front; this preserves row alignment
-        // across columns even when keys are missing or null.
-        let decomposed: Vec<super::json_nest::DecomposedRow> = content_rows
-            .iter()
-            .map(|row| decompose_json_row(row, nesting))
-            .collect::<super::json_nest::Result<Vec<_>>>()
-            .map_err(|source| DataFusionError::External(Box::new(Error::JsonNesting { source })))?;
+        let fields = self.projected_schema.fields();
+        let field_names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
+        let catchall_projected = field_names.contains(&nesting.json_field_name.as_str());
 
-        let columns: Vec<ArrayRef> = self
-            .projected_schema
-            .fields()
-            .iter()
-            .map(|field| {
-                let name = field.name().as_str();
-                let iter = decomposed
-                    .iter()
-                    .map(|row| row.get(name).and_then(|v| v.as_deref()));
-                let arr: StringArray = iter.collect();
-                Arc::new(arr) as ArrayRef
-            })
+        let mut builders: Vec<StringBuilder> = std::iter::repeat_with(StringBuilder::new)
+            .take(fields.len())
+            .collect();
+
+        for row in content_rows {
+            if !catchall_projected
+                && let Ok(serde_json::Value::Object(obj)) =
+                    serde_json::from_str::<serde_json::Value>(row)
+            {
+                for (builder, name) in builders.iter_mut().zip(field_names.iter()) {
+                    match obj.get(*name) {
+                        None | Some(serde_json::Value::Null) => builder.append_null(),
+                        Some(serde_json::Value::String(s)) => builder.append_value(s),
+                        Some(other) => builder.append_value(other.to_string()),
+                    }
+                }
+                continue;
+            }
+
+            let decomposed = decompose_json_row(row, nesting).map_err(|source| {
+                DataFusionError::External(Box::new(Error::JsonNesting { source }))
+            })?;
+            for (builder, name) in builders.iter_mut().zip(field_names.iter()) {
+                match decomposed.get(*name).and_then(|v| v.as_deref()) {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+        }
+
+        let columns: Vec<ArrayRef> = builders
+            .into_iter()
+            .map(|mut b| Arc::new(b.finish()) as ArrayRef)
             .collect();
 
         RecordBatch::try_new(Arc::clone(&self.projected_schema), columns)
@@ -5242,5 +5265,121 @@ mod tests {
             1,
             "no duplicates: {result}"
         );
+    }
+
+    fn nested_exec(
+        column_order: &[&str],
+        json_field: &str,
+    ) -> (HttpExec, super::super::json_nest::HttpJsonNesting) {
+        let nesting = super::super::json_nest::HttpJsonNesting::new(
+            column_order.iter().map(|s| (*s).to_string()).collect(),
+            json_field.to_string(),
+        );
+        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let schema = provider.schema();
+        let exec = HttpExec::new(schema, provider, vec![(None, None, None)], None);
+        (exec, nesting)
+    }
+
+    fn string_col(batch: &RecordBatch, name: &str) -> Vec<Option<String>> {
+        let idx = batch
+            .schema()
+            .index_of(name)
+            .expect("column should exist in batch");
+        let arr = batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("column should be StringArray");
+        (0..arr.len())
+            .map(|i| {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i).to_string())
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_decomposes_object_rows() {
+        let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
+        let rows = vec![
+            r#"{"id":"1","name":"alpha","extra":"x"}"#.to_string(),
+            r#"{"id":"2","name":"beta","k":42}"#.to_string(),
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 3);
+        assert_eq!(
+            string_col(&batch, "id"),
+            vec![Some("1".to_string()), Some("2".to_string())]
+        );
+        assert_eq!(
+            string_col(&batch, "name"),
+            vec![Some("alpha".to_string()), Some("beta".to_string())]
+        );
+        let details = string_col(&batch, "details");
+        assert_eq!(details[0].as_deref(), Some(r#"{"extra":"x"}"#));
+        assert_eq!(details[1].as_deref(), Some(r#"{"k":42}"#));
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_missing_key_is_null() {
+        let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
+        let rows = vec![r#"{"id":"1"}"#.to_string()];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(string_col(&batch, "id"), vec![Some("1".to_string())]);
+        assert_eq!(string_col(&batch, "name"), vec![None]);
+        assert_eq!(string_col(&batch, "details"), vec![Some("{}".to_string())]);
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_non_object_row_goes_to_catchall() {
+        let (exec, nesting) = nested_exec(&["id", "details"], "details");
+        let rows = vec![r#""just a string""#.to_string()];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(string_col(&batch, "id"), vec![None]);
+        // Non-object rows are placed verbatim in the catch-all column.
+        let details = string_col(&batch, "details");
+        assert!(details[0].is_some());
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_fast_path_skips_catchall_when_not_projected() {
+        // When the catch-all column is not projected, the fast path reads
+        // static fields directly without calling decompose_json_row.
+        // Build an exec whose projected schema does NOT include the catch-all.
+        let nesting = super::super::json_nest::HttpJsonNesting::new(
+            vec!["id".to_string(), "name".to_string(), "details".to_string()],
+            "details".to_string(),
+        );
+        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        // Project only static columns, not "details".
+        let full_schema = provider.schema();
+        let projected = Arc::new(
+            full_schema
+                .project(&[
+                    full_schema.index_of("id").unwrap(),
+                    full_schema.index_of("name").unwrap(),
+                ])
+                .expect("projection should succeed"),
+        );
+        let exec = HttpExec::new(projected, provider, vec![(None, None, None)], None);
+        let rows = vec![r#"{"id":"42","name":"fast","extra":"ignored"}"#.to_string()];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("fast-path batch should be created");
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(string_col(&batch, "id"), vec![Some("42".to_string())]);
+        assert_eq!(string_col(&batch, "name"), vec![Some("fast".to_string())]);
     }
 }

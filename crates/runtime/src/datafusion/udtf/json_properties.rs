@@ -45,7 +45,7 @@ limitations under the License.
 //! - `items.properties` (arrays of objects; leaves appear at `array.field`).
 //! - `additionalProperties` maps (the map field emits `type = "map"`, children
 //!   appear at `map.child`; with `expand_maps = true` they appear at
-//!   `map.<map_wildcard>.child` — JSONPath-style).
+//!   `map.<map_wildcard>.child` — JSONPath-style.
 //! - `allOf`, `oneOf`, `anyOf` merge — fields from every branch are emitted;
 //!   duplicate names across branches are deduped.
 //! - Local `$ref` pointers (`#/$defs/*`, `#/definitions/*`, `#/properties/*`)
@@ -465,8 +465,7 @@ impl<'a> Walker<'a> {
                         // JSONPath storage conventions (e.g.
                         // `identityMap.[*].id` when the map's values
                         // are arrays of objects).
-                        let wildcard = self.opts.map_wildcard.clone();
-                        self.handle_field(&wildcard, ap, &path, false, depth + 1);
+                        self.handle_field(self.opts.map_wildcard.as_str(), ap, &path, false, depth + 1);
                     } else {
                         // Legacy: collapse children onto the map's own path.
                         // For Map<String, Object>, ap has `properties` and
