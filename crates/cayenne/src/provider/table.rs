@@ -3405,12 +3405,14 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Persist table-level aggregate statistics from accumulated write stats.
+    /// Persist statistics for the most recent write.
     ///
-    /// Takes a `ColumnStatsAccumulator` populated during writes and persists the
-    /// accumulated stats as a Vortex `FileStatistics` blob in the metastore. This
-    /// makes statistics available for distributed query planning without re-reading
-    /// file footers.
+    /// The accumulator contains stats for the rows written by the current
+    /// operation only. The metastore row is keyed by `table_id` and upserted,
+    /// so this overwrites any previous entry (last-write-wins) — it does not
+    /// merge with stats from earlier writes yet. Treating these values as
+    /// table-wide stats is unsafe; consumers must read them as optimization
+    /// hints until cross-write merging lands.
     ///
     /// Best-effort: logs a warning and continues if stats persistence fails,
     /// since stats are an optimization and not critical for correctness.
