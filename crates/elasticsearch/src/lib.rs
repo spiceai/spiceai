@@ -51,8 +51,8 @@ pub enum Error {
 
 impl Error {
     /// Returns true if this error represents a transient condition that may
-    /// succeed on retry (HTTP 429, 502, 503, 504, or a timed-out/connect-reset
-    /// transport error).
+    /// succeed on retry. Transient includes HTTP 429 (too many requests), any
+    /// 5xx response (500–599), or a timed-out/connect-reset transport error.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
@@ -245,6 +245,12 @@ impl Client {
 
     /// Retry `f` on transient errors (HTTP 429/5xx, connect/timeout) with
     /// exponential backoff. Bounded by `self.retry.max_retries`.
+    ///
+    /// Retry is opt-in per call site: only operations that wrap their request
+    /// in `with_retry` are retried. Today this is scoped to `bulk_index`, which
+    /// is the hot ingestion path. Other operations (`search`, `index_exists`,
+    /// `create_index`, `put_mapping`, `get_mapping`, `index_document`) bypass
+    /// retries to keep startup/query failures fast and attributable.
     async fn with_retry<'a, F, Fut, T>(&'a self, op: &'static str, mut f: F) -> Result<T>
     where
         F: FnMut(&'a Self) -> Fut,

@@ -119,16 +119,19 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub async fn write(index: &ElasticsearchIndex, record: RecordBatch) -> Result<RecordBatch> {
     let es_index = index.es_index.as_str();
 
+    // Fail fast if the embedded column is missing: silently returning the batch
+    // would turn a mis-projection or upstream schema bug into zero-document
+    // indexing while the pipeline reports success, which is silent data loss
+    // for the vector store.
     let Some((embedded_column_idx, _)) = record
         .schema()
         .column_with_name(index.embedded_column.as_str())
     else {
-        tracing::warn!(
-            "Skipping write to Elasticsearch index '{}': embedded column '{}' is not in the record batch schema.",
-            es_index,
-            index.embedded_column
-        );
-        return Ok(record);
+        return ColumnNotFoundSnafu {
+            index: es_index.to_string(),
+            column: index.embedded_column.clone(),
+        }
+        .fail();
     };
 
     let embedding_vectors = embed_column(
@@ -524,13 +527,13 @@ fn update_embedding_column_in_batch(
         columns[idx] = embedding_array;
         schema
     } else {
+        // Derive the new field's type directly from the embedding array so the
+        // schema always matches the actual array (e.g. when `create_embedding_array`
+        // falls back to an inferred dimension because `dimension <= 0`).
         let mut fields = schema.fields().to_vec();
         fields.push(Arc::new(Field::new(
             &embedding_column_name,
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, false)),
-                dimension,
-            ),
+            embedding_array.data_type().clone(),
             true,
         )));
         columns.push(embedding_array);

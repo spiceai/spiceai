@@ -245,6 +245,22 @@ impl Index for ElasticsearchIndex {
                 cols.push(t.clone());
             }
         }
+
+        // Include user-declared metadata columns (`vectors: filterable | non-filterable`)
+        // so they survive projection pruning and make it into the ES `_source` on
+        // refresh/CDC indexing. Without this, the mapping hints would be ineffective
+        // and expected metadata would be dropped. The derived embedding column is
+        // excluded because the write path computes it itself.
+        let derived_embedding_column = embedding_col(&self.embedded_column);
+        for name in self.metadata_columns.all_names() {
+            if name == derived_embedding_column {
+                continue;
+            }
+            if !cols.contains(&name) {
+                cols.push(name);
+            }
+        }
+
         cols
     }
 
