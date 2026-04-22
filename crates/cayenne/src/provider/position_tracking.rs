@@ -26,6 +26,7 @@ limitations under the License.
 
 use std::any::Any;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch, StringBuilder, StructArray};
@@ -55,6 +56,7 @@ use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use futures::FutureExt;
 use object_store::ObjectStore;
+use roaring::{RoaringBitmap, RoaringTreemap};
 #[cfg(feature = "partition-table-provider")]
 use runtime_table_partition::provider::PartitionTableProvider;
 use vortex::VortexSessionDefault;
@@ -64,6 +66,7 @@ use vortex::expr::{col, pack};
 use vortex::file::OpenOptionsSessionExt;
 use vortex::layout::layouts::row_idx::row_idx;
 use vortex::session::VortexSession;
+use vortex_scan::Selection;
 
 use crate::provider::CayenneTableProvider;
 
@@ -182,7 +185,7 @@ impl TableProvider for CayennePositionTrackingTable {
 
 pub(crate) async fn is_position_based_cayenne(provider: &Arc<dyn TableProvider>) -> bool {
     if let Some(cayenne) = unwrap_to_cayenne(provider) {
-        return cayenne.is_position_based() && cayenne.has_pending_deletions().is_ok_and(|v| !v);
+        return cayenne.is_position_based();
     }
 
     #[cfg(feature = "partition-table-provider")]
@@ -190,12 +193,7 @@ pub(crate) async fn is_position_based_cayenne(provider: &Arc<dyn TableProvider>)
         let providers: Vec<Arc<dyn TableProvider>> = partitioned.partition_table_providers().await;
         return !providers.is_empty()
             && providers.iter().all(|provider| {
-                unwrap_to_cayenne(provider).is_some_and(|cayenne| {
-                    cayenne.is_position_based()
-                        && cayenne
-                            .has_pending_deletions()
-                            .is_ok_and(|pending| !pending)
-                })
+                unwrap_to_cayenne(provider).is_some_and(CayenneTableProvider::is_position_based)
             });
     }
 
@@ -323,6 +321,7 @@ pub(crate) struct CayennePositionTrackingExec {
     file_groups: Vec<FileGroup>,
     object_store_url: ObjectStoreUrl,
     base_schema: SchemaRef,
+    deletion_snapshot: Arc<HashMap<String, RoaringBitmap>>,
     scan_schema: SchemaRef,
     schema: SchemaRef,
     properties: PlanProperties,
@@ -334,6 +333,7 @@ impl CayennePositionTrackingExec {
         file_groups: Vec<FileGroup>,
         object_store_url: ObjectStoreUrl,
         base_schema: SchemaRef,
+        deletion_snapshot: Arc<HashMap<String, RoaringBitmap>>,
     ) -> Self {
         let scan_schema = tracked_scan_schema(&base_schema);
         let schema = tracked_schema(&base_schema);
@@ -348,6 +348,7 @@ impl CayennePositionTrackingExec {
             file_groups,
             object_store_url,
             base_schema,
+            deletion_snapshot,
             scan_schema,
             schema,
             properties,
@@ -438,6 +439,7 @@ impl ExecutionPlan for CayennePositionTrackingExec {
         let stream_schema = Arc::clone(&self.schema);
         let scan_schema = Arc::clone(&self.scan_schema);
         let base_schema = Arc::clone(&self.base_schema);
+        let deletion_snapshot = Arc::clone(&self.deletion_snapshot);
         let object_store_url = self.object_store_url.clone();
 
         // Use async_stream here because we need to sequentially open files and then yield
@@ -458,12 +460,21 @@ impl ExecutionPlan for CayennePositionTrackingExec {
                         "Failed to open Vortex file '{file_path}' for position tracking: {e}"
                     )))?;
 
-                let mut stream = vxf
+                let mut scan_builder = vxf
                     .scan()
                     .map_err(|e| DataFusionError::Execution(format!(
                         "Failed to build Vortex scan for position tracking on '{file_path}': {e}"
                     )))?
-                    .with_projection(projection.clone())
+                    .with_projection(projection.clone());
+
+                if let Some(bitmap) = deletion_snapshot.get(&file_path)
+                    && !bitmap.is_empty()
+                {
+                    let excluded_indices: RoaringTreemap = bitmap.iter().map(u64::from).collect();
+                    scan_builder = scan_builder.with_selection(Selection::ExcludeRoaring(excluded_indices));
+                }
+
+                let mut stream = scan_builder
                     .into_stream()
                     .map_err(|e| DataFusionError::Execution(format!(
                         "Failed to start Vortex stream for position tracking on '{file_path}': {e}"

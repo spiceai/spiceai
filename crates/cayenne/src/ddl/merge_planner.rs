@@ -190,6 +190,7 @@ async fn build_local_merge_input(
             &target_provider,
         ))?)
     } else {
+        // panic!("We don't expect this");
         Arc::clone(&target_provider)
     };
 

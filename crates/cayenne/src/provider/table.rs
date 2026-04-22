@@ -4339,6 +4339,19 @@ impl CayenneTableProvider {
                 ))
             })?;
 
+        let deletion_snapshot = self
+            .pk_deletion_strategy
+            .position_based_cache()
+            .map(|cache| {
+                cache.read().map(|guard| Arc::clone(&guard)).map_err(|_| {
+                    datafusion_common::DataFusionError::Execution(
+                        DELETION_CACHE_LOCK_POISONED.to_string(),
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or_else(|| Arc::new(HashMap::new()));
+
         let mut plan: Arc<dyn ExecutionPlan> = if list_result.file_groups.is_empty() {
             Arc::new(EmptyExec::new(
                 crate::provider::position_tracking::tracked_schema(&self.table_metadata.schema),
@@ -4348,6 +4361,7 @@ impl CayenneTableProvider {
                 list_result.file_groups,
                 object_store_url,
                 Arc::clone(&self.table_metadata.schema),
+                deletion_snapshot,
             ))
         };
 

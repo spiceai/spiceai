@@ -29,6 +29,7 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::array::{Array, ArrayRef, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -577,13 +578,25 @@ async fn execute_merge(
 ) -> Result<RecordBatch, DataFusionError> {
     use futures::TryStreamExt;
 
+    let merge_started = Instant::now();
+
     // Step 1: Execute the join plan to get matched rows with updated values.
+    let join_started = Instant::now();
     let join_stream = execute_stream(Arc::clone(&join_plan), Arc::clone(&context))?;
     let updated_batches: Vec<RecordBatch> = join_stream.try_collect().await?;
+    let merge_join_duration = join_started.elapsed();
 
     let total_rows: usize = updated_batches.iter().map(RecordBatch::num_rows).sum();
 
     if total_rows == 0 {
+        emit_merge_metrics(
+            merge_join_duration,
+            Duration::ZERO,
+            Duration::ZERO,
+            merge_started.elapsed(),
+            total_rows,
+        );
+
         // No matches — nothing to do.
         return Ok(RecordBatch::try_from_iter_with_nullable(vec![(
             "count",
@@ -600,6 +613,7 @@ async fn execute_merge(
             .is_some()
     });
 
+    let delete_started = Instant::now();
     let delete_count;
     let normalized_batches = if has_positions {
         let positions = extract_deletion_positions(&updated_batches)?;
@@ -654,6 +668,7 @@ async fn execute_merge(
 
         normalized_batches
     };
+    let merge_delete_duration = delete_started.elapsed();
 
     // Verify the delete count matches the expected number of rows.
     if delete_count != total_rows as u64 {
@@ -663,12 +678,14 @@ async fn execute_merge(
     }
 
     // Step 5: Insert updated rows into the target.
+    let insert_started = Instant::now();
     let input_exec = MemorySourceConfig::try_new_exec(&[normalized_batches], target_schema, None)?;
     let insert_plan = target_provider
         .insert_into(&session_state, input_exec, InsertOp::Append)
         .await?;
     let insert_stream = execute_stream(insert_plan, Arc::clone(&context))?;
     let insert_batches: Vec<RecordBatch> = insert_stream.try_collect().await?;
+    let merge_insert_duration = insert_started.elapsed();
 
     // Verify the insert count matches.
     let insert_count = extract_dml_count(&insert_batches);
@@ -678,12 +695,52 @@ async fn execute_merge(
         )));
     }
 
+    emit_merge_metrics(
+        merge_join_duration,
+        merge_delete_duration,
+        merge_insert_duration,
+        merge_started.elapsed(),
+        total_rows,
+    );
+
     // Step 6: Return the count of updated rows.
     Ok(RecordBatch::try_from_iter_with_nullable(vec![(
         "count",
         Arc::new(UInt64Array::from(vec![total_rows as u64])) as ArrayRef,
         false,
     )])?)
+}
+
+fn emit_merge_metrics(
+    merge_join_duration: Duration,
+    merge_delete_duration: Duration,
+    merge_insert_duration: Duration,
+    total_merge_duration: Duration,
+    matched_rows: usize,
+) {
+    let merge_join_ms = merge_join_duration.as_secs_f64() * 1000.0;
+    let merge_delete_ms = merge_delete_duration.as_secs_f64() * 1000.0;
+    let merge_insert_ms = merge_insert_duration.as_secs_f64() * 1000.0;
+    let merge_total_ms = total_merge_duration.as_secs_f64() * 1000.0;
+
+    tracing::info!(
+        merge_join_ms = %merge_join_ms,
+        merge_delete_ms = %merge_delete_ms,
+        merge_insert_ms = %merge_insert_ms,
+        merge_total_ms = %merge_total_ms,
+        matched_rows,
+        "MERGE INTO execution metrics"
+    );
+
+    tracing::info!(
+        target: "task_history",
+        merge_join_ms = %merge_join_ms,
+        merge_delete_ms = %merge_delete_ms,
+        merge_insert_ms = %merge_insert_ms,
+        merge_total_ms = %merge_total_ms,
+        matched_rows = %matched_rows,
+        "labels"
+    );
 }
 
 /// Extract the row count from DML output batches (e.g., from `delete_from` or `insert_into`).
