@@ -50,7 +50,7 @@ use crate::search::util::table_ref_from_column_expr;
 pub static RRF_UDF_NAME: &str = "rrf";
 
 /// Column name for the fused score computed by RRF.
-pub static RRF_FUSED_SCORE_COLUMN_NAME: &str = "fused_score";
+pub static RRF_FUSED_SCORE_COLUMN_NAME: &str = "_fused_score";
 
 /// Internal column name for the synthetic row ID used when no user-provided join key exists.
 const RRF_ROW_ID_COLUMN_NAME: &str = "__spice_rrf_row_id";
