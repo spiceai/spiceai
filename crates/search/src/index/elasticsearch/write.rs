@@ -104,6 +104,11 @@ pub enum Error {
         column: String,
         data_type: String,
     },
+
+    #[snafu(display(
+        "Failed to write to Elasticsearch index '{index}': source column '{column}' collides with the configured vector_field name. Rename one of the columns so the embedding vector does not silently overwrite a source value."
+    ))]
+    VectorFieldCollidesWithSourceColumn { index: String, column: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -215,6 +220,20 @@ fn build_documents(
                 index: es_index.to_string(),
             })?;
         column_encoders.push((field.name().clone(), encoder));
+    }
+
+    // Detect name collision between the configured vector field and any source
+    // column. Without this, inserting the embedding vector below would silently
+    // overwrite a source value in the document sent to Elasticsearch.
+    if column_encoders
+        .iter()
+        .any(|(name, _)| name == &index.vector_field)
+    {
+        return VectorFieldCollidesWithSourceColumnSnafu {
+            index: es_index.to_string(),
+            column: index.vector_field.clone(),
+        }
+        .fail();
     }
 
     let mut docs: Vec<(Option<String>, Value)> = Vec::with_capacity(record.num_rows());

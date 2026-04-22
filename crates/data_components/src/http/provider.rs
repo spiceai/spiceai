@@ -5451,4 +5451,62 @@ mod tests {
         assert!(id[0].is_none(), "non-object row: id should be NULL");
         assert_eq!(id[1].as_deref(), Some("x"));
     }
+
+    #[test]
+    fn create_batch_from_rows_empty_projection_nested_falls_back_to_first_column() {
+        // When DataFusion projects zero columns (e.g. COUNT(*)), `get_projected_schema`
+        // falls back to a single-column schema. For nested providers that's the first
+        // declared column. `create_batch_from_rows_nested` must produce a batch with
+        // the correct row count against that single-column schema.
+        let nesting = super::super::json_nest::HttpJsonNesting::new(
+            vec!["id".to_string(), "details".to_string()],
+            "details".to_string(),
+        );
+        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let full_schema = provider.schema();
+        let projected =
+            HttpTableProvider::get_projected_schema(&full_schema, Some(&vec![])).expect("schema");
+        assert_eq!(
+            projected.fields().len(),
+            1,
+            "empty projection should fall back to a single field"
+        );
+        let exec = HttpExec::new(projected, provider, vec![(None, None, None)], None);
+        let rows = vec![
+            r#"{"id":"1","extra":"x"}"#.to_string(),
+            r#"{"id":"2"}"#.to_string(),
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 1);
+    }
+
+    #[test]
+    fn create_batch_from_rows_dispatches_to_nested_when_configured() {
+        // End-to-end through create_batch_from_rows: a provider configured with
+        // JSON nesting should route batch construction through the nested path
+        // and ignore HTTP-metadata fields.
+        let (exec, _nesting) = nested_exec(&["id", "name", "details"], "details");
+        let rows = vec![
+            r#"{"id":"1","name":"alpha","extra":"x"}"#.to_string(),
+            r#"{"id":"2","name":"beta"}"#.to_string(),
+        ];
+        let fetch_result = HttpFetchResult {
+            content: String::new(),
+            max_age: Duration::from_secs(0),
+            detected_format: "json".to_string(),
+            response_date: None,
+            response_status: 200,
+            response_headers: Vec::new(),
+        };
+        let batch = exec
+            .create_batch_from_rows(None, None, None, &rows, &fetch_result)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 2);
+        let schema = batch.schema();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(field_names, vec!["id", "name", "details"]);
+    }
 }
