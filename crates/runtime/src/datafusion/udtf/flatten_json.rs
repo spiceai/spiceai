@@ -661,6 +661,10 @@ impl TableProvider for FlattenJsonTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Single-node only: a bare `DataSourceExec(MemorySourceConfig)` is
+        // rejected by `EnsureSupportedFileScan` in cluster mode. Distributed
+        // support requires a dedicated `UdtfArgs` proto variant + codec so
+        // remote executors can re-invoke the walker; that's follow-up scope.
         let batch = rows_to_batch(&self.rows, Arc::clone(&self.schema))?;
         let src = MemorySourceConfig::try_new(
             &[vec![batch]],
