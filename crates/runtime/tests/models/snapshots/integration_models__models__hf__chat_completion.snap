@@ -5,20 +5,11 @@ expression: "normalize_chat_completion_response(response, true)"
 {
   "choices": [
     {
-      "finish_reason": "tool_calls",
+      "finish_reason": "stop",
       "index": 0,
       "message": {
-        "role": "assistant",
-        "tool_calls": [
-          {
-            "function": {
-              "arguments": "{\"query\":\"{\\\"table\\\":\\\"spice.public.taxi_trips\\\"}\"}",
-              "name": "describe"
-            },
-            "id": "call-0edea482-f8d1-4a66-a24b-e8d8b49f0685",
-            "type": "function"
-          }
-        ]
+        "content": "content_val",
+        "role": "assistant"
       }
     }
   ],
