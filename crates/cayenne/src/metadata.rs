@@ -303,15 +303,18 @@ pub struct CreateTableOptions {
     pub vortex_config: VortexConfig,
 }
 
-/// Table-level aggregate statistics stored as a serialized Vortex [`FileStatistics`] blob.
+/// Table-level statistics stored as a serialized Vortex [`FileStatistics`] blob.
 ///
-/// Stores per-column statistics (min, max, null count, sum, etc.) aggregated across
-/// all files in the table. Uses Vortex's native statistics format for zero-conversion
-/// overhead and compatibility with the Vortex file footer statistics.
+/// Stores per-column statistics (min, max, null count, sum, etc.) captured from
+/// the most recent write (the write's `ColumnStatsAccumulator`). The row in
+/// `cayenne_table_statistics` is keyed by `table_id` and upserted on every write,
+/// so entries represent last-write-wins snapshots rather than aggregates across
+/// every file ever produced; a future change will merge new writes into the
+/// existing blob.
 ///
-/// Used by the query optimizer for join ordering, aggregation strategies, and
-/// partition pruning — especially in distributed query planning where a remote
-/// node needs table stats without access to the underlying Vortex files.
+/// Consumers should treat these values as optimization hints only. Uses Vortex's
+/// native statistics format for zero-conversion overhead and compatibility with
+/// the Vortex file footer statistics.
 ///
 /// [`FileStatistics`]: vortex::file::FileStatistics
 #[derive(Debug, Clone)]
