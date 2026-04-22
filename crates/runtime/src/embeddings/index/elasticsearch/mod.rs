@@ -145,9 +145,9 @@ pub async fn try_from_table(
             "`partition_by` is not yet supported for the Elasticsearch vector engine. Remove the parameter or use the S3 Vectors engine for partitioned workloads.",
         ));
     }
-    if string_from_params(&params, "spill_writes").is_some_and(|v| {
-        matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes")
-    }) {
+    if string_from_params(&params, "spill_writes")
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+    {
         return Err(Box::<dyn std::error::Error + Send + Sync>::from(
             "`spill_writes` is not yet supported for the Elasticsearch vector engine.",
         ));
