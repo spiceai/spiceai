@@ -349,7 +349,13 @@ fn build_array_from_hits(
                     let v = extract_field(&h.source, field_name)?;
                     if let Some(ms) = v.as_i64() {
                         // epoch-millis → epoch-microseconds
-                        return Some(ms * 1_000);
+                        return ms.checked_mul(1_000);
+                    }
+                    if let Some(ms) = v.as_u64() {
+                        // epoch-millis → epoch-microseconds
+                        return i64::try_from(ms)
+                            .ok()
+                            .and_then(|ms| ms.checked_mul(1_000));
                     }
                     if let Some(s) = v.as_str() {
                         return DateTime::parse_from_rfc3339(s)

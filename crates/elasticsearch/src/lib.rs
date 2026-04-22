@@ -340,7 +340,7 @@ impl Client {
             .replace(['\n', '\r'], " ");
         Err(Error::ElasticsearchError {
             status: status.as_u16(),
-            message: format!("HTTP {status}: {}", body.trim()),
+            message: body.trim().to_string(),
         })
     }
 
@@ -448,7 +448,7 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
             .replace(['\n', '\r'], " ");
         return Err(Error::ElasticsearchError {
             status: status.as_u16(),
-            message: format!("HTTP {status}: {}", body.trim()),
+            message: body.trim().to_string(),
         });
     }
     Ok(resp)

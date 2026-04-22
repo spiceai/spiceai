@@ -293,14 +293,16 @@ impl ElasticsearchIndex {
         Arc::new(Schema::new(fields))
     }
 
-    /// Schema for `list_table_provider` results: primary keys + embedding + offset.
+    /// Schema for `list_table_provider` results: primary keys + embedding (+ offset when chunked).
     ///
-    /// The offset column (`{embedded_column}_offset`) is included so that when this
-    /// index is wrapped by [`ChunkedSearchIndex`] / [`super::chunking::ChunkedVectorIndex`],
-    /// the aggregation query built in `ChunkedVectorIndex::list_table_provider` can
-    /// reference it. The column is always emitted by the chunking write path into the
-    /// inner-index batch, so Elasticsearch stores it even though the schema was previously
-    /// not advertising it—causing "Schema error: No field named content_offset".
+    /// The offset column (`{embedded_column}_offset`) is only included when this index is
+    /// wrapped by [`ChunkedSearchIndex`] / [`super::chunking::ChunkedVectorIndex`] (detected
+    /// by the presence of [`CHUNKED_INDEX_CHUNK_KEY`] in `self.primary_key`). The chunking
+    /// write path always emits the offset column into the inner-index batch, so Elasticsearch
+    /// stores it even though the schema was previously not advertising it—causing
+    /// "Schema error: No field named content_offset". For non-chunked indexes the offset
+    /// is never written, so advertising it here would produce null values and violate the
+    /// non-nullable declaration.
     fn list_result_schema(&self) -> SchemaRef {
         let mut fields: Vec<Field> = self.primary_key.clone();
         fields.push(Field::new(
@@ -311,12 +313,23 @@ impl ElasticsearchIndex {
             ),
             true,
         ));
-        fields.push(Field::new(
-            ChunkedSearchIndex::chunking_offset_col(&self.embedded_column),
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 2),
-            false,
-        ));
+        if self.is_chunked() {
+            fields.push(Field::new(
+                ChunkedSearchIndex::chunking_offset_col(&self.embedded_column),
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 2),
+                false,
+            ));
+        }
         Arc::new(Schema::new(fields))
+    }
+
+    /// Whether this index is being used as the inner index of a [`ChunkedSearchIndex`],
+    /// detected by the presence of [`CHUNKED_INDEX_CHUNK_KEY`] in `self.primary_key`
+    /// (added by [`ChunkedSearchIndex::augment_primary_key`]).
+    fn is_chunked(&self) -> bool {
+        self.primary_key
+            .iter()
+            .any(|f| f.name() == CHUNKED_INDEX_CHUNK_KEY)
     }
 }
 
