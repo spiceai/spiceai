@@ -123,6 +123,16 @@ impl DataConnector for FullTextConnector {
         self.inner_connector.metadata_provider(dataset).await
     }
 
+    async fn register_object_stores(
+        &self,
+        dataset: &Dataset,
+        runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> DataConnectorResult<()> {
+        self.inner_connector
+            .register_object_stores(dataset, runtime_env)
+            .await
+    }
+
     fn initialization(&self) -> ComponentInitialization {
         self.inner_connector.initialization()
     }
