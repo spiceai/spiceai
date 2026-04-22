@@ -72,7 +72,9 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::{Arc, LazyLock};
 
-use arrow::array::{Array, ArrayRef, LargeListArray, StringBuilder, StructArray, as_string_array};
+use arrow::array::{
+    Array, ArrayRef, LargeListArray, StringBuilder, StructArray, as_largestring_array,
+};
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::kernels::cast::cast;
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
@@ -323,7 +325,15 @@ impl Walker<'_> {
                 } else {
                     for (idx, child) in arr.iter().enumerate() {
                         let child_path = make_array_index(path, idx, self.opts.path_style);
-                        let idx_key = format!("[{idx}]");
+                        // Match the last path segment: bracketed for dot
+                        // paths (`[0]`), bare index for json-pointer
+                        // (`0`). Keeps `key` consistent with the trailing
+                        // segment of `path` so callers can reconstruct
+                        // `path` from `parent_path` + `key`.
+                        let idx_key = match self.opts.path_style {
+                            PathStyle::JsonPointer => idx.to_string(),
+                            PathStyle::Dot => format!("[{idx}]"),
+                        };
                         self.walk(child, &child_path, &idx_key, depth + 1);
                         if self.row_cap_hit {
                             return;
@@ -769,13 +779,17 @@ impl ScalarUDFImpl for FlattenJsonScalar {
         let opts = FlattenOptions::default();
 
         let array = input_col.into_array(args.number_rows)?;
-        let normalized = if matches!(array.data_type(), DataType::Utf8) {
+        // Normalize to `LargeUtf8` rather than `Utf8` so inputs whose
+        // cumulative string bytes exceed the 32-bit offset limit still
+        // work (casting `LargeUtf8` -> `Utf8` can fail for truly large
+        // inputs even though the UDF signature advertises `LargeUtf8`).
+        let normalized = if matches!(array.data_type(), DataType::LargeUtf8) {
             array
         } else {
-            cast(&array, &DataType::Utf8)
+            cast(&array, &DataType::LargeUtf8)
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
         };
-        let strings = as_string_array(&normalized);
+        let strings = as_largestring_array(&normalized);
 
         let mut all_rows: Vec<JsonRow> = Vec::new();
         let mut offsets: Vec<i64> = Vec::with_capacity(strings.len() + 1);
