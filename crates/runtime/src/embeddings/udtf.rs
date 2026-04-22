@@ -1265,8 +1265,7 @@ mod tests {
     #[test]
     fn test_parse_query_arg_sql_array_empty_rejected() {
         let q = list_literal(&[]);
-        let err =
-            VectorSearchTableFunc::parse_query_arg(Some(&q)).expect_err("expected rejection");
+        let err = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect_err("expected rejection");
         assert!(err.to_string().contains("at least one query string"));
     }
 
