@@ -30,11 +30,11 @@ use datafusion::logical_expr::{
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{DataFrame, SessionContext, coalesce, exp, greatest, now, to_unixtime};
 use datafusion_expr::expr::ScalarFunction;
-use datafusion_expr::{ExprFunctionExt, col, ident, lit};
+use datafusion_expr::{ExprFunctionExt, TableProviderFilterPushDown, col, ident, lit};
 use itertools::Itertools;
 use runtime_datafusion_udfs::digest_many::digest_many;
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
@@ -48,6 +48,12 @@ use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
 use crate::search::util::table_ref_from_column_expr;
 
 pub static RRF_UDF_NAME: &str = "rrf";
+
+/// Column name for the fused score computed by RRF.
+pub static RRF_FUSED_SCORE_COLUMN_NAME: &str = "_fused_score";
+
+/// Internal column name for the synthetic row ID used when no user-provided join key exists.
+const RRF_ROW_ID_COLUMN_NAME: &str = "__spice_rrf_row_id";
 
 /// When the user sets a fused-result `limit` on `rrf()`, each underlying search
 /// subquery is asked for `limit * RRF_CANDIDATE_POOL_FACTOR` rows so the
@@ -554,7 +560,11 @@ pub struct ReciprocalRankFusion {
     pub session_context: Arc<SessionContext>,
     // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `SessionContext` implement them.
     session_ptr: u64,
-    df: Option<DataFrame>,
+    /// Output schema, derived once in `call()` by building the fused `DataFrame`.
+    schema: Option<SchemaRef>,
+    /// Stores the original RRF arguments so that `scan()` can rebuild the
+    /// fused `DataFrame` with pre-filters injected into each sub-query.
+    rrf_args: Option<Arc<ReciprocalRankFusionArgs>>,
     /// Stores the original RRF arguments for distributed serialization.
     ///
     /// This is set when the provider is created via the `rrf()` UDTF and enables
@@ -585,7 +595,8 @@ impl ReciprocalRankFusion {
         Self {
             session_context: Arc::clone(session_context),
             session_ptr: ptr,
-            df: None,
+            schema: None,
+            rrf_args: None,
             rrf_source: None,
         }
     }
@@ -596,8 +607,14 @@ impl ReciprocalRankFusion {
     }
 
     #[must_use]
-    pub fn with_df(mut self, df: DataFrame) -> Self {
-        self.df = Some(df);
+    fn with_schema(mut self, schema: SchemaRef) -> Self {
+        self.schema = Some(schema);
+        self
+    }
+
+    #[must_use]
+    fn with_rrf_args(mut self, args: Arc<ReciprocalRankFusionArgs>) -> Self {
+        self.rrf_args = Some(args);
         self
     }
 
@@ -638,9 +655,9 @@ impl ReciprocalRankFusion {
             .reduce(|a, b| a + b);
 
         let score_expr = if let Some(score_expr) = score_expr {
-            score_expr.alias("fused_score")
+            score_expr.alias(RRF_FUSED_SCORE_COLUMN_NAME)
         } else {
-            return exec_err!("{RRF_UDF_NAME} unable to compute fused_score");
+            return exec_err!("{RRF_UDF_NAME} unable to compute {RRF_FUSED_SCORE_COLUMN_NAME}");
         };
 
         // If user specifies a recency column, we enable recency boosting
@@ -687,13 +704,20 @@ impl ReciprocalRankFusion {
         };
 
         // Fall back to the original score expression if a recency boost cannot be computed
-        Ok((score_expr * coalesce(vec![recency_expr, lit(1.0)])).alias("fused_score"))
+        Ok(
+            (score_expr * coalesce(vec![recency_expr, lit(1.0)]))
+                .alias(RRF_FUSED_SCORE_COLUMN_NAME),
+        )
     }
 
     // Given arguments to n search calls: execute searches, generate row IDs, rank by score, JOIN,
     // then finally re-rank and sort fused results
-    fn rerank_and_fuse_df(&self, args: &ReciprocalRankFusionArgs) -> Result<DataFrame> {
-        let (subquery_dfs, join_key) = self.prepare_and_execute_subqueries(args)?;
+    fn rerank_and_fuse_df(
+        &self,
+        args: &ReciprocalRankFusionArgs,
+        filters: &[Expr],
+    ) -> Result<DataFrame> {
+        let (subquery_dfs, join_key) = self.prepare_and_execute_subqueries(args, filters)?;
         let score_expr = Self::compute_score_expr(args, &subquery_dfs)?;
 
         // Create column expressions for final projection
@@ -737,7 +761,8 @@ impl ReciprocalRankFusion {
         if let Some(joined) = maybe_joined {
             tracing::trace!("{RRF_UDF_NAME} made reranked & fused DF for: {args:?}");
             // Take the highest scores from multiple matches
-            let mut agg_cols = vec![max(col("fused_score")).alias("fused_score")];
+            let mut agg_cols =
+                vec![max(col(RRF_FUSED_SCORE_COLUMN_NAME)).alias(RRF_FUSED_SCORE_COLUMN_NAME)];
 
             // The first column is the score_expr, which gets special treatment above.
             // These are unaliased, because they get flattened by coalesce() in the first select.
@@ -749,8 +774,11 @@ impl ReciprocalRankFusion {
                     None
                 } else {
                     Some(
-                        first_value(ident(&cname), vec![col("fused_score").sort(false, false)])
-                            .alias(&cname),
+                        first_value(
+                            ident(&cname),
+                            vec![col(RRF_FUSED_SCORE_COLUMN_NAME).sort(false, false)],
+                        )
+                        .alias(&cname),
                     )
                 }
             }));
@@ -758,8 +786,8 @@ impl ReciprocalRankFusion {
             let sorted = joined
                 .select(columns)?
                 .aggregate(vec![join_key], agg_cols)?
-                .drop_columns(&["__spice_rrf_row_id"])?
-                .sort(vec![col("fused_score").sort(false, false)])?;
+                .drop_columns(&[RRF_ROW_ID_COLUMN_NAME])?
+                .sort(vec![col(RRF_FUSED_SCORE_COLUMN_NAME).sort(false, false)])?;
 
             // Apply the RRF-level limit so `FROM rrf(..., limit => N)` alone is
             // sufficient — users don't have to add an outer LIMIT clause.
@@ -791,9 +819,16 @@ impl ReciprocalRankFusion {
 
     // Given RRF args with unparsed search udtf exprs, turn each subquery into a DF,
     // add a hashed row ID, rank it, then give it an alias of `search_{i_in_argv}`
+    //
+    // When `filters` is non-empty, each filter whose referenced columns all
+    // exist in a sub-query's schema is applied as a pre-filter on that
+    // sub-query *before* ranking. This narrows the candidate set so that
+    // ranks reflect position within the filtered population — matching user
+    // intent for queries like `WHERE review_date > '2015-06-15' AND product_category = 'some category'`.
     fn prepare_and_execute_subqueries(
         &self,
         args: &ReciprocalRankFusionArgs,
+        filters: &[Expr],
     ) -> Result<(Vec<DataFrame>, Expr)> {
         tracing::trace!("{RRF_UDF_NAME} preparing subqueries for: {:?}", args);
 
@@ -846,6 +881,30 @@ impl ReciprocalRankFusion {
                     );
                 }
 
+                // Apply pre-filters: only keep filters whose columns all exist
+                // in this sub-query's schema. This narrows the candidate set
+                // *before* ranking so ranks reflect position within the
+                // filtered population.
+                let df = if filters.is_empty() {
+                    df
+                } else {
+                    let schema = df.schema();
+                    if let Some(combined) = filters
+                        .iter()
+                        .filter(|f| {
+                            f.column_refs()
+                                .iter()
+                                .all(|c| schema.has_column_with_unqualified_name(c.name()))
+                        })
+                        .cloned()
+                        .reduce(Expr::and)
+                    {
+                        df.filter(combined)?
+                    } else {
+                        df
+                    }
+                };
+
                 // Propagate the RRF-level `limit` into each subquery as a wider
                 // candidate pool — but only when the subquery itself does not
                 // already specify an explicit `limit` positional argument. We
@@ -890,7 +949,7 @@ impl ReciprocalRankFusion {
                 // over equal scores depends on scan order and is non-reproducible.
                 let tie_break = join_key
                     .as_ref()
-                    .map_or_else(|| col("__spice_rrf_row_id"), Clone::clone);
+                    .map_or_else(|| col(RRF_ROW_ID_COLUMN_NAME), Clone::clone);
 
                 df_with_id
                     .and_then(|df| Self::with_rank(df, &tie_break))
@@ -898,7 +957,10 @@ impl ReciprocalRankFusion {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok((prepared_dfs, join_key.unwrap_or(col("__spice_rrf_row_id"))))
+        Ok((
+            prepared_dfs,
+            join_key.unwrap_or(col(RRF_ROW_ID_COLUMN_NAME)),
+        ))
     }
 
     // Given a DF with overlapping unqualified names (as produced by JOIN), where column values
@@ -1012,7 +1074,7 @@ impl ReciprocalRankFusion {
                 .collect();
         }
 
-        df.with_column("__spice_rrf_row_id", digest_many(selected, "md5"))
+        df.with_column(RRF_ROW_ID_COLUMN_NAME, digest_many(selected, "md5"))
     }
 }
 
@@ -1045,12 +1107,14 @@ impl ScalarUDFImpl for ReciprocalRankFusion {
 
 impl TableFunctionImpl for ReciprocalRankFusion {
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
-        let rrf_args = ReciprocalRankFusionArgs::from_udtf_exprs(args)?;
+        let rrf_args = Arc::new(ReciprocalRankFusionArgs::from_udtf_exprs(args)?);
         let serializable_args = rrf_args.to_serializable()?;
-        let rerank_and_fuse_df = self.rerank_and_fuse_df(&rrf_args)?;
+        let schema_df = self.rerank_and_fuse_df(&rrf_args, &[])?;
+        let schema = Arc::clone(schema_df.schema().inner());
         Ok(Arc::new(
             ReciprocalRankFusion::from_ctx(&self.session_context)
-                .with_df(rerank_and_fuse_df)
+                .with_schema(schema)
+                .with_rrf_args(rrf_args)
                 .with_rrf_source(serializable_args),
         ))
     }
@@ -1063,14 +1127,45 @@ impl TableProvider for ReciprocalRankFusion {
     }
 
     fn schema(&self) -> SchemaRef {
-        match self.df.as_ref() {
-            Some(df) => Arc::clone(df.schema().inner()),
+        match self.schema.as_ref() {
+            Some(schema) => Arc::clone(schema),
             None => panic!("ReciprocalRankFusion schema is not set. This is a bug in Spice.ai"),
         }
     }
 
     fn table_type(&self) -> TableType {
         TableType::Temporary
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        let schema = self.schema();
+        // `fused_score` is computed by RRF; all other columns come from the
+        // underlying search subqueries and are safe to push down.
+        let base_field_names: HashSet<&str> = schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .filter(|name| *name != RRF_FUSED_SCORE_COLUMN_NAME)
+            .collect();
+
+        filters
+            .iter()
+            .map(|f| {
+                let pushable = f
+                    .column_refs()
+                    .iter()
+                    .all(|c| base_field_names.contains(c.name()));
+
+                Ok(if pushable {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                })
+            })
+            .collect()
     }
 
     async fn scan(
@@ -1080,27 +1175,33 @@ impl TableProvider for ReciprocalRankFusion {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if let Some(ref df) = self.df {
-            let mut df = df.clone();
+        let Some(ref rrf_args) = self.rrf_args else {
+            return exec_err!(
+                "ReciprocalRankFusion has no stored args — cannot create physical plan"
+            );
+        };
+        let mut df = self.rerank_and_fuse_df(rrf_args, filters)?;
 
-            if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
-                df = df.filter(filter)?;
-            }
-
-            if let Some(projection) = projection {
-                df = df.select(
-                    self.schema()
-                        .project(projection)?
-                        .fields
-                        .iter()
-                        .map(|f| ident(f.name())),
-                )?;
-            }
-
-            df.limit(0, limit)?.create_physical_plan().await
-        } else {
-            exec_err!("ReciprocalRankFusion could not create physical plan")
+        // Also apply filters post-fusion as a safety net: pre-filters are
+        // only injected into sub-queries whose schema contains the
+        // referenced columns. If sub-queries have different schemas a
+        // filter may be skipped for some, letting unfiltered rows leak
+        // through the FULL JOIN. The post-fusion filter guarantees correctness.
+        if let Some(post_filter) = filters.iter().cloned().reduce(Expr::and) {
+            df = df.filter(post_filter)?;
         }
+
+        if let Some(projection) = projection {
+            df = df.select(
+                self.schema()
+                    .project(projection)?
+                    .fields
+                    .iter()
+                    .map(|f| ident(f.name())),
+            )?;
+        }
+
+        df.limit(0, limit)?.create_physical_plan().await
     }
 }
 
@@ -1374,7 +1475,7 @@ mod tests {
 
         Base RRF score for id=1, k=0 = 1/(k + rank) = 1/(0+1) = 1/1
         But should be unboosted!
-        | fused_score        | content                      | id | picked_at           |
+        | _fused_score       | content                      | id | picked_at           |
         +--------------------+------------------------------+----+---------------------+
         | 1.0                | orange citrus round juicy    | 1  | 1970-01-01T00:00:00 |
         | 0.4723665527410147 | apple fruit sweet red crispy | 3  | 2025-09-23T14:26:15 |
@@ -1382,7 +1483,7 @@ mod tests {
         +--------------------+------------------------------+----+---------------------+
 
         After:
-        | fused_score        | content                      | id | picked_at           |
+        | _fused_score       | content                      | id | picked_at           |
         +--------------------+------------------------------+----+---------------------+
         | 0.4723665527410147 | apple fruit sweet red crispy | 3  | 2025-09-23T14:32:53 |
         | 0.3032653298563167 | banana yellow curved fruit   | 2  | 2025-09-24T14:32:53 |
@@ -1553,18 +1654,24 @@ mod tests {
 
         let query_empty_red_results = test_query!(
             runtime,
-            "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red')) order by fused_score desc"
+            "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red')) order by _fused_score desc"
         );
-        let query_empty_red_content =
-            extract_column!(query_empty_red_results, "fused_score", as_float64_array)?;
+        let query_empty_red_content = extract_column!(
+            query_empty_red_results,
+            RRF_FUSED_SCORE_COLUMN_NAME,
+            as_float64_array
+        )?;
         let query_empty_red_score = query_empty_red_content.value(0);
 
         let query_red_empty_results = test_query!(
             runtime,
             "select * from rrf(vector_search(foo, 'red'), vector_search(bar, 'empty'))"
         );
-        let query_red_empty_content =
-            extract_column!(query_red_empty_results, "fused_score", as_float64_array)?;
+        let query_red_empty_content = extract_column!(
+            query_red_empty_results,
+            RRF_FUSED_SCORE_COLUMN_NAME,
+            as_float64_array
+        )?;
         let query_red_empty_score = query_red_empty_content.value(0);
 
         // Compare permutation of RRF invocations to ensure score is consistent regardless of order
@@ -1578,7 +1685,7 @@ mod tests {
         );
         let query_empty_red_recency_scores = extract_column!(
             query_empty_red_recency_results,
-            "fused_score",
+            RRF_FUSED_SCORE_COLUMN_NAME,
             as_float64_array
         )?;
 
@@ -1761,5 +1868,107 @@ mod tests {
             err.to_string().contains("does not yet support"),
             "unexpected error: {err}"
         );
+    }
+
+    // -- filter pushdown tests --------------------------------------------------
+
+    use super::{RRF_FUSED_SCORE_COLUMN_NAME, ReciprocalRankFusion};
+    use arrow::datatypes::{Field, Schema};
+    use datafusion::prelude::SessionContext;
+    use datafusion_expr::TableProviderFilterPushDown;
+
+    /// Create a minimal `ReciprocalRankFusion` provider with the given schema,
+    /// suitable for testing `supports_filters_pushdown`.
+    fn make_rrf_provider(schema: Schema) -> ReciprocalRankFusion {
+        let ctx = Arc::new(SessionContext::new());
+        ReciprocalRankFusion::from_ctx(&ctx).with_schema(Arc::new(schema))
+    }
+
+    #[test]
+    fn test_rrf_filter_pushdown_base_column() {
+        let provider = make_rrf_provider(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, false),
+        ]));
+
+        let filter = col("id").gt(lit(10));
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(result, vec![TableProviderFilterPushDown::Exact]);
+    }
+
+    #[test]
+    fn test_rrf_filter_pushdown_fused_score_unsupported() {
+        let provider = make_rrf_provider(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(RRF_FUSED_SCORE_COLUMN_NAME, DataType::Float64, false),
+        ]));
+
+        let filter = col(RRF_FUSED_SCORE_COLUMN_NAME).gt(lit(0.5));
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(result, vec![TableProviderFilterPushDown::Unsupported]);
+    }
+
+    #[test]
+    fn test_rrf_filter_pushdown_mixed_filters() {
+        let provider = make_rrf_provider(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("content", DataType::Utf8, false),
+            Field::new(RRF_FUSED_SCORE_COLUMN_NAME, DataType::Float64, false),
+        ]));
+
+        let base_filter = col("id").gt(lit(10));
+        let score_filter = col(RRF_FUSED_SCORE_COLUMN_NAME).gt(lit(0.5));
+        let content_filter = col("content").eq(lit("test"));
+
+        let result = provider
+            .supports_filters_pushdown(&[&base_filter, &score_filter, &content_filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(
+            result,
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rrf_filter_pushdown_mixed_column_expr_unsupported() {
+        let provider = make_rrf_provider(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(RRF_FUSED_SCORE_COLUMN_NAME, DataType::Float64, false),
+        ]));
+
+        // A filter referencing both a base column and fused_score should not be pushed down.
+        let filter = col("id")
+            .gt(lit(10))
+            .and(col(RRF_FUSED_SCORE_COLUMN_NAME).gt(lit(0.5)));
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(result, vec![TableProviderFilterPushDown::Unsupported]);
+    }
+
+    #[test]
+    fn test_rrf_filter_pushdown_constant_expr_exact() {
+        let provider =
+            make_rrf_provider(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        // A constant expression with no column refs is safe to push down.
+        let filter = lit(true);
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(result, vec![TableProviderFilterPushDown::Exact]);
     }
 }
