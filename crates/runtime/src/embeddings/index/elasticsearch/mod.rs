@@ -237,8 +237,10 @@ pub async fn try_from_table(
 }
 
 /// Create the ES index with a `dense_vector` mapping for `vector_field` if the index
-/// does not already exist. If the index exists, add/update the mapping so the vector
-/// field is searchable via kNN. This is idempotent.
+/// does not already exist. If the index already exists, attempt to add or update the
+/// mapping so the vector field is searchable via kNN. Mapping updates for existing
+/// indices are best-effort: if `put_mapping` fails, the error is logged and the
+/// function continues, which may leave the existing mapping unchanged.
 async fn ensure_index_with_mapping(
     client: &dyn Elasticsearch,
     es_index: &str,

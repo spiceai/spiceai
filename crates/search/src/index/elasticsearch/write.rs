@@ -32,7 +32,7 @@ use arrow::array::{
 use arrow_json::{EncoderOptions, writer::make_encoder};
 use arrow_schema::{DataType, Field, Schema};
 use llms::embeddings::{Embed, EmbeddingInput};
-use serde_json::{Value, json};
+use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 use util::{convert_string_arrow_to_iterator, distribute_nulls};
 
@@ -521,7 +521,7 @@ fn inspect_bulk_response(resp: &Value, es_index: &str) -> Result<()> {
     }
 
     let items = resp.get("items").and_then(Value::as_array);
-    let (failures, first_error) = items.map_or((1usize, json!("unknown").to_string()), |arr| {
+    let (failures, first_error) = items.map_or((1usize, "unknown".to_string()), |arr| {
         let mut failures = 0usize;
         let mut first: Option<String> = None;
         for item in arr {
