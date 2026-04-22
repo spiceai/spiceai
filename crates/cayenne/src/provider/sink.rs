@@ -589,6 +589,22 @@ impl CayenneDataSink {
                 self.table.table_name()
             );
         }
+        // Clear the prior statistics row before upserting so a zero-row
+        // overwrite leaves no stats at all (rather than stale stats that
+        // describe rows the overwrite just deleted). `persist_table_stats`
+        // is a no-op when the accumulator is empty, so the clear is what
+        // actually removes the stale row in that case.
+        if let Err(e) = self
+            .table
+            .catalog()
+            .clear_table_statistics(self.table.table_id())
+            .await
+        {
+            tracing::warn!(
+                "Failed to clear table statistics after overwrite for table {}: {e}",
+                self.table.table_name()
+            );
+        }
         self.table.persist_table_stats(&write_stats_acc).await;
 
         Ok(total_rows)
