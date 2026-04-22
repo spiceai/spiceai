@@ -611,7 +611,7 @@ fn arrow_type_to_es_mapping(dt: &DataType) -> serde_json::Value {
 ///   `build_dense_vector_array` always produces this exact inner field.
 fn normalize_es_data_type(dt: &DataType) -> DataType {
     match dt {
-        DataType::LargeUtf8 => DataType::Utf8,
+        DataType::LargeUtf8 | DataType::Utf8View => DataType::Utf8,
         DataType::FixedSizeList(_, dim) => DataType::FixedSizeList(
             Arc::new(arrow_schema::Field::new("item", DataType::Float32, false)),
             *dim,

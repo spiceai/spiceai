@@ -22,11 +22,14 @@ limitations under the License.
 use std::any::Any;
 use std::sync::Arc;
 
+use chrono::DateTime;
+
 use arrow::array::{
     ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, RecordBatch, StringArray,
+    Int64Array, LargeStringBuilder, ListBuilder, RecordBatch, StringArray, StringBuilder,
+    TimestampMicrosecondArray,
 };
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::project_schema;
@@ -298,6 +301,72 @@ fn build_array_from_hits(
         DataType::FixedSizeList(_inner_field, dim) => {
             build_dense_vector_array(hits, field_name, *dim)
         }
+        // List<Utf8> or List<LargeUtf8>: ES returns JSON arrays of strings.
+        // Use `.with_field` so the inner field name matches the schema exactly.
+        DataType::List(inner_field)
+            if matches!(
+                inner_field.data_type(),
+                DataType::Utf8 | DataType::LargeUtf8
+            ) =>
+        {
+            if inner_field.data_type() == &DataType::LargeUtf8 {
+                let mut builder =
+                    ListBuilder::new(LargeStringBuilder::new()).with_field(Arc::clone(inner_field));
+                for hit in hits {
+                    match extract_field(&hit.source, field_name).and_then(|v| v.as_array()) {
+                        Some(arr) => {
+                            for val in arr {
+                                builder.values().append_option(val.as_str());
+                            }
+                            builder.append(true);
+                        }
+                        None => builder.append(false),
+                    }
+                }
+                Ok(Arc::new(builder.finish()) as ArrayRef)
+            } else {
+                let mut builder =
+                    ListBuilder::new(StringBuilder::new()).with_field(Arc::clone(inner_field));
+                for hit in hits {
+                    match extract_field(&hit.source, field_name).and_then(|v| v.as_array()) {
+                        Some(arr) => {
+                            for val in arr {
+                                builder.values().append_option(val.as_str());
+                            }
+                            builder.append(true);
+                        }
+                        None => builder.append(false),
+                    }
+                }
+                Ok(Arc::new(builder.finish()) as ArrayRef)
+            }
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            // Elasticsearch timestamps are ISO 8601 strings or epoch-millis integers.
+            let values: Vec<Option<i64>> = hits
+                .iter()
+                .map(|h| {
+                    let v = extract_field(&h.source, field_name)?;
+                    if let Some(ms) = v.as_i64() {
+                        // epoch-millis → epoch-microseconds
+                        return Some(ms * 1_000);
+                    }
+                    if let Some(s) = v.as_str() {
+                        return DateTime::parse_from_rfc3339(s)
+                            .ok()
+                            .map(|dt| dt.timestamp_micros());
+                    }
+                    None
+                })
+                .collect();
+            let arr = TimestampMicrosecondArray::from(values);
+            let arr = if let Some(tz_str) = tz {
+                arr.with_timezone(tz_str.as_ref())
+            } else {
+                arr
+            };
+            Ok(Arc::new(arr) as ArrayRef)
+        }
         _ => {
             // Fallback: serialize as JSON string.
             let values: Vec<Option<String>> = hits
@@ -376,5 +445,132 @@ fn json_value_to_string(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{
+        Array, LargeStringArray, ListArray, StringArray, TimestampMicrosecondArray,
+    };
+    use arrow::datatypes::{Field, Schema, TimeUnit};
+    use elasticsearch::Hit;
+    use serde_json::json;
+
+    fn make_hit(source: serde_json::Value) -> Hit {
+        Hit {
+            id: "id".to_string(),
+            score: Some(1.0),
+            source,
+        }
+    }
+
+    // ── Timestamp ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_timestamp_iso8601_parses_correctly() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
+            true,
+        )]));
+        let hits = vec![
+            make_hit(json!({"created_at": "2024-01-15T10:30:00Z"})),
+            make_hit(json!({})), // missing → null
+        ];
+        let batch = hits_to_record_batch(&hits, &schema).unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+
+        assert!(!col.is_null(0));
+        assert!(col.is_null(1));
+        let expected = chrono::DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z")
+            .unwrap()
+            .timestamp_micros();
+        assert_eq!(col.value(0), expected);
+    }
+
+    #[test]
+    fn test_timestamp_epoch_millis_parses_correctly() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
+            true,
+        )]));
+        let epoch_ms: i64 = 1_705_311_000_000;
+        let hits = vec![make_hit(json!({"ts": epoch_ms}))];
+        let batch = hits_to_record_batch(&hits, &schema).unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+
+        assert_eq!(col.value(0), epoch_ms * 1_000);
+    }
+
+    // ── List<LargeUtf8> ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_list_large_utf8_builds_correct_array() {
+        let inner = Arc::new(Field::new("element", DataType::LargeUtf8, true));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "sentences",
+            DataType::List(Arc::clone(&inner)),
+            true,
+        )]));
+        let hits = vec![
+            make_hit(json!({"sentences": ["hello", "world"]})),
+            make_hit(json!({})),                // missing → null
+            make_hit(json!({"sentences": []})), // empty list → non-null empty
+        ];
+        let batch = hits_to_record_batch(&hits, &schema).unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+
+        assert!(!col.is_null(0));
+        assert!(col.is_null(1));
+        assert!(!col.is_null(2));
+
+        let row0 = col.value(0);
+        let strings = row0.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        assert_eq!(strings.len(), 2);
+        assert_eq!(strings.value(0), "hello");
+        assert_eq!(strings.value(1), "world");
+
+        assert_eq!(col.value(2).len(), 0);
+    }
+
+    // ── List<Utf8> ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_list_utf8_builds_correct_array() {
+        let inner = Arc::new(Field::new("item", DataType::Utf8, true));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "tags",
+            DataType::List(Arc::clone(&inner)),
+            true,
+        )]));
+        let hits = vec![make_hit(json!({"tags": ["a", "b", "c"]}))];
+        let batch = hits_to_record_batch(&hits, &schema).unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+
+        let row0 = col.value(0);
+        let strings = row0.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(strings.len(), 3);
+        assert_eq!(strings.value(0), "a");
+        assert_eq!(strings.value(1), "b");
+        assert_eq!(strings.value(2), "c");
     }
 }
