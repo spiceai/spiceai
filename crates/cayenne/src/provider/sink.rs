@@ -275,8 +275,7 @@ impl CayenneDataSink {
             while let Some(batch) = futures::StreamExt::next(&mut prepared_stream).await {
                 let batch = batch?;
                 total_rows += batch.num_rows();
-                total_bytes =
-                    total_bytes.saturating_add(batch.get_array_memory_size());
+                total_bytes = total_bytes.saturating_add(batch.get_array_memory_size());
                 batches.push(batch);
                 if total_rows > super::table::INLINE_MAX_ROWS
                     || total_bytes > super::table::INLINE_MAX_BUFFER_BYTES

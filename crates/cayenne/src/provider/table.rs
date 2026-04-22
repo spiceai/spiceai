@@ -285,6 +285,17 @@ pub(crate) const INLINE_MAX_ROWS: usize = 1024;
 /// Maximum serialized IPC size (bytes) to inline in the metastore.
 const INLINE_MAX_BYTES: usize = 1_048_576; // 1 MB
 
+/// Maximum in-memory byte budget while buffering the inline fast-path stream.
+///
+/// `INLINE_MAX_ROWS` alone does not bound memory usage — a pathological batch
+/// with few rows but very large string / binary values can still consume a lot
+/// of RAM. Once the cumulative array memory size of buffered batches exceeds
+/// this budget the fast-path bails out and falls through to the normal Vortex
+/// write path, where the stream is consumed incrementally. Held slightly above
+/// `INLINE_MAX_BYTES` (the serialized IPC cap) to account for in-memory Arrow
+/// overhead vs. the compact IPC representation.
+pub(crate) const INLINE_MAX_BUFFER_BYTES: usize = 4 * 1_048_576; // 4 MB
+
 /// Serialize a `RecordBatch` to Arrow IPC bytes (stream format, single batch).
 fn serialize_batch_to_ipc(
     batch: &RecordBatch,

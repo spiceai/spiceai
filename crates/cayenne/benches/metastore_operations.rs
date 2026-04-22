@@ -527,7 +527,7 @@ fn bench_inlined_data(c: &mut Criterion) {
                                         MetastoreValue::Text("bench-table-id".to_string()),
                                         MetastoreValue::Blob(blob.clone()),
                                         MetastoreValue::Integer(100),
-                                        MetastoreValue::Integer(i64::try_from(i).unwrap_or(0)),
+                                        MetastoreValue::Integer(i64::from(i)),
                                     ],
                                 })
                                 .await

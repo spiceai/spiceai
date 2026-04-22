@@ -298,6 +298,10 @@ pub(crate) fn build_file_statistics(
 /// min/max/null-count has been incorporated it stays incorporated, and the
 /// merged `num_rows` reflects the full table when `existing_num_rows` is
 /// passed in correctly by the caller.
+#[expect(
+    dead_code,
+    reason = "Wired into `persist_table_stats` in a follow-up that switches table-level stats from last-write-wins to cross-write merge; kept here as the scaffold."
+)]
 pub(crate) fn merge_serialized_stats(
     existing_blob: &[u8],
     new_column_stats: &[StatsSet],
