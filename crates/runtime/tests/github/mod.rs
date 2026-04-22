@@ -46,7 +46,10 @@ enum GithubDatasetType {
     },
 }
 
-const GITHUB_COMMITS_PAGE_SIZE: usize = 100;
+// GitHub's API page size is 100, but under rate limiting or transient errors it
+// may return fewer rows. Use 50 as the lower bound to tolerate partial pages
+// while still catching a completely empty or near-empty result.
+const GITHUB_COMMITS_PAGE_SIZE: usize = 50;
 
 // GitHub commits queries request 100 history rows per page, so use a larger limit
 // in the pagination-sensitive tests to ensure they cross the page boundary.
