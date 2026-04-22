@@ -25,8 +25,39 @@ use arrow::array::{
 };
 use arrow_schema::DataType;
 use datafusion::common::{DataFusionError, Result as DataFusionResult, exec_err};
+use datafusion::logical_expr::ColumnarValue;
+use datafusion::scalar::ScalarValue;
 use simsimd::SpatialSimilarity;
 use std::sync::Arc;
+
+/// Wraps a per-array kernel into a scalar/array dispatcher following `DataFusion`'s
+/// `invoke_with_args` convention: scalar args are broadcast to the length of any
+/// array arg, and the result is scalar when all inputs are scalar.
+pub(crate) fn make_scalar_function<F>(
+    inner: F,
+) -> impl Fn(&[ColumnarValue]) -> DataFusionResult<ColumnarValue>
+where
+    F: Fn(&[ArrayRef]) -> DataFusionResult<ArrayRef>,
+{
+    move |args: &[ColumnarValue]| {
+        let len = args
+            .iter()
+            .fold(Option::<usize>::None, |acc, arg| match arg {
+                ColumnarValue::Scalar(_) => acc,
+                ColumnarValue::Array(a) => Some(a.len()),
+            });
+
+        let args = ColumnarValue::values_to_arrays(args)?;
+        let result = (inner)(&args);
+
+        if len.is_none() {
+            let result = result.and_then(|arr| ScalarValue::try_from_array(&arr, 0));
+            result.map(ColumnarValue::Scalar)
+        } else {
+            result.map(ColumnarValue::Array)
+        }
+    }
+}
 
 /// Scalar similarity kernel for a single pair of equal-length f32 slices.
 #[derive(Clone, Copy)]
@@ -55,10 +86,7 @@ pub(crate) fn is_fixed_size_list_f32(dt: &DataType) -> bool {
 }
 
 /// Checks that both arg types are `FixedSizeList<Float32, N>` with the same `N`.
-pub(crate) fn matching_fixed_size_list_f32(
-    lhs: &DataType,
-    rhs: &DataType,
-) -> Option<i32> {
+pub(crate) fn matching_fixed_size_list_f32(lhs: &DataType, rhs: &DataType) -> Option<i32> {
     match (lhs, rhs) {
         (DataType::FixedSizeList(lf, ln), DataType::FixedSizeList(rf, rn))
             if ln == rn
@@ -71,7 +99,41 @@ pub(crate) fn matching_fixed_size_list_f32(
     }
 }
 
-fn as_fsl<'a>(arr: &'a ArrayRef) -> DataFusionResult<&'a FixedSizeListArray> {
+/// Validate that a two-arg UDF call receives matching `FixedSizeList<Float32, N>`
+/// inputs, returning the coerced arg types unchanged. Shared across
+/// `cosine_distance`, `inner_product`, `l2_distance`, `l2_squared_distance`.
+pub(crate) fn coerce_fsl_f32_binary_args(
+    udf_name: &str,
+    arg_types: &[DataType],
+) -> DataFusionResult<Vec<DataType>> {
+    if arg_types.len() != 2 {
+        return exec_err!("{udf_name} expects exactly two arguments");
+    }
+    if matching_fixed_size_list_f32(&arg_types[0], &arg_types[1]).is_none() {
+        return exec_err!(
+            "{udf_name} requires both arguments to be FixedSizeList<Float32, N> with matching N, got {:?} and {:?}",
+            arg_types[0],
+            arg_types[1]
+        );
+    }
+    Ok(vec![arg_types[0].clone(), arg_types[1].clone()])
+}
+
+/// Validate arg shape for a two-arg UDF and return `Float64` as the return type.
+pub(crate) fn fsl_f32_binary_return_type(
+    udf_name: &str,
+    arg_types: &[DataType],
+) -> DataFusionResult<DataType> {
+    if arg_types.len() != 2 {
+        return exec_err!("{udf_name} expects exactly two arguments");
+    }
+    if !is_fixed_size_list_f32(&arg_types[0]) || !is_fixed_size_list_f32(&arg_types[1]) {
+        return exec_err!("{udf_name} requires both arguments to be FixedSizeList<Float32, N>");
+    }
+    Ok(DataType::Float64)
+}
+
+fn as_fsl(arr: &ArrayRef) -> DataFusionResult<&FixedSizeListArray> {
     arr.as_any()
         .downcast_ref::<FixedSizeListArray>()
         .ok_or_else(|| {
@@ -82,7 +144,7 @@ fn as_fsl<'a>(arr: &'a ArrayRef) -> DataFusionResult<&'a FixedSizeListArray> {
         })
 }
 
-fn flat_f32<'a>(fsl: &'a FixedSizeListArray) -> DataFusionResult<&'a [f32]> {
+fn flat_f32(fsl: &FixedSizeListArray) -> DataFusionResult<&[f32]> {
     let values = fsl.values();
     let f32 = values
         .as_any()
@@ -96,36 +158,6 @@ fn flat_f32<'a>(fsl: &'a FixedSizeListArray) -> DataFusionResult<&'a [f32]> {
     // Child nulls are ignored; rows with a null child slot are treated as nullable rows
     // at the outer FSL level (see `row_null_propagates`).
     Ok(f32.values())
-}
-
-/// Returns `true` if either outer FSL row is null or any of its f32 slots is null.
-fn row_null_propagates(
-    fsl_a: &FixedSizeListArray,
-    fsl_b: &FixedSizeListArray,
-    row: usize,
-    dim: usize,
-) -> bool {
-    if fsl_a.is_null(row) || fsl_b.is_null(row) {
-        return true;
-    }
-    let values_a = fsl_a.values();
-    let values_b = fsl_b.values();
-    let start = row * dim;
-    let end = start + dim;
-    // Nulls inside the child Float32Array propagate to the row result.
-    let a_nulls = values_a.logical_nulls();
-    let b_nulls = values_b.logical_nulls();
-    if let Some(n) = a_nulls.as_ref()
-        && (start..end).any(|i| n.is_null(i))
-    {
-        return true;
-    }
-    if let Some(n) = b_nulls.as_ref()
-        && (start..end).any(|i| n.is_null(i))
-    {
-        return true;
-    }
-    false
 }
 
 /// Compute a per-row similarity over two equal-length `FixedSizeList<Float32>` arrays.
@@ -155,33 +187,50 @@ where
     let dim_a = a.value_length();
     let dim_b = b.value_length();
     if dim_a != dim_b {
-        return exec_err!(
-            "vector_simd: lhs and rhs dimensions differ ({dim_a} vs {dim_b})"
-        );
+        return exec_err!("vector_simd: lhs and rhs dimensions differ ({dim_a} vs {dim_b})");
     }
-    let dim = usize::try_from(dim_a).map_err(|_| {
-        DataFusionError::Internal(format!("vector_simd: negative FSL dim {dim_a}"))
-    })?;
+    let dim = usize::try_from(dim_a)
+        .map_err(|_| DataFusionError::Internal(format!("vector_simd: negative FSL dim {dim_a}")))?;
 
     let flat_a = flat_f32(a)?;
     let flat_b = flat_f32(b)?;
 
+    // Hoist null buffers out of the per-row loop. For fully-dense arrays (the
+    // common case for precomputed embeddings) the `check_inner_nulls` flag is
+    // false and the per-row inner-slot scan is skipped entirely.
+    let a_outer = a.nulls();
+    let b_outer = b.nulls();
+    let a_inner = a.values().logical_nulls();
+    let b_inner = b.values().logical_nulls();
+    let check_inner_nulls = a_inner.is_some() || b_inner.is_some();
+
     let n = a.len();
     let mut builder = Float64Builder::with_capacity(n);
-    for row in 0..n {
-        if row_null_propagates(a, b, row, dim) {
+    let iter = flat_a.chunks_exact(dim).zip(flat_b.chunks_exact(dim));
+    for (row, (slice_a, slice_b)) in iter.enumerate() {
+        if a_outer.is_some_and(|nb| nb.is_null(row)) || b_outer.is_some_and(|nb| nb.is_null(row)) {
             builder.append_null();
             continue;
         }
-        let start = row * dim;
-        let end = start + dim;
-        let raw = kernel
-            .apply(&flat_a[start..end], &flat_b[start..end])
-            .ok_or_else(|| {
-                DataFusionError::Execution(
-                    "vector_simd: simsimd returned None (length mismatch)".to_string(),
-                )
-            })?;
+        if check_inner_nulls {
+            let start = row * dim;
+            let end = start + dim;
+            let any_inner_null = a_inner
+                .as_ref()
+                .is_some_and(|n| (start..end).any(|i| n.is_null(i)))
+                || b_inner
+                    .as_ref()
+                    .is_some_and(|n| (start..end).any(|i| n.is_null(i)));
+            if any_inner_null {
+                builder.append_null();
+                continue;
+            }
+        }
+        let raw = kernel.apply(slice_a, slice_b).ok_or_else(|| {
+            DataFusionError::Execution(
+                "vector_simd: simsimd returned None (length mismatch)".to_string(),
+            )
+        })?;
         builder.append_value(post_process(raw));
     }
 
@@ -200,21 +249,22 @@ pub(crate) fn compute_fsl_f32_l2_norm(array: &ArrayRef) -> DataFusionResult<Arra
         ))
     })?;
     let flat = flat_f32(fsl)?;
+    let outer = fsl.nulls();
 
     let n = fsl.len();
     let mut builder = Float32Builder::with_capacity(n);
-    for row in 0..n {
-        if fsl.is_null(row) {
+    for (row, slice) in flat.chunks_exact(dim).enumerate() {
+        if outer.is_some_and(|nb| nb.is_null(row)) {
             builder.append_null();
             continue;
         }
-        let start = row * dim;
-        let end = start + dim;
-        // Use simsimd dot against self for SIMD sum-of-squares.
-        let sq = f32::dot(&flat[start..end], &flat[start..end]).ok_or_else(|| {
+        let sq = f32::dot(slice, slice).ok_or_else(|| {
             DataFusionError::Execution("vector_simd: simsimd dot returned None".to_string())
         })?;
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "sq fits in f32 by construction (bounded by input f32 magnitudes)"
+        )]
         builder.append_value((sq as f32).sqrt());
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
@@ -252,12 +302,8 @@ mod tests {
     fn cosine_raw_identical_is_zero() {
         let a = testing::fsl_f32(&[&[1.0, 2.0, 3.0]]);
         let b = testing::fsl_f32(&[&[1.0, 2.0, 3.0]]);
-        let out = compute_fsl_f32(
-            &[a as ArrayRef, b as ArrayRef],
-            Kernel::CosineRaw,
-            |v| v,
-        )
-        .expect("ok");
+        let out =
+            compute_fsl_f32(&[a as ArrayRef, b as ArrayRef], Kernel::CosineRaw, |v| v).expect("ok");
         let out = out.as_primitive::<Float64Type>();
         assert!((out.value(0) - 0.0).abs() < 1e-6);
     }
@@ -266,12 +312,8 @@ mod tests {
     fn cosine_raw_opposite_is_two() {
         let a = testing::fsl_f32(&[&[1.0, 2.0, 3.0]]);
         let b = testing::fsl_f32(&[&[-1.0, -2.0, -3.0]]);
-        let out = compute_fsl_f32(
-            &[a as ArrayRef, b as ArrayRef],
-            Kernel::CosineRaw,
-            |v| v,
-        )
-        .expect("ok");
+        let out =
+            compute_fsl_f32(&[a as ArrayRef, b as ArrayRef], Kernel::CosineRaw, |v| v).expect("ok");
         let out = out.as_primitive::<Float64Type>();
         assert!((out.value(0) - 2.0).abs() < 1e-5);
     }
@@ -280,8 +322,7 @@ mod tests {
     fn dot_basic() {
         let a = testing::fsl_f32(&[&[1.0, 2.0, 3.0]]);
         let b = testing::fsl_f32(&[&[4.0, 5.0, 6.0]]);
-        let out = compute_fsl_f32(&[a as ArrayRef, b as ArrayRef], Kernel::Dot, |v| v)
-            .expect("ok");
+        let out = compute_fsl_f32(&[a as ArrayRef, b as ArrayRef], Kernel::Dot, |v| v).expect("ok");
         let out = out.as_primitive::<Float64Type>();
         assert!((out.value(0) - 32.0).abs() < 1e-5);
     }
@@ -290,12 +331,8 @@ mod tests {
     fn l2sq_basic() {
         let a = testing::fsl_f32(&[&[0.0, 0.0, 0.0]]);
         let b = testing::fsl_f32(&[&[1.0, 2.0, 2.0]]);
-        let out = compute_fsl_f32(
-            &[a as ArrayRef, b as ArrayRef],
-            Kernel::L2Squared,
-            |v| v,
-        )
-        .expect("ok");
+        let out =
+            compute_fsl_f32(&[a as ArrayRef, b as ArrayRef], Kernel::L2Squared, |v| v).expect("ok");
         let out = out.as_primitive::<Float64Type>();
         // 1^2 + 2^2 + 2^2 = 9
         assert!((out.value(0) - 9.0).abs() < 1e-5);
@@ -305,11 +342,7 @@ mod tests {
     fn null_outer_row_propagates() {
         let a = testing::fsl_f32(&[&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]]);
         // Construct b with second row null by slicing a single-row fsl into a larger builder.
-        let field = Arc::new(arrow_schema::Field::new(
-            "item",
-            DataType::Float32,
-            true,
-        ));
+        let field = Arc::new(arrow_schema::Field::new("item", DataType::Float32, true));
         let inner = arrow::array::Float32Array::from(vec![
             Some(1.0),
             Some(2.0),
@@ -321,15 +354,9 @@ mod tests {
         // Create null bitmap: row 0 valid, row 1 null.
         let nulls = arrow::buffer::NullBuffer::from(vec![true, false]);
         let b = Arc::new(
-            FixedSizeListArray::try_new(field, 3, Arc::new(inner), Some(nulls))
-                .expect("valid"),
+            FixedSizeListArray::try_new(field, 3, Arc::new(inner), Some(nulls)).expect("valid"),
         ) as ArrayRef;
-        let out = compute_fsl_f32(
-            &[a as ArrayRef, b],
-            Kernel::Dot,
-            |v| v,
-        )
-        .expect("ok");
+        let out = compute_fsl_f32(&[a as ArrayRef, b], Kernel::Dot, |v| v).expect("ok");
         let out = out.as_primitive::<Float64Type>();
         assert!(!out.is_null(0));
         assert!(out.is_null(1));

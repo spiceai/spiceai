@@ -23,13 +23,10 @@ use arrow::array::ArrayRef;
 use arrow_schema::DataType;
 use datafusion::common::{Result as DataFusionResult, exec_err};
 use datafusion::logical_expr::ScalarFunctionArgs;
-use datafusion::{
-    logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility},
-};
+use datafusion::logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility};
 use std::any::Any;
 
-use crate::cosine_distance::make_scalar_function;
-use crate::vector_simd::{compute_fsl_f32_l2_norm, is_fixed_size_list_f32};
+use crate::vector_simd::{compute_fsl_f32_l2_norm, is_fixed_size_list_f32, make_scalar_function};
 
 pub static L2_NORM_UDF_NAME: &str = "l2_norm";
 
@@ -71,9 +68,7 @@ impl ScalarUDFImpl for L2Norm {
             return exec_err!("{L2_NORM_UDF_NAME} expects exactly one argument");
         }
         if !is_fixed_size_list_f32(&arg_types[0]) {
-            return exec_err!(
-                "{L2_NORM_UDF_NAME} requires a FixedSizeList<Float32, N> argument"
-            );
+            return exec_err!("{L2_NORM_UDF_NAME} requires a FixedSizeList<Float32, N> argument");
         }
         Ok(DataType::Float32)
     }

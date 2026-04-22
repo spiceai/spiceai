@@ -1765,10 +1765,7 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new(
                 "embedding",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    768,
-                ),
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 768),
                 true,
             ),
         ]);
@@ -1789,18 +1786,12 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new(
                 "embedding_f64",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float64, true)),
-                    384,
-                ),
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, true)), 384),
                 true,
             ),
             Field::new(
                 "nums",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Int32, true)),
-                    4,
-                ),
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 4),
                 true,
             ),
         ]);
@@ -1818,10 +1809,7 @@ mod tests {
             Field::new("body", DataType::Utf8, true),
             Field::new(
                 "body_embedding",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    384,
-                ),
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 384),
                 true,
             ),
         ]);
@@ -1841,10 +1829,7 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new(
                 "title_embed",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    256,
-                ),
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 256),
                 true,
             ),
             Field::new(
@@ -1863,7 +1848,7 @@ mod tests {
             .filter_map(|i| {
                 i.as_any()
                     .downcast_ref::<NativeVectorIndex>()
-                    .map(|n| n.dimension())
+                    .map(VectorIndex::dimension)
             })
             .collect();
         assert!(dims.contains(&256));

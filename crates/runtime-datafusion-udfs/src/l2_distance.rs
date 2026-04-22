@@ -27,44 +27,18 @@ limitations under the License.
 
 use arrow::array::ArrayRef;
 use arrow_schema::DataType;
-use datafusion::common::{Result as DataFusionResult, exec_err};
+use datafusion::common::Result as DataFusionResult;
 use datafusion::logical_expr::ScalarFunctionArgs;
-use datafusion::{
-    logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility},
-};
+use datafusion::logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility};
 use std::any::Any;
 
-use crate::cosine_distance::make_scalar_function;
-use crate::vector_simd::{Kernel, compute_fsl_f32, is_fixed_size_list_f32, matching_fixed_size_list_f32};
+use crate::vector_simd::{
+    Kernel, coerce_fsl_f32_binary_args, compute_fsl_f32, fsl_f32_binary_return_type,
+    make_scalar_function,
+};
 
 pub static L2_DISTANCE_UDF_NAME: &str = "l2_distance";
 pub static L2_SQUARED_DISTANCE_UDF_NAME: &str = "l2_squared_distance";
-
-fn check_fsl_f32_args(name: &str, arg_types: &[DataType]) -> DataFusionResult<Vec<DataType>> {
-    if arg_types.len() != 2 {
-        return exec_err!("{name} expects exactly two arguments");
-    }
-    if matching_fixed_size_list_f32(&arg_types[0], &arg_types[1]).is_none() {
-        return exec_err!(
-            "{name} requires both arguments to be FixedSizeList<Float32, N> with matching N, got {:?} and {:?}",
-            arg_types[0],
-            arg_types[1]
-        );
-    }
-    Ok(vec![arg_types[0].clone(), arg_types[1].clone()])
-}
-
-fn check_fsl_f32_return(name: &str, arg_types: &[DataType]) -> DataFusionResult<DataType> {
-    if arg_types.len() != 2 {
-        return exec_err!("{name} expects exactly two arguments");
-    }
-    if !is_fixed_size_list_f32(&arg_types[0]) || !is_fixed_size_list_f32(&arg_types[1]) {
-        return exec_err!(
-            "{name} requires both arguments to be FixedSizeList<Float32, N>"
-        );
-    }
-    Ok(DataType::Float64)
-}
 
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub struct L2Distance {
@@ -100,11 +74,11 @@ impl ScalarUDFImpl for L2Distance {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> DataFusionResult<DataType> {
-        check_fsl_f32_return(L2_DISTANCE_UDF_NAME, arg_types)
+        fsl_f32_binary_return_type(L2_DISTANCE_UDF_NAME, arg_types)
     }
 
     fn coerce_types(&self, arg_types: &[DataType]) -> DataFusionResult<Vec<DataType>> {
-        check_fsl_f32_args(L2_DISTANCE_UDF_NAME, arg_types)
+        coerce_fsl_f32_binary_args(L2_DISTANCE_UDF_NAME, arg_types)
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
@@ -146,11 +120,11 @@ impl ScalarUDFImpl for L2SquaredDistance {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> DataFusionResult<DataType> {
-        check_fsl_f32_return(L2_SQUARED_DISTANCE_UDF_NAME, arg_types)
+        fsl_f32_binary_return_type(L2_SQUARED_DISTANCE_UDF_NAME, arg_types)
     }
 
     fn coerce_types(&self, arg_types: &[DataType]) -> DataFusionResult<Vec<DataType>> {
-        check_fsl_f32_args(L2_SQUARED_DISTANCE_UDF_NAME, arg_types)
+        coerce_fsl_f32_binary_args(L2_SQUARED_DISTANCE_UDF_NAME, arg_types)
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
