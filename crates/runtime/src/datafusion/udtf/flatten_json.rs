@@ -26,7 +26,7 @@ limitations under the License.
 //!     path         Utf8,
 //!     parent_path  Utf8,
 //!     key          Utf8,
-//!     value        Utf8,   -- leaf value as string; NULL for JSON null and containers
+//!     value        Utf8,   -- leaf value as string; NULL for JSON null; compact JSON for containers (with include_internal)
 //!     type         Utf8    -- "object"|"array"|"string"|"number"|"integer"|"boolean"|"null"
 //! )
 //! ```
@@ -34,8 +34,14 @@ limitations under the License.
 //! Two entry points are registered:
 //!
 //! - **UDTF** — `SELECT * FROM flatten_json('{...}')` (named options supported).
-//! - **Scalar UDF** — returns `LargeList<Struct<...>>` for use with `UNNEST`,
-//!   e.g. `FROM docs d, UNNEST(flatten_json(d.body)) AS r`.
+//! - **Scalar UDF** — returns `LargeList<Struct<...>>` for per-row use. Access
+//!   struct fields via `UNNEST` in SELECT position:
+//!   ```sql
+//!   SELECT rows.path, rows.value, rows.type
+//!   FROM (SELECT UNNEST(flatten_json(body)) AS rows FROM docs);
+//!   ```
+//!   Note: the cross-join form `FROM docs d, UNNEST(flatten_json(d.body)) AS r`
+//!   does NOT expose struct fields as `r.path` — use the SELECT-position form above.
 //!
 //! Options (named args):
 //! - `max_depth` (`UInt`, default `64`).
@@ -51,9 +57,11 @@ limitations under the License.
 //!
 //! Telemetry: OpenTelemetry counters `flatten_json_invocations_total`,
 //! `flatten_json_rows_emitted_total`, and
-//! `flatten_json_errors_total{kind}`. Malformed input or a hit cap emits
-//! an error-kind metric and yields an empty / truncated batch — never a
-//! query-level error.
+//! `flatten_json_errors_total{kind}`. For the UDTF entry point, malformed
+//! input or a hit cap emits an error-kind metric and yields an empty /
+//! truncated batch — never a query-level error. The scalar UDF variant
+//! returns `DataFusionError::Execution` when `SCALAR_BATCH_MAX_ROWS` is
+//! exceeded (the per-document `max_rows` cap is not configurable there).
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
@@ -503,8 +511,10 @@ fn parse_udtf_args(exprs: &[Expr]) -> DataFusionResult<ParsedUdtfArgs> {
     let input = literal_string(first).map_err(|e| {
         DataFusionError::NotImplemented(format!(
             "{FLATTEN_JSON_UDTF_NAME}() currently supports a literal JSON string as the \
-             first argument. For per-row / LATERAL invocation, use \
-             `UNNEST({FLATTEN_JSON_UDTF_NAME}(<column>))`. Details: {e}"
+             first argument. For per-row usage, use the scalar UDF form with UNNEST in \
+             SELECT position: `SELECT rows.path, rows.value, rows.type FROM \
+             (SELECT UNNEST({FLATTEN_JSON_UDTF_NAME}(<column>)) AS rows FROM <table>)`. \
+             Details: {e}"
         ))
     })?;
 
@@ -766,7 +776,7 @@ impl ScalarUDFImpl for FlattenJsonScalar {
                 if all_rows.len() > SCALAR_BATCH_MAX_ROWS {
                     record_error("batch_cap_hit");
                     return Err(DataFusionError::Execution(format!(
-                        "{FLATTEN_JSON_UDTF_NAME}(): batch produced more than {SCALAR_BATCH_MAX_ROWS} flattened rows; lower `max_rows` or split the input."
+                        "{FLATTEN_JSON_UDTF_NAME}(): batch produced more than {SCALAR_BATCH_MAX_ROWS} flattened rows; split the input or use the UDTF form with `max_rows => N`."
                     )));
                 }
             }
