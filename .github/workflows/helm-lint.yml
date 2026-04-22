@@ -9,17 +9,11 @@ on:
       - feature-*
     paths:
       - 'deploy/chart/**'
-  merge_group:
-    branches:
-      - trunk
-      - release-*
-      - release/*
-      - feature-*
 
 jobs:
   lint-helm:
     name: Helm Lint
-    runs-on: ubuntu-latest
+    runs-on: spiceai-macos
 
     steps:
       - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
