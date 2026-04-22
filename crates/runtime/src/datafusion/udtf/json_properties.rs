@@ -468,9 +468,30 @@ impl<'a> Walker<'a> {
                         let wildcard = self.opts.map_wildcard.clone();
                         self.handle_field(&wildcard, ap, &path, false, depth + 1);
                     } else {
-                        // Legacy behavior: collapse map children onto
-                        // the map's own path (e.g. `labels.value`).
-                        self.walk_schema(ap, &path, depth + 1);
+                        // Legacy: collapse children onto the map's own path.
+                        // For Map<String, Object>, ap has `properties` and
+                        // walk_schema finds them directly (e.g. `labels.value`).
+                        // For Map<String, Array<Object>>, ap is an array schema
+                        // with no top-level `properties` — unwrap its `items`
+                        // first so leaves appear at `map.field` rather than
+                        // being silently dropped.
+                        let ap_effective = self.effective_schemas(ap);
+                        let ap_type = ap_effective
+                            .iter()
+                            .map(|s| compute_type(s))
+                            .find(|t| t != "unknown")
+                            .unwrap_or_else(|| "unknown".to_owned());
+                        if ap_type == "array" {
+                            if let Some(items) = ap_effective
+                                .iter()
+                                .find_map(|s| s.get("items"))
+                                .filter(|v| v.is_object())
+                            {
+                                self.walk_schema(items, &path, depth + 1);
+                            }
+                        } else {
+                            self.walk_schema(ap, &path, depth + 1);
+                        }
                     }
                 }
             }
@@ -1243,6 +1264,38 @@ mod tests {
         assert_eq!(by["labels"].type_name, "map");
         // Child properties under additionalProperties are emitted at labels.value.
         assert_eq!(by["labels.value"].type_name, "string");
+    }
+
+    #[test]
+    fn additional_properties_map_of_array_of_object() {
+        // Regression: when additionalProperties is an array schema (Map<String,
+        // Array<Object>>), the legacy path must unwrap `items` before calling
+        // walk_schema, otherwise walk_schema finds no `properties` on the array
+        // schema and silently emits nothing but the map container row.
+        let json = r#"{
+            "properties": {
+                "identityMap": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "authenticatedState": {"type": "string"},
+                                "id": {"type": "string"},
+                                "primary": {"type": "boolean"}
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        let rows = flatten_with_options(json, &with_internal());
+        let by = by_path(&rows);
+        assert_eq!(by["identityMap"].type_name, "map");
+        assert_eq!(by["identityMap.authenticatedState"].type_name, "string");
+        assert_eq!(by["identityMap.id"].type_name, "string");
+        assert_eq!(by["identityMap.primary"].type_name, "boolean");
     }
 
     #[test]

@@ -34,8 +34,14 @@ limitations under the License.
 //! Two entry points are registered:
 //!
 //! - **UDTF** — `SELECT * FROM flatten_json('{...}')` (named options supported).
-//! - **Scalar UDF** — returns `LargeList<Struct<...>>` for use with `UNNEST`,
-//!   e.g. `FROM docs d, UNNEST(flatten_json(d.body)) AS r`.
+//! - **Scalar UDF** — returns `LargeList<Struct<...>>` for per-row use. Access
+//!   struct fields via `UNNEST` in SELECT position:
+//!   ```sql
+//!   SELECT rows.path, rows.value, rows.type
+//!   FROM (SELECT UNNEST(flatten_json(body)) AS rows FROM docs);
+//!   ```
+//!   Note: the cross-join form `FROM docs d, UNNEST(flatten_json(d.body)) AS r`
+//!   does NOT expose struct fields as `r.path` — use the SELECT-position form above.
 //!
 //! Options (named args):
 //! - `max_depth` (`UInt`, default `64`).
@@ -503,8 +509,10 @@ fn parse_udtf_args(exprs: &[Expr]) -> DataFusionResult<ParsedUdtfArgs> {
     let input = literal_string(first).map_err(|e| {
         DataFusionError::NotImplemented(format!(
             "{FLATTEN_JSON_UDTF_NAME}() currently supports a literal JSON string as the \
-             first argument. For per-row / LATERAL invocation, use \
-             `UNNEST({FLATTEN_JSON_UDTF_NAME}(<column>))`. Details: {e}"
+             first argument. For per-row usage, use the scalar UDF form with UNNEST in \
+             SELECT position: `SELECT rows.path, rows.value, rows.type FROM \
+             (SELECT UNNEST({FLATTEN_JSON_UDTF_NAME}(<column>)) AS rows FROM <table>)`. \
+             Details: {e}"
         ))
     })?;
 
