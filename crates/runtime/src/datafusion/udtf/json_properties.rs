@@ -465,7 +465,13 @@ impl<'a> Walker<'a> {
                         // JSONPath storage conventions (e.g.
                         // `identityMap.[*].id` when the map's values
                         // are arrays of objects).
-                        self.handle_field(self.opts.map_wildcard.as_str(), ap, &path, false, depth + 1);
+                        self.handle_field(
+                            self.opts.map_wildcard.as_str(),
+                            ap,
+                            &path,
+                            false,
+                            depth + 1,
+                        );
                     } else {
                         // Legacy: collapse children onto the map's own path.
                         // For Map<String, Object>, ap has `properties` and
