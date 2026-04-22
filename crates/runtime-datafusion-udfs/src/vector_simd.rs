@@ -85,11 +85,14 @@ pub(crate) fn is_fixed_size_list_f32(dt: &DataType) -> bool {
     matches!(dt, DataType::FixedSizeList(field, _) if field.data_type() == &DataType::Float32)
 }
 
-/// Checks that both arg types are `FixedSizeList<Float32, N>` with the same `N`.
+/// Checks that both arg types are `FixedSizeList<Float32, N>` with the same
+/// positive `N`. Rejects `N <= 0` so planner errors surface before hitting the
+/// SIMD kernel.
 pub(crate) fn matching_fixed_size_list_f32(lhs: &DataType, rhs: &DataType) -> Option<i32> {
     match (lhs, rhs) {
         (DataType::FixedSizeList(lf, ln), DataType::FixedSizeList(rf, rn))
             if ln == rn
+                && *ln > 0
                 && lf.data_type() == &DataType::Float32
                 && rf.data_type() == &DataType::Float32 =>
         {
@@ -240,6 +243,7 @@ where
 /// Compute L2 norm (sqrt of sum of squares) for each row of a `FixedSizeList<Float32>`.
 ///
 /// Used by the `l2_norm` UDF. Output is `Float32Array` to preserve input precision.
+/// Rows with a null outer FSL — or null inner slots — produce a null output.
 pub(crate) fn compute_fsl_f32_l2_norm(array: &ArrayRef) -> DataFusionResult<ArrayRef> {
     let fsl = as_fsl(array)?;
     let dim = usize::try_from(fsl.value_length()).map_err(|_| {
@@ -250,6 +254,8 @@ pub(crate) fn compute_fsl_f32_l2_norm(array: &ArrayRef) -> DataFusionResult<Arra
     })?;
     let flat = flat_f32(fsl)?;
     let outer = fsl.nulls();
+    let inner = fsl.values().logical_nulls();
+    let check_inner_nulls = inner.is_some();
 
     let n = fsl.len();
     let mut builder = Float32Builder::with_capacity(n);
@@ -257,6 +263,17 @@ pub(crate) fn compute_fsl_f32_l2_norm(array: &ArrayRef) -> DataFusionResult<Arra
         if outer.is_some_and(|nb| nb.is_null(row)) {
             builder.append_null();
             continue;
+        }
+        if check_inner_nulls {
+            let start = row * dim;
+            let end = start + dim;
+            if inner
+                .as_ref()
+                .is_some_and(|n| (start..end).any(|i| n.is_null(i)))
+            {
+                builder.append_null();
+                continue;
+            }
         }
         let sq = f32::dot(slice, slice).ok_or_else(|| {
             DataFusionError::Execution("vector_simd: simsimd dot returned None".to_string())

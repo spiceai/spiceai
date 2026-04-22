@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! [`NativeVectorIndex`] — a zero-external-dependency vector index that relies on
-//! Spice's registered SIMD similarity UDFs (`cosine_distance`, `inner_product`,
-//! `l2_distance`) to score rows in place.
+//! [`NativeVectorIndex`] — a zero-external-dependency vector index that relies
+//! on Spice's registered SIMD similarity UDFs to score rows in place. The
+//! `vector_search` UDTF compiles per-metric plans against:
+//!   - `cosine_distance` for `DistanceMetric::Cosine`
+//!   - `l2_distance` for `DistanceMetric::L2`
+//!   - `inner_product` for `DistanceMetric::Dot`
 //!
 //! This is the index used by the Cayenne accelerator: the embedding column lives
 //! in the underlying table, so there is no separate index store. The index acts

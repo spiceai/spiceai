@@ -134,12 +134,12 @@ pub enum DistanceMetric {
     /// Cosine similarity (default). Score = `1 - cosine_distance(q, v)`.
     /// Best default; if embeddings are L2-normalized, this is equivalent to dot product.
     Cosine,
-    /// Negated Euclidean distance: `Score = -array_distance(q, v)`.
-    /// Use when your embedding model/index was trained against L2 distance.
+    /// Negated Euclidean distance: `Score = -l2_distance(q, v)`. Use when your
+    /// embedding model/index was trained against L2 distance.
     L2,
-    /// Dot product. Score = `Σ q[i] * v[i]`.
-    /// Prefer `Cosine` with L2-normalized embeddings when possible — a native
-    /// `dot` UDF is not yet wired through the runtime.
+    /// Dot product. Score = `inner_product(q, v)`. Prefer `Cosine` with
+    /// L2-normalized embeddings when possible — they are equivalent up to a
+    /// constant for unit vectors.
     Dot,
 }
 
@@ -1019,19 +1019,19 @@ impl TableProvider for VectorSearchUDTFProvider {
                 )
             }
             DistanceMetric::L2 => {
-                // DataFusion's `array_distance` is Euclidean (L2). Negate so higher == closer.
-                let Some(array_distance_udf) =
-                    state.scalar_functions().get("array_distance").cloned()
-                else {
+                // SIMD-backed `l2_distance` for `FixedSizeList<Float32>` columns.
+                // Negate so higher == closer.
+                let l2_name = runtime_datafusion_udfs::l2_distance::L2_DISTANCE_UDF_NAME;
+                let Some(l2_distance_udf) = state.scalar_functions().get(l2_name).cloned() else {
                     return Err(DataFusionError::Execution(format!(
-                        "UDF 'array_distance' is required for distance_metric => 'l2' in {VECTOR_SEARCH_UDTF_NAME}, but it is not registered."
+                        "UDF '{l2_name}' is required for distance_metric => 'l2' in {VECTOR_SEARCH_UDTF_NAME}, but it is not registered."
                     )));
                 };
                 binary_expr(
                     lit(0.0),
                     Operator::Minus,
                     Expr::ScalarFunction(ScalarFunction {
-                        func: array_distance_udf,
+                        func: l2_distance_udf,
                         args: vec![query_lit, embed_expr],
                     }),
                 )
