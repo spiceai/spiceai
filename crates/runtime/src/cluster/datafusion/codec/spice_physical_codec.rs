@@ -77,7 +77,9 @@ impl PhysicalExtensionCodec for SpicePhysicalCodec {
             return Ok(plan);
         }
 
-        if let Ok(node) = SchemaCastScanExecNode::decode(buf) {
+        if let Ok(node) = SchemaCastScanExecNode::decode(buf)
+            && !node.schema.is_empty()
+        {
             let schema = datafusion_common::Schema::decode(&*node.schema)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
