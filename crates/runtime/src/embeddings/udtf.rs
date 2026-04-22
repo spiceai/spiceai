@@ -147,14 +147,9 @@ impl DistanceMetric {
         match s.to_ascii_lowercase().as_str() {
             "cosine" | "cos" => Ok(Self::Cosine),
             "l2" | "euclidean" | "euclid" => Ok(Self::L2),
-            // Dot is not yet wired through the scan path; reject at parse time so
-            // users get a clear error instead of silently constructing args that
-            // will then fail with `NotImplemented` deeper in execution.
-            "dot" | "inner" | "ip" => Err(DataFusionError::Plan(format!(
-                "distance_metric '{s}' is not yet implemented for {VECTOR_SEARCH_UDTF_NAME}. Supported: 'cosine', 'l2'."
-            ))),
+            "dot" | "inner" | "ip" => Ok(Self::Dot),
             other => Err(DataFusionError::Plan(format!(
-                "Unsupported distance_metric '{other}' for {VECTOR_SEARCH_UDTF_NAME}. Supported: 'cosine', 'l2'."
+                "Unsupported distance_metric '{other}' for {VECTOR_SEARCH_UDTF_NAME}. Supported: 'cosine', 'l2', 'dot'."
             ))),
         }
     }
@@ -1014,11 +1009,21 @@ impl TableProvider for VectorSearchUDTFProvider {
                 )
             }
             DistanceMetric::Dot => {
-                return Err(DataFusionError::NotImplemented(format!(
-                    "distance_metric => 'dot' is not yet wired through {VECTOR_SEARCH_UDTF_NAME}. \
-                     For L2-normalized embeddings, use distance_metric => 'cosine' which is \
-                     mathematically equivalent. See https://spiceai.org/docs for roadmap."
-                )));
+                // inner_product already returns higher-is-more-similar; no negation needed.
+                let Some(inner_product_udf) = state
+                    .scalar_functions()
+                    .get(runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME)
+                    .cloned()
+                else {
+                    return Err(DataFusionError::Execution(format!(
+                        "UDF '{}' is required for distance_metric => 'dot' in {VECTOR_SEARCH_UDTF_NAME}, but it is not registered.",
+                        runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME
+                    )));
+                };
+                Expr::ScalarFunction(ScalarFunction {
+                    func: inner_product_udf,
+                    args: vec![query_lit, embed_expr],
+                })
             }
         };
 

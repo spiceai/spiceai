@@ -61,6 +61,7 @@ use itertools::Itertools;
 use runtime_datafusion_index::IndexedTableProvider;
 use search::index::SearchIndex;
 use search::index::chunking::ChunkedSearchIndex;
+use search::index::native_vector::NativeVectorIndex;
 use search::{
     aggregation::{AggregationResult, reciprocal_rank::ReciprocalRankFusion},
     generation::CandidateGeneration,
@@ -108,6 +109,11 @@ impl SearchEngine {
                 && s3v.search_column() == embedding_column
             {
                 return Some(Arc::new(s3v.clone()) as Arc<dyn SearchIndex>);
+            }
+            if let Some(native) = idx.as_any().downcast_ref::<NativeVectorIndex>()
+                && native.search_column() == embedding_column
+            {
+                return Some(Arc::new(native.clone()) as Arc<dyn SearchIndex>);
             }
             None
         })
