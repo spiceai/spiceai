@@ -768,7 +768,7 @@ mod tests {
 
     fn unwrap_alias(expr: &LogicalExpr) -> &LogicalExpr {
         match expr {
-            LogicalExpr::Alias(a) => &*a.expr,
+            LogicalExpr::Alias(a) => &a.expr,
             other => other,
         }
     }
