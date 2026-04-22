@@ -191,6 +191,9 @@ where
     }
     let dim = usize::try_from(dim_a)
         .map_err(|_| DataFusionError::Internal(format!("vector_simd: negative FSL dim {dim_a}")))?;
+    if dim == 0 {
+        return exec_err!("vector_simd: invalid FSL dim 0 (chunks_exact would panic)");
+    }
 
     let flat_a = flat_f32(a)?;
     let flat_b = flat_f32(b)?;
@@ -249,6 +252,9 @@ pub(crate) fn compute_fsl_f32_l2_norm(array: &ArrayRef) -> DataFusionResult<Arra
             fsl.value_length()
         ))
     })?;
+    if dim == 0 {
+        return exec_err!("vector_simd: invalid FSL dim 0 (chunks_exact would panic)");
+    }
     let flat = flat_f32(fsl)?;
     let outer = fsl.nulls();
     let inner = fsl.values().logical_nulls();
