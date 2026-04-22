@@ -262,17 +262,25 @@ impl CayenneDataSink {
             && !is_partitioned
             && !self.table.has_retention_filters();
         if can_inline {
-            // Collect the stream incrementally. Stop as soon as the inline
-            // threshold is exceeded so we don't buffer the entire large insert.
+            // Collect the stream incrementally. Stop as soon as the inline row
+            // threshold or an in-memory byte budget is exceeded so we don't
+            // buffer the entire large insert. The byte budget guards against
+            // pathological batches (e.g. a few rows with very large strings)
+            // where row count alone does not bound memory usage.
             let schema = prepared_stream.schema();
             let mut batches = Vec::new();
             let mut total_rows = 0usize;
+            let mut total_bytes = 0usize;
             let mut exceeded = false;
             while let Some(batch) = futures::StreamExt::next(&mut prepared_stream).await {
                 let batch = batch?;
                 total_rows += batch.num_rows();
+                total_bytes =
+                    total_bytes.saturating_add(batch.get_array_memory_size());
                 batches.push(batch);
-                if total_rows > super::table::INLINE_MAX_ROWS {
+                if total_rows > super::table::INLINE_MAX_ROWS
+                    || total_bytes > super::table::INLINE_MAX_BUFFER_BYTES
+                {
                     exceeded = true;
                     break;
                 }

@@ -286,6 +286,72 @@ pub(crate) fn build_file_statistics(
     FileStatistics::new_with_dtype(Arc::from(column_stats.into_boxed_slice()), &struct_dtype)
 }
 
+/// Merge an existing serialized [`FileStatistics`] blob with new per-column
+/// [`StatsSet`]s and return the merged, serialized blob.
+///
+/// Uses Vortex's commutative `merge_unordered` per column so the caller does
+/// not need to worry about ordering. If the existing blob cannot be
+/// deserialized, or if the column counts do not match, `None` is returned so
+/// callers can fall back to writing the new stats alone.
+///
+/// This preserves data correctness across multi-write sequences: once a row's
+/// min/max/null-count has been incorporated it stays incorporated, and the
+/// merged `num_rows` reflects the full table when `existing_num_rows` is
+/// passed in correctly by the caller.
+pub(crate) fn merge_serialized_stats(
+    existing_blob: &[u8],
+    new_column_stats: &[StatsSet],
+    dtypes: &[DType],
+    schema: &Schema,
+) -> Option<Vec<u8>> {
+    if new_column_stats.len() != dtypes.len() {
+        tracing::warn!(
+            "merge_serialized_stats: new_column_stats len {} != dtypes len {}",
+            new_column_stats.len(),
+            dtypes.len(),
+        );
+        return None;
+    }
+
+    let existing = match deserialize_file_statistics(existing_blob, schema) {
+        Ok(fs) => fs,
+        Err(e) => {
+            tracing::warn!(
+                "merge_serialized_stats: failed to deserialize existing stats blob: {e}"
+            );
+            return None;
+        }
+    };
+
+    let existing_sets: Vec<StatsSet> = existing.into_iter().map(|(set, _)| set.clone()).collect();
+
+    if existing_sets.len() != new_column_stats.len() {
+        tracing::warn!(
+            "merge_serialized_stats: existing column count {} != new count {}; \
+             skipping merge (schema may have changed)",
+            existing_sets.len(),
+            new_column_stats.len(),
+        );
+        return None;
+    }
+
+    let merged: Vec<StatsSet> = existing_sets
+        .into_iter()
+        .zip(new_column_stats.iter())
+        .zip(dtypes.iter())
+        .map(|((existing, new), dtype)| existing.merge_unordered(new, dtype))
+        .collect();
+
+    let file_stats = build_file_statistics(merged, schema);
+    match serialize_file_statistics(&file_stats) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            tracing::warn!("merge_serialized_stats: failed to serialize merged stats: {e}");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
