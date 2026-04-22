@@ -83,7 +83,7 @@ pub(super) fn make_refresher()
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
     let mem_table = Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]])?);
     let federated = Arc::new(FederatedTable::Immediate(
-        mem_table.clone() as Arc<dyn datafusion::datasource::TableProvider>
+        Arc::clone(&mem_table) as Arc<dyn datafusion::datasource::TableProvider>
     ));
     Ok(Arc::new(Refresher::new(
         crate::status::RuntimeStatus::new(),
