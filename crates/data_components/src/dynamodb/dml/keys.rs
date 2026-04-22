@@ -16,8 +16,8 @@ limitations under the License.
 
 //! Shared primary key extraction logic for DynamoDB DML operations.
 
-use arrow::array::Array;
 use crate::dynamodb::utils::scalar_to_attribute_value;
+use arrow::array::Array;
 use aws_sdk_dynamodb::types::AttributeValue;
 use datafusion::common::ScalarValue;
 use datafusion::error::DataFusionError;
@@ -116,42 +116,40 @@ fn extract_keys_from_expr(
             left,
             op: Operator::Eq,
             right,
-        }) => {
-            match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(col), Expr::Literal(scalar, _))
-                | (Expr::Literal(scalar, _), Expr::Column(col)) => {
-                    let col = col.name();
-                    if col == partition_key {
-                        let attr = scalar_to_attribute_value(scalar, time_format)?;
-                        keys.push((attr, None));
-                    } else if sort_key.is_some_and(|sk| sk == col) {
-                        return Err(DataFusionError::Plan(
+        }) => match (left.as_ref(), right.as_ref()) {
+            (Expr::Column(col), Expr::Literal(scalar, _))
+            | (Expr::Literal(scalar, _), Expr::Column(col)) => {
+                let col = col.name();
+                if col == partition_key {
+                    let attr = scalar_to_attribute_value(scalar, time_format)?;
+                    keys.push((attr, None));
+                } else if sort_key.is_some_and(|sk| sk == col) {
+                    return Err(DataFusionError::Plan(
                             "DynamoDB DML: sort key filter must be combined with partition key using AND".to_string(),
                         ));
-                    } else {
-                        return Err(DataFusionError::Plan(format!(
-                            "DynamoDB DML only supports filters on primary key columns, got '{col}'"
-                        )));
-                    }
-                }
-                (Expr::ScalarFunction(func), Expr::Literal(scalar, _))
-                | (Expr::Literal(scalar, _), Expr::ScalarFunction(func)) => {
-                    extract_keys_from_struct_eq(
-                        func,
-                        scalar,
-                        partition_key,
-                        sort_key,
-                        time_format,
-                        keys,
-                    )?;
-                }
-                _ => {
-                    return Err(DataFusionError::Plan(
-                        "DynamoDB DML only supports column = literal or struct = struct filters on primary key columns".to_string(),
-                    ));
+                } else {
+                    return Err(DataFusionError::Plan(format!(
+                        "DynamoDB DML only supports filters on primary key columns, got '{col}'"
+                    )));
                 }
             }
-        }
+            (Expr::ScalarFunction(func), Expr::Literal(scalar, _))
+            | (Expr::Literal(scalar, _), Expr::ScalarFunction(func)) => {
+                extract_keys_from_struct_eq(
+                    func,
+                    scalar,
+                    partition_key,
+                    sort_key,
+                    time_format,
+                    keys,
+                )?;
+            }
+            _ => {
+                return Err(DataFusionError::Plan(
+                        "DynamoDB DML only supports column = literal or struct = struct filters on primary key columns".to_string(),
+                    ));
+            }
+        },
         // Simple IN list: pk IN (v1, v2, v3)
         Expr::InList(InList {
             expr: in_expr,
@@ -303,13 +301,12 @@ fn extract_keys_from_in_list(
                                 "DynamoDB DML: expected single-row struct in IN list".to_string(),
                             ));
                         }
-                        let pk_scalar =
-                            ScalarValue::try_from_array(struct_array.column(pk_idx), 0)
-                                .map_err(|e| {
-                                    DataFusionError::Plan(format!(
-                                        "Failed to extract pk from struct: {e}"
-                                    ))
-                                })?;
+                        let pk_scalar = ScalarValue::try_from_array(struct_array.column(pk_idx), 0)
+                            .map_err(|e| {
+                                DataFusionError::Plan(format!(
+                                    "Failed to extract pk from struct: {e}"
+                                ))
+                            })?;
                         let pk_attr = scalar_to_attribute_value(&pk_scalar, time_format)?;
                         let sk_attr = sk_idx
                             .map(|idx| {

@@ -159,7 +159,10 @@ impl ExecutionPlan for DynamoDBUpdateExec {
             })
         });
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(count_schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            count_schema,
+            stream,
+        )))
     }
 }
 
@@ -232,7 +235,11 @@ async fn execute_update(
 fn build_update_expression(
     assignments: &[(String, Expr)],
     time_format: &str,
-) -> DataFusionResult<(String, HashMap<String, String>, HashMap<String, AttributeValue>)> {
+) -> DataFusionResult<(
+    String,
+    HashMap<String, String>,
+    HashMap<String, AttributeValue>,
+)> {
     if assignments.is_empty() {
         return Err(DataFusionError::Plan(
             "DynamoDB UPDATE requires at least one column assignment".to_string(),
