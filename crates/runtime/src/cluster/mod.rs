@@ -92,8 +92,18 @@ pub enum DistributedNode {
         /// Registry of connected executors for `FlightSQL`.
         executor_registry: Arc<ExecutorRegistry>,
 
-        /// Manager for accelerated table partition metadata (initialized when scheduler config is available)
-        partition_manager: Arc<PartitionManager>,
+        /// Shared cluster state document used by both partition managers
+        /// and the scheduler registry.
+        cluster_state: Arc<ClusterStateStore>,
+
+        /// Heartbeat store, owned alongside the cluster state.
+        heartbeats: Arc<SchedulerHeartbeatStore>,
+
+        /// Manager for accelerated table partition metadata.
+        accelerations_partitions: Arc<AccelerationsPartitions>,
+
+        /// Manager for catalog/federated table partition metadata.
+        catalog_partitions: Arc<CatalogPartitions>,
     },
     Executor {
         /// Partition assignments for this runtime (executor) for each table.
@@ -393,21 +403,32 @@ fn update_scheduler_pollers(
     *known_schedulers = next_schedulers;
 }
 
+mod cluster_state;
 mod composite_flight_service;
 mod control_stream_client;
 pub mod datafusion;
 pub(crate) mod executor_registry;
+mod heartbeat;
 pub mod metrics_collector;
 pub mod partition;
-mod scheduler_registry;
+mod reaper;
+pub(crate) mod scheduler_registry;
 mod servers;
 mod service;
 
+pub use cluster_state::{
+    CLUSTER_STATE_SCHEMA_VERSION, ClusterState as SpiceClusterState, ClusterStateStore,
+    MutateError, MutateOk, MutationOutcome, PartitionScope, SchedulerEntry,
+};
 pub use control_stream_client::ControlStreamManager;
 pub use executor_registry::{ExecutorRegistry, FederatedPartitionProvider};
-pub use partition::{PartitionManager, PartitionMetadata, TablePartitionMetadata};
-pub use scheduler_registry::start_scheduler_registry;
-pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
+pub use heartbeat::{CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeat, SchedulerHeartbeatStore};
+pub use partition::{
+    AccelerationsPartitions, CatalogPartitions, PartitionManager, PartitionMetadata,
+    TablePartitionMetadata,
+};
+pub use reaper::{Reaper, ReaperOutcome};
+pub use scheduler_registry::{SchedulerPeers, start_scheduler_registry};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
 pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 
@@ -887,16 +908,33 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         let registry_shutdown_for_task = registry_shutdown.clone();
         let peers = Arc::clone(&scheduler_peers);
         let self_ref = Arc::clone(rt);
+        let cluster_state = rt.cluster_state();
+        let heartbeats = rt.scheduler_heartbeats();
         let scheduler_registry_fut = self_for_task
             .start_runtime_task(
                 CLUSTER_SCHEDULER_REGISTRY,
                 Some(registry_shutdown_for_task),
                 async move {
-                    start_scheduler_registry(self_ref, &config, registry_shutdown.clone(), peers)
-                        .await
-                        .map_err(|err| crate::Error::FailedToRegisterScheduler {
-                            source: Box::new(err),
-                        })
+                    let (Some(cluster_state), Some(heartbeats)) = (cluster_state, heartbeats)
+                    else {
+                        return Err(crate::Error::FailedToRegisterScheduler {
+                            source: Box::new(std::io::Error::other(
+                                "cluster state store not initialized for scheduler role",
+                            )),
+                        });
+                    };
+                    start_scheduler_registry(
+                        self_ref,
+                        &config,
+                        registry_shutdown.clone(),
+                        peers,
+                        cluster_state,
+                        heartbeats,
+                    )
+                    .await
+                    .map_err(|err| crate::Error::FailedToRegisterScheduler {
+                        source: Box::new(err),
+                    })
                 },
             )
             .await;

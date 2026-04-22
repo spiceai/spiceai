@@ -190,7 +190,7 @@ utoipa-swagger-ui = { version = ">=8.1.1", features = [
 ], optional = true }
 
 gethostname.workspace = true
-uuid = { workspace = true, features = ["v7"] }
+uuid = { workspace = true, features = ["v4", "v7"] }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
 
