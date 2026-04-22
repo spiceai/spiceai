@@ -5367,8 +5367,8 @@ mod tests {
         let projected = Arc::new(
             full_schema
                 .project(&[
-                    full_schema.index_of("id").unwrap(),
-                    full_schema.index_of("name").unwrap(),
+                    full_schema.index_of("id").expect("id in schema"),
+                    full_schema.index_of("name").expect("name in schema"),
                 ])
                 .expect("projection should succeed"),
         );
