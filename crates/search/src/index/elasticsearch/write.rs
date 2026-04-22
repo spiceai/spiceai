@@ -169,11 +169,13 @@ pub async fn write(index: &ElasticsearchIndex, record: RecordBatch) -> Result<Re
         let chunk_size = index.batch_write_rows.max(1);
         let total = docs.len();
         for chunk in docs.chunks(chunk_size) {
-            let resp = index.client.bulk_index(es_index, chunk).await.context(
-                BulkIndexSnafu {
+            let resp = index
+                .client
+                .bulk_index(es_index, chunk)
+                .await
+                .context(BulkIndexSnafu {
                     index: es_index.to_string(),
-                },
-            )?;
+                })?;
             inspect_bulk_response(&resp, es_index)?;
         }
         tracing::debug!(

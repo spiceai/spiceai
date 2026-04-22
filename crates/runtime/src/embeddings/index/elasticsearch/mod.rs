@@ -26,8 +26,8 @@ use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use elasticsearch::{Client, ClientOptions, Elasticsearch};
 use search::generation::util::get_primary_keys;
-use search::metadata::{MetadataColumn, MetadataColumns};
 pub(crate) use search::index::elasticsearch::ElasticsearchIndex;
+use search::metadata::{MetadataColumn, MetadataColumns};
 use spicepod::{
     param::Params,
     semantic::{Column, ColumnLevelEmbeddingConfig, MetadataType},
@@ -225,9 +225,13 @@ pub async fn try_from_table(
     // Parse optional batch write size.
     let batch_write_rows = string_from_params(&params, "batch_write_rows")
         .map(|s| {
-            s.parse::<usize>().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("Invalid value for Elasticsearch parameter 'batch_write_rows': '{s}': {e}").into()
-            })
+            s.parse::<usize>()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!(
+                        "Invalid value for Elasticsearch parameter 'batch_write_rows': '{s}': {e}"
+                    )
+                    .into()
+                })
         })
         .transpose()?
         .filter(|n| *n > 0)
@@ -366,9 +370,11 @@ fn parse_u32_param(
     let Some(s) = string_from_params(params, key) else {
         return Ok(None);
     };
-    let v: u32 = s.parse().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-        format!("Invalid value for Elasticsearch parameter '{key}': '{s}': {e}").into()
-    })?;
+    let v: u32 = s
+        .parse()
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("Invalid value for Elasticsearch parameter '{key}': '{s}': {e}").into()
+        })?;
     Ok(Some(v))
 }
 
@@ -379,9 +385,11 @@ fn parse_duration_param(
     let Some(s) = string_from_params(params, key) else {
         return Ok(None);
     };
-    duration_parse::parse_duration(s).map(Some).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-        format!("Invalid value for Elasticsearch parameter '{key}': '{s}': {e}").into()
-    })
+    duration_parse::parse_duration(s).map(Some).map_err(
+        |e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("Invalid value for Elasticsearch parameter '{key}': '{s}': {e}").into()
+        },
+    )
 }
 
 fn build_client_options(
@@ -462,10 +470,7 @@ async fn ensure_index_with_mapping(
             index_options.insert("m".to_string(), serde_json::Value::from(m));
         }
         if let Some(ef) = mapping_opts.hnsw_ef_construction {
-            index_options.insert(
-                "ef_construction".to_string(),
-                serde_json::Value::from(ef),
-            );
+            index_options.insert("ef_construction".to_string(), serde_json::Value::from(ef));
         }
         if let Some(obj) = dense_vector.as_object_mut() {
             obj.insert(
@@ -504,15 +509,9 @@ async fn ensure_index_with_mapping(
         let mut mapping = arrow_type_to_es_mapping(c.field().data_type());
         if let Some(obj) = mapping.as_object_mut() {
             let indexable = matches!(c, MetadataColumn::Filterable(_));
-            obj.insert(
-                "index".to_string(),
-                serde_json::Value::Bool(indexable),
-            );
+            obj.insert("index".to_string(), serde_json::Value::Bool(indexable));
             if !indexable {
-                obj.insert(
-                    "doc_values".to_string(),
-                    serde_json::Value::Bool(false),
-                );
+                obj.insert("doc_values".to_string(), serde_json::Value::Bool(false));
             }
         }
         properties.insert(name, mapping);
