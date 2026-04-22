@@ -27,7 +27,10 @@ limitations under the License.
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 //!  - `value` (UTF8): The subset of the column most relevant. For non-chunked embedding columns, `value` is the entire value.
 
-use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
+use arrow::{
+    array::{Array, FixedSizeListArray, StringArray},
+    datatypes::Float32Type,
+};
 use arrow_schema::{DataType, Field, SchemaRef};
 use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::exec_err;
@@ -410,6 +413,39 @@ impl VectorSearchTableFunc {
                             )));
                         }
                     }
+                }
+                Ok(out)
+            }
+            // SQL array literal syntax: ['a', 'b', 'c'] parses as ScalarValue::List
+            Some(Expr::Literal(ScalarValue::List(arr), None)) => {
+                let inner = arr.value(0);
+                let strings = inner
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(
+                            "Multi-query array elements must be strings.".to_string(),
+                        )
+                    })?;
+                if strings.is_empty() {
+                    return Err(DataFusionError::Plan(
+                        "Multi-query array must contain at least one query string.".to_string(),
+                    ));
+                }
+                if strings.len() > VECTOR_SEARCH_MAX_QUERIES {
+                    return Err(DataFusionError::Plan(format!(
+                        "Multi-query array is limited to {VECTOR_SEARCH_MAX_QUERIES} query strings, got {}.",
+                        strings.len()
+                    )));
+                }
+                let mut out = Vec::with_capacity(strings.len());
+                for i in 0..strings.len() {
+                    if strings.is_null(i) {
+                        return Err(DataFusionError::Plan(
+                            "Multi-query array elements cannot be null.".to_string(),
+                        ));
+                    }
+                    out.push(strings.value(i).to_string());
                 }
                 Ok(out)
             }
@@ -1191,6 +1227,44 @@ mod tests {
         use datafusion::functions_nested::make_array::make_array_udf;
         let make_array = make_array_udf();
         let q = Expr::ScalarFunction(ScalarFunction::new_udf(Arc::clone(&make_array), vec![]));
+        let err = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect_err("expected rejection");
+        assert!(err.to_string().contains("at least one query string"));
+    }
+
+    fn list_literal(strs: &[&str]) -> Expr {
+        use arrow::datatypes::DataType;
+        let scalars: Vec<ScalarValue> = strs
+            .iter()
+            .map(|s| ScalarValue::Utf8(Some((*s).to_string())))
+            .collect();
+        let arr = ScalarValue::new_list_nullable(&scalars, &DataType::Utf8);
+        Expr::Literal(ScalarValue::List(arr), None)
+    }
+
+    #[test]
+    fn test_parse_query_arg_sql_array_literal() {
+        let q = list_literal(&["climate", "economy", "anxiety"]);
+        let out = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect("ok");
+        assert_eq!(
+            out,
+            vec![
+                "climate".to_string(),
+                "economy".to_string(),
+                "anxiety".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_query_arg_sql_array_single_element() {
+        let q = list_literal(&["hello world"]);
+        let out = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect("ok");
+        assert_eq!(out, vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_query_arg_sql_array_empty_rejected() {
+        let q = list_literal(&[]);
         let err = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect_err("expected rejection");
         assert!(err.to_string().contains("at least one query string"));
     }
