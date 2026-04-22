@@ -1,15 +1,16 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: "normalize_search_response(resp, round_scores)"
+expression: normalize_search_response(resp, round_scores)
 ---
 {
   "duration_ms": "duration_ms_val",
   "results": [
     {
-      "_score": "0.01",
+      "_score": "0.03",
       "dataset": "qs",
       "matches": {
         "question": [
+          "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants.",
           "Find the number of ways a judge can award first, second, and third places in a contest with 18 contestants."
         ]
       },
@@ -22,11 +23,11 @@ expression: "normalize_search_response(resp, round_scores)"
       "dataset": "qs",
       "matches": {
         "question": [
-          "\\((-6) \\div (-2)\\)"
+          "How many groups of 2 are in 14?"
         ]
       },
       "primary_key": {
-        "id": 1324
+        "id": 462
       }
     },
     {
@@ -34,11 +35,11 @@ expression: "normalize_search_response(resp, round_scores)"
       "dataset": "qs",
       "matches": {
         "question": [
-          "Yasenia is 3 years older than Xavier. How old is Yasenia when Xavier is 18 years old?"
+          "How many groups of 5 are in 25?"
         ]
       },
       "primary_key": {
-        "id": 1323
+        "id": 464
       }
     },
     {
@@ -46,11 +47,11 @@ expression: "normalize_search_response(resp, round_scores)"
       "dataset": "qs",
       "matches": {
         "question": [
-          "\\((-9) \\div (-3)\\)"
+          "How many groups of 3 are in 18?"
         ]
       },
       "primary_key": {
-        "id": 1325
+        "id": 463
       }
     }
   ]
