@@ -121,7 +121,11 @@ impl From<Error> for DataFusionError {
             Error::InvalidUrl { source } => DataFusionError::External(Box::new(source)),
             Error::Arrow { source } => DataFusionError::ArrowError(Box::new(source), None),
             Error::DataFusion { source } => source,
-            Error::JsonNesting { source } => DataFusionError::External(Box::new(source)),
+            Error::JsonNesting { source } => {
+                // Preserve the "Failed to decompose HTTP response row into declared columns:"
+                // context from the outer Error instead of bubbling up only the raw JSON error.
+                DataFusionError::External(Box::new(Error::JsonNesting { source }))
+            }
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
             }
@@ -5340,6 +5344,45 @@ mod tests {
     }
 
     #[test]
+    fn create_batch_from_rows_nested_missing_keys_become_null() {
+        let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
+        let rows = vec![
+            r#"{"id":"1","extra":"x"}"#.to_string(),
+            r#"{"name":"beta"}"#.to_string(),
+        ];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 2);
+
+        assert_eq!(string_col(&batch, "id"), vec![Some("1".to_string()), None]);
+        assert_eq!(
+            string_col(&batch, "name"),
+            vec![None, Some("beta".to_string())]
+        );
+        // Row 0 has a non-declared key, row 1 has no extras so catch-all is NULL.
+        let details = string_col(&batch, "details");
+        assert_eq!(details[0].as_deref(), Some(r#"{"extra":"x"}"#));
+        assert!(details[1].is_none());
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_empty_catchall_is_null_when_all_keys_declared() {
+        let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
+        let rows = vec![r#"{"id":"1","name":"alpha"}"#.to_string()];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(string_col(&batch, "id")[0].as_deref(), Some("1"));
+        assert_eq!(string_col(&batch, "name")[0].as_deref(), Some("alpha"));
+        assert!(
+            string_col(&batch, "details")[0].is_none(),
+            "catch-all should be NULL when no non-declared keys are present"
+        );
+    }
+
+    #[test]
     fn create_batch_from_rows_nested_non_object_row_goes_to_catchall() {
         let (exec, nesting) = nested_exec(&["id", "details"], "details");
         let rows = vec![r#""just a string""#.to_string()];
@@ -5381,5 +5424,31 @@ mod tests {
         assert_eq!(batch.num_columns(), 2);
         assert_eq!(string_col(&batch, "id"), vec![Some("42".to_string())]);
         assert_eq!(string_col(&batch, "name"), vec![Some("fast".to_string())]);
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_fast_path_falls_through_on_non_object_rows() {
+        // When catch-all isn't projected but a row isn't a JSON object,
+        // the fast path must not apply blindly — decompose_json_row still
+        // runs and yields NULL for static fields.
+        let nesting = super::super::json_nest::HttpJsonNesting::new(
+            vec!["id".to_string(), "details".to_string()],
+            "details".to_string(),
+        );
+        let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        let full_schema = provider.schema();
+        let id_idx = full_schema.index_of("id").expect("id in schema");
+        let projected = datafusion::common::project_schema(&full_schema, Some(&vec![id_idx]))
+            .expect("project schema");
+        let exec = HttpExec::new(projected, provider, vec![(None, None, None)], None);
+        let rows = vec!["[1,2,3]".to_string(), r#"{"id":"x"}"#.to_string()];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 1);
+        let id = string_col(&batch, "id");
+        assert!(id[0].is_none(), "non-object row: id should be NULL");
+        assert_eq!(id[1].as_deref(), Some("x"));
     }
 }
