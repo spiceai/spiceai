@@ -479,17 +479,17 @@ mod tests {
             make_hit(json!({"created_at": "2024-01-15T10:30:00Z"})),
             make_hit(json!({})), // missing → null
         ];
-        let batch = hits_to_record_batch(&hits, &schema).unwrap();
+        let batch = hits_to_record_batch(&hits, &schema).expect("hits_to_record_batch failed");
         let col = batch
             .column(0)
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
-            .unwrap();
+            .expect("column 0 should be TimestampMicrosecondArray");
 
         assert!(!col.is_null(0));
         assert!(col.is_null(1));
         let expected = chrono::DateTime::parse_from_rfc3339("2024-01-15T10:30:00Z")
-            .unwrap()
+            .expect("valid RFC 3339 literal")
             .timestamp_micros();
         assert_eq!(col.value(0), expected);
     }
@@ -503,12 +503,12 @@ mod tests {
         )]));
         let epoch_ms: i64 = 1_705_311_000_000;
         let hits = vec![make_hit(json!({"ts": epoch_ms}))];
-        let batch = hits_to_record_batch(&hits, &schema).unwrap();
+        let batch = hits_to_record_batch(&hits, &schema).expect("hits_to_record_batch failed");
         let col = batch
             .column(0)
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
-            .unwrap();
+            .expect("column 0 should be TimestampMicrosecondArray");
 
         assert_eq!(col.value(0), epoch_ms * 1_000);
     }
@@ -528,19 +528,22 @@ mod tests {
             make_hit(json!({})),                // missing → null
             make_hit(json!({"sentences": []})), // empty list → non-null empty
         ];
-        let batch = hits_to_record_batch(&hits, &schema).unwrap();
+        let batch = hits_to_record_batch(&hits, &schema).expect("hits_to_record_batch failed");
         let col = batch
             .column(0)
             .as_any()
             .downcast_ref::<ListArray>()
-            .unwrap();
+            .expect("column 0 should be ListArray");
 
         assert!(!col.is_null(0));
         assert!(col.is_null(1));
         assert!(!col.is_null(2));
 
         let row0 = col.value(0);
-        let strings = row0.as_any().downcast_ref::<LargeStringArray>().unwrap();
+        let strings = row0
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("list values should be LargeStringArray");
         assert_eq!(strings.len(), 2);
         assert_eq!(strings.value(0), "hello");
         assert_eq!(strings.value(1), "world");
@@ -559,15 +562,18 @@ mod tests {
             true,
         )]));
         let hits = vec![make_hit(json!({"tags": ["a", "b", "c"]}))];
-        let batch = hits_to_record_batch(&hits, &schema).unwrap();
+        let batch = hits_to_record_batch(&hits, &schema).expect("hits_to_record_batch failed");
         let col = batch
             .column(0)
             .as_any()
             .downcast_ref::<ListArray>()
-            .unwrap();
+            .expect("column 0 should be ListArray");
 
         let row0 = col.value(0);
-        let strings = row0.as_any().downcast_ref::<StringArray>().unwrap();
+        let strings = row0
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("list values should be StringArray");
         assert_eq!(strings.len(), 3);
         assert_eq!(strings.value(0), "a");
         assert_eq!(strings.value(1), "b");
