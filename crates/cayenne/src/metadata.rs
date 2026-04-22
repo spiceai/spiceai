@@ -324,7 +324,8 @@ pub struct TableStatistics {
     /// Serialized Vortex `FileStatistics` flatbuffer bytes containing per-column
     /// stats (min, max, null count, sum, NaN count, `is_constant`, etc.)
     pub statistics_blob: Vec<u8>,
-    /// Total number of rows in the table across all files
+    /// Row count captured by the most recent write's accumulator (not an
+    /// aggregate across every file ever produced — see the struct docs).
     pub num_rows: i64,
 }
 
