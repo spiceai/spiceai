@@ -15958,6 +15958,7 @@ dependencies = [
  "db_connection_pool",
  "document_parse",
  "duckdb",
+ "duration-parse",
  "dynamodb-streams",
  "elasticsearch",
  "event_stream",
