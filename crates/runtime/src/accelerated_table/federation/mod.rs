@@ -98,10 +98,7 @@ impl AcceleratedTable {
         // Only fall back to the federated source during initial load for ready states that
         // are designed to serve queries before acceleration completes. The default `OnLoad`
         // state must NOT federate during initial load — it returns "Acceleration not ready".
-        let fallback_during_initial_load = matches!(
-            self.ready_state,
-            ReadyState::OnSchemaResolved | ReadyState::OnRegistration
-        );
+        let fallback_during_initial_load = matches!(self.ready_state, ReadyState::OnSchemaResolved);
 
         let table_source: Arc<dyn FederatedTableSource> = match fallback {
             Some((fb_provider, fb_table_ref)) if fb_table_ref != accelerated_table_ref => {
@@ -155,5 +152,58 @@ impl AcceleratedTable {
             )),
             None => self,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use provider::make_refresher;
+
+    fn table_ref(name: &str) -> MultiPartTableReference {
+        MultiPartTableReference::from(datafusion::sql::TableReference::bare(name))
+    }
+
+    fn full_table_ref(catalog: &str, schema: &str, table: &str) -> MultiPartTableReference {
+        MultiPartTableReference::from(datafusion::sql::TableReference::full(
+            catalog, schema, table,
+        ))
+    }
+
+    /// Before initial load completes, `DynamicSQLTable` should present the
+    /// fallback (source) table reference so federation generates fully-qualified SQL.
+    #[tokio::test]
+    async fn test_dynamic_table_ref_uses_fallback_before_load() {
+        let refresher = make_refresher();
+        assert!(!refresher.initial_load_completed());
+
+        let table = DynamicSQLTable {
+            fallback_table_ref: full_table_ref("cat", "sch", "remote"),
+            accelerated_table_ref: table_ref("local"),
+            schema: Arc::new(datafusion::arrow::datatypes::Schema::empty()),
+            refresher,
+        };
+
+        assert_eq!(
+            table.table_reference(),
+            full_table_ref("cat", "sch", "remote")
+        );
+    }
+
+    /// After initial load completes, `DynamicSQLTable` should present the
+    /// accelerated layer's table reference so queries target the local engine.
+    #[tokio::test]
+    async fn test_dynamic_table_ref_uses_accelerated_after_load() {
+        let refresher = make_refresher();
+        refresher.set_initial_load_completed(true);
+
+        let table = DynamicSQLTable {
+            fallback_table_ref: full_table_ref("cat", "sch", "remote"),
+            accelerated_table_ref: table_ref("local"),
+            schema: Arc::new(datafusion::arrow::datatypes::Schema::empty()),
+            refresher,
+        };
+
+        assert_eq!(table.table_reference(), table_ref("local"));
     }
 }

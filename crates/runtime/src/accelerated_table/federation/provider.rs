@@ -69,6 +69,35 @@ impl AcceleratedTableFederationProvider {
     }
 }
 
+#[cfg(test)]
+pub(super) fn make_refresher() -> Arc<crate::accelerated_table::refresh::Refresher> {
+    use crate::accelerated_table::refresh::{Refresh, Refresher};
+    use crate::component::dataset::acceleration::RefreshMode;
+    use crate::federated_table::FederatedTable;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::MemTable;
+    use datafusion::common::TableReference;
+    use tokio::runtime::Handle;
+    use tokio::sync::{Mutex, RwLock};
+
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let mem_table = Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).unwrap());
+    let federated = Arc::new(FederatedTable::Immediate(
+        mem_table.clone() as Arc<dyn datafusion::datasource::TableProvider>
+    ));
+    Arc::new(Refresher::new(
+        crate::status::RuntimeStatus::new(),
+        TableReference::bare("test"),
+        federated,
+        None,
+        Arc::new(RwLock::new(Refresh::new(RefreshMode::Full))),
+        mem_table,
+        None,
+        Handle::current(),
+        Arc::new(Mutex::new(())),
+    ))
+}
+
 impl FederationProvider for AcceleratedTableFederationProvider {
     fn name(&self) -> &'static str {
         "FederationProviderForAcceleratedDataset"
@@ -80,5 +109,108 @@ impl FederationProvider for AcceleratedTableFederationProvider {
 
     fn analyzer(&self, plan: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
         self.federation_provider()?.analyzer(plan)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct MockFederationProvider {
+        context: &'static str,
+    }
+
+    impl FederationProvider for MockFederationProvider {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+
+        fn compute_context(&self) -> Option<String> {
+            Some(self.context.to_string())
+        }
+
+        fn analyzer(&self, _: &LogicalPlan) -> Option<FederationAnalyzerForLogicalPlan> {
+            None
+        }
+    }
+
+    fn accelerated() -> Arc<dyn FederationProvider> {
+        Arc::new(MockFederationProvider {
+            context: "accelerated",
+        })
+    }
+
+    fn fallback() -> Arc<dyn FederationProvider> {
+        Arc::new(MockFederationProvider {
+            context: "fallback",
+        })
+    }
+
+    /// Pre-load + fallback enabled → federate to source (e.g. Databricks).
+    #[tokio::test]
+    async fn test_pre_load_fallback_enabled_uses_fallback_provider() {
+        let refresher = make_refresher();
+        assert!(!refresher.initial_load_completed());
+
+        let provider = AcceleratedTableFederationProvider::new(
+            true,
+            true,
+            Some(accelerated()),
+            Some(fallback()),
+            refresher,
+        );
+
+        assert_eq!(provider.compute_context(), Some("fallback".to_string()));
+    }
+
+    /// Pre-load + fallback disabled (on_load default) → no federation.
+    #[tokio::test]
+    async fn test_pre_load_fallback_disabled_returns_none() {
+        let refresher = make_refresher();
+
+        let provider = AcceleratedTableFederationProvider::new(
+            true,
+            false,
+            Some(accelerated()),
+            Some(fallback()),
+            refresher,
+        );
+
+        assert!(provider.compute_context().is_none());
+    }
+
+    /// Post-load + enabled → federate to accelerated layer (e.g. DuckDB).
+    #[tokio::test]
+    async fn test_post_load_enabled_uses_accelerated_provider() {
+        let refresher = make_refresher();
+        refresher.set_initial_load_completed(true);
+
+        let provider = AcceleratedTableFederationProvider::new(
+            true,
+            true,
+            Some(accelerated()),
+            Some(fallback()),
+            refresher,
+        );
+
+        assert_eq!(provider.compute_context(), Some("accelerated".to_string()));
+    }
+
+    /// Post-load + disabled → no federation.
+    #[tokio::test]
+    async fn test_post_load_disabled_returns_none() {
+        let refresher = make_refresher();
+        refresher.set_initial_load_completed(true);
+
+        let provider = AcceleratedTableFederationProvider::new(
+            false,
+            false,
+            Some(accelerated()),
+            Some(fallback()),
+            refresher,
+        );
+
+        assert!(provider.compute_context().is_none());
     }
 }
