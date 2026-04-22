@@ -39,8 +39,8 @@ use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
+use crate::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex};
 use crate::index::{SearchIndex, VectorIndex, embedding_col};
-use crate::index::chunking::{ChunkedSearchIndex, CHUNKED_INDEX_CHUNK_KEY};
 use crate::metadata::MetadataColumns;
 use data_components::elasticsearch::search_table::{
     ElasticsearchKnnTable, ElasticsearchTextSearchTable, QueryEmbedder,
@@ -313,10 +313,7 @@ impl ElasticsearchIndex {
         ));
         fields.push(Field::new(
             ChunkedSearchIndex::chunking_offset_col(&self.embedded_column),
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Int32, false)),
-                2,
-            ),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 2),
             false,
         ));
         Arc::new(Schema::new(fields))

@@ -358,7 +358,11 @@ impl SearchIndex for ChunkedSearchIndex {
                 arrs[i] = list_arr;
             } else {
                 arrs.push(list_arr);
-                fields.push(Arc::new(Field::new_list(&offsets, Arc::unwrap_or_clone(item_field), false)));
+                fields.push(Arc::new(Field::new_list(
+                    &offsets,
+                    Arc::unwrap_or_clone(item_field),
+                    false,
+                )));
             }
         }
 
@@ -378,7 +382,11 @@ impl SearchIndex for ChunkedSearchIndex {
                 arrs[i] = list_arr;
             } else {
                 arrs.push(list_arr);
-                fields.push(Arc::new(Field::new_list(&embeddings, Arc::unwrap_or_clone(item_field), false)));
+                fields.push(Arc::new(Field::new_list(
+                    &embeddings,
+                    Arc::unwrap_or_clone(item_field),
+                    false,
+                )));
             }
         }
         RecordBatch::try_new(Arc::new(Schema::new(fields)), arrs).boxed()
