@@ -21,7 +21,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, SchemaRef};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
 use elasticsearch::{Client, Elasticsearch};
@@ -63,11 +63,12 @@ pub async fn try_from_table(
     config: ColumnLevelEmbeddingConfig,
     vector_store_config: &VectorStore,
     inner_table_provider: &Arc<dyn TableProvider>,
+    index_schema: SchemaRef,
     embedding_models: Arc<RwLock<EmbeddingModelStore>>,
     dataset_columns: Vec<Column>,
     secrets: Arc<RwLock<Secrets>>,
 ) -> Result<ElasticsearchIndex, Box<dyn std::error::Error + Send + Sync>> {
-    let inner_schema = inner_table_provider.schema();
+    let inner_schema = index_schema;
     let primary_keys: Vec<String> = match config.row_ids.clone() {
         Some(row_ids) => row_ids,
         None => get_primary_keys(inner_table_provider)
