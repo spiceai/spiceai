@@ -79,7 +79,7 @@ impl HttpJsonNesting {
     pub fn new(column_order: Vec<String>, json_field_name: String) -> Self {
         let static_fields: HashSet<String> = column_order
             .iter()
-            .filter(|c| **c != json_field_name)
+            .filter(|c| c.as_str() != json_field_name.as_str())
             .cloned()
             .collect();
         Self {

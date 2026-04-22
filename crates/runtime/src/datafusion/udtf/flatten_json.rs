@@ -26,7 +26,10 @@ limitations under the License.
 //!     path         Utf8,
 //!     parent_path  Utf8,
 //!     key          Utf8,
-//!     value        Utf8,   -- leaf value as string; NULL for JSON null; compact JSON for containers (with include_internal)
+//!     value        Utf8,   -- leaf value as string; NULL for JSON null;
+//!                          -- containers emit compact JSON when
+//!                          -- `include_internal` / empty-container
+//!                          -- fallbacks surface them as rows
 //!     type         Utf8    -- "object"|"array"|"string"|"number"|"integer"|"boolean"|"null"
 //! )
 //! ```
@@ -59,9 +62,11 @@ limitations under the License.
 //! `flatten_json_rows_emitted_total`, and
 //! `flatten_json_errors_total{kind}`. For the UDTF entry point, malformed
 //! input or a hit cap emits an error-kind metric and yields an empty /
-//! truncated batch — never a query-level error. The scalar UDF variant
-//! returns `DataFusionError::Execution` when `SCALAR_BATCH_MAX_ROWS` is
-//! exceeded (the per-document `max_rows` cap is not configurable there).
+//! truncated batch instead of a query-level error. The scalar UDF entry
+//! point additionally returns `DataFusionError::Execution` if a single
+//! batch would exceed `SCALAR_BATCH_MAX_ROWS` flattened rows or if the
+//! resulting `LargeList` offsets would overflow `i64`; callers in those
+//! paths should reduce `max_rows` or split the input.
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
