@@ -1475,7 +1475,7 @@ mod tests {
 
         Base RRF score for id=1, k=0 = 1/(k + rank) = 1/(0+1) = 1/1
         But should be unboosted!
-        | fused_score        | content                      | id | picked_at           |
+        | _fused_score       | content                      | id | picked_at           |
         +--------------------+------------------------------+----+---------------------+
         | 1.0                | orange citrus round juicy    | 1  | 1970-01-01T00:00:00 |
         | 0.4723665527410147 | apple fruit sweet red crispy | 3  | 2025-09-23T14:26:15 |
@@ -1483,7 +1483,7 @@ mod tests {
         +--------------------+------------------------------+----+---------------------+
 
         After:
-        | fused_score        | content                      | id | picked_at           |
+        | _fused_score       | content                      | id | picked_at           |
         +--------------------+------------------------------+----+---------------------+
         | 0.4723665527410147 | apple fruit sweet red crispy | 3  | 2025-09-23T14:32:53 |
         | 0.3032653298563167 | banana yellow curved fruit   | 2  | 2025-09-24T14:32:53 |
@@ -1654,7 +1654,7 @@ mod tests {
 
         let query_empty_red_results = test_query!(
             runtime,
-            "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red')) order by fused_score desc"
+            "select * from rrf(vector_search(bar, 'empty'), vector_search(foo, 'red')) order by _fused_score desc"
         );
         let query_empty_red_content = extract_column!(
             query_empty_red_results,
