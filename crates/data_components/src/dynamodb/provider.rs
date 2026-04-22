@@ -24,6 +24,7 @@ use crate::delete::DeletionExec;
 use crate::dynamodb::arrow::dynamodb_items_to_arrow;
 use crate::dynamodb::dml::delete::DynamoDBDeletionSink;
 use crate::dynamodb::dml::insert::DynamoDBInsertSink;
+use crate::dynamodb::dml::update::DynamoDBUpdateExec;
 use crate::dynamodb::json_nest::{JsonNesting, json_nest_except_fields};
 use crate::dynamodb::request_builder::DynamoDBRequestPlanBuilder;
 use crate::dynamodb::request_plan::{DynamoDBRequestPlan, QueryParams, ScanParams};
@@ -668,6 +669,24 @@ impl TableProvider for DynamoDBTableProvider {
                 parallelism: self.write_parallelism,
             },
         ))))
+    }
+
+    async fn update(
+        &self,
+        _state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(DynamoDBUpdateExec::new(
+            Arc::clone(&self.db_client),
+            self.table_schema.table_name().to_string(),
+            self.table_schema.partition_key().to_string(),
+            self.table_schema.sort_key().map(ToString::to_string),
+            self.table_schema.time_format(),
+            assignments,
+            filters,
+            self.write_parallelism,
+        )))
     }
 }
 

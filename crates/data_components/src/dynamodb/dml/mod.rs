@@ -16,6 +16,8 @@ limitations under the License.
 
 pub mod delete;
 pub mod insert;
+pub(crate) mod keys;
+pub mod update;
 
 use std::sync::Arc;
 use std::time::Duration;
