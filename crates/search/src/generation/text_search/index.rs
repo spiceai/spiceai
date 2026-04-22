@@ -41,8 +41,10 @@ use crate::generation::text_search::{
 use crate::generation::util::get_primary_keys;
 use crate::index::SearchIndex;
 
-/// The minimum number of bytes to support writing to in-memory [`tantivy::Index`].
-pub static MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX: usize = 15_000_000;
+/// The heap budget for the [`tantivy::IndexWriter`] (150 MiB).
+/// A larger budget reduces the number of segment flushes and subsequent merges,
+/// significantly improving bulk-indexing throughput.
+pub static MEMORY_BUDGET_FOR_INDEX_WRITER: usize = 150 * 1024 * 1024;
 pub static INDEX_UNIQUE_FIELD_NAME: &str = "__spice.unique_field";
 
 #[derive(Clone)]
@@ -51,8 +53,10 @@ pub struct FullTextDatabaseIndex {
     pub primary_key: Vec<String>,
     pub base_table: Arc<dyn TableProvider>,
 
-    // `index` access should only be needed for write path. Query/reads should use [`self::reader`].
+    // Retained for shared ownership across clones (e.g. `with_new_base`).
+    // Writes go through [`Self::writer`]; reads through [`Self::reader`].
     pub index: Arc<Mutex<tantivy::Index>>,
+    pub writer: Arc<Mutex<tantivy::IndexWriter>>,
     pub reader: tantivy::IndexReader,
 }
 
@@ -124,11 +128,15 @@ impl FullTextDatabaseIndex {
             tantivy::Index::create_in_ram(tantivy_schema)
         };
         let reader = index.reader().context(TextSearchIndexingSnafu)?;
+        let writer = index
+            .writer(MEMORY_BUDGET_FOR_INDEX_WRITER)
+            .context(IndexCreationSnafu)?;
 
         Ok(Self {
             base_table: inner,
             search_fields,
             index: Arc::new(Mutex::new(index)),
+            writer: Arc::new(Mutex::new(writer)),
             primary_key: pks,
             reader,
         })
@@ -242,10 +250,7 @@ impl FullTextDatabaseIndex {
         let docs = parse_json_array(&index_schema, doc_json.as_str())
             .context(FailedToInsertDataIntoIndexSnafu)?;
 
-        let index_writable = self.index.lock().await;
-        let mut index_writer: tantivy::IndexWriter = index_writable
-            .writer(MINIMUM_MEMORY_BUDGET_FOR_MEMORY_INDEX)
-            .context(IndexCreationSnafu)?;
+        let mut index_writer = self.writer.lock().await;
         // Deletion.
         for t in terms_to_delete {
             index_writer.delete_term(t);
@@ -257,7 +262,7 @@ impl FullTextDatabaseIndex {
         index_writer
             .commit()
             .context(FailedToInsertDataIntoIndexSnafu)?;
-        drop(index_writable);
+        drop(index_writer);
 
         self.reader.reload().boxed().context(InvalidIndexingSnafu {
             context: "Data successfully written to full-text index, but failed to update search path to reference the latest commit. Queries will be served from previous revision until the next update.".to_string(),
@@ -283,6 +288,7 @@ impl FullTextDatabaseIndex {
             search_fields: self.search_fields.clone(),
             primary_key: self.primary_key.clone(),
             index: Arc::clone(&self.index),
+            writer: Arc::clone(&self.writer),
             base_table,
             reader: self.reader.clone(),
         }
