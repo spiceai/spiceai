@@ -40,6 +40,7 @@ use runtime_datafusion_index::Index;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
 use crate::index::{SearchIndex, VectorIndex, embedding_col};
+use crate::metadata::MetadataColumns;
 use data_components::elasticsearch::search_table::{
     ElasticsearchKnnTable, ElasticsearchTextSearchTable, QueryEmbedder,
 };
@@ -94,6 +95,14 @@ pub struct ElasticsearchIndex {
 
     /// Full source schema for extracting fields from Elasticsearch results.
     pub source_schema: SchemaRef,
+
+    /// Filterable / non-filterable metadata columns as declared by the user.
+    /// These influence the ES mapping (index: true vs index: false) but are
+    /// otherwise written into `_source` like any other source column.
+    pub metadata_columns: MetadataColumns,
+
+    /// Maximum number of rows to send per Elasticsearch `_bulk` request.
+    pub batch_write_rows: usize,
 }
 
 #[async_trait]

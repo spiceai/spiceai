@@ -24,12 +24,13 @@ use std::sync::Arc;
 use arrow_schema::{DataType, SchemaRef};
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
-use elasticsearch::{Client, Elasticsearch};
+use elasticsearch::{Client, ClientOptions, Elasticsearch};
 use search::generation::util::get_primary_keys;
+use search::metadata::{MetadataColumn, MetadataColumns};
 pub(crate) use search::index::elasticsearch::ElasticsearchIndex;
 use spicepod::{
     param::Params,
-    semantic::{Column, ColumnLevelEmbeddingConfig},
+    semantic::{Column, ColumnLevelEmbeddingConfig, MetadataType},
     vector::VectorStore,
 };
 use tokio::sync::RwLock;
@@ -218,6 +219,27 @@ pub async fn try_from_table(
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
         as i32;
 
+    // Parse optional vector-mapping tuning params.
+    let mapping_opts = parse_mapping_options(&params)?;
+
+    // Parse optional batch write size.
+    let batch_write_rows = string_from_params(&params, "batch_write_rows")
+        .map(|s| {
+            s.parse::<usize>().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("Invalid value for Elasticsearch parameter 'batch_write_rows': '{s}': {e}").into()
+            })
+        })
+        .transpose()?
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_BATCH_WRITE_ROWS);
+
+    // Resolve spicepod `vectors: filterable | non-filterable` hints into
+    // [`search::metadata::MetadataColumns`]. These shape the ES mapping
+    // (`index: true` / `index: false`) so filterable fields participate in
+    // query filters, and non-filterable fields are stored only in `_source`.
+    let metadata_columns =
+        es_metadata_columns(&dataset_columns, &inner_schema, &column, &vector_field);
+
     // Normalize the source schema to match what the Elasticsearch HTTP client actually produces.
     // Accelerated tables (e.g. DuckDB) may store columns with types that differ from what ES
     // returns, causing RecordBatch::try_new to fail when schemas are compared:
@@ -270,6 +292,8 @@ pub async fn try_from_table(
         &vector_field,
         dims,
         &text_fields,
+        &mapping_opts,
+        &metadata_columns,
     )
     .await?;
 
@@ -283,7 +307,125 @@ pub async fn try_from_table(
         compute_query: model,
         dims,
         source_schema,
+        metadata_columns,
+        batch_write_rows,
     })
+}
+
+/// Default number of rows per Elasticsearch `_bulk` request.
+const DEFAULT_BATCH_WRITE_ROWS: usize = 1000;
+
+/// Parsed vector-mapping tuning options (HNSW params + similarity).
+#[derive(Debug, Clone)]
+struct VectorMappingOptions {
+    similarity: String,
+    hnsw_m: Option<u32>,
+    hnsw_ef_construction: Option<u32>,
+}
+
+impl Default for VectorMappingOptions {
+    fn default() -> Self {
+        Self {
+            similarity: "cosine".to_string(),
+            hnsw_m: None,
+            hnsw_ef_construction: None,
+        }
+    }
+}
+
+fn parse_mapping_options(
+    params: &Parameters,
+) -> Result<VectorMappingOptions, Box<dyn std::error::Error + Send + Sync>> {
+    let mut opts = VectorMappingOptions::default();
+
+    if let Some(s) = string_from_params(params, "distance_metric") {
+        opts.similarity = match s.trim().to_ascii_lowercase().as_str() {
+            "cosine" => "cosine".to_string(),
+            "l2_norm" | "l2" | "euclidean" => "l2_norm".to_string(),
+            "dot_product" | "dot" => "dot_product".to_string(),
+            "max_inner_product" | "mip" => "max_inner_product".to_string(),
+            other => {
+                return Err(format!(
+                    "Invalid Elasticsearch 'distance_metric': '{other}'. Expected one of: cosine | l2_norm | dot_product | max_inner_product."
+                )
+                .into());
+            }
+        };
+    }
+
+    opts.hnsw_m = parse_u32_param(params, "hnsw_m")?;
+    opts.hnsw_ef_construction = parse_u32_param(params, "hnsw_ef_construction")?;
+
+    Ok(opts)
+}
+
+fn parse_u32_param(
+    params: &Parameters,
+    key: &str,
+) -> Result<Option<u32>, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(s) = string_from_params(params, key) else {
+        return Ok(None);
+    };
+    let v: u32 = s.parse().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("Invalid value for Elasticsearch parameter '{key}': '{s}': {e}").into()
+    })?;
+    Ok(Some(v))
+}
+
+fn parse_duration_param(
+    params: &Parameters,
+    key: &str,
+) -> Result<Option<std::time::Duration>, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(s) = string_from_params(params, key) else {
+        return Ok(None);
+    };
+    duration_parse::parse_duration(s).map(Some).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("Invalid value for Elasticsearch parameter '{key}': '{s}': {e}").into()
+    })
+}
+
+fn build_client_options(
+    params: &Parameters,
+) -> Result<ClientOptions, Box<dyn std::error::Error + Send + Sync>> {
+    let mut opts = ClientOptions::default();
+    if let Some(d) = parse_duration_param(params, "client_timeout")? {
+        opts.request_timeout = d;
+    }
+    if let Some(d) = parse_duration_param(params, "connect_timeout")? {
+        opts.connect_timeout = d;
+    }
+    if let Some(n) = parse_u32_param(params, "max_retries")? {
+        opts.retry.max_retries = n;
+    }
+    if let Some(d) = parse_duration_param(params, "retry_initial_backoff")? {
+        opts.retry.initial_backoff = d;
+    }
+    Ok(opts)
+}
+
+/// Resolve spicepod `vectors` metadata hints from dataset columns into
+/// [`MetadataColumns`]. Columns marked `filterable`/`non-filterable` contribute
+/// to the ES mapping (index: true / index: false respectively). The embedded
+/// column and the vector field itself are excluded.
+fn es_metadata_columns(
+    columns: &[Column],
+    schema: &SchemaRef,
+    embedded_column: &str,
+    vector_field: &str,
+) -> MetadataColumns {
+    let cols: Vec<MetadataColumn> = columns
+        .iter()
+        .filter(|c| c.name != embedded_column && c.name != vector_field)
+        .filter_map(|c| {
+            let kind = c.as_vector_metadata()?;
+            let field = schema.field_with_name(&c.name).ok()?.clone();
+            Some(match kind {
+                MetadataType::Filterable => MetadataColumn::Filterable(Arc::new(field)),
+                MetadataType::NonFilterable => MetadataColumn::NonFilterable(Arc::new(field)),
+            })
+        })
+        .collect();
+    cols.into()
 }
 
 /// Create the ES index with a `dense_vector` mapping for `vector_field` if the index
@@ -297,6 +439,8 @@ async fn ensure_index_with_mapping(
     vector_field: &str,
     dims: i32,
     text_fields: &[String],
+    mapping_opts: &VectorMappingOptions,
+    metadata_columns: &MetadataColumns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if dims <= 0 {
         return Err(format!(
@@ -305,16 +449,34 @@ async fn ensure_index_with_mapping(
         .into());
     }
 
+    let mut dense_vector = serde_json::json!({
+        "type": "dense_vector",
+        "dims": dims,
+        "index": true,
+        "similarity": mapping_opts.similarity,
+    });
+    if mapping_opts.hnsw_m.is_some() || mapping_opts.hnsw_ef_construction.is_some() {
+        let mut index_options = serde_json::Map::new();
+        index_options.insert("type".to_string(), serde_json::Value::String("hnsw".into()));
+        if let Some(m) = mapping_opts.hnsw_m {
+            index_options.insert("m".to_string(), serde_json::Value::from(m));
+        }
+        if let Some(ef) = mapping_opts.hnsw_ef_construction {
+            index_options.insert(
+                "ef_construction".to_string(),
+                serde_json::Value::from(ef),
+            );
+        }
+        if let Some(obj) = dense_vector.as_object_mut() {
+            obj.insert(
+                "index_options".to_string(),
+                serde_json::Value::Object(index_options),
+            );
+        }
+    }
+
     let mut properties = serde_json::Map::new();
-    properties.insert(
-        vector_field.to_string(),
-        serde_json::json!({
-            "type": "dense_vector",
-            "dims": dims,
-            "index": true,
-            "similarity": "cosine",
-        }),
-    );
+    properties.insert(vector_field.to_string(), dense_vector);
     for t in text_fields {
         // Skip the vector field if a text column happens to share the name.
         if t == vector_field {
@@ -327,6 +489,33 @@ async fn ensure_index_with_mapping(
                 "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } },
             }),
         );
+    }
+
+    // Filterable metadata columns get mapped with `index: true` so they can
+    // participate in ES query filters. Non-filterable columns are stored in
+    // `_source` only (`index: false`, `doc_values: false`) — retrieved on hits
+    // but never scanned for filtering. Columns already covered by the text
+    // mapping above are skipped.
+    for c in metadata_columns.iter() {
+        let name = c.name().to_string();
+        if name == vector_field || properties.contains_key(&name) {
+            continue;
+        }
+        let mut mapping = arrow_type_to_es_mapping(c.field().data_type());
+        if let Some(obj) = mapping.as_object_mut() {
+            let indexable = matches!(c, MetadataColumn::Filterable(_));
+            obj.insert(
+                "index".to_string(),
+                serde_json::Value::Bool(indexable),
+            );
+            if !indexable {
+                obj.insert(
+                    "doc_values".to_string(),
+                    serde_json::Value::Bool(false),
+                );
+            }
+        }
+        properties.insert(name, mapping);
     }
 
     let exists = client
@@ -389,6 +578,31 @@ fn is_index_already_exists_error(error: &(dyn std::error::Error + 'static)) -> b
         current = err.source();
     }
     false
+}
+
+/// Map an Arrow [`DataType`] to the best-effort Elasticsearch field mapping.
+/// Unknown types fall back to `keyword` (lossless round-trip via `_source`).
+fn arrow_type_to_es_mapping(dt: &DataType) -> serde_json::Value {
+    match dt {
+        DataType::Boolean => serde_json::json!({ "type": "boolean" }),
+        DataType::Int8 | DataType::Int16 | DataType::UInt8 | DataType::UInt16 => {
+            serde_json::json!({ "type": "integer" })
+        }
+        DataType::Int32 | DataType::UInt32 => serde_json::json!({ "type": "integer" }),
+        DataType::Int64 | DataType::UInt64 => serde_json::json!({ "type": "long" }),
+        DataType::Float32 => serde_json::json!({ "type": "float" }),
+        DataType::Float64 => serde_json::json!({ "type": "double" }),
+        DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => {
+            serde_json::json!({ "type": "date" })
+        }
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+            serde_json::json!({
+                "type": "text",
+                "fields": { "keyword": { "type": "keyword", "ignore_above": 256 } },
+            })
+        }
+        _ => serde_json::json!({ "type": "keyword" }),
+    }
 }
 
 /// Normalize an Arrow [`DataType`] to match what the Elasticsearch HTTP client produces.

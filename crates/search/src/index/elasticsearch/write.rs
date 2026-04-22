@@ -164,19 +164,20 @@ pub async fn write(index: &ElasticsearchIndex, record: RecordBatch) -> Result<Re
             "No documents to index into Elasticsearch index '{es_index}' for this batch."
         );
     } else {
-        let resp = index
-            .client
-            .bulk_index(es_index, &docs)
-            .await
-            .context(BulkIndexSnafu {
-                index: es_index.to_string(),
-            })?;
-
-        inspect_bulk_response(&resp, es_index)?;
-
+        // Chunk the bulk payload to bound per-request memory/size. `batch_write_rows`
+        // is validated > 0 at construction time; still guard defensively.
+        let chunk_size = index.batch_write_rows.max(1);
+        let total = docs.len();
+        for chunk in docs.chunks(chunk_size) {
+            let resp = index.client.bulk_index(es_index, chunk).await.context(
+                BulkIndexSnafu {
+                    index: es_index.to_string(),
+                },
+            )?;
+            inspect_bulk_response(&resp, es_index)?;
+        }
         tracing::debug!(
-            "Indexed {} document(s) into Elasticsearch index '{es_index}'.",
-            docs.len()
+            "Indexed {total} document(s) into Elasticsearch index '{es_index}' (chunk size: {chunk_size})."
         );
     }
 
