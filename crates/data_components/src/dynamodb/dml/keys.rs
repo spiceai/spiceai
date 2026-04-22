@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Shared primary key extraction logic for DynamoDB DML operations.
+//! Shared primary key extraction logic for `DynamoDB` DML operations.
 
 use crate::dynamodb::utils::scalar_to_attribute_value;
 use arrow::array::Array;

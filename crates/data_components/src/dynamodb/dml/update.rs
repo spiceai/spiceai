@@ -39,7 +39,7 @@ pub struct DynamoDBUpdateExec {
     pub partition_key: String,
     pub sort_key: Option<String>,
     pub time_format: Arc<String>,
-    /// Pairs of (column_name, new_value_expr). Only `Expr::Literal` values are supported.
+    /// Pairs of (`column_name`, `new_value_expr`). Only `Expr::Literal` values are supported.
     pub assignments: Vec<(String, Expr)>,
     pub filters: Vec<Expr>,
     pub parallelism: usize,
@@ -47,6 +47,7 @@ pub struct DynamoDBUpdateExec {
 }
 
 impl DynamoDBUpdateExec {
+    #[must_use] 
     pub fn new(
         db_client: Arc<DbClient>,
         table_name: String,
@@ -228,8 +229,8 @@ async fn execute_update(
     Ok(total)
 }
 
-/// Build a DynamoDB `UpdateExpression` of the form `SET #n0 = :v0, #n1 = :v1, ...`
-/// from a list of (column, Expr::Literal) assignments.
+/// Build a `DynamoDB` `UpdateExpression` of the form `SET #n0 = :v0, #n1 = :v1, ...`
+/// from a list of (column, `Expr::Literal`) assignments.
 ///
 /// Uses expression attribute names (`#n<i>`) to avoid reserved word conflicts.
 fn build_update_expression(
