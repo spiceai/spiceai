@@ -897,7 +897,14 @@ mod tests {
         assert!(paths.contains(&"identityMap.CRM[*].primary"));
         // Three rows for `id` (EMAIL×1 + CRM×2) all collapsed onto two
         // distinct wildcard paths (one per top-level map key).
-        let id_rows = rows.iter().filter(|r| r.path.ends_with(".id")).count();
+        let id_rows = rows
+            .iter()
+            .filter(|r| {
+                r.path
+                    .rsplit_once('.')
+                    .is_some_and(|(_, suffix)| suffix == "id")
+            })
+            .count();
         assert_eq!(id_rows, 3);
     }
 
