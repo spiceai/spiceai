@@ -560,7 +560,11 @@ pub struct ReciprocalRankFusion {
     pub session_context: Arc<SessionContext>,
     // store a pointer to use for Hash/Eq since UDTF impls require this trait bound but we cannot feasibly make `SessionContext` implement them.
     session_ptr: u64,
-    df: Option<DataFrame>,
+    /// Output schema, derived once in `call()` by building the fused `DataFrame`.
+    schema: Option<SchemaRef>,
+    /// Stores the original RRF arguments so that `scan()` can rebuild the
+    /// fused `DataFrame` with pre-filters injected into each sub-query.
+    rrf_args: Option<Arc<ReciprocalRankFusionArgs>>,
     /// Stores the original RRF arguments for distributed serialization.
     ///
     /// This is set when the provider is created via the `rrf()` UDTF and enables
@@ -591,7 +595,8 @@ impl ReciprocalRankFusion {
         Self {
             session_context: Arc::clone(session_context),
             session_ptr: ptr,
-            df: None,
+            schema: None,
+            rrf_args: None,
             rrf_source: None,
         }
     }
@@ -602,8 +607,14 @@ impl ReciprocalRankFusion {
     }
 
     #[must_use]
-    pub fn with_df(mut self, df: DataFrame) -> Self {
-        self.df = Some(df);
+    fn with_schema(mut self, schema: SchemaRef) -> Self {
+        self.schema = Some(schema);
+        self
+    }
+
+    #[must_use]
+    fn with_rrf_args(mut self, args: Arc<ReciprocalRankFusionArgs>) -> Self {
+        self.rrf_args = Some(args);
         self
     }
 
@@ -701,8 +712,12 @@ impl ReciprocalRankFusion {
 
     // Given arguments to n search calls: execute searches, generate row IDs, rank by score, JOIN,
     // then finally re-rank and sort fused results
-    fn rerank_and_fuse_df(&self, args: &ReciprocalRankFusionArgs) -> Result<DataFrame> {
-        let (subquery_dfs, join_key) = self.prepare_and_execute_subqueries(args)?;
+    fn rerank_and_fuse_df(
+        &self,
+        args: &ReciprocalRankFusionArgs,
+        filters: &[Expr],
+    ) -> Result<DataFrame> {
+        let (subquery_dfs, join_key) = self.prepare_and_execute_subqueries(args, filters)?;
         let score_expr = Self::compute_score_expr(args, &subquery_dfs)?;
 
         // Create column expressions for final projection
@@ -804,9 +819,16 @@ impl ReciprocalRankFusion {
 
     // Given RRF args with unparsed search udtf exprs, turn each subquery into a DF,
     // add a hashed row ID, rank it, then give it an alias of `search_{i_in_argv}`
+    //
+    // When `filters` is non-empty, each filter whose referenced columns all
+    // exist in a sub-query's schema is applied as a pre-filter on that
+    // sub-query *before* ranking. This narrows the candidate set so that
+    // ranks reflect position within the filtered population — matching user
+    // intent for queries like `WHERE review_date > '2015-06-15' AND product_category = 'some category'`.
     fn prepare_and_execute_subqueries(
         &self,
         args: &ReciprocalRankFusionArgs,
+        filters: &[Expr],
     ) -> Result<(Vec<DataFrame>, Expr)> {
         tracing::trace!("{RRF_UDF_NAME} preparing subqueries for: {:?}", args);
 
@@ -858,6 +880,30 @@ impl ReciprocalRankFusion {
                         "{RRF_UDF_NAME}: Query at position {i} does not have a `_score` column."
                     );
                 }
+
+                // Apply pre-filters: only keep filters whose columns all exist
+                // in this sub-query's schema. This narrows the candidate set
+                // *before* ranking so ranks reflect position within the
+                // filtered population.
+                let df = if filters.is_empty() {
+                    df
+                } else {
+                    let schema = df.schema();
+                    if let Some(combined) = filters
+                        .iter()
+                        .filter(|f| {
+                            f.column_refs()
+                                .iter()
+                                .all(|c| schema.has_column_with_unqualified_name(c.name()))
+                        })
+                        .cloned()
+                        .reduce(Expr::and)
+                    {
+                        df.filter(combined)?
+                    } else {
+                        df
+                    }
+                };
 
                 // Propagate the RRF-level `limit` into each subquery as a wider
                 // candidate pool — but only when the subquery itself does not
@@ -1061,12 +1107,14 @@ impl ScalarUDFImpl for ReciprocalRankFusion {
 
 impl TableFunctionImpl for ReciprocalRankFusion {
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
-        let rrf_args = ReciprocalRankFusionArgs::from_udtf_exprs(args)?;
+        let rrf_args = Arc::new(ReciprocalRankFusionArgs::from_udtf_exprs(args)?);
         let serializable_args = rrf_args.to_serializable()?;
-        let rerank_and_fuse_df = self.rerank_and_fuse_df(&rrf_args)?;
+        let schema_df = self.rerank_and_fuse_df(&rrf_args, &[])?;
+        let schema = Arc::clone(schema_df.schema().inner());
         Ok(Arc::new(
             ReciprocalRankFusion::from_ctx(&self.session_context)
-                .with_df(rerank_and_fuse_df)
+                .with_schema(schema)
+                .with_rrf_args(rrf_args)
                 .with_rrf_source(serializable_args),
         ))
     }
@@ -1079,8 +1127,8 @@ impl TableProvider for ReciprocalRankFusion {
     }
 
     fn schema(&self) -> SchemaRef {
-        match self.df.as_ref() {
-            Some(df) => Arc::clone(df.schema().inner()),
+        match self.schema.as_ref() {
+            Some(schema) => Arc::clone(schema),
             None => panic!("ReciprocalRankFusion schema is not set. This is a bug in Spice.ai"),
         }
     }
@@ -1127,27 +1175,33 @@ impl TableProvider for ReciprocalRankFusion {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if let Some(ref df) = self.df {
-            let mut df = df.clone();
+        let Some(ref rrf_args) = self.rrf_args else {
+            return exec_err!(
+                "ReciprocalRankFusion has no stored args — cannot create physical plan"
+            );
+        };
+        let mut df = self.rerank_and_fuse_df(rrf_args, filters)?;
 
-            if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
-                df = df.filter(filter)?;
-            }
-
-            if let Some(projection) = projection {
-                df = df.select(
-                    self.schema()
-                        .project(projection)?
-                        .fields
-                        .iter()
-                        .map(|f| ident(f.name())),
-                )?;
-            }
-
-            df.limit(0, limit)?.create_physical_plan().await
-        } else {
-            exec_err!("ReciprocalRankFusion could not create physical plan")
+        // Also apply filters post-fusion as a safety net: pre-filters are
+        // only injected into sub-queries whose schema contains the
+        // referenced columns. If sub-queries have different schemas a
+        // filter may be skipped for some, letting unfiltered rows leak
+        // through the FULL JOIN. The post-fusion filter guarantees correctness.
+        if let Some(post_filter) = filters.iter().cloned().reduce(Expr::and) {
+            df = df.filter(post_filter)?;
         }
+
+        if let Some(projection) = projection {
+            df = df.select(
+                self.schema()
+                    .project(projection)?
+                    .fields
+                    .iter()
+                    .map(|f| ident(f.name())),
+            )?;
+        }
+
+        df.limit(0, limit)?.create_physical_plan().await
     }
 }
 
@@ -1820,19 +1874,14 @@ mod tests {
 
     use super::{RRF_FUSED_SCORE_COLUMN_NAME, ReciprocalRankFusion};
     use arrow::datatypes::{Field, Schema};
-    use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
     use datafusion_expr::TableProviderFilterPushDown;
 
-    /// Create a minimal `ReciprocalRankFusion` provider backed by a DataFrame
-    /// with the given schema, suitable for testing `supports_filters_pushdown`.
+    /// Create a minimal `ReciprocalRankFusion` provider with the given schema,
+    /// suitable for testing `supports_filters_pushdown`.
     fn make_rrf_provider(schema: Schema) -> ReciprocalRankFusion {
-        let schema = Arc::new(schema);
-        let mem: Arc<dyn TableProvider> =
-            Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("valid MemTable"));
         let ctx = Arc::new(SessionContext::new());
-        let df = ctx.read_table(Arc::clone(&mem)).expect("read table");
-        ReciprocalRankFusion::from_ctx(&ctx).with_df(df)
+        ReciprocalRankFusion::from_ctx(&ctx).with_schema(Arc::new(schema))
     }
 
     #[test]
