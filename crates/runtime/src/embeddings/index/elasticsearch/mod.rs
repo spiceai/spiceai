@@ -135,6 +135,24 @@ pub async fn try_from_table(
 
     let params = get_store_params(vector_store_config, Arc::clone(&secrets)).await?;
 
+    // Surface explicit "not yet supported" errors for params that require
+    // significant new infrastructure (per-partition index routing / spill
+    // queues). Better to fail loudly than silently ignore the config.
+    if string_from_params(&params, "partition_by").is_some()
+        || !vector_store_config.partition_by.is_empty()
+    {
+        return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "`partition_by` is not yet supported for the Elasticsearch vector engine. Remove the parameter or use the S3 Vectors engine for partitioned workloads.",
+        ));
+    }
+    if string_from_params(&params, "spill_writes").is_some_and(|v| {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes")
+    }) {
+        return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "`spill_writes` is not yet supported for the Elasticsearch vector engine.",
+        ));
+    }
+
     let endpoint = string_from_params(&params, "endpoint").ok_or_else(|| {
         Box::<dyn std::error::Error + Send + Sync>::from(
             "Missing required parameter 'endpoint' for Elasticsearch vector engine.",
@@ -144,8 +162,9 @@ pub async fn try_from_table(
     let user = string_from_params(&params, "user");
     let pass = string_from_params(&params, "pass");
 
+    let client_options = build_client_options(&params)?;
     let client: Arc<dyn Elasticsearch> = Arc::new(
-        Client::new(endpoint, user, pass)
+        Client::new_with_options(endpoint, user, pass, &client_options)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?,
     );
 
