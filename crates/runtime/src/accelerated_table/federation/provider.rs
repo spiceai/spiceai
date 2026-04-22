@@ -26,7 +26,7 @@ pub struct AcceleratedTableFederationProvider {
     /// `on_registration` ready states). If false (default `on_load`), return `None` so that
     /// `AcceleratedTable::scan()` can surface the "Acceleration not ready" error.
     fallback_during_initial_load: bool,
-    /// Federation provider for the accelerated layer (e.g. DuckDB). Used post-load.
+    /// Federation provider for the accelerated layer (e.g. `DuckDB`). Used post-load.
     provider: Option<Arc<dyn FederationProvider>>,
     /// Federation provider for the federated source (e.g. Databricks). Used during initial load
     /// to ensure queries are federated correctly while acceleration is being populated.
@@ -164,7 +164,7 @@ mod tests {
         assert_eq!(provider.compute_context(), Some("fallback".to_string()));
     }
 
-    /// Pre-load + fallback disabled (on_load default) → no federation.
+    /// Pre-load + fallback disabled (`on_load` default) → no federation.
     #[tokio::test]
     async fn test_pre_load_fallback_disabled_returns_none() {
         let refresher = make_refresher();
@@ -180,7 +180,7 @@ mod tests {
         assert!(provider.compute_context().is_none());
     }
 
-    /// Post-load + enabled → federate to accelerated layer (e.g. DuckDB).
+    /// Post-load + enabled → federate to accelerated layer (e.g. `DuckDB`).
     #[tokio::test]
     async fn test_post_load_enabled_uses_accelerated_provider() {
         let refresher = make_refresher();

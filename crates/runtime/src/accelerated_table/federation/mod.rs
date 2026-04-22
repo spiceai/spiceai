@@ -34,7 +34,7 @@ mod provider;
 /// whether the initial acceleration load has completed.
 ///
 /// During initial load, queries are federated to the original source (e.g. Databricks)
-/// using `fallback_table_ref`. After load, they target the accelerated layer (e.g. DuckDB)
+/// using `fallback_table_ref`. After load, they target the accelerated layer (e.g. `DuckDB`)
 /// using `accelerated_table_ref`.
 #[derive(Debug)]
 struct DynamicSQLTable {
