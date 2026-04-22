@@ -1029,7 +1029,7 @@ mod tests {
             ..FlattenOptions::default()
         };
         let rows = flatten_with_options(json, &opts);
-        assert_eq!(rows.len()https://github.com/spiceai/spiceai/pull/10453, 3);
+        assert_eq!(rows.len(), 3);
     }
 
     #[test]
