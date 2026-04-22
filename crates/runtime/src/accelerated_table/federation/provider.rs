@@ -52,15 +52,14 @@ impl AcceleratedTableFederationProvider {
     }
 
     fn federation_provider(&self) -> Option<Arc<dyn FederationProvider>> {
+        if !self.enabled {
+            return None;
+        }
         if self.refresher.initial_load_completed() {
-            // Post-load: use the accelerated provider (e.g. DuckDB) if federation is enabled.
-            if self.enabled {
-                self.provider.clone()
-            } else {
-                None
-            }
+            // Post-load: use the accelerated provider (e.g. DuckDB).
+            self.provider.clone()
         } else if self.fallback_during_initial_load {
-            // on_schema_resolved / on_registration: federate to the source during initial load.
+            // on_schema_resolved: federate to the source during initial load.
             self.fallback_provider.clone()
         } else {
             // on_load (default): don't federate; let AcceleratedTable::scan() return "not ready".
@@ -70,7 +69,8 @@ impl AcceleratedTableFederationProvider {
 }
 
 #[cfg(test)]
-pub(super) fn make_refresher() -> Arc<crate::accelerated_table::refresh::Refresher> {
+pub(super) fn make_refresher()
+-> datafusion::common::Result<Arc<crate::accelerated_table::refresh::Refresher>> {
     use crate::accelerated_table::refresh::{Refresh, Refresher};
     use crate::component::dataset::acceleration::RefreshMode;
     use crate::federated_table::FederatedTable;
@@ -81,11 +81,11 @@ pub(super) fn make_refresher() -> Arc<crate::accelerated_table::refresh::Refresh
     use tokio::sync::{Mutex, RwLock};
 
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-    let mem_table = Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).unwrap());
+    let mem_table = Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]])?);
     let federated = Arc::new(FederatedTable::Immediate(
         mem_table.clone() as Arc<dyn datafusion::datasource::TableProvider>
     ));
-    Arc::new(Refresher::new(
+    Ok(Arc::new(Refresher::new(
         crate::status::RuntimeStatus::new(),
         TableReference::bare("test"),
         federated,
@@ -95,7 +95,7 @@ pub(super) fn make_refresher() -> Arc<crate::accelerated_table::refresh::Refresh
         None,
         Handle::current(),
         Arc::new(Mutex::new(())),
-    ))
+    )))
 }
 
 impl FederationProvider for AcceleratedTableFederationProvider {
@@ -150,7 +150,7 @@ mod tests {
     /// Pre-load + fallback enabled → federate to source (e.g. Databricks).
     #[tokio::test]
     async fn test_pre_load_fallback_enabled_uses_fallback_provider() {
-        let refresher = make_refresher();
+        let refresher = make_refresher().expect("make_refresher");
         assert!(!refresher.initial_load_completed());
 
         let provider = AcceleratedTableFederationProvider::new(
@@ -167,7 +167,7 @@ mod tests {
     /// Pre-load + fallback disabled (`on_load` default) → no federation.
     #[tokio::test]
     async fn test_pre_load_fallback_disabled_returns_none() {
-        let refresher = make_refresher();
+        let refresher = make_refresher().expect("make_refresher");
 
         let provider = AcceleratedTableFederationProvider::new(
             true,
@@ -180,10 +180,26 @@ mod tests {
         assert!(provider.compute_context().is_none());
     }
 
+    /// Pre-load + federation disabled → no federation even when fallback is configured.
+    #[tokio::test]
+    async fn test_pre_load_federation_disabled_returns_none() {
+        let refresher = make_refresher().expect("make_refresher");
+
+        let provider = AcceleratedTableFederationProvider::new(
+            false,
+            true,
+            Some(accelerated()),
+            Some(fallback()),
+            refresher,
+        );
+
+        assert!(provider.compute_context().is_none());
+    }
+
     /// Post-load + enabled → federate to accelerated layer (e.g. `DuckDB`).
     #[tokio::test]
     async fn test_post_load_enabled_uses_accelerated_provider() {
-        let refresher = make_refresher();
+        let refresher = make_refresher().expect("make_refresher");
         refresher.set_initial_load_completed(true);
 
         let provider = AcceleratedTableFederationProvider::new(
@@ -200,7 +216,7 @@ mod tests {
     /// Post-load + disabled → no federation.
     #[tokio::test]
     async fn test_post_load_disabled_returns_none() {
-        let refresher = make_refresher();
+        let refresher = make_refresher().expect("make_refresher");
         refresher.set_initial_load_completed(true);
 
         let provider = AcceleratedTableFederationProvider::new(

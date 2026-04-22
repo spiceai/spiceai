@@ -174,7 +174,7 @@ mod tests {
     /// fallback (source) table reference so federation generates fully-qualified SQL.
     #[tokio::test]
     async fn test_dynamic_table_ref_uses_fallback_before_load() {
-        let refresher = make_refresher();
+        let refresher = make_refresher().expect("make_refresher");
         assert!(!refresher.initial_load_completed());
 
         let table = DynamicSQLTable {
@@ -194,7 +194,7 @@ mod tests {
     /// accelerated layer's table reference so queries target the local engine.
     #[tokio::test]
     async fn test_dynamic_table_ref_uses_accelerated_after_load() {
-        let refresher = make_refresher();
+        let refresher = make_refresher().expect("make_refresher");
         refresher.set_initial_load_completed(true);
 
         let table = DynamicSQLTable {
