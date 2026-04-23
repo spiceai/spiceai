@@ -428,8 +428,10 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
         }
         #[cfg(feature = "aws-secrets-manager")]
         SecretStoreType::AwsSecretsManager(secret_name) => {
-            let secret_store =
-                stores::aws_secrets_manager::AwsSecretsManager::new(secret_name.clone());
+            let secret_store = stores::aws_secrets_manager::AwsSecretsManager::new(&secret_name)
+                .map_err(|e| Error::UnableToInitializeAwsSecretsManager {
+                    source: Box::new(e),
+                })?;
 
             secret_store
                 .init()
