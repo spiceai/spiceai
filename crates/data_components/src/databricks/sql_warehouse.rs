@@ -55,12 +55,12 @@ use util::{
     format_datafusion_error,
 };
 
+#[cfg(test)]
+use crate::resilient_http::configure_client_builder;
 use crate::resilient_http::{
     DEFAULT_HTTP_CONNECT_TIMEOUT, DEFAULT_HTTP_REQUEST_TIMEOUT, RetryConfig,
     configure_client_builder_with_timeouts, send_request_with_retry_and_concurrency_limit,
 };
-#[cfg(test)]
-use crate::resilient_http::configure_client_builder;
 use crate::schema_discovery::{
     DatasetPermissions, NoPermissionsCheck, PermissionCheckResult, SchemaProbeResult,
     discover_schema,
