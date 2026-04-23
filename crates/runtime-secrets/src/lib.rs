@@ -45,6 +45,12 @@ pub enum Error {
         source: Box<stores::aws_secrets_manager::Error>,
     },
 
+    #[cfg(feature = "azure-keyvault")]
+    #[snafu(display("Unable to initialize Azure Key Vault: {source}"))]
+    UnableToInitializeAzureKeyVault {
+        source: Box<stores::azure_keyvault::Error>,
+    },
+
     #[snafu(display("Unable to parse secret value"))]
     UnableToParseSecretValue,
 
@@ -305,6 +311,8 @@ pub enum SecretStoreType {
     Kubernetes(stores::kubernetes::KubernetesConfig),
     #[cfg(feature = "aws-secrets-manager")]
     AwsSecretsManager(stores::aws_secrets_manager::AwsSecretsManagerConfig),
+    #[cfg(feature = "azure-keyvault")]
+    AzureKeyVault(stores::azure_keyvault::AzureKeyVaultConfig),
     SchedulerRPC,
 }
 
@@ -392,6 +400,14 @@ async fn spicepod_secret_store_type(
                     secret_name,
                     &params,
                 ),
+            ))
+        }
+        #[cfg(feature = "azure-keyvault")]
+        "azure_keyvault" => {
+            let vault = require_selector(provider, selector)?;
+            let params = validate(stores::azure_keyvault::PARAMETERS)?;
+            Ok(SecretStoreType::AzureKeyVault(
+                stores::azure_keyvault::AzureKeyVaultConfig::from_params(vault, &params),
             ))
         }
         "scheduler_rpc" => {
@@ -489,6 +505,22 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
                 .init()
                 .await
                 .map_err(|e| Error::UnableToInitializeAwsSecretsManager {
+                    source: Box::new(e),
+                })?;
+
+            Ok(Arc::new(secret_store) as Arc<dyn SecretStore>)
+        },
+        #[cfg(feature = "azure-keyvault")]
+        SecretStoreType::AzureKeyVault(config) => {
+            let secret_store = stores::azure_keyvault::AzureKeyVault::from_config(config)
+                .map_err(|e| Error::UnableToInitializeAzureKeyVault {
+                    source: Box::new(e),
+                })?;
+
+            secret_store
+                .init()
+                .await
+                .map_err(|e| Error::UnableToInitializeAzureKeyVault {
                     source: Box::new(e),
                 })?;
 
@@ -744,6 +776,210 @@ mod tests {
             }
             _ => panic!("expected AwsSecretsManager variant"),
         }
+    }
+
+    #[cfg(feature = "azure-keyvault")]
+    #[tokio::test]
+    async fn test_azure_keyvault_params_threaded_through() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        let mut p = HashMap::new();
+        p.insert("auth_method".to_string(), "service_principal".to_string());
+        p.insert(
+            "tenant_id".to_string(),
+            "00000000-0000-0000-0000-000000000001".to_string(),
+        );
+        p.insert(
+            "client_id".to_string(),
+            "00000000-0000-0000-0000-000000000002".to_string(),
+        );
+        p.insert("client_secret".to_string(), "shh".to_string());
+        p.insert("endpoint".to_string(), "vault.usgovcloudapi.net".to_string());
+
+        let store = SpicepodSecret {
+            from: "azure_keyvault:my-vault".to_string(),
+            name: "azure".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let resolved = super::spicepod_secret_store_type(&store, env.as_ref())
+            .await
+            .map_err(|e| e.to_string())
+            .expect("validates");
+        match resolved {
+            super::SecretStoreType::AzureKeyVault(cfg) => {
+                assert_eq!(cfg.vault, "my-vault");
+                assert_eq!(
+                    cfg.auth_method,
+                    super::stores::azure_keyvault::AuthMethod::ServicePrincipal
+                );
+                assert_eq!(
+                    cfg.tenant_id.as_deref(),
+                    Some("00000000-0000-0000-0000-000000000001")
+                );
+                assert_eq!(
+                    cfg.client_id.as_deref(),
+                    Some("00000000-0000-0000-0000-000000000002")
+                );
+                assert_eq!(cfg.client_secret.as_deref(), Some("shh"));
+                assert_eq!(cfg.endpoint.as_deref(), Some("vault.usgovcloudapi.net"));
+            }
+            _ => panic!("expected AzureKeyVault variant"),
+        }
+    }
+
+    #[cfg(feature = "azure-keyvault")]
+    #[tokio::test]
+    async fn test_azure_keyvault_unknown_param_is_rejected() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        // A misspelled `tennant_id` must be rejected at load time rather
+        // than silently dropped — this is exactly the failure mode the
+        // ParameterSpec validation is meant to prevent.
+        let mut p = HashMap::new();
+        p.insert(
+            "tennant_id".to_string(),
+            "00000000-0000-0000-0000-000000000000".to_string(),
+        );
+
+        let store = SpicepodSecret {
+            from: "azure_keyvault:my-vault".to_string(),
+            name: "azure".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let Err(err) = super::spicepod_secret_store_type(&store, env.as_ref()).await else {
+            panic!("unknown param should have been rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("tennant_id"), "got {msg}");
+        assert!(
+            msg.contains("tenant_id"),
+            "error must list supported params; got {msg}"
+        );
+    }
+
+    #[cfg(feature = "azure-keyvault")]
+    #[tokio::test]
+    async fn test_azure_keyvault_env_bootstrap_resolves_client_secret() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        // The canonical path: client_secret (and tenant/client ids) are
+        // sourced from environment via `${ env:... }` references so they
+        // are never committed to the spicepod.
+        let tenant_var = format!("SPICE_TEST_AZURE_TENANT_{}", rand::random::<u64>());
+        let client_var = format!("SPICE_TEST_AZURE_CLIENT_{}", rand::random::<u64>());
+        let secret_var = format!("SPICE_TEST_AZURE_SECRET_{}", rand::random::<u64>());
+        unsafe {
+            std::env::set_var(&tenant_var, "tenant-xyz");
+            std::env::set_var(&client_var, "client-xyz");
+            std::env::set_var(&secret_var, "s3cret");
+        }
+
+        let mut p = HashMap::new();
+        p.insert("auth_method".to_string(), "service_principal".to_string());
+        p.insert("tenant_id".to_string(), format!("${{ env:{tenant_var} }}"));
+        p.insert("client_id".to_string(), format!("${{ env:{client_var} }}"));
+        p.insert(
+            "client_secret".to_string(),
+            format!("${{ secrets:{secret_var} }}"),
+        );
+
+        let store = SpicepodSecret {
+            from: "azure_keyvault:my-vault".to_string(),
+            name: "azure".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let resolved = super::spicepod_secret_store_type(&store, env.as_ref())
+            .await
+            .map_err(|e| e.to_string())
+            .expect("validates");
+
+        unsafe {
+            std::env::remove_var(&tenant_var);
+            std::env::remove_var(&client_var);
+            std::env::remove_var(&secret_var);
+        }
+
+        match resolved {
+            super::SecretStoreType::AzureKeyVault(cfg) => {
+                assert_eq!(cfg.tenant_id.as_deref(), Some("tenant-xyz"));
+                assert_eq!(cfg.client_id.as_deref(), Some("client-xyz"));
+                assert_eq!(cfg.client_secret.as_deref(), Some("s3cret"));
+            }
+            _ => panic!("expected AzureKeyVault variant"),
+        }
+    }
+
+    #[cfg(feature = "azure-keyvault")]
+    #[tokio::test]
+    async fn test_azure_keyvault_rejects_invalid_auth_method() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        // `one_of` enforcement: only the five documented values are allowed.
+        let mut p = HashMap::new();
+        p.insert("auth_method".to_string(), "oauth".to_string());
+
+        let store = SpicepodSecret {
+            from: "azure_keyvault:my-vault".to_string(),
+            name: "azure".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let Err(err) = super::spicepod_secret_store_type(&store, env.as_ref()).await else {
+            panic!("invalid auth_method should have been rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("oauth"), "got {msg}");
+        assert!(
+            msg.contains("service_principal") && msg.contains("managed_identity"),
+            "error must list the allowed values; got {msg}"
+        );
+    }
+
+    #[cfg(feature = "azure-keyvault")]
+    #[tokio::test]
+    async fn test_azure_keyvault_selector_is_required() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        // `from: azure_keyvault` with no selector must fail — there is no
+        // sensible default vault.
+        let store = SpicepodSecret {
+            from: "azure_keyvault".to_string(),
+            name: "azure".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(HashMap::new())),
+        };
+
+        let env = bootstrap_env();
+        let Err(err) = super::spicepod_secret_store_type(&store, env.as_ref()).await else {
+            panic!("missing selector should have been rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("azure_keyvault"), "got {msg}");
+        assert!(
+            msg.contains("secret selector"),
+            "error should explain the selector requirement; got {msg}"
+        );
     }
 
     #[cfg(feature = "aws-secrets-manager")]
