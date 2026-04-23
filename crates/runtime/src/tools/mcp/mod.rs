@@ -21,7 +21,7 @@ pub mod tool;
 
 use std::{collections::HashMap, str::FromStr};
 
-use rmcp::Error as McpError;
+use rmcp::ErrorData as McpError;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;

@@ -38,9 +38,11 @@ use axum::{extract::State, routing::patch};
 use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use opentelemetry::KeyValue;
 #[cfg(feature = "mcp")]
-use rmcp::transport::SseServer;
-#[cfg(feature = "mcp")]
-use rmcp::transport::sse_server::SseServerConfig;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpService,
+    session::local::LocalSessionManager,
+    tower::StreamableHttpServerConfig,
+};
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -118,71 +120,34 @@ pub(crate) struct ApiDoc;
 #[cfg(feature = "openapi")]
 #[must_use]
 pub fn get_api_doc() -> utoipa::openapi::OpenApi {
-    use utoipa::openapi::{
-        Required,
-        path::{Parameter, ParameterIn},
-    };
-
     let mut openai = ApiDoc::openapi();
 
     #[cfg(feature = "mcp")]
     {
         openai.paths.add_path_operation(
-            "/v1/mcp/sse",
-            vec![HttpMethod::Get],
+            "/v1/mcp",
+            vec![HttpMethod::Post],
             Operation::builder()
-                .operation_id(Some("operation_id"))
+                .operation_id(Some("mcp_message"))
                 .tag("mcp")
-                .summary(Some("Establish an MCP SSE Connection"))
+                .summary(Some("Send a Model Context Protocol message"))
                 .description(Some(
-                    "Initiates a Server-Sent Events (SSE) connection using the Model Context Protocol (MCP) to interact with Spice tools.\n\n
-             Once connected, clients can send messages via `POST /v1/mcp/sse` and receive responses through this SSE stream.",
+                    "Send a JSON-RPC message to the Spice MCP server using the MCP Streamable HTTP transport. \
+The response is either a single JSON-RPC response or an SSE stream, depending on the `Accept` header. \
+Session continuity is carried via the `Mcp-Session-Id` header.",
                 ))
                 .build(),
         );
         openai.paths.add_path_operation(
-            "/v1/mcp/sse",
-            vec![HttpMethod::Post],
+            "/v1/mcp",
+            vec![HttpMethod::Get],
             Operation::builder()
-                .operation_id(Some("mcp_event"))
+                .operation_id(Some("mcp_stream"))
                 .tag("mcp")
-                .summary(Some("Send message to MCP server"))
+                .summary(Some("Open an MCP server-to-client SSE stream"))
                 .description(Some(
-                    "Send message to the MCP endoint, for a given session.",
+                    "Open a long-lived server-to-client SSE stream for the current MCP session as defined by the Streamable HTTP transport.",
                 ))
-                .parameter(
-                    Parameter::builder()
-                        .name("sessionId")
-                        .parameter_in(ParameterIn::Query)
-                        .required(Required::True)
-                        .build(),
-                )
-                .response(
-                    "202",
-                    utoipa::openapi::ResponseBuilder::new()
-                        .description("Message accepted. Response will stream via SSE.")
-                        .build(),
-                )
-                .response(
-                    "404",
-                    utoipa::openapi::ResponseBuilder::new()
-                        .description(
-                            "Session not found. No active session for the given `session_id`.",
-                        )
-                        .build(),
-                )
-                .response(
-                    "413",
-                    utoipa::openapi::ResponseBuilder::new()
-                        .description("Payload too large. Maximum allowed size is 4MB.")
-                        .build(),
-                )
-                .response(
-                    "500",
-                    utoipa::openapi::ResponseBuilder::new()
-                        .description("Internal server error. An unexpected issue occurred.")
-                        .build(),
-                )
                 .build(),
         );
     }
@@ -333,24 +298,22 @@ pub(crate) fn routes(
 
     #[cfg(feature = "mcp")]
     {
-        let (sse_server, mcp_router) = SseServer::new(SseServerConfig {
-            bind: config.http_bind_address,
-            sse_path: "/v1/mcp/sse".to_string(),
-            post_path: "/v1/mcp/sse".to_string(),
-            ct: tokio_util::sync::CancellationToken::new(),
-            sse_keep_alive: None,
-        });
-
+        // Streamable HTTP transport endpoint per MCP 2025-11-25 spec.
+        // This replaces the legacy SSE transport that was removed in rmcp 1.x.
         let runtime_arc = Arc::clone(rt);
-        let _cancellation_token =
-            sse_server.with_service(move || RuntimeServer::from(&runtime_arc));
+        let mcp_service = StreamableHttpService::new(
+            move || Ok(RuntimeServer::from(&runtime_arc)),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
 
-        // Apply MCP-specific request body limit before merging
         tracing::debug!(
             "MCP request body size limit set to {} bytes",
             MCP_REQUEST_BODY_LIMIT
         );
-        let mcp_router = mcp_router.route_layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_LIMIT));
+        let mcp_router = Router::new()
+            .nest_service("/v1/mcp", mcp_service)
+            .route_layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_LIMIT));
         authenticated_router = mcp_router.merge(authenticated_router);
     }
 
