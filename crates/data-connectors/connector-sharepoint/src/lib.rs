@@ -147,9 +147,17 @@ impl Sharepoint {
         })
     }
 
+    /// Pick a [`DocumentParser`] for this dataset's content. Tries the
+    /// explicit `file_format=` param first, then falls back to the URL's
+    /// trailing extension. `None` means "no document parsing" — raw bytes
+    /// are surfaced as text, which is the right default for `.md` / `.txt`.
     async fn get_formatter(&self, dataset: &Dataset) -> Option<Arc<dyn DocumentParser>> {
-        let file_format = dataset.params.get("file_format")?;
-        document_parse::get_parser_factory(file_format)
+        let key = dataset
+            .params
+            .get("file_format")
+            .cloned()
+            .or_else(|| url_extension(&dataset.from))?;
+        document_parse::get_parser_factory(&key)
             .await
             .map(|factory| factory.default())
     }
@@ -191,6 +199,49 @@ impl Sharepoint {
             runtime: self.runtime.clone(),
         })
     }
+}
+
+/// Return a `Dataset` whose `file_format` param is filled in from the URL's
+/// trailing extension when the user didn't set one explicitly.
+///
+/// `ListingTableConnector::get_file_format_and_extension` errors with
+/// "Missing file format" when both `file_format=` and a recognized
+/// extension are absent, so this lets `sharepoint://…/file.xlsx`-style
+/// datasets just work without forcing the user to repeat the extension
+/// in their spicepod. Recognized tabular extensions are normalized to
+/// matching `file_format` values; everything else is passed through as
+/// the raw extension so `create_text_table` can dispatch via
+/// [`document_parse::get_parser_factory`].
+fn dataset_with_inferred_format(dataset: &Dataset) -> std::borrow::Cow<'_, Dataset> {
+    if dataset.params.contains_key("file_format") {
+        return std::borrow::Cow::Borrowed(dataset);
+    }
+    let Some(ext) = url_extension(&dataset.from) else {
+        return std::borrow::Cow::Borrowed(dataset);
+    };
+    let mut owned = dataset.clone();
+    owned.params.insert("file_format".to_string(), ext);
+    std::borrow::Cow::Owned(owned)
+}
+
+/// Pull the file extension out of a SharePoint dataset URL, lowercased.
+///
+/// Works for both the new `sharepoint://drives/{id}/path/file.pdf` URL
+/// scheme and the legacy `sharepoint:driveId:{id}/path:foo/bar.pdf`
+/// compact form — we just look at the last `.` after the last `/`. Returns
+/// `None` when the trailing segment has no extension (e.g. a folder URL
+/// or a name with no dot).
+fn url_extension(from: &str) -> Option<String> {
+    let last_segment = from.rsplit('/').next()?;
+    let dot = last_segment.rfind('.')?;
+    let ext = &last_segment[dot + 1..];
+    // Strip query/fragment that would otherwise pollute the extension
+    // (e.g. `file.csv?sv=...`).
+    let ext = ext.split(['?', '#']).next()?;
+    if ext.is_empty() {
+        return None;
+    }
+    Some(ext.to_ascii_lowercase())
 }
 
 /// Register a [`SharepointObjectStore`] on `runtime_env` under the
@@ -496,9 +547,10 @@ impl DataConnector for Sharepoint {
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if Self::uses_object_store(dataset) {
+            let inferred = dataset_with_inferred_format(dataset);
             return self
-                .listing_connector(dataset)?
-                .read_provider(dataset)
+                .listing_connector(&inferred)?
+                .read_provider(&inferred)
                 .await;
         }
         // Legacy path — metadata-listing table provider.
@@ -525,8 +577,9 @@ impl DataConnector for Sharepoint {
             return None;
         }
         if Self::uses_object_store(dataset) {
-            return match self.listing_connector(dataset) {
-                Ok(c) => c.metadata_provider(dataset).await,
+            let inferred = dataset_with_inferred_format(dataset);
+            return match self.listing_connector(&inferred) {
+                Ok(c) => c.metadata_provider(&inferred).await,
                 Err(e) => Some(Err(e)),
             };
         }
@@ -701,4 +754,47 @@ impl ListingTableConnector for SharepointListingConnector {
 #[must_use]
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     SharepointFactory::new_arc()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_extension_from_new_scheme() {
+        assert_eq!(
+            url_extension("sharepoint://me/Documents/sales.csv").as_deref(),
+            Some("csv")
+        );
+        assert_eq!(
+            url_extension("sharepoint://drives/abc123/reports/Q4.XLSX").as_deref(),
+            Some("xlsx"),
+        );
+    }
+
+    #[test]
+    fn url_extension_from_legacy_scheme() {
+        assert_eq!(
+            url_extension("sharepoint:driveId:abc/path:Documents/contract.pdf").as_deref(),
+            Some("pdf")
+        );
+    }
+
+    #[test]
+    fn url_extension_strips_query_and_fragment() {
+        assert_eq!(
+            url_extension("sharepoint://me/Documents/data.json?foo=bar").as_deref(),
+            Some("json")
+        );
+        assert_eq!(
+            url_extension("sharepoint://me/Documents/data.json#section").as_deref(),
+            Some("json")
+        );
+    }
+
+    #[test]
+    fn url_extension_none_when_no_dot() {
+        assert!(url_extension("sharepoint://me/Documents/folder").is_none());
+        assert!(url_extension("sharepoint://drives/id").is_none());
+    }
 }

@@ -3,13 +3,23 @@
 SharePoint / OneDrive data connector for Spice.ai. Supports **reading and
 writing** files on a SharePoint drive as either:
 
-1. **Tabular formats** (CSV, JSON, Parquet) — via DataFusion's `ListingTable`
-   plus a custom `ObjectStore` implementation. Enables `SELECT`, `INSERT INTO`,
+1. **Tabular formats** (CSV, TSV, JSON / NDJSON / JSONL / LDJSON, Parquet,
+   Vortex non-Windows, Socrata) — via DataFusion's `ListingTable` plus a
+   custom `ObjectStore` implementation. Enables `SELECT`, `INSERT INTO`,
    `COPY TO`, `COPY FROM`, and `CREATE EXTERNAL TABLE`.
-2. **Blob / unstructured formats** (PDF, PPTX, DOCX, plain text, etc.) — via
-   the same `ObjectStore` for raw byte round-trips, and the legacy
-   `SharepointTableProvider` for drive-item metadata listings with optional
-   inline file content.
+2. **Document formats with text extraction** (PDF, DOCX, PPTX, XLSX) — read
+   as a `content` column via the `ObjectStore` text-table path or the legacy
+   `SharepointTableProvider`, with parsing dispatched through the shared
+   `document_parse` registry. Adding a new parser there immediately lights
+   up that format for SharePoint.
+3. **Plain blobs** (Markdown, plain text, raw byte round-trips) — same paths,
+   with content surfaced as-is.
+
+`file_format` is auto-inferred from the URL extension when the param is
+omitted, so `from: sharepoint://me/Documents/Q4.xlsx` works without
+spelling out `file_format: xlsx`. Unknown extensions fall through to the
+text-table path, which calls into `document_parse::get_parser_factory`
+based on the extension.
 
 ## URL schemes
 
