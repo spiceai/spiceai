@@ -230,10 +230,7 @@ fn validate_assertion_encoding(assertion: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::unwrap_used,
-    reason = "tests use unwrap to assert happy paths"
-)]
+#[expect(clippy::unwrap_used, reason = "tests use unwrap to assert happy paths")]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Arc;

@@ -43,8 +43,8 @@ use data_components::sharepoint::client::SharepointClient;
 use data_components::sharepoint::object_store::{
     ConflictBehavior, DriveKind, SharepointObjectStore, SharepointObjectStoreConfig,
 };
-use data_components::sharepoint::url::DriveRef;
 use data_components::sharepoint::table::SharepointTableProvider;
+use data_components::sharepoint::url::DriveRef;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::parquet::arrow::async_reader::ObjectVersionType;
@@ -182,7 +182,8 @@ fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
     // `auth_code` or `refresh_token` represents a single auth-code /
     // refresh-token flow (secret acts as the app credential, not a
     // separate flow). Any other combination is ambiguous.
-    let client_secret_as_flow = client_secret.is_some() && auth_code.is_none() && refresh_token.is_none();
+    let client_secret_as_flow =
+        client_secret.is_some() && auth_code.is_none() && refresh_token.is_none();
     let flow_count = [
         client_secret_as_flow,
         bearer_token.is_some(),
@@ -537,7 +538,6 @@ impl ListingTableConnector for SharepointListingConnector {
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     SharepointFactory::new_arc()
 }
-
 
 #[cfg(test)]
 mod tests {

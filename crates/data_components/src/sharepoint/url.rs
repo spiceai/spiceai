@@ -189,10 +189,7 @@ impl DriveRef {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::unwrap_used,
-    reason = "tests use unwrap to assert happy paths"
-)]
+#[expect(clippy::unwrap_used, reason = "tests use unwrap to assert happy paths")]
 mod tests {
     use super::*;
 

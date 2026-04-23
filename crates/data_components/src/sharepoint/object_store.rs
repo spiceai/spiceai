@@ -191,7 +191,6 @@ impl SharepointObjectStore {
     fn resolve(&self, location: &Path) -> ObjectStoreResult<(DriveRef, Path)> {
         resolve_static(self.kind, location)
     }
-
 }
 
 fn resolve_static(kind: Option<DriveKind>, location: &Path) -> ObjectStoreResult<(DriveRef, Path)> {
@@ -969,15 +968,14 @@ fn graph_err(e: &graph_rs_sdk::GraphFailure) -> object_store::Error {
     // structured inner_error surfaced instead of just `Display`.
     object_store::Error::Generic {
         store: STORE_TAG,
-        source: Box::new(std::io::Error::other(super::error::resolve_graph_failure(e))),
+        source: Box::new(std::io::Error::other(super::error::resolve_graph_failure(
+            e,
+        ))),
     }
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::unwrap_used,
-    reason = "tests use unwrap to assert happy paths"
-)]
+#[expect(clippy::unwrap_used, reason = "tests use unwrap to assert happy paths")]
 mod tests {
     use super::*;
 
@@ -1224,10 +1222,7 @@ mod tests {
             run_async(async {
                 let (url, count, _captured) = start_mock(vec![MockResp::ok_json(HEAD_JSON)]).await;
                 let store = mock_store(&url);
-                let meta = store
-                    .head(&Path::from("Documents/file.csv"))
-                    .await
-                    .unwrap();
+                let meta = store.head(&Path::from("Documents/file.csv")).await.unwrap();
                 assert_eq!(meta.size, 42);
                 assert_eq!(meta.e_tag.as_deref(), Some("\"abc\""));
                 assert_eq!(meta.version.as_deref(), Some("\"def\""));

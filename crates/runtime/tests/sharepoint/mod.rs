@@ -133,8 +133,7 @@ fn store_and_delete_path(
     use data_components::sharepoint::url::{DriveRef, SharepointUrl};
     use object_store::path::Path;
 
-    let parsed =
-        SharepointUrl::parse(uri).map_err(|e| anyhow::anyhow!("parse test uri: {e}"))?;
+    let parsed = SharepointUrl::parse(uri).map_err(|e| anyhow::anyhow!("parse test uri: {e}"))?;
     let (kind, path) = match &parsed.drive {
         DriveRef::Me => (None, parsed.item_path.clone()),
         DriveRef::Drive(id) => (Some(DriveKind::Drives), prefix_with(id, &parsed.item_path)),
@@ -227,7 +226,8 @@ async fn sharepoint_csv_round_trip() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(|e| anyhow::anyhow!("build_graph_client: {e}"))?;
             let (store, delete_path) = store_and_delete_path(client, &uri)?;
-            store.delete(&delete_path)
+            store
+                .delete(&delete_path)
                 .await
                 .map_err(|e| anyhow::anyhow!("cleanup delete: {e}"))?;
             Ok(())
