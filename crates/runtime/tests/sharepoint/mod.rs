@@ -114,11 +114,16 @@ impl LiveConfig {
 }
 
 fn unique_filename(ext: &str) -> String {
+    // Combine ms timestamp (human-readable in cleanup logs) with a v4
+    // UUID suffix so two tests starting in the same millisecond — or two
+    // parallel test processes — can't ever collide and trample each
+    // other's drive items.
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    format!("spice-test-{ts}.{ext}")
+    let nonce = uuid::Uuid::new_v4().simple();
+    format!("spice-test-{ts}-{nonce}.{ext}")
 }
 
 /// Build a `SharepointObjectStore` matching the `kind` DataFusion would
