@@ -142,6 +142,7 @@ impl SamlBearerFlow {
     /// one is missing or stale. Callers that just want a one-shot exchange
     /// without caching can call [`Self::exchange_once`].
     pub async fn acquire_token(&self) -> Result<AcquiredToken> {
+        // Fast path: read lock only — most calls hit a fresh cached token.
         {
             let cached = self.cache.read().await;
             if let Some(tok) = &*cached
@@ -150,8 +151,18 @@ impl SamlBearerFlow {
                 return Ok(tok.clone());
             }
         }
-        let fresh = self.exchange_once().await?;
+        // Contended / refresh path: acquire the write lock *before*
+        // `exchange_once()` so only one caller performs the HTTP
+        // round-trip. Other concurrent callers queue on the lock and
+        // pick up the freshly-exchanged token via the double-check
+        // below — no thundering herd against Azure AD.
         let mut cache = self.cache.write().await;
+        if let Some(tok) = &*cache
+            && tok.is_fresh()
+        {
+            return Ok(tok.clone());
+        }
+        let fresh = self.exchange_once().await?;
         *cache = Some(fresh.clone());
         Ok(fresh)
     }

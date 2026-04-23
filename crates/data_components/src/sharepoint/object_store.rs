@@ -730,8 +730,12 @@ async fn get_content(
         None => Ok(bytes),
         Some(r) => {
             let Range { start, end } = resolve_range(r, total_size);
-            let start = usize::try_from(start).unwrap_or(0);
+            // Clamp both bounds to the actual buffer length so a
+            // requested range past EOF (or a stale `total_size`) produces
+            // an empty slice instead of panicking in `Bytes::slice`.
+            let start = usize::try_from(start).unwrap_or(0).min(bytes.len());
             let end = usize::try_from(end).unwrap_or(bytes.len()).min(bytes.len());
+            let end = end.max(start);
             Ok(bytes.slice(start..end))
         }
     }
