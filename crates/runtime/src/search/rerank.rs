@@ -30,7 +30,7 @@ limitations under the License.
 //!     prompt template. No extra configuration required.
 //!
 //! Output schema: `schema(input) ∪ {rerank_score}` (after dropping the input's
-//! `_score`/`fused_score` to avoid confusion). Rows are sorted by
+//! `_score`/`_fused_score` to avoid confusion). Rows are sorted by
 //! `rerank_score DESC` and limited to the requested `limit` (or all rows).
 
 use std::any::Any;
@@ -59,7 +59,7 @@ use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA}
 use crate::embeddings::udtf::VECTOR_SEARCH_UDTF_NAME;
 use crate::model::LLMChatCompletionsModelStore as ChatModelStore;
 use crate::search::full_text::udtf::TEXT_SEARCH_UDTF_NAME;
-use crate::search::rrf::RRF_UDF_NAME;
+use crate::search::rrf::{RRF_FUSED_SCORE_COLUMN_NAME, RRF_UDF_NAME};
 use crate::search::util::table_ref_from_column_expr;
 
 pub static RERANK_UDTF_NAME: &str = "rerank";
@@ -83,7 +83,7 @@ pub static RERANK_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
 });
 
 /// Output column for reranker scores. Chosen distinct from `_score` /
-/// `fused_score` so downstream callers can tell which stage produced which
+/// `_fused_score` so downstream callers can tell which stage produced which
 /// score. The reranker output drops the upstream score columns and keeps only
 /// `rerank_score` — the fresh relevance judgement is what matters.
 pub const RERANK_SCORE_COLUMN: &str = "rerank_score";
@@ -488,13 +488,13 @@ impl std::fmt::Debug for RerankUDTFProvider {
 }
 
 impl RerankUDTFProvider {
-    /// Build the output schema: input schema, minus `_score` / `fused_score`
+    /// Build the output schema: input schema, minus `_score` / `_fused_score`
     /// (they'd be confusing alongside `rerank_score`), plus `rerank_score`.
     fn output_schema(input: &SchemaRef) -> SchemaRef {
         let mut fields: Vec<Field> = input
             .fields()
             .iter()
-            .filter(|f| f.name() != "_score" && f.name() != "fused_score")
+            .filter(|f| f.name() != "_score" && f.name() != RRF_FUSED_SCORE_COLUMN_NAME)
             .map(|f| f.as_ref().clone())
             .collect();
         fields.push(Field::new(RERANK_SCORE_COLUMN, DataType::Float32, false));
@@ -714,14 +714,14 @@ impl TableProvider for RerankUDTFProvider {
             scores[*idx] = *score;
         }
 
-        // Build output schema + batch: drop _score/fused_score, append rerank_score.
+        // Build output schema + batch: drop _score/_fused_score, append rerank_score.
         let output_schema = Self::output_schema(&input_schema);
         let drop_cols: Vec<usize> = input_schema
             .fields()
             .iter()
             .enumerate()
             .filter_map(|(i, f)| {
-                if f.name() == "_score" || f.name() == "fused_score" {
+                if f.name() == "_score" || f.name() == RRF_FUSED_SCORE_COLUMN_NAME {
                     None
                 } else {
                     Some(i)
@@ -989,7 +989,10 @@ mod tests {
             Field::new("id", DataType::Utf8, false),
             Field::new("content", DataType::Utf8, false),
             Field::new("_score", DataType::Float32, true),
-            Field::new("fused_score", DataType::Float64, true),
+            // RRF emits its fused score as `_fused_score` (see
+            // `RRF_FUSED_SCORE_COLUMN_NAME`); the UDTF must drop it alongside
+            // `_score` so downstream rows only see `rerank_score`.
+            Field::new(RRF_FUSED_SCORE_COLUMN_NAME, DataType::Float64, true),
         ]));
         let out = RerankUDTFProvider::output_schema(&input_schema);
         let names: Vec<&str> = out.fields().iter().map(|f| f.name().as_str()).collect();
