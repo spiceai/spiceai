@@ -4307,6 +4307,7 @@ dependencies = [
  "secrecy",
  "snafu",
  "tokio",
+ "tracing",
  "url",
 ]
 

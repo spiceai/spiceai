@@ -193,6 +193,38 @@ impl Sharepoint {
     }
 }
 
+/// Register a [`SharepointObjectStore`] on `runtime_env` under the
+/// scheme+authority key DataFusion's registry actually looks up.
+///
+/// `ListingTableUrl::object_store()` returns the canonical registry key
+/// (e.g. `sharepoint://drives/`), with the path stripped. Registering
+/// under the full dataset URL would prevent re-use across paths and
+/// cause lookups for the same authority+different path to miss.
+fn register_sharepoint_store(
+    runtime_env: &Arc<RuntimeEnv>,
+    store_url: &Url,
+    store: Arc<SharepointObjectStore>,
+) {
+    use datafusion::datasource::listing::ListingTableUrl;
+    match ListingTableUrl::parse(store_url.as_str()) {
+        Ok(ltu) => {
+            runtime_env.register_object_store(ltu.object_store().as_ref(), store);
+        }
+        Err(e) => {
+            // `store_url` was already validated as a parseable URL upstream
+            // (see `parse_object_store_components`), so this branch is a
+            // defensive fallback. Register under the full URL so the caller
+            // still gets a working store.
+            tracing::warn!(
+                store_url = %store_url,
+                error = %e,
+                "Failed to derive ObjectStore registry key from SharePoint URL; registering under full URL"
+            );
+            runtime_env.register_object_store(store_url, store);
+        }
+    }
+}
+
 /// Parse the dataset URL and connector params into the components needed to
 /// build a [`SharepointObjectStore`]. Used by both
 /// [`Sharepoint::register_object_stores`] and
@@ -537,7 +569,7 @@ impl DataConnector for Sharepoint {
             kind,
             config,
         ));
-        runtime_env.register_object_store(&store_url, store);
+        register_sharepoint_store(runtime_env, &store_url, store);
         // Then defer to the listing connector for any additional setup.
         self.listing_connector(dataset)?
             .register_object_stores(dataset, runtime_env)
@@ -656,8 +688,11 @@ impl ListingTableConnector for SharepointListingConnector {
             config,
             default_runtime_env(self.tokio_io_runtime.clone()),
         );
-        ctx.runtime_env()
-            .register_object_store(&self.store_url, self.build_object_store());
+        register_sharepoint_store(
+            &ctx.runtime_env(),
+            &self.store_url,
+            self.build_object_store(),
+        );
         ctx
     }
 }

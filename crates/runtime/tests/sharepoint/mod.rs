@@ -47,6 +47,7 @@ limitations under the License.
 use std::{sync::Arc, time::Duration};
 
 use app::AppBuilder;
+use arrow::array::{Int64Array, RecordBatch};
 use data_components::sharepoint::auth::{DEFAULT_SCOPE, SharepointAuth};
 use futures::StreamExt;
 use object_store::ObjectStore;
@@ -152,6 +153,25 @@ fn store_and_delete_path(
     Ok((store, path))
 }
 
+/// Extract the scalar value produced by `SELECT COUNT(*) AS n FROM ...`.
+///
+/// `assert!(!batches.is_empty())` is useless against `COUNT(*)` because it
+/// always returns one row, so we have to actually inspect the cell.
+fn count_from_batches(batches: &[RecordBatch]) -> Result<i64, anyhow::Error> {
+    let batch = batches
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no batches returned"))?;
+    let col = batch.column(0);
+    let array = col
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow::anyhow!("expected Int64 count column, got {:?}", col.data_type()))?;
+    if array.is_empty() {
+        return Err(anyhow::anyhow!("count batch had zero rows"));
+    }
+    Ok(array.value(0))
+}
+
 fn prefix_with(id: &str, p: &object_store::path::Path) -> object_store::path::Path {
     let mut segments = vec![id.to_string()];
     for part in p.parts() {
@@ -215,7 +235,8 @@ async fn sharepoint_csv_round_trip() -> Result<(), anyhow::Error> {
             while let Some(b) = q.data.next().await {
                 batches.push(b?);
             }
-            assert!(!batches.is_empty(), "expected at least one batch");
+            let count = count_from_batches(&batches)?;
+            assert_eq!(count, 1, "INSERT should make one row visible on read-back");
 
             // Clean up — DELETE the file we wrote.
             let auth = SharepointAuth::ClientCredentials {
@@ -295,9 +316,10 @@ async fn sharepoint_parquet_copy_to() -> Result<(), anyhow::Error> {
             while let Some(b) = q.data.next().await {
                 batches.push(b?);
             }
-            assert!(
-                !batches.is_empty(),
-                "COPY TO produced no rows visible on read-back"
+            let count = count_from_batches(&batches)?;
+            assert_eq!(
+                count, 1,
+                "COPY TO should produce exactly one row visible on read-back"
             );
 
             // Clean up.

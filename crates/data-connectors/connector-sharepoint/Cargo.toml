@@ -19,4 +19,5 @@ runtime-object-store = { path = "../../runtime-object-store" }
 secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 url.workspace = true
