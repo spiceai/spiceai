@@ -49,7 +49,8 @@ pub enum Error {
     UnableToParseSecretValue,
 
     #[snafu(display(
-        "Unknown secret store '{store}'. Available stores: env, keyring, kubernetes, aws_secrets_manager. Docs: https://spiceai.org/docs/components/secret-stores"
+        "Unknown secret store '{store}'. Available stores: {}. Docs: https://spiceai.org/docs/components/secret-stores",
+        known_secret_stores().join(", ")
     ))]
     UnknownSecretStore { store: String },
 
@@ -69,6 +70,22 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type AnyErrorResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Secret store types this binary was compiled with. Must match the cases in
+/// [`spicepod_secret_store_type`] so unknown-store errors don't lie about what's
+/// available in the current build (e.g. `keyring` is only present with the
+/// `keyring-secret-store` feature).
+#[must_use]
+pub fn known_secret_stores() -> Vec<&'static str> {
+    let mut stores = vec!["env"];
+    #[cfg(feature = "keyring-secret-store")]
+    stores.push("keyring");
+    stores.push("kubernetes");
+    #[cfg(feature = "aws-secrets-manager")]
+    stores.push("aws_secrets_manager");
+    stores.push("scheduler_rpc");
+    stores
+}
 
 pub const SECRETS: &str = "secrets";
 
@@ -233,12 +250,7 @@ impl Secrets {
         // component layer then reports as "missing required parameter" without any
         // back-reference to the failed secret lookup. Include enough context here
         // (store, key, source of reference) that users can tie cause to effect.
-        let configured = self
-            .stores
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
+        let configured = self.stores.keys().cloned().collect::<Vec<_>>().join(", ");
         if store_name == SECRETS {
             match self.get_secret(key).await {
                 Ok(Some(secret)) => return Some(secret.expose_secret().to_string()),

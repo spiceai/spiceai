@@ -523,7 +523,11 @@ fn closest_param_suggestion(
     let (candidate, distance) = best?;
     // Bound: at most 1/3 of the longer string (so short typos only match very close names).
     let max_allowed = (candidate.len().max(typo.len()) / 3).max(1);
-    if distance <= max_allowed { Some(candidate) } else { None }
+    if distance <= max_allowed {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 /// Build the suffix appended to "Missing required parameter: <name>" when a required

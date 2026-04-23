@@ -497,8 +497,12 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 continue;
             }
             ".clear" => {
-                // Clear-screen only makes sense on a real terminal.
-                if ansi_colors::colors_enabled() {
+                // Clear-screen only makes sense on a real terminal; gate on the TTY
+                // directly rather than on the colour heuristic (NO_COLOR should still
+                // let the escape codes through on a TTY, and FORCE_COLOR shouldn't
+                // push them into a pipe).
+                use std::io::IsTerminal;
+                if std::io::stdout().is_terminal() {
                     print!("\x1B[H\x1B[2J");
                     let _ = std::io::stdout().flush();
                 }
@@ -529,7 +533,10 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                     "  {} Show details of the last error",
                     PROMPT_COLOR.paint(".error                ")
                 );
-                println!("  {} Clear the screen", PROMPT_COLOR.paint(".clear                "));
+                println!(
+                    "  {} Clear the screen",
+                    PROMPT_COLOR.paint(".clear                ")
+                );
                 println!(
                     "  {} Clear persisted query history",
                     PROMPT_COLOR.paint(".clear history        ")
@@ -570,29 +577,44 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 "select catalog_name, schema_name from information_schema.schemata where schema_name != 'information_schema';"
             }
             line if {
-                let lc = line.to_ascii_lowercase();
-                let trimmed = lc.trim_end_matches(';').trim();
-                (trimmed.starts_with("describe ") || trimmed.starts_with("desc "))
-                    && trimmed.split_whitespace().count() == 2
+                // Match the `describe`/`desc` keyword case-insensitively but keep
+                // the identifier token in its original case.
+                let without_semi = line.trim_end_matches(';').trim();
+                let mut parts = without_semi.splitn(2, char::is_whitespace);
+                let first = parts.next().unwrap_or_default();
+                let rest = parts.next().unwrap_or_default().trim();
+                let kw =
+                    first.eq_ignore_ascii_case("describe") || first.eq_ignore_ascii_case("desc");
+                kw && !rest.is_empty() && !rest.contains(char::is_whitespace)
             } =>
             {
                 // Rewrite `describe <table>` into an information_schema.columns lookup.
-                // Schema-qualified names ("myschema.mytable") are split; bare names match any schema.
-                let trimmed_lower = line.to_ascii_lowercase();
-                let trimmed = trimmed_lower.trim_end_matches(';').trim();
-                let tbl = trimmed
-                    .split_whitespace()
-                    .nth(1)
+                // Schema-qualified names (`schema.table`) are split; bare names match any schema.
+                // Identifiers keep their original case so quoted/mixed-case tables work.
+                // Single quotes are escaped (SQL standard `''`) before they're interpolated
+                // into the string literals to avoid query injection/syntax errors.
+                let without_semi = line.trim_end_matches(';').trim();
+                let mut parts = without_semi.splitn(2, char::is_whitespace);
+                let _kw = parts.next();
+                let ident = parts
+                    .next()
                     .unwrap_or_default()
+                    .trim()
                     .trim_matches('"')
                     .trim_matches('\'');
-                let rewritten = if let Some((schema, name)) = tbl.split_once('.') {
+                fn esc(s: &str) -> String {
+                    s.replace('\'', "''")
+                }
+                let rewritten = if let Some((schema, name)) = ident.split_once('.') {
                     format!(
-                        "select column_name, data_type, is_nullable from information_schema.columns where table_schema = '{schema}' and table_name = '{name}' order by ordinal_position;"
+                        "select column_name, data_type, is_nullable from information_schema.columns where table_schema = '{}' and table_name = '{}' order by ordinal_position;",
+                        esc(schema),
+                        esc(name)
                     )
                 } else {
                     format!(
-                        "select table_schema, column_name, data_type, is_nullable from information_schema.columns where table_name = '{tbl}' order by table_schema, ordinal_position;"
+                        "select table_schema, column_name, data_type, is_nullable from information_schema.columns where table_name = '{}' order by table_schema, ordinal_position;",
+                        esc(ident)
                     )
                 };
                 let _ = rl.add_history_entry(line);

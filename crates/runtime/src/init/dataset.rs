@@ -201,10 +201,7 @@ impl Runtime {
         // Aggregate startup summary so users see "3/5 queued, 2 failed at init" at a glance
         // instead of having to piece that together from per-dataset warnings.
         let dispatched = spawned_tasks.len();
-        let init_failed = init_results
-            .values()
-            .filter(|r| r.is_err())
-            .count();
+        let init_failed = init_results.values().filter(|r| r.is_err()).count();
         let total = valid_datasets.len();
         if total > 0 {
             tracing::info!(

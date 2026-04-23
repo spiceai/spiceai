@@ -125,7 +125,9 @@ const PARAMETERS: &[ParameterSpec] = &[
         ])
         .help_link(POSTGRES_DOCS),
     ParameterSpec::component("sslrootcert")
-        .description("Path to a PEM-encoded CA certificate used when sslmode is verify-ca/verify-full.")
+        .description(
+            "Path to a PEM-encoded CA certificate used when sslmode is verify-ca/verify-full.",
+        )
         .help_link(POSTGRES_DOCS),
     ParameterSpec::component("connection_pool_min_idle")
         .description("The minimum number of idle connections to keep open in the pool.")
