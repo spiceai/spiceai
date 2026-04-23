@@ -33,9 +33,7 @@ use futures::future::join_all;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub struct DynamoDBUpdateExec {
-    pub db_client: Arc<DbClient>,
-    pub table_name: String,
+pub struct UpdateConfig {
     pub partition_key: String,
     pub sort_key: Option<String>,
     pub time_format: Arc<String>,
@@ -43,21 +41,18 @@ pub struct DynamoDBUpdateExec {
     pub assignments: Vec<(String, Expr)>,
     pub filters: Vec<Expr>,
     pub parallelism: usize,
+}
+
+pub struct DynamoDBUpdateExec {
+    pub db_client: Arc<DbClient>,
+    pub table_name: String,
+    pub config: UpdateConfig,
     properties: PlanProperties,
 }
 
 impl DynamoDBUpdateExec {
     #[must_use]
-    pub fn new(
-        db_client: Arc<DbClient>,
-        table_name: String,
-        partition_key: String,
-        sort_key: Option<String>,
-        time_format: Arc<String>,
-        assignments: Vec<(String, Expr)>,
-        filters: Vec<Expr>,
-        parallelism: usize,
-    ) -> Self {
+    pub fn new(db_client: Arc<DbClient>, table_name: String, config: UpdateConfig) -> Self {
         let count_schema = Arc::new(Schema::new(vec![Field::new(
             "count",
             DataType::UInt64,
@@ -72,12 +67,7 @@ impl DynamoDBUpdateExec {
         Self {
             db_client,
             table_name,
-            partition_key,
-            sort_key,
-            time_format,
-            assignments,
-            filters,
-            parallelism,
+            config,
             properties,
         }
     }
@@ -134,25 +124,17 @@ impl ExecutionPlan for DynamoDBUpdateExec {
 
         let client = Arc::clone(&self.db_client);
         let table_name = self.table_name.clone();
-        let partition_key = self.partition_key.clone();
-        let sort_key = self.sort_key.clone();
-        let time_format = Arc::clone(&self.time_format);
-        let assignments = self.assignments.clone();
-        let filters = self.filters.clone();
-        let parallelism = self.parallelism;
+        let config = UpdateConfig {
+            partition_key: self.config.partition_key.clone(),
+            sort_key: self.config.sort_key.clone(),
+            time_format: Arc::clone(&self.config.time_format),
+            assignments: self.config.assignments.clone(),
+            filters: self.config.filters.clone(),
+            parallelism: self.config.parallelism,
+        };
 
         let stream = futures::stream::once(async move {
-            let count = execute_update(
-                &client,
-                &table_name,
-                &partition_key,
-                sort_key.as_deref(),
-                &time_format,
-                &assignments,
-                &filters,
-                parallelism,
-            )
-            .await?;
+            let count = execute_update(&client, &table_name, &config).await?;
 
             let array = Arc::new(UInt64Array::from(vec![count])) as ArrayRef;
             RecordBatch::try_from_iter_with_nullable(vec![("count", array, false)]).map_err(|e| {
@@ -170,29 +152,29 @@ impl ExecutionPlan for DynamoDBUpdateExec {
 async fn execute_update(
     client: &Arc<DbClient>,
     table_name: &str,
-    partition_key: &str,
-    sort_key: Option<&str>,
-    time_format: &str,
-    assignments: &[(String, Expr)],
-    filters: &[Expr],
-    parallelism: usize,
+    config: &UpdateConfig,
 ) -> DataFusionResult<u64> {
-    let keys = extract_primary_keys(filters, partition_key, sort_key, time_format)?;
+    let keys = extract_primary_keys(
+        &config.filters,
+        &config.partition_key,
+        config.sort_key.as_deref(),
+        &config.time_format,
+    )?;
 
     // Build the SET expression and attribute maps from assignments.
     let (update_expression, attr_names, attr_values) =
-        build_update_expression(assignments, time_format)?;
+        build_update_expression(&config.assignments, &config.time_format)?;
 
     // Issue UpdateItem calls in parallel chunks.
     let mut total: u64 = 0;
-    for chunk in keys.chunks(parallelism) {
+    for chunk in keys.chunks(config.parallelism) {
         let futures: Vec<_> = chunk
             .iter()
             .map(|(pk_attr, sk_attr)| {
                 let client = Arc::clone(client);
                 let table_name = table_name.to_string();
-                let partition_key = partition_key.to_string();
-                let sort_key = sort_key.map(ToString::to_string);
+                let partition_key = config.partition_key.clone();
+                let sort_key = config.sort_key.clone();
                 let update_expression = update_expression.clone();
                 let attr_names = attr_names.clone();
                 let attr_values = attr_values.clone();
@@ -229,6 +211,12 @@ async fn execute_update(
     Ok(total)
 }
 
+type UpdateExpression = (
+    String,
+    HashMap<String, String>,
+    HashMap<String, AttributeValue>,
+);
+
 /// Build a `DynamoDB` `UpdateExpression` of the form `SET #n0 = :v0, #n1 = :v1, ...`
 /// from a list of (column, `Expr::Literal`) assignments.
 ///
@@ -236,11 +224,7 @@ async fn execute_update(
 fn build_update_expression(
     assignments: &[(String, Expr)],
     time_format: &str,
-) -> DataFusionResult<(
-    String,
-    HashMap<String, String>,
-    HashMap<String, AttributeValue>,
-)> {
+) -> DataFusionResult<UpdateExpression> {
     if assignments.is_empty() {
         return Err(DataFusionError::Plan(
             "DynamoDB UPDATE requires at least one column assignment".to_string(),
@@ -255,13 +239,10 @@ fn build_update_expression(
         let name_placeholder = format!("#n{i}");
         let value_placeholder = format!(":v{i}");
 
-        let scalar = match value_expr {
-            Expr::Literal(scalar, _) => scalar,
-            _ => {
-                return Err(DataFusionError::Plan(format!(
-                    "DynamoDB UPDATE only supports literal values in SET assignments, got: {value_expr}"
-                )));
-            }
+        let Expr::Literal(scalar, _) = value_expr else {
+            return Err(DataFusionError::Plan(format!(
+                "DynamoDB UPDATE only supports literal values in SET assignments, got: {value_expr}"
+            )));
         };
 
         let attr_value = scalar_to_attribute_value(scalar, time_format)?;
