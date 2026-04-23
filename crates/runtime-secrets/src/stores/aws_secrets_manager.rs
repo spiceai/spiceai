@@ -30,8 +30,7 @@ limitations under the License.
 //!   that only one `GetSecretValue` call is in flight at a time per store.
 //! - Transient failures (throttling, 5xx, connection errors) are retried by
 //!   the AWS SDK itself using the standard retry strategy with exponential
-//!   backoff. We raise `max_attempts` above the SDK default to tolerate brief
-//!   Secrets Manager throttling without failing Spicepod load.
+//!   backoff and jitter (SDK default: 3 attempts).
 //! - A per-operation timeout prevents a stalled AWS endpoint from hanging
 //!   Spicepod loads or parameter resolution indefinitely.
 //! - `ResourceNotFoundException` is treated as "secret does not exist" and
@@ -51,7 +50,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
 use aws_sdk_credential_bridge::default_aws_config;
 use aws_sdk_secretsmanager::{error::SdkError, operation::get_secret_value::GetSecretValueError};
@@ -85,22 +83,15 @@ const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60);
 /// references a missing key.
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(10);
 
-/// Maximum number of attempts for a single Secrets Manager API call.
-///
-/// The AWS SDK default is 3. We raise this to 5 to better tolerate brief
-/// throttling during Spicepod load, where many parameter resolutions may
-/// converge on the same secret in a short window. The SDK applies exponential
-/// backoff with jitter between attempts.
-const MAX_ATTEMPTS: u32 = 5;
-
 /// Per-attempt timeout for a single Secrets Manager API call. Bounded so a
 /// stalled endpoint cannot hang Spicepod initialization indefinitely.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Overall timeout across all retry attempts for a single operation.
 ///
-/// Must be larger than `MAX_ATTEMPTS * ATTEMPT_TIMEOUT` plus backoff delays
-/// so the retry strategy gets a chance to fire before the wall-clock cap.
+/// Sized larger than the SDK's default retry budget (3 attempts with
+/// exponential backoff + jitter) so the retry strategy gets a chance to
+/// fire before the wall-clock cap.
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Snafu)]
@@ -372,17 +363,15 @@ impl AwsSecretsManager {
     }
 }
 
-/// Builds an AWS SDK configuration with explicit retry, timeout, and
-/// identification settings tuned for secret retrieval.
+/// Builds an AWS SDK configuration with explicit timeouts for secret retrieval.
 ///
-/// The standard retry strategy already covers the common transient failure
-/// modes for Secrets Manager (throttling, 5xx, connection reset, I/O errors)
-/// using exponential backoff with jitter. We raise the attempt cap to
-/// [`MAX_ATTEMPTS`] and add an operation-level timeout so a stalled endpoint
-/// cannot hang Spicepod initialization indefinitely.
+/// The SDK's standard retry strategy (exponential backoff + jitter, 3
+/// attempts by default) already covers the common transient failure modes
+/// for Secrets Manager (throttling, 5xx, connection reset, I/O errors), so
+/// we rely on the defaults. We layer on operation-level timeouts so a
+/// stalled endpoint cannot hang Spicepod initialization indefinitely.
 async fn build_aws_config() -> aws_config::SdkConfig {
     default_aws_config()
-        .retry_config(RetryConfig::standard().with_max_attempts(MAX_ATTEMPTS))
         .timeout_config(
             TimeoutConfig::builder()
                 .operation_attempt_timeout(ATTEMPT_TIMEOUT)
