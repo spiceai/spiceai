@@ -26,8 +26,9 @@ limitations under the License.
 //!   the accelerator is updated through the normal refresh cycle. Default.
 //! - [`WriteMode::AcceleratorOnly`]: writes go only to the local accelerator
 //!   (used when `on_conflict` upserts into the accelerator).
-//! - [`WriteMode::WriteBack`]: writes go to the local accelerator first (fast
-//!   path), then are forwarded asynchronously to the federated source.
+//! - [`WriteMode::WriteBack`]: writes go to the local accelerator only;
+//!   propagation back to the federated source happens through the existing
+//!   replication / refresh-on-changes mechanism.
 //! - [`WriteMode::WriteThrough`]: writes go to both the Cayenne accelerator
 //!   and the federated source simultaneously with staged commit/rollback.
 //!
@@ -54,9 +55,9 @@ pub(crate) enum WriteMode {
     /// Writes go only to the local accelerator (not replicated to the source).
     /// Used when `on_conflict` is configured or for internal tables.
     AcceleratorOnly,
-    /// Writes go to the local accelerator first, returning immediately to the caller.
-    /// The write is then asynchronously forwarded to the federated source. Faster response
-    /// times, but the source may lag behind the accelerator briefly.
+    /// Writes go to the local accelerator only and return immediately to the caller.
+    /// The federated source is updated out-of-band by the configured replication or
+    /// refresh-on-changes mechanism, so the source may lag behind the accelerator briefly.
     WriteBack,
     /// Writes go simultaneously to both the federated source and the local Cayenne
     /// accelerator using staged append/commit/rollback semantics.
