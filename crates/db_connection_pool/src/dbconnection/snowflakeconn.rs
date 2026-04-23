@@ -327,7 +327,7 @@ pub fn snowflake_schema_cast(record_batch: &RecordBatch) -> Result<RecordBatch, 
         let field_metadata = field.metadata();
         if let Some(sf_logical_type) = field_metadata.get("logicalType") {
             match sf_logical_type.to_lowercase().as_str() {
-                "timestamp_ntz" => {
+                "timestamp_ntz" | "timestamp_ltz" => {
                     fields.push(Arc::new(Field::new(
                         field.name(),
                         DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -416,8 +416,13 @@ fn cast_sf_timestamp_to_arrow_timestamp(column: &ArrayRef, is_tz: bool) -> Resul
             } else {
                 let epoch = epoch_array.value(idx);
                 let fraction = i64::from(fraction_array.value(idx));
-                let timestamp = epoch * NANOSECONDS + fraction;
-                builder.append_value(timestamp);
+                let nanos = epoch
+                    .checked_mul(NANOSECONDS)
+                    .and_then(|n| n.checked_add(fraction));
+                match nanos {
+                    Some(ts) => builder.append_value(ts),
+                    None => builder.append_null(),
+                }
             }
         }
 
@@ -433,9 +438,10 @@ fn cast_sf_timestamp_to_arrow_timestamp(column: &ArrayRef, is_tz: bool) -> Resul
             if epoch_array.is_null(idx) {
                 builder.append_null();
             } else {
-                // Convert epoch seconds to nanoseconds
-                let timestamp = epoch_array.value(idx) * NANOSECONDS;
-                builder.append_value(timestamp);
+                match epoch_array.value(idx).checked_mul(NANOSECONDS) {
+                    Some(ts) => builder.append_value(ts),
+                    None => builder.append_null(),
+                }
             }
         }
 
@@ -1497,5 +1503,87 @@ mod tests {
         }
 
         Arc::new(builder.finish()) as ArrayRef
+    }
+
+    #[test]
+    fn test_snowflake_schema_cast_timestamp_ltz() {
+        let timestamp_ltz_array = create_timestamp_ntz_array(
+            vec![Some(1_696_164_330), None, Some(1_714_647_301)],
+            vec![Some(0), None, Some(500_000_000)],
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "created_at",
+                DataType::Struct(
+                    vec![
+                        Field::new("epoch", DataType::Int64, true),
+                        Field::new("fraction", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            )
+            .with_metadata(
+                [("logicalType".to_string(), "TIMESTAMP_LTZ".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+        ]));
+
+        let batch = RecordBatch::try_new(schema, vec![timestamp_ltz_array])
+            .expect("Should create record batch");
+
+        let result = snowflake_schema_cast(&batch).expect("Should cast TIMESTAMP_LTZ");
+        assert_eq!(
+            *result.schema().field(0).data_type(),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        );
+
+        let ts_array = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("Should downcast to TimestampNanosecondArray");
+
+        assert_eq!(ts_array.value(0), 1_696_164_330_000_000_000);
+        assert!(ts_array.is_null(1));
+        assert_eq!(ts_array.value(2), 1_714_647_301_500_000_000);
+    }
+
+    #[test]
+    fn test_cast_sf_timestamp_overflow_produces_null() {
+        let overflow_epoch = i64::MAX / NANOSECONDS + 1;
+        let timestamp_array = create_timestamp_ntz_array(
+            vec![Some(overflow_epoch), Some(1_696_164_330)],
+            vec![Some(0), Some(0)],
+        );
+
+        let result = cast_sf_timestamp_to_arrow_timestamp(&timestamp_array, false)
+            .expect("Should not error on overflow");
+        let result = result
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("Should downcast to TimestampNanosecondArray");
+
+        assert!(result.is_null(0), "Overflowing epoch should produce null");
+        assert_eq!(result.value(1), 1_696_164_330_000_000_000);
+    }
+
+    #[test]
+    fn test_cast_sf_timestamp_seconds_overflow_produces_null() {
+        let mut builder = Int64Builder::new();
+        builder.append_values(&[i64::MAX / NANOSECONDS + 1, 1_696_164_330], &[true, true]);
+        let epoch_array = Arc::new(builder.finish()) as Arc<dyn Array>;
+
+        let result = cast_sf_timestamp_to_arrow_timestamp(&epoch_array, false)
+            .expect("Should not error on overflow");
+        let result = result
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("Should downcast to TimestampNanosecondArray");
+
+        assert!(result.is_null(0), "Overflowing epoch should produce null");
+        assert_eq!(result.value(1), 1_696_164_330_000_000_000);
     }
 }
