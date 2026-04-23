@@ -531,23 +531,27 @@ fn closest_param_suggestion(
 }
 
 /// Build the suffix appended to "Missing required parameter: <name>" when a required
-/// parameter is absent. Includes a description, example, and doc link when the spec provides them.
+/// parameter is absent. Renders whatever the spec carries (description, first example,
+/// doc link) as a single trailing sentence — joined with `. ` separators so reading
+/// stays natural regardless of which subset of fields is populated.
 fn describe_missing_parameter(parameter: &ParameterSpec) -> String {
-    let mut out = String::new();
+    let mut parts = Vec::<String>::new();
     if !parameter.description.is_empty() {
-        out.push_str(". ");
-        out.push_str(parameter.description);
+        // Strip an author-supplied trailing period so we don't produce `..` when
+        // concatenating with the next section.
+        parts.push(parameter.description.trim_end_matches('.').to_string());
     }
     if let Some(first_example) = parameter.examples.first() {
-        out.push_str(" Example: `");
-        out.push_str(first_example);
-        out.push('`');
+        parts.push(format!("Example: `{first_example}`"));
     }
     if !parameter.help_link.is_empty() {
-        out.push_str(". Docs: ");
-        out.push_str(parameter.help_link);
+        parts.push(format!("Docs: {}", parameter.help_link));
     }
-    out
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(". {}.", parts.join(". "))
+    }
 }
 
 #[cfg(test)]
@@ -607,6 +611,14 @@ mod test {
     }
 
     #[test]
+    fn test_describe_missing_parameter_description_without_trailing_period() {
+        // Author-supplied descriptions without a trailing period should still
+        // render cleanly (no dangling `..`).
+        let spec = ParameterSpec::component("host").description("The DB host");
+        assert_eq!(describe_missing_parameter(&spec), ". The DB host.");
+    }
+
+    #[test]
     fn test_describe_missing_parameter_full_suffix() {
         let spec = ParameterSpec::component("host")
             .description("The DB host.")
@@ -614,16 +626,28 @@ mod test {
             .help_link("https://docs.example/host");
         assert_eq!(
             describe_missing_parameter(&spec),
-            ". The DB host. Example: `db.example.com`. Docs: https://docs.example/host"
+            ". The DB host. Example: `db.example.com`. Docs: https://docs.example/host."
         );
     }
 
     #[test]
     fn test_describe_missing_parameter_example_without_description() {
+        // Previously this produced a dangling leading-space ` Example: ...`; the
+        // message should start with a proper `. ` sentence boundary regardless of
+        // which subset of fields the spec carries.
         let spec = ParameterSpec::component("host").examples(&["db.example.com"]);
         assert_eq!(
             describe_missing_parameter(&spec),
-            " Example: `db.example.com`"
+            ". Example: `db.example.com`."
+        );
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_help_link_only() {
+        let spec = ParameterSpec::component("host").help_link("https://docs.example/host");
+        assert_eq!(
+            describe_missing_parameter(&spec),
+            ". Docs: https://docs.example/host."
         );
     }
 

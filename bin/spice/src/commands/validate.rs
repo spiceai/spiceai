@@ -78,9 +78,11 @@ pub async fn execute(args: &ValidateArgs) -> Result<()> {
 }
 
 /// Resolve `path` into a loaded [`Spicepod`]:
-/// - existing file → load that file directly
-/// - existing directory → load `spicepod.yaml` (or `.yml`) from within
-/// - non-existent path → let `Spicepod::load_exact` produce the canonical error
+/// - metadata reports a file → load that file directly
+/// - metadata reports a directory → load `spicepod.yaml` (or `.yml`) from within
+/// - metadata fails (not-found, permission-denied, …) → fall through to
+///   `Spicepod::load_exact`, which surfaces the underlying I/O error with the
+///   path attached instead of us inventing a vague "not found" message here.
 async fn load_pod(path: &std::path::Path) -> std::result::Result<Spicepod, spicepod::Error> {
     match tokio::fs::metadata(path).await {
         Ok(meta) if meta.is_file() => Spicepod::load_exact(path).await,
