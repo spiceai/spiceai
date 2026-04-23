@@ -28,6 +28,7 @@ object_store.workspace = true
 opentelemetry.workspace = true
 telemetry = { path = "../telemetry" }
 runtime-parameters = { path = "../runtime-parameters" }
+runtime-object-store = { path = "../runtime-object-store" }
 runtime-secrets = { path = "../runtime-secrets" }
 serde.workspace = true
 serde_json.workspace = true

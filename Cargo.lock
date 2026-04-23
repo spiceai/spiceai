@@ -16114,6 +16114,7 @@ dependencies = [
  "hex",
  "object_store",
  "opentelemetry",
+ "runtime-object-store",
  "runtime-parameters",
  "runtime-secrets",
  "serde",
