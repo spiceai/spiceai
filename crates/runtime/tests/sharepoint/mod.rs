@@ -112,6 +112,48 @@ fn unique_filename(ext: &str) -> String {
     format!("spice-test-{ts}.{ext}")
 }
 
+/// Build a `SharepointObjectStore` matching the `kind` DataFusion would
+/// derive from the test URI, plus the path the test should pass into
+/// `delete()`/etc. — for `me` URIs that's the in-drive path; for other
+/// kinds it's `{drive-id}/{in-drive}` so the store's `resolve()` can
+/// recover the drive ID from the first path segment.
+fn store_and_delete_path(
+    client: std::sync::Arc<data_components::sharepoint::GraphClient>,
+    uri: &str,
+) -> Result<
+    (
+        data_components::sharepoint::object_store::SharepointObjectStore,
+        object_store::path::Path,
+    ),
+    anyhow::Error,
+> {
+    use data_components::sharepoint::object_store::{
+        DriveKind, SharepointObjectStore, SharepointObjectStoreConfig,
+    };
+    use data_components::sharepoint::url::{DriveRef, SharepointUrl};
+    use object_store::path::Path;
+
+    let parsed =
+        SharepointUrl::parse(uri).map_err(|e| anyhow::anyhow!("parse test uri: {e}"))?;
+    let (kind, path) = match &parsed.drive {
+        DriveRef::Me => (None, parsed.item_path.clone()),
+        DriveRef::Drive(id) => (Some(DriveKind::Drives), prefix_with(id, &parsed.item_path)),
+        DriveRef::Site(id) => (Some(DriveKind::Sites), prefix_with(id, &parsed.item_path)),
+        DriveRef::User(id) => (Some(DriveKind::Users), prefix_with(id, &parsed.item_path)),
+        DriveRef::Group(id) => (Some(DriveKind::Groups), prefix_with(id, &parsed.item_path)),
+    };
+    let store = SharepointObjectStore::new(client, kind, SharepointObjectStoreConfig::default());
+    Ok((store, path))
+}
+
+fn prefix_with(id: &str, p: &object_store::path::Path) -> object_store::path::Path {
+    let mut segments = vec![id.to_string()];
+    for part in p.parts() {
+        segments.push(part.as_ref().to_string());
+    }
+    segments.iter().map(String::as_str).collect()
+}
+
 /// End-to-end round-trip using `sharepoint://` URL: DDL create external table,
 /// `INSERT INTO`, `SELECT`, `DELETE`. Skips silently when credentials aren't
 /// in the environment.
@@ -171,9 +213,6 @@ async fn sharepoint_csv_round_trip() -> Result<(), anyhow::Error> {
 
             // Clean up — DELETE the file we wrote.
             use data_components::sharepoint::auth::{DEFAULT_SCOPE, SharepointAuth};
-            use data_components::sharepoint::object_store::{
-                SharepointObjectStore, SharepointObjectStoreConfig,
-            };
             use object_store::ObjectStore;
             use secrecy::SecretString;
 
@@ -187,15 +226,8 @@ async fn sharepoint_csv_round_trip() -> Result<(), anyhow::Error> {
                 .build_graph_client()
                 .await
                 .map_err(|e| anyhow::anyhow!("build_graph_client: {e}"))?;
-            let parsed = data_components::sharepoint::url::SharepointUrl::parse(&uri)
-                .map_err(|e| anyhow::anyhow!("parse test uri: {e}"))?;
-            let store = SharepointObjectStore::new(
-                client,
-                parsed.drive,
-                SharepointObjectStoreConfig::default(),
-            );
-            store
-                .delete(&parsed.item_path)
+            let (store, delete_path) = store_and_delete_path(client, &uri)?;
+            store.delete(&delete_path)
                 .await
                 .map_err(|e| anyhow::anyhow!("cleanup delete: {e}"))?;
             Ok(())
@@ -267,9 +299,6 @@ async fn sharepoint_parquet_copy_to() -> Result<(), anyhow::Error> {
 
             // Clean up.
             use data_components::sharepoint::auth::SharepointAuth;
-            use data_components::sharepoint::object_store::{
-                SharepointObjectStore, SharepointObjectStoreConfig,
-            };
             use object_store::ObjectStore;
             use secrecy::SecretString;
 
@@ -283,14 +312,8 @@ async fn sharepoint_parquet_copy_to() -> Result<(), anyhow::Error> {
                 .build_graph_client()
                 .await
                 .map_err(|e| anyhow::anyhow!("build_graph_client: {e}"))?;
-            let parsed = data_components::sharepoint::url::SharepointUrl::parse(&uri)
-                .map_err(|e| anyhow::anyhow!("parse test uri: {e}"))?;
-            let store = SharepointObjectStore::new(
-                client,
-                parsed.drive,
-                SharepointObjectStoreConfig::default(),
-            );
-            let _ = store.delete(&parsed.item_path).await;
+            let (store, delete_path) = store_and_delete_path(client, &uri)?;
+            let _ = store.delete(&delete_path).await;
             Ok(())
         })
         .await

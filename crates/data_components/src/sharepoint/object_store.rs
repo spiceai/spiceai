@@ -113,9 +113,47 @@ pub struct SharepointObjectStoreConfig {
     pub conflict_behavior: ConflictBehavior,
 }
 
+/// Kind of drive handled by a non-`me` [`SharepointObjectStore`]. Stores
+/// registered under `sharepoint://drives`, `sharepoint://sites`, etc. are
+/// shared by DataFusion across every dataset that resolves to the same
+/// scheme+authority, so the drive ID must come from the first path segment
+/// on each operation rather than from construction-time state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveKind {
+    Drives,
+    Sites,
+    Users,
+    Groups,
+}
+
+impl DriveKind {
+    fn authority(self) -> &'static str {
+        match self {
+            Self::Drives => "drives",
+            Self::Sites => "sites",
+            Self::Users => "users",
+            Self::Groups => "groups",
+        }
+    }
+
+    fn with_id(self, id: String) -> DriveRef {
+        match self {
+            Self::Drives => DriveRef::Drive(id),
+            Self::Sites => DriveRef::Site(id),
+            Self::Users => DriveRef::User(id),
+            Self::Groups => DriveRef::Group(id),
+        }
+    }
+}
+
 pub struct SharepointObjectStore {
     client: Arc<GraphClient>,
-    drive: DriveRef,
+    /// `None` for the `sharepoint://me` store (drive fixed to
+    /// [`DriveRef::Me`], paths are drive-relative). `Some(kind)` for
+    /// `sharepoint://{drives,sites,users,groups}` stores — the drive ID
+    /// is encoded as the first path segment of every `Path` argument,
+    /// matching `DefaultObjectStoreRegistry`'s scheme+authority keying.
+    kind: Option<DriveKind>,
     config: SharepointObjectStoreConfig,
 }
 
@@ -123,12 +161,12 @@ impl SharepointObjectStore {
     #[must_use]
     pub fn new(
         client: Arc<GraphClient>,
-        drive: DriveRef,
+        kind: Option<DriveKind>,
         config: SharepointObjectStoreConfig,
     ) -> Self {
         Self {
             client,
-            drive,
+            kind,
             config,
         }
     }
@@ -142,6 +180,46 @@ impl SharepointObjectStore {
             String::new()
         } else {
             format!(":/{s}:")
+        }
+    }
+
+    /// Split a `Path` argument from DataFusion into the drive target and
+    /// the drive-relative item path. For the `me` store the drive is fixed;
+    /// for kinded stores the ID is the first path segment so every
+    /// `sharepoint://{kind}/{id}/...` dataset can share a single registered
+    /// store without cross-drive confusion.
+    fn resolve(&self, location: &Path) -> ObjectStoreResult<(DriveRef, Path)> {
+        resolve_static(self.kind, location)
+    }
+
+}
+
+fn resolve_static(kind: Option<DriveKind>, location: &Path) -> ObjectStoreResult<(DriveRef, Path)> {
+    match kind {
+        None => Ok((DriveRef::Me, location.clone())),
+        Some(kind) => {
+            let mut parts = location.parts();
+            let Some(first) = parts.next() else {
+                return Err(object_store::Error::Generic {
+                    store: STORE_TAG,
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "missing drive id — expected path prefix '{id}/...' for sharepoint://{auth}",
+                            id = kind.authority().trim_end_matches('s'),
+                            auth = kind.authority(),
+                        ),
+                    )),
+                });
+            };
+            let id = first.as_ref().to_string();
+            let rest: Path = parts
+                .map(|p| p.as_ref().to_string())
+                .collect::<Vec<_>>()
+                .iter()
+                .map(String::as_str)
+                .collect();
+            Ok((kind.with_id(id), rest))
         }
     }
 }
@@ -173,8 +251,9 @@ impl ObjectStore for SharepointObjectStore {
         // graph-http's cross-crate `http` types make setting `If-Match`
         // on the PUT awkward, so we do a head-then-put check. Small TOCTOU
         // window is acceptable for the typical acceleration-writer use case.
+        let (drive, in_drive) = self.resolve(location)?;
         if let PutMode::Update(expected) = &opts.mode {
-            let current = head_drive_item(&self.client, &self.drive, location).await?;
+            let current = head_drive_item(&self.client, &drive, &in_drive).await?;
             let e_tag_matches = expected.e_tag.is_none() || expected.e_tag == current.e_tag;
             let version_matches = expected.version.is_none() || expected.version == current.version;
             if !(e_tag_matches && version_matches) {
@@ -197,9 +276,9 @@ impl ObjectStore for SharepointObjectStore {
         };
 
         let result = if bytes.len() <= INLINE_PUT_THRESHOLD {
-            inline_put(&self.client, &self.drive, location, bytes, effective_conflict).await
+            inline_put(&self.client, &drive, &in_drive, bytes, effective_conflict).await
         } else {
-            resumable_put(&self.client, &self.drive, location, bytes, effective_conflict).await
+            resumable_put(&self.client, &drive, &in_drive, bytes, effective_conflict).await
         }?;
 
         Ok(PutResult {
@@ -213,18 +292,20 @@ impl ObjectStore for SharepointObjectStore {
         location: &Path,
         _opts: PutMultipartOptions,
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        let (drive, in_drive) = self.resolve(location)?;
         Ok(Box::new(BufferedMultipart::new(
             Arc::clone(&self.client),
-            self.drive.clone(),
-            location.clone(),
+            drive,
+            in_drive,
             self.config.conflict_behavior,
         )))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        let (drive, in_drive) = self.resolve(location)?;
         // Fetch metadata first — needed both for the ObjectMeta in GetResult
         // and to respect If-Match / If-None-Match via object_store's helper.
-        let meta = head_drive_item(&self.client, &self.drive, location).await?;
+        let meta = head_drive_item(&self.client, &drive, &in_drive).await?;
         let object_meta = ObjectMeta {
             location: location.clone(),
             last_modified: meta.last_modified,
@@ -237,8 +318,8 @@ impl ObjectStore for SharepointObjectStore {
         // Slice in-memory after fetch (see note in `get_content`).
         let bytes = get_content(
             &self.client,
-            &self.drive,
-            location,
+            &drive,
+            &in_drive,
             options.range.as_ref(),
             meta.size,
         )
@@ -264,7 +345,8 @@ impl ObjectStore for SharepointObjectStore {
     }
 
     async fn head(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
-        let meta = head_drive_item(&self.client, &self.drive, location).await?;
+        let (drive, in_drive) = self.resolve(location)?;
+        let meta = head_drive_item(&self.client, &drive, &in_drive).await?;
         Ok(ObjectMeta {
             location: location.clone(),
             last_modified: meta.last_modified,
@@ -275,25 +357,41 @@ impl ObjectStore for SharepointObjectStore {
     }
 
     async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
-        delete_item(&self.client, &self.drive, location).await
+        let (drive, in_drive) = self.resolve(location)?;
+        delete_item(&self.client, &drive, &in_drive).await
     }
 
+    /// Lists objects recursively below `prefix`, matching the `ObjectStore`
+    /// trait contract (S3/GCS semantics — all objects with a given prefix).
+    /// SharePoint's `list_children` only returns one folder level, so we
+    /// walk the folder tree in BFS order, yielding files as we find them
+    /// and queueing any subfolders.
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
         let client = Arc::clone(&self.client);
-        let drive = self.drive.clone();
-        let prefix = prefix.cloned().unwrap_or_else(|| Path::from(""));
+        let kind = self.kind;
+        let start = prefix.cloned().unwrap_or_else(|| Path::from(""));
         Box::pin(async_stream::stream! {
-            let mut pages = list_children(&client, &drive, &prefix);
-            while let Some(res) = pages.next().await {
-                match res {
-                    Ok(batch) => {
-                        for item in batch {
-                            if let Some(meta) = item.into_object_meta(&prefix) {
-                                yield Ok(meta);
+            let mut queue: std::collections::VecDeque<Path> = std::collections::VecDeque::new();
+            queue.push_back(start);
+            while let Some(current) = queue.pop_front() {
+                let (drive, in_drive) = match resolve_static(kind, &current) {
+                    Ok(r) => r,
+                    Err(e) => { yield Err(e); return; }
+                };
+                let mut pages = list_children(&client, &drive, &in_drive);
+                while let Some(page) = pages.next().await {
+                    match page {
+                        Ok(batch) => {
+                            for item in batch {
+                                if item.is_folder {
+                                    queue.push_back(child_location(&current, &item.name));
+                                } else if let Some(meta) = item.into_object_meta(&current) {
+                                    yield Ok(meta);
+                                }
                             }
                         }
+                        Err(e) => yield Err(e),
                     }
-                    Err(e) => yield Err(e),
                 }
             }
         })
@@ -301,7 +399,8 @@ impl ObjectStore for SharepointObjectStore {
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
         let prefix = prefix.cloned().unwrap_or_else(|| Path::from(""));
-        let mut pages = list_children(&self.client, &self.drive, &prefix);
+        let (drive, in_drive) = self.resolve(&prefix)?;
+        let mut pages = list_children(&self.client, &drive, &in_drive);
 
         let mut objects = Vec::new();
         let mut common_prefixes = Vec::new();
@@ -1082,7 +1181,7 @@ mod tests {
             client.use_test_endpoint(&Url::parse(&format!("{endpoint}/v1.0")).unwrap());
             SharepointObjectStore::new(
                 Arc::new(client),
-                DriveRef::Me,
+                None,
                 SharepointObjectStoreConfig::default(),
             )
         }

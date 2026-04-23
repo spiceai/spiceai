@@ -41,8 +41,9 @@ use async_trait::async_trait;
 use data_components::sharepoint::auth::{SharepointAuth, saml::SamlBearerConfig};
 use data_components::sharepoint::client::SharepointClient;
 use data_components::sharepoint::object_store::{
-    ConflictBehavior, SharepointObjectStore, SharepointObjectStoreConfig,
+    ConflictBehavior, DriveKind, SharepointObjectStore, SharepointObjectStoreConfig,
 };
+use data_components::sharepoint::url::DriveRef;
 use data_components::sharepoint::table::SharepointTableProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -417,14 +418,13 @@ impl DataConnector for Sharepoint {
         if !Self::uses_object_store(dataset) {
             return Ok(());
         }
-        // Pre-register the SharepointObjectStore against the dataset's URL
-        // so that the blanket ListingTableConnector impl finds it when it
-        // calls `runtime_env.object_store(...)`. The drive target
-        // (me/drives/sites/users/groups) is extracted from the URL and
-        // stored on the SharepointObjectStore instance, so the object-store
-        // paths returned in `ObjectMeta.location` are drive-relative (the
-        // conventional ObjectStore semantics — paths are keys within a
-        // single registered store).
+        // Pre-register the SharepointObjectStore under the dataset's URL.
+        // DataFusion's registry keys on scheme+authority, so all
+        // `sharepoint://drives/…` (or `…/sites/…`, etc.) datasets share a
+        // single registered store — the store reads the drive ID from the
+        // first path segment on every operation, rather than binding one
+        // drive per store instance. `sharepoint://me` is the one special
+        // case where the drive is fixed.
         let store_url =
             Url::parse(&dataset.from).map_err(|e| DataConnectorError::InvalidConfiguration {
                 dataconnector: CONNECTOR_NAME.to_string(),
@@ -442,6 +442,13 @@ impl DataConnector for Sharepoint {
                 connector_component: ConnectorComponent::from(dataset),
                 source: Box::new(e),
             })?;
+        let kind = match sp_url.drive {
+            DriveRef::Me => None,
+            DriveRef::Drive(_) => Some(DriveKind::Drives),
+            DriveRef::Site(_) => Some(DriveKind::Sites),
+            DriveRef::User(_) => Some(DriveKind::Users),
+            DriveRef::Group(_) => Some(DriveKind::Groups),
+        };
         let conflict = parse_conflict_behavior(&self.params).map_err(|e| {
             DataConnectorError::InvalidConfiguration {
                 dataconnector: CONNECTOR_NAME.to_string(),
@@ -452,7 +459,7 @@ impl DataConnector for Sharepoint {
         })?;
         let store = Arc::new(SharepointObjectStore::new(
             Arc::clone(&self.client),
-            sp_url.drive,
+            kind,
             SharepointObjectStoreConfig {
                 conflict_behavior: conflict,
             },
