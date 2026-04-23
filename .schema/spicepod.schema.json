@@ -830,11 +830,19 @@
           "default": "full"
         },
         "properties": {
+          "description": "Custom key/value attributes attached to telemetry metrics emitted by\nspiced. Applied as OpenTelemetry resource attributes on the runtime's\n`MeterProvider`, so they appear as dimensions on every metric exported\nvia the Prometheus scrape endpoint, the cluster on-demand OTLP reader,\nand the `otel_exporter` push exporter, and as labels on anonymous\nusage telemetry. Currently does not affect tracing spans or logs.\nExample: `{ environment: prod, region: us-west-2, team: data-platform }`.",
           "type": "object",
           "additionalProperties": {
             "type": "string"
           },
           "default": {}
+        },
+        "metric_prefix": {
+          "description": "Optional prefix prepended to every exported metric name.\n\nUseful for namespacing Spice metrics in shared backends (e.g. Datadog,\nGrafana Cloud) so they don't collide with metrics from other services.\nFor example, with `metric_prefix: \"spiceai.\"` the runtime metric\n`query_duration_ms` is exported as `spiceai.query_duration_ms`.\n\nThe prefix is applied via an `OpenTelemetry` `View` on the runtime's\n`MeterProvider`, so it affects every metric reader attached to that\nprovider — the Prometheus scrape endpoint (`--metrics`), the cluster\non-demand OTLP reader, and the `otel_exporter` push reader.\n`OpenTelemetry` 0.31's SDK does not support per-reader name transforms,\nso this knob is intentionally placed at the telemetry level rather\nthan under any single exporter.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "otel_exporter": {
           "description": "Optional configuration for pushing metrics to an OpenTelemetry collector",
@@ -893,13 +901,6 @@
           "description": "Aggregation temporality preference for exported metrics.\n\nDefaults to `delta`, which is required by Datadog and recommended for\nmost push-based OTLP backends (`CloudWatch`, New Relic, etc.). Set to\n`cumulative` when forwarding to an `OTel` collector that feeds Prometheus\nor another cumulative-native backend. See [`OtelTemporality`] for\ndetails.",
           "$ref": "#/$defs/OtelTemporality",
           "default": "delta"
-        },
-        "prefix": {
-          "description": "Optional prefix prepended to every exported metric name.\n\nUseful for namespacing Spice metrics in shared backends so they don't\ncollide with metrics from other services. For example, with\n`prefix: \"spiceai.\"` the runtime metric `query_duration_ms` is exported\nas `spiceai.query_duration_ms`.\n\nThe prefix is applied via an `OpenTelemetry` `View` on the runtime's\n`MeterProvider`, so it affects every metric reader attached to that\nprovider (the `otel_exporter` push reader, the Prometheus scrape\nendpoint, and the cluster on-demand OTLP reader). In practice users\ntypically enable only one of these at a time, so the prefix appears on\nexactly the destination they configured it for.",
-          "type": [
-            "string",
-            "null"
-          ]
         }
       },
       "additionalProperties": false,
@@ -2082,6 +2083,26 @@
           ],
           "format": "uint",
           "minimum": 0
+        },
+        "aggregation": {
+          "description": "Aggregation strategy for multi-vector embeddings. Only meaningful\nwhen the underlying column is list-typed. Defaults to `max`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmbeddingAggregation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_elements_per_row": {
+          "description": "Maximum number of list elements embedded per row for multi-vector\ncolumns. Defaults to `32`; hard-capped at `1024`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
         }
       }
     },
@@ -2109,6 +2130,15 @@
           "default": false
         }
       }
+    },
+    "EmbeddingAggregation": {
+      "description": "Aggregation strategy applied when a multi-vector (list-typed) column\nis queried. Each list element produces its own embedding; at query\ntime the per-element similarities are combined into a single per-row\nscore using this aggregation.\n\n`Max` is the ColBERT-style `MaxSim` default — a row scores as high as\nits best-matching element.",
+      "type": "string",
+      "enum": [
+        "max",
+        "mean",
+        "sum"
+      ]
     },
     "FullTextSearchConfig": {
       "type": "object",
@@ -2740,6 +2770,26 @@
           ]
         },
         "vector_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "aggregation": {
+          "description": "Aggregation strategy for multi-vector embeddings. Only meaningful\nwhen the underlying column is list-typed (`List<Utf8>` /\n`LargeList<Utf8>`). Defaults to `max` (ColBERT-style `MaxSim`).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EmbeddingAggregation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_elements_per_row": {
+          "description": "Maximum number of list elements embedded per row for multi-vector\ncolumns. Defaults to `32`; hard-capped at `1024`. Excess elements\nare dropped with a warning log.",
           "type": [
             "integer",
             "null"
