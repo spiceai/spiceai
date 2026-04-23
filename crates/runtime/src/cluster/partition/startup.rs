@@ -16,19 +16,16 @@ limitations under the License.
 
 use std::{collections::HashMap, sync::Arc};
 
-use app::{App, spicepod::component::runtime::Scheduler as SchedulerConfig};
+use app::App;
 
 use datafusion::{execution::FunctionRegistry, logical_expr::Expr, sql::TableReference};
 use datafusion_proto::bytes::Serializeable;
 use object_store::ObjectStore;
-use object_store::prefix::PrefixStore;
 use runtime_proto::{
     AllocateInitialPartitionsRequest, cluster_service_client::ClusterServiceClient,
 };
-use runtime_secrets::Secrets;
 use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
-use tokio::{runtime::Handle, sync::RwLock};
 use tonic::transport::Channel;
 
 use super::Result;
