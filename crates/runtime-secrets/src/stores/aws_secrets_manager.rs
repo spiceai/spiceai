@@ -535,9 +535,9 @@ mod tests {
 
     #[test]
     fn rejects_non_object_payload() {
-        assert!(parse_json_to_hashmap(r#"["a","b"]"#).is_err());
-        assert!(parse_json_to_hashmap(r#""just a string""#).is_err());
-        assert!(parse_json_to_hashmap("not json").is_err());
+        let _ = parse_json_to_hashmap(r#"["a","b"]"#).expect_err("array is not an object");
+        let _ = parse_json_to_hashmap(r#""just a string""#).expect_err("string is not an object");
+        let _ = parse_json_to_hashmap("not json").expect_err("invalid JSON");
     }
 
     #[test]
