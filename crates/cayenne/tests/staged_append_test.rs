@@ -384,12 +384,24 @@ async fn test_wal_persists_on_move_failure_impl(
     std::fs::remove_dir_all(&snapshot_dir)?;
     std::fs::write(&snapshot_dir, b"not a directory")?;
 
-    // Step 3: Attempt another insert — should fail during the move phase
-    let result = ctx
-        .sql("INSERT INTO wal_move_fail VALUES (2, 'Bob')")
-        .await?
-        .collect()
-        .await;
+    // Step 3: Attempt another insert — should fail during the move phase.
+    // Build the batch directly (>1024 rows so the data-inlining fast-path is
+    // bypassed and the write goes through the Vortex staging WAL path). Using
+    // a RecordBatch instead of a large `INSERT ... VALUES (...)` SQL string
+    // avoids SQL parser / statement-size limits that would make the failure
+    // assertion less meaningful.
+    let ids: Vec<i64> = (2..1030).collect();
+    let names: Vec<String> = ids.iter().map(|i| format!("name_{i}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let schema = table.schema();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(name_refs)),
+        ],
+    )?;
+    let result = common::insert_batch(&table, batch).await;
 
     assert!(
         result.is_err(),
