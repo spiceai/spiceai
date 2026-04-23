@@ -98,6 +98,11 @@ pub enum Error {
         "Invalid sharepoint_conflict_behavior '{value}' — expected 'replace', 'fail', or 'rename'. Defaults to 'replace' (creates a new version on overwrite)."
     ))]
     InvalidConflictBehavior { value: String },
+
+    #[snafu(display(
+        "Invalid sharepoint_max_put_bytes '{value}' — expected an unsigned integer (bytes)."
+    ))]
+    InvalidMaxPutBytes { value: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -152,8 +157,14 @@ impl Sharepoint {
     /// Whether this dataset uses the new `sharepoint://` URL scheme (routed
     /// through `ObjectStore` + `ListingTable`) or the legacy compact
     /// `sharepoint:…` syntax (routed to [`SharepointTableProvider`]).
+    /// URL schemes are case-insensitive, so we parse and compare on scheme
+    /// + authority rather than a raw prefix match — `SharePoint://me/…`
+    /// should route the same as `sharepoint://me/…`.
     fn uses_object_store(dataset: &Dataset) -> bool {
-        dataset.from.starts_with("sharepoint://")
+        match Url::parse(&dataset.from) {
+            Ok(u) => u.scheme().eq_ignore_ascii_case(CONNECTOR_NAME) && u.has_authority(),
+            Err(_) => false,
+        }
     }
 
     /// Build the helper connector that backs `sharepoint://` datasets.
@@ -293,6 +304,17 @@ fn parse_conflict_behavior(params: &Parameters) -> Result<ConflictBehavior> {
     }
 }
 
+/// Parse `sharepoint_max_put_bytes` from connector params, falling back to
+/// `SharepointObjectStoreConfig::default().max_put_bytes` when unset.
+fn parse_max_put_bytes(params: &Parameters) -> Result<usize> {
+    match params.get("max_put_bytes").expose().ok() {
+        None => Ok(SharepointObjectStoreConfig::default().max_put_bytes),
+        Some(v) => v.parse::<usize>().map_err(|_| Error::InvalidMaxPutBytes {
+            value: v.to_string(),
+        }),
+    }
+}
+
 #[derive(Default, Copy, Clone)]
 pub struct SharepointFactory {}
 
@@ -324,6 +346,8 @@ const PARAMETERS: &[ParameterSpec] = &[
     // Write behavior
     ParameterSpec::component("conflict_behavior")
         .description("How to handle writes to an existing path: 'replace' (default; creates a new SharePoint version), 'fail' (reject), or 'rename' (write under a unique name)."),
+    ParameterSpec::component("max_put_bytes")
+        .description("Hard cap (in bytes) on the size of a single put/multipart upload. Writes above this limit are rejected rather than silently buffered. Default: 1 GiB."),
     // Legacy / shared
     ParameterSpec::runtime("file_format"),
 ];
@@ -458,11 +482,20 @@ impl DataConnector for Sharepoint {
                 source: Box::new(e),
             }
         })?;
+        let max_put_bytes = parse_max_put_bytes(&self.params).map_err(|e| {
+            DataConnectorError::InvalidConfiguration {
+                dataconnector: CONNECTOR_NAME.to_string(),
+                message: format!("{e}"),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            }
+        })?;
         let store = Arc::new(SharepointObjectStore::new(
             Arc::clone(&self.client),
             kind,
             SharepointObjectStoreConfig {
                 conflict_behavior: conflict,
+                max_put_bytes,
             },
         ));
         runtime_env.register_object_store(&store_url, store);

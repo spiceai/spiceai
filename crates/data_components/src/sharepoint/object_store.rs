@@ -107,10 +107,32 @@ impl FromStr for ConflictBehavior {
     }
 }
 
+/// Hard cap on the total bytes a single `put`/`put_multipart` write may
+/// materialize in memory before the store rejects the request. Large
+/// writes go through `resumable_put`, which still buffers the whole
+/// object in RAM (SharePoint's upload-session protocol requires the
+/// total size up-front). Default: 1 GiB — big enough for typical
+/// Parquet/CSV writes, small enough to fail loudly instead of OOM-ing
+/// the runtime on a pathological `COPY TO`.
+const DEFAULT_MAX_PUT_BYTES: usize = 1024 * 1024 * 1024;
+
 /// Configuration applied to all operations against a [`SharepointObjectStore`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SharepointObjectStoreConfig {
     pub conflict_behavior: ConflictBehavior,
+    /// Reject `put` / `put_multipart` writes larger than this many bytes
+    /// instead of silently buffering them all in memory. Defaults to
+    /// [`DEFAULT_MAX_PUT_BYTES`] (1 GiB).
+    pub max_put_bytes: usize,
+}
+
+impl Default for SharepointObjectStoreConfig {
+    fn default() -> Self {
+        Self {
+            conflict_behavior: ConflictBehavior::default(),
+            max_put_bytes: DEFAULT_MAX_PUT_BYTES,
+        }
+    }
 }
 
 /// Kind of drive handled by a non-`me` [`SharepointObjectStore`]. Stores
@@ -270,6 +292,16 @@ impl ObjectStore for SharepointObjectStore {
             }
         }
 
+        let total_bytes: usize = payload.iter().map(bytes::Bytes::len).sum();
+        if total_bytes > self.config.max_put_bytes {
+            return Err(object_store::Error::Generic {
+                store: STORE_TAG,
+                source: Box::new(std::io::Error::other(format!(
+                    "SharePoint put rejected: {total_bytes} bytes exceeds max_put_bytes={} (raise sharepoint_max_put_bytes or stage writes in smaller pieces)",
+                    self.config.max_put_bytes
+                ))),
+            });
+        }
         let bytes = payload_to_bytes(&payload);
 
         // Honor the store's configured `conflict_behavior` for normal
@@ -304,6 +336,7 @@ impl ObjectStore for SharepointObjectStore {
             drive,
             in_drive,
             self.config.conflict_behavior,
+            self.config.max_put_bytes,
         )))
     }
 
@@ -386,6 +419,12 @@ impl ObjectStore for SharepointObjectStore {
     /// `starts_with` check drive the yield decision. Folders that match
     /// the name-prefix are descended into recursively (BFS), with no
     /// further name filtering at deeper levels.
+    ///
+    /// Uses `async_stream::stream!` for readability: the generator has
+    /// multiple early-exit branches on errors and a nested page loop,
+    /// which `futures::stream::unfold` would turn into an explicit
+    /// state-machine with ~3× the boilerplate. Consistent with
+    /// `runtime-object-store/src/store/github.rs`'s `list` impl.
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
         let client = Arc::clone(&self.client);
         let kind = self.kind;
@@ -513,6 +552,7 @@ struct BufferedMultipart {
     drive: DriveRef,
     item_path: Path,
     conflict: ConflictBehavior,
+    max_put_bytes: usize,
     buffer: Arc<Mutex<Vec<u8>>>,
     completed: bool,
 }
@@ -523,12 +563,14 @@ impl BufferedMultipart {
         drive: DriveRef,
         item_path: Path,
         conflict: ConflictBehavior,
+        max_put_bytes: usize,
     ) -> Self {
         Self {
             client,
             drive,
             item_path,
             conflict,
+            max_put_bytes,
             buffer: Arc::new(Mutex::new(Vec::new())),
             completed: false,
         }
@@ -539,9 +581,18 @@ impl BufferedMultipart {
 impl MultipartUpload for BufferedMultipart {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
         let buffer = Arc::clone(&self.buffer);
+        let max = self.max_put_bytes;
         Box::pin(async move {
             let bytes = payload_to_bytes(&data);
             let mut buf = buffer.lock().await;
+            if buf.len().saturating_add(bytes.len()) > max {
+                return Err(object_store::Error::Generic {
+                    store: STORE_TAG,
+                    source: Box::new(std::io::Error::other(format!(
+                        "SharePoint multipart upload rejected: buffered size would exceed max_put_bytes={max} (raise sharepoint_max_put_bytes or split the write)"
+                    ))),
+                });
+            }
             buf.extend_from_slice(&bytes);
             Ok(())
         })
@@ -956,6 +1007,11 @@ async fn delete_item(
 /// Pages through `list_children` for a given drive+path, yielding batches via
 /// the SDK's built-in `.paging().stream()` helper (same pattern as
 /// [`super::client::SharepointClient::stream_drive_items`]).
+///
+/// `async_stream::stream!` is used here (rather than `futures::stream::unfold`)
+/// because the generator threads two error-translation sites through a page
+/// loop; the equivalent `unfold` state machine would roughly triple the LOC
+/// without changing behavior.
 fn list_children(
     client: &GraphClient,
     drive: &DriveRef,
@@ -1257,7 +1313,7 @@ mod tests {
         /// debug builds of deep async chains (graph-rs-sdk + reqwest + tokio +
         /// async-stream) exceed both the default 2 MiB test-runner stack and
         /// tokio's default worker stack. We jump onto a fresh thread with
-        /// 32 MiB, then into a multi-thread runtime with 16 MiB workers, so
+        /// 64 MiB, then into a multi-thread runtime with 64 MiB workers, so
         /// the driving future and its spawned tasks all have headroom.
         fn run_async<F>(f: F)
         where

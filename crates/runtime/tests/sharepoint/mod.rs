@@ -314,7 +314,12 @@ async fn sharepoint_parquet_copy_to() -> Result<(), anyhow::Error> {
                 .await
                 .map_err(|e| anyhow::anyhow!("build_graph_client: {e}"))?;
             let (store, delete_path) = store_and_delete_path(client, &uri)?;
-            let _ = store.delete(&delete_path).await;
+            if let Err(e) = store.delete(&delete_path).await {
+                // Surface cleanup failures so we don't silently leak
+                // artifacts in the test tenant, but don't fail the test —
+                // the COPY TO round-trip has already succeeded.
+                eprintln!("sharepoint_parquet_copy_to: cleanup delete failed: {e}");
+            }
             Ok(())
         })
         .await
