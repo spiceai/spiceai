@@ -783,8 +783,18 @@ mod tests {
         match resolved {
             super::SecretStoreType::AwsSecretsManager(cfg) => {
                 assert_eq!(cfg.access_key_id.as_deref(), Some("AKIA_TEST"));
-                assert_eq!(cfg.secret_access_key.as_deref(), Some("shh"));
-                assert_eq!(cfg.session_token.as_deref(), Some("tok"));
+                assert_eq!(
+                    cfg.secret_access_key
+                        .as_ref()
+                        .map(|s| s.expose_secret().to_string()),
+                    Some("shh".to_string())
+                );
+                assert_eq!(
+                    cfg.session_token
+                        .as_ref()
+                        .map(|s| s.expose_secret().to_string()),
+                    Some("tok".to_string())
+                );
             }
             _ => panic!("expected AwsSecretsManager variant"),
         }

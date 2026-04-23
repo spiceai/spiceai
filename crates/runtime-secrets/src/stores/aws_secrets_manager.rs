@@ -106,14 +106,38 @@ pub const PARAMETERS: &[ParameterSpec] = &[
 ];
 
 /// Resolved configuration for the `aws_secrets_manager` secret store.
-#[derive(Debug, Clone)]
+///
+/// `secret_access_key` and `session_token` are held as [`SecretString`] so
+/// they carry zeroize-on-drop semantics and so the manual `Debug` impl
+/// below can redact them — deriving `Debug` on plain `String` credentials
+/// would surface them via any `{:?}` print (panic dumps, log calls, etc.).
+#[derive(Clone)]
 pub struct AwsSecretsManagerConfig {
     pub secret_name: String,
     pub region: Option<String>,
     pub endpoint_url: Option<String>,
     pub access_key_id: Option<String>,
-    pub secret_access_key: Option<String>,
-    pub session_token: Option<String>,
+    pub secret_access_key: Option<SecretString>,
+    pub session_token: Option<SecretString>,
+}
+
+impl std::fmt::Debug for AwsSecretsManagerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AwsSecretsManagerConfig")
+            .field("secret_name", &self.secret_name)
+            .field("region", &self.region)
+            .field("endpoint_url", &self.endpoint_url)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl AwsSecretsManagerConfig {
@@ -126,8 +150,14 @@ impl AwsSecretsManagerConfig {
             region: params.get("region").cloned(),
             endpoint_url: params.get("endpoint_url").cloned(),
             access_key_id: params.get("key").cloned(),
-            secret_access_key: params.get("secret").cloned(),
-            session_token: params.get("session_token").cloned(),
+            secret_access_key: params
+                .get("secret")
+                .cloned()
+                .map(SecretString::from),
+            session_token: params
+                .get("session_token")
+                .cloned()
+                .map(SecretString::from),
         }
     }
 }
@@ -248,9 +278,11 @@ pub struct AwsSecretsManager {
     /// Optional static credentials sourced from the spicepod `params:`
     /// block. When `access_key_id` and `secret_access_key` are both set
     /// they take precedence over the SDK's default credential chain.
+    /// The secret half is held as a [`SecretString`] so its backing buffer
+    /// is zeroized on drop.
     access_key_id: Option<String>,
-    secret_access_key: Option<String>,
-    session_token: Option<String>,
+    secret_access_key: Option<SecretString>,
+    session_token: Option<SecretString>,
     /// Lazily-initialized, shared SDK configuration. Resolved exactly once per
     /// store instance and reused by both the STS pre-flight and the Secrets
     /// Manager client, so credential-provider resolution (including IMDS
@@ -602,8 +634,8 @@ impl AwsSecretsManager {
 async fn build_aws_config(
     region: Option<String>,
     access_key_id: Option<String>,
-    secret_access_key: Option<String>,
-    session_token: Option<String>,
+    secret_access_key: Option<SecretString>,
+    session_token: Option<SecretString>,
 ) -> aws_config::SdkConfig {
     let mut builder = default_aws_config().timeout_config(
         TimeoutConfig::builder()
@@ -616,10 +648,15 @@ async fn build_aws_config(
     }
     match (access_key_id, secret_access_key) {
         (Some(key), Some(secret)) => {
+            // `Credentials::new` takes owned `String`s. We call
+            // `expose_secret().to_string()` exactly once, right at the SDK
+            // boundary — the allocation then lives inside
+            // `aws_credential_types::Credentials` (which has its own
+            // scrubbing behavior on drop) and is never re-exposed.
             let credentials = aws_credential_types::Credentials::new(
                 key,
-                secret,
-                session_token,
+                secret.expose_secret().to_string(),
+                session_token.map(|t| t.expose_secret().to_string()),
                 None,
                 "SpiceAwsSecretsManagerStore",
             );
@@ -744,6 +781,33 @@ mod tests {
         let _ = parse_json_to_hashmap(r#"["a","b"]"#).expect_err("array is not an object");
         let _ = parse_json_to_hashmap(r#""just a string""#).expect_err("string is not an object");
         let _ = parse_json_to_hashmap("not json").expect_err("invalid JSON");
+    }
+
+    /// Ensures a `{:?}` print of the config never surfaces the raw
+    /// `secret_access_key` or `session_token`.
+    #[test]
+    fn config_debug_redacts_static_credentials() {
+        let cfg = AwsSecretsManagerConfig {
+            secret_name: "my-secret".to_string(),
+            region: Some("us-east-1".to_string()),
+            endpoint_url: None,
+            access_key_id: Some("AKIA_PUBLIC".to_string()),
+            secret_access_key: Some(SecretString::from("super-secret-value".to_string())),
+            session_token: Some(SecretString::from("SESSION_TOKEN_VALUE".to_string())),
+        };
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("super-secret-value"),
+            "Debug output must not include the secret_access_key; got: {debug}"
+        );
+        assert!(
+            !debug.contains("SESSION_TOKEN_VALUE"),
+            "Debug output must not include the session_token; got: {debug}"
+        );
+        assert!(debug.contains("<redacted>"), "got {debug}");
+        // access_key_id is not a secret — should still be visible for
+        // debugging.
+        assert!(debug.contains("AKIA_PUBLIC"), "got {debug}");
     }
 
     #[test]
