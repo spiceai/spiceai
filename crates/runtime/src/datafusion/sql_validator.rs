@@ -74,10 +74,7 @@ pub fn validate_sql_query_operations(
                 }
 
                 // Fall back to per-table writable check
-                if df.is_writable(&dml.table_name) {
-                    Ok(TreeNodeRecursion::Continue)
-                } else if df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
-                    // No catalog specified but default catalog is writable
+                if df.is_writable(&dml.table_name) || df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
                     Ok(TreeNodeRecursion::Continue)
                 } else {
                     plan_err!(
@@ -104,10 +101,7 @@ pub fn validate_sql_query_operations(
                     return Ok(TreeNodeRecursion::Continue);
                 }
 
-                if df.is_writable(&dml.table_name) {
-                    Ok(TreeNodeRecursion::Continue)
-                } else if df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
-                    // No catalog specified but default catalog is writable
+                if df.is_writable(&dml.table_name) || df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
                     Ok(TreeNodeRecursion::Continue)
                 } else {
                     plan_err!(
@@ -134,9 +128,7 @@ pub fn validate_sql_query_operations(
                     return Ok(TreeNodeRecursion::Continue);
                 }
 
-                if df.is_writable(&dml.table_name) {
-                    Ok(TreeNodeRecursion::Continue)
-                } else if df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
+                if df.is_writable(&dml.table_name) || df.is_catalog_writable(super::SPICE_DEFAULT_CATALOG) {
                     Ok(TreeNodeRecursion::Continue)
                 } else {
                     plan_err!(
