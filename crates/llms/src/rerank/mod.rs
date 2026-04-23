@@ -84,6 +84,11 @@ pub enum Error {
     HealthCheckFailed {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Failed to build HTTP client for reranker '{model}' — standard timeout/TLS defaults are unavailable."
+    ))]
+    HttpClientCreationFailed { model: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -504,11 +509,14 @@ mod tests {
     #[test]
     fn strategy_parses_case_insensitively() {
         assert_eq!(
-            LlmStrategy::parse("Listwise").unwrap(),
+            LlmStrategy::parse("Listwise").expect("mixed case listwise"),
             LlmStrategy::Listwise
         );
-        assert_eq!(LlmStrategy::parse("POINT").unwrap(), LlmStrategy::Pointwise);
-        assert!(LlmStrategy::parse("nonsense").is_err());
+        assert_eq!(
+            LlmStrategy::parse("POINT").expect("upper-case point alias"),
+            LlmStrategy::Pointwise
+        );
+        LlmStrategy::parse("nonsense").expect_err("unknown strategy must error");
     }
 
     #[test]

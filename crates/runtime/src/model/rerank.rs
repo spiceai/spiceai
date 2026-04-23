@@ -22,7 +22,7 @@ limitations under the License.
 use llms::rerank::{CohereReranker, HttpReranker, JinaReranker, Rerank, VoyageReranker};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use secrecy::{ExposeSecret, SecretString};
-use snafu::{OptionExt, Snafu};
+use snafu::{OptionExt, ResultExt, Snafu};
 use spicepod::component::rerankers::{Reranker, RerankerPrefix};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
@@ -44,6 +44,12 @@ pub enum Error {
 
     #[snafu(display("Reranker '{name}' failed health check: {source}"))]
     HealthFailed {
+        name: String,
+        source: llms::rerank::Error,
+    },
+
+    #[snafu(display("Failed to build reranker '{name}': {source}"))]
+    BuildFailed {
         name: String,
         source: llms::rerank::Error,
     },
@@ -90,8 +96,11 @@ pub async fn try_to_rerank_model(
                     name: component.name.clone(),
                     param_key: "api_key".to_string(),
                 })?;
-            let mut c =
-                CohereReranker::new(component.name.clone(), api_key).with_model_id(model_id);
+            let mut c = CohereReranker::try_new(component.name.clone(), api_key)
+                .context(BuildFailedSnafu {
+                    name: component.name.clone(),
+                })?
+                .with_model_id(model_id);
             if let Some(endpoint) = extract_secret(&params, "endpoint") {
                 c = c.with_endpoint(endpoint);
             }
@@ -104,8 +113,11 @@ pub async fn try_to_rerank_model(
                     name: component.name.clone(),
                     param_key: "api_key".to_string(),
                 })?;
-            let mut v =
-                VoyageReranker::new(component.name.clone(), api_key).with_model_id(model_id);
+            let mut v = VoyageReranker::try_new(component.name.clone(), api_key)
+                .context(BuildFailedSnafu {
+                    name: component.name.clone(),
+                })?
+                .with_model_id(model_id);
             if let Some(endpoint) = extract_secret(&params, "endpoint") {
                 v = v.with_endpoint(endpoint);
             }
@@ -118,7 +130,11 @@ pub async fn try_to_rerank_model(
                     name: component.name.clone(),
                     param_key: "api_key".to_string(),
                 })?;
-            let mut j = JinaReranker::new(component.name.clone(), api_key).with_model_id(model_id);
+            let mut j = JinaReranker::try_new(component.name.clone(), api_key)
+                .context(BuildFailedSnafu {
+                    name: component.name.clone(),
+                })?
+                .with_model_id(model_id);
             if let Some(endpoint) = extract_secret(&params, "endpoint") {
                 j = j.with_endpoint(endpoint);
             }
@@ -129,7 +145,11 @@ pub async fn try_to_rerank_model(
             // auth header are both optional (some self-hosted services pin
             // the model and auth upstream).
             let endpoint = model_id;
-            let mut h = HttpReranker::new(component.name.clone(), endpoint);
+            let mut h = HttpReranker::try_new(component.name.clone(), endpoint).context(
+                BuildFailedSnafu {
+                    name: component.name.clone(),
+                },
+            )?;
             if let Some(api_key) = extract_secret(&params, "api_key") {
                 h = h.with_api_key(Some(api_key));
             }

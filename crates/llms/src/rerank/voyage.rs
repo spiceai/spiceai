@@ -64,15 +64,18 @@ impl Debug for VoyageReranker {
 }
 
 impl VoyageReranker {
-    #[must_use]
-    pub fn new(name: impl Into<String>, api_key: impl Into<String>) -> Self {
-        Self {
-            client: create_http_client().unwrap_or_default(),
+    pub fn try_new(name: impl Into<String>, api_key: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        let client = create_http_client().ok_or(Error::HttpClientCreationFailed {
+            model: name.clone(),
+        })?;
+        Ok(Self {
+            client,
             endpoint: DEFAULT_ENDPOINT.to_string(),
-            name: name.into(),
+            name,
             model_id: DEFAULT_MODEL.to_string(),
             api_key: api_key.into(),
-        }
+        })
     }
 
     #[must_use]

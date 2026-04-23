@@ -157,15 +157,18 @@ impl Debug for HttpReranker {
 }
 
 impl HttpReranker {
-    #[must_use]
-    pub fn new(name: impl Into<String>, endpoint: impl Into<String>) -> Self {
-        Self {
-            client: create_http_client().unwrap_or_default(),
+    pub fn try_new(name: impl Into<String>, endpoint: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        let client = create_http_client().ok_or(Error::HttpClientCreationFailed {
+            model: name.clone(),
+        })?;
+        Ok(Self {
+            client,
             endpoint: endpoint.into(),
-            name: name.into(),
+            name,
             model_id: None,
             api_key: None,
-        }
+        })
     }
 
     #[must_use]

@@ -171,40 +171,40 @@ mod tests {
     #[test]
     fn prefix_recognizes_providers() {
         assert_eq!(
-            RerankerPrefix::try_from("cohere:rerank-v3.5").unwrap(),
+            RerankerPrefix::try_from("cohere:rerank-v3.5").expect("cohere: prefix"),
             RerankerPrefix::Cohere
         );
         assert_eq!(
-            RerankerPrefix::try_from("voyage:rerank-2").unwrap(),
+            RerankerPrefix::try_from("voyage:rerank-2").expect("voyage: prefix"),
             RerankerPrefix::Voyage
         );
         assert_eq!(
-            RerankerPrefix::try_from("jina:jina-reranker-v2").unwrap(),
+            RerankerPrefix::try_from("jina:jina-reranker-v2").expect("jina: prefix"),
             RerankerPrefix::Jina
         );
         assert_eq!(
-            RerankerPrefix::try_from("http://example.com/rerank").unwrap(),
+            RerankerPrefix::try_from("http://example.com/rerank").expect("http prefix"),
             RerankerPrefix::Http
         );
         assert_eq!(
-            RerankerPrefix::try_from("https://example.com/rerank").unwrap(),
+            RerankerPrefix::try_from("https://example.com/rerank").expect("https prefix"),
             RerankerPrefix::Http
         );
-        assert!(RerankerPrefix::try_from("openai:gpt-4").is_err());
+        RerankerPrefix::try_from("openai:gpt-4").expect_err("unknown provider must error");
     }
 
     #[test]
     fn prefix_requires_delimiter_after_provider_name() {
         // `cohereXYZ:...` must NOT match Cohere — otherwise `get_model_id()`
         // would strip nothing and we'd dispatch to the wrong client.
-        assert!(RerankerPrefix::try_from("cohereXYZ:rerank-v3.5").is_err());
-        assert!(RerankerPrefix::try_from("voyager:rerank-2").is_err());
-        assert!(RerankerPrefix::try_from("jinafoo").is_err());
+        RerankerPrefix::try_from("cohereXYZ:rerank-v3.5").expect_err("stray suffix on cohere");
+        RerankerPrefix::try_from("voyager:rerank-2").expect_err("stray suffix on voyage");
+        RerankerPrefix::try_from("jinafoo").expect_err("stray suffix on jina");
 
         // Bare provider name (no delimiter, no model id) is also rejected.
-        assert!(RerankerPrefix::try_from("cohere").is_err());
-        assert!(RerankerPrefix::try_from("voyage").is_err());
-        assert!(RerankerPrefix::try_from("jina").is_err());
+        RerankerPrefix::try_from("cohere").expect_err("bare cohere");
+        RerankerPrefix::try_from("voyage").expect_err("bare voyage");
+        RerankerPrefix::try_from("jina").expect_err("bare jina");
     }
 
     #[test]
