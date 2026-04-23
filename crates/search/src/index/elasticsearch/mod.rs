@@ -20,6 +20,8 @@ limitations under the License.
 //! with the Spice search pipeline, enabling hybrid search via `vector_search`,
 //! `text_search`, and `rrf` UDTFs.
 
+mod write;
+
 use std::any::Any;
 use std::sync::Arc;
 
@@ -32,11 +34,14 @@ use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion_expr::LogicalPlanBuilder;
 use elasticsearch::Elasticsearch;
+use futures::future::try_join_all;
 use llms::embeddings::Embed;
 use runtime_datafusion_index::Index;
 
 use crate::SEARCH_SCORE_COLUMN_NAME;
+use crate::index::chunking::{CHUNKED_INDEX_CHUNK_KEY, ChunkedSearchIndex};
 use crate::index::{SearchIndex, VectorIndex, embedding_col};
+use crate::metadata::MetadataColumns;
 use data_components::elasticsearch::search_table::{
     ElasticsearchKnnTable, ElasticsearchTextSearchTable, QueryEmbedder,
 };
@@ -91,6 +96,14 @@ pub struct ElasticsearchIndex {
 
     /// Full source schema for extracting fields from Elasticsearch results.
     pub source_schema: SchemaRef,
+
+    /// Filterable / non-filterable metadata columns as declared by the user.
+    /// These influence the ES mapping (index: true vs index: false) but are
+    /// otherwise written into `_source` like any other source column.
+    pub metadata_columns: MetadataColumns,
+
+    /// Maximum number of rows to send per Elasticsearch `_bulk` request.
+    pub batch_write_rows: usize,
 }
 
 #[async_trait]
@@ -107,10 +120,9 @@ impl SearchIndex for ElasticsearchIndex {
         &self,
         record: RecordBatch,
     ) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>> {
-        // Elasticsearch indexes are typically populated by the source system;
-        // for now, writes from the Spice pipeline are a pass-through.
-        // A full implementation would bulk-index documents here.
-        Ok(record)
+        write::write(self, record)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
     }
 
     fn query_table_provider(&self, query: &str) -> Result<Arc<LogicalPlan>, DataFusionError> {
@@ -228,14 +240,59 @@ impl Index for ElasticsearchIndex {
     fn required_columns(&self) -> Vec<String> {
         let mut cols: Vec<_> = self.primary_key.iter().map(|f| f.name().clone()).collect();
         cols.push(self.embedded_column.clone());
+        for t in &self.text_fields {
+            if !cols.contains(t) {
+                cols.push(t.clone());
+            }
+        }
+
+        // Include user-declared metadata columns (`vectors: filterable | non-filterable`)
+        // so they survive projection pruning and make it into the ES `_source` on
+        // refresh/CDC indexing. Without this, the mapping hints would be ineffective
+        // and expected metadata would be dropped. The derived embedding column is
+        // excluded because the write path computes it itself.
+        let derived_embedding_column = embedding_col(&self.embedded_column);
+        for name in self.metadata_columns.all_names() {
+            if name == derived_embedding_column {
+                continue;
+            }
+            if !cols.contains(&name) {
+                cols.push(name);
+            }
+        }
+
         cols
+    }
+
+    async fn compute_index(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, DataFusionError> {
+        let futs = batches.into_iter().map(|rb| async move {
+            write::write(self, rb)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))
+        });
+        try_join_all(futs).await
     }
 }
 
 impl ElasticsearchIndex {
     /// Schema for `query_table_provider` results: primary keys + embedding + `_score`.
+    ///
+    /// `_spice.chunk_id` is excluded even when present in `self.primary_key` (added by
+    /// [`ChunkedSearchIndex::augment_primary_key`]). It is an internal ordering key used
+    /// only inside `list_table_provider`'s aggregation — it is never stored in ES `_source`
+    /// as a retrievable field, so `knn_hits_to_batch` would fill it with nulls and violate
+    /// the non-nullable declaration ("Column '_spice.chunk_id' is declared as non-nullable
+    /// but contains null values").
     fn query_result_schema(&self) -> SchemaRef {
-        let mut fields: Vec<Field> = self.primary_key.clone();
+        let mut fields: Vec<Field> = self
+            .primary_key
+            .iter()
+            .filter(|f| f.name() != CHUNKED_INDEX_CHUNK_KEY)
+            .cloned()
+            .collect();
         fields.push(Field::new(
             embedding_col(&self.embedded_column),
             DataType::FixedSizeList(
@@ -252,7 +309,16 @@ impl ElasticsearchIndex {
         Arc::new(Schema::new(fields))
     }
 
-    /// Schema for `list_table_provider` results: primary keys + embedding.
+    /// Schema for `list_table_provider` results: primary keys + embedding (+ offset when chunked).
+    ///
+    /// The offset column (`{embedded_column}_offset`) is only included when this index is
+    /// wrapped by [`ChunkedSearchIndex`] / [`super::chunking::ChunkedVectorIndex`] (detected
+    /// by the presence of [`CHUNKED_INDEX_CHUNK_KEY`] in `self.primary_key`). The chunking
+    /// write path always emits the offset column into the inner-index batch, so Elasticsearch
+    /// stores it even though the schema was previously not advertising it—causing
+    /// "Schema error: No field named content_offset". For non-chunked indexes the offset
+    /// is never written, so advertising it here would produce null values and violate the
+    /// non-nullable declaration.
     fn list_result_schema(&self) -> SchemaRef {
         let mut fields: Vec<Field> = self.primary_key.clone();
         fields.push(Field::new(
@@ -263,7 +329,23 @@ impl ElasticsearchIndex {
             ),
             true,
         ));
+        if self.is_chunked() {
+            fields.push(Field::new(
+                ChunkedSearchIndex::chunking_offset_col(&self.embedded_column),
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 2),
+                false,
+            ));
+        }
         Arc::new(Schema::new(fields))
+    }
+
+    /// Whether this index is being used as the inner index of a [`ChunkedSearchIndex`],
+    /// detected by the presence of [`CHUNKED_INDEX_CHUNK_KEY`] in `self.primary_key`
+    /// (added by [`ChunkedSearchIndex::augment_primary_key`]).
+    fn is_chunked(&self) -> bool {
+        self.primary_key
+            .iter()
+            .any(|f| f.name() == CHUNKED_INDEX_CHUNK_KEY)
     }
 }
 
