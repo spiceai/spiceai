@@ -86,7 +86,7 @@ impl PartitionMetadata {
     }
 }
 
-/// Converts a partition value map into a serialized DataFusion [`Expr`] byte representation.
+/// Converts a partition value map into a serialized `DataFusion` [`Expr`] byte representation.
 ///
 /// # Errors
 ///
@@ -160,7 +160,7 @@ impl TablePartitionMetadata {
     ///
     /// # Errors
     ///
-    /// Returns an error if the table schema cannot be converted to a DataFusion schema
+    /// Returns an error if the table schema cannot be converted to a `DataFusion` schema
     /// or if a partition expression cannot be parsed.
     pub fn all_executor_partitions(
         &self,
