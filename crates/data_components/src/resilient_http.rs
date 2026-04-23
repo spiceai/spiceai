@@ -22,8 +22,8 @@ use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Semaphore;
 use util::retry_strategy::{Backoff, BackoffMethod, RetryBackoffBuilder};
-pub const DEFAULT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-pub const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_HTTP_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 const DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 16;
@@ -217,7 +217,7 @@ pub fn configure_client_builder(builder: ClientBuilder) -> ClientBuilder {
 /// Like [`configure_client_builder`] but lets the caller override the connect
 /// and per-request timeouts. Pool and keepalive settings remain at their
 /// defaults.
-pub fn configure_client_builder_with_timeouts(
+pub(crate) fn configure_client_builder_with_timeouts(
     builder: ClientBuilder,
     connect_timeout: Duration,
     request_timeout: Duration,
