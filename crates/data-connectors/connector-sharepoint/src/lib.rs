@@ -533,10 +533,6 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
 
 
 #[cfg(test)]
-#[expect(
-    clippy::unwrap_used,
-    reason = "tests use unwrap to assert happy paths"
-)]
 mod tests {
     #[test]
     fn uses_object_store_detects_prefix() {

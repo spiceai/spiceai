@@ -59,6 +59,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 
 use super::url::DriveRef;
+use crate::resilient_http::sanitize_error_body;
 
 /// SharePoint cap on a single `PUT /content` is 4 MiB. We use a slightly lower
 /// threshold to leave headroom for request headers/overhead.
@@ -262,7 +263,7 @@ impl ObjectStore for SharepointObjectStore {
         let drive = self.drive.clone();
         let prefix = prefix.cloned().unwrap_or_else(|| Path::from(""));
         Box::pin(async_stream::stream! {
-            let mut pages = list_children(&client, &drive, &prefix, false);
+            let mut pages = list_children(&client, &drive, &prefix);
             while let Some(res) = pages.next().await {
                 match res {
                     Ok(batch) => {
@@ -280,7 +281,7 @@ impl ObjectStore for SharepointObjectStore {
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
         let prefix = prefix.cloned().unwrap_or_else(|| Path::from(""));
-        let mut pages = list_children(&self.client, &self.drive, &prefix, true);
+        let mut pages = list_children(&self.client, &self.drive, &prefix);
 
         let mut objects = Vec::new();
         let mut common_prefixes = Vec::new();
@@ -627,7 +628,7 @@ async fn parse_put_response(response: reqwest::Response) -> ObjectStoreResult<Pu
             store: STORE_TAG,
             source: Box::new(std::io::Error::other(format!(
                 "SharePoint upload failed: HTTP {status}: {}",
-                summarize_error_body(&body)
+                sanitize_error_body(&body, 256)
             ))),
         });
     }
@@ -789,7 +790,6 @@ fn list_children(
     client: &GraphClient,
     drive: &DriveRef,
     item_path: &Path,
-    _want_prefixes: bool,
 ) -> BoxStream<'static, ObjectStoreResult<Vec<DriveItemMeta>>> {
     let graph_path = SharepointObjectStore::graph_path(item_path);
     let req_result = match drive_chain(client, drive) {
@@ -844,34 +844,13 @@ fn list_children(
     })
 }
 
-/// Collapse whitespace in an HTTP error body to a single line and cap it to
-/// a readable length, so logs/error messages stay one-line and grep-friendly.
-fn summarize_error_body(body: &str) -> String {
-    const MAX: usize = 256;
-    let mut out = String::with_capacity(body.len().min(MAX));
-    let mut prev_space = false;
-    for ch in body.chars() {
-        if ch.is_whitespace() {
-            if !prev_space {
-                out.push(' ');
-                prev_space = true;
-            }
-        } else {
-            out.push(ch);
-            prev_space = false;
-        }
-        if out.len() >= MAX {
-            out.push('…');
-            break;
-        }
-    }
-    out.trim().to_string()
-}
-
 fn graph_err(e: &graph_rs_sdk::GraphFailure) -> object_store::Error {
+    // Delegate to the shared Graph-specific error formatter in
+    // `sharepoint::error` so permission / token errors get their
+    // structured inner_error surfaced instead of just `Display`.
     object_store::Error::Generic {
         store: STORE_TAG,
-        source: Box::new(std::io::Error::other(format!("Graph API error: {e}"))),
+        source: Box::new(std::io::Error::other(super::error::resolve_graph_failure(e))),
     }
 }
 
@@ -923,19 +902,6 @@ mod tests {
     fn child_location_nested() {
         let p = child_location(&Path::from("Documents/2026"), "report.parquet");
         assert_eq!(p.as_ref(), "Documents/2026/report.parquet");
-    }
-
-    #[test]
-    fn summarize_error_body_collapses_whitespace() {
-        let s = summarize_error_body("line1\n\nline2\t\tfinal");
-        assert_eq!(s, "line1 line2 final");
-    }
-
-    #[test]
-    fn summarize_error_body_truncates_long_input() {
-        let s = summarize_error_body(&"x".repeat(500));
-        assert!(s.len() < 270);
-        assert!(s.ends_with("…"));
     }
 
     #[test]
@@ -1094,7 +1060,11 @@ mod tests {
         fn mock_store(endpoint: &str) -> SharepointObjectStore {
             let mut client = GraphClient::new("unused-test-token");
             client.use_test_endpoint(&Url::parse(&format!("{endpoint}/v1.0")).unwrap());
-            SharepointObjectStore::new(Arc::new(client), SharepointObjectStoreConfig::default())
+            SharepointObjectStore::new(
+                Arc::new(client),
+                DriveRef::Me,
+                SharepointObjectStoreConfig::default(),
+            )
         }
 
         /// Run a test future on a tokio runtime with a generous thread stack —
@@ -1136,7 +1106,7 @@ mod tests {
                 let (url, count, _captured) = start_mock(vec![MockResp::ok_json(HEAD_JSON)]).await;
                 let store = mock_store(&url);
                 let meta = store
-                    .head(&Path::from("me/Documents/file.csv"))
+                    .head(&Path::from("Documents/file.csv"))
                     .await
                     .unwrap();
                 assert_eq!(meta.size, 42);
@@ -1154,7 +1124,7 @@ mod tests {
                     start_mock(vec![MockResp::empty("404 Not Found")]).await;
                 let store = mock_store(&url);
                 let err = store
-                    .head(&Path::from("me/Documents/missing.csv"))
+                    .head(&Path::from("Documents/missing.csv"))
                     .await
                     .unwrap_err();
                 assert!(
@@ -1175,7 +1145,7 @@ mod tests {
                 .await;
                 let store = mock_store(&url);
                 let result = store
-                    .get_opts(&Path::from("me/Documents/file.csv"), GetOptions::default())
+                    .get_opts(&Path::from("Documents/file.csv"), GetOptions::default())
                     .await
                     .unwrap();
                 assert_eq!(result.meta.size, 42);
@@ -1200,7 +1170,7 @@ mod tests {
                 let (url, count, _captured) = start_mock(vec![MockResp::ok_json("{}")]).await;
                 let store = mock_store(&url);
                 store
-                    .delete(&Path::from("me/Documents/file.csv"))
+                    .delete(&Path::from("Documents/file.csv"))
                     .await
                     .unwrap();
                 assert_eq!(count.load(Ordering::SeqCst), 1);
@@ -1218,7 +1188,7 @@ mod tests {
                 .await;
                 let store = mock_store(&url);
                 let err = store
-                    .delete(&Path::from("me/Documents/gone.csv"))
+                    .delete(&Path::from("Documents/gone.csv"))
                     .await
                     .unwrap_err();
                 assert!(matches!(err, object_store::Error::NotFound { .. }));
@@ -1232,7 +1202,7 @@ mod tests {
                 let store = mock_store(&url);
                 let result = store
                     .put_opts(
-                        &Path::from("me/Documents/file.csv"),
+                        &Path::from("Documents/file.csv"),
                         PutPayload::from(bytes::Bytes::from_static(b"abc123")),
                         PutOptions::default(),
                     )
@@ -1276,7 +1246,7 @@ mod tests {
                 let (url, count, _captured) =
                     start_mock(vec![MockResp::ok_json(page1), MockResp::ok_json(page2)]).await;
                 let store = mock_store(&url);
-                let mut stream = store.list(Some(&Path::from("me/Documents")));
+                let mut stream = store.list(Some(&Path::from("Documents")));
                 let mut names = Vec::new();
                 while let Some(item) = stream.next().await {
                     let meta = item.unwrap();
@@ -1305,7 +1275,7 @@ mod tests {
                 let (url, _count, _captured) = start_mock(vec![MockResp::ok_json(page)]).await;
                 let store = mock_store(&url);
                 let result = store
-                    .list_with_delimiter(Some(&Path::from("me/Documents")))
+                    .list_with_delimiter(Some(&Path::from("Documents")))
                     .await
                     .unwrap();
                 assert_eq!(result.objects.len(), 1);

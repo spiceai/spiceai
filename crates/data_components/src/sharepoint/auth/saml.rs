@@ -46,9 +46,6 @@ use serde::Deserialize;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::RwLock;
 
-/// Default Graph scope when none is specified by the caller.
-const DEFAULT_SCOPE: &str = "https://graph.microsoft.com/.default";
-
 /// Default grace period before expiry when we consider the token stale and
 /// eagerly re-exchange.
 const EXPIRY_GRACE: Duration = Duration::from_secs(60);
@@ -185,7 +182,7 @@ impl SamlBearerFlow {
             .config
             .scope
             .clone()
-            .unwrap_or_else(|| DEFAULT_SCOPE.to_string());
+            .unwrap_or_else(|| super::DEFAULT_SCOPE.to_string());
 
         let params: [(&str, &str); 4] = [
             ("grant_type", GRANT_TYPE),
