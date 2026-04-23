@@ -19,51 +19,25 @@ use std::{
     sync::Arc,
 };
 
-use app::{App, spicepod::component::runtime::Scheduler as SchedulerConfig};
+use app::App;
 
 use datafusion::{execution::FunctionRegistry, logical_expr::Expr, sql::TableReference};
 use datafusion_proto::bytes::Serializeable;
-use object_store::ObjectStore;
-use object_store::prefix::PrefixStore;
 use runtime_proto::{
     AllocateInitialPartitionsRequest, cluster_service_client::ClusterServiceClient,
 };
-use runtime_secrets::Secrets;
 use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
-use tokio::{runtime::Handle, sync::RwLock};
 use tonic::transport::Channel;
 
-use super::{PartitionManager, Result};
+use super::PartitionManager;
 use crate::{
     cluster::partition::{
-        MissingPartitionKeysSnafu, ObjectStoreBuildSnafu, PartitionAllocationRequestSnafu,
-        PartitionExpressionDeserializationSnafu, discovery,
+        MissingPartitionKeysSnafu, PartitionAllocationRequestSnafu,
+        PartitionExpressionDeserializationSnafu, Result, discovery,
     },
     datafusion::DataFusion,
 };
-
-/// Builds an object store for partition metadata from scheduler configuration.
-pub async fn build_partition_metadata_store(
-    io_runtime: Handle,
-    secrets: Arc<RwLock<Secrets>>,
-    config: &SchedulerConfig,
-) -> Result<Arc<dyn ObjectStore>> {
-    let (store, prefix) = crate::cluster::scheduler_registry::build_object_store_internal(
-        secrets,
-        io_runtime,
-        &config.state_location,
-        config,
-    )
-    .await
-    .context(ObjectStoreBuildSnafu)?;
-
-    if prefix.is_empty() {
-        Ok(store)
-    } else {
-        Ok(Arc::new(PrefixStore::new(store, prefix)))
-    }
-}
 
 /// Initialize acceleration partition metadata for all accelerated tables on scheduler startup.
 ///

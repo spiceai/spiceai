@@ -27,7 +27,10 @@ limitations under the License.
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 //!  - `value` (UTF8): The subset of the column most relevant. For non-chunked embedding columns, `value` is the entire value.
 
-use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
+use arrow::{
+    array::{Array, FixedSizeListArray, StringArray},
+    datatypes::Float32Type,
+};
 use arrow_schema::{DataType, Field, SchemaRef};
 use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::exec_err;
@@ -47,7 +50,8 @@ use datafusion::{
 };
 
 use datafusion_expr::{
-    LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, binary_expr, col, ident,
+    LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, TableProviderFilterPushDown,
+    binary_expr, col, ident,
 };
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use futures::FutureExt;
@@ -61,7 +65,7 @@ use search::generation::util::get_primary_keys;
 use std::{
     any::Any,
     cmp::min,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, LazyLock, Weak},
 };
 
@@ -88,7 +92,10 @@ use {
 };
 
 #[cfg(feature = "s3_vectors")]
-use {search::index::chunking::ChunkedSearchIndex, search::index::s3_vectors::S3Vector};
+use search::index::s3_vectors::S3Vector;
+
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+use search::index::chunking::ChunkedSearchIndex;
 
 #[cfg(feature = "elasticsearch")]
 use search::index::elasticsearch::ElasticsearchIndex;
@@ -412,6 +419,39 @@ impl VectorSearchTableFunc {
                 }
                 Ok(out)
             }
+            // SQL array literal syntax: ['a', 'b', 'c'] parses as ScalarValue::List
+            Some(Expr::Literal(ScalarValue::List(arr), None)) => {
+                let inner = arr.value(0);
+                let strings = inner
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(
+                            "Multi-query array elements must be strings.".to_string(),
+                        )
+                    })?;
+                if strings.is_empty() {
+                    return Err(DataFusionError::Plan(
+                        "Multi-query array must contain at least one query string.".to_string(),
+                    ));
+                }
+                if strings.len() > VECTOR_SEARCH_MAX_QUERIES {
+                    return Err(DataFusionError::Plan(format!(
+                        "Multi-query array is limited to {VECTOR_SEARCH_MAX_QUERIES} query strings, got {}.",
+                        strings.len()
+                    )));
+                }
+                let mut out = Vec::with_capacity(strings.len());
+                for i in 0..strings.len() {
+                    if strings.is_null(i) {
+                        return Err(DataFusionError::Plan(
+                            "Multi-query array elements cannot be null.".to_string(),
+                        ));
+                    }
+                    out.push(strings.value(i).to_string());
+                }
+                Ok(out)
+            }
             other => Err(DataFusionError::Plan(format!(
                 "Second argument must be a query string or array of query strings, but got {other:?}."
             ))),
@@ -558,15 +598,6 @@ impl VectorSearchTableFunc {
                         .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
                 );
             }
-            if let Some((chunked_indexes, _)) =
-                find_index_in_table_provider::<ChunkedSearchIndex>(tbl)
-            {
-                vector_indexes.extend(
-                    chunked_indexes
-                        .into_iter()
-                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
-                );
-            }
         }
 
         #[cfg(feature = "elasticsearch")]
@@ -578,6 +609,18 @@ impl VectorSearchTableFunc {
                         .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
                 );
             }
+        }
+
+        // Chunked search indexes (used by both S3 Vectors and Elasticsearch engines
+        // when chunking is enabled) are discovered once here to avoid registering
+        // the same `ChunkedSearchIndex` twice when both features are enabled.
+        if let Some((chunked_indexes, _)) = find_index_in_table_provider::<ChunkedSearchIndex>(tbl)
+        {
+            vector_indexes.extend(
+                chunked_indexes
+                    .into_iter()
+                    .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
+            );
         }
 
         if vector_indexes.is_empty() {
@@ -906,6 +949,33 @@ impl TableProvider for VectorSearchUDTFProvider {
         TableType::View
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        let schema = self.underlying.schema();
+        let base_field_names: HashSet<&str> =
+            schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        filters
+            .iter()
+            .map(|f| {
+                // Only push down filters whose columns all exist in the underlying table.
+                // Filters on computed columns (e.g. _score) are not pushable.
+                let pushable = f
+                    .column_refs()
+                    .iter()
+                    .all(|c| base_field_names.contains(c.name()));
+
+                Ok(if pushable {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                })
+            })
+            .collect()
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -1072,11 +1142,22 @@ fn alias_value_to_match(
 
 #[cfg(test)]
 mod tests {
-    use super::{VectorSearchTableFunc, closest_column};
+    use super::{VectorSearchTableFunc, VectorSearchTableFuncArgs, closest_column};
+    use crate::embeddings::udtf::VectorSearchUDTFProvider;
+    use crate::model::EmbeddingModelStore;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::TableProvider;
+    use datafusion::datasource::MemTable;
     use datafusion::prelude::Expr;
     use datafusion::scalar::ScalarValue;
+    use datafusion::sql::TableReference;
+    use datafusion_expr::TableProviderFilterPushDown;
     use datafusion_expr::expr::ScalarFunction;
+    use datafusion_expr::{col, lit};
+    use search::SEARCH_SCORE_COLUMN_NAME;
+    use std::collections::HashMap;
     use std::sync::Arc;
+    use tokio::sync::RwLock;
 
     fn fields(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| (*s).to_string()).collect()
@@ -1154,5 +1235,157 @@ mod tests {
         let q = Expr::ScalarFunction(ScalarFunction::new_udf(Arc::clone(&make_array), vec![]));
         let err = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect_err("expected rejection");
         assert!(err.to_string().contains("at least one query string"));
+    }
+
+    fn list_literal(strs: &[&str]) -> Expr {
+        use arrow::datatypes::DataType;
+        let scalars: Vec<ScalarValue> = strs
+            .iter()
+            .map(|s| ScalarValue::Utf8(Some((*s).to_string())))
+            .collect();
+        let arr = ScalarValue::new_list_nullable(&scalars, &DataType::Utf8);
+        Expr::Literal(ScalarValue::List(arr), None)
+    }
+
+    #[test]
+    fn test_parse_query_arg_sql_array_literal() {
+        let q = list_literal(&["climate", "economy", "anxiety"]);
+        let out = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect("ok");
+        assert_eq!(
+            out,
+            vec![
+                "climate".to_string(),
+                "economy".to_string(),
+                "anxiety".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_query_arg_sql_array_single_element() {
+        let q = list_literal(&["hello world"]);
+        let out = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect("ok");
+        assert_eq!(out, vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_query_arg_sql_array_empty_rejected() {
+        let q = list_literal(&[]);
+        let err = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect_err("expected rejection");
+        assert!(err.to_string().contains("at least one query string"));
+    }
+
+    /// Create a minimal `VectorSearchUDTFProvider` with the given underlying schema for testing.
+    fn make_provider(schema: Schema) -> VectorSearchUDTFProvider {
+        let schema = Arc::new(schema);
+        let underlying: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("valid MemTable"));
+        VectorSearchUDTFProvider {
+            args: VectorSearchTableFuncArgs {
+                tbl: TableReference::bare("test_table"),
+                query: "test query".to_string(),
+                queries: vec!["test query".to_string()],
+                column: None,
+                limit: Some(5),
+                include_score: Some(true),
+                distance_metric: None,
+            },
+            underlying,
+            embedded_columns: HashMap::new(),
+            embedding_models: Arc::new(RwLock::new(EmbeddingModelStore::default())),
+        }
+    }
+
+    #[test]
+    fn test_filter_pushdown_base_column() {
+        let provider = make_provider(Schema::new(vec![
+            Field::new("review_date", DataType::Date32, false),
+            Field::new("review_body", DataType::Utf8, false),
+        ]));
+
+        let filter = col("review_date").gt(lit("2015-08-30"));
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(result, vec![TableProviderFilterPushDown::Exact]);
+    }
+
+    #[test]
+    fn test_filter_pushdown_computed_column_unsupported() {
+        let provider = make_provider(Schema::new(vec![Field::new(
+            "review_date",
+            DataType::Date32,
+            false,
+        )]));
+
+        let filter = col(SEARCH_SCORE_COLUMN_NAME).gt(lit(0.5));
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(result, vec![TableProviderFilterPushDown::Unsupported]);
+    }
+
+    #[test]
+    fn test_filter_pushdown_mixed_filters() {
+        let provider = make_provider(Schema::new(vec![
+            Field::new("review_date", DataType::Date32, false),
+            Field::new("star_rating", DataType::Int32, false),
+        ]));
+
+        let base_filter = col("review_date").gt(lit("2015-08-30"));
+        let score_filter = col(SEARCH_SCORE_COLUMN_NAME).gt(lit(0.5));
+        let multi_base_filter = col("star_rating").gt_eq(lit(4));
+
+        let result = provider
+            .supports_filters_pushdown(&[&base_filter, &score_filter, &multi_base_filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(
+            result,
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_filter_pushdown_mixed_column_expr_unsupported() {
+        let provider = make_provider(Schema::new(vec![Field::new(
+            "review_date",
+            DataType::Date32,
+            false,
+        )]));
+
+        // A filter referencing both a base column and a computed column should not be pushed down.
+        let filter = col("review_date")
+            .gt(lit("2015-08-30"))
+            .and(col(SEARCH_SCORE_COLUMN_NAME).gt(lit(0.5)));
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(result, vec![TableProviderFilterPushDown::Unsupported]);
+    }
+
+    #[test]
+    fn test_filter_pushdown_constant_expr_exact() {
+        let provider = make_provider(Schema::new(vec![Field::new(
+            "review_date",
+            DataType::Date32,
+            false,
+        )]));
+
+        // A constant expression with no column refs (e.g. `WHERE true`) references no computed
+        // columns, so it is safe to push down — consistent with EmbeddingTable behavior.
+        let filter = lit(true);
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(result, vec![TableProviderFilterPushDown::Exact]);
     }
 }
