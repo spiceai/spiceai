@@ -129,11 +129,21 @@ impl TryFrom<&str> for RerankerPrefix {
     type Error = &'static str;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        if value.starts_with("cohere") {
+        // Require `:` or `/` after the provider name so strings like
+        // `cohereXYZ:...` or a bare `cohere` aren't silently routed to the
+        // Cohere provider (which would then fail inside `get_model_id()`
+        // with a confusing `UnknownSource`-style error).
+        let has_provider_delim = |prefix: &str| {
+            value
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with(':') || rest.starts_with('/'))
+        };
+
+        if has_provider_delim("cohere") {
             Ok(RerankerPrefix::Cohere)
-        } else if value.starts_with("voyage") {
+        } else if has_provider_delim("voyage") {
             Ok(RerankerPrefix::Voyage)
-        } else if value.starts_with("jina") {
+        } else if has_provider_delim("jina") {
             Ok(RerankerPrefix::Jina)
         } else if value.starts_with("http://") || value.starts_with("https://") {
             Ok(RerankerPrefix::Http)
@@ -181,6 +191,20 @@ mod tests {
             RerankerPrefix::Http
         );
         assert!(RerankerPrefix::try_from("openai:gpt-4").is_err());
+    }
+
+    #[test]
+    fn prefix_requires_delimiter_after_provider_name() {
+        // `cohereXYZ:...` must NOT match Cohere — otherwise `get_model_id()`
+        // would strip nothing and we'd dispatch to the wrong client.
+        assert!(RerankerPrefix::try_from("cohereXYZ:rerank-v3.5").is_err());
+        assert!(RerankerPrefix::try_from("voyager:rerank-2").is_err());
+        assert!(RerankerPrefix::try_from("jinafoo").is_err());
+
+        // Bare provider name (no delimiter, no model id) is also rejected.
+        assert!(RerankerPrefix::try_from("cohere").is_err());
+        assert!(RerankerPrefix::try_from("voyage").is_err());
+        assert!(RerankerPrefix::try_from("jina").is_err());
     }
 
     #[test]

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Jina Reranker client — https://jina.ai/reranker/
+//! Jina Reranker client — <https://jina.ai/reranker/>
 //!
 //! `POST https://api.jina.ai/v1/rerank` with `{model, query, documents}`. The
 //! response uses Cohere-compatible `results` with `{index, relevance_score}`.
@@ -24,7 +24,7 @@ use reqwest::Client;
 use serde::Serialize;
 use std::fmt::Debug;
 
-use super::http::{CohereLikeResponse, scores_from_results};
+use super::http::{CohereLikeResponse, scores_from_results_strict};
 use super::{Error, ModelCallFailedSnafu, Rerank, Result};
 use crate::provider::create_http_client;
 use snafu::ResultExt;
@@ -53,7 +53,7 @@ impl Debug for JinaReranker {
             .field("name", &self.name)
             .field("model_id", &self.model_id)
             .field("endpoint", &self.endpoint)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -114,7 +114,7 @@ impl Rerank for JinaReranker {
                 response: format!("Jina rerank response decode failed: {e}"),
             })?;
 
-        Ok(scores_from_results(&resp.results, documents.len()))
+        scores_from_results_strict(&resp.results, documents.len(), &self.name)
     }
 
     fn model_name(&self) -> Option<&str> {

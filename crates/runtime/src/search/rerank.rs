@@ -65,7 +65,7 @@ use crate::search::util::table_ref_from_column_expr;
 pub static RERANK_UDTF_NAME: &str = "rerank";
 
 /// Signature accepts a variadic positional input plus named arguments.
-/// Parameter names are declared so DataFusion v51+ named-arg syntax works.
+/// Parameter names are declared so `DataFusion` v51+ named-arg syntax works.
 pub static RERANK_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
     let param_names = vec![
         "input".to_string(),
@@ -121,7 +121,7 @@ pub struct RerankTableFuncArgs {
 #[derive(Debug, Clone)]
 pub enum RerankInput {
     /// Nested UDTF call (`vector_search`, `text_search`, or `rrf`). Stored as
-    /// the raw ScalarFunction expression so we can delegate to the session's
+    /// the raw `ScalarFunction` expression so we can delegate to the session's
     /// table-function registry — same mechanism `rrf` uses for its children.
     NestedUdtf(ScalarFunction),
     /// Bare table reference.
@@ -361,7 +361,7 @@ impl std::fmt::Debug for RerankTableFunc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RerankTableFunc")
             .field("df_ptr", &self.df_ptr)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -483,7 +483,7 @@ impl std::fmt::Debug for RerankUDTFProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RerankUDTFProvider")
             .field("args", &self.args)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

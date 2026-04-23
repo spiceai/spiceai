@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Voyage Rerank client — https://docs.voyageai.com/reference/reranker-api
+//! Voyage Rerank client — <https://docs.voyageai.com/reference/reranker-api>
 //!
 //! `POST https://api.voyageai.com/v1/rerank` with `{model, query, documents}`.
 //! Voyage wraps results under `data` (not `results`) with `{index, relevance_score}`
@@ -25,7 +25,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 
-use super::http::{CohereLikeResult, scores_from_results};
+use super::http::{CohereLikeResult, scores_from_results_strict};
 use super::{Error, ModelCallFailedSnafu, Rerank, Result};
 use crate::provider::create_http_client;
 use snafu::ResultExt;
@@ -59,7 +59,7 @@ impl Debug for VoyageReranker {
             .field("name", &self.name)
             .field("model_id", &self.model_id)
             .field("endpoint", &self.endpoint)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -120,7 +120,7 @@ impl Rerank for VoyageReranker {
                 response: format!("Voyage rerank response decode failed: {e}"),
             })?;
 
-        Ok(scores_from_results(&resp.data, documents.len()))
+        scores_from_results_strict(&resp.data, documents.len(), &self.name)
     }
 
     fn model_name(&self) -> Option<&str> {

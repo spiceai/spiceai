@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Cohere Rerank client — https://docs.cohere.com/reference/rerank
+//! Cohere Rerank client — <https://docs.cohere.com/reference/rerank>
 //!
 //! Sends a `POST /v1/rerank` with `{model, query, documents}` and parses the
 //! `{results: [{index, relevance_score}, ...]}` response. The base URL
@@ -26,7 +26,7 @@ use reqwest::Client;
 use serde::Serialize;
 use std::fmt::Debug;
 
-use super::http::{CohereLikeResponse, scores_from_results};
+use super::http::{CohereLikeResponse, scores_from_results_strict};
 use super::{Error, ModelCallFailedSnafu, Rerank, Result};
 use crate::provider::create_http_client;
 use snafu::ResultExt;
@@ -59,7 +59,7 @@ impl Debug for CohereReranker {
             .field("name", &self.name)
             .field("model_id", &self.model_id)
             .field("endpoint", &self.endpoint)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -121,7 +121,7 @@ impl Rerank for CohereReranker {
                 response: format!("Cohere rerank response decode failed: {e}"),
             })?;
 
-        Ok(scores_from_results(&resp.results, documents.len()))
+        scores_from_results_strict(&resp.results, documents.len(), &self.name)
     }
 
     fn model_name(&self) -> Option<&str> {

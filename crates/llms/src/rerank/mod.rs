@@ -153,14 +153,14 @@ impl LlmStrategy {
 
 /// Default listwise prompt template. `{query}` and `{documents}` are replaced
 /// at call time. The model is asked for strict JSON so we can parse it.
-pub const DEFAULT_LISTWISE_PROMPT: &str = r#"You are a relevance reranker. Given a query and a numbered list of documents, rank the documents by how well they answer the query. For each document, return a JSON object with `id` (the 1-based index) and `score` (a relevance score from 0.0 to 1.0 where 1.0 is maximally relevant). Return ONLY a JSON array of these objects, with no surrounding prose. Include an entry for every document in the input.
+pub const DEFAULT_LISTWISE_PROMPT: &str = "You are a relevance reranker. Given a query and a numbered list of documents, rank the documents by how well they answer the query. For each document, return a JSON object with `id` (the 1-based index) and `score` (a relevance score from 0.0 to 1.0 where 1.0 is maximally relevant). Return ONLY a JSON array of these objects, with no surrounding prose. Include an entry for every document in the input.
 
 Query: {query}
 
 Documents:
 {documents}
 
-Response (JSON array only):"#;
+Response (JSON array only):";
 
 /// Default pointwise prompt template. `{query}` and `{document}` are replaced
 /// at call time for each document.
@@ -190,7 +190,7 @@ impl Debug for LlmRerank {
             .field("name", &self.name)
             .field("strategy", &self.strategy)
             .field("has_custom_prompt", &self.prompt_template.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -343,7 +343,7 @@ fn render_template(template: &str, placeholders: &[(&str, &str)]) -> String {
     out
 }
 
-/// Strip common LLM response wrappers (fenced ```json blocks, leading/trailing
+/// Strip common LLM response wrappers (fenced JSON code blocks, leading/trailing
 /// prose) so our JSON parser sees the bare object/array.
 fn strip_llm_wrappers(s: &str) -> &str {
     let trimmed = s.trim();

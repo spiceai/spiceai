@@ -1230,6 +1230,11 @@ impl Runtime {
                     .update_embedding(&embedding.name, ComponentStatus::Initializing);
             }
 
+            for reranker in &app.rerankers {
+                self.status
+                    .update_reranker(&reranker.name, ComponentStatus::Initializing);
+            }
+
             for model in &app.models {
                 self.status
                     .update_model(&model.name, ComponentStatus::Initializing);

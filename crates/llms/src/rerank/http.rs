@@ -65,6 +65,10 @@ pub(crate) struct CohereLikeResult {
 /// Missing indices default to `0.0` (same lenient contract as [`crate::rerank::LlmRerank`]);
 /// out-of-range indices are silently dropped. Callers get a vector whose
 /// `i`th entry is the score for the `i`th input document.
+///
+/// Use this for BYO [`HttpReranker`] endpoints, which may be quirky. Native
+/// providers (Cohere, Voyage, Jina) should use [`scores_from_results_strict`]
+/// so a partial/invalid provider response fails fast.
 pub(crate) fn scores_from_results(results: &[CohereLikeResult], expected: usize) -> Vec<f32> {
     let mut out = vec![0.0_f32; expected];
     for entry in results {
@@ -73,6 +77,52 @@ pub(crate) fn scores_from_results(results: &[CohereLikeResult], expected: usize)
         }
     }
     out
+}
+
+/// Strict version of [`scores_from_results`]: every index in `0..expected`
+/// must be present exactly once. Any missing, duplicated, or out-of-range
+/// index surfaces as [`Error::UnparseableResponse`] so silent mis-ranking
+/// doesn't slip through.
+pub(crate) fn scores_from_results_strict(
+    results: &[CohereLikeResult],
+    expected: usize,
+    model: &str,
+) -> Result<Vec<f32>> {
+    if results.len() != expected {
+        return Err(Error::MismatchedScoreCount {
+            model: model.to_string(),
+            expected,
+            actual: results.len(),
+        });
+    }
+    let mut out = vec![None; expected];
+    for entry in results {
+        if entry.index >= expected {
+            return Err(Error::UnparseableResponse {
+                model: model.to_string(),
+                response: format!(
+                    "reranker returned out-of-range index {} (expected 0..{expected})",
+                    entry.index
+                ),
+            });
+        }
+        if out[entry.index].is_some() {
+            return Err(Error::UnparseableResponse {
+                model: model.to_string(),
+                response: format!("reranker returned duplicate index {}", entry.index),
+            });
+        }
+        out[entry.index] = Some(entry.relevance_score);
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(i, s)| {
+            s.ok_or_else(|| Error::UnparseableResponse {
+                model: model.to_string(),
+                response: format!("reranker response missing index {i}"),
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -102,7 +152,7 @@ impl Debug for HttpReranker {
             .field("endpoint", &self.endpoint)
             .field("has_api_key", &self.api_key.is_some())
             .field("model_id", &self.model_id)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -213,5 +263,67 @@ mod tests {
         let scores = scores_from_results(&results, 2);
         assert!((scores[0] - 0.5).abs() < 1e-6);
         assert!((scores[1] - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn scores_from_results_strict_happy_path() {
+        let results = vec![
+            CohereLikeResult {
+                index: 1,
+                relevance_score: 0.3,
+            },
+            CohereLikeResult {
+                index: 0,
+                relevance_score: 0.9,
+            },
+        ];
+        let scores = scores_from_results_strict(&results, 2, "m").expect("should map all indices");
+        assert!((scores[0] - 0.9).abs() < 1e-6);
+        assert!((scores[1] - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn scores_from_results_strict_rejects_missing_index() {
+        let results = vec![CohereLikeResult {
+            index: 0,
+            relevance_score: 0.9,
+        }];
+        let err = scores_from_results_strict(&results, 2, "m")
+            .expect_err("expected=2 but only 1 result, so must error");
+        assert!(matches!(err, Error::MismatchedScoreCount { .. }));
+    }
+
+    #[test]
+    fn scores_from_results_strict_rejects_duplicate_index() {
+        let results = vec![
+            CohereLikeResult {
+                index: 0,
+                relevance_score: 0.3,
+            },
+            CohereLikeResult {
+                index: 0,
+                relevance_score: 0.9,
+            },
+        ];
+        let err = scores_from_results_strict(&results, 2, "m")
+            .expect_err("duplicate index 0 must surface as an error");
+        assert!(matches!(err, Error::UnparseableResponse { .. }));
+    }
+
+    #[test]
+    fn scores_from_results_strict_rejects_out_of_range() {
+        let results = vec![
+            CohereLikeResult {
+                index: 0,
+                relevance_score: 0.5,
+            },
+            CohereLikeResult {
+                index: 7,
+                relevance_score: 0.9,
+            },
+        ];
+        let err = scores_from_results_strict(&results, 2, "m")
+            .expect_err("out-of-range index must surface as an error");
+        assert!(matches!(err, Error::UnparseableResponse { .. }));
     }
 }
