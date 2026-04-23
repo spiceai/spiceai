@@ -56,6 +56,12 @@ use crate::accelerated_table::refresh::Refresher;
 use crate::federated_table::FederatedTable;
 
 /// Creates a `DataSinkExec` plan for write-back inserts.
+///
+/// Only `InsertOp::Append` is supported. Destructive modes
+/// (`InsertOp::Overwrite` / `InsertOp::Replace`) are rejected because the
+/// asynchronous forward to the federated source can silently fail, which
+/// would leave the accelerator replaced while the source is unchanged —
+/// a particularly surprising form of divergence.
 pub(crate) fn insert_write_back(
     input: Arc<dyn ExecutionPlan>,
     overwrite: InsertOp,
@@ -63,7 +69,9 @@ pub(crate) fn insert_write_back(
     federated: Arc<FederatedTable>,
     refresher: Arc<Refresher>,
     schema: SchemaRef,
-) -> Arc<dyn ExecutionPlan> {
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    validate_insert_op(overwrite)?;
+
     let sink = Arc::new(WriteBackDataSink {
         accelerator,
         federated,
@@ -71,7 +79,20 @@ pub(crate) fn insert_write_back(
         overwrite,
         schema,
     });
-    Arc::new(DataSinkExec::new(input, sink, None))
+    Ok(Arc::new(DataSinkExec::new(input, sink, None)))
+}
+
+/// Returns an error for `InsertOp::Overwrite` / `InsertOp::Replace` because
+/// the asynchronous forward to the federated source can silently fail, which
+/// would leave the accelerator replaced while the source is unchanged — a
+/// particularly surprising form of divergence for destructive writes.
+fn validate_insert_op(overwrite: InsertOp) -> DataFusionResult<()> {
+    match overwrite {
+        InsertOp::Append => Ok(()),
+        InsertOp::Overwrite | InsertOp::Replace => Err(DataFusionError::Plan(
+            "Write-back accelerated tables currently support append writes only".to_string(),
+        )),
+    }
 }
 
 struct WriteBackDataSink {
@@ -126,11 +147,15 @@ impl DataSink for WriteBackDataSink {
             batches.push(batch);
         }
 
-        // Write to the accelerator synchronously using the caller's task
-        // context so session configuration/runtime env (object store,
-        // extensions, limits) is preserved. The caller blocks until this
-        // completes, matching the "write reaches local storage before the
-        // response is returned" contract of write-back caching.
+        // Write to the accelerator synchronously, using the caller's
+        // `TaskContext` when driving the insert plan so session-scoped runtime
+        // resources (object stores, extensions, memory pools) are honored.
+        // The `insert_into` call itself still runs under a fresh
+        // `SessionContext` because `DataSink::write_all` does not receive a
+        // `SessionState` — this matches the existing write-through path. The
+        // caller blocks until this completes, matching the "write reaches local
+        // storage before the response is returned" contract of write-back
+        // caching.
         execute_insert(
             Arc::clone(&self.accelerator),
             Arc::clone(&input_schema),
@@ -186,4 +211,72 @@ async fn execute_insert(
     let task_ctx = task_context.unwrap_or_else(|| ctx.task_ctx());
     let _ = datafusion::physical_plan::collect(plan, task_ctx).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int32Array;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::catalog::MemTable;
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]))
+    }
+
+    fn test_batch(schema: &SchemaRef, values: &[i32]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![Arc::new(Int32Array::from(values.to_vec()))],
+        )
+        .expect("failed to build test record batch")
+    }
+
+    #[test]
+    fn validate_insert_op_allows_append() {
+        assert!(validate_insert_op(InsertOp::Append).is_ok());
+    }
+
+    #[test]
+    fn validate_insert_op_rejects_overwrite() {
+        let err = validate_insert_op(InsertOp::Overwrite)
+            .expect_err("Overwrite must be rejected by write-back validation");
+        assert!(
+            err.to_string().contains("append writes only"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_insert_op_rejects_replace() {
+        let err = validate_insert_op(InsertOp::Replace)
+            .expect_err("Replace must be rejected by write-back validation");
+        assert!(
+            err.to_string().contains("append writes only"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_insert_casts_to_provider_schema() {
+        // Provider schema uses Int64; input batches use Int32 to force a cast.
+        let provider_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let provider: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(Arc::clone(&provider_schema), vec![vec![]])
+                .expect("failed to build MemTable"),
+        );
+
+        let input_schema = test_schema();
+        let batches = vec![test_batch(&input_schema, &[1, 2, 3])];
+
+        execute_insert(
+            Arc::clone(&provider),
+            input_schema,
+            batches,
+            InsertOp::Append,
+            None,
+        )
+        .await
+        .expect("execute_insert should cast Int32 -> Int64 and succeed");
+    }
 }
