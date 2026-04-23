@@ -39,9 +39,7 @@ use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use opentelemetry::KeyValue;
 #[cfg(feature = "mcp")]
 use rmcp::transport::streamable_http_server::{
-    StreamableHttpService,
-    session::local::LocalSessionManager,
-    tower::StreamableHttpServerConfig,
+    StreamableHttpService, session::local::LocalSessionManager, tower::StreamableHttpServerConfig,
 };
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
