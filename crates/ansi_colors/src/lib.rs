@@ -50,6 +50,7 @@ fn check_target(target: Target) -> bool {
 }
 
 /// Returns `true` when colored output should be emitted for the given stream.
+#[must_use]
 pub fn colors_enabled_for(target: Target) -> bool {
     // Internal tests assert literal escape codes, so we force colors on under cfg(test).
     // Downstream crates that want colors under their own test harness should call
@@ -70,6 +71,7 @@ pub fn colors_enabled_for(target: Target) -> bool {
 }
 
 /// Convenience — whether stdout gets colour. Equivalent to `colors_enabled_for(Target::Stdout)`.
+#[must_use]
 pub fn colors_enabled() -> bool {
     colors_enabled_for(Target::Stdout)
 }
