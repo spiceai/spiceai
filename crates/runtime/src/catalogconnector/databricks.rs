@@ -78,7 +78,9 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .description("The execution mode for querying against Databricks.")
         .default("spark_connect"),
     ParameterSpec::runtime("client_timeout")
-        .description("The timeout setting for object store client."),
+        .description("HTTP client request timeout. In 'delta_lake' mode, applies to the object store client. In 'sql_warehouse' mode, applies per-HTTP-call (statement submit, status poll, chunk fetch) — set to the longest expected single call, not total query duration. Accepts durations like '30s' or '5m'. Default: 30s."),
+    ParameterSpec::runtime("connect_timeout")
+        .description("Timeout for establishing TCP/TLS connections to the Databricks API. Applies in 'sql_warehouse' mode. Accepts durations like '10s'. Default: 10s."),
     ParameterSpec::component("cluster_id").description("The ID of the compute cluster in Databricks to use for the query. Only valid when mode is spark_connect."),
     ParameterSpec::component("use_ssl").description("Use a TLS connection to connect to the Databricks Spark Connect endpoint.").default("true"),
     ParameterSpec::component("sql_warehouse_id")
@@ -737,5 +739,28 @@ mod tests {
         );
         assert_eq!(config.connect_timeout, defaults.connect_timeout);
         assert_eq!(config.request_timeout, defaults.request_timeout);
+    }
+
+    /// Regression test: every runtime param consumed by
+    /// [`build_sql_warehouse_config`] must be declared in [`PARAMETERS`],
+    /// otherwise `Parameters::try_new` strips the key before it reaches
+    /// `build_sql_warehouse_config` and the override is silently ignored.
+    #[test]
+    fn test_sql_warehouse_config_params_are_declared_in_parameters_spec() {
+        let expected = [
+            "max_concurrent_requests",
+            "http_max_retries",
+            "backoff_method",
+            "statement_max_retries",
+            "disable_on_permanent_error",
+            "connect_timeout",
+            "client_timeout",
+        ];
+        for name in expected {
+            assert!(
+                PARAMETERS.iter().any(|p| p.name == name),
+                "parameter `{name}` is consumed by build_sql_warehouse_config but not declared in PARAMETERS; Parameters::try_new would strip it"
+            );
+        }
     }
 }
