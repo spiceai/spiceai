@@ -176,11 +176,14 @@ pub struct AwsSecretsManager {
     /// In-process cache of the parsed secret payload. Protected by an
     /// `RwLock` so cache hits never serialize against each other.
     cache: RwLock<Option<CachedPayload>>,
-    /// Single-flight coordinator: whichever task wins the `fetch_mutex`
-    /// performs the network call; others wait on `fetch_notify` and then
-    /// re-read the cache. This avoids holding a lock across the AWS call
-    /// while still coalescing concurrent cache misses.
+    /// Single-flight coordinator. The `fetch_mutex` is held only long enough
+    /// to elect a winner via `fetch_inflight`; it is dropped before any
+    /// `.await` on the AWS call. The winner performs the network fetch with
+    /// no locks held; losers `await` on `fetch_notify` and then re-check the
+    /// cache. This both coalesces concurrent misses and obeys the
+    /// "don't hold locks across `.await`" guideline.
     fetch_mutex: Mutex<()>,
+    fetch_inflight: AtomicBool,
     fetch_notify: Notify,
     cache_ttl: Duration,
     /// One-shot flag used to emit a single warning when a non-object payload
@@ -206,6 +209,7 @@ impl AwsSecretsManager {
             client: OnceCell::new(),
             cache: RwLock::new(None),
             fetch_mutex: Mutex::new(()),
+            fetch_inflight: AtomicBool::new(false),
             fetch_notify: Notify::new(),
             cache_ttl: DEFAULT_CACHE_TTL,
             warned_non_object: AtomicBool::new(false),
@@ -378,47 +382,74 @@ impl AwsSecretsManager {
     /// Concurrency
     /// - Cache hits take only an `RwLock` read and never serialize against
     ///   each other or against in-flight fetches.
-    /// - On a miss, one task wins `fetch_mutex` and performs the network
-    ///   call. Other tasks wait on `fetch_notify` and re-check the cache,
-    ///   so at most one `GetSecretValue` request is in flight per store.
+    /// - On a miss, one task is elected winner via the `fetch_inflight`
+    ///   atomic (under a brief `fetch_mutex` critical section that contains
+    ///   no `.await` against the network). The mutex is dropped before the
+    ///   AWS round-trip so it is never held across an `.await`.
+    /// - Losing tasks `await` on `fetch_notify` and then re-check the cache.
     /// - The AWS SDK call is never made while any lock is held, so a
     ///   stalled endpoint cannot stall cache readers.
     async fn payload(&self) -> crate::AnyErrorResult<Arc<HashMap<String, String>>> {
-        // Fast path: fresh cache hit.
-        if let Some(data) = self.try_cached().await {
-            return Ok(data);
-        }
-
-        // Serialize refreshes so we coalesce concurrent misses. Waiters below
-        // the winner block here until the winner drops `_fetch_guard`.
-        let _fetch_guard = self.fetch_mutex.lock().await;
-
-        // Re-check the cache — another task may have refreshed it while we
-        // were waiting on `fetch_mutex`.
-        if let Some(data) = self.try_cached().await {
-            return Ok(data);
-        }
-
-        // We are the winner: perform the network fetch without holding any
-        // cache lock. Regardless of success or failure, wake any waiters
-        // that arrived after us so they can re-check the cache.
-        let result = self.fetch_payload().await;
-        match result {
-            Ok((data, ttl)) => {
-                let mut guard = self.cache.write().await;
-                *guard = Some(CachedPayload {
-                    data: Arc::clone(&data),
-                    fetched_at: Instant::now(),
-                    ttl,
-                });
-                drop(guard);
-                self.fetch_notify.notify_waiters();
-                Ok(data)
+        loop {
+            // Fast path: fresh cache hit.
+            if let Some(data) = self.try_cached().await {
+                return Ok(data);
             }
-            Err(err) => {
-                self.fetch_notify.notify_waiters();
-                Err(err)
+
+            // Election: take the mutex only long enough to claim the
+            // in-flight slot or to observe that another task already holds
+            // it. No `.await` happens inside this block apart from the
+            // mutex acquisition itself, so the mutex is never held across
+            // the AWS network call.
+            let should_fetch = {
+                let _fetch_guard = self.fetch_mutex.lock().await;
+
+                // Another task may have refreshed the cache while we were
+                // waiting on the mutex; check again.
+                if let Some(data) = self.try_cached().await {
+                    return Ok(data);
+                }
+
+                if self.fetch_inflight.load(Ordering::Acquire) {
+                    false
+                } else {
+                    self.fetch_inflight.store(true, Ordering::Release);
+                    true
+                }
+                // `_fetch_guard` is dropped here, before any await on the
+                // AWS round-trip below.
+            };
+
+            if !should_fetch {
+                // Loser: wait for the winner to publish a result, then loop
+                // and re-check the cache. If the winner failed, the cache
+                // is still empty and we will try to become the new winner.
+                self.fetch_notify.notified().await;
+                continue;
             }
+
+            // Winner: perform the network fetch with no locks held.
+            // Always clear `fetch_inflight` and wake waiters, regardless of
+            // success or failure, so they can make progress.
+            let result = self.fetch_payload().await;
+            self.fetch_inflight.store(false, Ordering::Release);
+            return match result {
+                Ok((data, ttl)) => {
+                    let mut guard = self.cache.write().await;
+                    *guard = Some(CachedPayload {
+                        data: Arc::clone(&data),
+                        fetched_at: Instant::now(),
+                        ttl,
+                    });
+                    drop(guard);
+                    self.fetch_notify.notify_waiters();
+                    Ok(data)
+                }
+                Err(err) => {
+                    self.fetch_notify.notify_waiters();
+                    Err(err)
+                }
+            };
         }
     }
 
