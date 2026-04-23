@@ -987,7 +987,7 @@ fn decode_flatten_options(json: &str) -> DataFusionResult<FlattenOptions> {
                         "map_wildcard must be a non-empty string (e.g. '[*]').".to_owned(),
                     ));
                 }
-                opts.map_wildcard = s.to_owned();
+                s.clone_into(&mut opts.map_wildcard);
             }
             other => {
                 return Err(DataFusionError::Plan(format!(
