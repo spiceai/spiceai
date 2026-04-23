@@ -786,8 +786,40 @@ impl Runtime {
     pub fn partition_manager(&self) -> Option<Arc<PartitionManager>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler {
-                partition_manager, ..
-            }) => Some(Arc::clone(partition_manager)),
+                accelerations_partitions,
+                ..
+            }) => Some(Arc::clone(accelerations_partitions)),
+            _ => None,
+        }
+    }
+
+    /// Returns the catalog/federated partition manager (scheduler only).
+    #[must_use]
+    pub fn catalog_partition_manager(&self) -> Option<Arc<PartitionManager>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler {
+                catalog_partitions, ..
+            }) => Some(Arc::clone(catalog_partitions)),
+            _ => None,
+        }
+    }
+
+    /// Returns the shared cluster state store (scheduler only).
+    #[must_use]
+    pub fn cluster_state(&self) -> Option<Arc<crate::cluster::ClusterStateStore>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { cluster_state, .. }) => {
+                Some(Arc::clone(cluster_state))
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the scheduler heartbeat store (scheduler only).
+    #[must_use]
+    pub fn scheduler_heartbeats(&self) -> Option<Arc<crate::cluster::SchedulerHeartbeatStore>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { heartbeats, .. }) => Some(Arc::clone(heartbeats)),
             _ => None,
         }
     }
