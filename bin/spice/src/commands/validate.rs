@@ -107,7 +107,9 @@ mod tests {
     async fn loads_file_path_directly() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write_pod(&dir, "not_spicepod.yaml", VALID_POD);
-        let pod = load_pod(&path).await.expect("should load from explicit file");
+        let pod = load_pod(&path)
+            .await
+            .expect("should load from explicit file");
         assert_eq!(pod.name, "test_app");
     }
 
