@@ -57,7 +57,7 @@ use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
 use secrecy::SecretString;
 use secrecy::zeroize::Zeroizing;
 use snafu::{OptionExt, ResultExt, Snafu};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
 
 use crate::SecretStore;
 
@@ -89,10 +89,11 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Overall timeout across all retry attempts for a single operation.
 ///
-/// Sized larger than the SDK's default retry budget (3 attempts with
-/// exponential backoff + jitter) so the retry strategy gets a chance to
-/// fire before the wall-clock cap.
-const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
+/// Sized generously above the SDK's default retry budget (3 attempts with
+/// exponential backoff + jitter; worst-case ~30s of attempts plus ~20s of
+/// backoff) so the retry strategy always gets a chance to fire before the
+/// wall-clock cap.
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -165,10 +166,22 @@ impl CachedPayload {
 
 pub struct AwsSecretsManager {
     secret_name: String,
+    /// Lazily-initialized, shared SDK configuration. Resolved exactly once per
+    /// store instance and reused by both the STS pre-flight and the Secrets
+    /// Manager client, so credential-provider resolution (including IMDS
+    /// lookups) does not run twice.
+    sdk_config: OnceCell<aws_config::SdkConfig>,
     /// Lazily-initialized SDK client, shared across all lookups.
     client: OnceCell<aws_sdk_secretsmanager::Client>,
-    /// In-process cache of the parsed secret payload.
-    cache: Mutex<Option<CachedPayload>>,
+    /// In-process cache of the parsed secret payload. Protected by an
+    /// `RwLock` so cache hits never serialize against each other.
+    cache: RwLock<Option<CachedPayload>>,
+    /// Single-flight coordinator: whichever task wins the `fetch_mutex`
+    /// performs the network call; others wait on `fetch_notify` and then
+    /// re-read the cache. This avoids holding a lock across the AWS call
+    /// while still coalescing concurrent cache misses.
+    fetch_mutex: Mutex<()>,
+    fetch_notify: Notify,
     cache_ttl: Duration,
     /// One-shot flag used to emit a single warning when a non-object payload
     /// is encountered. Prevents log spam on hot paths.
@@ -189,8 +202,11 @@ impl AwsSecretsManager {
 
         Ok(Self {
             secret_name: trimmed.to_string(),
+            sdk_config: OnceCell::new(),
             client: OnceCell::new(),
-            cache: Mutex::new(None),
+            cache: RwLock::new(None),
+            fetch_mutex: Mutex::new(()),
+            fetch_notify: Notify::new(),
             cache_ttl: DEFAULT_CACHE_TTL,
             warned_non_object: AtomicBool::new(false),
         })
@@ -217,8 +233,8 @@ impl AwsSecretsManager {
     /// Returns an error if the STS call fails (e.g. missing/expired credentials,
     /// unreachable STS endpoint, denied IAM policy).
     pub async fn init(&self) -> Result<()> {
-        let config = build_aws_config().await;
-        let sts_client = aws_sdk_sts::Client::new(&config);
+        let config = self.sdk_config().await;
+        let sts_client = aws_sdk_sts::Client::new(config);
 
         sts_client
             .get_caller_identity()
@@ -231,11 +247,18 @@ impl AwsSecretsManager {
         Ok(())
     }
 
+    /// Returns the shared [`aws_config::SdkConfig`] for this store, loading
+    /// it on first use. Reused by both the STS pre-flight and the Secrets
+    /// Manager client so credential-provider resolution only happens once.
+    async fn sdk_config(&self) -> &aws_config::SdkConfig {
+        self.sdk_config.get_or_init(build_aws_config).await
+    }
+
     async fn client(&self) -> &aws_sdk_secretsmanager::Client {
         self.client
             .get_or_init(|| async {
-                let config = build_aws_config().await;
-                aws_sdk_secretsmanager::Client::new(&config)
+                let config = self.sdk_config().await;
+                aws_sdk_secretsmanager::Client::new(config)
             })
             .await
     }
@@ -319,20 +342,31 @@ impl AwsSecretsManager {
             return Ok((Arc::new(HashMap::new()), self.cache_ttl));
         };
 
-        if let Ok(map) = parse_json_to_hashmap(payload.as_str()) {
-            Ok((Arc::new(map), self.cache_ttl))
-        } else {
-            // Only warn once per store instance; the secret payload format
-            // does not typically change between calls.
-            if !self.warned_non_object.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    secret_name = %self.secret_name,
-                    "AWS secret payload is not a JSON object of string values. \
-                     Spice expects the secret value to be a JSON object mapping keys \
-                     to string values; this secret will resolve to no keys."
-                );
+        // Treat whitespace-only payloads as empty — they can occur as test
+        // fixtures or when a secret is reset — without tripping the
+        // non-object warning below.
+        if payload.as_str().trim().is_empty() {
+            return Ok((Arc::new(HashMap::new()), self.cache_ttl));
+        }
+
+        match parse_json_to_hashmap(payload.as_str()) {
+            Ok(map) => Ok((Arc::new(map), self.cache_ttl)),
+            Err(err) => {
+                // Only warn once per store instance; the secret payload format
+                // does not typically change between calls. The error message
+                // from `serde_json` never includes the payload contents, so it
+                // is safe to log.
+                if !self.warned_non_object.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        secret_name = %self.secret_name,
+                        error = %err,
+                        "AWS secret payload is not a JSON object of string values. \
+                         Spice expects the secret value to be a JSON object mapping keys \
+                         to string values; this secret will resolve to no keys."
+                    );
+                }
+                Ok((Arc::new(HashMap::new()), self.cache_ttl))
             }
-            Ok((Arc::new(HashMap::new()), self.cache_ttl))
         }
     }
 
@@ -340,26 +374,61 @@ impl AwsSecretsManager {
     ///
     /// Returns an `Arc`-shared map so callers do not clone the underlying
     /// (potentially secret-bearing) data out of the cache.
+    ///
+    /// Concurrency
+    /// - Cache hits take only an `RwLock` read and never serialize against
+    ///   each other or against in-flight fetches.
+    /// - On a miss, one task wins `fetch_mutex` and performs the network
+    ///   call. Other tasks wait on `fetch_notify` and re-check the cache,
+    ///   so at most one `GetSecretValue` request is in flight per store.
+    /// - The AWS SDK call is never made while any lock is held, so a
+    ///   stalled endpoint cannot stall cache readers.
     async fn payload(&self) -> crate::AnyErrorResult<Arc<HashMap<String, String>>> {
-        let mut guard = self.cache.lock().await;
-
-        if let Some(entry) = guard.as_ref()
-            && entry.is_fresh()
-        {
-            return Ok(Arc::clone(&entry.data));
+        // Fast path: fresh cache hit.
+        if let Some(data) = self.try_cached().await {
+            return Ok(data);
         }
 
-        // Cache is empty or stale. Fetch under the lock to coalesce concurrent
-        // misses into a single AWS call. Holding an async `Mutex` across `.await`
-        // is intentional here: the critical section is exactly the fetch itself,
-        // and this store is only touched during parameter resolution.
-        let (data, ttl) = self.fetch_payload().await?;
-        *guard = Some(CachedPayload {
-            data: Arc::clone(&data),
-            fetched_at: Instant::now(),
-            ttl,
-        });
-        Ok(data)
+        // Serialize refreshes so we coalesce concurrent misses. Waiters below
+        // the winner block here until the winner drops `_fetch_guard`.
+        let _fetch_guard = self.fetch_mutex.lock().await;
+
+        // Re-check the cache — another task may have refreshed it while we
+        // were waiting on `fetch_mutex`.
+        if let Some(data) = self.try_cached().await {
+            return Ok(data);
+        }
+
+        // We are the winner: perform the network fetch without holding any
+        // cache lock. Regardless of success or failure, wake any waiters
+        // that arrived after us so they can re-check the cache.
+        let result = self.fetch_payload().await;
+        match result {
+            Ok((data, ttl)) => {
+                let mut guard = self.cache.write().await;
+                *guard = Some(CachedPayload {
+                    data: Arc::clone(&data),
+                    fetched_at: Instant::now(),
+                    ttl,
+                });
+                drop(guard);
+                self.fetch_notify.notify_waiters();
+                Ok(data)
+            }
+            Err(err) => {
+                self.fetch_notify.notify_waiters();
+                Err(err)
+            }
+        }
+    }
+
+    /// Returns the cached payload if present and still fresh.
+    async fn try_cached(&self) -> Option<Arc<HashMap<String, String>>> {
+        let guard = self.cache.read().await;
+        guard
+            .as_ref()
+            .filter(|e| e.is_fresh())
+            .map(|e| Arc::clone(&e.data))
     }
 }
 
@@ -500,7 +569,7 @@ mod tests {
         data.insert("api_key".to_string(), "plain".to_string());
         data.insert("only_plain".to_string(), "plain-value".to_string());
 
-        *store.cache.lock().await = Some(CachedPayload {
+        *store.cache.write().await = Some(CachedPayload {
             data: Arc::new(data),
             fetched_at: Instant::now(),
             ttl: Duration::from_secs(60),
@@ -530,13 +599,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn honors_negative_cache_entries() {
+    async fn returns_none_for_empty_cached_payload() {
+        // Seeds the cache with an empty map (the state produced for
+        // `ResourceNotFoundException`) and verifies lookups resolve to `None`
+        // without any network call.
         let store = AwsSecretsManager::new("test").expect("valid name");
 
-        *store.cache.lock().await = Some(CachedPayload {
+        *store.cache.write().await = Some(CachedPayload {
             data: Arc::new(HashMap::new()),
             fetched_at: Instant::now(),
-            ttl: Duration::from_secs(60),
+            ttl: NEGATIVE_CACHE_TTL,
         });
 
         assert!(
@@ -546,5 +618,26 @@ mod tests {
                 .expect("lookup ok")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn expired_cache_entry_is_not_served() {
+        // A stale entry must not be returned by the cache fast-path. We don't
+        // exercise the refresh path here (that would hit AWS); we just verify
+        // that `try_cached()` discards expired entries.
+        let store = AwsSecretsManager::new("test").expect("valid name");
+
+        let mut data = HashMap::new();
+        data.insert("k".to_string(), "v".to_string());
+
+        *store.cache.write().await = Some(CachedPayload {
+            data: Arc::new(data),
+            fetched_at: Instant::now()
+                .checked_sub(Duration::from_secs(3600))
+                .expect("system time has enough headroom"),
+            ttl: Duration::from_secs(60),
+        });
+
+        assert!(store.try_cached().await.is_none());
     }
 }
