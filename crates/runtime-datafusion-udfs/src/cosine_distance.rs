@@ -29,7 +29,7 @@ use datafusion::logical_expr::ScalarFunctionArgs;
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     common::{DataFusionError, Result as DataFusionResult, exec_err},
-    logical_expr::{ColumnarValue, Expr, ScalarUDFImpl, Signature, Volatility},
+    logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility},
 };
 use std::any::Any;
 use std::sync::Arc;
@@ -141,34 +141,6 @@ impl ScalarUDFImpl for CosineDistance {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
         make_scalar_function(cosine_distance_inner)(&args.args)
-    }
-
-    fn schema_name(&self, args: &[Expr]) -> DataFusionResult<String> {
-        let formatted_args: Vec<String> = args
-            .iter()
-            .map(|arg| match arg {
-                Expr::Literal(scalar_value, _) => truncate_scalar_value(scalar_value),
-                other => other.schema_name().to_string(),
-            })
-            .collect();
-        Ok(format!("{}({})", self.name(), formatted_args.join(",")))
-    }
-}
-
-/// Truncates large `ScalarValue` representations for readable EXPLAIN output.
-/// List types show a compact type summary instead of dumping all values.
-fn truncate_scalar_value(value: &ScalarValue) -> String {
-    match value {
-        ScalarValue::FixedSizeList(arr) => {
-            if let DataType::FixedSizeList(field, size) = arr.data_type() {
-                format!("<literal {}[{size}]>", field.data_type())
-            } else {
-                format!("<{}>", arr.data_type())
-            }
-        }
-        ScalarValue::List(arr) => format!("<{}>", arr.data_type()),
-        ScalarValue::LargeList(arr) => format!("<{}>", arr.data_type()),
-        other => format!("{other}"),
     }
 }
 
@@ -312,13 +284,9 @@ fn convert_to_f64_array(array: &ArrayRef) -> DataFusionResult<Float64Array> {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array, Float64Array};
-    use arrow::datatypes::{DataType, Field};
-    use datafusion::logical_expr::{Expr, ScalarUDFImpl, col};
-    use datafusion::scalar::ScalarValue;
-    use std::sync::Arc;
+    use arrow::array::Float64Array;
 
-    use super::{CosineDistance, cosine_distance};
+    use super::cosine_distance;
 
     #[expect(clippy::float_cmp)]
     #[test]
@@ -343,66 +311,5 @@ mod tests {
             &Float64Array::from(vec![-42.0, 123.0, -3.0]),
         );
         assert!((0.0..=1.0).contains(&dist));
-    }
-
-    // -- schema_name tests covering all supported embedding types --
-
-    #[test]
-    fn test_schema_name_fixed_size_list_float32() {
-        let udf = CosineDistance::new();
-
-        let values = Float32Array::from(vec![0.1_f32; 1536]);
-        let field = Arc::new(Field::new("item", DataType::Float32, true));
-        let list_arr = FixedSizeListArray::try_new(field, 1536, Arc::new(values) as ArrayRef, None)
-            .expect("valid fixed size list");
-        let scalar = ScalarValue::FixedSizeList(Arc::new(list_arr));
-
-        let args = vec![Expr::Literal(scalar, None), col("embedding_col")];
-        let name = udf.schema_name(&args).expect("schema_name should succeed");
-
-        assert_eq!(
-            name,
-            "cosine_distance(<literal Float32[1536]>,embedding_col)"
-        );
-    }
-
-    #[test]
-    fn test_schema_name_fixed_size_list_float64() {
-        let udf = CosineDistance::new();
-
-        let values = Float64Array::from(vec![0.1_f64; 768]);
-        let field = Arc::new(Field::new("item", DataType::Float64, true));
-        let list_arr = FixedSizeListArray::try_new(field, 768, Arc::new(values) as ArrayRef, None)
-            .expect("valid fixed size list");
-        let scalar = ScalarValue::FixedSizeList(Arc::new(list_arr));
-
-        let args = vec![Expr::Literal(scalar, None), col("embedding_col")];
-        let name = udf.schema_name(&args).expect("schema_name should succeed");
-
-        assert_eq!(
-            name,
-            "cosine_distance(<literal Float64[768]>,embedding_col)"
-        );
-    }
-
-    #[test]
-    fn test_schema_name_preserves_small_literal() {
-        let udf = CosineDistance::new();
-
-        let small_literal = ScalarValue::Utf8(Some("hello".to_string()));
-        let args = vec![Expr::Literal(small_literal, None), col("embedding_col")];
-        let name = udf.schema_name(&args).expect("schema_name should succeed");
-
-        assert_eq!(name, "cosine_distance(hello,embedding_col)");
-    }
-
-    #[test]
-    fn test_schema_name_non_literal_args() {
-        let udf = CosineDistance::new();
-
-        let args = vec![col("vec_a"), col("vec_b")];
-        let name = udf.schema_name(&args).expect("schema_name should succeed");
-
-        assert_eq!(name, "cosine_distance(vec_a,vec_b)");
     }
 }
