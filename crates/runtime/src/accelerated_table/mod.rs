@@ -452,9 +452,9 @@ impl Builder {
         self
     }
 
-    /// Enable write-back mode: writes go to the local accelerator only. The
-    /// federated source is updated out-of-band by the configured replication
-    /// or refresh-on-changes mechanism, so the source may lag briefly.
+    /// Enable write-back mode: writes go to the local accelerator only.
+    /// Source synchronization is not performed by this path; the caller
+    /// must arrange it out-of-band (attested by `replication.enabled`).
     pub fn write_back(&mut self) -> &mut Self {
         self.write_back = true;
         self
@@ -1407,10 +1407,10 @@ impl TableProvider for AcceleratedTable {
             }
             WriteMode::WriteBack => {
                 // Writes are streamed directly into the accelerator (no
-                // in-memory buffering of the input plan). Propagation back to
-                // the federated source happens through the existing
-                // replication / refresh-on-changes mechanism, which write-back
-                // requires by validation.
+                // in-memory buffering of the input plan). This path does not
+                // forward writes to the federated source; validation requires
+                // `replication.enabled` so that source synchronization is an
+                // externally-attested responsibility of the caller.
                 write::write_back::validate_insert_op(overwrite)?;
                 let accelerated_insert_plan = self
                     .accelerator

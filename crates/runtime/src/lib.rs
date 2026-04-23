@@ -261,9 +261,14 @@ pub enum Error {
     AcceleratedReadWriteTableWithoutReplication,
 
     #[snafu(display(
-        "An accelerated table for {dataset_name} cannot be configured with both 'on_conflict' and 'acceleration.write_mode: write_back'. 'on_conflict' declares the accelerator as the only write target with no source synchronization, while 'write_back' expects the federated source to be synchronized with accelerator writes via replication or changes refresh. Remove one of these options."
+        "An accelerated table for {dataset_name} cannot be configured with both 'on_conflict' and 'acceleration.write_mode: write_back'. 'on_conflict' declares the accelerator as the only write target with no source synchronization, while 'write_back' expects the federated source to be synchronized with accelerator writes. Remove one of these options."
     ))]
     AcceleratedWriteBackWithOnConflict { dataset_name: String },
+
+    #[snafu(display(
+        "An accelerated table for {dataset_name} was configured with 'acceleration.write_mode: write_back' but 'replication.enabled' is not set. Write-back writes only to the local accelerator, so an external mechanism is required to keep the federated source in sync; 'refresh_mode: changes' only synchronizes source changes into the accelerator and cannot propagate accelerator writes back. Set 'replication.enabled: true' or use a different write_mode."
+    ))]
+    AcceleratedWriteBackWithoutReplication { dataset_name: String },
 
     #[snafu(display(
         "An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."

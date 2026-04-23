@@ -1859,8 +1859,8 @@ impl DataFusion {
         // Configure write caching mode for read-write accelerated datasets.
         // `on_conflict` declares accelerator-only writes with no source
         // synchronization, so it is incompatible with write-back (which
-        // expects the federated source to be synchronized via replication
-        // or changes refresh).
+        // expects the caller to synchronize the federated source via an
+        // externally-managed replication mechanism).
         if dataset.access().allows_write()
             && !has_on_conflict
             && acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteBack

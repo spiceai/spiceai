@@ -42,9 +42,11 @@ pub enum RefreshMode {
 ///   source. The local accelerator is updated via the normal refresh mechanism
 ///   (e.g. WAL replication with `refresh_mode: changes`).
 ///
-/// - `write_back`: Writes go to the local accelerator first, returning immediately
-///   to the user. The write is then asynchronously forwarded to the federated source.
-///   Faster response times, but the source may lag behind the accelerator briefly.
+/// - `write_back`: Writes go to the local accelerator only and return immediately
+///   to the user. This mode does not synchronously commit the write to the federated
+///   source as part of the insert path; source synchronization is the caller's
+///   responsibility (declared by setting `replication.enabled: true`). Faster
+///   response times, without the source commit guarantees of `write_through`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(rename_all = "snake_case")]

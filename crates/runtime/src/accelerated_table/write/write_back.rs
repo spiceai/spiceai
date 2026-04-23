@@ -18,12 +18,13 @@ limitations under the License.
 //!
 //! Writes are streamed directly into the local accelerator. The synchronous
 //! response returns once the accelerator commit completes. This path does
-//! not forward writes to the federated source itself; source synchronization
-//! is handled out-of-band by the existing replication or refresh-on-changes
-//! mechanism. Write-back is gated by validation that requires
-//! `replication.enabled` or `acceleration.refresh_mode: changes`
+//! not forward writes to the federated source itself; an external
+//! mechanism must keep the source in sync. Write-back is gated by
+//! validation that requires `replication.enabled: true` as the user's
+//! attestation that source synchronization is handled
 //! (`acceleration.on_conflict` is rejected separately because it declares
-//! accelerator-only semantics).
+//! accelerator-only semantics; `refresh_mode: changes` alone is not
+//! sufficient because it is a source-to-accelerator stream).
 //!
 //! No batches are buffered in memory in this path: the caller's input
 //! [`ExecutionPlan`] is handed directly to

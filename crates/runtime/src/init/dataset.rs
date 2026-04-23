@@ -940,13 +940,27 @@ impl Runtime {
         // `on_conflict` declares the accelerator as the only write target
         // with no source synchronization, which is incompatible with
         // `write_mode: write_back` (which expects the federated source to
-        // be synchronized with accelerator writes via replication or
-        // changes refresh). Reject the combination explicitly to prevent
-        // surprising partial writes.
+        // be synchronized with accelerator writes). Reject the combination
+        // explicitly to prevent surprising partial writes.
         if has_on_conflict
             && acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteBack
         {
             crate::AcceleratedWriteBackWithOnConflictSnafu {
+                dataset_name: ds.name.to_string(),
+            }
+            .fail()?;
+        }
+
+        // `write_mode: write_back` writes only to the local accelerator,
+        // so some external mechanism is required to keep the federated
+        // source in sync. `refresh_mode: changes` is a source->accelerator
+        // stream and cannot propagate accelerator writes back, so require
+        // `replication.enabled` as the user's explicit attestation that
+        // source synchronization is handled.
+        if acceleration_settings.write_mode == spicepod::acceleration::WriteMode::WriteBack
+            && !replicate
+        {
+            crate::AcceleratedWriteBackWithoutReplicationSnafu {
                 dataset_name: ds.name.to_string(),
             }
             .fail()?;
