@@ -204,7 +204,7 @@ fn resolve_static(kind: Option<DriveKind>, location: &Path) -> ObjectStoreResult
                     source: Box::new(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         format!(
-                            "missing drive id — expected path prefix '{id}/...' for sharepoint://{auth}",
+                            "missing drive id — expected path prefix '{{{id}-id}}/...' for sharepoint://{auth}",
                             id = kind.authority().trim_end_matches('s'),
                             auth = kind.authority(),
                         ),
@@ -252,7 +252,10 @@ impl ObjectStore for SharepointObjectStore {
         // window is acceptable for the typical acceleration-writer use case.
         let (drive, in_drive) = self.resolve(location)?;
         if let PutMode::Update(expected) = &opts.mode {
-            let current = head_drive_item(&self.client, &drive, &in_drive).await?;
+            let current = with_original_location(
+                head_drive_item(&self.client, &drive, &in_drive).await,
+                location,
+            )?;
             let e_tag_matches = expected.e_tag.is_none() || expected.e_tag == current.e_tag;
             let version_matches = expected.version.is_none() || expected.version == current.version;
             if !(e_tag_matches && version_matches) {
@@ -269,9 +272,13 @@ impl ObjectStore for SharepointObjectStore {
 
         let bytes = payload_to_bytes(&payload);
 
+        // Honor the store's configured `conflict_behavior` for normal
+        // overwrite/update writes (e.g. `sharepoint_conflict_behavior=rename`
+        // or `fail`). `PutMode::Create` always maps to Fail regardless —
+        // that's what "create, don't overwrite" means.
         let effective_conflict = match opts.mode {
             PutMode::Create => ConflictBehavior::Fail,
-            PutMode::Overwrite | PutMode::Update(_) => ConflictBehavior::Replace,
+            PutMode::Overwrite | PutMode::Update(_) => self.config.conflict_behavior,
         };
 
         let result = if bytes.len() <= INLINE_PUT_THRESHOLD {
@@ -304,7 +311,10 @@ impl ObjectStore for SharepointObjectStore {
         let (drive, in_drive) = self.resolve(location)?;
         // Fetch metadata first — needed both for the ObjectMeta in GetResult
         // and to respect If-Match / If-None-Match via object_store's helper.
-        let meta = head_drive_item(&self.client, &drive, &in_drive).await?;
+        let meta = with_original_location(
+            head_drive_item(&self.client, &drive, &in_drive).await,
+            location,
+        )?;
         let object_meta = ObjectMeta {
             location: location.clone(),
             last_modified: meta.last_modified,
@@ -315,14 +325,17 @@ impl ObjectStore for SharepointObjectStore {
         options.check_preconditions(&object_meta)?;
 
         // Slice in-memory after fetch (see note in `get_content`).
-        let bytes = get_content(
-            &self.client,
-            &drive,
-            &in_drive,
-            options.range.as_ref(),
-            meta.size,
-        )
-        .await?;
+        let bytes = with_original_location(
+            get_content(
+                &self.client,
+                &drive,
+                &in_drive,
+                options.range.as_ref(),
+                meta.size,
+            )
+            .await,
+            location,
+        )?;
         let range = options
             .range
             .as_ref()
@@ -345,7 +358,10 @@ impl ObjectStore for SharepointObjectStore {
 
     async fn head(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
         let (drive, in_drive) = self.resolve(location)?;
-        let meta = head_drive_item(&self.client, &drive, &in_drive).await?;
+        let meta = with_original_location(
+            head_drive_item(&self.client, &drive, &in_drive).await,
+            location,
+        )?;
         Ok(ObjectMeta {
             location: location.clone(),
             last_modified: meta.last_modified,
@@ -357,22 +373,29 @@ impl ObjectStore for SharepointObjectStore {
 
     async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
         let (drive, in_drive) = self.resolve(location)?;
-        delete_item(&self.client, &drive, &in_drive).await
+        with_original_location(delete_item(&self.client, &drive, &in_drive).await, location)
     }
 
     /// Lists objects recursively below `prefix`, matching the `ObjectStore`
-    /// trait contract (S3/GCS semantics — all objects with a given prefix).
-    /// SharePoint's `list_children` only returns one folder level, so we
-    /// walk the folder tree in BFS order, yielding files as we find them
-    /// and queueing any subfolders.
+    /// trait contract: "all objects whose key starts with `prefix`"
+    /// (S3/GCS semantics), not "all objects inside a folder". Since
+    /// `object_store::Path` drops trailing slashes, we can't tell whether
+    /// the last segment of `prefix` is a folder name or a partial file
+    /// name — so we walk the parent folder, apply the last segment as a
+    /// name-prefix filter at that level only, and let the full-path
+    /// `starts_with` check drive the yield decision. Folders that match
+    /// the name-prefix are descended into recursively (BFS), with no
+    /// further name filtering at deeper levels.
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
         let client = Arc::clone(&self.client);
         let kind = self.kind;
-        let start = prefix.cloned().unwrap_or_else(|| Path::from(""));
+        let full_prefix = prefix.cloned().unwrap_or_else(|| Path::from(""));
+        let (parent, name_filter) = split_prefix(&full_prefix);
         Box::pin(async_stream::stream! {
-            let mut queue: std::collections::VecDeque<Path> = std::collections::VecDeque::new();
-            queue.push_back(start);
-            while let Some(current) = queue.pop_front() {
+            let mut queue: std::collections::VecDeque<(Path, Option<String>)> =
+                std::collections::VecDeque::new();
+            queue.push_back((parent, name_filter));
+            while let Some((current, filter)) = queue.pop_front() {
                 let (drive, in_drive) = match resolve_static(kind, &current) {
                     Ok(r) => r,
                     Err(e) => { yield Err(e); return; }
@@ -382,9 +405,20 @@ impl ObjectStore for SharepointObjectStore {
                     match page {
                         Ok(batch) => {
                             for item in batch {
+                                if let Some(f) = filter.as_deref()
+                                    && !item.name.starts_with(f)
+                                {
+                                    continue;
+                                }
+                                let child = child_location(&current, &item.name);
                                 if item.is_folder {
-                                    queue.push_back(child_location(&current, &item.name));
-                                } else if let Some(meta) = item.into_object_meta(&current) {
+                                    // Once we've descended past the name-
+                                    // filter level, the full-path starts_with
+                                    // check below is all we need.
+                                    queue.push_back((child, None));
+                                } else if child.as_ref().starts_with(full_prefix.as_ref())
+                                    && let Some(meta) = item.into_object_meta(&current)
+                                {
                                     yield Ok(meta);
                                 }
                             }
@@ -440,12 +474,30 @@ fn payload_to_bytes(payload: &PutPayload) -> Vec<u8> {
     buf
 }
 
+/// Split an `ObjectStore::list` prefix into `(parent_folder, name_filter)`
+/// so the driver can walk the parent and apply a starts-with filter on
+/// the first-level children. Empty prefix returns `(root, None)`.
+fn split_prefix(prefix: &Path) -> (Path, Option<String>) {
+    let parts: Vec<String> = prefix.parts().map(|p| p.as_ref().to_string()).collect();
+    if parts.is_empty() {
+        return (Path::from(""), None);
+    }
+    let (last, rest) = parts.split_last().expect("non-empty");
+    let parent: Path = rest.iter().map(String::as_str).collect();
+    (parent, Some(last.clone()))
+}
+
 fn resolve_range(range: &GetRange, total_size: u64) -> std::ops::Range<u64> {
     match range {
-        // Clamp Bounded ranges to [0, total_size] so the returned `GetResult.range`
-        // always matches the sliced payload length, matching the semantics
-        // documented on `GetRange::Bounded`.
-        GetRange::Bounded(r) => r.start.min(total_size)..r.end.min(total_size),
+        // Clamp Bounded ranges to [0, total_size] and ensure `end >= start`
+        // so the returned `GetResult.range` always matches the sliced
+        // payload length — even when the caller passes an inverted range
+        // like `GetRange::Bounded(200..50)`.
+        GetRange::Bounded(r) => {
+            let start = r.start.min(total_size);
+            let end = r.end.min(total_size).max(start);
+            start..end
+        }
         GetRange::Offset(off) => (*off).min(total_size)..total_size,
         GetRange::Suffix(n) => total_size.saturating_sub(*n)..total_size,
     }
@@ -959,6 +1011,23 @@ fn list_children(
                 page.value.into_iter().map(RawDriveItem::into_meta).collect();
             yield Ok(metas);
         }
+    })
+}
+
+/// Rewrite any `Error::NotFound` path to the caller's original object-store
+/// `location` (which for kinded stores includes the drive-ID prefix that
+/// `resolve()` stripped before the Graph call). Keeps the error path
+/// consistent with the input the caller passed in.
+fn with_original_location<T>(
+    result: ObjectStoreResult<T>,
+    location: &Path,
+) -> ObjectStoreResult<T> {
+    result.map_err(|e| match e {
+        object_store::Error::NotFound { source, .. } => object_store::Error::NotFound {
+            path: location.to_string(),
+            source,
+        },
+        other => other,
     })
 }
 

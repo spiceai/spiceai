@@ -538,12 +538,3 @@ impl ListingTableConnector for SharepointListingConnector {
 pub fn factory() -> Arc<dyn DataConnectorFactory> {
     SharepointFactory::new_arc()
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn uses_object_store_detects_prefix() {
-        assert!("sharepoint://me/file.csv".starts_with("sharepoint://"));
-        assert!(!"sharepoint:me/root".starts_with("sharepoint://"));
-    }
-}

@@ -17,9 +17,10 @@ limitations under the License.
 //! End-to-end SharePoint integration tests.
 //!
 //! These tests exercise the real Microsoft Graph API and write to a real
-//! SharePoint drive. They silently no-op when the required env vars are not
-//! set, so the full `cargo test -p runtime --test integration` run stays
-//! green for contributors without a SharePoint tenant.
+//! SharePoint drive. They skip (and print a one-line skip reason to stderr)
+//! when the required env vars are not set, so the full
+//! `cargo test -p runtime --test integration` run stays green for
+//! contributors without a SharePoint tenant.
 //!
 //! To run them:
 //!
