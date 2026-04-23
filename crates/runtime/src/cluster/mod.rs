@@ -1831,6 +1831,7 @@ async fn executor_bind_app(
 
     Arc::clone(rt).load_catalogs().await;
     rt.load_embeddings().await;
+    rt.load_rerankers().await;
     Arc::clone(rt).load_models().await;
     Arc::clone(rt).load_tools().await;
     Arc::clone(rt).load_datasets().await;

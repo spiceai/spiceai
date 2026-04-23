@@ -20,7 +20,10 @@ limitations under the License.
 //! and file references. It can be implemented by different RDBMS backends
 //! (`SQLite`, `PostgreSQL`, etc.).
 
-use super::metadata::{CreateTableOptions, DeleteFile, PartitionMetadata, TableMetadata};
+use super::metadata::{
+    CreateTableOptions, DeleteFile, InlinedData, InlinedDelete, PartitionMetadata, TableMetadata,
+    TableStatistics,
+};
 use async_trait::async_trait;
 use snafu::Snafu;
 use std::collections::HashMap;
@@ -344,6 +347,50 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Get all partitions for a table.
     async fn get_partitions(&self, table_id: &str) -> CatalogResult<Vec<PartitionMetadata>>;
+
+    /// Upsert table-level aggregate statistics.
+    ///
+    /// Replaces existing stats for the given table. The statistics blob contains
+    /// a serialized Vortex `FileStatistics` flatbuffer with per-column stats.
+    async fn upsert_table_statistics(&self, stats: &TableStatistics) -> CatalogResult<()>;
+
+    /// Get table-level aggregate statistics for a table.
+    async fn get_table_statistics(&self, table_id: &str) -> CatalogResult<Option<TableStatistics>>;
+
+    /// Clear table-level aggregate statistics for a table.
+    async fn clear_table_statistics(&self, table_id: &str) -> CatalogResult<()>;
+
+    // ── Inlined data (data inlining for small writes) ──────────────────
+
+    /// Add a small batch of insert data inlined in the metastore.
+    ///
+    /// The `data_ipc` field contains an Arrow IPC serialized `RecordBatch`.
+    async fn add_inlined_data(&self, data: InlinedData) -> CatalogResult<String>;
+
+    /// Get all inlined data entries for a table.
+    async fn get_inlined_data(&self, table_id: &str) -> CatalogResult<Vec<InlinedData>>;
+
+    /// Get inlined data entries for a specific partition of a table.
+    async fn get_inlined_data_for_partition(
+        &self,
+        table_id: &str,
+        partition_key: &str,
+    ) -> CatalogResult<Vec<InlinedData>>;
+
+    /// Get the total number of inlined rows for a table.
+    async fn get_inlined_data_count(&self, table_id: &str) -> CatalogResult<i64>;
+
+    /// Remove all inlined data for a table (called after checkpoint flushes to Vortex).
+    async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// Add a small batch of delete identifiers inlined in the metastore.
+    async fn add_inlined_delete(&self, delete: InlinedDelete) -> CatalogResult<String>;
+
+    /// Get all inlined delete entries for a table.
+    async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>>;
+
+    /// Remove all inlined deletes for a table (called after checkpoint).
+    async fn clear_inlined_deletes(&self, table_id: &str) -> CatalogResult<()>;
 
     /// Shutdown the catalog, performing any necessary cleanup (e.g., WAL checkpoint, optimize).
     /// Default implementation does nothing.

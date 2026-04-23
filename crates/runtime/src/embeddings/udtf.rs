@@ -92,7 +92,10 @@ use {
 };
 
 #[cfg(feature = "s3_vectors")]
-use {search::index::chunking::ChunkedSearchIndex, search::index::s3_vectors::S3Vector};
+use search::index::s3_vectors::S3Vector;
+
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+use search::index::chunking::ChunkedSearchIndex;
 
 #[cfg(feature = "elasticsearch")]
 use search::index::elasticsearch::ElasticsearchIndex;
@@ -600,15 +603,6 @@ impl VectorSearchTableFunc {
                         .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
                 );
             }
-            if let Some((chunked_indexes, _)) =
-                find_index_in_table_provider::<ChunkedSearchIndex>(tbl)
-            {
-                vector_indexes.extend(
-                    chunked_indexes
-                        .into_iter()
-                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
-                );
-            }
         }
 
         #[cfg(feature = "elasticsearch")]
@@ -620,6 +614,18 @@ impl VectorSearchTableFunc {
                         .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
                 );
             }
+        }
+
+        // Chunked search indexes (used by both S3 Vectors and Elasticsearch engines
+        // when chunking is enabled) are discovered once here to avoid registering
+        // the same `ChunkedSearchIndex` twice when both features are enabled.
+        if let Some((chunked_indexes, _)) = find_index_in_table_provider::<ChunkedSearchIndex>(tbl)
+        {
+            vector_indexes.extend(
+                chunked_indexes
+                    .into_iter()
+                    .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
+            );
         }
 
         if vector_indexes.is_empty() {

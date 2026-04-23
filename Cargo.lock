@@ -2318,7 +2318,7 @@ dependencies = [
 [[package]]
 name = "ballista-core"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=729428c650a0d0fe2a10662e35d14250505140a2#729428c650a0d0fe2a10662e35d14250505140a2"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=e6bcc66785319e08f530b07c2e1fa029ff14a2db#e6bcc66785319e08f530b07c2e1fa029ff14a2db"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -2359,7 +2359,7 @@ dependencies = [
 [[package]]
 name = "ballista-executor"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=729428c650a0d0fe2a10662e35d14250505140a2#729428c650a0d0fe2a10662e35d14250505140a2"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=e6bcc66785319e08f530b07c2e1fa029ff14a2db#e6bcc66785319e08f530b07c2e1fa029ff14a2db"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2392,7 +2392,7 @@ dependencies = [
 [[package]]
 name = "ballista-scheduler"
 version = "52.0.0"
-source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=729428c650a0d0fe2a10662e35d14250505140a2#729428c650a0d0fe2a10662e35d14250505140a2"
+source = "git+https://github.com/spiceai/datafusion-ballista.git?rev=e6bcc66785319e08f530b07c2e1fa029ff14a2db#e6bcc66785319e08f530b07c2e1fa029ff14a2db"
 dependencies = [
  "arrow-flight",
  "async-trait",
@@ -3454,6 +3454,7 @@ dependencies = [
  "datafusion-physical-expr",
  "datafusion-physical-plan",
  "datafusion-table-providers",
+ "flatbuffers",
  "futures",
  "hash-index",
  "insta",
@@ -6998,6 +6999,7 @@ name = "elasticsearch"
 version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
+ "bytes",
  "reqwest 0.12.24",
  "serde",
  "serde_json",
@@ -15958,6 +15960,7 @@ dependencies = [
  "db_connection_pool",
  "document_parse",
  "duckdb",
+ "duration-parse",
  "dynamodb-streams",
  "elasticsearch",
  "event_stream",
@@ -16109,6 +16112,7 @@ dependencies = [
  "hex",
  "object_store",
  "opentelemetry",
+ "runtime-object-store",
  "runtime-parameters",
  "runtime-secrets",
  "serde",
@@ -16264,10 +16268,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-parameter-spec"
+version = "2.0.0-unstable"
+
+[[package]]
 name = "runtime-parameters"
 version = "2.0.0-unstable"
 dependencies = [
  "itertools 0.14.0",
+ "runtime-parameter-spec",
  "runtime-secrets",
  "secrecy",
  "snafu",
@@ -16329,6 +16338,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-credential-bridge",
  "aws-sdk-secretsmanager",
  "aws-sdk-sts",
@@ -16341,6 +16351,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.10.1",
  "reqwest 0.12.24",
+ "runtime-parameter-spec",
  "secrecy",
  "serde_json",
  "snafu",
