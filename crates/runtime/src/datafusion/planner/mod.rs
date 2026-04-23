@@ -247,6 +247,13 @@ fn is_cayenne_table(session: &SessionState, table_name: &TableReference) -> bool
 }
 
 async fn is_distributed_insert_table(session: &SessionState, table_name: &TableReference) -> bool {
+    // Distributed scheduler-mode INSERT rewriting applies to both:
+    // 1. Cayenne catalog tables, which must be forwarded to executors, and
+    // 2. write-through accelerated tables, which also forward writes remotely.
+    if is_cayenne_table(session, table_name) {
+        return true;
+    }
+
     let catalog_name = table_name.catalog().unwrap_or(SPICE_DEFAULT_CATALOG);
     let schema_name = table_name.schema().unwrap_or(SPICE_DEFAULT_SCHEMA);
 
