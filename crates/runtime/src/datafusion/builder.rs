@@ -541,7 +541,6 @@ impl DataFusionBuilder {
             scheduler_server: RwLock::new(None),
             executor: RwLock::new(None),
             executor_stream_registry: RwLock::new(None),
-            executor_registry: self.executor_registry,
             partition_service: self.partition_service,
             #[cfg(not(windows))]
             cayenne_ddl_handler,

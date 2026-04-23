@@ -397,11 +397,14 @@ fn update_scheduler_pollers(
 }
 
 pub(crate) mod accelerated_partition_provider;
+mod cluster_state;
 mod composite_flight_service;
 mod control_stream_client;
 pub mod datafusion;
+mod heartbeat;
 pub mod metrics_collector;
 pub mod partition;
+mod reaper;
 mod scheduler_registry;
 mod servers;
 mod service;
@@ -410,9 +413,10 @@ use crate::cluster::partition::service::PartitionService;
 pub use accelerated_partition_provider::AcceleratedPartitionProvider;
 pub use control_stream_client::ControlStreamManager;
 pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
+pub use reaper::{Reaper, ReaperOutcome};
 pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
+pub use scheduler_registry::SchedulerPeers;
 pub use scheduler_registry::start_scheduler_registry;
-pub use scheduler_registry::{SchedulerPeers, SchedulerRecord};
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
 pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 

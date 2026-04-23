@@ -577,8 +577,6 @@ pub struct DataFusion {
     /// Registry of connected executor control streams for `PollNow` broadcasts.
     /// Only used in scheduler mode.
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
-    /// Executor registry for distributed write forwarding (scheduler mode only).
-    pub executor_registry: Option<Arc<ExecutorRegistry>>,
     /// Partition service for discovering/assigning partitions (scheduler mode only).
     pub(crate) partition_service: Option<Arc<PartitionService>>,
     #[cfg(not(windows))]
@@ -1011,7 +1009,7 @@ impl DataFusion {
         let catalog = self.resolve_catalog_provider(table_reference);
         resolve_table_partition_expr(
             catalog.as_deref(),
-            self.executor_registry.as_deref(),
+            self.executor_registry().map(Arc::as_ref),
             table_reference,
         )
         .await
@@ -2781,7 +2779,7 @@ impl DataFusion {
             },
             cluster_role: self.cluster_config.effective_role(),
             ddl_extension_store: Arc::clone(&self.ddl_extension_store),
-            executor_registry: self.executor_registry.clone(),
+            executor_registry: self.executor_registry().cloned(),
             ddl_handler: self.cayenne_ddl_handler.clone(),
         };
 
@@ -2860,6 +2858,13 @@ impl DataFusion {
     #[must_use]
     pub fn executor_stream_registry(&self) -> Option<ExecutorControlStreamRegistry> {
         self.executor_stream_registry.read().ok()?.clone()
+    }
+
+    #[must_use]
+    pub fn executor_registry(&self) -> Option<&Arc<ExecutorRegistry>> {
+        self.partition_service
+            .as_ref()
+            .map(|ps| &ps.executor_registry)
     }
 
     pub fn bind_executor(&self, executor: Arc<Executor>) -> Result<()> {

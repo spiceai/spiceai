@@ -115,8 +115,6 @@ pub async fn start_scheduler_registry(
     config: &SchedulerConfig,
     cancel: CancellationToken,
     peers: Arc<RwLock<SchedulerPeers>>,
-    cluster: Arc<ClusterStateStore>,
-    heartbeats: Arc<SchedulerHeartbeatStore>,
 ) -> Result<()> {
     let datafusion = rt.datafusion();
     let advertise_host = datafusion
@@ -147,10 +145,15 @@ pub async fn start_scheduler_registry(
         labels: HashMap::new(),
     };
 
-    // Initialize job executor for async SQL queries. Reuses the raw
-    // (store, base_prefix) pair behind ClusterStateStore.
     let (store, base_prefix) =
         build_object_store(rt.as_ref(), &config.state_location, config).await?;
+
+    let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), &base_prefix));
+    let heartbeats = Arc::new(SchedulerHeartbeatStore::new(
+        Arc::clone(&store),
+        &base_prefix,
+    ));
+
     let job_store = crate::jobs::JobStore::new(
         Arc::clone(&store),
         base_prefix.clone(),
