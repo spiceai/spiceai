@@ -28,7 +28,11 @@ use stores::env::EnvSecretStoreBuilder;
 use tokio::sync::RwLock;
 
 mod lexer;
+mod params;
 pub mod stores;
+
+pub use params::{ParamError as SecretStoreParamError, expand_bootstrap_refs, validate_params};
+pub use runtime_parameter_spec::{ParameterSpec, ParameterType};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -56,6 +60,9 @@ pub enum Error {
         "The secret store {store} should not specify a secret selector. i.e. `from: {store}`"
     ))]
     SecretStoreInvalidSecretSelector { store: String },
+
+    #[snafu(display("Invalid secret store params: {source}"))]
+    InvalidSecretStoreParams { source: Box<params::ParamError> },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -120,8 +127,14 @@ impl Secrets {
     pub async fn load_from(&mut self, secrets: &[SpicepodSecret]) -> Result<()> {
         self.stores.clear();
 
+        // Bootstrap env store used only to resolve `${ env:KEY }` /
+        // `${ secrets:KEY }` references inside other stores' `params:`
+        // blocks. Constructed once so `.env` files are loaded a single time
+        // for the whole secrets section.
+        let bootstrap_env: Arc<dyn SecretStore> = load_default_store();
+
         for secret in secrets {
-            let store_type = spicepod_secret_store_type(secret)?;
+            let store_type = spicepod_secret_store_type(secret, bootstrap_env.as_ref()).await?;
 
             let secret_store = match load_secret_store(store_type).await {
                 Ok(secret_store) => secret_store,
@@ -286,13 +299,12 @@ pub fn extract_secret_references(content: &str) -> std::collections::HashMap<Str
 }
 
 pub enum SecretStoreType {
-    Env,
-    EnvCustomPath(String),
+    Env(stores::env::EnvConfig),
     #[cfg(feature = "keyring-secret-store")]
     Keyring,
-    Kubernetes(String),
+    Kubernetes(stores::kubernetes::KubernetesConfig),
     #[cfg(feature = "aws-secrets-manager")]
-    AwsSecretsManager(String),
+    AwsSecretsManager(stores::aws_secrets_manager::AwsSecretsManagerConfig),
     SchedulerRPC,
 }
 
@@ -315,32 +327,73 @@ pub async fn get_params_with_secrets(
     params_with_secrets
 }
 
-fn spicepod_secret_store_type(store: &SpicepodSecret) -> Result<SecretStoreType> {
+async fn spicepod_secret_store_type(
+    store: &SpicepodSecret,
+    bootstrap_env: &dyn SecretStore,
+) -> Result<SecretStoreType> {
     let provider = secret_store_provider(&store.from);
     let selector = secret_selector(&store.from);
+    let mut user_params = store
+        .params
+        .as_ref()
+        .map(spicepod::param::Params::as_string_map)
+        .unwrap_or_default();
+
+    // Resolve `${ env:KEY }` / `${ secrets:KEY }` references in the
+    // user-supplied params using the bootstrap env store *before* validating
+    // against the spec. This lets users keep secrets like AWS regions /
+    // endpoints out of the spicepod, while still failing fast on typos
+    // (`regoin`, missing env vars, references to other stores) instead of
+    // silently dropping them.
+    expand_bootstrap_refs(provider, &mut user_params, bootstrap_env)
+        .await
+        .map_err(|source| Error::InvalidSecretStoreParams {
+            source: Box::new(source),
+        })?;
+
+    // Validates user-provided params against the store's static
+    // `ParameterSpec` list. Unknown params return an error rather than being
+    // silently dropped.
+    let validate = |spec: &'static [ParameterSpec]| {
+        validate_params(provider, user_params.clone(), spec).map_err(|source| {
+            Error::InvalidSecretStoreParams {
+                source: Box::new(source),
+            }
+        })
+    };
+
     match provider {
         "env" => {
             require_no_selector(provider, selector)?;
-            if let Some(params) = store.params.as_ref() {
-                let params = params.as_string_map();
-                if let Some(path) = params.get("file_path") {
-                    return Ok(SecretStoreType::EnvCustomPath(path.clone()));
-                }
-            }
-            Ok(SecretStoreType::Env)
+            let params = validate(stores::env::PARAMETERS)?;
+            Ok(SecretStoreType::Env(stores::env::EnvConfig::from_params(
+                &params,
+            )))
         }
         #[cfg(feature = "keyring-secret-store")]
         "keyring" => {
             require_no_selector(provider, selector)?;
+            let _ = validate(stores::keyring::PARAMETERS)?;
             Ok(SecretStoreType::Keyring)
         }
-        "kubernetes" => Ok(SecretStoreType::Kubernetes(require_selector(
-            provider, selector,
-        )?)),
+        "kubernetes" => {
+            let secret_name = require_selector(provider, selector)?;
+            let params = validate(stores::kubernetes::PARAMETERS)?;
+            Ok(SecretStoreType::Kubernetes(
+                stores::kubernetes::KubernetesConfig::from_params(secret_name, &params),
+            ))
+        }
         #[cfg(feature = "aws-secrets-manager")]
-        "aws_secrets_manager" => Ok(SecretStoreType::AwsSecretsManager(require_selector(
-            provider, selector,
-        )?)),
+        "aws_secrets_manager" => {
+            let secret_name = require_selector(provider, selector)?;
+            let params = validate(stores::aws_secrets_manager::PARAMETERS)?;
+            Ok(SecretStoreType::AwsSecretsManager(
+                stores::aws_secrets_manager::AwsSecretsManagerConfig::from_params(
+                    secret_name,
+                    &params,
+                ),
+            ))
+        }
         "scheduler_rpc" => {
             require_no_selector(provider, selector)?;
             Ok(SecretStoreType::SchedulerRPC)
@@ -401,23 +454,22 @@ fn load_default_store() -> Arc<dyn SecretStore> {
 /// Returns an error if the secrets cannot be loaded.
 async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn SecretStore>> {
     match store_type {
-        SecretStoreType::Env => {
-            let env_secret_store = EnvSecretStoreBuilder::new().build();
-
-            Ok(Arc::new(env_secret_store) as Arc<dyn SecretStore>)
-        }
-        SecretStoreType::EnvCustomPath(path) => {
-            let env_secret_store = EnvSecretStoreBuilder::new().with_path(path.into()).build();
-
-            Ok(Arc::new(env_secret_store) as Arc<dyn SecretStore>)
+        SecretStoreType::Env(config) => {
+            let mut builder = EnvSecretStoreBuilder::new();
+            if let Some(path) = config.file_path {
+                builder = builder.with_path(path.into());
+            }
+            Ok(Arc::new(builder.build()) as Arc<dyn SecretStore>)
         }
         #[cfg(feature = "keyring-secret-store")]
         SecretStoreType::Keyring => {
             Ok(Arc::new(stores::keyring::KeyringSecretStore::new()) as Arc<dyn SecretStore>)
         }
-        SecretStoreType::Kubernetes(secret_name) => {
-            let mut kubernetes_secret_store =
-                stores::kubernetes::KubernetesSecretStore::new(secret_name.clone());
+        SecretStoreType::Kubernetes(config) => {
+            let mut kubernetes_secret_store = stores::kubernetes::KubernetesSecretStore::new(
+                config.secret_name,
+                config.namespace,
+            );
 
             kubernetes_secret_store
                 .init()
@@ -427,9 +479,11 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
             Ok(Arc::new(kubernetes_secret_store) as Arc<dyn SecretStore>)
         }
         #[cfg(feature = "aws-secrets-manager")]
-        SecretStoreType::AwsSecretsManager(secret_name) => {
-            let secret_store =
-                stores::aws_secrets_manager::AwsSecretsManager::new(secret_name.clone());
+        SecretStoreType::AwsSecretsManager(config) => {
+            let secret_store = stores::aws_secrets_manager::AwsSecretsManager::from_config(config)
+                .map_err(|e| Error::UnableToInitializeAwsSecretsManager {
+                    source: Box::new(e),
+                })?;
 
             secret_store
                 .init()
@@ -472,6 +526,254 @@ mod tests {
     fn test_secret_selector() {
         assert_eq!(Some("bar"), super::secret_selector("foo:bar"));
         assert_eq!(None, super::secret_selector("foo"));
+    }
+
+    fn bootstrap_env() -> std::sync::Arc<dyn super::SecretStore> {
+        super::load_default_store()
+    }
+
+    #[cfg(feature = "aws-secrets-manager")]
+    #[tokio::test]
+    async fn test_aws_secrets_manager_params_threaded_through() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        let mut p = HashMap::new();
+        p.insert("region".to_string(), "eu-west-2".to_string());
+        p.insert(
+            "endpoint_url".to_string(),
+            "https://localhost:4566".to_string(),
+        );
+
+        let store = SpicepodSecret {
+            from: "aws_secrets_manager:my-secret".to_string(),
+            name: "aws".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let resolved = super::spicepod_secret_store_type(&store, env.as_ref())
+            .await
+            .map_err(|e| e.to_string())
+            .expect("validates");
+        match resolved {
+            super::SecretStoreType::AwsSecretsManager(cfg) => {
+                assert_eq!(cfg.secret_name, "my-secret");
+                assert_eq!(cfg.region.as_deref(), Some("eu-west-2"));
+                assert_eq!(cfg.endpoint_url.as_deref(), Some("https://localhost:4566"));
+            }
+            _ => panic!("expected AwsSecretsManager variant"),
+        }
+    }
+
+    #[cfg(feature = "aws-secrets-manager")]
+    #[tokio::test]
+    async fn test_aws_secrets_manager_unknown_param_is_rejected() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        // The classic typo path: a misspelled `regoin` parameter must be
+        // rejected at load time rather than silently dropped (which is the
+        // failure mode this whole feature exists to prevent).
+        let mut p = HashMap::new();
+        p.insert("regoin".to_string(), "us-east-1".to_string());
+
+        let store = SpicepodSecret {
+            from: "aws_secrets_manager:my-secret".to_string(),
+            name: "aws".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let Err(err) = super::spicepod_secret_store_type(&store, env.as_ref()).await else {
+            panic!("unknown param should have been rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("regoin"), "got {msg}");
+        assert!(
+            msg.contains("region"),
+            "error must list supported params; got {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_env_file_path_param_routed_through_validation() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        let mut p = HashMap::new();
+        p.insert("file_path".to_string(), "/tmp/spice.env".to_string());
+
+        let store = SpicepodSecret {
+            from: "env".to_string(),
+            name: "env".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let resolved = super::spicepod_secret_store_type(&store, env.as_ref())
+            .await
+            .map_err(|e| e.to_string())
+            .expect("validates");
+        match resolved {
+            super::SecretStoreType::Env(cfg) => {
+                assert_eq!(cfg.file_path.as_deref(), Some("/tmp/spice.env"));
+            }
+            _ => panic!("expected Env variant"),
+        }
+    }
+
+    #[cfg(feature = "aws-secrets-manager")]
+    #[tokio::test]
+    async fn test_aws_secrets_manager_env_bootstrap_resolves_region() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        // Unique env-var name keeps tests isolated when run in parallel.
+        let var = format!("SPICE_TEST_BOOTSTRAP_REGION_{}", rand::random::<u64>());
+        unsafe { std::env::set_var(&var, "ap-south-1") };
+
+        let mut p = HashMap::new();
+        p.insert("region".to_string(), format!("${{ env:{var} }}"));
+        // Also exercise `secrets:` syntax — at bootstrap it must resolve
+        // against env (the only loaded store).
+        let var2 = format!("SPICE_TEST_BOOTSTRAP_ENDPOINT_{}", rand::random::<u64>());
+        unsafe { std::env::set_var(&var2, "https://localhost:4566") };
+        p.insert("endpoint_url".to_string(), format!("${{ secrets:{var2} }}"));
+
+        let store = SpicepodSecret {
+            from: "aws_secrets_manager:my-secret".to_string(),
+            name: "aws".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let resolved = super::spicepod_secret_store_type(&store, env.as_ref())
+            .await
+            .map_err(|e| e.to_string())
+            .expect("validates");
+
+        unsafe {
+            std::env::remove_var(&var);
+            std::env::remove_var(&var2);
+        }
+
+        match resolved {
+            super::SecretStoreType::AwsSecretsManager(cfg) => {
+                assert_eq!(cfg.region.as_deref(), Some("ap-south-1"));
+                assert_eq!(cfg.endpoint_url.as_deref(), Some("https://localhost:4566"));
+            }
+            _ => panic!("expected AwsSecretsManager variant"),
+        }
+    }
+
+    #[cfg(feature = "aws-secrets-manager")]
+    #[tokio::test]
+    async fn test_aws_secrets_manager_missing_env_var_fails_fast() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        let var = format!("SPICE_TEST_DEFINITELY_UNSET_{}", rand::random::<u64>());
+        // Defensive: ensure it's not set in case of a prior leak.
+        unsafe { std::env::remove_var(&var) };
+
+        let mut p = HashMap::new();
+        p.insert("region".to_string(), format!("${{ env:{var} }}"));
+
+        let store = SpicepodSecret {
+            from: "aws_secrets_manager:my-secret".to_string(),
+            name: "aws".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let Err(err) = super::spicepod_secret_store_type(&store, env.as_ref()).await else {
+            panic!("missing env var should have failed fast");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&var),
+            "error must name the missing var; got {msg}"
+        );
+    }
+
+    #[cfg(feature = "aws-secrets-manager")]
+    #[cfg(feature = "aws-secrets-manager")]
+    #[tokio::test]
+    async fn test_aws_secrets_manager_static_credentials_threaded_through() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        // `key` / `secret` / `session_token` should land on the resolved
+        // config so the store can hand them to the AWS SDK as static
+        // credentials, instead of being silently dropped.
+        let mut p = HashMap::new();
+        p.insert("region".to_string(), "us-east-1".to_string());
+        p.insert("key".to_string(), "AKIA_TEST".to_string());
+        p.insert("secret".to_string(), "shh".to_string());
+        p.insert("session_token".to_string(), "tok".to_string());
+
+        let store = SpicepodSecret {
+            from: "aws_secrets_manager:my-secret".to_string(),
+            name: "aws".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let resolved = super::spicepod_secret_store_type(&store, env.as_ref())
+            .await
+            .map_err(|e| e.to_string())
+            .expect("validates");
+        match resolved {
+            super::SecretStoreType::AwsSecretsManager(cfg) => {
+                assert_eq!(cfg.access_key_id.as_deref(), Some("AKIA_TEST"));
+                assert_eq!(cfg.secret_access_key.as_deref(), Some("shh"));
+                assert_eq!(cfg.session_token.as_deref(), Some("tok"));
+            }
+            _ => panic!("expected AwsSecretsManager variant"),
+        }
+    }
+
+    #[cfg(feature = "aws-secrets-manager")]
+    #[tokio::test]
+    async fn test_aws_secrets_manager_rejects_non_env_store_ref() {
+        use spicepod::component::secret::Secret as SpicepodSecret;
+        use spicepod::param::Params;
+        use std::collections::HashMap;
+
+        // References to other stores are a bootstrap cycle and must be
+        // rejected with a clear error.
+        let mut p = HashMap::new();
+        p.insert(
+            "region".to_string(),
+            "${ kubernetes:my-region }".to_string(),
+        );
+
+        let store = SpicepodSecret {
+            from: "aws_secrets_manager:my-secret".to_string(),
+            name: "aws".to_string(),
+            description: None,
+            params: Some(Params::from_string_map(p)),
+        };
+
+        let env = bootstrap_env();
+        let Err(err) = super::spicepod_secret_store_type(&store, env.as_ref()).await else {
+            panic!("non-env store ref should have been rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("kubernetes"), "got {msg}");
     }
 
     #[tokio::test]

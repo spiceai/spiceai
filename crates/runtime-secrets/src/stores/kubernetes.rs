@@ -25,8 +25,36 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 /// while preserving safe characters like `-`, `_`, and `.` that are valid in secret names.
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS.add(b'/').add(b'\\');
 use reqwest;
+use runtime_parameter_spec::ParameterSpec;
 use secrecy::SecretString;
 use snafu::{ResultExt, Snafu};
+
+/// Parameters accepted by the `kubernetes` secret store.
+pub const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::runtime("namespace")
+    .description(
+        "Kubernetes namespace containing the secret. Defaults to the namespace of the \
+         current pod (read from the service-account mount).",
+    )
+    .examples(&["spice", "my-team"])];
+
+/// Resolved configuration for the `kubernetes` secret store.
+#[derive(Debug, Clone)]
+pub struct KubernetesConfig {
+    pub secret_name: String,
+    pub namespace: Option<String>,
+}
+
+impl KubernetesConfig {
+    /// Builds a [`KubernetesConfig`] from the parsed selector and a
+    /// validated parameter map.
+    #[must_use]
+    pub fn from_params(secret_name: String, params: &HashMap<String, String>) -> Self {
+        Self {
+            secret_name,
+            namespace: params.get("namespace").cloned(),
+        }
+    }
+}
 
 use crate::SecretStore;
 
@@ -71,6 +99,9 @@ struct KubernetesClient {
     client: Option<reqwest::Client>,
     token: Option<String>,
     namespace: Option<String>,
+    /// Optional namespace override supplied via `params: { namespace: ... }`.
+    /// When set, takes precedence over the namespace from the service-account mount.
+    namespace_override: Option<String>,
 }
 
 fn secret_url(namespace: &str, secret_name: &str) -> String {
@@ -79,22 +110,29 @@ fn secret_url(namespace: &str, secret_name: &str) -> String {
 }
 
 impl KubernetesClient {
-    fn new() -> Self {
+    fn new(namespace_override: Option<String>) -> Self {
         Self {
             client: None,
             token: None,
             namespace: None,
+            namespace_override,
         }
     }
 
     async fn init(&mut self) -> Result<(), Error> {
-        // Perform blocking file I/O in a separate thread to avoid blocking the async runtime
-        let (token, namespace, ca_cert) = tokio::task::spawn_blocking(|| {
+        let override_ns = self.namespace_override.clone();
+        // Perform blocking file I/O in a separate thread to avoid blocking the async runtime.
+        // When a namespace override is supplied, skip reading the namespace file so the store
+        // works in environments where it is unavailable (e.g. local dev).
+        let (token, namespace, ca_cert) = tokio::task::spawn_blocking(move || {
             let token = std::fs::read_to_string(format!("{KUBERNETES_ACCOUNT_PATH}/token"))
                 .context(UnableToReadK8STokenSnafu)?;
 
-            let namespace = std::fs::read_to_string(format!("{KUBERNETES_ACCOUNT_PATH}/namespace"))
-                .context(UnableToReadK8SNamespaceSnafu)?;
+            let namespace = match override_ns {
+                Some(ns) => ns,
+                None => std::fs::read_to_string(format!("{KUBERNETES_ACCOUNT_PATH}/namespace"))
+                    .context(UnableToReadK8SNamespaceSnafu)?,
+            };
 
             let ca_cert = std::fs::read_to_string(format!("{KUBERNETES_ACCOUNT_PATH}/ca.crt"))
                 .context(UnableToReadCACertificateSnafu)?;
@@ -185,10 +223,10 @@ pub struct KubernetesSecretStore {
 
 impl KubernetesSecretStore {
     #[must_use]
-    pub fn new(secret_name: String) -> Self {
+    pub fn new(secret_name: String, namespace_override: Option<String>) -> Self {
         Self {
             secret_name,
-            kubernetes_client: KubernetesClient::new(),
+            kubernetes_client: KubernetesClient::new(namespace_override),
         }
     }
 
