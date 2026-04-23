@@ -106,6 +106,8 @@ mod results_cache;
 mod retention;
 mod s3;
 mod s3_location_pruning;
+#[cfg(feature = "sharepoint")]
+mod sharepoint;
 #[cfg(any(
     feature = "postgres",
     feature = "duckdb",

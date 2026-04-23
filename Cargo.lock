@@ -4302,7 +4302,9 @@ dependencies = [
  "linkme",
  "paste",
  "runtime",
+ "secrecy",
  "snafu",
+ "tokio",
  "url",
 ]
 

@@ -1,0 +1,1356 @@
+/*
+Copyright 2024-2026 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+//! [`object_store::ObjectStore`] implementation backed by Microsoft Graph's
+//! Drive APIs. Enables DataFusion to read, write, list, and delete files on
+//! SharePoint/OneDrive via the standard object-store abstraction.
+//!
+//! Files are addressed as `sharepoint://{drive-ref}/{path}` — see [`super::url`].
+//!
+//! Write path semantics:
+//! - Files ≤ [`INLINE_PUT_THRESHOLD`] go through `PUT /items/{id}/content`.
+//! - Larger files use a resumable upload session (`POST createUploadSession`
+//!   → chunked `PUT`s to the returned upload URL).
+//! - [`ConflictBehavior`] controls overwrite semantics; the default `Replace`
+//!   preserves SharePoint's version-on-overwrite behavior.
+
+use std::{
+    fmt::{self, Debug, Display},
+    io::Cursor,
+    ops::Range,
+    str::FromStr,
+    sync::Arc,
+};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use futures::{StreamExt, stream::BoxStream};
+use graph_rs_sdk::{
+    GraphClient, GraphFailure, default_drive::DefaultDriveApiClient, drives::DrivesIdApiClient,
+    error::ErrorMessage,
+    http::{AsyncIterator, ResponseExt},
+};
+use object_store::{
+    Attributes, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Result as ObjectStoreResult, UploadPart, path::Path,
+};
+use serde::Deserialize;
+use tokio::sync::Mutex;
+
+use super::url::{DriveRef, SharepointUrl};
+
+/// SharePoint cap on a single `PUT /content` is 4 MiB. We use a slightly lower
+/// threshold to leave headroom for request headers/overhead.
+const INLINE_PUT_THRESHOLD: usize = 4 * 1024 * 1024 - 4096;
+
+const STORE_TAG: &str = "SharepointObjectStore";
+
+/// Controls what happens on write when a file with the same path exists.
+/// Maps to SharePoint's `@microsoft.graph.conflictBehavior` header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConflictBehavior {
+    /// Overwrite the existing file; SharePoint retains the prior content as a
+    /// prior version. This is the default and matches SharePoint's standard
+    /// versioning-on-overwrite behavior.
+    #[default]
+    Replace,
+    /// Refuse to overwrite; return an error if the path exists.
+    Fail,
+    /// Write under a new name chosen by SharePoint (e.g. `file (1).csv`).
+    Rename,
+}
+
+impl ConflictBehavior {
+    fn as_graph_header(self) -> &'static str {
+        match self {
+            ConflictBehavior::Replace => "replace",
+            ConflictBehavior::Fail => "fail",
+            ConflictBehavior::Rename => "rename",
+        }
+    }
+}
+
+impl FromStr for ConflictBehavior {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "replace" => Ok(ConflictBehavior::Replace),
+            "fail" => Ok(ConflictBehavior::Fail),
+            "rename" => Ok(ConflictBehavior::Rename),
+            other => Err(format!(
+                "invalid conflict_behavior '{other}' (expected 'replace', 'fail', or 'rename')"
+            )),
+        }
+    }
+}
+
+/// Configuration applied to all operations against a [`SharepointObjectStore`].
+#[derive(Debug, Clone, Default)]
+pub struct SharepointObjectStoreConfig {
+    pub conflict_behavior: ConflictBehavior,
+}
+
+pub struct SharepointObjectStore {
+    client: Arc<GraphClient>,
+    config: SharepointObjectStoreConfig,
+}
+
+impl SharepointObjectStore {
+    #[must_use]
+    pub fn new(client: Arc<GraphClient>, config: SharepointObjectStoreConfig) -> Self {
+        Self { client, config }
+    }
+
+    /// Resolve a path from an object-store [`Path`] to a SharePoint API path
+    /// component in the form `:/full/path:`. Root returns `""` so callers can
+    /// use `item_by_path("")` directly.
+    fn graph_path(p: &Path) -> String {
+        let s = p.as_ref();
+        if s.is_empty() {
+            String::new()
+        } else {
+            format!(":/{s}:")
+        }
+    }
+
+    fn drive_from_url(url: &url::Url) -> ObjectStoreResult<SharepointUrl> {
+        SharepointUrl::from_url(url).map_err(|e| object_store::Error::Generic {
+            store: STORE_TAG,
+            source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)),
+        })
+    }
+}
+
+impl Debug for SharepointObjectStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharepointObjectStore")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Display for SharepointObjectStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(STORE_TAG)
+    }
+}
+
+/// Helper that parses the `Path` argument given to object-store methods as a
+/// `sharepoint://...` URL. The registry keys stores by authority, so the
+/// full URL (authority + path) is passed down — we need both the drive target
+/// and the in-drive path.
+fn parse_location(location: &Path) -> ObjectStoreResult<(DriveRef, Path)> {
+    let full = format!("sharepoint://{location}");
+    let parsed = SharepointUrl::parse(&full).map_err(|e| object_store::Error::Generic {
+        store: STORE_TAG,
+        source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)),
+    })?;
+    Ok((parsed.drive, parsed.item_path))
+}
+
+#[async_trait]
+impl ObjectStore for SharepointObjectStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        let (drive, item_path) = parse_location(location)?;
+        let bytes = payload_to_bytes(payload);
+
+        let effective_conflict = match opts.mode {
+            PutMode::Create => ConflictBehavior::Fail,
+            PutMode::Overwrite => ConflictBehavior::Replace,
+            PutMode::Update(_) => self.config.conflict_behavior,
+        };
+
+        let result = if bytes.len() <= INLINE_PUT_THRESHOLD {
+            inline_put(&self.client, &drive, &item_path, bytes, effective_conflict).await
+        } else {
+            resumable_put(&self.client, &drive, &item_path, bytes, effective_conflict).await
+        }?;
+
+        Ok(PutResult {
+            e_tag: result.e_tag,
+            version: result.version,
+        })
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        _opts: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        let (drive, item_path) = parse_location(location)?;
+        Ok(Box::new(BufferedMultipart::new(
+            Arc::clone(&self.client),
+            drive,
+            item_path,
+            self.config.conflict_behavior,
+        )))
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> ObjectStoreResult<GetResult> {
+        let (drive, item_path) = parse_location(location)?;
+
+        // Fetch metadata first — needed both for the ObjectMeta in GetResult
+        // and to respect If-Match / If-None-Match via object_store's helper.
+        let meta = head_drive_item(&self.client, &drive, &item_path).await?;
+        let object_meta = ObjectMeta {
+            location: location.clone(),
+            last_modified: meta.last_modified,
+            size: meta.size,
+            e_tag: meta.e_tag.clone(),
+            version: meta.version.clone(),
+        };
+        options.check_preconditions(&object_meta)?;
+
+        // Slice in-memory after fetch (see note in `get_content`).
+        let bytes = get_content(
+            &self.client,
+            &drive,
+            &item_path,
+            options.range.as_ref(),
+            meta.size,
+        )
+        .await?;
+        let range = if let Some(r) = options.range {
+            Some(resolve_range(&r, meta.size))
+        } else {
+            Some(0..meta.size)
+        };
+
+        let stream = futures::stream::once(async move { Ok(bytes) });
+        Ok(GetResult {
+            payload: GetResultPayload::Stream(Box::pin(stream)),
+            attributes: Attributes::default(),
+            range: range.unwrap_or(0..meta.size),
+            meta: ObjectMeta {
+                location: location.clone(),
+                last_modified: meta.last_modified,
+                size: meta.size,
+                e_tag: meta.e_tag.clone(),
+                version: meta.version.clone(),
+            },
+        })
+    }
+
+    async fn head(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
+        let (drive, item_path) = parse_location(location)?;
+        let meta = head_drive_item(&self.client, &drive, &item_path).await?;
+        Ok(ObjectMeta {
+            location: location.clone(),
+            last_modified: meta.last_modified,
+            size: meta.size,
+            e_tag: meta.e_tag,
+            version: meta.version,
+        })
+    }
+
+    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
+        let (drive, item_path) = parse_location(location)?;
+        delete_item(&self.client, &drive, &item_path).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        let client = Arc::clone(&self.client);
+        let prefix = prefix.cloned();
+        Box::pin(async_stream::stream! {
+            let (drive, item_path) = match prefix_to_location(&prefix) {
+                Ok(parts) => parts,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+            let mut pages = list_children(client, drive.clone(), item_path.clone(), false).await;
+            while let Some(res) = pages.next().await {
+                match res {
+                    Ok(batch) => {
+                        for item in batch {
+                            if let Some(meta) = item.into_object_meta(&drive, &item_path) {
+                                yield Ok(meta);
+                            }
+                        }
+                    }
+                    Err(e) => yield Err(e),
+                }
+            }
+        })
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> ObjectStoreResult<ListResult> {
+        let (drive, item_path) = prefix_to_location(&prefix.cloned())?;
+        let mut pages = list_children(
+            Arc::clone(&self.client),
+            drive.clone(),
+            item_path.clone(),
+            true,
+        )
+        .await;
+
+        let mut objects = Vec::new();
+        let mut common_prefixes = Vec::new();
+        while let Some(res) = pages.next().await {
+            let batch = res?;
+            for item in batch {
+                if item.is_folder {
+                    if let Some(p) = item.as_prefix(&drive, &item_path) {
+                        common_prefixes.push(p);
+                    }
+                } else if let Some(meta) = item.into_object_meta(&drive, &item_path) {
+                    objects.push(meta);
+                }
+            }
+        }
+
+        Ok(ListResult {
+            common_prefixes,
+            objects,
+        })
+    }
+
+    async fn copy(&self, _from: &Path, _to: &Path) -> ObjectStoreResult<()> {
+        Err(object_store::Error::NotImplemented)
+    }
+
+    async fn copy_if_not_exists(&self, _from: &Path, _to: &Path) -> ObjectStoreResult<()> {
+        Err(object_store::Error::NotImplemented)
+    }
+}
+
+fn payload_to_bytes(payload: PutPayload) -> Vec<u8> {
+    let total: usize = payload.iter().map(bytes::Bytes::len).sum();
+    let mut buf = Vec::with_capacity(total);
+    for chunk in payload.iter() {
+        buf.extend_from_slice(chunk);
+    }
+    buf
+}
+
+fn prefix_to_location(prefix: &Option<Path>) -> ObjectStoreResult<(DriveRef, Path)> {
+    let prefix = match prefix {
+        Some(p) => p.clone(),
+        None => {
+            return Err(object_store::Error::Generic {
+                store: STORE_TAG,
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "list requires a prefix with a drive reference (e.g. 'me/' or 'drives/{id}/')",
+                )),
+            });
+        }
+    };
+    parse_location(&prefix)
+}
+
+fn format_range(range: &GetRange, total_size: u64) -> String {
+    match range {
+        GetRange::Bounded(r) => format!("bytes={}-{}", r.start, r.end.saturating_sub(1)),
+        GetRange::Offset(off) => format!("bytes={off}-"),
+        GetRange::Suffix(n) => {
+            let start = total_size.saturating_sub(*n);
+            format!("bytes={start}-")
+        }
+    }
+}
+
+fn resolve_range(range: &GetRange, total_size: u64) -> std::ops::Range<u64> {
+    match range {
+        GetRange::Bounded(r) => r.clone(),
+        GetRange::Offset(off) => *off..total_size,
+        GetRange::Suffix(n) => total_size.saturating_sub(*n)..total_size,
+    }
+}
+
+
+/// A [`MultipartUpload`] that buffers all parts in memory, then uploads at
+/// `complete()` using either an inline PUT or a resumable upload session.
+/// Simpler and more robust than trying to stream SharePoint's upload-session
+/// chunks directly (which requires the total size up-front anyway).
+#[derive(Debug)]
+struct BufferedMultipart {
+    client: Arc<GraphClient>,
+    drive: DriveRef,
+    item_path: Path,
+    conflict: ConflictBehavior,
+    buffer: Arc<Mutex<Vec<u8>>>,
+    completed: bool,
+}
+
+impl BufferedMultipart {
+    fn new(
+        client: Arc<GraphClient>,
+        drive: DriveRef,
+        item_path: Path,
+        conflict: ConflictBehavior,
+    ) -> Self {
+        Self {
+            client,
+            drive,
+            item_path,
+            conflict,
+            buffer: Arc::new(Mutex::new(Vec::new())),
+            completed: false,
+        }
+    }
+}
+
+#[async_trait]
+impl MultipartUpload for BufferedMultipart {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        let buffer = Arc::clone(&self.buffer);
+        Box::pin(async move {
+            let bytes = payload_to_bytes(data);
+            let mut buf = buffer.lock().await;
+            buf.extend_from_slice(&bytes);
+            Ok(())
+        })
+    }
+
+    async fn complete(&mut self) -> ObjectStoreResult<PutResult> {
+        if self.completed {
+            return Err(object_store::Error::Generic {
+                store: STORE_TAG,
+                source: Box::new(std::io::Error::other(
+                    "multipart upload already completed",
+                )),
+            });
+        }
+        self.completed = true;
+
+        let bytes = {
+            let mut buf = self.buffer.lock().await;
+            std::mem::take(&mut *buf)
+        };
+        let result = if bytes.len() <= INLINE_PUT_THRESHOLD {
+            inline_put(&self.client, &self.drive, &self.item_path, bytes, self.conflict).await?
+        } else {
+            resumable_put(&self.client, &self.drive, &self.item_path, bytes, self.conflict).await?
+        };
+        Ok(PutResult {
+            e_tag: result.e_tag,
+            version: result.version,
+        })
+    }
+
+    async fn abort(&mut self) -> ObjectStoreResult<()> {
+        self.completed = true;
+        let mut buf = self.buffer.lock().await;
+        buf.clear();
+        Ok(())
+    }
+}
+
+/// Minimal metadata extracted from a DriveItem JSON response for head/list.
+#[derive(Debug, Clone)]
+struct DriveItemMeta {
+    id: String,
+    name: String,
+    last_modified: DateTime<Utc>,
+    size: u64,
+    e_tag: Option<String>,
+    version: Option<String>,
+    is_folder: bool,
+}
+
+impl DriveItemMeta {
+    fn into_object_meta(self, drive: &DriveRef, parent: &Path) -> Option<ObjectMeta> {
+        if self.is_folder {
+            return None;
+        }
+        Some(ObjectMeta {
+            location: drive_item_location(drive, parent, &self.name),
+            last_modified: self.last_modified,
+            size: self.size,
+            e_tag: self.e_tag,
+            version: self.version,
+        })
+    }
+
+    fn as_prefix(&self, drive: &DriveRef, parent: &Path) -> Option<Path> {
+        if self.is_folder {
+            Some(drive_item_location(drive, parent, &self.name))
+        } else {
+            None
+        }
+    }
+}
+
+fn drive_item_location(drive: &DriveRef, parent: &Path, name: &str) -> Path {
+    let mut segments: Vec<String> = Vec::new();
+    segments.push(drive.url_authority().to_string());
+    if let Some(id) = drive.id() {
+        segments.push(id.to_string());
+    }
+    for seg in parent.parts() {
+        segments.push(seg.as_ref().to_string());
+    }
+    segments.push(name.to_string());
+    Path::from_iter(segments.iter().map(String::as_str))
+}
+
+/// Parsed subset of a DriveItem JSON response.
+#[derive(Debug, Deserialize)]
+struct RawDriveItem {
+    id: String,
+    name: String,
+    size: Option<i64>,
+    #[serde(rename = "eTag")]
+    e_tag: Option<String>,
+    #[serde(rename = "cTag")]
+    c_tag: Option<String>,
+    #[serde(rename = "lastModifiedDateTime")]
+    last_modified: Option<String>,
+    folder: Option<serde_json::Value>,
+}
+
+impl RawDriveItem {
+    fn into_meta(self) -> ObjectStoreResult<DriveItemMeta> {
+        let last_modified = self
+            .last_modified
+            .as_deref()
+            .map(|s| {
+                DateTime::parse_from_rfc3339(s)
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_default())
+            })
+            .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_default());
+        Ok(DriveItemMeta {
+            id: self.id,
+            name: self.name,
+            last_modified,
+            size: u64::try_from(self.size.unwrap_or(0)).unwrap_or(0),
+            e_tag: self.e_tag,
+            version: self.c_tag,
+            is_folder: self.folder.is_some(),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawChildrenPage {
+    value: Vec<RawDriveItem>,
+    #[serde(rename = "@odata.nextLink")]
+    next_link: Option<String>,
+}
+
+struct PutOutcome {
+    e_tag: Option<String>,
+    version: Option<String>,
+}
+
+/// `Drive` API chain that abstracts over the two SDK-exposed types
+/// ([`DrivesIdApiClient`] and [`DefaultDriveApiClient`]) which happen to expose
+/// identical method names but aren't unified by a trait.
+enum DriveChain {
+    ById(DrivesIdApiClient),
+    Default(DefaultDriveApiClient),
+}
+
+fn drive_chain(client: &GraphClient, drive: &DriveRef) -> DriveChain {
+    match drive {
+        DriveRef::Me => DriveChain::Default(client.me().drive()),
+        DriveRef::Drive(id) => DriveChain::ById(client.drive(id)),
+        DriveRef::Site(id) => DriveChain::Default(client.site(id).drive()),
+        DriveRef::User(id) => DriveChain::Default(client.user(id).drive()),
+        DriveRef::Group(id) => DriveChain::Default(client.group(id).drive()),
+    }
+}
+
+async fn inline_put(
+    client: &GraphClient,
+    drive: &DriveRef,
+    item_path: &Path,
+    bytes: Vec<u8>,
+    conflict: ConflictBehavior,
+) -> ObjectStoreResult<PutOutcome> {
+    // `PUT /content` doesn't cleanly support `@microsoft.graph.conflictBehavior`
+    // for non-replace semantics, so route any non-default conflict behavior
+    // through a resumable upload session (which takes conflictBehavior in the
+    // JSON body). For the default `Replace`, SharePoint already preserves
+    // history by versioning on overwrite.
+    if conflict != ConflictBehavior::Replace {
+        return resumable_put(client, drive, item_path, bytes, conflict).await;
+    }
+    let graph_path = SharepointObjectStore::graph_path(item_path);
+    let body = reqwest::Body::from(bytes);
+    let response = match drive_chain(client, drive) {
+        DriveChain::ById(c) => c
+            .item_by_path(&graph_path)
+            .update_items_content(body)
+            .send()
+            .await
+            .map_err(graph_err)?,
+        DriveChain::Default(c) => c
+            .item_by_path(&graph_path)
+            .update_items_content(body)
+            .send()
+            .await
+            .map_err(graph_err)?,
+    };
+    parse_put_response(response).await
+}
+
+async fn resumable_put(
+    client: &GraphClient,
+    drive: &DriveRef,
+    item_path: &Path,
+    bytes: Vec<u8>,
+    conflict: ConflictBehavior,
+) -> ObjectStoreResult<PutOutcome> {
+    let graph_path = SharepointObjectStore::graph_path(item_path);
+    let body = serde_json::json!({
+        "item": { "@microsoft.graph.conflictBehavior": conflict.as_graph_header() },
+    });
+
+    let response = match drive_chain(client, drive) {
+        DriveChain::ById(c) => c
+            .item_by_path(&graph_path)
+            .create_upload_session(&body)
+            .send()
+            .await
+            .map_err(graph_err)?,
+        DriveChain::Default(c) => c
+            .item_by_path(&graph_path)
+            .create_upload_session(&body)
+            .send()
+            .await
+            .map_err(graph_err)?,
+    };
+
+    let mut session = response
+        .into_upload_session(Cursor::new(bytes))
+        .await
+        .map_err(graph_err)?;
+
+    let mut last_response: Option<reqwest::Response> = None;
+    while let Some(chunk_result) = session.next().await {
+        let resp = chunk_result.map_err(graph_err)?;
+        if !resp.status().is_success() {
+            return Err(object_store::Error::Generic {
+                store: STORE_TAG,
+                source: Box::new(std::io::Error::other(format!(
+                    "upload session chunk returned status {}",
+                    resp.status()
+                ))),
+            });
+        }
+        last_response = Some(resp);
+    }
+
+    match last_response {
+        Some(resp) => parse_put_response(resp).await,
+        None => Err(object_store::Error::Generic {
+            store: STORE_TAG,
+            source: Box::new(std::io::Error::other(
+                "upload session produced no responses",
+            )),
+        }),
+    }
+}
+
+async fn parse_put_response(
+    response: reqwest::Response,
+) -> ObjectStoreResult<PutOutcome> {
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(object_store::Error::Generic {
+            store: STORE_TAG,
+            source: Box::new(std::io::Error::other(format!(
+                "SharePoint upload failed: HTTP {status}: {body}"
+            ))),
+        });
+    }
+    let raw: RawDriveItem = response.json().await.map_err(|e| object_store::Error::Generic {
+        store: STORE_TAG,
+        source: Box::new(e),
+    })?;
+    let meta = raw.into_meta()?;
+    Ok(PutOutcome {
+        e_tag: meta.e_tag,
+        version: meta.version,
+    })
+}
+
+async fn head_drive_item(
+    client: &GraphClient,
+    drive: &DriveRef,
+    item_path: &Path,
+) -> ObjectStoreResult<DriveItemMeta> {
+    let graph_path = SharepointObjectStore::graph_path(item_path);
+    let response = match drive_chain(client, drive) {
+        DriveChain::ById(c) => c
+            .item_by_path(&graph_path)
+            .get_items()
+            .send()
+            .await
+            .map_err(graph_err)?,
+        DriveChain::Default(c) => c
+            .item_by_path(&graph_path)
+            .get_items()
+            .send()
+            .await
+            .map_err(graph_err)?,
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(object_store::Error::NotFound {
+            path: item_path.to_string(),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "drive item not found",
+            )),
+        });
+    }
+    if !response.status().is_success() {
+        return Err(object_store::Error::Generic {
+            store: STORE_TAG,
+            source: Box::new(std::io::Error::other(format!(
+                "head failed: HTTP {}",
+                response.status()
+            ))),
+        });
+    }
+    let raw: RawDriveItem = response
+        .json()
+        .await
+        .map_err(|e| object_store::Error::Generic {
+            store: STORE_TAG,
+            source: Box::new(e),
+        })?;
+    raw.into_meta()
+}
+
+async fn get_content(
+    client: &GraphClient,
+    drive: &DriveRef,
+    item_path: &Path,
+    range: Option<&GetRange>,
+    total_size: u64,
+) -> ObjectStoreResult<Bytes> {
+    let graph_path = SharepointObjectStore::graph_path(item_path);
+    let request = match drive_chain(client, drive) {
+        DriveChain::ById(c) => c.item_by_path(&graph_path).get_items_content(),
+        DriveChain::Default(c) => c.item_by_path(&graph_path).get_items_content(),
+    };
+    let response = request.send().await.map_err(graph_err)?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(object_store::Error::NotFound {
+            path: item_path.to_string(),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "drive item not found",
+            )),
+        });
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| object_store::Error::Generic {
+            store: STORE_TAG,
+            source: Box::new(e),
+        })?;
+    // Slice client-side: graph_http's RequestHandler doesn't accept cross-crate
+    // header types, so instead of the HTTP `Range` header we fetch the full
+    // body and slice. For large files this is wasteful — revisit once the SDK
+    // exposes a typed header API.
+    match range {
+        None => Ok(bytes),
+        Some(r) => {
+            let Range { start, end } = resolve_range(r, total_size);
+            let start = usize::try_from(start).unwrap_or(0);
+            let end = usize::try_from(end).unwrap_or(bytes.len()).min(bytes.len());
+            Ok(bytes.slice(start..end))
+        }
+    }
+}
+
+async fn delete_item(
+    client: &GraphClient,
+    drive: &DriveRef,
+    item_path: &Path,
+) -> ObjectStoreResult<()> {
+    let graph_path = SharepointObjectStore::graph_path(item_path);
+    let response = match drive_chain(client, drive) {
+        DriveChain::ById(c) => c
+            .item_by_path(&graph_path)
+            .delete_items()
+            .send()
+            .await
+            .map_err(graph_err)?,
+        DriveChain::Default(c) => c
+            .item_by_path(&graph_path)
+            .delete_items()
+            .send()
+            .await
+            .map_err(graph_err)?,
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(object_store::Error::NotFound {
+            path: item_path.to_string(),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "drive item not found",
+            )),
+        });
+    }
+    if !response.status().is_success() {
+        return Err(object_store::Error::Generic {
+            store: STORE_TAG,
+            source: Box::new(std::io::Error::other(format!(
+                "delete failed: HTTP {}",
+                response.status()
+            ))),
+        });
+    }
+    Ok(())
+}
+
+/// Pages through `list_children` for a given drive+path, yielding batches via
+/// the SDK's built-in `.paging().stream()` helper (same pattern as
+/// [`super::client::SharepointClient::stream_drive_items`]).
+async fn list_children(
+    client: Arc<GraphClient>,
+    drive: DriveRef,
+    item_path: Path,
+    _want_prefixes: bool,
+) -> BoxStream<'static, ObjectStoreResult<Vec<DriveItemMeta>>> {
+    let graph_path = SharepointObjectStore::graph_path(&item_path);
+    let req_result = match drive_chain(&client, &drive) {
+        DriveChain::ById(c) => c
+            .item_by_path(&graph_path)
+            .list_children()
+            .paging()
+            .stream::<RawChildrenPage>(),
+        DriveChain::Default(c) => c
+            .item_by_path(&graph_path)
+            .list_children()
+            .paging()
+            .stream::<RawChildrenPage>(),
+    };
+
+    let paging_stream = match req_result {
+        Ok(s) => s,
+        Err(e) => {
+            return Box::pin(async_stream::stream! {
+                yield Err(graph_err(e));
+            });
+        }
+    };
+
+    Box::pin(async_stream::stream! {
+        let mut paging_stream = Box::pin(paging_stream);
+        while let Some(resp_result) = paging_stream.next().await {
+            let response = match resp_result {
+                Ok(r) => r,
+                Err(e) => {
+                    yield Err(graph_err(e));
+                    return;
+                }
+            };
+            let page: RawChildrenPage = match response.into_body() {
+                Ok(p) => p,
+                Err(e) => {
+                    yield Err(object_store::Error::Generic {
+                        store: STORE_TAG,
+                        source: Box::new(std::io::Error::other(format!(
+                            "list_children response parse failed: {}",
+                            GraphFailure::ErrorMessage(e)
+                        ))),
+                    });
+                    return;
+                }
+            };
+            let mut metas = Vec::with_capacity(page.value.len());
+            for raw in page.value {
+                match raw.into_meta() {
+                    Ok(m) => metas.push(m),
+                    Err(e) => {
+                        yield Err(e);
+                        return;
+                    }
+                }
+            }
+            yield Ok(metas);
+        }
+    })
+}
+
+
+fn graph_err(e: graph_rs_sdk::GraphFailure) -> object_store::Error {
+    object_store::Error::Generic {
+        store: STORE_TAG,
+        source: Box::new(std::io::Error::other(format!("Graph API error: {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use graph_rs_sdk::GraphClient;
+
+    use super::*;
+
+    #[test]
+    fn graph_path_root_is_empty() {
+        assert_eq!(SharepointObjectStore::graph_path(&Path::from("")), "");
+    }
+
+    #[test]
+    fn graph_path_wraps_with_colons() {
+        assert_eq!(
+            SharepointObjectStore::graph_path(&Path::from("Documents/foo.csv")),
+            ":/Documents/foo.csv:"
+        );
+    }
+
+    #[test]
+    fn conflict_behavior_from_str() {
+        assert_eq!(
+            "replace".parse::<ConflictBehavior>().unwrap(),
+            ConflictBehavior::Replace
+        );
+        assert_eq!(
+            "fail".parse::<ConflictBehavior>().unwrap(),
+            ConflictBehavior::Fail
+        );
+        assert_eq!(
+            "rename".parse::<ConflictBehavior>().unwrap(),
+            ConflictBehavior::Rename
+        );
+        assert!("bogus".parse::<ConflictBehavior>().is_err());
+    }
+
+    #[test]
+    fn parse_location_roundtrip() {
+        let (drive, path) = parse_location(&Path::from("me/Documents/a.csv")).unwrap();
+        assert_eq!(drive, DriveRef::Me);
+        assert_eq!(path.as_ref(), "Documents/a.csv");
+
+        let (drive, path) =
+            parse_location(&Path::from("drives/b!abc/Shared/file.parquet")).unwrap();
+        assert_eq!(drive, DriveRef::Drive("b!abc".to_string()));
+        assert_eq!(path.as_ref(), "Shared/file.parquet");
+    }
+
+    #[test]
+    fn drive_item_location_me() {
+        let p = drive_item_location(&DriveRef::Me, &Path::from("Documents"), "a.csv");
+        assert_eq!(p.as_ref(), "me/Documents/a.csv");
+    }
+
+    #[test]
+    fn drive_item_location_site() {
+        let p = drive_item_location(
+            &DriveRef::Site("contoso.sharepoint.com,1,2".to_string()),
+            &Path::from("Shared"),
+            "data.json",
+        );
+        assert_eq!(p.as_ref(), "sites/contoso.sharepoint.com,1,2/Shared/data.json");
+    }
+
+    #[test]
+    fn format_range_bounded() {
+        let r = format_range(&GetRange::Bounded(10..20), 100);
+        assert_eq!(r, "bytes=10-19");
+    }
+
+    #[test]
+    fn format_range_suffix() {
+        let r = format_range(&GetRange::Suffix(25), 100);
+        assert_eq!(r, "bytes=75-");
+    }
+
+    #[test]
+    fn format_range_offset() {
+        let r = format_range(&GetRange::Offset(10), 100);
+        assert_eq!(r, "bytes=10-");
+    }
+
+    // ---- End-to-end object-store tests against a mocked Graph endpoint. ----
+    //
+    // Gated behind:
+    //  - `sharepoint-mock-host` feature → enables `graph-rs-sdk/test-util` so
+    //    `GraphClient::use_test_endpoint` accepts a localhost URL.
+    //  - `not(debug_assertions)` → debug builds of the full
+    //    graph-rs-sdk + reqwest + tokio + async-stream stack produce async
+    //    state machines that overflow tokio worker stacks; release builds
+    //    inline/elide those intermediate frames.
+    //
+    // Run via:
+    //
+    //     cargo test --release -p data_components \
+    //         --features sharepoint,sharepoint-mock-host \
+    //         --no-default-features \
+    //         sharepoint::object_store::tests::mock_http
+    #[cfg(all(feature = "sharepoint-mock-host", not(debug_assertions)))]
+    mod mock_http {
+        use super::*;
+        use futures::StreamExt;
+        use url::Url;
+
+        struct MockResp {
+            status: &'static str,
+            body_bytes: Vec<u8>,
+            content_type: &'static str,
+        }
+
+        impl MockResp {
+            fn ok_json(body: &str) -> Self {
+                Self {
+                    status: "200 OK",
+                    body_bytes: body.as_bytes().to_vec(),
+                    content_type: "application/json",
+                }
+            }
+            fn ok_bytes(bytes: Vec<u8>) -> Self {
+                Self {
+                    status: "200 OK",
+                    body_bytes: bytes,
+                    content_type: "application/octet-stream",
+                }
+            }
+            fn empty(status: &'static str) -> Self {
+                Self {
+                    status,
+                    body_bytes: Vec::new(),
+                    content_type: "application/json",
+                }
+            }
+        }
+
+        async fn start_mock(
+            responses: Vec<MockResp>,
+        ) -> (String, Arc<AtomicUsize>, Arc<tokio::sync::Mutex<Vec<String>>>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock");
+            let addr = listener.local_addr().unwrap();
+            let responses = Arc::new(tokio::sync::Mutex::new(VecDeque::from(responses)));
+            let count = Arc::new(AtomicUsize::new(0));
+            let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            let count_srv = Arc::clone(&count);
+            let captured_srv = Arc::clone(&captured);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else { break };
+                    let responses = Arc::clone(&responses);
+                    let count = Arc::clone(&count_srv);
+                    let captured = Arc::clone(&captured_srv);
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 8192];
+                        let mut raw = Vec::new();
+                        let mut header_end: Option<usize> = None;
+                        let mut content_length = 0usize;
+                        loop {
+                            let n = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            raw.extend_from_slice(&buf[..n]);
+                            if header_end.is_none()
+                                && let Some(i) =
+                                    raw.windows(4).position(|w| w == b"\r\n\r\n").map(|j| j + 4)
+                            {
+                                header_end = Some(i);
+                                let ht = String::from_utf8_lossy(&raw[..i]);
+                                content_length = ht
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (k, v) = line.split_once(':')?;
+                                        k.trim()
+                                            .eq_ignore_ascii_case("Content-Length")
+                                            .then(|| v.trim().parse::<usize>().ok())
+                                            .flatten()
+                                    })
+                                    .unwrap_or(0);
+                            }
+                            if let Some(end) = header_end
+                                && raw.len() >= end + content_length
+                            {
+                                break;
+                            }
+                        }
+                        count.fetch_add(1, Ordering::SeqCst);
+                        captured
+                            .lock()
+                            .await
+                            .push(String::from_utf8_lossy(&raw).into_owned());
+                        let resp = responses.lock().await.pop_front().unwrap_or(MockResp {
+                            status: "500 Internal Server Error",
+                            body_bytes: b"{}".to_vec(),
+                            content_type: "application/json",
+                        });
+                        let mut hdr = format!(
+                            "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
+                            resp.status,
+                            resp.content_type,
+                            resp.body_bytes.len()
+                        )
+                        .into_bytes();
+                        hdr.extend_from_slice(&resp.body_bytes);
+                        let _ = stream.write_all(&hdr).await;
+                    });
+                }
+            });
+            (format!("http://{addr}"), count, captured)
+        }
+
+        fn mock_store(endpoint: &str) -> SharepointObjectStore {
+            let mut client = GraphClient::new("unused-test-token");
+            client.use_test_endpoint(&Url::parse(&format!("{endpoint}/v1.0")).unwrap());
+            SharepointObjectStore::new(Arc::new(client), SharepointObjectStoreConfig::default())
+        }
+
+        /// Run a test future on a tokio runtime with a generous thread stack —
+        /// debug builds of deep async chains (graph-rs-sdk + reqwest + tokio +
+        /// async-stream) exceed both the default 2 MiB test-runner stack and
+        /// tokio's default worker stack. We jump onto a fresh thread with
+        /// 32 MiB, then into a multi-thread runtime with 16 MiB workers, so
+        /// the driving future and its spawned tasks all have headroom.
+        fn run_async<F>(f: F)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            std::thread::Builder::new()
+                .stack_size(64 * 1024 * 1024)
+                .spawn(move || {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .thread_stack_size(64 * 1024 * 1024)
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(f);
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        }
+
+        const HEAD_JSON: &str = r#"{
+            "id": "01ABC", "name": "file.csv", "size": 42,
+            "eTag": "\"abc\"", "cTag": "\"def\"",
+            "lastModifiedDateTime": "2026-04-22T10:00:00Z"
+        }"#;
+
+        #[test]
+        #[ignore = "graph-rs-sdk + reqwest debug-build async state machines blow the tokio worker stack; run with --release: cargo test --release -p data_components --features sharepoint,sharepoint-mock-host --no-default-features -- --ignored sharepoint::object_store::tests::mock_http"]
+        fn head_parses_drive_item_metadata() {
+            run_async(async {
+                let (url, count, _captured) =
+                    start_mock(vec![MockResp::ok_json(HEAD_JSON)]).await;
+                let store = mock_store(&url);
+                let meta = store
+                    .head(&Path::from("me/Documents/file.csv"))
+                    .await
+                    .unwrap();
+                assert_eq!(meta.size, 42);
+                assert_eq!(meta.e_tag.as_deref(), Some("\"abc\""));
+                assert_eq!(meta.version.as_deref(), Some("\"def\""));
+                assert_eq!(count.load(Ordering::SeqCst), 1);
+            });
+        }
+
+        #[test]
+        #[ignore = "graph-rs-sdk debug-build async recursion; run --release with --ignored"]
+        fn head_returns_not_found_on_404() {
+            run_async(async {
+                let (url, _count, _captured) =
+                    start_mock(vec![MockResp::empty("404 Not Found")]).await;
+                let store = mock_store(&url);
+                let err = store
+                    .head(&Path::from("me/Documents/missing.csv"))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, object_store::Error::NotFound { .. }),
+                    "expected NotFound, got {err:?}"
+                );
+            });
+        }
+
+        #[test]
+        fn get_returns_bytes_after_head() {
+            run_async(async {
+                // get_opts does a head first, then fetches /content.
+                let (url, count, _captured) = start_mock(vec![
+                    MockResp::ok_json(HEAD_JSON),
+                    MockResp::ok_bytes(b"hello, world".to_vec()),
+                ])
+                .await;
+                let store = mock_store(&url);
+                let result = store
+                    .get_opts(&Path::from("me/Documents/file.csv"), GetOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!(result.meta.size, 42);
+                let bytes = match result.payload {
+                    GetResultPayload::Stream(mut s) => {
+                        let mut all = Vec::new();
+                        while let Some(chunk) = s.next().await {
+                            all.extend_from_slice(&chunk.unwrap());
+                        }
+                        all
+                    }
+                    _ => panic!("expected stream payload"),
+                };
+                assert_eq!(bytes, b"hello, world");
+                assert_eq!(count.load(Ordering::SeqCst), 2);
+            });
+        }
+
+        #[test]
+        fn delete_returns_ok_on_success() {
+            run_async(async {
+                let (url, count, _captured) = start_mock(vec![MockResp::ok_json("{}")]).await;
+                let store = mock_store(&url);
+                store
+                    .delete(&Path::from("me/Documents/file.csv"))
+                    .await
+                    .unwrap();
+                assert_eq!(count.load(Ordering::SeqCst), 1);
+            });
+        }
+
+        #[test]
+        fn delete_returns_not_found_on_404() {
+            run_async(async {
+                let (url, _count, _captured) = start_mock(vec![MockResp {
+                    status: "404 Not Found",
+                    body_bytes: b"{}".to_vec(),
+                    content_type: "application/json",
+                }])
+                .await;
+                let store = mock_store(&url);
+                let err = store
+                    .delete(&Path::from("me/Documents/gone.csv"))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, object_store::Error::NotFound { .. }));
+            });
+        }
+
+        #[test]
+        fn put_small_returns_etag_from_response() {
+            run_async(async {
+                let (url, count, captured) =
+                    start_mock(vec![MockResp::ok_json(HEAD_JSON)]).await;
+                let store = mock_store(&url);
+                let result = store
+                    .put_opts(
+                        &Path::from("me/Documents/file.csv"),
+                        PutPayload::from(bytes::Bytes::from_static(b"abc123")),
+                        PutOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result.e_tag.as_deref(), Some("\"abc\""));
+                assert_eq!(result.version.as_deref(), Some("\"def\""));
+                assert_eq!(count.load(Ordering::SeqCst), 1);
+                let req = &captured.lock().await[0];
+                assert!(
+                    req.starts_with("PUT "),
+                    "expected PUT request, got: {}",
+                    req.lines().next().unwrap_or("")
+                );
+                assert!(
+                    req.contains("/content"),
+                    "expected /content path in PUT request"
+                );
+            });
+        }
+
+        #[test]
+        fn list_paginates_via_odata_next_link() {
+            run_async(async {
+                let page1 = r#"{
+                    "value": [
+                        {"id":"1","name":"a.csv","size":10,"eTag":"\"e1\"","cTag":"\"c1\"",
+                         "lastModifiedDateTime":"2026-04-22T10:00:00Z"},
+                        {"id":"2","name":"subfolder","size":0,"eTag":"\"e2\"","cTag":"\"c2\"",
+                         "lastModifiedDateTime":"2026-04-22T10:00:00Z",
+                         "folder":{"childCount":0}}
+                    ],
+                    "@odata.nextLink":"PAGE2"
+                }"#;
+                let page2 = r#"{
+                    "value": [
+                        {"id":"3","name":"b.parquet","size":20,"eTag":"\"e3\"","cTag":"\"c3\"",
+                         "lastModifiedDateTime":"2026-04-22T10:00:00Z"}
+                    ]
+                }"#;
+                let (url, count, _captured) =
+                    start_mock(vec![MockResp::ok_json(page1), MockResp::ok_json(page2)]).await;
+                let store = mock_store(&url);
+                let mut stream = store.list(Some(&Path::from("me/Documents")));
+                let mut names = Vec::new();
+                while let Some(item) = stream.next().await {
+                    let meta = item.unwrap();
+                    names.push(meta.location.to_string());
+                }
+                // Folders skipped from files-only list; two files across two pages.
+                assert_eq!(names.len(), 2, "got names={names:?}");
+                assert!(names[0].ends_with("a.csv"));
+                assert!(names[1].ends_with("b.parquet"));
+                assert_eq!(count.load(Ordering::SeqCst), 2);
+            });
+        }
+
+        #[test]
+        fn list_with_delimiter_separates_files_and_folders() {
+            run_async(async {
+                let page = r#"{
+                    "value": [
+                        {"id":"1","name":"a.csv","size":10,"eTag":"\"e1\"","cTag":"\"c1\"",
+                         "lastModifiedDateTime":"2026-04-22T10:00:00Z"},
+                        {"id":"2","name":"sub","size":0,"eTag":"\"e2\"","cTag":"\"c2\"",
+                         "lastModifiedDateTime":"2026-04-22T10:00:00Z",
+                         "folder":{"childCount":0}}
+                    ]
+                }"#;
+                let (url, _count, _captured) = start_mock(vec![MockResp::ok_json(page)]).await;
+                let store = mock_store(&url);
+                let result = store
+                    .list_with_delimiter(Some(&Path::from("me/Documents")))
+                    .await
+                    .unwrap();
+                assert_eq!(result.objects.len(), 1);
+                assert!(result.objects[0].location.to_string().ends_with("a.csv"));
+                assert_eq!(result.common_prefixes.len(), 1);
+                assert!(result.common_prefixes[0].to_string().ends_with("sub"));
+            });
+        }
+    }
+}
