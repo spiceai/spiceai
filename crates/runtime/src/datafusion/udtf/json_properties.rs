@@ -2045,13 +2045,13 @@ mod tests {
     /// named argument from SQL. This is the actual user-facing path the PR
     /// fixes — `invoke_with_args` direct calls bypass `simplify`.
     ///
-    /// Ignored: DataFusion's SQL planner resolves `name => value` to a positional
+    /// Ignored: `DataFusion`'s SQL planner resolves `name => value` to a positional
     /// slot via `Signature::with_parameter_names` and then drops the
     /// `spice.parameter_name` metadata before `simplify` is invoked, so the
     /// runtime can no longer recover which option was specified. The scalar-path
     /// fix still covers `invoke_with_args` with explicit arg field names (see
     /// `scalar_udf_named_arg_expand_maps_applied`); unblocking the SQL path
-    /// requires a DataFusion change to keep the metadata through type coercion.
+    /// requires a `DataFusion` change to keep the metadata through type coercion.
     #[ignore = "DataFusion strips named-arg metadata before ScalarUDFImpl::simplify"]
     #[tokio::test]
     async fn scalar_udf_named_arg_via_sql_session() {
