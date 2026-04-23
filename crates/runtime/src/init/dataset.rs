@@ -922,9 +922,11 @@ impl Runtime {
         let accelerator_engine = acceleration_settings.engine;
 
         // Allow ReadWrite access when:
-        // 1. Replication is enabled (changes are synced back to source), OR
-        // 2. on_conflict is configured (accelerator supports local writes via upsert/drop), OR
-        // 3. refresh_mode is `changes` (CDC/WAL stream replicates writes back to the accelerator)
+        // 1. `replication.enabled` is set (user attestation that accelerator
+        //    writes are kept in sync with the federated source out-of-band), OR
+        // 2. on_conflict is configured (accelerator-only writes via upsert/drop, no source sync), OR
+        // 3. refresh_mode is `changes` (source->accelerator CDC/WAL stream keeps the accelerator
+        //    in sync with source-side changes)
         let has_on_conflict = !acceleration_settings.on_conflict.is_empty();
         let has_changes_refresh = acceleration_settings
             .refresh_mode
