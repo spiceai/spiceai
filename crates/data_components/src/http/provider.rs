@@ -5311,7 +5311,6 @@ mod tests {
             .expect("batch should be created");
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 3);
-
         assert_eq!(
             string_col(&batch, "id"),
             vec![Some("1".to_string()), Some("2".to_string())]
@@ -5323,6 +5322,18 @@ mod tests {
         let details = string_col(&batch, "details");
         assert_eq!(details[0].as_deref(), Some(r#"{"extra":"x"}"#));
         assert_eq!(details[1].as_deref(), Some(r#"{"k":42}"#));
+    }
+
+    #[test]
+    fn create_batch_from_rows_nested_missing_key_is_null() {
+        let (exec, nesting) = nested_exec(&["id", "name", "details"], "details");
+        let rows = vec![r#"{"id":"1"}"#.to_string()];
+        let batch = exec
+            .create_batch_from_rows_nested(&rows, &nesting)
+            .expect("batch should be created");
+        assert_eq!(string_col(&batch, "id"), vec![Some("1".to_string())]);
+        assert_eq!(string_col(&batch, "name"), vec![None]);
+        assert_eq!(string_col(&batch, "details"), vec![None]);
     }
 
     #[test]
@@ -5396,24 +5407,25 @@ mod tests {
             "details".to_string(),
         );
         let provider = Arc::new(base_provider().with_json_nesting(nesting.clone()));
+        // Project only static columns, not "details".
         let full_schema = provider.schema();
-        let id_idx = full_schema.index_of("id").expect("id in schema");
-        let projected = datafusion::common::project_schema(&full_schema, Some(&vec![id_idx]))
-            .expect("project schema");
+        let projected = Arc::new(
+            full_schema
+                .project(&[
+                    full_schema.index_of("id").expect("id in schema"),
+                    full_schema.index_of("name").expect("name in schema"),
+                ])
+                .expect("projection should succeed"),
+        );
         let exec = HttpExec::new(projected, provider, vec![(None, None, None)], None);
-        let rows = vec![
-            r#"{"id":"1","name":"alpha","huge":"x","payload":{"a":1,"b":[1,2,3]}}"#.to_string(),
-            r#"{"id":"2","payload":"y"}"#.to_string(),
-        ];
+        let rows = vec![r#"{"id":"42","name":"fast","extra":"ignored"}"#.to_string()];
         let batch = exec
             .create_batch_from_rows_nested(&rows, &nesting)
-            .expect("batch should be created");
-        assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 1);
-        assert_eq!(
-            string_col(&batch, "id"),
-            vec![Some("1".to_string()), Some("2".to_string())]
-        );
+            .expect("fast-path batch should be created");
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(string_col(&batch, "id"), vec![Some("42".to_string())]);
+        assert_eq!(string_col(&batch, "name"), vec![Some("fast".to_string())]);
     }
 
     #[test]

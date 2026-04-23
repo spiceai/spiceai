@@ -146,6 +146,7 @@ rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
 elasticsearch = { path = "../elasticsearch", optional = true }
+duration-parse = { workspace = true, optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
@@ -190,7 +191,7 @@ utoipa-swagger-ui = { version = ">=8.1.1", features = [
 ], optional = true }
 
 gethostname.workspace = true
-uuid = { workspace = true, features = ["v7"] }
+uuid = { workspace = true, features = ["v4", "v7"] }
 workers = { path = "../workers" }
 x509-certificate.workspace = true
 
@@ -281,6 +282,7 @@ dremio = []
 elasticsearch = [
     "data_components/elasticsearch",
     "dep:elasticsearch",
+    "dep:duration-parse",
     "search/elasticsearch",
 ]
 duckdb = [

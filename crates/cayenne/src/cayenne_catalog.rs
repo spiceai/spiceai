@@ -17,7 +17,10 @@ limitations under the License.
 //! Metadata catalog implementation for Cayenne.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog};
-use super::metadata::{CreateTableOptions, DeleteFile, PartitionMetadata, TableMetadata};
+use super::metadata::{
+    CreateTableOptions, DeleteFile, InlinedData, InlinedDelete, PartitionMetadata, TableMetadata,
+    TableStatistics,
+};
 use super::metastore::sqlite::SqliteMetastore;
 #[cfg(feature = "turso")]
 use super::metastore::turso::TursoMetastore;
@@ -1261,6 +1264,222 @@ impl MetadataCatalog for CayenneCatalog {
             })
     }
 
+    async fn upsert_table_statistics(&self, stats: &TableStatistics) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "INSERT OR REPLACE INTO cayenne_table_statistics \
+                      (table_id, statistics_blob, num_rows) \
+                      VALUES (?1, ?2, ?3)",
+                params: vec![
+                    MetastoreValue::Text(stats.table_id.clone()),
+                    MetastoreValue::Blob(stats.statistics_blob.clone()),
+                    MetastoreValue::Integer(stats.num_rows),
+                ],
+            })
+            .await
+    }
+
+    async fn get_table_statistics(&self, table_id: &str) -> CatalogResult<Option<TableStatistics>> {
+        let results = self
+            .metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT table_id, statistics_blob, num_rows
+                    FROM cayenne_table_statistics
+                    WHERE table_id = ?1
+                    ",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| {
+                    Ok(TableStatistics {
+                        table_id: row.get_string(0)?,
+                        statistics_blob: row.get_blob(1)?,
+                        num_rows: row.get_i64(2)?,
+                    })
+                },
+            )
+            .await?;
+        Ok(results.into_iter().next())
+    }
+
+    async fn clear_table_statistics(&self, table_id: &str) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_table_statistics WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+    }
+
+    async fn add_inlined_data(&self, data: InlinedData) -> CatalogResult<String> {
+        let inlined_id = if data.inlined_id.is_empty() {
+            uuid::Uuid::now_v7().to_string()
+        } else {
+            data.inlined_id
+        };
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: r"
+                INSERT INTO cayenne_inlined_data
+                    (inlined_id, table_id, partition_key, data_ipc, record_count, sequence_number)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ",
+                params: vec![
+                    MetastoreValue::Text(inlined_id.clone()),
+                    MetastoreValue::Text(data.table_id),
+                    data.partition_key.into(),
+                    MetastoreValue::Blob(data.data_ipc),
+                    MetastoreValue::Integer(data.record_count),
+                    MetastoreValue::Integer(data.sequence_number),
+                ],
+            })
+            .await?;
+        Ok(inlined_id)
+    }
+
+    async fn get_inlined_data(&self, table_id: &str) -> CatalogResult<Vec<InlinedData>> {
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT inlined_id, table_id, partition_key, data_ipc, record_count, sequence_number, created_at
+                    FROM cayenne_inlined_data
+                    WHERE table_id = ?1
+                    ORDER BY sequence_number
+                    ",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| {
+                    Ok(InlinedData {
+                        inlined_id: row.get_string(0)?,
+                        table_id: row.get_string(1)?,
+                        partition_key: row.get_optional_string(2)?,
+                        data_ipc: row.get_blob(3)?,
+                        record_count: row.get_i64(4)?,
+                        sequence_number: row.get_i64(5)?,
+                        created_at: row.get_string(6)?,
+                    })
+                },
+            )
+            .await
+    }
+
+    async fn get_inlined_data_for_partition(
+        &self,
+        table_id: &str,
+        partition_key: &str,
+    ) -> CatalogResult<Vec<InlinedData>> {
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT inlined_id, table_id, partition_key, data_ipc, record_count, sequence_number, created_at
+                    FROM cayenne_inlined_data
+                    WHERE table_id = ?1 AND partition_key = ?2
+                    ORDER BY sequence_number
+                    ",
+                    params: vec![
+                        MetastoreValue::Text(table_id.to_string()),
+                        MetastoreValue::Text(partition_key.to_string()),
+                    ],
+                },
+                |row| {
+                    Ok(InlinedData {
+                        inlined_id: row.get_string(0)?,
+                        table_id: row.get_string(1)?,
+                        partition_key: row.get_optional_string(2)?,
+                        data_ipc: row.get_blob(3)?,
+                        record_count: row.get_i64(4)?,
+                        sequence_number: row.get_i64(5)?,
+                        created_at: row.get_string(6)?,
+                    })
+                },
+            )
+            .await
+    }
+
+    async fn get_inlined_data_count(&self, table_id: &str) -> CatalogResult<i64> {
+        self.metastore
+            .query_row_helper(
+                QueryRowParams {
+                    sql: "SELECT COALESCE(SUM(record_count), 0) FROM cayenne_inlined_data WHERE table_id = ?1",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+    }
+
+    async fn clear_inlined_data(&self, table_id: &str) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_inlined_data WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+    }
+
+    async fn add_inlined_delete(&self, delete: InlinedDelete) -> CatalogResult<String> {
+        let inlined_id = if delete.inlined_id.is_empty() {
+            uuid::Uuid::now_v7().to_string()
+        } else {
+            delete.inlined_id
+        };
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: r"
+                INSERT INTO cayenne_inlined_delete
+                    (inlined_id, table_id, delete_ipc, delete_count, sequence_number)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                ",
+                params: vec![
+                    MetastoreValue::Text(inlined_id.clone()),
+                    MetastoreValue::Text(delete.table_id),
+                    MetastoreValue::Blob(delete.delete_ipc),
+                    MetastoreValue::Integer(delete.delete_count),
+                    MetastoreValue::Integer(delete.sequence_number),
+                ],
+            })
+            .await?;
+        Ok(inlined_id)
+    }
+
+    async fn get_inlined_deletes(&self, table_id: &str) -> CatalogResult<Vec<InlinedDelete>> {
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT inlined_id, table_id, delete_ipc, delete_count, sequence_number, created_at
+                    FROM cayenne_inlined_delete
+                    WHERE table_id = ?1
+                    ORDER BY sequence_number
+                    ",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                |row| {
+                    Ok(InlinedDelete {
+                        inlined_id: row.get_string(0)?,
+                        table_id: row.get_string(1)?,
+                        delete_ipc: row.get_blob(2)?,
+                        delete_count: row.get_i64(3)?,
+                        sequence_number: row.get_i64(4)?,
+                        created_at: row.get_string(5)?,
+                    })
+                },
+            )
+            .await
+    }
+
+    async fn clear_inlined_deletes(&self, table_id: &str) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_inlined_delete WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.to_string())],
+            })
+            .await
+    }
+
     async fn drop_table(&self, table_name: &str) -> CatalogResult<bool> {
         // First check if the table exists and get its ID
         let table_id: Option<String> = self
@@ -1328,7 +1547,43 @@ impl MetadataCatalog for CayenneCatalog {
                 source: Box::new(e),
             })?;
 
-        // 5. Finally delete the table itself
+        // 5. Delete table statistics
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_table_statistics WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.clone())],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete table statistics.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 6. Delete inlined data
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_inlined_data WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.clone())],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete inlined data.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 7. Delete inlined deletes
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_inlined_delete WHERE table_id = ?1",
+                params: vec![MetastoreValue::Text(table_id.clone())],
+            })
+            .await
+            .map_err(|e| CatalogError::InvalidOperation {
+                message: "Failed to delete inlined deletes.".to_string(),
+                source: Box::new(e),
+            })?;
+
+        // 8. Finally delete the table itself
         self.metastore
             .execute_helper(ExecuteParams {
                 sql: "DELETE FROM cayenne_table WHERE table_id = ?1",
