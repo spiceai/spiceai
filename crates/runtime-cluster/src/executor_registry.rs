@@ -317,7 +317,7 @@ impl ExecutorRegistry {
             return Vec::new();
         };
 
-        get_partitions_from_manager(
+        get_partitions_from_store(
             &self.accelerations_partition_store,
             &connections,
             &flight_sql_clients,
@@ -347,7 +347,7 @@ pub(crate) fn flight_sql_table_provider(
 ///
 /// Uses the given [`PartitionStore`] to look up partition metadata, validates liveness against
 /// `connections`, selects a minimal executor set, and returns `(FlightSQL provider, partition values)` pairs.
-pub(crate) fn get_partitions_from_manager(
+pub(crate) fn get_partitions_from_store(
     partition_store: &PartitionStore,
     connections: &HashMap<String, ExecutorConnection>,
     flight_sql_clients: &HashMap<String, FlightSqlClient>,
@@ -484,7 +484,7 @@ impl TablePartitionProvider for FederatedPartitionProvider {
             return Vec::new();
         };
 
-        get_partitions_from_manager(
+        get_partitions_from_store(
             &self.partition_store,
             &connections,
             &flight_sql_clients,

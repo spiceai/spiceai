@@ -483,7 +483,7 @@ impl ClusterStateStore {
     }
 }
 
-pub(crate) fn now_ms() -> Result<u64> {
+pub fn now_ms() -> Result<u64> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context(ClockSnafu)?;
