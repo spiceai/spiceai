@@ -18,7 +18,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.53",
+      "_score": "0.54",
       "dataset": "qs_view",
       "matches": {
         "answer": [
@@ -42,7 +42,7 @@ expression: "normalize_search_response(resp, round_scores)"
       }
     },
     {
-      "_score": "0.51",
+      "_score": "0.52",
       "dataset": "qs_view",
       "matches": {
         "answer": [
