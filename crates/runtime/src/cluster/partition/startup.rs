@@ -20,7 +20,6 @@ use app::App;
 
 use datafusion::{execution::FunctionRegistry, logical_expr::Expr, sql::TableReference};
 use datafusion_proto::bytes::Serializeable;
-use object_store::ObjectStore;
 use runtime_proto::{
     AllocateInitialPartitionsRequest, cluster_service_client::ClusterServiceClient,
 };
