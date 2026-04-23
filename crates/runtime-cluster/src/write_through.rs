@@ -179,6 +179,10 @@ type ExecutorFilter = (ExecutorId, Arc<dyn datafusion::physical_plan::PhysicalEx
 ///
 /// Batches are decoded and routed incrementally from the Flight stream to
 /// avoid materializing the full payload in memory.
+///
+/// # Errors
+///
+/// Returns an error if schema decoding, batch routing, or the Flight response fails.
 pub async fn forward_federated_partitioned_write(
     executor_registry: &ExecutorRegistry,
     ctx: Arc<datafusion::prelude::SessionContext>,
@@ -256,6 +260,11 @@ fn maybe_read_first_batch(
 ///
 /// Accepts an async stream of [`RecordBatch`] and routes each batch to the
 /// correct executor as it arrives, avoiding full materialization in memory.
+///
+/// # Errors
+///
+/// Returns an error if partition metadata lookup, batch forwarding to an executor, or
+/// assignment persistence fails.
 pub async fn forward_partitioned_batches(
     executor_registry: &ExecutorRegistry,
     ctx: Arc<datafusion::prelude::SessionContext>,

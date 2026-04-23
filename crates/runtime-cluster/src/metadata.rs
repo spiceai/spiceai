@@ -86,6 +86,11 @@ impl PartitionMetadata {
     }
 }
 
+/// Converts a partition value map into a serialized DataFusion [`Expr`] byte representation.
+///
+/// # Errors
+///
+/// Returns an error if the partition expression cannot be resolved or serialized.
 pub async fn partition_value_to_bytes(
     p: PartitionValue,
     tbl: &TableReference,
@@ -152,6 +157,11 @@ impl TablePartitionMetadata {
     }
 
     /// Returns a mapping of executor IDs to the partition expressions they contain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table schema cannot be converted to a DataFusion schema
+    /// or if a partition expression cannot be parsed.
     pub fn all_executor_partitions(
         &self,
         ctx: &Arc<SessionContext>,

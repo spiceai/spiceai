@@ -144,6 +144,10 @@ impl PartitionStore {
     }
 
     /// Get partition metadata for a table from object store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state read fails.
     pub async fn get_table_metadata(
         &self,
         table: &TableReference,
@@ -172,6 +176,10 @@ impl PartitionStore {
     /// Initialize partition metadata for a table with the given partition expression SQL strings.
     ///
     /// Returns `Ok(true)` if a new entry was created, `Ok(false)` if one already existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
     pub async fn initialize_metadata(
         &self,
         table: &TableReference,
@@ -210,6 +218,10 @@ impl PartitionStore {
     }
 
     /// Update partition metadata with discovered partitions, all marked as unassigned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails or encounters a concurrent modification.
     pub async fn set_unassigned_partitions(
         &self,
         table: &TableReference,
@@ -256,6 +268,10 @@ impl PartitionStore {
     }
 
     /// Allocates unassigned partitions to an executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table metadata is not found, or if the cluster state mutation fails.
     pub async fn allocate_partitions(
         &self,
         table: &TableReference,
@@ -338,6 +354,10 @@ impl PartitionStore {
 
     /// Assigns a single partition to an executor. Most callers should
     /// prefer [`Self::apply_assignments`] for batching.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the partition or table metadata is not found, or if the mutation fails.
     pub async fn assign_partition(
         &self,
         table: &TableReference,
@@ -366,6 +386,10 @@ impl PartitionStore {
     /// same `(table, partition)` are overwritten with the new executor.
     /// Partition rows that don't yet exist are created so that callers
     /// can use this both for "first-time assignment" and "reassign".
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any table metadata is not found or if the cluster state mutation fails.
     pub async fn apply_assignments(&self, assignments: &[AssignmentRequest]) -> Result<()> {
         let mut not_found: Option<(String, String)> = None;
         self.apply_assignments_inner(assignments, &mut not_found)
@@ -463,6 +487,10 @@ impl PartitionStore {
 
     /// Adds new partitions to a table's metadata and assigns each to
     /// its respective executor in a single OCC write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails (see [`Self::apply_assignments`]).
     pub async fn add_and_assign_partitions(
         &self,
         table: &TableReference,
@@ -485,6 +513,10 @@ impl PartitionStore {
     /// Replace this table's metadata wholesale (atomic OCC write). Used
     /// by callers that compute the new metadata externally and just need
     /// to persist it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
     pub async fn write_metadata(
         &self,
         table: &TableReference,
@@ -513,6 +545,10 @@ impl PartitionStore {
     }
 
     /// List all tables (in this scope) with partition metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state read fails with an unexpected error.
     pub async fn list_tables(&self) -> Result<Vec<String>> {
         match self.cluster.read().await {
             Ok(snap) => Ok(self.scope.map(&snap).keys().cloned().collect()),
@@ -525,6 +561,10 @@ impl PartitionStore {
     }
 
     /// Refresh the local cache from object store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state read fails with an unexpected error.
     pub async fn refresh(&self) -> Result<()> {
         match self.cluster.read().await {
             Ok(_) | Err(MutateError::ClusterDocMissing { .. }) => Ok(()),
@@ -537,6 +577,10 @@ impl PartitionStore {
 
     /// Copy partition assignments from one table to another atomically
     /// (read + write happen inside a single OCC mutation).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
     pub async fn copy_assignments(
         &self,
         source_table: &TableReference,
