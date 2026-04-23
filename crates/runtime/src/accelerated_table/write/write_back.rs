@@ -26,7 +26,7 @@ limitations under the License.
 //! No batches are buffered in memory in this path: the caller's input
 //! [`ExecutionPlan`] is handed directly to
 //! [`TableProvider::insert_into`](datafusion::datasource::TableProvider::insert_into)
-//! on the accelerator, so DataFusion's streaming execution is preserved.
+//! on the accelerator, so `DataFusion`'s streaming execution is preserved.
 //!
 //! [`WriteMode::WriteBack`]: super::WriteMode::WriteBack
 
@@ -53,7 +53,7 @@ mod tests {
 
     #[test]
     fn validate_insert_op_allows_append() {
-        assert!(validate_insert_op(InsertOp::Append).is_ok());
+        validate_insert_op(InsertOp::Append).expect("Append must be accepted by write-back");
     }
 
     #[test]
