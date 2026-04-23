@@ -54,12 +54,83 @@ use aws_config::timeout::TimeoutConfig;
 use aws_sdk_credential_bridge::default_aws_config;
 use aws_sdk_secretsmanager::{error::SdkError, operation::get_secret_value::GetSecretValueError};
 use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
+use runtime_parameter_spec::ParameterSpec;
 use secrecy::SecretString;
 use secrecy::zeroize::Zeroizing;
 use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
 
 use crate::SecretStore;
+
+/// Parameters accepted by the `aws_secrets_manager` secret store.
+///
+/// `region` and `endpoint_url` mirror the conventions used by the AWS
+/// data connectors (S3, `DynamoDB`, etc.) so users can configure all AWS
+/// components with a consistent vocabulary. When `region` is omitted, the
+/// AWS SDK falls back to the standard credential-provider chain
+/// (`AWS_REGION` / `AWS_DEFAULT_REGION` / IMDS).
+pub const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::runtime("region")
+        .description(
+            "AWS region the Secrets Manager secret lives in. When omitted, the SDK \
+             falls back to AWS_REGION / AWS_DEFAULT_REGION / IMDS.",
+        )
+        .examples(&["us-east-1", "eu-west-2"]),
+    ParameterSpec::runtime("endpoint_url")
+        .description(
+            "Override the Secrets Manager endpoint URL. Useful for VPC endpoints, \
+             FIPS endpoints, or local testing against e.g. LocalStack.",
+        )
+        .examples(&[
+            "https://secretsmanager.us-east-1.amazonaws.com",
+            "https://localhost:4566",
+        ]),
+    // Static credential params. Naming matches the S3 connector
+    // (`key`, `secret`, `session_token`) so AWS-flavored components share
+    // a vocabulary. When `key` and `secret` are both supplied they take
+    // precedence over the default credential chain; when omitted, the
+    // SDK's standard provider chain (env vars / shared config / web
+    // identity / ECS / IMDS) is used.
+    ParameterSpec::runtime("key").description(
+        "AWS access key ID for static credentials. Must be set together with `secret`. \
+             Typically sourced from another secret store, e.g. `${ env:AWS_ACCESS_KEY_ID }`.",
+    ),
+    ParameterSpec::runtime("secret").description(
+        "AWS secret access key for static credentials. Must be set together with `key`. \
+             Typically sourced from another secret store, e.g. `${ env:AWS_SECRET_ACCESS_KEY }`.",
+    ),
+    ParameterSpec::runtime("session_token").description(
+        "Optional AWS session token. Only meaningful alongside `key` and `secret`, \
+             e.g. for short-lived STS credentials.",
+    ),
+];
+
+/// Resolved configuration for the `aws_secrets_manager` secret store.
+#[derive(Debug, Clone)]
+pub struct AwsSecretsManagerConfig {
+    pub secret_name: String,
+    pub region: Option<String>,
+    pub endpoint_url: Option<String>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub session_token: Option<String>,
+}
+
+impl AwsSecretsManagerConfig {
+    /// Builds an [`AwsSecretsManagerConfig`] from the parsed selector and a
+    /// validated parameter map.
+    #[must_use]
+    pub fn from_params(secret_name: String, params: &HashMap<String, String>) -> Self {
+        Self {
+            secret_name,
+            region: params.get("region").cloned(),
+            endpoint_url: params.get("endpoint_url").cloned(),
+            access_key_id: params.get("key").cloned(),
+            secret_access_key: params.get("secret").cloned(),
+            session_token: params.get("session_token").cloned(),
+        }
+    }
+}
 
 /// Prefix used to scope secret keys to Spice.
 ///
@@ -166,6 +237,17 @@ impl CachedPayload {
 
 pub struct AwsSecretsManager {
     secret_name: String,
+    /// Optional AWS region override sourced from the spicepod `params:` block.
+    region: Option<String>,
+    /// Optional Secrets Manager endpoint URL override sourced from the
+    /// spicepod `params:` block.
+    endpoint_url: Option<String>,
+    /// Optional static credentials sourced from the spicepod `params:`
+    /// block. When `access_key_id` and `secret_access_key` are both set
+    /// they take precedence over the SDK's default credential chain.
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    session_token: Option<String>,
     /// Lazily-initialized, shared SDK configuration. Resolved exactly once per
     /// store instance and reused by both the STS pre-flight and the Secrets
     /// Manager client, so credential-provider resolution (including IMDS
@@ -192,19 +274,44 @@ pub struct AwsSecretsManager {
 }
 
 impl AwsSecretsManager {
-    /// Creates a new [`AwsSecretsManager`] store bound to the given secret name or ARN.
+    /// Creates a new [`AwsSecretsManager`] store bound to the given secret name or ARN,
+    /// without any region or endpoint override.
     ///
     /// # Errors
     ///
     /// Returns [`Error::EmptySecretName`] if `secret_name` is empty or whitespace-only.
     pub fn new(secret_name: &str) -> Result<Self> {
-        let trimmed = secret_name.trim();
+        Self::from_config(AwsSecretsManagerConfig {
+            secret_name: secret_name.to_string(),
+            region: None,
+            endpoint_url: None,
+            access_key_id: None,
+            secret_access_key: None,
+            session_token: None,
+        })
+    }
+
+    /// Creates a new [`AwsSecretsManager`] store from a validated
+    /// [`AwsSecretsManagerConfig`] (i.e. one produced by
+    /// [`crate::validate_params`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::EmptySecretName`] if the configured secret name is
+    /// empty or whitespace-only.
+    pub fn from_config(config: AwsSecretsManagerConfig) -> Result<Self> {
+        let trimmed = config.secret_name.trim();
         if trimmed.is_empty() {
             return EmptySecretNameSnafu.fail();
         }
 
         Ok(Self {
             secret_name: trimmed.to_string(),
+            region: config.region,
+            endpoint_url: config.endpoint_url,
+            access_key_id: config.access_key_id,
+            secret_access_key: config.secret_access_key,
+            session_token: config.session_token,
             sdk_config: OnceCell::new(),
             client: OnceCell::new(),
             cache: RwLock::new(None),
@@ -255,14 +362,27 @@ impl AwsSecretsManager {
     /// it on first use. Reused by both the STS pre-flight and the Secrets
     /// Manager client so credential-provider resolution only happens once.
     async fn sdk_config(&self) -> &aws_config::SdkConfig {
-        self.sdk_config.get_or_init(build_aws_config).await
+        self.sdk_config
+            .get_or_init(|| {
+                build_aws_config(
+                    self.region.clone(),
+                    self.access_key_id.clone(),
+                    self.secret_access_key.clone(),
+                    self.session_token.clone(),
+                )
+            })
+            .await
     }
 
     async fn client(&self) -> &aws_sdk_secretsmanager::Client {
         self.client
             .get_or_init(|| async {
                 let config = self.sdk_config().await;
-                aws_sdk_secretsmanager::Client::new(config)
+                let mut builder = aws_sdk_secretsmanager::config::Builder::from(config);
+                if let Some(endpoint) = self.endpoint_url.as_deref() {
+                    builder = builder.endpoint_url(endpoint);
+                }
+                aws_sdk_secretsmanager::Client::from_conf(builder.build())
             })
             .await
     }
@@ -470,16 +590,55 @@ impl AwsSecretsManager {
 /// for Secrets Manager (throttling, 5xx, connection reset, I/O errors), so
 /// we rely on the defaults. We layer on operation-level timeouts so a
 /// stalled endpoint cannot hang Spicepod initialization indefinitely.
-async fn build_aws_config() -> aws_config::SdkConfig {
-    default_aws_config()
-        .timeout_config(
-            TimeoutConfig::builder()
-                .operation_attempt_timeout(ATTEMPT_TIMEOUT)
-                .operation_timeout(OPERATION_TIMEOUT)
-                .build(),
-        )
-        .load()
-        .await
+///
+/// When `access_key_id` and `secret_access_key` are both supplied, they
+/// override the SDK's default credential chain via
+/// `aws_credential_types::Credentials`. Mismatched pairs (only one of the
+/// two set) are ignored with a warning so the SDK can still fall back to
+/// the chain rather than panicking at config-build time.
+async fn build_aws_config(
+    region: Option<String>,
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    session_token: Option<String>,
+) -> aws_config::SdkConfig {
+    let mut builder = default_aws_config().timeout_config(
+        TimeoutConfig::builder()
+            .operation_attempt_timeout(ATTEMPT_TIMEOUT)
+            .operation_timeout(OPERATION_TIMEOUT)
+            .build(),
+    );
+    if let Some(region) = region {
+        builder = builder.region(aws_config::Region::new(region));
+    }
+    match (access_key_id, secret_access_key) {
+        (Some(key), Some(secret)) => {
+            let credentials = aws_credential_types::Credentials::new(
+                key,
+                secret,
+                session_token,
+                None,
+                "SpiceAwsSecretsManagerStore",
+            );
+            builder = builder.credentials_provider(credentials);
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            tracing::warn!(
+                "aws_secrets_manager: `key` and `secret` must both be set to use static \
+                 credentials; only one was provided. Falling back to the default AWS \
+                 credential chain."
+            );
+        }
+        (None, None) => {
+            if session_token.is_some() {
+                tracing::warn!(
+                    "aws_secrets_manager: `session_token` is only meaningful alongside \
+                     `key` and `secret`; ignoring it."
+                );
+            }
+        }
+    }
+    builder.load().await
 }
 
 #[async_trait]

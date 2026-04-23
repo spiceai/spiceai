@@ -41,6 +41,7 @@ members = [
     "crates/runtime-datafusion-index",
     "crates/runtime-datafusion-udfs",
     "crates/runtime-proto",
+    "crates/runtime-parameter-spec",
     "crates/runtime-parameters",
     "crates/runtime-secrets",
     "crates/runtime-table-partition",
