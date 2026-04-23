@@ -149,24 +149,10 @@ pub async fn registered_catalog_names() -> Vec<String> {
     names
 }
 
-/// Closest-match suggestion for an unknown catalog connector name.
+/// Closest-match suggestion for an unknown catalog connector name. Reuses the
+/// same scoring/threshold helper as data connectors so behaviour is consistent.
 pub async fn suggest_catalog_connector(name: &str) -> Option<String> {
-    let names = registered_catalog_names().await;
-    let input = name.to_ascii_lowercase();
-    let mut best: Option<(String, usize)> = None;
-    for candidate in names {
-        let d = util::levenshtein::distance(&input, &candidate.to_ascii_lowercase());
-        if best.as_ref().is_none_or(|(_, b)| d < *b) {
-            best = Some((candidate, d));
-        }
-    }
-    let (candidate, distance) = best?;
-    let max_allowed = (candidate.len().max(name.len()) / 3).max(1);
-    if distance <= max_allowed {
-        Some(candidate)
-    } else {
-        None
-    }
+    crate::dataconnector::closest_name(name, &registered_catalog_names().await)
 }
 
 pub async fn register_all() {

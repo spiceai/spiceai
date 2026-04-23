@@ -596,22 +596,26 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 let without_semi = line.trim_end_matches(';').trim();
                 let mut parts = without_semi.splitn(2, char::is_whitespace);
                 let _kw = parts.next();
-                let ident = parts
-                    .next()
-                    .unwrap_or_default()
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'');
+                let raw_ident = parts.next().unwrap_or_default().trim();
+                // Quotes need stripping per identifier segment, not just the whole token:
+                // `describe schema."MyTable"` should split into (`schema`, `MyTable`), not
+                // (`schema`, `"MyTable"`). Unquote each side after the split.
+                fn unquote(s: &str) -> &str {
+                    s.trim_matches('"').trim_matches('\'')
+                }
                 fn esc(s: &str) -> String {
                     s.replace('\'', "''")
                 }
-                let rewritten = if let Some((schema, name)) = ident.split_once('.') {
+                let rewritten = if let Some((schema, name)) = raw_ident.split_once('.') {
+                    let schema = unquote(schema);
+                    let name = unquote(name);
                     format!(
                         "select column_name, data_type, is_nullable from information_schema.columns where table_schema = '{}' and table_name = '{}' order by ordinal_position;",
                         esc(schema),
                         esc(name)
                     )
                 } else {
+                    let ident = unquote(raw_ident);
                     format!(
                         "select table_schema, column_name, data_type, is_nullable from information_schema.columns where table_name = '{}' order by table_schema, ordinal_position;",
                         esc(ident)

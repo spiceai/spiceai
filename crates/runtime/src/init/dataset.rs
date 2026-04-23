@@ -214,39 +214,42 @@ impl Runtime {
         // Spawn a best-effort follow-up summary that samples the status registry after
         // a grace period, so users see a single line with how many actually reached Ready
         // instead of having to query /v1/datasets. Uses the runtime's shutdown token so
-        // a ctrl-c stops the sampler cleanly.
-        let status_handle = Arc::clone(&self.status);
-        let shutdown_token = self.status.shutdown_token();
-        tokio::spawn(async move {
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
-                () = shutdown_token.cancelled() => return,
-            }
-            let statuses = status_handle.get_dataset_statuses();
-            let mut ready = 0usize;
-            let mut unhealthy = 0usize;
-            let mut initializing = 0usize;
-            for s in statuses.values() {
-                match s {
-                    status::ComponentStatus::Ready | status::ComponentStatus::Refreshing => {
-                        ready += 1;
-                    }
-                    status::ComponentStatus::Error(_) => unhealthy += 1,
-                    status::ComponentStatus::Initializing => initializing += 1,
-                    _ => {}
+        // a ctrl-c stops the sampler cleanly. Skipped when there are no datasets at all
+        // so we don't spawn a timer that would just no-op.
+        if total > 0 {
+            let status_handle = Arc::clone(&self.status);
+            let shutdown_token = self.status.shutdown_token();
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                    () = shutdown_token.cancelled() => return,
                 }
-            }
-            let total = statuses.len();
-            if total > 0 {
-                // Phrasing deliberately avoids "error"/"failed" so quickstart smoke tests
-                // that grep spice.log for those tokens don't get false positives on a
-                // healthy startup. Real per-dataset failure is already logged at WARN level
-                // inside `load_dataset`.
-                tracing::info!(
-                    "Dataset load summary (after 30s): {ready}/{total} ready, {unhealthy} unhealthy, {initializing} still initializing."
-                );
-            }
-        });
+                let statuses = status_handle.get_dataset_statuses();
+                let mut ready = 0usize;
+                let mut unhealthy = 0usize;
+                let mut initializing = 0usize;
+                for s in statuses.values() {
+                    match s {
+                        status::ComponentStatus::Ready | status::ComponentStatus::Refreshing => {
+                            ready += 1;
+                        }
+                        status::ComponentStatus::Error(_) => unhealthy += 1,
+                        status::ComponentStatus::Initializing => initializing += 1,
+                        _ => {}
+                    }
+                }
+                let total = statuses.len();
+                if total > 0 {
+                    // Phrasing deliberately avoids "error"/"failed" so quickstart smoke
+                    // tests that grep spice.log for those tokens don't get false positives
+                    // on a healthy startup. Real per-dataset failure is already logged at
+                    // WARN level inside `load_dataset`.
+                    tracing::info!(
+                        "Dataset load summary (after 30s): {ready}/{total} ready, {unhealthy} unhealthy, {initializing} still initializing."
+                    );
+                }
+            });
+        }
 
         let _ = join_all(spawned_tasks).await;
 

@@ -488,17 +488,26 @@ pub async fn registered_connector_names() -> Vec<String> {
 /// Returns the registered connector name whose Levenshtein distance to `name`
 /// is lowest (bounded so short typos only match very close names).
 pub async fn suggest_connector(name: &str) -> Option<String> {
-    let names = registered_connector_names().await;
-    let input = name.to_ascii_lowercase();
+    closest_name(name, &registered_connector_names().await)
+}
+
+/// Pure helper used by [`suggest_connector`]. Kept separate from the registry
+/// lookup so its scoring + threshold can be unit-tested without spinning up
+/// the async registry.
+pub(crate) fn closest_name(typo: &str, candidates: &[String]) -> Option<String> {
+    let input = typo.to_ascii_lowercase();
     let mut best: Option<(String, usize)> = None;
-    for candidate in names {
+    for candidate in candidates {
         let d = util::levenshtein::distance(&input, &candidate.to_ascii_lowercase());
         if best.as_ref().is_none_or(|(_, b)| d < *b) {
-            best = Some((candidate, d));
+            best = Some((candidate.clone(), d));
         }
     }
     let (candidate, distance) = best?;
-    let max_allowed = (candidate.len().max(name.len()) / 3).max(1);
+    // Bound: allow at most one edit per 3 chars of the longer string. Prevents a
+    // wildly different name ("kafka" vs. "postgres") from being suggested while
+    // still catching "postgress_host" → "postgres_host" (d=1) and similar typos.
+    let max_allowed = (candidate.len().max(typo.len()) / 3).max(1);
     if distance <= max_allowed {
         Some(candidate)
     } else {
@@ -804,6 +813,52 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn closest_name_matches_one_char_typo() {
+        let candidates = names(&["postgres", "mysql", "snowflake", "kafka"]);
+        assert_eq!(
+            closest_name("postgress", &candidates),
+            Some("postgres".to_string())
+        );
+    }
+
+    #[test]
+    fn closest_name_matches_case_insensitive() {
+        let candidates = names(&["postgres", "mysql"]);
+        assert_eq!(
+            closest_name("MYSQL", &candidates),
+            Some("mysql".to_string())
+        );
+    }
+
+    #[test]
+    fn closest_name_distant_returns_none() {
+        let candidates = names(&["postgres", "mysql", "kafka"]);
+        // "xyz" has no close match.
+        assert_eq!(closest_name("xyz", &candidates), None);
+    }
+
+    #[test]
+    fn closest_name_empty_candidates_returns_none() {
+        let candidates: Vec<String> = Vec::new();
+        assert_eq!(closest_name("postgres", &candidates), None);
+    }
+
+    #[test]
+    fn closest_name_short_typo_short_threshold() {
+        // Short names get a max_allowed floor of 1 — a single-char off name matches,
+        // but two chars off does not (protects against wildly different suggestions).
+        let candidates = names(&["pg", "my"]);
+        // "po" vs "pg": distance 1, allowed. vs "my": distance 2, not allowed.
+        assert_eq!(closest_name("po", &candidates), Some("pg".to_string()));
+        // "zz" vs both is distance 2 — no match.
+        assert_eq!(closest_name("zz", &candidates), None);
+    }
     use crate::component::dataset::UnsupportedTypeAction as DatasetUnsupportedTypeAction;
     use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataconnector::parameters::ConnectorParamsBuilder;

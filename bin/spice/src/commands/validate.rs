@@ -52,15 +52,7 @@ pub struct ValidateArgs {
 }
 
 pub async fn execute(args: &ValidateArgs) -> Result<()> {
-    let path = &args.path;
-
-    let result = match tokio::fs::metadata(path).await {
-        Ok(meta) if meta.is_file() => Spicepod::load_exact(path).await,
-        Ok(_) => Spicepod::load(path).await,
-        Err(_) => Spicepod::load_exact(path).await,
-    };
-
-    match result {
+    match load_pod(&args.path).await {
         Ok(pod) => {
             println!(
                 "{} {} (datasets: {}, models: {}, views: {}, tools: {}, workers: {})",
@@ -82,5 +74,64 @@ pub async fn execute(args: &ValidateArgs) -> Result<()> {
             }
             .fail()
         }
+    }
+}
+
+/// Resolve `path` into a loaded [`Spicepod`]:
+/// - existing file → load that file directly
+/// - existing directory → load `spicepod.yaml` (or `.yml`) from within
+/// - non-existent path → let `Spicepod::load_exact` produce the canonical error
+async fn load_pod(path: &std::path::Path) -> std::result::Result<Spicepod, spicepod::Error> {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.is_file() => Spicepod::load_exact(path).await,
+        Ok(_) => Spicepod::load(path).await,
+        Err(_) => Spicepod::load_exact(path).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    const VALID_POD: &str = "version: v2\nkind: Spicepod\nname: test_app\n";
+
+    fn write_pod(dir: &tempfile::TempDir, filename: &str, body: &str) -> std::path::PathBuf {
+        let path = dir.path().join(filename);
+        let mut f = std::fs::File::create(&path).expect("create pod file");
+        f.write_all(body.as_bytes()).expect("write pod file");
+        path
+    }
+
+    #[tokio::test]
+    async fn loads_file_path_directly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_pod(&dir, "not_spicepod.yaml", VALID_POD);
+        let pod = load_pod(&path).await.expect("should load from explicit file");
+        assert_eq!(pod.name, "test_app");
+    }
+
+    #[tokio::test]
+    async fn loads_directory_containing_spicepod() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _ = write_pod(&dir, "spicepod.yaml", VALID_POD);
+        let pod = load_pod(dir.path())
+            .await
+            .expect("should load spicepod.yaml from directory");
+        assert_eq!(pod.name, "test_app");
+    }
+
+    #[tokio::test]
+    async fn missing_path_produces_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does_not_exist.yaml");
+        assert!(load_pod(&missing).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_yaml_produces_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_pod(&dir, "spicepod.yaml", "not: [valid, yaml: for: a spicepod");
+        assert!(load_pod(&path).await.is_err());
     }
 }

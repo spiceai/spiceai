@@ -555,6 +555,79 @@ mod test {
     use super::*;
 
     #[test]
+    fn test_closest_param_suggestion_close_typo_matches() {
+        let specs = [
+            ParameterSpec::component("host"),
+            ParameterSpec::component("port"),
+            ParameterSpec::component("user"),
+        ];
+        // Single-char typo against the longest match wins.
+        assert_eq!(
+            closest_param_suggestion(&specs, "pg", "pg_hots"),
+            Some("pg_host".to_string())
+        );
+    }
+
+    #[test]
+    fn test_closest_param_suggestion_distant_typo_returns_none() {
+        let specs = [
+            ParameterSpec::component("host"),
+            ParameterSpec::component("port"),
+        ];
+        // Genuinely unrelated key should not suggest anything.
+        assert_eq!(
+            closest_param_suggestion(&specs, "pg", "totally_unrelated"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_closest_param_suggestion_ignores_deprecated() {
+        let specs = [
+            ParameterSpec::component("host"),
+            ParameterSpec::component("hostname").deprecated("use host"),
+        ];
+        // The close-but-deprecated `hostname` shouldn't win over the canonical `host`.
+        assert_eq!(
+            closest_param_suggestion(&specs, "pg", "pg_hostnam"),
+            Some("pg_host".to_string())
+        );
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_empty_spec_is_empty_suffix() {
+        let spec = ParameterSpec::component("host");
+        assert_eq!(describe_missing_parameter(&spec), "");
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_with_description() {
+        let spec = ParameterSpec::component("host").description("The DB host.");
+        assert_eq!(describe_missing_parameter(&spec), ". The DB host.");
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_full_suffix() {
+        let spec = ParameterSpec::component("host")
+            .description("The DB host.")
+            .examples(&["db.example.com"])
+            .help_link("https://docs.example/host");
+        assert_eq!(
+            describe_missing_parameter(&spec),
+            ". The DB host. Example: `db.example.com`. Docs: https://docs.example/host"
+        );
+    }
+
+    #[test]
+    fn test_describe_missing_parameter_example_without_description() {
+        let spec = ParameterSpec::component("host").examples(&["db.example.com"]);
+        assert_eq!(
+            describe_missing_parameter(&spec),
+            " Example: `db.example.com`"
+        );
+    }
+
+    #[test]
     fn test_validate_and_format_key_combined() {
         // key with prefix, parameter expects prefix.
         assert_eq!(
