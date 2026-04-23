@@ -55,7 +55,7 @@ use aws_sdk_credential_bridge::default_aws_config;
 use aws_sdk_secretsmanager::{error::SdkError, operation::get_secret_value::GetSecretValueError};
 use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
 use runtime_parameter_spec::ParameterSpec;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use secrecy::zeroize::Zeroizing;
 use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
@@ -218,11 +218,14 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///
 /// The parsed map is held behind an `Arc` so that readers share a single
 /// allocation and never clone the (potentially secret-bearing) map out of the
-/// cache. Memory is released (and zeroizing-sensitive buffers in the caller
-/// can take effect) once the final `Arc` reference is dropped.
+/// cache. Each value is a [`SecretString`]: when the final `Arc` reference
+/// drops (cache eviction, store shutdown), every value's backing buffer is
+/// zeroized via `secrecy`'s Drop impl. Previously this was a
+/// `HashMap<String, String>` whose freed allocations could linger in the
+/// heap until reuse overwrote them.
 struct CachedPayload {
     /// Parsed key/value map. Empty if the secret is missing or not a JSON object.
-    data: Arc<HashMap<String, String>>,
+    data: Arc<HashMap<String, SecretString>>,
     /// Monotonic timestamp at which this entry was captured.
     fetched_at: Instant,
     /// Effective TTL for this entry (shorter for negative results).
@@ -396,7 +399,7 @@ impl AwsSecretsManager {
     /// strategy configured on the client.
     async fn fetch_payload(
         &self,
-    ) -> crate::AnyErrorResult<(Arc<HashMap<String, String>>, Duration)> {
+    ) -> crate::AnyErrorResult<(Arc<HashMap<String, SecretString>>, Duration)> {
         tracing::debug!(
             secret_name = %self.secret_name,
             "Fetching AWS secret payload"
@@ -509,7 +512,7 @@ impl AwsSecretsManager {
     /// - Losing tasks `await` on `fetch_notify` and then re-check the cache.
     /// - The AWS SDK call is never made while any lock is held, so a
     ///   stalled endpoint cannot stall cache readers.
-    async fn payload(&self) -> crate::AnyErrorResult<Arc<HashMap<String, String>>> {
+    async fn payload(&self) -> crate::AnyErrorResult<Arc<HashMap<String, SecretString>>> {
         loop {
             // Fast path: fresh cache hit.
             if let Some(data) = self.try_cached().await {
@@ -574,7 +577,7 @@ impl AwsSecretsManager {
     }
 
     /// Returns the cached payload if present and still fresh.
-    async fn try_cached(&self) -> Option<Arc<HashMap<String, String>>> {
+    async fn try_cached(&self) -> Option<Arc<HashMap<String, SecretString>>> {
         let guard = self.cache.read().await;
         guard
             .as_ref()
@@ -655,25 +658,38 @@ impl SecretStore for AwsSecretsManager {
         // Prefer the Spice-prefixed key so that Spice-owned values can coexist
         // with other application secrets in the same AWS secret without
         // collisions, then fall back to the unprefixed key.
+        //
+        // The cached values are already `SecretString`s, so the only
+        // plaintext copy made here is the fresh one we hand back to the
+        // caller (which owns its own zeroize-on-drop buffer).
         let prefixed_key = format!("{SPICE_KEY_PREFIX}{key}");
         if let Some(value) = data.get(&prefixed_key) {
-            return Ok(Some(SecretString::from(value.clone())));
+            return Ok(Some(SecretString::from(value.expose_secret().to_string())));
         }
-        Ok(data.get(key).cloned().map(SecretString::from))
+        Ok(data
+            .get(key)
+            .map(|v| SecretString::from(v.expose_secret().to_string())))
     }
 }
 
-/// Parses a JSON string into a `HashMap<String, String>`.
+/// Parses a JSON string into a `HashMap<String, SecretString>`.
 ///
 /// The input must be a JSON object. Primitive scalar values (strings, numbers,
 /// booleans) are coerced to their string representation; objects, arrays, and
 /// null values are skipped so that a partially-structured secret still yields
 /// the scalar keys it does contain.
 ///
+/// Every value is wrapped in [`SecretString`] so the parsed entries carry
+/// zeroize-on-drop semantics into the cache. Intermediate `serde_json::Value`
+/// allocations still exist briefly and are not themselves zeroized — that's
+/// a property of `serde_json`, not something we can fix here without a
+/// custom parser — but those allocations drop when this function returns,
+/// and the cached representation handed back to callers is secret-aware.
+///
 /// # Errors
 ///
 /// Returns an error if the input is not valid JSON or is not a JSON object.
-pub fn parse_json_to_hashmap(json_str: &str) -> Result<HashMap<String, String>> {
+pub fn parse_json_to_hashmap(json_str: &str) -> Result<HashMap<String, SecretString>> {
     let parsed: serde_json::Value =
         serde_json::from_str(json_str).context(UnableToParseJsonSnafu)?;
     let root = parsed.as_object().context(InvalidJsonFormatSnafu)?;
@@ -682,13 +698,13 @@ pub fn parse_json_to_hashmap(json_str: &str) -> Result<HashMap<String, String>> 
     for (key, value) in root {
         match value {
             serde_json::Value::String(s) => {
-                data.insert(key.clone(), s.clone());
+                data.insert(key.clone(), SecretString::from(s.clone()));
             }
             serde_json::Value::Number(n) => {
-                data.insert(key.clone(), n.to_string());
+                data.insert(key.clone(), SecretString::from(n.to_string()));
             }
             serde_json::Value::Bool(b) => {
-                data.insert(key.clone(), b.to_string());
+                data.insert(key.clone(), SecretString::from(b.to_string()));
             }
             // Skip null/object/array values – they cannot be injected as
             // strings into parameters, and silently coercing them risks
@@ -714,9 +730,9 @@ mod tests {
     fn parses_string_number_and_bool_values() {
         let json = r#"{"a": "hello", "b": 42, "c": true, "d": null, "e": [1,2], "f": {"x": 1}}"#;
         let map = parse_json_to_hashmap(json).expect("parse succeeds");
-        assert_eq!(map.get("a").map(String::as_str), Some("hello"));
-        assert_eq!(map.get("b").map(String::as_str), Some("42"));
-        assert_eq!(map.get("c").map(String::as_str), Some("true"));
+        assert_eq!(map.get("a").map(|s| s.expose_secret()), Some("hello"));
+        assert_eq!(map.get("b").map(|s| s.expose_secret()), Some("42"));
+        assert_eq!(map.get("c").map(|s| s.expose_secret()), Some("true"));
         // Null/array/object entries are intentionally skipped.
         assert!(!map.contains_key("d"));
         assert!(!map.contains_key("e"));
@@ -754,10 +770,19 @@ mod tests {
     async fn prefers_spice_prefixed_keys_then_falls_back() {
         let store = AwsSecretsManager::new("test").expect("valid name");
 
-        let mut data = HashMap::new();
-        data.insert("spice_api_key".to_string(), "prefixed".to_string());
-        data.insert("api_key".to_string(), "plain".to_string());
-        data.insert("only_plain".to_string(), "plain-value".to_string());
+        let mut data: HashMap<String, SecretString> = HashMap::new();
+        data.insert(
+            "spice_api_key".to_string(),
+            SecretString::from("prefixed".to_string()),
+        );
+        data.insert(
+            "api_key".to_string(),
+            SecretString::from("plain".to_string()),
+        );
+        data.insert(
+            "only_plain".to_string(),
+            SecretString::from("plain-value".to_string()),
+        );
 
         *store.cache.write().await = Some(CachedPayload {
             data: Arc::new(data),
@@ -817,8 +842,8 @@ mod tests {
         // that `try_cached()` discards expired entries.
         let store = AwsSecretsManager::new("test").expect("valid name");
 
-        let mut data = HashMap::new();
-        data.insert("k".to_string(), "v".to_string());
+        let mut data: HashMap<String, SecretString> = HashMap::new();
+        data.insert("k".to_string(), SecretString::from("v".to_string()));
 
         *store.cache.write().await = Some(CachedPayload {
             data: Arc::new(data),

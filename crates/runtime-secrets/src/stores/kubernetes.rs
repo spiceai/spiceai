@@ -26,7 +26,7 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS.add(b'/').add(b'\\');
 use reqwest;
 use runtime_parameter_spec::ParameterSpec;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString, zeroize::Zeroizing};
 use snafu::{ResultExt, Snafu};
 
 /// Parameters accepted by the `kubernetes` secret store.
@@ -97,7 +97,10 @@ const KUBERNETES_API_SERVER: &str = "https://kubernetes.default.svc";
 
 struct KubernetesClient {
     client: Option<reqwest::Client>,
-    token: Option<String>,
+    /// Service-account bearer token. Held as a [`SecretString`] so the
+    /// in-memory buffer is zeroized when the client drops and so stray
+    /// `{:?}` prints (e.g. via `Debug` on an outer struct) cannot leak it.
+    token: Option<SecretString>,
     namespace: Option<String>,
     /// Optional namespace override supplied via `params: { namespace: ... }`.
     /// When set, takes precedence over the namespace from the service-account mount.
@@ -142,7 +145,7 @@ impl KubernetesClient {
         .await
         .map_err(|_| Error::UnableToReadKubernetesCredentials {})??;
 
-        self.token = Some(token);
+        self.token = Some(SecretString::from(token));
         self.namespace = Some(namespace);
 
         let Ok(certificate) = reqwest::Certificate::from_pem(ca_cert.as_bytes()) else {
@@ -161,7 +164,15 @@ impl KubernetesClient {
         Ok(())
     }
 
-    async fn get_secret(&self, secret_name: &str) -> Result<HashMap<String, String>, Error> {
+    /// Fetches the named Kubernetes secret and returns its `data` map with
+    /// every value wrapped in a [`SecretString`] so each entry owns a
+    /// zeroize-on-drop allocation. Callers pull exactly the key they care
+    /// about; everything else drops with its bytes scrubbed when the map
+    /// goes out of scope.
+    async fn get_secret(
+        &self,
+        secret_name: &str,
+    ) -> Result<HashMap<String, SecretString>, Error> {
         let Some(client) = &self.client else {
             return Err(Error::UnableToReadKubernetesCredentials {});
         };
@@ -178,7 +189,7 @@ impl KubernetesClient {
 
         let kubernetes_secret = client
             .get(url.clone())
-            .bearer_auth(token.clone())
+            .bearer_auth(token.expose_secret())
             .send()
             .await
             .context(UnableToGetK8SSecretSnafu)?
@@ -186,7 +197,7 @@ impl KubernetesClient {
             .await
             .context(UnableToGetK8SSecretSnafu)?;
 
-        let mut secret: HashMap<String, String> = HashMap::new();
+        let mut secret: HashMap<String, SecretString> = HashMap::new();
 
         let Some(data) = kubernetes_secret.get("data") else {
             return Ok(secret);
@@ -196,21 +207,28 @@ impl KubernetesClient {
             return Ok(secret);
         };
 
-        obj.iter().for_each(|(key, value)| {
-            let Some(value) = value.as_str() else {
-                return;
+        for (key, value) in obj {
+            let Some(b64_value) = value.as_str() else {
+                continue;
             };
 
-            let Ok(decoded_string) = general_purpose::STANDARD.decode(value) else {
-                return;
+            // `Zeroizing` scrubs the decoded bytes when the temporary drops,
+            // covering the window between base64 decode and UTF-8 conversion.
+            let Ok(decoded_bytes) = general_purpose::STANDARD.decode(b64_value) else {
+                continue;
+            };
+            let decoded = Zeroizing::new(decoded_bytes);
+
+            let Ok(decoded_str) = std::str::from_utf8(&decoded) else {
+                continue;
             };
 
-            let Ok(secret_value) = String::from_utf8(decoded_string) else {
-                return;
-            };
-
-            secret.insert(key.clone(), secret_value.trim_end_matches('\n').to_string());
-        });
+            // Trim a single trailing newline (common artifact of `echo | base64`)
+            // via a string slice; avoids the intermediate plain-String
+            // allocation that the previous `.to_string().trim()` path produced.
+            let trimmed = decoded_str.trim_end_matches('\n');
+            secret.insert(key.clone(), SecretString::from(trimmed.to_string()));
+        }
 
         Ok(secret)
     }
@@ -251,15 +269,19 @@ impl SecretStore for KubernetesSecretStore {
     async fn get_secret(&self, key: &str) -> crate::AnyErrorResult<Option<SecretString>> {
         // First try looking for `spice_my_key` and then `my_key`
         let prefixed_key = format!("{SPICE_KEY_PREFIX}{key}");
-        match self.kubernetes_client.get_secret(&self.secret_name).await {
-            Ok(secret) => {
-                if let Some(value) = secret.get(&prefixed_key) {
-                    return Ok(Some(SecretString::from(value.clone())));
-                }
-                Ok(secret.get(key).cloned().map(SecretString::from))
-            }
-            Err(err) => Err(Box::new(StoreError::UnableToGetSecret { source: err })),
+        let mut secret = self
+            .kubernetes_client
+            .get_secret(&self.secret_name)
+            .await
+            .map_err(|err| Box::new(StoreError::UnableToGetSecret { source: err }))?;
+
+        // Hand the `SecretString` back by removing it from the map so its
+        // zeroize-on-drop guarantee transfers to the caller rather than
+        // leaving a duplicate allocation behind.
+        if let Some(value) = secret.remove(&prefixed_key) {
+            return Ok(Some(value));
         }
+        Ok(secret.remove(key))
     }
 }
 

@@ -166,9 +166,16 @@ impl Secrets {
 
     pub async fn inject_secrets(&self, key: &str, param_str: ParamStr<'_>) -> SecretString {
         tracing::trace!("Injecting secrets for: {}", key);
-        let mut result = String::new();
+        let input = param_str.0;
+        // Preallocate so the builder rarely re-allocates. Any reallocation
+        // would free the old buffer (containing partial secret bytes) without
+        // zeroizing it — defense in depth, though the final wrap below does
+        // guarantee the last live buffer is scrubbed when the `SecretString`
+        // drops.
+        let mut result = String::with_capacity(input.len().saturating_add(256));
         let mut last_end = 0;
-        for secret_replacement in SecretReplacementMatcher::new(param_str.0) {
+        for secret_replacement in SecretReplacementMatcher::new(input) {
+            // Log only the store name + key, never the resolved value.
             tracing::debug!(
                 "Found secret replacement: Store name: {}, Key: {}, Span: {:?}",
                 secret_replacement.store_name,
@@ -176,28 +183,28 @@ impl Secrets {
                 secret_replacement.span,
             );
 
-            // Append text from last match to the start of the current match
-            result.push_str(&param_str.0[last_end..secret_replacement.span.start]);
+            result.push_str(&input[last_end..secret_replacement.span.start]);
 
-            // Get the secret value from the store
-            let secret = self
-                .get_store_secret(
-                    &param_str,
+            // Keep the value inside `SecretString` until we splice its bytes
+            // into `result`. Previously this path went through
+            // `expose_secret().to_string()` which allocates a plain String
+            // that is dropped without zeroizing — those bytes would linger
+            // in freed heap slots.
+            if let Some(secret) = self
+                .lookup_for_injection(
+                    input,
                     &secret_replacement.store_name,
                     &secret_replacement.key,
                 )
                 .await
-                .unwrap_or_default();
+            {
+                result.push_str(secret.expose_secret());
+            }
 
-            // Replace the token with the desired string
-            result.push_str(&secret);
-
-            // Update the last end to the end of the current match
             last_end = secret_replacement.span.end;
         }
 
-        // Append the remaining text after the last match
-        result.push_str(&param_str.0[last_end..]);
+        result.push_str(&input[last_end..]);
 
         SecretString::from(result)
     }
@@ -219,48 +226,47 @@ impl Secrets {
         Ok(None)
     }
 
-    async fn get_store_secret(
+    /// Internal helper for [`Self::inject_secrets`]. Returns the value
+    /// wrapped in a [`SecretString`] (never a plain `String`) so the caller
+    /// can splice the bytes without an intermediate non-zeroizing allocation.
+    async fn lookup_for_injection(
         &self,
-        param_str: &ParamStr<'_>,
+        param_str: &str,
         store_name: &str,
         key: &str,
-    ) -> Option<String> {
-        // This is a special case for loading secrets across stores in precedence order
+    ) -> Option<SecretString> {
+        // Special case: the `secrets:` sentinel means "walk the registry in
+        // precedence order", which matches `get_secret`.
         if store_name == SECRETS {
-            match self.get_secret(key).await {
-                Ok(Some(secret)) => return Some(secret.expose_secret().to_string()),
+            return match self.get_secret(key).await {
+                Ok(Some(secret)) => Some(secret),
                 Ok(None) => {
                     tracing::error!("Key '{key}' not found in any connected secrets.");
-                    return None;
+                    None
                 }
                 Err(e) => {
                     tracing::error!("Error getting secret: {}", e);
-                    return None;
+                    None
                 }
-            }
+            };
         }
 
-        let secret = if let Some(store) = self.stores.get(store_name) {
-            match store.get_secret(key).await {
-                Ok(Some(secret)) => secret.expose_secret().to_string(),
-                Ok(None) => {
-                    tracing::error!("Key {key} not found in secret store: {store_name}");
-                    return None;
-                }
-                Err(e) => {
-                    tracing::error!("Error getting secret: {}", e);
-                    return None;
-                }
-            }
-        } else {
-            tracing::error!(
-                "Secret '{store_name}' referenced in {} not found.",
-                param_str.0
-            );
+        let Some(store) = self.stores.get(store_name) else {
+            tracing::error!("Secret '{store_name}' referenced in {param_str} not found.");
             return None;
         };
 
-        Some(secret)
+        match store.get_secret(key).await {
+            Ok(Some(secret)) => Some(secret),
+            Ok(None) => {
+                tracing::error!("Key {key} not found in secret store: {store_name}");
+                None
+            }
+            Err(e) => {
+                tracing::error!("Error getting secret: {}", e);
+                None
+            }
+        }
     }
 }
 
@@ -543,8 +549,14 @@ mod tests {
 
     #[async_trait]
     impl super::ClusterSecretExpander for MockClusterSecretExpander {
-        async fn expand_secret(&self, executor_id: &str, key: &str) -> Result<String, String> {
-            Ok(format!("{executor_id}:{key}:expanded"))
+        async fn expand_secret(
+            &self,
+            executor_id: &str,
+            key: &str,
+        ) -> Result<secrecy::SecretString, String> {
+            Ok(secrecy::SecretString::from(format!(
+                "{executor_id}:{key}:expanded"
+            )))
         }
     }
 
@@ -825,7 +837,12 @@ mod tests {
                     cfg.client_id.as_deref(),
                     Some("00000000-0000-0000-0000-000000000002")
                 );
-                assert_eq!(cfg.client_secret.as_deref(), Some("shh"));
+                assert_eq!(
+                    cfg.client_secret
+                        .as_ref()
+                        .map(|s| s.expose_secret().to_string()),
+                    Some("shh".to_string())
+                );
                 assert_eq!(cfg.endpoint.as_deref(), Some("vault.usgovcloudapi.net"));
             }
             _ => panic!("expected AzureKeyVault variant"),
@@ -918,7 +935,12 @@ mod tests {
             super::SecretStoreType::AzureKeyVault(cfg) => {
                 assert_eq!(cfg.tenant_id.as_deref(), Some("tenant-xyz"));
                 assert_eq!(cfg.client_id.as_deref(), Some("client-xyz"));
-                assert_eq!(cfg.client_secret.as_deref(), Some("s3cret"));
+                assert_eq!(
+                    cfg.client_secret
+                        .as_ref()
+                        .map(|s| s.expose_secret().to_string()),
+                    Some("s3cret".to_string())
+                );
             }
             _ => panic!("expected AzureKeyVault variant"),
         }

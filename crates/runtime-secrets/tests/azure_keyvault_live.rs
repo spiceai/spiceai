@@ -65,6 +65,7 @@ use runtime_secrets::stores::azure_keyvault::{
     AuthMethod, AzureKeyVault, AzureKeyVaultConfig,
 };
 use runtime_secrets::{ExposeSecret, SecretStore};
+use secrecy::SecretString;
 
 fn env_or_skip(var: &str) -> Option<String> {
     match std::env::var(var) {
@@ -100,7 +101,9 @@ fn build_store(vault: &str) -> AzureKeyVault {
             auth_method: AuthMethod::ServicePrincipal,
             tenant_id: std::env::var("AZURE_TENANT_ID").ok(),
             client_id: std::env::var("AZURE_CLIENT_ID").ok(),
-            client_secret: std::env::var("AZURE_CLIENT_SECRET").ok(),
+            client_secret: std::env::var("AZURE_CLIENT_SECRET")
+                .ok()
+                .map(SecretString::from),
             endpoint: None,
         }
     } else {

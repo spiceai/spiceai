@@ -60,7 +60,7 @@ use azure_identity::{
 use azure_security_keyvault_secrets::SecretClient;
 use futures::StreamExt;
 use runtime_parameter_spec::ParameterSpec;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::Snafu;
 use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
 
@@ -128,14 +128,34 @@ pub const PARAMETERS: &[ParameterSpec] = &[
 /// `vault` carries either the bare vault name from the selector or the
 /// fully-qualified URL the user supplied — we defer URL construction to
 /// [`AzureKeyVault::from_config`] so the parse errors surface from one place.
-#[derive(Debug, Clone)]
+///
+/// No `Debug` derive: `client_secret` is sensitive, and silently printing
+/// it via `{:?}` in a panic trace or log call is exactly the class of leak
+/// this module has to prevent. The manual impl below redacts the secret.
+#[derive(Clone)]
 pub struct AzureKeyVaultConfig {
     pub vault: String,
     pub auth_method: AuthMethod,
     pub tenant_id: Option<String>,
     pub client_id: Option<String>,
-    pub client_secret: Option<String>,
+    pub client_secret: Option<SecretString>,
     pub endpoint: Option<String>,
+}
+
+impl std::fmt::Debug for AzureKeyVaultConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AzureKeyVaultConfig")
+            .field("vault", &self.vault)
+            .field("auth_method", &self.auth_method)
+            .field("tenant_id", &self.tenant_id)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
 }
 
 /// Authentication mode for the Key Vault SDK client.
@@ -181,7 +201,10 @@ impl AzureKeyVaultConfig {
             auth_method,
             tenant_id: params.get("tenant_id").cloned(),
             client_id: params.get("client_id").cloned(),
-            client_secret: params.get("client_secret").cloned(),
+            client_secret: params
+                .get("client_secret")
+                .cloned()
+                .map(SecretString::from),
             endpoint: params.get("endpoint").cloned(),
         }
     }
@@ -287,7 +310,7 @@ pub struct AzureKeyVault {
     auth_method: AuthMethod,
     tenant_id: Option<String>,
     client_id: Option<String>,
-    client_secret: Option<String>,
+    client_secret: Option<SecretString>,
 
     /// Lazily-initialized SDK client, shared across all lookups.
     client: OnceCell<SecretClient>,
@@ -322,6 +345,13 @@ impl AzureKeyVault {
         })
     }
 
+    /// `validate_auth_params` operates on `&str`, so unwrap the
+    /// [`SecretString`] only while checking for its presence — the exposed
+    /// `&str` is never stored or logged.
+    fn client_secret_str(&self) -> Option<&str> {
+        self.client_secret.as_ref().map(ExposeSecret::expose_secret)
+    }
+
     /// Creates a new [`AzureKeyVault`] store from a validated
     /// [`AzureKeyVaultConfig`] (i.e. one produced by [`crate::validate_params`]).
     ///
@@ -346,7 +376,10 @@ impl AzureKeyVault {
             config.auth_method,
             config.tenant_id.as_deref(),
             config.client_id.as_deref(),
-            config.client_secret.as_deref(),
+            config
+                .client_secret
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
         )?;
 
         Ok(Self {
@@ -450,7 +483,12 @@ impl AzureKeyVault {
                 // the mode resolves to ServicePrincipal.
                 let tenant_id = self.tenant_id.as_deref().unwrap_or_default();
                 let client_id = self.client_id.clone().unwrap_or_default();
-                let secret = AzureSecret::from(self.client_secret.clone().unwrap_or_default());
+                // `AzureSecret::from(String)` moves ownership; we clone the
+                // plaintext out of the `SecretString` only once and hand it
+                // straight to the SDK's own secret wrapper. The momentary
+                // `String` lives only for this statement.
+                let secret =
+                    AzureSecret::from(self.client_secret_str().unwrap_or_default().to_string());
                 let cred = ClientSecretCredential::new(tenant_id, client_id, secret, None)
                     .map_err(boxed)?;
                 Ok(cred as Arc<dyn TokenCredential>)
@@ -480,10 +518,10 @@ impl AzureKeyVault {
                 // modes (IMDS timeouts, missing federated-token files) are
                 // noisy and confusing when the user actually intended the
                 // CLI path.
-                if self.client_secret.is_some() {
+                if let Some(client_secret) = self.client_secret_str() {
                     let tenant_id = self.tenant_id.as_deref().unwrap_or_default();
                     let client_id = self.client_id.clone().unwrap_or_default();
-                    let secret = AzureSecret::from(self.client_secret.clone().unwrap_or_default());
+                    let secret = AzureSecret::from(client_secret.to_string());
                     let cred = ClientSecretCredential::new(tenant_id, client_id, secret, None)
                         .map_err(boxed)?;
                     Ok(cred as Arc<dyn TokenCredential>)
@@ -503,6 +541,13 @@ impl AzureKeyVault {
             AuthMethod::Default if self.client_secret.is_some() => AuthMethod::ServicePrincipal,
             other => other,
         }
+    }
+
+    /// Test-only accessor for the redacted client_secret field. Production
+    /// code never borrows this outside of the credential-build path.
+    #[cfg(test)]
+    fn has_client_secret(&self) -> bool {
+        self.client_secret.is_some()
     }
 
     /// Returns the cached entry for `key` if it is still fresh.
@@ -913,11 +958,33 @@ mod tests {
             auth_method: AuthMethod::Default,
             tenant_id: Some("t".to_string()),
             client_id: Some("c".to_string()),
-            client_secret: Some("s".to_string()),
+            client_secret: Some(SecretString::from("s".to_string())),
             endpoint: None,
         };
         let store = AzureKeyVault::from_config(cfg).expect("valid");
         assert_eq!(store.effective_auth_method(), AuthMethod::ServicePrincipal);
+        assert!(store.has_client_secret());
+    }
+
+    /// Ensures a `{:?}` print of the config never surfaces the raw
+    /// `client_secret`. This is the guard against a rogue log/panic leaking
+    /// service-principal credentials.
+    #[test]
+    fn config_debug_redacts_client_secret() {
+        let cfg = AzureKeyVaultConfig {
+            vault: "my-vault".to_string(),
+            auth_method: AuthMethod::ServicePrincipal,
+            tenant_id: Some("t".to_string()),
+            client_id: Some("c".to_string()),
+            client_secret: Some(SecretString::from("super-secret-value".to_string())),
+            endpoint: None,
+        };
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("super-secret-value"),
+            "Debug output must not include the raw client_secret; got: {debug}"
+        );
+        assert!(debug.contains("<redacted>"), "got {debug}");
     }
 
     #[test]
