@@ -256,7 +256,7 @@ fn maybe_read_first_batch(
 ///
 /// Accepts an async stream of [`RecordBatch`] and routes each batch to the
 /// correct executor as it arrives, avoiding full materialization in memory.
-pub(crate) async fn forward_partitioned_batches(
+pub async fn forward_partitioned_batches(
     executor_registry: &ExecutorRegistry,
     ctx: Arc<datafusion::prelude::SessionContext>,
     io_runtime: tokio::runtime::Handle,
