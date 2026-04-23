@@ -117,7 +117,7 @@ impl FromStr for ConflictBehavior {
 const DEFAULT_MAX_PUT_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Configuration applied to all operations against a [`SharepointObjectStore`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct SharepointObjectStoreConfig {
     pub conflict_behavior: ConflictBehavior,
     /// Reject `put` / `put_multipart` writes larger than this many bytes

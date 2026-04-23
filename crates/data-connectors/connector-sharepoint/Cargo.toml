@@ -15,6 +15,7 @@ graph-rs-sdk.workspace = true
 linkme.workspace = true
 paste.workspace = true
 runtime = { path = "../../runtime" }
+runtime-object-store = { path = "../../runtime-object-store" }
 secrecy.workspace = true
 snafu.workspace = true
 tokio.workspace = true

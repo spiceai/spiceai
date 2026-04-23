@@ -169,13 +169,87 @@ impl Sharepoint {
     }
 
     /// Build the helper connector that backs `sharepoint://` datasets.
-    fn listing_connector(&self) -> SharepointListingConnector {
-        SharepointListingConnector {
+    ///
+    /// The blanket [`ListingTableConnector::read_provider`] impl creates a
+    /// fresh [`SessionContext`] whose [`RuntimeEnv`] doesn't know how to
+    /// build a `sharepoint://` store from a URL, so we hand the helper
+    /// connector everything it needs to register a [`SharepointObjectStore`]
+    /// on that fresh env (see its `get_session_context` /
+    /// `get_object_store` overrides).
+    fn listing_connector(
+        &self,
+        dataset: &Dataset,
+    ) -> DataConnectorResult<SharepointListingConnector> {
+        let (store_url, kind, config) = parse_object_store_components(&self.params, dataset)?;
+        Ok(SharepointListingConnector {
+            client: Arc::clone(&self.client),
+            store_url,
+            kind,
+            config,
             params: self.params.clone(),
             tokio_io_runtime: self.tokio_io_runtime.clone(),
             runtime: self.runtime.clone(),
-        }
+        })
     }
+}
+
+/// Parse the dataset URL and connector params into the components needed to
+/// build a [`SharepointObjectStore`]. Used by both
+/// [`Sharepoint::register_object_stores`] and
+/// [`Sharepoint::listing_connector`] so the two paths agree on URL,
+/// drive-kind routing, and config.
+fn parse_object_store_components(
+    params: &Parameters,
+    dataset: &Dataset,
+) -> DataConnectorResult<(Url, Option<DriveKind>, SharepointObjectStoreConfig)> {
+    let store_url =
+        Url::parse(&dataset.from).map_err(|e| DataConnectorError::InvalidConfiguration {
+            dataconnector: CONNECTOR_NAME.to_string(),
+            message: format!(
+                "'{}' is not a valid sharepoint:// URL. See https://spiceai.org/docs/components/data-connectors/sharepoint#from",
+                dataset.from
+            ),
+            connector_component: ConnectorComponent::from(dataset),
+            source: Box::new(e),
+        })?;
+    let sp_url =
+        data_components::sharepoint::url::SharepointUrl::from_url(&store_url).map_err(|e| {
+            DataConnectorError::InvalidConfiguration {
+                dataconnector: CONNECTOR_NAME.to_string(),
+                message: format!("{e}"),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            }
+        })?;
+    let kind = match sp_url.drive {
+        DriveRef::Me => None,
+        DriveRef::Drive(_) => Some(DriveKind::Drives),
+        DriveRef::Site(_) => Some(DriveKind::Sites),
+        DriveRef::User(_) => Some(DriveKind::Users),
+        DriveRef::Group(_) => Some(DriveKind::Groups),
+    };
+    let conflict_behavior =
+        parse_conflict_behavior(params).map_err(|e| DataConnectorError::InvalidConfiguration {
+            dataconnector: CONNECTOR_NAME.to_string(),
+            message: format!("{e}"),
+            connector_component: ConnectorComponent::from(dataset),
+            source: Box::new(e),
+        })?;
+    let max_put_bytes =
+        parse_max_put_bytes(params).map_err(|e| DataConnectorError::InvalidConfiguration {
+            dataconnector: CONNECTOR_NAME.to_string(),
+            message: format!("{e}"),
+            connector_component: ConnectorComponent::from(dataset),
+            source: Box::new(e),
+        })?;
+    Ok((
+        store_url,
+        kind,
+        SharepointObjectStoreConfig {
+            conflict_behavior,
+            max_put_bytes,
+        },
+    ))
 }
 
 fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
@@ -390,7 +464,10 @@ impl DataConnector for Sharepoint {
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if Self::uses_object_store(dataset) {
-            return self.listing_connector().read_provider(dataset).await;
+            return self
+                .listing_connector(dataset)?
+                .read_provider(dataset)
+                .await;
         }
         // Legacy path — metadata-listing table provider.
         let client = SharepointClient::new(Arc::clone(&self.client), &dataset.from)
@@ -416,7 +493,10 @@ impl DataConnector for Sharepoint {
             return None;
         }
         if Self::uses_object_store(dataset) {
-            return self.listing_connector().metadata_provider(dataset).await;
+            return match self.listing_connector(dataset) {
+                Ok(c) => c.metadata_provider(dataset).await,
+                Err(e) => Some(Err(e)),
+            };
         }
         let result = SharepointClient::new(Arc::clone(&self.client), &dataset.from)
             .await
@@ -451,57 +531,15 @@ impl DataConnector for Sharepoint {
         // first path segment on every operation, rather than binding one
         // drive per store instance. `sharepoint://me` is the one special
         // case where the drive is fixed.
-        let store_url =
-            Url::parse(&dataset.from).map_err(|e| DataConnectorError::InvalidConfiguration {
-                dataconnector: CONNECTOR_NAME.to_string(),
-                message: format!(
-                    "'{}' is not a valid sharepoint:// URL. See https://spiceai.org/docs/components/data-connectors/sharepoint#from",
-                    dataset.from
-                ),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(e),
-            })?;
-        let sp_url = data_components::sharepoint::url::SharepointUrl::from_url(&store_url)
-            .map_err(|e| DataConnectorError::InvalidConfiguration {
-                dataconnector: CONNECTOR_NAME.to_string(),
-                message: format!("{e}"),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(e),
-            })?;
-        let kind = match sp_url.drive {
-            DriveRef::Me => None,
-            DriveRef::Drive(_) => Some(DriveKind::Drives),
-            DriveRef::Site(_) => Some(DriveKind::Sites),
-            DriveRef::User(_) => Some(DriveKind::Users),
-            DriveRef::Group(_) => Some(DriveKind::Groups),
-        };
-        let conflict = parse_conflict_behavior(&self.params).map_err(|e| {
-            DataConnectorError::InvalidConfiguration {
-                dataconnector: CONNECTOR_NAME.to_string(),
-                message: format!("{e}"),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(e),
-            }
-        })?;
-        let max_put_bytes = parse_max_put_bytes(&self.params).map_err(|e| {
-            DataConnectorError::InvalidConfiguration {
-                dataconnector: CONNECTOR_NAME.to_string(),
-                message: format!("{e}"),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(e),
-            }
-        })?;
+        let (store_url, kind, config) = parse_object_store_components(&self.params, dataset)?;
         let store = Arc::new(SharepointObjectStore::new(
             Arc::clone(&self.client),
             kind,
-            SharepointObjectStoreConfig {
-                conflict_behavior: conflict,
-                max_put_bytes,
-            },
+            config,
         ));
         runtime_env.register_object_store(&store_url, store);
         // Then defer to the listing connector for any additional setup.
-        self.listing_connector()
+        self.listing_connector(dataset)?
             .register_object_stores(dataset, runtime_env)
             .await
     }
@@ -510,7 +548,18 @@ impl DataConnector for Sharepoint {
 /// Internal helper that implements [`ListingTableConnector`]. Not a public
 /// connector (not registered in the connector factory); instantiated on
 /// demand by [`Sharepoint`] for `sharepoint://` datasets.
+///
+/// Carries the authenticated [`GraphClient`] and parsed drive routing so
+/// that the `get_session_context` / `get_object_store` overrides can
+/// register a [`SharepointObjectStore`] on the freshly built session
+/// context. Without that, the blanket [`ListingTableConnector`] impl
+/// falls back to `SpiceObjectStoreRegistry`, which doesn't know how to
+/// build `sharepoint://` stores and would fail at schema inference.
 struct SharepointListingConnector {
+    client: Arc<GraphClient>,
+    store_url: Url,
+    kind: Option<DriveKind>,
+    config: SharepointObjectStoreConfig,
     params: Parameters,
     tokio_io_runtime: tokio::runtime::Handle,
     runtime: Option<Runtime>,
@@ -526,6 +575,16 @@ impl fmt::Debug for SharepointListingConnector {
 impl Display for SharepointListingConnector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(CONNECTOR_NAME)
+    }
+}
+
+impl SharepointListingConnector {
+    fn build_object_store(&self) -> Arc<SharepointObjectStore> {
+        Arc::new(SharepointObjectStore::new(
+            Arc::clone(&self.client),
+            self.kind,
+            self.config,
+        ))
     }
 }
 
@@ -564,6 +623,42 @@ impl ListingTableConnector for SharepointListingConnector {
             connector_component: ConnectorComponent::from(dataset),
             source: Box::new(e),
         })
+    }
+
+    /// Override the default to short-circuit the registry lookup — we
+    /// already know how to build a [`SharepointObjectStore`] for this
+    /// dataset, and `SpiceObjectStoreRegistry` doesn't.
+    fn get_object_store(
+        &self,
+        _dataset: &Dataset,
+    ) -> DataConnectorResult<Arc<dyn datafusion::object_store::ObjectStore>> {
+        Ok(self.build_object_store())
+    }
+
+    /// Override the default to register the [`SharepointObjectStore`] on
+    /// the freshly created [`SessionContext`]'s runtime env. Schema
+    /// inference (`ListingOptions::infer_schema`) reaches into
+    /// `ctx.state().runtime_env()` to resolve the store, so without this
+    /// the blanket [`ListingTableConnector::read_provider`] impl would
+    /// fail on first listing.
+    fn get_session_context(&self) -> datafusion::execution::context::SessionContext {
+        use datafusion::execution::context::SessionContext;
+        use runtime_object_store::registry::default_runtime_env;
+
+        let mut config = runtime::datafusion::builder::DEFAULT_DATAFUSION_CONFIG
+            .read()
+            .map_or_else(|_| datafusion::prelude::SessionConfig::new(), |c| c.clone());
+        config
+            .options_mut()
+            .execution
+            .listing_table_ignore_subdirectory = false;
+        let ctx = SessionContext::new_with_config_rt(
+            config,
+            default_runtime_env(self.tokio_io_runtime.clone()),
+        );
+        ctx.runtime_env()
+            .register_object_store(&self.store_url, self.build_object_store());
+        ctx
     }
 }
 
