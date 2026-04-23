@@ -47,7 +47,7 @@ pub struct DynamoDBUpdateExec {
 }
 
 impl DynamoDBUpdateExec {
-    #[must_use] 
+    #[must_use]
     pub fn new(
         db_client: Arc<DbClient>,
         table_name: String,
