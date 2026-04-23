@@ -22,8 +22,8 @@ use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Semaphore;
 use util::retry_strategy::{Backoff, BackoffMethod, RetryBackoffBuilder};
-const DEFAULT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_HTTP_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 const DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 16;
@@ -207,9 +207,24 @@ pub fn enable_supported_compression(builder: ClientBuilder) -> ClientBuilder {
 }
 
 pub fn configure_client_builder(builder: ClientBuilder) -> ClientBuilder {
+    configure_client_builder_with_timeouts(
+        builder,
+        DEFAULT_HTTP_CONNECT_TIMEOUT,
+        DEFAULT_HTTP_REQUEST_TIMEOUT,
+    )
+}
+
+/// Like [`configure_client_builder`] but lets the caller override the connect
+/// and per-request timeouts. Pool and keepalive settings remain at their
+/// defaults.
+pub fn configure_client_builder_with_timeouts(
+    builder: ClientBuilder,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> ClientBuilder {
     enable_supported_compression(builder)
-        .connect_timeout(DEFAULT_HTTP_CONNECT_TIMEOUT)
-        .timeout(DEFAULT_HTTP_REQUEST_TIMEOUT)
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
         .pool_idle_timeout(DEFAULT_HTTP_POOL_IDLE_TIMEOUT)
         .pool_max_idle_per_host(DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST)
         .tcp_keepalive(DEFAULT_HTTP_TCP_KEEPALIVE)

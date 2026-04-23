@@ -56,8 +56,11 @@ use util::{
 };
 
 use crate::resilient_http::{
-    RetryConfig, configure_client_builder, send_request_with_retry_and_concurrency_limit,
+    DEFAULT_HTTP_CONNECT_TIMEOUT, DEFAULT_HTTP_REQUEST_TIMEOUT, RetryConfig,
+    configure_client_builder_with_timeouts, send_request_with_retry_and_concurrency_limit,
 };
+#[cfg(test)]
+use crate::resilient_http::configure_client_builder;
 use crate::schema_discovery::{
     DatasetPermissions, NoPermissionsCheck, PermissionCheckResult, SchemaProbeResult,
     discover_schema,
@@ -105,6 +108,15 @@ pub struct SqlWarehouseConfig {
     /// the connector so subsequent queries fail immediately without issuing
     /// further HTTP requests.
     pub disable_on_permanent_error: bool,
+
+    /// Timeout for establishing TCP/TLS connections to the SQL Warehouse API.
+    pub connect_timeout: std::time::Duration,
+
+    /// Per-request wall-clock timeout for every HTTP call (statement submit,
+    /// status poll, and result-chunk fetch). Must be set to the longest
+    /// expected single HTTP call, not the total query duration — the overall
+    /// query duration is bounded by `statement_max_retries` × backoff.
+    pub request_timeout: std::time::Duration,
 }
 
 impl Default for SqlWarehouseConfig {
@@ -115,6 +127,8 @@ impl Default for SqlWarehouseConfig {
             backoff_method: BackoffMethod::Fibonacci,
             statement_max_retries: SQL_WAREHOUSE_DEFAULT_STATEMENT_MAX_RETRIES,
             disable_on_permanent_error: true,
+            connect_timeout: DEFAULT_HTTP_CONNECT_TIMEOUT,
+            request_timeout: DEFAULT_HTTP_REQUEST_TIMEOUT,
         }
     }
 }
@@ -604,10 +618,14 @@ impl SqlWarehouseApi {
         metrics: Arc<DatabricksMetrics>,
         request_semaphore: Arc<Semaphore>,
     ) -> Result<Self, Error> {
-        let client = configure_client_builder(ClientBuilder::new())
-            .user_agent(super::user_agent())
-            .build()
-            .context(ClientBuildFailedSnafu)?;
+        let client = configure_client_builder_with_timeouts(
+            ClientBuilder::new(),
+            config.connect_timeout,
+            config.request_timeout,
+        )
+        .user_agent(super::user_agent())
+        .build()
+        .context(ClientBuildFailedSnafu)?;
 
         Ok(Self {
             client,

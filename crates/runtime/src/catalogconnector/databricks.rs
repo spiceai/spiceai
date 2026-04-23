@@ -475,6 +475,22 @@ pub fn build_sql_warehouse_config(params: &Parameters) -> SqlWarehouseConfig {
             }
         }
     }
+    if let Some(v) = params.get("connect_timeout").expose().ok() {
+        match duration_parse::parse_duration(v) {
+            Ok(d) => config.connect_timeout = d,
+            Err(e) => {
+                tracing::warn!(parameter = "connect_timeout", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default");
+            }
+        }
+    }
+    if let Some(v) = params.get("client_timeout").expose().ok() {
+        match duration_parse::parse_duration(v) {
+            Ok(d) => config.request_timeout = d,
+            Err(e) => {
+                tracing::warn!(parameter = "client_timeout", value = v, error = %e, "Invalid Databricks SQL Warehouse config value; using default");
+            }
+        }
+    }
 
     config
 }
@@ -675,6 +691,8 @@ mod tests {
             ("backoff_method", "exponential"),
             ("statement_max_retries", "21"),
             ("disable_on_permanent_error", "false"),
+            ("connect_timeout", "5s"),
+            ("client_timeout", "2m"),
         ]);
 
         let config = build_sql_warehouse_config(&params);
@@ -687,6 +705,8 @@ mod tests {
         );
         assert_eq!(config.statement_max_retries, 21);
         assert!(!config.disable_on_permanent_error);
+        assert_eq!(config.connect_timeout, std::time::Duration::from_secs(5));
+        assert_eq!(config.request_timeout, std::time::Duration::from_secs(120));
     }
 
     #[test]
@@ -697,6 +717,8 @@ mod tests {
             ("backoff_method", "quadratic"),
             ("statement_max_retries", "bad"),
             ("disable_on_permanent_error", "maybe"),
+            ("connect_timeout", "not-a-duration"),
+            ("client_timeout", ""),
         ]);
 
         let config = build_sql_warehouse_config(&params);
@@ -713,5 +735,7 @@ mod tests {
             config.disable_on_permanent_error,
             defaults.disable_on_permanent_error
         );
+        assert_eq!(config.connect_timeout, defaults.connect_timeout);
+        assert_eq!(config.request_timeout, defaults.request_timeout);
     }
 }
