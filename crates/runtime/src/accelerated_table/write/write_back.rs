@@ -17,11 +17,13 @@ limitations under the License.
 //! Write-back execution path for [`WriteMode::WriteBack`].
 //!
 //! Writes are streamed directly into the local accelerator. The synchronous
-//! response returns once the accelerator commit completes. Propagation back
-//! to the federated source is the responsibility of the existing replication
-//! / refresh-on-changes mechanism (write-back is gated by validation that
-//! requires one of `replication.enabled`, `acceleration.on_conflict`, or
-//! `acceleration.refresh_mode: changes`).
+//! response returns once the accelerator commit completes. This path does
+//! not forward writes to the federated source itself; source synchronization
+//! is handled out-of-band by the existing replication or refresh-on-changes
+//! mechanism. Write-back is gated by validation that requires
+//! `replication.enabled` or `acceleration.refresh_mode: changes`
+//! (`acceleration.on_conflict` is rejected separately because it declares
+//! accelerator-only semantics).
 //!
 //! No batches are buffered in memory in this path: the caller's input
 //! [`ExecutionPlan`] is handed directly to

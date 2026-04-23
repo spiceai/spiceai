@@ -452,8 +452,9 @@ impl Builder {
         self
     }
 
-    /// Enable write-back mode: writes go to the local accelerator first (fast path),
-    /// then asynchronously forwarded to the federated source.
+    /// Enable write-back mode: writes go to the local accelerator only. The
+    /// federated source is updated out-of-band by the configured replication
+    /// or refresh-on-changes mechanism, so the source may lag briefly.
     pub fn write_back(&mut self) -> &mut Self {
         self.write_back = true;
         self
