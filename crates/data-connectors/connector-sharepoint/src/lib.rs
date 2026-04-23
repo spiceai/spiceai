@@ -157,8 +157,9 @@ impl Sharepoint {
     /// Whether this dataset uses the new `sharepoint://` URL scheme (routed
     /// through `ObjectStore` + `ListingTable`) or the legacy compact
     /// `sharepoint:…` syntax (routed to [`SharepointTableProvider`]).
+    ///
     /// URL schemes are case-insensitive, so we parse and compare on scheme
-    /// + authority rather than a raw prefix match — `SharePoint://me/…`
+    /// and authority rather than a raw prefix match — `SharePoint://me/…`
     /// should route the same as `sharepoint://me/…`.
     fn uses_object_store(dataset: &Dataset) -> bool {
         match Url::parse(&dataset.from) {

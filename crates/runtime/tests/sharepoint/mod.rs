@@ -39,12 +39,19 @@ limitations under the License.
 //! and clean up after themselves. Each file name is unique-per-run to avoid
 //! collisions.
 
+#![expect(
+    clippy::doc_markdown,
+    reason = "prose-frequent identifiers (SharePoint, DataFusion) are clearer without backticks"
+)]
+
 use std::{sync::Arc, time::Duration};
 
 use app::AppBuilder;
+use data_components::sharepoint::auth::{DEFAULT_SCOPE, SharepointAuth};
 use futures::StreamExt;
-
+use object_store::ObjectStore;
 use runtime::Runtime;
+use secrecy::SecretString;
 use spicepod::{component::dataset::Dataset, param::Params};
 
 use crate::{configure_test_datafusion, init_tracing, utils::test_request_context};
@@ -132,7 +139,6 @@ fn store_and_delete_path(
         DriveKind, SharepointObjectStore, SharepointObjectStoreConfig,
     };
     use data_components::sharepoint::url::{DriveRef, SharepointUrl};
-    use object_store::path::Path;
 
     let parsed = SharepointUrl::parse(uri).map_err(|e| anyhow::anyhow!("parse test uri: {e}"))?;
     let (kind, path) = match &parsed.drive {
@@ -212,10 +218,6 @@ async fn sharepoint_csv_round_trip() -> Result<(), anyhow::Error> {
             assert!(!batches.is_empty(), "expected at least one batch");
 
             // Clean up — DELETE the file we wrote.
-            use data_components::sharepoint::auth::{DEFAULT_SCOPE, SharepointAuth};
-            use object_store::ObjectStore;
-            use secrecy::SecretString;
-
             let auth = SharepointAuth::ClientCredentials {
                 tenant_id: cfg.tenant_id.clone(),
                 client_id: cfg.client_id.clone(),
@@ -299,10 +301,6 @@ async fn sharepoint_parquet_copy_to() -> Result<(), anyhow::Error> {
             );
 
             // Clean up.
-            use data_components::sharepoint::auth::SharepointAuth;
-            use object_store::ObjectStore;
-            use secrecy::SecretString;
-
             let auth = SharepointAuth::ClientCredentials {
                 tenant_id: cfg.tenant_id.clone(),
                 client_id: cfg.client_id.clone(),

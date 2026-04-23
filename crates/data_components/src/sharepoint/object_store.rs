@@ -304,13 +304,34 @@ impl ObjectStore for SharepointObjectStore {
         }
         let bytes = payload_to_bytes(&payload);
 
-        // Honor the store's configured `conflict_behavior` for normal
-        // overwrite/update writes (e.g. `sharepoint_conflict_behavior=rename`
-        // or `fail`). `PutMode::Create` always maps to Fail regardless —
-        // that's what "create, don't overwrite" means.
+        // Map `PutMode` to SharePoint conflict behavior without violating the
+        // `ObjectStore` contract. The contract requires that a successful
+        // `PutMode::Overwrite` / `PutMode::Update` make the object at
+        // `location` contain the new payload. SharePoint's `rename`
+        // (succeed-with-different-name) and `fail` (reject on conflict)
+        // cannot satisfy that, so we reject them here rather than silently
+        // writing to a different path or failing a user who explicitly asked
+        // to overwrite.
+        //
+        // - `Create`   → `Fail` (that's exactly "create, don't overwrite").
+        // - `Overwrite`→ `Replace` only; reject `Rename`/`Fail` configs.
+        // - `Update`   → `Replace` unconditionally. The precondition has
+        //   already been verified above; the config must not force a rename
+        //   or fail an OCC write that matched its precondition.
         let effective_conflict = match opts.mode {
             PutMode::Create => ConflictBehavior::Fail,
-            PutMode::Overwrite | PutMode::Update(_) => self.config.conflict_behavior,
+            PutMode::Overwrite => match self.config.conflict_behavior {
+                ConflictBehavior::Replace => ConflictBehavior::Replace,
+                other @ (ConflictBehavior::Rename | ConflictBehavior::Fail) => {
+                    return Err(object_store::Error::Generic {
+                        store: STORE_TAG,
+                        source: Box::new(std::io::Error::other(format!(
+                            "SharePoint put rejected for {location}: configured conflict_behavior={other:?} cannot satisfy PutMode::Overwrite; set sharepoint_conflict_behavior=replace"
+                        ))),
+                    });
+                }
+            },
+            PutMode::Update(_) => ConflictBehavior::Replace,
         };
 
         let result = if bytes.len() <= INLINE_PUT_THRESHOLD {
@@ -331,11 +352,24 @@ impl ObjectStore for SharepointObjectStore {
         _opts: PutMultipartOptions,
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
         let (drive, in_drive) = self.resolve(location)?;
+        // Same contract issue as `put_opts`: `put_multipart` is implicitly
+        // overwrite semantics, which `rename` / `fail` configs cannot satisfy.
+        match self.config.conflict_behavior {
+            ConflictBehavior::Replace => {}
+            other @ (ConflictBehavior::Rename | ConflictBehavior::Fail) => {
+                return Err(object_store::Error::Generic {
+                    store: STORE_TAG,
+                    source: Box::new(std::io::Error::other(format!(
+                        "SharePoint multipart upload rejected for {location}: configured conflict_behavior={other:?} cannot satisfy overwrite; set sharepoint_conflict_behavior=replace"
+                    ))),
+                });
+            }
+        }
         Ok(Box::new(BufferedMultipart::new(
             Arc::clone(&self.client),
             drive,
             in_drive,
-            self.config.conflict_behavior,
+            ConflictBehavior::Replace,
             self.config.max_put_bytes,
         )))
     }

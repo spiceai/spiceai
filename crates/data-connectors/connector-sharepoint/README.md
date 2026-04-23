@@ -74,6 +74,12 @@ matches the connector default (`conflict_behavior=replace`). Alternatives:
 | `fail`              | Reject the write if the path already exists.               |
 | `rename`            | Write under a SharePoint-chosen unique name.               |
 
+Only `replace` is compatible with the `ObjectStore` contract used by
+`INSERT`/`COPY TO` (those writes must produce an object at the requested
+path on success). Configuring `fail` or `rename` causes `put` and
+`put_multipart` to reject writes with a clear error; those values are
+reserved for non-`ObjectStore` paths that may be added in the future.
+
 Non-`replace` conflict behaviors always route through a resumable upload
 session (`createUploadSession`) because the single-shot `PUT /content`
 endpoint doesn't cleanly expose conflict behavior headers.
