@@ -67,13 +67,17 @@ pub mod optimizer_rules;
 pub(crate) mod partition_creator;
 pub mod provider;
 pub(crate) mod schema;
+pub mod stats;
 
 pub use catalog::MetadataCatalog;
 pub use catalog_provider::{
     CayenneCatalogProvider, CayenneCatalogProviderConfig, CayenneSchemaProvider,
 };
 pub use cayenne_catalog::CayenneCatalog;
-pub use metadata::{DataFile, DeleteFile, ObjectStoreConfig, PartitionMetadata, TableMetadata};
+pub use metadata::{
+    DataFile, DeleteFile, InlinedData, InlinedDelete, ObjectStoreConfig, PartitionMetadata,
+    TableMetadata, TableStatistics,
+};
 pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME};
 pub use provider::{
     CayenneContext, CayenneStagedAppend, CayenneTableProvider, CayenneTableProviderBuilder,

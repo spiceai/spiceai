@@ -3454,6 +3454,7 @@ dependencies = [
  "datafusion-physical-expr",
  "datafusion-physical-plan",
  "datafusion-table-providers",
+ "flatbuffers",
  "futures",
  "hash-index",
  "insta",

@@ -14,14 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::time::SystemTime;
-use std::{collections::HashMap, sync::Arc};
+//! Partition metadata wrappers backed by [`ClusterStateStore`].
+//!
+//! The cluster's accelerated and catalog/federated partition metadata
+//! both live as submaps inside the single `cluster.json` document. This
+//! module exposes a [`PartitionManager`] type parameterised by
+//! [`PartitionScope`] so that call sites get a typed, scope-specific
+//! handle (`AccelerationsPartitions` / `CatalogPartitions`) without
+//! duplicating method bodies. Both type aliases point at the same
+//! struct; the only difference is the scope passed at construction.
+
+use std::sync::Arc;
+use std::{collections::HashMap, time::SystemTime};
 
 use datafusion::sql::TableReference;
-use object_store::ObjectStore;
-use object_store_occ::{InsertResult, ObjectState, WriteResult};
 use snafu::prelude::*;
 
+use crate::cluster::cluster_state::{
+    ClusterStateStore, MutateError, MutateOk, MutationOutcome, PartitionScope,
+};
 use crate::cluster::partition::metadata::PartitionValue;
 
 use super::metadata::{PartitionMetadata, TablePartitionMetadata, normalized_table_name};
@@ -29,10 +40,7 @@ use super::metadata::{PartitionMetadata, TablePartitionMetadata, normalized_tabl
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to access partition metadata for table {table}: {source}"))]
-    MetadataAccess {
-        table: String,
-        source: object_store_occ::Error,
-    },
+    MetadataAccess { table: String, source: MutateError },
 
     #[snafu(display("Failed to get current time: {source}"))]
     SystemTime { source: std::time::SystemTimeError },
@@ -48,17 +56,6 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-static PARTITION_PREFIX: &str = "accelerations/partitions/";
-
-/// Manages partition metadata for accelerated tables in object storage.
-///
-/// Uses optimistic concurrency control to safely coordinate partition assignments
-/// across multiple schedulers without locks.
-#[derive(Debug)]
-pub struct PartitionManager {
-    state: ObjectState<TablePartitionMetadata>,
-}
 
 /// Result of copying partition assignments from one table to another.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,21 +91,58 @@ impl AllocationResult {
     }
 }
 
+/// A single (table, partition, executor) assignment, used by the
+/// batched [`PartitionManager::apply_assignments`] API.
+#[derive(Debug, Clone)]
+pub struct AssignmentRequest {
+    pub table: TableReference,
+    pub partition_value: PartitionValue,
+    pub executor_id: String,
+}
+
+/// Partition metadata manager bound to one [`PartitionScope`] of the
+/// shared cluster document.
+///
+/// Construct via [`PartitionManager::accelerations`] or
+/// [`PartitionManager::catalog`] (or via the [`AccelerationsPartitions`]
+/// / [`CatalogPartitions`] type aliases for clarity at call sites).
+#[derive(Debug, Clone)]
+pub struct PartitionManager {
+    cluster: Arc<ClusterStateStore>,
+    scope: PartitionScope,
+}
+
+/// Type alias used at scheduler/executor wiring sites for clarity.
+pub type AccelerationsPartitions = PartitionManager;
+/// Type alias used at scheduler/executor wiring sites for clarity.
+pub type CatalogPartitions = PartitionManager;
+
 impl PartitionManager {
-    /// Creates a new partition manager with the given object store.
-    ///
-    /// All partition metadata will be stored under the "partitions/" prefix.
     #[must_use]
-    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self {
-            state: ObjectState::new(store).with_prefix(PARTITION_PREFIX),
-        }
+    pub fn new(cluster: Arc<ClusterStateStore>, scope: PartitionScope) -> Self {
+        Self { cluster, scope }
+    }
+
+    /// Convenience constructor for the acceleration scope.
+    #[must_use]
+    pub fn accelerations(cluster: Arc<ClusterStateStore>) -> Self {
+        Self::new(cluster, PartitionScope::Acceleration)
+    }
+
+    /// Convenience constructor for the catalog/federated scope.
+    #[must_use]
+    pub fn catalog(cluster: Arc<ClusterStateStore>) -> Self {
+        Self::new(cluster, PartitionScope::Catalog)
     }
 
     #[must_use]
-    pub fn with_prefix(mut self, prefix: &str) -> Self {
-        self.state = self.state.with_prefix(prefix);
-        self
+    pub fn scope(&self) -> PartitionScope {
+        self.scope
+    }
+
+    #[must_use]
+    pub fn cluster_state(&self) -> &Arc<ClusterStateStore> {
+        &self.cluster
     }
 
     /// Get partition metadata for a table from object store.
@@ -117,79 +151,113 @@ impl PartitionManager {
         table: &TableReference,
     ) -> Result<Option<TablePartitionMetadata>> {
         let key = normalized_table_name(table);
-        self.state
-            .get(&key)
+        let snap = self
+            .cluster
+            .read()
             .await
-            .context(MetadataAccessSnafu { table: key })
+            .context(MetadataAccessSnafu { table: key.clone() })?;
+        Ok(self.scope.map(&snap).get(&key).cloned())
     }
 
-    /// Get partition metadata from local cache (may be stale).
+    /// Get partition metadata from the most recent in-memory snapshot.
+    /// Cheap; no IO; never returns stale-deletes (snapshot is whole-doc).
     #[must_use]
     pub fn get_cached_table_metadata(
         &self,
         table: &TableReference,
     ) -> Option<TablePartitionMetadata> {
         let key = normalized_table_name(table);
-        self.state.get_cached(&key)
+        let snap = self.cluster.read_cached()?;
+        self.scope.map(&snap).get(&key).cloned()
     }
 
     /// Initialize partition metadata for a table with the given partition expression SQL strings.
     ///
-    /// If the file already exists, this is a no-op and returns `Ok(false)`.
+    /// Returns `Ok(true)` if a new entry was created, `Ok(false)` if one already existed.
     pub async fn initialize_metadata(
         &self,
         table: &TableReference,
         partition_expressions: Vec<String>,
     ) -> Result<bool> {
-        // If its cached, can avoid insert operation. Optimisation to reduce object store calls.
         if self.get_cached_table_metadata(table).is_some() {
             return Ok(false);
         }
+
         let key = normalized_table_name(table);
         let now_ms = now_ms()?;
         let metadata = TablePartitionMetadata::new(table, now_ms, partition_expressions);
-
-        match self
-            .state
-            .insert(&key, &metadata)
+        let scope = self.scope;
+        let key_for_closure = key.clone();
+        let metadata_for_closure = metadata.clone();
+        let mut created = false;
+        let res = self
+            .cluster
+            .mutate(|state| {
+                let map = scope.map_mut(state);
+                if map.contains_key(&key_for_closure) {
+                    created = false;
+                    MutationOutcome::NoChange
+                } else {
+                    map.insert(key_for_closure.clone(), metadata_for_closure.clone());
+                    created = true;
+                    MutationOutcome::Apply
+                }
+            })
             .await
-            .context(MetadataAccessSnafu { table: key.clone() })?
-        {
-            InsertResult::Ok => Ok(true),
-            InsertResult::AlreadyExists => Ok(false),
+            .context(MetadataAccessSnafu { table: key.clone() })?;
+        match res {
+            MutateOk::Committed => Ok(created),
+            MutateOk::AlreadySatisfied => Ok(false),
         }
     }
 
     /// Update partition metadata with discovered partitions, all marked as unassigned.
-    ///
-    /// This replaces the partitions list with the provided partition values.
-    /// If `partition_expressions` is non-empty, it also sets the SQL expression strings
-    /// (only when currently empty, to avoid overwriting values set during table creation).
     pub async fn set_unassigned_partitions(
         &self,
         table: &TableReference,
         partition_values: Vec<HashMap<String, String>>,
         partition_expressions: Vec<String>,
     ) -> Result<()> {
-        let now_ms = now_ms()?;
-
-        let mut metadata = self
-            .get_table_metadata(table)
-            .await?
-            .unwrap_or_else(|| TablePartitionMetadata::new(table, now_ms, partition_expressions));
-
-        metadata.partitions = partition_values
-            .into_iter()
-            .map(PartitionMetadata::new)
-            .collect();
-        metadata.updated_at = now_ms;
-
-        self.write_metadata(table, metadata).await
+        let key = normalized_table_name(table);
+        let scope = self.scope;
+        let table_clone = table.clone();
+        self.cluster
+            .mutate(|state| {
+                let now_ms = match crate::cluster::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                let map = scope.map_mut(state);
+                let entry = map.entry(key.clone()).or_insert_with(|| {
+                    TablePartitionMetadata::new(&table_clone, now_ms, partition_expressions.clone())
+                });
+                if entry.partition_expressions.is_empty() && !partition_expressions.is_empty() {
+                    entry
+                        .partition_expressions
+                        .clone_from(&partition_expressions);
+                }
+                entry.partitions = partition_values
+                    .iter()
+                    .cloned()
+                    .map(PartitionMetadata::new)
+                    .collect();
+                entry.updated_at = now_ms;
+                MutationOutcome::Apply
+            })
+            .await
+            .map_err(|e| match e {
+                MutateError::ConcurrentModification { .. } => {
+                    Error::ConcurrentModification { table: key }
+                }
+                other => Error::MetadataAccess {
+                    table: key,
+                    source: other,
+                },
+            })?;
+        Ok(())
     }
 
     /// Allocates unassigned partitions to an executor.
-    ///
-    /// Uses OCC to atomically update metadata.
     pub async fn allocate_partitions(
         &self,
         table: &TableReference,
@@ -197,137 +265,206 @@ impl PartitionManager {
         limit: usize,
     ) -> Result<AllocationResult> {
         let key = normalized_table_name(table);
-        let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
-            .max_retries(Some(5))
-            .build();
+        let scope = self.scope;
 
-        loop {
-            let now_ms = now_ms()?;
-            let mut metadata = self
-                .get_table_metadata(table)
-                .await?
-                .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
+        let mut captured: Option<AllocationResult> = None;
+        let executor = executor_id.to_string();
+        let key_for_err = key.clone();
+        let res = self
+            .cluster
+            .mutate(|state| {
+                let now_ms = match crate::cluster::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                let map = scope.map_mut(state);
+                let Some(metadata) = map.get_mut(&key) else {
+                    return MutationOutcome::Abort(MutateError::Conflict {
+                        message: format!("no partition metadata for table {key}"),
+                    });
+                };
 
-            let mut result = AllocationResult {
-                newly_assigned: vec![],
-                previously_assigned: metadata
+                let previously_assigned: Vec<PartitionValue> = metadata
                     .partitions
                     .iter()
-                    .filter_map(|p| {
-                        if p.is_assigned_to(executor_id) {
-                            Some(p.partition_value.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect(),
-            };
-            let mut changes = false;
-
-            for partition in &mut metadata.partitions {
-                if result.count() >= limit {
-                    break;
-                }
-
-                if !partition.is_assigned() {
-                    partition.assign_to(executor_id.to_string(), now_ms);
-                    result
-                        .newly_assigned
-                        .push(partition.partition_value.clone());
-                    changes = true;
-                }
-            }
-
-            if !changes {
-                return Ok(result);
-            }
-
-            metadata.updated_at = now_ms;
-
-            match self.write_metadata(table, metadata).await {
-                Ok(()) => return Ok(result),
-                Err(Error::ConcurrentModification { .. }) => {
-                    if let Some(delay) = backoff.next_duration() {
-                        tokio::time::sleep(delay).await;
-                        continue;
+                    .filter(|p| p.is_assigned_to(&executor))
+                    .map(|p| p.partition_value.clone())
+                    .collect();
+                let mut newly_assigned: Vec<PartitionValue> = Vec::new();
+                let mut total = previously_assigned.len();
+                let mut changes = false;
+                for partition in &mut metadata.partitions {
+                    if total >= limit {
+                        break;
                     }
-                    return Err(Error::ConcurrentModification { table: key.clone() });
+                    if !partition.is_assigned() {
+                        partition.assign_to(executor.clone(), now_ms);
+                        newly_assigned.push(partition.partition_value.clone());
+                        total += 1;
+                        changes = true;
+                    }
                 }
-                Err(e) => return Err(e),
-            }
-        }
+
+                let result = AllocationResult {
+                    previously_assigned,
+                    newly_assigned,
+                };
+                captured = Some(result);
+
+                if changes {
+                    metadata.updated_at = now_ms;
+                    MutationOutcome::Apply
+                } else {
+                    MutationOutcome::NoChange
+                }
+            })
+            .await
+            .map_err(|e| match e {
+                MutateError::ConcurrentModification { .. } => Error::ConcurrentModification {
+                    table: key_for_err.clone(),
+                },
+                MutateError::Conflict { message } if message.contains("no partition metadata") => {
+                    Error::TableMetadataNotFound {
+                        table: key_for_err.clone(),
+                    }
+                }
+                other => Error::MetadataAccess {
+                    table: key_for_err.clone(),
+                    source: other,
+                },
+            })?;
+
+        let _ = res;
+        captured.ok_or_else(|| Error::TableMetadataNotFound { table: key_for_err })
     }
 
-    /// Assigns a partition to an executor in the metadata store.
+    /// Assigns a single partition to an executor. Most callers should
+    /// prefer [`Self::apply_assignments`] for batching.
     pub async fn assign_partition(
         &self,
         table: &TableReference,
         partition_value: &PartitionValue,
         executor_id: &str,
     ) -> Result<()> {
-        let key = normalized_table_name(table);
-        let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
-            .max_retries(Some(5))
-            .build();
+        let assignments = vec![AssignmentRequest {
+            table: table.clone(),
+            partition_value: partition_value.clone(),
+            executor_id: executor_id.to_string(),
+        }];
+        let mut not_found: Option<(String, String)> = None;
+        self.apply_assignments_inner(&assignments, &mut not_found)
+            .await?;
+        if let Some((tbl, part)) = not_found {
+            return Err(Error::PartitionNotFound {
+                table: tbl,
+                partition: part,
+            });
+        }
+        Ok(())
+    }
 
-        loop {
-            let now_ms = now_ms()?;
-            let mut metadata = self
-                .get_table_metadata(table)
-                .await?
-                .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
+    /// Atomically apply many `(table, partition, executor)` assignments
+    /// in a single cluster-document write. Existing assignments to the
+    /// same `(table, partition)` are overwritten with the new executor.
+    /// Partition rows that don't yet exist are created so that callers
+    /// can use this both for "first-time assignment" and "reassign".
+    pub async fn apply_assignments(&self, assignments: &[AssignmentRequest]) -> Result<()> {
+        let mut not_found: Option<(String, String)> = None;
+        self.apply_assignments_inner(assignments, &mut not_found)
+            .await
+    }
 
-            let mut updated = false;
-            for partition in &mut metadata.partitions {
-                if partition.partition_value == *partition_value {
-                    partition.assign_to(executor_id.to_string(), now_ms);
-                    updated = true;
-                    break;
-                }
-            }
+    async fn apply_assignments_inner(
+        &self,
+        assignments: &[AssignmentRequest],
+        not_found_out: &mut Option<(String, String)>,
+    ) -> Result<()> {
+        if assignments.is_empty() {
+            return Ok(());
+        }
+        let scope = self.scope;
+        let assignments_owned: Vec<_> = assignments.to_vec();
+        // Captured by the mutator on the failure path so the surfaced
+        // error can name the exact table (and partition) that broke the
+        // batch instead of guessing from `assignments[0]`.
+        let mut missing_key: Option<(String, String)> = None;
 
-            if !updated {
-                return Err(Error::PartitionNotFound {
-                    table: key.clone(),
-                    partition: format!("{partition_value:?}"),
-                });
-            }
-
-            metadata.updated_at = now_ms;
-
-            match self.write_metadata(table, metadata).await {
-                Ok(()) => return Ok(()),
-                Err(Error::ConcurrentModification { .. }) => {
-                    if let Some(delay) = backoff.next_duration() {
-                        tokio::time::sleep(delay).await;
-                        continue;
+        let res = self
+            .cluster
+            .mutate(|state| {
+                let now_ms = match crate::cluster::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                let map = scope.map_mut(state);
+                let mut changes = false;
+                for assignment in &assignments_owned {
+                    let key = normalized_table_name(&assignment.table);
+                    let Some(metadata) = map.get_mut(&key) else {
+                        missing_key =
+                            Some((key.clone(), format!("{:?}", assignment.partition_value)));
+                        return MutationOutcome::Abort(MutateError::Conflict {
+                            message: format!("no partition metadata for table {key}"),
+                        });
+                    };
+                    if let Some(partition) = metadata
+                        .partitions
+                        .iter_mut()
+                        .find(|p| p.partition_value == assignment.partition_value)
+                    {
+                        if !partition.is_assigned_to(&assignment.executor_id) {
+                            partition.assigned_executors.clear();
+                            partition.assign_to(assignment.executor_id.clone(), now_ms);
+                            changes = true;
+                        }
+                    } else {
+                        let mut p = PartitionMetadata::new(assignment.partition_value.clone());
+                        p.assign_to(assignment.executor_id.clone(), now_ms);
+                        metadata.add_partition(p);
+                        changes = true;
                     }
-                    return Err(Error::ConcurrentModification { table: key.clone() });
+                    metadata.updated_at = now_ms;
                 }
-                Err(e) => return Err(e),
+                if changes {
+                    MutationOutcome::Apply
+                } else {
+                    MutationOutcome::NoChange
+                }
+            })
+            .await;
+
+        match res {
+            Ok(_) => Ok(()),
+            Err(MutateError::ConcurrentModification { .. }) => {
+                let table = missing_key
+                    .as_ref()
+                    .map(|(t, _)| t.clone())
+                    .or_else(|| assignments.first().map(|a| normalized_table_name(&a.table)))
+                    .unwrap_or_default();
+                Err(Error::ConcurrentModification { table })
             }
+            Err(MutateError::Conflict { .. }) => {
+                if let Some((tbl, part)) = missing_key {
+                    *not_found_out = Some((tbl.clone(), part));
+                    Err(Error::TableMetadataNotFound { table: tbl })
+                } else {
+                    Err(Error::MetadataAccess {
+                        table: String::from("<batch>"),
+                        source: MutateError::Conflict {
+                            message: "unexpected conflict from mutator".to_string(),
+                        },
+                    })
+                }
+            }
+            Err(other) => Err(Error::MetadataAccess {
+                table: missing_key.map_or_else(|| String::from("<batch>"), |(t, _)| t),
+                source: other,
+            }),
         }
     }
 
-    /// List all tables with partition metadata.
-    pub async fn list_tables(&self) -> Result<Vec<String>> {
-        self.state.list_keys().await.context(MetadataAccessSnafu {
-            table: String::from("<list>"),
-        })
-    }
-
-    /// Refresh the local cache from object store.
-    pub async fn refresh(&self) -> Result<()> {
-        self.state.refresh().await.context(MetadataAccessSnafu {
-            table: String::from("<refresh>"),
-        })
-    }
-
-    /// Adds new partitions to a table's metadata and assigns each to its
-    /// respective executor in a single OCC write. If a partition already exists,
-    /// it is assigned (or left as-is if already assigned to the same executor).
-    ///
-    /// `assignments` is a list of (`partition_value`, `executor_id`) tuples.
+    /// Adds new partitions to a table's metadata and assigns each to
+    /// its respective executor in a single OCC write.
     pub async fn add_and_assign_partitions(
         &self,
         table: &TableReference,
@@ -336,116 +473,124 @@ impl PartitionManager {
         if assignments.is_empty() {
             return Ok(());
         }
-
-        let key = normalized_table_name(table);
-        let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
-            .max_retries(Some(5))
-            .build();
-
-        loop {
-            let now_ms = now_ms()?;
-            let mut metadata = self
-                .get_table_metadata(table)
-                .await?
-                .ok_or_else(|| Error::TableMetadataNotFound { table: key.clone() })?;
-
-            let mut changes = false;
-
-            for &(partition_value, executor_id) in assignments {
-                let existing = metadata
-                    .partitions
-                    .iter_mut()
-                    .find(|p| p.partition_value == *partition_value);
-
-                if let Some(p) = existing {
-                    if !p.is_assigned_to(executor_id) {
-                        p.assign_to(executor_id.to_string(), now_ms);
-                        changes = true;
-                    }
-                } else {
-                    let mut new_partition = PartitionMetadata::new(partition_value.clone());
-                    new_partition.assign_to(executor_id.to_string(), now_ms);
-                    metadata.add_partition(new_partition);
-                    changes = true;
-                }
-            }
-
-            if !changes {
-                return Ok(());
-            }
-
-            metadata.updated_at = now_ms;
-
-            match self.write_metadata(table, metadata).await {
-                Ok(()) => return Ok(()),
-                Err(Error::ConcurrentModification { .. }) => {
-                    if let Some(delay) = backoff.next_duration() {
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    return Err(Error::ConcurrentModification { table: key.clone() });
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    /// Copy partition-to-executor assignments from one table to another.
-    ///
-    /// Creates (or overwrites) the target table's metadata with the same
-    /// partition expressions, partition values, and executor assignments
-    /// as the source table. This ensures `DoPut` write-through routes data
-    /// to the same executors for both tables.
-    ///
-    /// If the source table has no partition metadata, this is a no-op because
-    /// the source exists but is unpartitioned and there is nothing to copy.
-    pub async fn copy_assignments(
-        &self,
-        source_table: &TableReference,
-        target_table: &TableReference,
-    ) -> Result<CopyAssignmentsResult> {
-        let Some(source_metadata) = self.get_table_metadata(source_table).await? else {
-            return Ok(CopyAssignmentsResult::NoSourceMetadata);
-        };
-
-        let assigned_count = source_metadata
-            .partitions
+        let requests: Vec<AssignmentRequest> = assignments
             .iter()
-            .filter(|p| p.is_assigned())
-            .count();
-
-        let now_ms = now_ms()?;
-        let mut target_metadata = source_metadata;
-        target_metadata.table_name = normalized_table_name(target_table);
-        target_metadata.updated_at = now_ms;
-
-        self.write_metadata(target_table, target_metadata).await?;
-
-        if assigned_count == 0 {
-            Ok(CopyAssignmentsResult::NoAssignments)
-        } else {
-            Ok(CopyAssignmentsResult::Copied {
-                partition_count: assigned_count,
+            .map(|(pv, executor)| AssignmentRequest {
+                table: table.clone(),
+                partition_value: (*pv).clone(),
+                executor_id: (*executor).to_string(),
             })
-        }
+            .collect();
+        self.apply_assignments(&requests).await
     }
 
-    /// Write metadata using `insert_or_update` with conflict handling.
-    pub(crate) async fn write_metadata(
+    /// Replace this table's metadata wholesale (atomic OCC write). Used
+    /// by callers that compute the new metadata externally and just need
+    /// to persist it.
+    pub async fn write_metadata(
         &self,
         table: &TableReference,
         metadata: TablePartitionMetadata,
     ) -> Result<()> {
         let key = normalized_table_name(table);
-        match self
-            .state
-            .insert_or_update(&key, &metadata)
+        let scope = self.scope;
+        let key_for_err = key.clone();
+        self.cluster
+            .mutate(|state| {
+                let map = scope.map_mut(state);
+                map.insert(key.clone(), metadata.clone());
+                MutationOutcome::Apply
+            })
             .await
-            .context(MetadataAccessSnafu { table: key.clone() })?
-        {
-            WriteResult::Inserted | WriteResult::Updated => Ok(()),
-            WriteResult::Conflict { .. } => Err(Error::ConcurrentModification { table: key }),
+            .map_err(|e| match e {
+                MutateError::ConcurrentModification { .. } => {
+                    Error::ConcurrentModification { table: key_for_err }
+                }
+                other => Error::MetadataAccess {
+                    table: key_for_err,
+                    source: other,
+                },
+            })?;
+        Ok(())
+    }
+
+    /// List all tables (in this scope) with partition metadata.
+    pub async fn list_tables(&self) -> Result<Vec<String>> {
+        match self.cluster.read().await {
+            Ok(snap) => Ok(self.scope.map(&snap).keys().cloned().collect()),
+            Err(MutateError::ClusterDocMissing { .. }) => Ok(Vec::new()),
+            Err(other) => Err(Error::MetadataAccess {
+                table: String::from("<list>"),
+                source: other,
+            }),
         }
+    }
+
+    /// Refresh the local cache from object store.
+    pub async fn refresh(&self) -> Result<()> {
+        match self.cluster.read().await {
+            Ok(_) | Err(MutateError::ClusterDocMissing { .. }) => Ok(()),
+            Err(other) => Err(Error::MetadataAccess {
+                table: String::from("<refresh>"),
+                source: other,
+            }),
+        }
+    }
+
+    /// Copy partition assignments from one table to another atomically
+    /// (read + write happen inside a single OCC mutation).
+    pub async fn copy_assignments(
+        &self,
+        source_table: &TableReference,
+        target_table: &TableReference,
+    ) -> Result<CopyAssignmentsResult> {
+        let scope = self.scope;
+        let source_key = normalized_table_name(source_table);
+        let target_key = normalized_table_name(target_table);
+
+        let mut outcome: Option<CopyAssignmentsResult> = None;
+        let res = self
+            .cluster
+            .mutate(|state| {
+                let now_ms = match crate::cluster::cluster_state::now_ms() {
+                    Ok(v) => u128::from(v),
+                    Err(e) => return MutationOutcome::Abort(e),
+                };
+                let map = scope.map_mut(state);
+                let Some(source_meta) = map.get(&source_key).cloned() else {
+                    outcome = Some(CopyAssignmentsResult::NoSourceMetadata);
+                    return MutationOutcome::NoChange;
+                };
+                let assigned_count = source_meta
+                    .partitions
+                    .iter()
+                    .filter(|p| p.is_assigned())
+                    .count();
+                let mut target_meta = source_meta;
+                target_meta.table_name.clone_from(&target_key);
+                target_meta.updated_at = now_ms;
+                map.insert(target_key.clone(), target_meta);
+                outcome = Some(if assigned_count == 0 {
+                    CopyAssignmentsResult::NoAssignments
+                } else {
+                    CopyAssignmentsResult::Copied {
+                        partition_count: assigned_count,
+                    }
+                });
+                MutationOutcome::Apply
+            })
+            .await
+            .map_err(|e| match e {
+                MutateError::ConcurrentModification { .. } => Error::ConcurrentModification {
+                    table: target_key.clone(),
+                },
+                other => Error::MetadataAccess {
+                    table: target_key.clone(),
+                    source: other,
+                },
+            })?;
+        let _ = res;
+        Ok(outcome.unwrap_or(CopyAssignmentsResult::NoSourceMetadata))
     }
 }
 
@@ -460,25 +605,28 @@ fn now_ms() -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::cluster_state::ClusterStateStore;
     use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+    use object_store::ObjectStore;
     use object_store::memory::InMemory;
 
-    fn test_manager() -> PartitionManager {
-        PartitionManager::new(Arc::new(InMemory::new())).with_prefix("test/")
+    async fn test_manager() -> PartitionManager {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cs = Arc::new(ClusterStateStore::new(store, ""));
+        cs.bootstrap().await.expect("bootstrap");
+        PartitionManager::accelerations(cs)
     }
 
     #[tokio::test]
     async fn copy_assignments_copies_metadata() {
-        let pm = test_manager();
+        let pm = test_manager().await;
         let source = TableReference::parse_str("catalog.schema.source");
         let target = TableReference::parse_str("catalog.schema.target");
 
-        // Initialize source with partition expressions
         pm.initialize_metadata(&source, vec!["region".to_string()])
             .await
             .expect("should initialize");
 
-        // Add a partition and assign it
         let pv = HashMap::from([("region".to_string(), "us-east-1".to_string())]);
         pm.set_unassigned_partitions(&source, vec![pv], vec![])
             .await
@@ -489,14 +637,12 @@ mod tests {
             .await
             .expect("should assign");
 
-        // Copy assignments
         let result = pm
             .copy_assignments(&source, &target)
             .await
             .expect("should copy");
         assert_eq!(result, CopyAssignmentsResult::Copied { partition_count: 1 });
 
-        // Verify target has the same metadata
         let target_meta = pm
             .get_table_metadata(&target)
             .await
@@ -514,29 +660,26 @@ mod tests {
 
     #[tokio::test]
     async fn copy_assignments_noop_when_source_missing() {
-        let pm = test_manager();
+        let pm = test_manager().await;
         let source = TableReference::parse_str("catalog.schema.missing");
         let target = TableReference::parse_str("catalog.schema.target");
 
-        // Missing source metadata is a no-op (source exists but is unpartitioned).
         let result = pm
             .copy_assignments(&source, &target)
             .await
             .expect("should be a no-op for missing source metadata");
         assert_eq!(result, CopyAssignmentsResult::NoSourceMetadata);
 
-        // Target should have no metadata since nothing was copied.
         let target_meta = pm.get_table_metadata(&target).await.expect("should get");
         assert!(target_meta.is_none());
     }
 
     #[tokio::test]
     async fn copy_assignments_overwrites_existing_target() {
-        let pm = test_manager();
+        let pm = test_manager().await;
         let source = TableReference::parse_str("catalog.schema.source");
         let target = TableReference::parse_str("catalog.schema.target");
 
-        // Initialize both
         pm.initialize_metadata(&source, vec!["region".to_string()])
             .await
             .expect("should initialize source");
@@ -544,13 +687,11 @@ mod tests {
             .await
             .expect("should initialize target");
 
-        // Add partition to source
         let pv = HashMap::from([("region".to_string(), "eu-west-1".to_string())]);
         pm.set_unassigned_partitions(&source, vec![pv], vec![])
             .await
             .expect("should set partitions");
 
-        // Copy should overwrite target
         let result = pm
             .copy_assignments(&source, &target)
             .await
@@ -577,20 +718,14 @@ mod tests {
         let partial = TableReference::partial(SPICE_DEFAULT_SCHEMA, "my_table");
         let full = TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "my_table");
 
-        assert_eq!(
-            normalized_table_name(&bare),
-            normalized_table_name(&full),
-            "bare and full should produce the same key"
-        );
+        assert_eq!(normalized_table_name(&bare), normalized_table_name(&full));
         assert_eq!(
             normalized_table_name(&partial),
-            normalized_table_name(&full),
-            "partial and full should produce the same key"
+            normalized_table_name(&full)
         );
         assert_eq!(
             normalized_table_name(&bare),
-            normalized_table_name(&partial),
-            "bare and partial should produce the same key"
+            normalized_table_name(&partial)
         );
     }
 
@@ -613,22 +748,19 @@ mod tests {
 
     #[tokio::test]
     async fn fully_qualified_and_bare_resolve_to_same_partition() {
-        let pm = test_manager();
+        let pm = test_manager().await;
         let bare = TableReference::bare("my_table");
         let full = TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "my_table");
 
-        // Initialize with bare name
         pm.initialize_metadata(&bare, vec!["org_id".to_string()])
             .await
             .expect("should initialize");
 
-        // Set partitions using bare name
         let pv = HashMap::from([("org_id".to_string(), "test_org_name".to_string())]);
         pm.set_unassigned_partitions(&bare, vec![pv], vec![])
             .await
             .expect("should set partitions");
 
-        // Look up using fully qualified name — should find the same metadata
         let meta_via_full = pm
             .get_table_metadata(&full)
             .await
@@ -637,14 +769,12 @@ mod tests {
 
         assert_eq!(meta_via_full.partitions.len(), 1);
 
-        // Assign using fully qualified name
         let partition_value: PartitionValue =
             HashMap::from([("org_id".to_string(), "test_org_name".to_string())]);
         pm.assign_partition(&full, &partition_value, "executor-1")
             .await
             .expect("should assign via fully qualified ref");
 
-        // Verify assignment is visible via bare name
         let meta_via_bare = pm
             .get_table_metadata(&bare)
             .await
@@ -652,5 +782,63 @@ mod tests {
             .expect("bare lookup should see assignment made with fully qualified name");
 
         assert!(meta_via_bare.partitions[0].is_assigned_to("executor-1"));
+    }
+
+    #[tokio::test]
+    async fn acceleration_and_catalog_share_no_state() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cs = Arc::new(ClusterStateStore::new(store, ""));
+        cs.bootstrap().await.expect("bootstrap");
+        let acc = PartitionManager::accelerations(Arc::clone(&cs));
+        let cat = PartitionManager::catalog(Arc::clone(&cs));
+        let table = TableReference::bare("t");
+
+        acc.initialize_metadata(&table, vec!["region".to_string()])
+            .await
+            .expect("init");
+        let pv = HashMap::from([("region".to_string(), "us-east-1".to_string())]);
+        acc.set_unassigned_partitions(&table, vec![pv.clone()], vec![])
+            .await
+            .expect("set");
+        acc.assign_partition(&table, &pv, "exec-1")
+            .await
+            .expect("assign");
+
+        // Catalog scope should not see the acceleration assignment.
+        assert!(cat.get_table_metadata(&table).await.expect("get").is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_assignments_writes_once_for_many_partitions() {
+        let pm = test_manager().await;
+        let table = TableReference::bare("t");
+        pm.initialize_metadata(&table, vec!["region".to_string()])
+            .await
+            .expect("init");
+        let values: Vec<HashMap<String, String>> = (0..50)
+            .map(|i| HashMap::from([("region".to_string(), format!("r-{i}"))]))
+            .collect();
+        pm.set_unassigned_partitions(&table, values.clone(), vec![])
+            .await
+            .expect("set");
+
+        let requests: Vec<AssignmentRequest> = values
+            .iter()
+            .map(|pv| AssignmentRequest {
+                table: table.clone(),
+                partition_value: pv.clone(),
+                executor_id: "exec-1".to_string(),
+            })
+            .collect();
+        pm.apply_assignments(&requests).await.expect("apply");
+
+        let meta = pm
+            .get_table_metadata(&table)
+            .await
+            .expect("get")
+            .expect("present");
+        for p in meta.partitions {
+            assert!(p.is_assigned_to("exec-1"));
+        }
     }
 }
