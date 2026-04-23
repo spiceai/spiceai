@@ -174,7 +174,7 @@ async fn sharepoint_csv_round_trip() -> Result<(), anyhow::Error> {
             use data_components::sharepoint::object_store::{
                 SharepointObjectStore, SharepointObjectStoreConfig,
             };
-            use object_store::{ObjectStore, path::Path};
+            use object_store::ObjectStore;
             use secrecy::SecretString;
 
             let auth = SharepointAuth::ClientCredentials {
@@ -270,7 +270,7 @@ async fn sharepoint_parquet_copy_to() -> Result<(), anyhow::Error> {
             use data_components::sharepoint::object_store::{
                 SharepointObjectStore, SharepointObjectStoreConfig,
             };
-            use object_store::{ObjectStore, path::Path};
+            use object_store::ObjectStore;
             use secrecy::SecretString;
 
             let auth = SharepointAuth::ClientCredentials {

@@ -168,12 +168,32 @@ impl ObjectStore for SharepointObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> ObjectStoreResult<PutResult> {
+        // `PutMode::Update(expected)` is a conditional write — verify the
+        // current object still matches `expected` before overwriting.
+        // graph-http's cross-crate `http` types make setting `If-Match`
+        // on the PUT awkward, so we do a head-then-put check. Small TOCTOU
+        // window is acceptable for the typical acceleration-writer use case.
+        if let PutMode::Update(expected) = &opts.mode {
+            let current = head_drive_item(&self.client, &self.drive, location).await?;
+            let e_tag_matches = expected.e_tag.is_none() || expected.e_tag == current.e_tag;
+            let version_matches = expected.version.is_none() || expected.version == current.version;
+            if !(e_tag_matches && version_matches) {
+                return Err(object_store::Error::Precondition {
+                    path: location.to_string(),
+                    source: format!(
+                        "object changed: expected e_tag={:?} version={:?}, current e_tag={:?} version={:?}",
+                        expected.e_tag, expected.version, current.e_tag, current.version
+                    )
+                    .into(),
+                });
+            }
+        }
+
         let bytes = payload_to_bytes(&payload);
 
         let effective_conflict = match opts.mode {
             PutMode::Create => ConflictBehavior::Fail,
-            PutMode::Overwrite => ConflictBehavior::Replace,
-            PutMode::Update(_) => self.config.conflict_behavior,
+            PutMode::Overwrite | PutMode::Update(_) => ConflictBehavior::Replace,
         };
 
         let result = if bytes.len() <= INLINE_PUT_THRESHOLD {

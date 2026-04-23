@@ -48,7 +48,7 @@ Optional:
 - `redirect_uri` — required for `auth_code`.
 
 The flow is inferred automatically from which auth param is set. Providing
-more than one auth credential yields an `InvalidAuthentication` error.
+more than one auth credential yields a `DuplicateAuthentication` error.
 
 ### Required Microsoft Graph scopes
 
