@@ -38,7 +38,7 @@ limitations under the License.
 //! and clean up after themselves. Each file name is unique-per-run to avoid
 //! collisions.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use app::AppBuilder;
 use futures::StreamExt;
@@ -187,12 +187,15 @@ async fn sharepoint_csv_round_trip() -> Result<(), anyhow::Error> {
                 .build_graph_client()
                 .await
                 .map_err(|e| anyhow::anyhow!("build_graph_client: {e}"))?;
-            let store = SharepointObjectStore::new(client, SharepointObjectStoreConfig::default());
-            let (_, authority_and_path) = uri
-                .split_once("://")
-                .ok_or_else(|| anyhow::anyhow!("malformed test uri"))?;
+            let parsed = data_components::sharepoint::url::SharepointUrl::parse(&uri)
+                .map_err(|e| anyhow::anyhow!("parse test uri: {e}"))?;
+            let store = SharepointObjectStore::new(
+                client,
+                parsed.drive,
+                SharepointObjectStoreConfig::default(),
+            );
             store
-                .delete(&Path::from(authority_and_path))
+                .delete(&parsed.item_path)
                 .await
                 .map_err(|e| anyhow::anyhow!("cleanup delete: {e}"))?;
             Ok(())
@@ -216,12 +219,9 @@ async fn sharepoint_parquet_copy_to() -> Result<(), anyhow::Error> {
             let file = unique_filename("parquet");
             let uri = cfg.dataset_uri(&file);
 
-            // Seed dataset that provides rows for COPY TO.
-            let mut seed = Dataset::new("memtable://seed", "sp_seed");
-            let mut params = HashMap::new();
-            params.insert("mode".to_string(), "memory".to_string());
-            seed.params = Some(Params::from_string_map(params));
-
+            // `COPY (SELECT ...) TO '<sharepoint://...>' (FORMAT parquet)`
+            // writes via the registered SharepointObjectStore; the target
+            // dataset lets us read it back after the COPY completes.
             let mut target = Dataset::new(uri.clone(), "sp_target");
             target.params = Some(cfg.to_params("parquet"));
 
@@ -283,11 +283,14 @@ async fn sharepoint_parquet_copy_to() -> Result<(), anyhow::Error> {
                 .build_graph_client()
                 .await
                 .map_err(|e| anyhow::anyhow!("build_graph_client: {e}"))?;
-            let store = SharepointObjectStore::new(client, SharepointObjectStoreConfig::default());
-            let (_, authority_and_path) = uri
-                .split_once("://")
-                .ok_or_else(|| anyhow::anyhow!("malformed test uri"))?;
-            let _ = store.delete(&Path::from(authority_and_path)).await;
+            let parsed = data_components::sharepoint::url::SharepointUrl::parse(&uri)
+                .map_err(|e| anyhow::anyhow!("parse test uri: {e}"))?;
+            let store = SharepointObjectStore::new(
+                client,
+                parsed.drive,
+                SharepointObjectStoreConfig::default(),
+            );
+            let _ = store.delete(&parsed.item_path).await;
             Ok(())
         })
         .await

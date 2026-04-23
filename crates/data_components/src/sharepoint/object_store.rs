@@ -58,7 +58,7 @@ use object_store::{
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use super::url::{DriveRef, SharepointUrl};
+use super::url::DriveRef;
 
 /// SharePoint cap on a single `PUT /content` is 4 MiB. We use a slightly lower
 /// threshold to leave headroom for request headers/overhead.
@@ -114,13 +114,22 @@ pub struct SharepointObjectStoreConfig {
 
 pub struct SharepointObjectStore {
     client: Arc<GraphClient>,
+    drive: DriveRef,
     config: SharepointObjectStoreConfig,
 }
 
 impl SharepointObjectStore {
     #[must_use]
-    pub fn new(client: Arc<GraphClient>, config: SharepointObjectStoreConfig) -> Self {
-        Self { client, config }
+    pub fn new(
+        client: Arc<GraphClient>,
+        drive: DriveRef,
+        config: SharepointObjectStoreConfig,
+    ) -> Self {
+        Self {
+            client,
+            drive,
+            config,
+        }
     }
 
     /// Resolve a path from an object-store [`Path`] to a SharePoint API path
@@ -134,7 +143,6 @@ impl SharepointObjectStore {
             format!(":/{s}:")
         }
     }
-
 }
 
 impl Debug for SharepointObjectStore {
@@ -151,19 +159,6 @@ impl Display for SharepointObjectStore {
     }
 }
 
-/// Helper that parses the `Path` argument given to object-store methods as a
-/// `sharepoint://...` URL. The registry keys stores by authority, so the
-/// full URL (authority + path) is passed down — we need both the drive target
-/// and the in-drive path.
-fn parse_location(location: &Path) -> ObjectStoreResult<(DriveRef, Path)> {
-    let full = format!("sharepoint://{location}");
-    let parsed = SharepointUrl::parse(&full).map_err(|e| object_store::Error::Generic {
-        store: STORE_TAG,
-        source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)),
-    })?;
-    Ok((parsed.drive, parsed.item_path))
-}
-
 #[async_trait]
 impl ObjectStore for SharepointObjectStore {
     async fn put_opts(
@@ -172,7 +167,6 @@ impl ObjectStore for SharepointObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> ObjectStoreResult<PutResult> {
-        let (drive, item_path) = parse_location(location)?;
         let bytes = payload_to_bytes(&payload);
 
         let effective_conflict = match opts.mode {
@@ -182,9 +176,9 @@ impl ObjectStore for SharepointObjectStore {
         };
 
         let result = if bytes.len() <= INLINE_PUT_THRESHOLD {
-            inline_put(&self.client, &drive, &item_path, bytes, effective_conflict).await
+            inline_put(&self.client, &self.drive, location, bytes, effective_conflict).await
         } else {
-            resumable_put(&self.client, &drive, &item_path, bytes, effective_conflict).await
+            resumable_put(&self.client, &self.drive, location, bytes, effective_conflict).await
         }?;
 
         Ok(PutResult {
@@ -198,21 +192,18 @@ impl ObjectStore for SharepointObjectStore {
         location: &Path,
         _opts: PutMultipartOptions,
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        let (drive, item_path) = parse_location(location)?;
         Ok(Box::new(BufferedMultipart::new(
             Arc::clone(&self.client),
-            drive,
-            item_path,
+            self.drive.clone(),
+            location.clone(),
             self.config.conflict_behavior,
         )))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        let (drive, item_path) = parse_location(location)?;
-
         // Fetch metadata first — needed both for the ObjectMeta in GetResult
         // and to respect If-Match / If-None-Match via object_store's helper.
-        let meta = head_drive_item(&self.client, &drive, &item_path).await?;
+        let meta = head_drive_item(&self.client, &self.drive, location).await?;
         let object_meta = ObjectMeta {
             location: location.clone(),
             last_modified: meta.last_modified,
@@ -225,23 +216,22 @@ impl ObjectStore for SharepointObjectStore {
         // Slice in-memory after fetch (see note in `get_content`).
         let bytes = get_content(
             &self.client,
-            &drive,
-            &item_path,
+            &self.drive,
+            location,
             options.range.as_ref(),
             meta.size,
         )
         .await?;
-        let range = if let Some(r) = options.range {
-            Some(resolve_range(&r, meta.size))
-        } else {
-            Some(0..meta.size)
-        };
+        let range = options
+            .range
+            .as_ref()
+            .map_or(0..meta.size, |r| resolve_range(r, meta.size));
 
         let stream = futures::stream::once(async move { Ok(bytes) });
         Ok(GetResult {
             payload: GetResultPayload::Stream(Box::pin(stream)),
             attributes: Attributes::default(),
-            range: range.unwrap_or(0..meta.size),
+            range,
             meta: ObjectMeta {
                 location: location.clone(),
                 last_modified: meta.last_modified,
@@ -253,8 +243,7 @@ impl ObjectStore for SharepointObjectStore {
     }
 
     async fn head(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
-        let (drive, item_path) = parse_location(location)?;
-        let meta = head_drive_item(&self.client, &drive, &item_path).await?;
+        let meta = head_drive_item(&self.client, &self.drive, location).await?;
         Ok(ObjectMeta {
             location: location.clone(),
             last_modified: meta.last_modified,
@@ -265,27 +254,20 @@ impl ObjectStore for SharepointObjectStore {
     }
 
     async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
-        let (drive, item_path) = parse_location(location)?;
-        delete_item(&self.client, &drive, &item_path).await
+        delete_item(&self.client, &self.drive, location).await
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
         let client = Arc::clone(&self.client);
-        let prefix = prefix.cloned();
+        let drive = self.drive.clone();
+        let prefix = prefix.cloned().unwrap_or_else(|| Path::from(""));
         Box::pin(async_stream::stream! {
-            let (drive, item_path) = match prefix_to_location(prefix.as_ref()) {
-                Ok(parts) => parts,
-                Err(e) => {
-                    yield Err(e);
-                    return;
-                }
-            };
-            let mut pages = list_children(&client, &drive, &item_path, false);
+            let mut pages = list_children(&client, &drive, &prefix, false);
             while let Some(res) = pages.next().await {
                 match res {
                     Ok(batch) => {
                         for item in batch {
-                            if let Some(meta) = item.into_object_meta(&drive, &item_path) {
+                            if let Some(meta) = item.into_object_meta(&prefix) {
                                 yield Ok(meta);
                             }
                         }
@@ -297,8 +279,8 @@ impl ObjectStore for SharepointObjectStore {
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
-        let (drive, item_path) = prefix_to_location(prefix)?;
-        let mut pages = list_children(&self.client, &drive, &item_path, true);
+        let prefix = prefix.cloned().unwrap_or_else(|| Path::from(""));
+        let mut pages = list_children(&self.client, &self.drive, &prefix, true);
 
         let mut objects = Vec::new();
         let mut common_prefixes = Vec::new();
@@ -306,10 +288,10 @@ impl ObjectStore for SharepointObjectStore {
             let batch = res?;
             for item in batch {
                 if item.is_folder {
-                    if let Some(p) = item.as_prefix(&drive, &item_path) {
+                    if let Some(p) = item.as_prefix(&prefix) {
                         common_prefixes.push(p);
                     }
-                } else if let Some(meta) = item.into_object_meta(&drive, &item_path) {
+                } else if let Some(meta) = item.into_object_meta(&prefix) {
                     objects.push(meta);
                 }
             }
@@ -339,21 +321,13 @@ fn payload_to_bytes(payload: &PutPayload) -> Vec<u8> {
     buf
 }
 
-fn prefix_to_location(prefix: Option<&Path>) -> ObjectStoreResult<(DriveRef, Path)> {
-    let prefix = prefix.ok_or_else(|| object_store::Error::Generic {
-        store: STORE_TAG,
-        source: Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "list requires a prefix with a drive reference (e.g. 'me/' or 'drives/{id}/')",
-        )),
-    })?;
-    parse_location(prefix)
-}
-
 fn resolve_range(range: &GetRange, total_size: u64) -> std::ops::Range<u64> {
     match range {
-        GetRange::Bounded(r) => r.clone(),
-        GetRange::Offset(off) => *off..total_size,
+        // Clamp Bounded ranges to [0, total_size] so the returned `GetResult.range`
+        // always matches the sliced payload length, matching the semantics
+        // documented on `GetRange::Bounded`.
+        GetRange::Bounded(r) => r.start.min(total_size)..r.end.min(total_size),
+        GetRange::Offset(off) => (*off).min(total_size)..total_size,
         GetRange::Suffix(n) => total_size.saturating_sub(*n)..total_size,
     }
 }
@@ -460,12 +434,12 @@ struct DriveItemMeta {
 }
 
 impl DriveItemMeta {
-    fn into_object_meta(self, drive: &DriveRef, parent: &Path) -> Option<ObjectMeta> {
+    fn into_object_meta(self, parent: &Path) -> Option<ObjectMeta> {
         if self.is_folder {
             return None;
         }
         Some(ObjectMeta {
-            location: drive_item_location(drive, parent, &self.name),
+            location: child_location(parent, &self.name),
             last_modified: self.last_modified,
             size: self.size,
             e_tag: self.e_tag,
@@ -473,21 +447,20 @@ impl DriveItemMeta {
         })
     }
 
-    fn as_prefix(&self, drive: &DriveRef, parent: &Path) -> Option<Path> {
+    fn as_prefix(&self, parent: &Path) -> Option<Path> {
         if self.is_folder {
-            Some(drive_item_location(drive, parent, &self.name))
+            Some(child_location(parent, &self.name))
         } else {
             None
         }
     }
 }
 
-fn drive_item_location(drive: &DriveRef, parent: &Path, name: &str) -> Path {
+/// Build a drive-relative location by appending `name` to `parent`.
+/// Returned paths are relative to the store's drive root — the drive target
+/// (me / drives / sites / ...) is held on the store instance, not the path.
+fn child_location(parent: &Path, name: &str) -> Path {
     let mut segments: Vec<String> = Vec::new();
-    segments.push(drive.url_authority().to_string());
-    if let Some(id) = drive.id() {
-        segments.push(id.to_string());
-    }
     for seg in parent.parts() {
         segments.push(seg.as_ref().to_string());
     }
@@ -653,7 +626,8 @@ async fn parse_put_response(response: reqwest::Response) -> ObjectStoreResult<Pu
         return Err(object_store::Error::Generic {
             store: STORE_TAG,
             source: Box::new(std::io::Error::other(format!(
-                "SharePoint upload failed: HTTP {status}: {body}"
+                "SharePoint upload failed: HTTP {status}: {}",
+                summarize_error_body(&body)
             ))),
         });
     }
@@ -866,6 +840,30 @@ fn list_children(
     })
 }
 
+/// Collapse whitespace in an HTTP error body to a single line and cap it to
+/// a readable length, so logs/error messages stay one-line and grep-friendly.
+fn summarize_error_body(body: &str) -> String {
+    const MAX: usize = 256;
+    let mut out = String::with_capacity(body.len().min(MAX));
+    let mut prev_space = false;
+    for ch in body.chars() {
+        if ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+        if out.len() >= MAX {
+            out.push('…');
+            break;
+        }
+    }
+    out.trim().to_string()
+}
+
 fn graph_err(e: &graph_rs_sdk::GraphFailure) -> object_store::Error {
     object_store::Error::Generic {
         store: STORE_TAG,
@@ -912,34 +910,40 @@ mod tests {
     }
 
     #[test]
-    fn parse_location_roundtrip() {
-        let (drive, path) = parse_location(&Path::from("me/Documents/a.csv")).unwrap();
-        assert_eq!(drive, DriveRef::Me);
-        assert_eq!(path.as_ref(), "Documents/a.csv");
-
-        let (drive, path) =
-            parse_location(&Path::from("drives/b!abc/Shared/file.parquet")).unwrap();
-        assert_eq!(drive, DriveRef::Drive("b!abc".to_string()));
-        assert_eq!(path.as_ref(), "Shared/file.parquet");
+    fn child_location_empty_parent() {
+        let p = child_location(&Path::from(""), "a.csv");
+        assert_eq!(p.as_ref(), "a.csv");
     }
 
     #[test]
-    fn drive_item_location_me() {
-        let p = drive_item_location(&DriveRef::Me, &Path::from("Documents"), "a.csv");
-        assert_eq!(p.as_ref(), "me/Documents/a.csv");
+    fn child_location_nested() {
+        let p = child_location(&Path::from("Documents/2026"), "report.parquet");
+        assert_eq!(p.as_ref(), "Documents/2026/report.parquet");
     }
 
     #[test]
-    fn drive_item_location_site() {
-        let p = drive_item_location(
-            &DriveRef::Site("contoso.sharepoint.com,1,2".to_string()),
-            &Path::from("Shared"),
-            "data.json",
-        );
-        assert_eq!(
-            p.as_ref(),
-            "sites/contoso.sharepoint.com,1,2/Shared/data.json"
-        );
+    fn summarize_error_body_collapses_whitespace() {
+        let s = summarize_error_body("line1\n\nline2\t\tfinal");
+        assert_eq!(s, "line1 line2 final");
+    }
+
+    #[test]
+    fn summarize_error_body_truncates_long_input() {
+        let s = summarize_error_body(&"x".repeat(500));
+        assert!(s.len() < 270);
+        assert!(s.ends_with("…"));
+    }
+
+    #[test]
+    fn resolve_range_clamps_bounded() {
+        let r = resolve_range(&GetRange::Bounded(10..1000), 100);
+        assert_eq!(r, 10..100);
+    }
+
+    #[test]
+    fn resolve_range_offset_past_end_is_empty() {
+        let r = resolve_range(&GetRange::Offset(500), 100);
+        assert_eq!(r, 100..100);
     }
 
     // ---- End-to-end object-store tests against a mocked Graph endpoint. ----

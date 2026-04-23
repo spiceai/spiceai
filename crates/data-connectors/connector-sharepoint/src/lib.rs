@@ -97,9 +97,6 @@ pub enum Error {
         "Invalid sharepoint_conflict_behavior '{value}' — expected 'replace', 'fail', or 'rename'. Defaults to 'replace' (creates a new version on overwrite)."
     ))]
     InvalidConflictBehavior { value: String },
-
-    #[snafu(display("Missing redirect_uri parameter: {url}"))]
-    InvalidRedirectUrlError { url: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -179,8 +176,14 @@ fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
     let device_code = params.get("device_code").expose().ok();
     let saml_assertion = params.get("saml_assertion").expose().ok();
 
-    let provided_count = [
-        client_secret.is_some() && auth_code.is_none() && refresh_token.is_none(),
+    // Exactly one top-level flow must be selected. `client_secret` alone
+    // implies client credentials, but `client_secret` combined with
+    // `auth_code` or `refresh_token` represents a single auth-code /
+    // refresh-token flow (secret acts as the app credential, not a
+    // separate flow). Any other combination is ambiguous.
+    let client_secret_as_flow = client_secret.is_some() && auth_code.is_none() && refresh_token.is_none();
+    let flow_count = [
+        client_secret_as_flow,
         bearer_token.is_some(),
         auth_code.is_some(),
         refresh_token.is_some(),
@@ -191,8 +194,11 @@ fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
     .filter(|b| **b)
     .count();
 
-    if provided_count == 0 {
+    if flow_count == 0 {
         return Err(Error::InvalidAuthentication);
+    }
+    if flow_count > 1 {
+        return Err(Error::DuplicateAuthentication);
     }
 
     let scope = params.get("scope").expose().ok().map(String::from);
@@ -413,7 +419,12 @@ impl DataConnector for Sharepoint {
         }
         // Pre-register the SharepointObjectStore against the dataset's URL
         // so that the blanket ListingTableConnector impl finds it when it
-        // calls `runtime_env.object_store(...)`.
+        // calls `runtime_env.object_store(...)`. The drive target
+        // (me/drives/sites/users/groups) is extracted from the URL and
+        // stored on the SharepointObjectStore instance, so the object-store
+        // paths returned in `ObjectMeta.location` are drive-relative (the
+        // conventional ObjectStore semantics — paths are keys within a
+        // single registered store).
         let store_url =
             Url::parse(&dataset.from).map_err(|e| DataConnectorError::InvalidConfiguration {
                 dataconnector: CONNECTOR_NAME.to_string(),
@@ -421,6 +432,13 @@ impl DataConnector for Sharepoint {
                     "'{}' is not a valid sharepoint:// URL. See https://spiceai.org/docs/components/data-connectors/sharepoint#from",
                     dataset.from
                 ),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            })?;
+        let sp_url = data_components::sharepoint::url::SharepointUrl::from_url(&store_url)
+            .map_err(|e| DataConnectorError::InvalidConfiguration {
+                dataconnector: CONNECTOR_NAME.to_string(),
+                message: format!("{e}"),
                 connector_component: ConnectorComponent::from(dataset),
                 source: Box::new(e),
             })?;
@@ -434,6 +452,7 @@ impl DataConnector for Sharepoint {
         })?;
         let store = Arc::new(SharepointObjectStore::new(
             Arc::clone(&self.client),
+            sp_url.drive,
             SharepointObjectStoreConfig {
                 conflict_behavior: conflict,
             },

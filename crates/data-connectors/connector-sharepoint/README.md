@@ -92,7 +92,7 @@ endpoint doesn't cleanly expose conflict behavior headers.
 Reading a CSV:
 ```yaml
 datasets:
-  - from: sharepoint://sites/contoso.sharepoint.com,11111111-2222-3333-4444-555555555555,66666666-7777-8888-9999-aaaaaaaaaaaa/Shared Documents/reports/sales.csv
+  - from: sharepoint://sites/contoso.sharepoint.com,11111111-2222-3333-4444-555555555555,66666666-7777-8888-9999-aaaaaaaaaaaa/Shared%20Documents/reports/sales.csv
     name: sales
     params:
       sharepoint_client_id: ${secrets:sharepoint_client_id}
@@ -117,7 +117,7 @@ Creating an external table with DDL:
 ```sql
 CREATE EXTERNAL TABLE reports
 STORED AS PARQUET
-LOCATION 'sharepoint://sites/{site-id}/Shared Documents/reports/';
+LOCATION 'sharepoint://sites/{site-id}/Shared%20Documents/reports/';
 ```
 
 Blob upload of a PDF (binary round-trip via `COPY TO`):
