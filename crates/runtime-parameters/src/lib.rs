@@ -92,7 +92,15 @@ impl Parameters {
         }
 
         let Some(spec) = spec else {
-            tracing::warn!("Ignoring parameter {key}: not supported for {component_name}.");
+            let suggestion = closest_param_suggestion(all_params, prefix, key);
+            match suggestion {
+                Some(candidate) => tracing::warn!(
+                    "Ignoring parameter `{key}`: not supported for {component_name}. Did you mean `{candidate}`?"
+                ),
+                None => tracing::warn!(
+                    "Ignoring parameter `{key}`: not supported for {component_name}."
+                ),
+            }
             return None;
         };
 
@@ -209,8 +217,9 @@ impl Parameters {
                 return Err(Box::new(Error::InvalidConfigurationNoSource {
                     component: component_name.to_string(),
                     message: format!(
-                        "Missing required parameter: {}",
-                        parameter.display_name(prefix)
+                        "Missing required parameter: {}{}",
+                        parameter.display_name(prefix),
+                        describe_missing_parameter(parameter),
                     ),
                 }));
             }
@@ -488,6 +497,54 @@ impl<'a> ExposedParamLookup<'a> {
 }
 
 pub use runtime_parameter_spec::{ParameterSpec, ParameterType};
+
+/// Suggest the closest valid parameter name for a user-typo'd key.
+///
+/// Compares against the user-facing form of every spec (including prefix where relevant).
+/// Returns `Some(candidate)` only when edit distance is low enough to be useful,
+/// to avoid misleading suggestions for keys that are genuinely unknown.
+fn closest_param_suggestion(
+    all_params: &[ParameterSpec],
+    prefix: &str,
+    typo: &str,
+) -> Option<String> {
+    let typo_lower = typo.to_ascii_lowercase();
+    let mut best: Option<(String, usize)> = None;
+    for p in all_params {
+        if p.deprecation_message.is_some() {
+            continue;
+        }
+        let candidate = p.display_name(prefix);
+        let d = util::levenshtein::distance(&typo_lower, &candidate.to_ascii_lowercase());
+        if best.as_ref().is_none_or(|(_, best_d)| d < *best_d) {
+            best = Some((candidate, d));
+        }
+    }
+    let (candidate, distance) = best?;
+    // Bound: at most 1/3 of the longer string (so short typos only match very close names).
+    let max_allowed = (candidate.len().max(typo.len()) / 3).max(1);
+    if distance <= max_allowed { Some(candidate) } else { None }
+}
+
+/// Build the suffix appended to "Missing required parameter: <name>" when a required
+/// parameter is absent. Includes a description, example, and doc link when the spec provides them.
+fn describe_missing_parameter(parameter: &ParameterSpec) -> String {
+    let mut out = String::new();
+    if !parameter.description.is_empty() {
+        out.push_str(". ");
+        out.push_str(parameter.description);
+    }
+    if let Some(first_example) = parameter.examples.first() {
+        out.push_str(" Example: `");
+        out.push_str(first_example);
+        out.push('`');
+    }
+    if !parameter.help_link.is_empty() {
+        out.push_str(". Docs: ");
+        out.push_str(parameter.help_link);
+    }
+    out
+}
 
 #[cfg(test)]
 mod test {

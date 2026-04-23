@@ -126,14 +126,20 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 // Data Connector Parameters
 // ============================================================================
 
+const DATABRICKS_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/databricks";
+
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("endpoint")
         .required()
         .secret()
-        .description("The endpoint of the Databricks instance."),
+        .description("The endpoint of the Databricks instance.")
+        .examples(&["dbc-abcd.cloud.databricks.com"])
+        .help_link(DATABRICKS_DOCS),
     ParameterSpec::component("sql_warehouse_id")
         .secret()
-        .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'"),
+        .description("The SQL Warehouse ID to use when 'mode' is set to 'sql_warehouse'.")
+        .examples(&["862f1d7571f6f3c4"])
+        .help_link(DATABRICKS_DOCS),
 
     // Connection / resilience tuning (sql_warehouse mode)
     ParameterSpec::runtime("max_concurrent_requests")
@@ -155,10 +161,13 @@ pub const PARAMETERS: &[ParameterSpec] = &[
 
     ParameterSpec::component("token")
         .secret()
-        .description("The personal access token used to authenticate against the DataBricks API."),
+        .description("The personal access token used to authenticate against the DataBricks API.")
+        .help_link(DATABRICKS_DOCS),
     ParameterSpec::runtime("mode")
-        .description("The execution mode for running queries: 'spark_connect', 'delta_lake', or 'sql_warehouse'.")
-        .default("spark_connect"),
+        .description("The execution mode for running queries.")
+        .one_of(&["spark_connect", "delta_lake", "sql_warehouse"])
+        .default("spark_connect")
+        .help_link(DATABRICKS_DOCS),
     ParameterSpec::runtime("client_timeout")
         .description("The timeout setting for object store client."),
     ParameterSpec::component("cluster_id").description("The ID of the compute cluster in Databricks to use for the query. Only valid when mode is spark_connect."),

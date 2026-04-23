@@ -198,6 +198,53 @@ impl Runtime {
             spawned_tasks.push(handle);
         }
 
+        // Aggregate startup summary so users see "3/5 queued, 2 failed at init" at a glance
+        // instead of having to piece that together from per-dataset warnings.
+        let dispatched = spawned_tasks.len();
+        let init_failed = init_results
+            .values()
+            .filter(|r| r.is_err())
+            .count();
+        let total = valid_datasets.len();
+        if total > 0 {
+            tracing::info!(
+                "Loading datasets: {dispatched} dispatched, {init_failed} failed accelerator init (of {total} total)."
+            );
+        }
+
+        // Spawn a best-effort follow-up summary that samples the status registry after
+        // a grace period, so users see a single line with how many actually reached Ready
+        // instead of having to query /v1/datasets. Uses the runtime's shutdown token so
+        // a ctrl-c stops the sampler cleanly.
+        let status_handle = Arc::clone(&self.status);
+        let shutdown_token = self.status.shutdown_token();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                () = shutdown_token.cancelled() => return,
+            }
+            let statuses = status_handle.get_dataset_statuses();
+            let mut ready = 0usize;
+            let mut errored = 0usize;
+            let mut initializing = 0usize;
+            for s in statuses.values() {
+                match s {
+                    status::ComponentStatus::Ready | status::ComponentStatus::Refreshing => {
+                        ready += 1;
+                    }
+                    status::ComponentStatus::Error(_) => errored += 1,
+                    status::ComponentStatus::Initializing => initializing += 1,
+                    _ => {}
+                }
+            }
+            let total = statuses.len();
+            if total > 0 {
+                tracing::info!(
+                    "Dataset load summary (after 30s): {ready}/{total} ready, {errored} errored, {initializing} still initializing."
+                );
+            }
+        });
+
         let _ = join_all(spawned_tasks).await;
 
         // After all datasets have loaded, load the views.
@@ -820,8 +867,12 @@ impl Runtime {
                     return Err(OdbcNotInstalledSnafu.build());
                 }
 
+                let suggestion = dataconnector::suggest_connector(source).await;
+                let available = dataconnector::registered_connector_names().await;
                 return Err(UnknownDataConnectorSnafu {
                     data_connector: source,
+                    suggestion,
+                    available,
                 }
                 .build());
             };

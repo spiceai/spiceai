@@ -141,6 +141,34 @@ pub async fn create_new_connector(
     Some(factory.connector(params))
 }
 
+/// Names of every registered catalog connector, for "did you mean?" suggestions.
+pub async fn registered_catalog_names() -> Vec<String> {
+    let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+    let mut names: Vec<String> = guard.keys().cloned().collect();
+    names.sort();
+    names
+}
+
+/// Closest-match suggestion for an unknown catalog connector name.
+pub async fn suggest_catalog_connector(name: &str) -> Option<String> {
+    let names = registered_catalog_names().await;
+    let input = name.to_ascii_lowercase();
+    let mut best: Option<(String, usize)> = None;
+    for candidate in names {
+        let d = util::levenshtein::distance(&input, &candidate.to_ascii_lowercase());
+        if best.as_ref().is_none_or(|(_, b)| d < *b) {
+            best = Some((candidate, d));
+        }
+    }
+    let (candidate, distance) = best?;
+    let max_allowed = (candidate.len().max(name.len()) / 3).max(1);
+    if distance <= max_allowed {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 pub async fn register_all() {
     let mut registry = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
 

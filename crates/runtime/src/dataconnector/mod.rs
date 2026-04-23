@@ -476,6 +476,36 @@ pub async fn register_all() {
     }
 }
 
+/// Names of every registered data connector. Useful for generating helpful
+/// "did you mean?" suggestions when a user references an unknown connector.
+pub async fn registered_connector_names() -> Vec<String> {
+    let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+    let mut names: Vec<String> = guard.keys().cloned().collect();
+    names.sort();
+    names
+}
+
+/// Returns the registered connector name whose Levenshtein distance to `name`
+/// is lowest (bounded so short typos only match very close names).
+pub async fn suggest_connector(name: &str) -> Option<String> {
+    let names = registered_connector_names().await;
+    let input = name.to_ascii_lowercase();
+    let mut best: Option<(String, usize)> = None;
+    for candidate in names {
+        let d = util::levenshtein::distance(&input, &candidate.to_ascii_lowercase());
+        if best.as_ref().is_none_or(|(_, b)| d < *b) {
+            best = Some((candidate, d));
+        }
+    }
+    let (candidate, distance) = best?;
+    let max_allowed = (candidate.len().max(name.len()) / 3).max(1);
+    if distance <= max_allowed {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 pub async fn unregister_all() {
     let mut registry = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
     registry.clear();

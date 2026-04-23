@@ -21,7 +21,7 @@ use spice::commands::acceleration::{AccelerationArgs, SnapshotArgs, SnapshotsArg
 use spice::commands::{
     acceleration, add, catalogs, chat, cloud, cluster, completions, connect, dataset, datasets,
     init, install, login, models, nsql, pods, query, refresh, run, search, sql, status, trace,
-    upgrade, version, workers,
+    upgrade, validate, version, workers,
 };
 use spice::{Result, RuntimeContext};
 use tracing_subscriber::EnvFilter;
@@ -135,16 +135,25 @@ enum Commands {
 
     /// Generate shell completions
     Completions(completions::CompletionsArgs),
+
+    /// Validate a spicepod.yaml without starting the runtime
+    Validate(validate::ValidateArgs),
 }
 
 fn main() {
+    use std::io::IsTerminal;
+
     let cli = Cli::parse();
 
-    // Initialize logging based on verbosity
-    let filter = match cli.verbose {
-        0 => EnvFilter::new("info"),
-        1 => EnvFilter::new("debug"),
-        _ => EnvFilter::new("trace"),
+    // Verbosity flag wins; otherwise honour RUST_LOG; otherwise default to info.
+    let filter = if cli.verbose > 0 {
+        if cli.verbose == 1 {
+            EnvFilter::new("debug")
+        } else {
+            EnvFilter::new("trace")
+        }
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
     };
 
     tracing_subscriber::fmt()
@@ -153,11 +162,13 @@ fn main() {
         .without_time()
         .init();
 
-    // Print version header (matching Go CLI behavior), suppressed in JSON mode
-    if !matches!(cli.command, Commands::Version(_) | Commands::Completions(_))
+    // Version banner: stderr-only so it doesn't foul pipes, and only for interactive stderr.
+    // Suppressed for commands that produce JSON (scripting) or where it's just noise.
+    if std::io::stderr().is_terminal()
+        && !matches!(cli.command, Commands::Version(_) | Commands::Completions(_))
         && !is_json_output(&cli.command)
     {
-        println!("Spice.ai OSS CLI {}", version::cli_version());
+        eprintln!("Spice.ai OSS CLI {}", version::cli_version());
     }
 
     // Run the CLI
@@ -338,6 +349,11 @@ fn run_cli(cli: Cli) -> Result<()> {
         }
         Commands::Completions(args) => {
             completions::execute(&args, &mut Cli::command());
+        }
+        Commands::Validate(args) => {
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
+            rt.block_on(validate::execute(&args))?;
         }
     }
 

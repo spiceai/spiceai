@@ -54,7 +54,9 @@ pub enum Error {
     ))]
     MissingKafkaBootstrapServers,
 
-    #[snafu(display("Invalid Kafka configuration: {msg}"))]
+    #[snafu(display(
+        "Invalid Kafka configuration: {msg}. Docs: https://spiceai.org/docs/components/data-connectors/kafka"
+    ))]
     InvalidConfiguration { msg: String },
 }
 
@@ -196,49 +198,67 @@ impl KafkaFactory {
     }
 }
 
+const KAFKA_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/kafka";
+
 const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("bootstrap_servers")
         .required()
         .description(
             "A list of host/port pairs for establishing the initial Kafka cluster connection.",
-        ),
+        )
+        .examples(&["broker1.kafka.internal:9092,broker2.kafka.internal:9092"])
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("security_protocol")
         .default("sasl_ssl")
-        .description("Security protocol for Kafka connections. Default: 'sasl_ssl'. Options: 'plaintext', 'ssl', 'sasl_plaintext', 'sasl_ssl'."),
+        .description("Security protocol for Kafka connections. Default: 'sasl_ssl'.")
+        .one_of(&["plaintext", "ssl", "sasl_plaintext", "sasl_ssl"])
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("sasl_mechanism")
         .default("SCRAM-SHA-512")
-        .description("SASL authentication mechanism. Default: 'SCRAM-SHA-512'. Options: 'PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512'."),
+        .description("SASL authentication mechanism. Default: 'SCRAM-SHA-512'.")
+        .one_of(&["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"])
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("sasl_username")
         .secret()
-        .description("SASL username."),
+        .description("SASL username.")
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("sasl_password")
         .secret()
-        .description("SASL password."),
+        .description("SASL password.")
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("ssl_ca_location")
         .secret()
-        .description("Path to the SSL/TLS CA certificate file for server verification."),
+        .description("Path to the SSL/TLS CA certificate file for server verification.")
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("enable_ssl_certificate_verification")
         .default("true")
         .description("Enable SSL/TLS certificate verification. Default: 'true'.")
-        .is_boolean(),
+        .is_boolean()
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("ssl_endpoint_identification_algorithm")
         .default("https")
-        .description("SSL/TLS endpoint identification algorithm. Default: 'https'. Options: 'none', 'https'.")
-        .one_of(&["none", "https"]),
+        .description("SSL/TLS endpoint identification algorithm. Default: 'https'.")
+        .one_of(&["none", "https"])
+        .help_link(KAFKA_DOCS),
     ParameterSpec::runtime("schema_infer_max_records")
         .default("1")
-        .description("Number of Kafka messages to sample for schema inference. Default: '1'. Increase if your data has optional fields or varying structure."),
+        .description("Number of Kafka messages to sample for schema inference. Increase if your data has optional fields or varying structure.")
+        .help_link(KAFKA_DOCS),
     ParameterSpec::runtime("flatten_json")
         .description("Set true to flatten nested structs in JSON as separate columns.")
-        .is_boolean(),
+        .is_boolean()
+        .help_link(KAFKA_DOCS),
     ParameterSpec::component("consumer_group_id")
-        .description("Kafka consumer group id to use for this dataset. If not set, a unique id will be generated."),
+        .description("Kafka consumer group id to use for this dataset. If not set, a unique id will be generated.")
+        .help_link(KAFKA_DOCS),
     ParameterSpec::runtime("batch_max_size")
-        .description("Maximum number of change events to batch together before processing")
-        .default("10000"),
+        .description("Maximum number of change events to batch together before processing.")
+        .default("10000")
+        .help_link(KAFKA_DOCS),
     ParameterSpec::runtime("batch_max_duration")
-        .description("Maximum time to wait for a batch to fill before processing")
-        .default("1s"),
+        .description("Maximum time to wait for a batch to fill before processing.")
+        .default("1s")
+        .help_link(KAFKA_DOCS),
 ];
 
 impl DataConnectorFactory for KafkaFactory {

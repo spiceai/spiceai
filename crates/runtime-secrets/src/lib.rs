@@ -48,7 +48,9 @@ pub enum Error {
     #[snafu(display("Unable to parse secret value"))]
     UnableToParseSecretValue,
 
-    #[snafu(display("Unknown secret store: {store}"))]
+    #[snafu(display(
+        "Unknown secret store '{store}'. Available stores: env, keyring, kubernetes, aws_secrets_manager. Docs: https://spiceai.org/docs/components/secret-stores"
+    ))]
     UnknownSecretStore { store: String },
 
     #[snafu(display(
@@ -139,7 +141,15 @@ impl Secrets {
             let secret_store = match load_secret_store(store_type).await {
                 Ok(secret_store) => secret_store,
                 Err(e) => {
-                    tracing::error!("Error loading secret store {}: {e}", secret.name);
+                    // Swallowing this as a `continue` means any `${ <name>:KEY }` that later
+                    // references this store resolves to an empty string, masking the real
+                    // cause. Log a big actionable error and keep going so other stores can
+                    // still be loaded; the ref-resolution path now surfaces which store is
+                    // missing.
+                    tracing::error!(
+                        "Failed to initialize secret store `{name}`: {e}. Secret references `${{ {name}:KEY }}` in spicepod.yaml will fail to resolve. Check the store's `params:` block (e.g. region/credentials for aws_secrets_manager) and retry. Docs: https://spiceai.org/docs/components/secret-stores",
+                        name = secret.name
+                    );
                     continue;
                 }
             };
@@ -219,16 +229,31 @@ impl Secrets {
         store_name: &str,
         key: &str,
     ) -> Option<String> {
-        // This is a special case for loading secrets across stores in precedence order
+        // Substitution failures leave the parameter as the empty string, which the
+        // component layer then reports as "missing required parameter" without any
+        // back-reference to the failed secret lookup. Include enough context here
+        // (store, key, source of reference) that users can tie cause to effect.
+        let configured = self
+            .stores
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
         if store_name == SECRETS {
             match self.get_secret(key).await {
                 Ok(Some(secret)) => return Some(secret.expose_secret().to_string()),
                 Ok(None) => {
-                    tracing::error!("Key '{key}' not found in any connected secrets.");
+                    tracing::error!(
+                        "Secret `${{ secrets:{key} }}` (referenced by `{}`) not found in any configured secret store (searched: [{configured}]). The parameter will be empty, which typically surfaces later as a missing/invalid parameter. Docs: https://spiceai.org/docs/components/secret-stores",
+                        param_str.0
+                    );
                     return None;
                 }
                 Err(e) => {
-                    tracing::error!("Error getting secret: {}", e);
+                    tracing::error!(
+                        "Error looking up secret `${{ secrets:{key} }}` (referenced by `{}`): {e}",
+                        param_str.0
+                    );
                     return None;
                 }
             }
@@ -238,17 +263,23 @@ impl Secrets {
             match store.get_secret(key).await {
                 Ok(Some(secret)) => secret.expose_secret().to_string(),
                 Ok(None) => {
-                    tracing::error!("Key {key} not found in secret store: {store_name}");
+                    tracing::error!(
+                        "Secret `${{ {store_name}:{key} }}` (referenced by `{}`) not found in secret store `{store_name}`. The parameter will be empty. Docs: https://spiceai.org/docs/components/secret-stores",
+                        param_str.0
+                    );
                     return None;
                 }
                 Err(e) => {
-                    tracing::error!("Error getting secret: {}", e);
+                    tracing::error!(
+                        "Error looking up secret `${{ {store_name}:{key} }}` (referenced by `{}`): {e}",
+                        param_str.0
+                    );
                     return None;
                 }
             }
         } else {
             tracing::error!(
-                "Secret '{store_name}' referenced in {} not found.",
+                "Secret reference `${{ {store_name}:{key} }}` in `{}` uses an undefined store `{store_name}`. Configured stores: [{configured}]. Add a `secrets:` entry in spicepod.yaml with `from: {store_name}`, or use one of the configured stores. Docs: https://spiceai.org/docs/components/secret-stores",
                 param_str.0
             );
             return None;

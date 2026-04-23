@@ -169,13 +169,14 @@ async fn send_nsql_request(
         .await
 }
 
-const SPECIAL_COMMANDS: [&str; 8] = [
+const SPECIAL_COMMANDS: [&str; 9] = [
     ".exit",
     "exit",
     "quit",
     "q",
     ".error",
     "help",
+    "?",
     ".clear",
     ".clear history",
 ];
@@ -427,8 +428,12 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     rl.bind_sequence(KeyEvent::ctrl('C'), EventHandler::Conditional(key_handler));
     rl.bind_sequence(KeyEvent::ctrl('D'), rustyline::Cmd::EndOfFile);
 
-    println!("Welcome to the Spice.ai SQL REPL! Type 'help' for help.\n");
-    println!("show tables; -- list available tables");
+    println!("Welcome to the Spice.ai SQL REPL! Type `help` or `?` for commands.\n");
+    println!("Examples:");
+    println!("  show tables;              -- list available tables");
+    println!("  describe <table_name>;    -- show column types");
+    println!("  nql <question>            -- natural language to SQL (requires a model)");
+    println!();
 
     let mut last_error: Option<Status> = None;
 
@@ -492,9 +497,11 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 continue;
             }
             ".clear" => {
-                // Clear the screen using ANSI escape codes
-                print!("\x1B[H\x1B[2J");
-                let _ = std::io::stdout().flush();
+                // Clear-screen only makes sense on a real terminal.
+                if ansi_colors::colors_enabled() {
+                    print!("\x1B[H\x1B[2J");
+                    let _ = std::io::stdout().flush();
+                }
                 continue;
             }
             ".clear history" => {
@@ -512,28 +519,109 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 let _ = std::io::stdout().flush();
                 continue;
             }
-            "help" => {
-                println!("Available commands:\n");
+            "help" | "?" => {
+                println!("Meta-commands:\n");
                 println!(
-                    "{} Exit the REPL",
-                    PROMPT_COLOR.paint(".exit, exit, quit, q:")
+                    "  {} Exit the REPL",
+                    PROMPT_COLOR.paint(".exit, exit, quit, q")
                 );
                 println!(
-                    "{} Show details of the last error",
-                    PROMPT_COLOR.paint(".error:")
+                    "  {} Show details of the last error",
+                    PROMPT_COLOR.paint(".error                ")
                 );
-                println!("{} Clear the screen", PROMPT_COLOR.paint(".clear:"));
+                println!("  {} Clear the screen", PROMPT_COLOR.paint(".clear                "));
                 println!(
-                    "{} Clear the query history",
-                    PROMPT_COLOR.paint(".clear history:")
+                    "  {} Clear persisted query history",
+                    PROMPT_COLOR.paint(".clear history        ")
                 );
-                println!("{} Show this help message", PROMPT_COLOR.paint("help:"));
-                println!("\nOther lines will be interpreted as SQL");
+                println!(
+                    "  {} Show this help message",
+                    PROMPT_COLOR.paint("help, ?               ")
+                );
+                println!();
+                println!("SQL shortcuts (queries end with `;`, multi-line supported):");
+                println!(
+                    "  {} list all tables visible to the runtime",
+                    PROMPT_COLOR.paint("show tables;          ")
+                );
+                println!(
+                    "  {} list schemas (databases)",
+                    PROMPT_COLOR.paint("show schemas;         ")
+                );
+                println!(
+                    "  {} show a table's column names and types",
+                    PROMPT_COLOR.paint("describe <table>;     ")
+                );
+                println!();
+                println!("Natural language:");
+                println!(
+                    "  {} translate a question to SQL and run it",
+                    PROMPT_COLOR.paint("nql <question>        ")
+                );
+                println!();
+                println!("Any other line is run as SQL.");
                 let _ = std::io::stdout().flush();
                 continue;
             }
             "show tables" | "show tables;" => {
                 "select table_catalog, table_schema, table_name, table_type from information_schema.tables where table_schema != 'information_schema';"
+            }
+            "show schemas" | "show schemas;" | "show databases" | "show databases;" => {
+                "select catalog_name, schema_name from information_schema.schemata where schema_name != 'information_schema';"
+            }
+            line if {
+                let lc = line.to_ascii_lowercase();
+                let trimmed = lc.trim_end_matches(';').trim();
+                (trimmed.starts_with("describe ") || trimmed.starts_with("desc "))
+                    && trimmed.split_whitespace().count() == 2
+            } =>
+            {
+                // Rewrite `describe <table>` into an information_schema.columns lookup.
+                // Schema-qualified names ("myschema.mytable") are split; bare names match any schema.
+                let trimmed_lower = line.to_ascii_lowercase();
+                let trimmed = trimmed_lower.trim_end_matches(';').trim();
+                let tbl = trimmed
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .trim_matches('\'');
+                let rewritten = if let Some((schema, name)) = tbl.split_once('.') {
+                    format!(
+                        "select column_name, data_type, is_nullable from information_schema.columns where table_schema = '{schema}' and table_name = '{name}' order by ordinal_position;"
+                    )
+                } else {
+                    format!(
+                        "select table_schema, column_name, data_type, is_nullable from information_schema.columns where table_name = '{tbl}' order by table_schema, ordinal_position;"
+                    )
+                };
+                let _ = rl.add_history_entry(line);
+                let start_time = Instant::now();
+                match get_records(
+                    client.clone(),
+                    &rewritten,
+                    repl_config.api_key.as_ref(),
+                    &user_agent,
+                    repl_config.cache_control,
+                )
+                .await
+                {
+                    Ok((records, total_rows, from_cache)) => {
+                        display_records(&records, start_time, total_rows, from_cache)?;
+                    }
+                    Err(FlightError::Tonic(status)) => {
+                        display_grpc_error(&status);
+                        last_error = Some(*status);
+                    }
+                    Err(e) => {
+                        println!(
+                            "{} Unexpected Flight error: {e}.",
+                            Color::Red.paint("Error:")
+                        );
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+                continue;
             }
             line if line.to_lowercase().starts_with(NQL_LINE_PREFIX) => {
                 let _ = rl.add_history_entry(line);

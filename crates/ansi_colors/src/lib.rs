@@ -15,8 +15,51 @@ limitations under the License.
 */
 
 //! Simple ANSI color helpers for terminal output.
+//!
+//! Colors are only applied when the output destination is a terminal and the user
+//! hasn't opted out via `NO_COLOR`. The check is lazy and cached once per process —
+//! subsequent calls are a plain atomic load.
 
 use std::fmt::{self, Display};
+use std::io::IsTerminal;
+use std::sync::OnceLock;
+
+static COLOR_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Returns `true` when colored output should be emitted.
+///
+/// Rules (in order):
+/// 1. `NO_COLOR` set (any value) — disabled, per https://no-color.org.
+/// 2. `FORCE_COLOR` set — enabled (overrides the TTY check).
+/// 3. Otherwise — enabled iff stdout *is* a terminal.
+pub fn colors_enabled() -> bool {
+    // Internal tests assert literal escape codes, so we force colors on under cfg(test).
+    // Downstream crates that want colors under their own test harness should call
+    // `set_colors_enabled(true)` from a test fixture before any use.
+    #[cfg(test)]
+    {
+        return true;
+    }
+    #[cfg(not(test))]
+    {
+        *COLOR_ENABLED.get_or_init(|| {
+            if std::env::var_os("NO_COLOR").is_some() {
+                return false;
+            }
+            if std::env::var_os("FORCE_COLOR").is_some() {
+                return true;
+            }
+            std::io::stdout().is_terminal()
+        })
+    }
+}
+
+/// Force-set the color mode. Callers should invoke this once at startup (e.g. for tests
+/// or when the CLI knows better than the default heuristic). After the first read of
+/// `colors_enabled()` this call is a no-op.
+pub fn set_colors_enabled(enabled: bool) {
+    let _ = COLOR_ENABLED.set(enabled);
+}
 
 /// ANSI color codes for terminal output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +117,10 @@ pub struct Painted<S> {
 impl<S: AsRef<str>> Display for Painted<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         const RESET: &str = "\x1b[0m";
+
+        if !colors_enabled() {
+            return write!(f, "{}", self.text.as_ref());
+        }
 
         match self.color {
             Color::Fixed(n) => write!(f, "\x1b[38;5;{n}m{}{RESET}", self.text.as_ref()),

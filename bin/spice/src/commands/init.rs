@@ -74,7 +74,16 @@ pub fn execute(args: &InitArgs) -> Result<()> {
         path: spicepod_path.clone(),
     })?;
 
-    tracing::info!("Initialized {}", spicepod_path.display());
+    println!("Initialized {}", spicepod_path.display());
+    println!();
+    println!("Next steps:");
+    if spicepod_dir != "." {
+        println!("  cd {spicepod_dir}");
+    }
+    println!("  spice dataset configure   # add a dataset interactively");
+    println!("  spice run                 # start the runtime");
+    println!();
+    println!("Docs: https://spiceai.org/docs/");
     Ok(())
 }
 
@@ -110,11 +119,11 @@ fn determine_names(name_arg: &str) -> (String, String) {
 }
 
 /// Create the spicepod.yaml content.
+///
+/// The `yaml-language-server` directive enables schema validation + completion in
+/// editors (VS Code, Neovim with coc/yaml, IntelliJ) without any extra setup.
 fn create_spicepod_yaml(name: &str) -> String {
     format!(
-        r"version: v2
-kind: Spicepod
-name: {name}
-"
+        "# yaml-language-server: $schema=https://raw.githubusercontent.com/spiceai/spiceai/trunk/.schema/spicepod.schema.json\nversion: v2\nkind: Spicepod\nname: {name}\n"
     )
 }

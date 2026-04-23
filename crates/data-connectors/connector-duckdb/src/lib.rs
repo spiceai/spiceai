@@ -130,7 +130,14 @@ impl DuckDBFactory {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::component("open")];
+const DUCKDB_DOCS: &str = "https://spiceai.org/docs/components/data-connectors/duckdb";
+
+const PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec::component("open")
+        .description("Path to the DuckDB database file to open. Use ':memory:' for an in-memory database.")
+        .examples(&["/var/lib/spice/analytics.db", ":memory:"])
+        .help_link(DUCKDB_DOCS),
+];
 
 impl DataConnectorFactory for DuckDBFactory {
     fn as_any(&self) -> &dyn Any {
