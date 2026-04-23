@@ -7001,6 +7001,7 @@ name = "elasticsearch"
 version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
+ "bytes",
  "reqwest 0.12.24",
  "serde",
  "serde_json",
@@ -15961,6 +15962,7 @@ dependencies = [
  "db_connection_pool",
  "document_parse",
  "duckdb",
+ "duration-parse",
  "dynamodb-streams",
  "elasticsearch",
  "event_stream",

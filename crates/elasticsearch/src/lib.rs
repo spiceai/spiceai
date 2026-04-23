@@ -21,6 +21,7 @@ limitations under the License.
 //! Provides typed access to the Elasticsearch APIs needed by the data connector:
 //! index mappings, search (query DSL, kNN, full-text), and bulk operations.
 
+use bytes::Bytes;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -38,14 +39,30 @@ pub enum Error {
     #[snafu(display("Failed to parse JSON response: {source}"))]
     JsonParse { source: reqwest::Error },
 
-    #[snafu(display("Elasticsearch error: {message}"))]
-    ElasticsearchError { message: String },
+    #[snafu(display("Elasticsearch error (HTTP {status}): {message}"))]
+    ElasticsearchError { status: u16, message: String },
 
     #[snafu(display("Invalid URL: {source}"))]
     InvalidUrl { source: url::ParseError },
 
     #[snafu(display("Failed to serialize JSON: {source}"))]
     JsonSerialize { source: serde_json::Error },
+}
+
+impl Error {
+    /// Returns true if this error represents a transient condition that may
+    /// succeed on retry. Transient includes HTTP 429 (too many requests), any
+    /// 5xx response (500–599), or a timed-out/connect-reset transport error.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Error::ElasticsearchError { status, .. } => {
+                *status == 429 || (500..=599).contains(status)
+            }
+            Error::HttpRequest { source } => source.is_timeout() || source.is_connect(),
+            _ => false,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -140,6 +157,43 @@ pub struct Client {
     base_url: String,
     username: Option<String>,
     password: Option<String>,
+    retry: RetryConfig,
+}
+
+/// Configuration for retrying transient Elasticsearch errors (HTTP 429 / 5xx).
+#[derive(Debug, Clone, Copy)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts after the initial request. `0` disables retries.
+    pub max_retries: u32,
+    /// Initial backoff delay; each subsequent retry doubles the delay (capped at 30s).
+    pub initial_backoff: Duration,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            initial_backoff: Duration::from_millis(200),
+        }
+    }
+}
+
+/// Builder-style options for [`Client::new_with_options`].
+#[derive(Debug, Clone)]
+pub struct ClientOptions {
+    pub connect_timeout: Duration,
+    pub request_timeout: Duration,
+    pub retry: RetryConfig,
+}
+
+impl Default for ClientOptions {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(30),
+            retry: RetryConfig::default(),
+        }
+    }
 }
 
 impl Client {
@@ -147,6 +201,16 @@ impl Client {
     ///
     /// Optional basic-auth credentials are applied to every request.
     pub fn new(base_url: &str, username: Option<&str>, password: Option<&str>) -> Result<Self> {
+        Self::new_with_options(base_url, username, password, &ClientOptions::default())
+    }
+
+    /// Create a new client with explicit timeout and retry configuration.
+    pub fn new_with_options(
+        base_url: &str,
+        username: Option<&str>,
+        password: Option<&str>,
+        opts: &ClientOptions,
+    ) -> Result<Self> {
         // Validate the URL.
         let _: Url = base_url.parse().context(InvalidUrlSnafu)?;
 
@@ -156,8 +220,8 @@ impl Client {
         let http = reqwest::Client::builder()
             .default_headers(headers)
             .user_agent(concat!("spiceai/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
+            .connect_timeout(opts.connect_timeout)
+            .timeout(opts.request_timeout)
             .build()
             .context(HttpRequestSnafu)?;
 
@@ -166,6 +230,7 @@ impl Client {
             base_url: base_url.trim_end_matches('/').to_string(),
             username: username.map(ToString::to_string),
             password: password.map(ToString::to_string),
+            retry: opts.retry,
         })
     }
 
@@ -175,6 +240,39 @@ impl Client {
             (Some(user), Some(pass)) => req.basic_auth(user, Some(pass)),
             (Some(user), None) => req.basic_auth(user, None::<&str>),
             _ => req,
+        }
+    }
+
+    /// Retry `f` on transient errors (HTTP 429/5xx, connect/timeout) with
+    /// exponential backoff. Bounded by `self.retry.max_retries`.
+    ///
+    /// Retry is opt-in per call site: only operations that wrap their request
+    /// in `with_retry` are retried. Today this is scoped to `bulk_index`, which
+    /// is the hot ingestion path. Other operations (`search`, `index_exists`,
+    /// `create_index`, `put_mapping`, `get_mapping`, `index_document`) bypass
+    /// retries to keep startup/query failures fast and attributable.
+    async fn with_retry<'a, F, Fut, T>(&'a self, op: &'static str, mut f: F) -> Result<T>
+    where
+        F: FnMut(&'a Self) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let mut backoff = self.retry.initial_backoff;
+        let mut attempt: u32 = 0;
+        loop {
+            match f(self).await {
+                Ok(v) => return Ok(v),
+                Err(e) if attempt < self.retry.max_retries && e.is_transient() => {
+                    tracing::warn!(
+                        "Elasticsearch {op} attempt {n}/{max} failed with transient error; retrying after {backoff:?}: {e}",
+                        n = attempt + 1,
+                        max = self.retry.max_retries + 1,
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                    backoff = std::cmp::min(backoff.saturating_mul(2), Duration::from_secs(30));
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
 
@@ -224,6 +322,68 @@ impl Client {
         resp.json().await.context(JsonParseSnafu)
     }
 
+    // ── Index Management ───────────────────────────────────────────────
+
+    /// Check whether an index exists via `HEAD /<index>`.
+    pub async fn index_exists(&self, index: &str) -> Result<bool> {
+        let url = format!("{}/{}", self.base_url, index);
+        let resp = self
+            .auth(self.http.head(&url))
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(true);
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .replace(['\n', '\r'], " ");
+        Err(Error::ElasticsearchError {
+            status: status.as_u16(),
+            message: body.trim().to_string(),
+        })
+    }
+
+    /// Create an index with the provided mapping/settings body via `PUT /<index>`.
+    pub async fn create_index(
+        &self,
+        index: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}/{}", self.base_url, index);
+        let resp = self
+            .auth(self.http.put(&url))
+            .json(body)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        let resp = check_status(resp).await?;
+        resp.json().await.context(JsonParseSnafu)
+    }
+
+    /// Update the mapping of an existing index via `PUT /<index>/_mapping`.
+    pub async fn put_mapping(
+        &self,
+        index: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}/{}/_mapping", self.base_url, index);
+        let resp = self
+            .auth(self.http.put(&url))
+            .json(body)
+            .send()
+            .await
+            .context(HttpRequestSnafu)?;
+        let resp = check_status(resp).await?;
+        resp.json().await.context(JsonParseSnafu)
+    }
+
     // ── Document CRUD ──────────────────────────────────────────────────
 
     /// Index (upsert) a single document.
@@ -263,16 +423,24 @@ impl Client {
             ndjson.push_str(&serde_json::to_string(doc).context(JsonSerializeSnafu)?);
             ndjson.push('\n');
         }
-
-        let resp = self
-            .auth(self.http.post(&url))
-            .header(CONTENT_TYPE, "application/x-ndjson")
-            .body(ndjson)
-            .send()
-            .await
-            .context(HttpRequestSnafu)?;
-        let resp = check_status(resp).await?;
-        resp.json().await.context(JsonParseSnafu)
+        let url_ref = &url;
+        // Freeze the NDJSON payload into `Bytes` so retries reuse the same
+        // underlying buffer (cheap refcount clone) instead of copying the
+        // entire payload on every attempt.
+        let ndjson_bytes = Bytes::from(ndjson);
+        let ndjson_ref = &ndjson_bytes;
+        self.with_retry("bulk_index", |c| async move {
+            let resp = c
+                .auth(c.http.post(url_ref))
+                .header(CONTENT_TYPE, "application/x-ndjson")
+                .body(ndjson_ref.clone())
+                .send()
+                .await
+                .context(HttpRequestSnafu)?;
+            let resp = check_status(resp).await?;
+            resp.json().await.context(JsonParseSnafu)
+        })
+        .await
     }
 }
 
@@ -285,7 +453,8 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response> {
             .unwrap_or_default()
             .replace(['\n', '\r'], " ");
         return Err(Error::ElasticsearchError {
-            message: format!("HTTP {status}: {}", body.trim()),
+            status: status.as_u16(),
+            message: body.trim().to_string(),
         });
     }
     Ok(resp)
@@ -328,6 +497,14 @@ pub trait Elasticsearch: std::fmt::Debug + Send + Sync {
     async fn get_mapping(&self, index: &str) -> Result<MappingResponse>;
     async fn search(&self, index: &str, body: &SearchRequest) -> Result<SearchResponse>;
     async fn search_raw(&self, index: &str, body: &serde_json::Value) -> Result<SearchResponse>;
+    async fn index_exists(&self, index: &str) -> Result<bool>;
+    async fn create_index(
+        &self,
+        index: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value>;
+    async fn put_mapping(&self, index: &str, body: &serde_json::Value)
+    -> Result<serde_json::Value>;
     async fn index_document(
         &self,
         index: &str,
@@ -353,6 +530,26 @@ impl Elasticsearch for Client {
 
     async fn search_raw(&self, index: &str, body: &serde_json::Value) -> Result<SearchResponse> {
         self.search_raw(index, body).await
+    }
+
+    async fn index_exists(&self, index: &str) -> Result<bool> {
+        self.index_exists(index).await
+    }
+
+    async fn create_index(
+        &self,
+        index: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.create_index(index, body).await
+    }
+
+    async fn put_mapping(
+        &self,
+        index: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.put_mapping(index, body).await
     }
 
     async fn index_document(
