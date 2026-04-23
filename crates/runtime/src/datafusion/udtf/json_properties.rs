@@ -968,11 +968,10 @@ fn decode_flatten_options(json: &str) -> DataFusionResult<FlattenOptions> {
     if let Some(b) = v.get("expand_maps").and_then(Value::as_bool) {
         opts.expand_maps = b;
     }
-    if let Some(s) = v.get("map_wildcard").and_then(Value::as_str) {
-        if !s.is_empty() {
+    if let Some(s) = v.get("map_wildcard").and_then(Value::as_str)
+        && !s.is_empty() {
             opts.map_wildcard = s.to_owned();
         }
-    }
     Ok(opts)
 }
 
@@ -1223,12 +1222,11 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
         // code paths that bypass simplify (e.g. unit tests calling invoke_with_args directly).
         let mut opts = FlattenOptions::default();
         let mut decoded_from_json = false;
-        if let Some(ColumnarValue::Scalar(ScalarValue::Utf8(Some(json)))) = args.args.get(1) {
-            if json.trim_start().starts_with('{') {
+        if let Some(ColumnarValue::Scalar(ScalarValue::Utf8(Some(json)))) = args.args.get(1)
+            && json.trim_start().starts_with('{') {
                 opts = decode_flatten_options(json)?;
                 decoded_from_json = true;
             }
-        }
         if !decoded_from_json {
             for (val, field) in args.args.iter().zip(args.arg_fields.iter()).skip(1) {
                 let scalar = match val {
