@@ -517,13 +517,14 @@ fn payload_to_bytes(payload: &PutPayload) -> Vec<u8> {
 /// so the driver can walk the parent and apply a starts-with filter on
 /// the first-level children. Empty prefix returns `(root, None)`.
 fn split_prefix(prefix: &Path) -> (Path, Option<String>) {
-    let parts: Vec<String> = prefix.parts().map(|p| p.as_ref().to_string()).collect();
-    if parts.is_empty() {
-        return (Path::from(""), None);
+    let mut parts: Vec<String> = prefix.parts().map(|p| p.as_ref().to_string()).collect();
+    match parts.pop() {
+        None => (Path::from(""), None),
+        Some(last) => {
+            let parent: Path = parts.iter().map(String::as_str).collect();
+            (parent, Some(last))
+        }
     }
-    let (last, rest) = parts.split_last().expect("non-empty");
-    let parent: Path = rest.iter().map(String::as_str).collect();
-    (parent, Some(last.clone()))
 }
 
 fn resolve_range(range: &GetRange, total_size: u64) -> std::ops::Range<u64> {
