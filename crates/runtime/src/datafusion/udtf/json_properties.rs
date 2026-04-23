@@ -1001,9 +1001,7 @@ fn decode_flatten_options(json: &str) -> DataFusionResult<FlattenOptions> {
 
 fn decode_usize(name: &str, v: &Value) -> DataFusionResult<usize> {
     let n = v.as_u64().ok_or_else(|| {
-        DataFusionError::Plan(format!(
-            "{name} must be a non-negative integer, got {v}"
-        ))
+        DataFusionError::Plan(format!("{name} must be a non-negative integer, got {v}"))
     })?;
     usize::try_from(n)
         .map_err(|_| DataFusionError::Plan(format!("{name} value {n} does not fit in usize")))
@@ -2076,8 +2074,7 @@ mod tests {
             vec![Arc::new(StringArray::from(vec![schema_with_map])) as ArrayRef],
         )
         .expect("record batch");
-        let table =
-            MemTable::try_new(arrow_schema, vec![vec![batch]]).expect("memtable");
+        let table = MemTable::try_new(arrow_schema, vec![vec![batch]]).expect("memtable");
         ctx.register_table("schemas", Arc::new(table))
             .expect("register table");
 
