@@ -120,13 +120,11 @@ regex.workspace = true
 reqwest.workspace = true
 rmcp = { workspace = true, optional = true, features = [
     "client",
-    "reqwest",
     "server",
-    "transport-sse-server",
     "transport-io",
-    "transport-sse-client",
     "transport-child-process",
     "transport-streamable-http-server",
+    "transport-streamable-http-client-reqwest",
 ] }
 runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-api-types = { path = "../runtime-api-types" }
