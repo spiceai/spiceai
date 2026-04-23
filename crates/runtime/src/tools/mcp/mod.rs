@@ -56,7 +56,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MCPType {
-    /// Connect to an MCP server over HTTP(s) SSE protocol.
+    /// Connect to an MCP server over Streamable HTTP.
     Https(url::Url),
 
     /// Uses stdio to communicate with an MCP server. The string is the command to run.
@@ -109,6 +109,79 @@ impl MCPConfig {
                 Self::Stdio { command, args, env }
             }
             MCPType::Https(url) => Self::Https { url },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_type_parses_stdio_command() {
+        let t = MCPType::from_str("docker").expect("valid stdio MCP directive");
+        match t {
+            MCPType::Stdio(cmd) => assert_eq!(cmd, "docker"),
+            MCPType::Https(_) => panic!("expected stdio variant"),
+        }
+    }
+
+    #[test]
+    fn mcp_type_parses_https_url() {
+        let t = MCPType::from_str("https://example.com/v1/mcp").expect("valid https MCP directive");
+        match t {
+            MCPType::Https(url) => {
+                assert_eq!(url.scheme(), "https");
+                assert_eq!(url.host_str(), Some("example.com"));
+                assert_eq!(url.path(), "/v1/mcp");
+            }
+            MCPType::Stdio(_) => panic!("expected https variant"),
+        }
+    }
+
+    #[test]
+    fn mcp_type_parses_http_url_for_localhost() {
+        let t = MCPType::from_str("http://127.0.0.1:8090/v1/mcp")
+            .expect("valid http MCP directive for localhost");
+        match t {
+            MCPType::Https(url) => {
+                assert_eq!(url.scheme(), "http");
+                assert_eq!(url.path(), "/v1/mcp");
+            }
+            MCPType::Stdio(_) => panic!("expected https variant"),
+        }
+    }
+
+    #[test]
+    fn mcp_config_from_stdio_collects_args_and_env() {
+        let mcp_type = MCPType::Stdio("docker".to_string());
+        let mut params = HashMap::new();
+        params.insert(
+            "mcp_args".to_string(),
+            SecretString::from("run -i --rm mcp/fetch"),
+        );
+        let mut env = HashMap::new();
+        env.insert("FOO".to_string(), SecretString::from("bar"));
+
+        let cfg = MCPConfig::from_type(&mcp_type, &params, &env);
+        match cfg {
+            MCPConfig::Stdio { command, args, env } => {
+                assert_eq!(command, "docker");
+                assert_eq!(args, vec!["run", "-i", "--rm", "mcp/fetch"]);
+                assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+            }
+            MCPConfig::Https { .. } => panic!("expected stdio config"),
+        }
+    }
+
+    #[test]
+    fn mcp_config_from_https_preserves_url() {
+        let url = url::Url::parse("https://example.com/v1/mcp").expect("valid url");
+        let mcp_type = MCPType::Https(url.clone());
+        let cfg = MCPConfig::from_type(&mcp_type, &HashMap::new(), &HashMap::new());
+        match cfg {
+            MCPConfig::Https { url: u } => assert_eq!(u, url),
+            MCPConfig::Stdio { .. } => panic!("expected https config"),
         }
     }
 }

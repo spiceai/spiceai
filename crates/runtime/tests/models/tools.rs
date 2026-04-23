@@ -59,14 +59,14 @@ params:
         Ok(())
     }
 
-    /// Test that spiced can connect to an SSE MCP server, as well as be an MCP server.
+    /// Test that spiced can connect to a Streamable HTTP MCP server, as well as be an MCP server.
     #[tokio::test]
-    async fn test_mcp_sse() -> Result<(), anyhow::Error> {
+    async fn test_mcp_streamable_http() -> Result<(), anyhow::Error> {
         let http_server_url = start_spiced_with_tools(vec![])
             .await
             .expect("Failed to start spiced with tools");
 
-        let tool_yaml = format!("name: mcp_from_spiced\nfrom: mcp:{http_server_url}/v1/mcp/sse");
+        let tool_yaml = format!("name: mcp_from_spiced\nfrom: mcp:{http_server_url}/v1/mcp");
         let http_client_url = start_spiced_with_tools(vec![
             yaml::from_str(tool_yaml.as_str())
                 .expect("Tool spicepod component is not in expected format"),
@@ -76,6 +76,77 @@ params:
 
         let tools_list = call_tool_list(http_client_url.as_str()).await?;
         assert_json_snapshot!("mcp_spiced_list", tools_list);
+
+        Ok(())
+    }
+
+    /// Test the MCP Streamable HTTP server endpoint directly via JSON-RPC,
+    /// without going through the rmcp client. This verifies the wire format
+    /// (`POST /v1/mcp` with `Accept: application/json, text/event-stream`)
+    /// and the `initialize` handshake.
+    #[tokio::test]
+    async fn test_mcp_streamable_http_initialize() -> Result<(), anyhow::Error> {
+        let http_server_url = start_spiced_with_tools(vec![])
+            .await
+            .expect("Failed to start spiced with tools");
+
+        let client = reqwest::Client::new();
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "spice-integration-test",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            },
+        });
+
+        let resp = client
+            .post(format!("{http_server_url}/v1/mcp"))
+            .header(ACCEPT, "application/json, text/event-stream")
+            .header(CONTENT_TYPE, "application/json")
+            .json(&init_body)
+            .send()
+            .await?;
+
+        assert!(
+            resp.status().is_success(),
+            "initialize returned non-success status: {}",
+            resp.status()
+        );
+        assert!(
+            resp.headers().get("mcp-session-id").is_some(),
+            "initialize response missing Mcp-Session-Id header"
+        );
+
+        // Response may be SSE-framed or plain JSON depending on server policy.
+        let body = resp.text().await?;
+        let json_str = body
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap_or(body.as_str());
+        let v: Value = serde_json::from_str(json_str)
+            .map_err(|e| anyhow::anyhow!("Failed to parse initialize response '{body}': {e}"))?;
+        assert_eq!(v.get("jsonrpc"), Some(&Value::String("2.0".to_string())));
+        assert_eq!(v.get("id"), Some(&Value::Number(1.into())));
+        let result = v
+            .get("result")
+            .expect("initialize response missing 'result'");
+        assert_eq!(
+            result.get("serverInfo").and_then(|s| s.get("name")),
+            Some(&Value::String("Spice.ai Open Source".to_string()))
+        );
+        assert!(
+            result
+                .get("capabilities")
+                .and_then(|c| c.get("tools"))
+                .is_some(),
+            "initialize result missing tools capability: {result}"
+        );
 
         Ok(())
     }

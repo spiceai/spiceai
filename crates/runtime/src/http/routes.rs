@@ -159,7 +159,7 @@ Session continuity is carried via the `Mcp-Session-Id` header.",
 // 1. DEFAULT_REQUEST_BODY_LIMIT (128 MiB) - for all authenticated endpoints (queries, chat, embeddings)
 //    Applied as a route layer to the entire authenticated router to allow reasonable payload sizes for SQL INSERT operations and LLM requests
 // 2. MCP_REQUEST_BODY_LIMIT (32 MiB) - for Model Context Protocol (MCP) endpoints
-//    Applied to /v1/mcp/sse routes to support MCP message payloads while preventing excessive memory usage
+//    Applied to /v1/mcp routes to support MCP message payloads while preventing excessive memory usage
 // 3. HEALTH_REQUEST_BODY_LIMIT (128 KiB) - strict limit for unauthenticated endpoints (health checks, ready checks)
 //    Applied to unauthenticated routes to prevent DoS via health check endpoints
 const DEFAULT_REQUEST_BODY_LIMIT: usize = 128 * 1024 * 1024; // 128 MiB
