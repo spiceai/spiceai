@@ -493,7 +493,7 @@ mod tests {
     async fn test_validate_update_operation_blocked() {
         let df = create_test_datafusion();
 
-        let sql = "UPDATE tbl_writable SET name = 'updated' WHERE id = 1";
+        let sql = "UPDATE tbl_read_only SET name = 'updated' WHERE id = 1";
         let plan = df
             .ctx
             .state()
@@ -501,9 +501,12 @@ mod tests {
             .await
             .expect("plan should be created");
 
-        // UPDATE operations should be blocked
+        // UPDATE on a read-only dataset should be blocked
         let result = validate_sql_query_operations(&plan, &df);
-        assert!(result.is_err(), "UPDATE operations should be blocked");
+        assert!(
+            result.is_err(),
+            "UPDATE operations should be blocked on read-only datasets"
+        );
     }
 
     #[tokio::test]
