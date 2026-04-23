@@ -225,6 +225,44 @@ impl TursoMetastore {
             PRIMARY KEY (table_id, snapshot_id)
         )
     ";
+
+    /// Schema for the `cayenne_table_statistics` table.
+    const TABLE_STATISTICS_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_table_statistics (
+            table_id TEXT NOT NULL PRIMARY KEY,
+            statistics_blob BLOB NOT NULL,
+            num_rows BIGINT NOT NULL DEFAULT 0,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
+
+    const INLINED_DATA_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_inlined_data (
+            inlined_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
+            partition_key TEXT,
+            data_ipc BLOB NOT NULL,
+            record_count BIGINT NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
+
+    const INLINED_DELETE_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_inlined_delete (
+            inlined_id TEXT PRIMARY KEY,
+            table_id TEXT NOT NULL,
+            delete_ipc BLOB NOT NULL,
+            delete_count BIGINT NOT NULL,
+            sequence_number BIGINT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE
+        )
+    ";
+
+    const INLINED_DATA_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_data_table_seq ON cayenne_inlined_data(table_id, sequence_number)";
+    const INLINED_DELETE_INDEX_DDL: &'static str = "CREATE INDEX IF NOT EXISTS idx_cayenne_inlined_delete_table_seq ON cayenne_inlined_delete(table_id, sequence_number)";
 }
 
 /// Turso row wrapper implementing `MetastoreRow`.
@@ -343,13 +381,16 @@ impl MetastoreBackend for TursoMetastore {
 
         // Create tables
         let schema_sql = format!(
-            "{}; {}; {}; {}; {}; {};",
+            "{}; {}; {}; {}; {}; {}; {}; {}; {};",
             Self::TABLE_TABLE_DDL,
             Self::TABLE_NAME_UNIQUE_INDEX_DDL,
             Self::DELETE_FILE_TABLE_DDL,
             Self::PARTITION_TABLE_DDL,
             Self::INSERT_RECORD_TABLE_DDL,
-            Self::SNAPSHOT_SEQUENCE_TABLE_DDL
+            Self::SNAPSHOT_SEQUENCE_TABLE_DDL,
+            Self::TABLE_STATISTICS_DDL,
+            Self::INLINED_DATA_TABLE_DDL,
+            Self::INLINED_DELETE_TABLE_DDL
         );
 
         conn.execute_batch(&schema_sql)
@@ -362,6 +403,17 @@ impl MetastoreBackend for TursoMetastore {
             .await
             .map_err(|e| CatalogError::Database {
                 message: duplicate_delete_file_index_error_message("Turso/libSQL", e),
+            })?;
+
+        conn.execute(Self::INLINED_DATA_INDEX_DDL, ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to create inlined_data index: {e}"),
+            })?;
+        conn.execute(Self::INLINED_DELETE_INDEX_DDL, ())
+            .await
+            .map_err(|e| CatalogError::Database {
+                message: format!("Failed to create inlined_delete index: {e}"),
             })?;
 
         // Attempt to backfill newly added columns for existing deployments. Errors are ignored

@@ -303,6 +303,78 @@ pub struct CreateTableOptions {
     pub vortex_config: VortexConfig,
 }
 
+/// Table-level statistics stored as a serialized Vortex [`FileStatistics`] blob.
+///
+/// Stores per-column statistics (min, max, null count, sum, etc.) captured from
+/// the most recent write (the write's `ColumnStatsAccumulator`). The row in
+/// `cayenne_table_statistics` is keyed by `table_id` and upserted on every write,
+/// so entries represent last-write-wins snapshots rather than aggregates across
+/// every file ever produced; a future change will merge new writes into the
+/// existing blob.
+///
+/// Consumers should treat these values as optimization hints only. Uses Vortex's
+/// native statistics format for zero-conversion overhead and compatibility with
+/// the Vortex file footer statistics.
+///
+/// [`FileStatistics`]: vortex::file::FileStatistics
+#[derive(Debug, Clone)]
+pub struct TableStatistics {
+    /// Table this stats entry belongs to (`UUIDv7`)
+    pub table_id: String,
+    /// Serialized Vortex `FileStatistics` flatbuffer bytes. Today the write
+    /// path populates only min, max, and null count per column; other fields
+    /// supported by the Vortex format (sum, NaN count, `is_constant`, etc.)
+    /// remain `Absent` until future writer work fills them in.
+    pub statistics_blob: Vec<u8>,
+    /// Row count captured by the most recent write's accumulator (not an
+    /// aggregate across every file ever produced — see the struct docs).
+    pub num_rows: i64,
+}
+
+/// A small batch of insert data inlined directly in the metastore.
+///
+/// For streaming workloads that produce many tiny writes, storing data as
+/// Arrow IPC blobs in the catalog avoids the overhead of creating individual
+/// Vortex files. A checkpoint operation flushes accumulated inline data to
+/// consolidated Vortex files when the total size exceeds a threshold.
+#[derive(Debug, Clone)]
+pub struct InlinedData {
+    /// Unique identifier for this inlined entry (`UUIDv7`)
+    pub inlined_id: String,
+    /// Table this data belongs to (`UUIDv7`)
+    pub table_id: String,
+    /// Partition key (for partitioned tables), `None` for non-partitioned
+    pub partition_key: Option<String>,
+    /// Arrow IPC serialized `RecordBatch`
+    pub data_ipc: Vec<u8>,
+    /// Number of rows in this batch
+    pub record_count: i64,
+    /// Sequence number when this data was inlined
+    pub sequence_number: i64,
+    /// ISO 8601 timestamp of when this entry was created
+    pub created_at: String,
+}
+
+/// A small batch of delete identifiers inlined in the metastore.
+///
+/// Mirrors `InlinedData` but for deletions. Stores deletion identifiers
+/// (row IDs or primary key bytes) as Arrow IPC blobs.
+#[derive(Debug, Clone)]
+pub struct InlinedDelete {
+    /// Unique identifier for this inlined entry (`UUIDv7`)
+    pub inlined_id: String,
+    /// Table this delete belongs to (`UUIDv7`)
+    pub table_id: String,
+    /// Arrow IPC serialized deletion identifiers
+    pub delete_ipc: Vec<u8>,
+    /// Number of deleted rows in this batch
+    pub delete_count: i64,
+    /// Sequence number when this delete was inlined
+    pub sequence_number: i64,
+    /// ISO 8601 timestamp
+    pub created_at: String,
+}
+
 /// Configuration for an external object store (e.g., S3).
 #[derive(Debug, Clone)]
 pub struct ObjectStoreConfig {
