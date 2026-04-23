@@ -943,36 +943,80 @@ fn encode_flatten_options(opts: &FlattenOptions) -> String {
     .to_string()
 }
 
+/// Decode the JSON options blob produced by [`encode_flatten_options`].
+///
+/// Strict: unknown fields, wrong types, and out-of-range numeric values all
+/// produce a `DataFusionError::Plan` rather than silently falling back to
+/// defaults. Data correctness demands that a malformed options literal never
+/// silently changes flatten semantics.
 fn decode_flatten_options(json: &str) -> DataFusionResult<FlattenOptions> {
     let v: Value = serde_json::from_str(json)
         .map_err(|e| DataFusionError::Plan(format!("failed to decode flatten options: {e}")))?;
+    let obj = v.as_object().ok_or_else(|| {
+        DataFusionError::Plan("flatten options literal must be a JSON object".to_owned())
+    })?;
+
     let mut opts = FlattenOptions::default();
-    if let Some(n) = v.get("max_depth").and_then(Value::as_u64) {
-        opts.max_depth = n as usize;
-    }
-    if let Some(n) = v.get("max_rows").and_then(Value::as_u64) {
-        opts.max_rows = n as usize;
-    }
-    if let Some(n) = v.get("max_bytes").and_then(Value::as_u64) {
-        opts.max_bytes = n as usize;
-    }
-    if let Some(s) = v.get("dialect").and_then(Value::as_str) {
-        opts.dialect = Dialect::parse(s).unwrap_or(Dialect::JsonSchema);
-    }
-    if let Some(b) = v.get("include_internal").and_then(Value::as_bool) {
-        opts.include_internal = b;
-    }
-    if let Some(s) = v.get("path_style").and_then(Value::as_str) {
-        opts.path_style = PathStyle::parse(s).unwrap_or(PathStyle::Dot);
-    }
-    if let Some(b) = v.get("expand_maps").and_then(Value::as_bool) {
-        opts.expand_maps = b;
-    }
-    if let Some(s) = v.get("map_wildcard").and_then(Value::as_str)
-        && !s.is_empty() {
-            opts.map_wildcard = s.to_owned();
+    for (key, val) in obj {
+        match key.as_str() {
+            "max_depth" => opts.max_depth = decode_usize(key, val)?,
+            "max_rows" => opts.max_rows = decode_usize(key, val)?,
+            "max_bytes" => opts.max_bytes = decode_usize(key, val)?,
+            "dialect" => {
+                let s = decode_str(key, val)?;
+                opts.dialect = Dialect::parse(s).ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Unknown dialect '{s}'. Expected 'json-schema' or 'openapi'."
+                    ))
+                })?;
+            }
+            "include_internal" => opts.include_internal = decode_bool(key, val)?,
+            "path_style" => {
+                let s = decode_str(key, val)?;
+                opts.path_style = PathStyle::parse(s).ok_or_else(|| {
+                    DataFusionError::Plan(format!(
+                        "Unknown path_style '{s}'. Expected 'dot' or 'json-pointer'."
+                    ))
+                })?;
+            }
+            "expand_maps" => opts.expand_maps = decode_bool(key, val)?,
+            "map_wildcard" => {
+                let s = decode_str(key, val)?;
+                if s.is_empty() {
+                    return Err(DataFusionError::Plan(
+                        "map_wildcard must be a non-empty string (e.g. '[*]').".to_owned(),
+                    ));
+                }
+                opts.map_wildcard = s.to_owned();
+            }
+            other => {
+                return Err(DataFusionError::Plan(format!(
+                    "Unknown option '{other}' in flatten options literal."
+                )));
+            }
         }
+    }
     Ok(opts)
+}
+
+fn decode_usize(name: &str, v: &Value) -> DataFusionResult<usize> {
+    let n = v.as_u64().ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "{name} must be a non-negative integer, got {v}"
+        ))
+    })?;
+    usize::try_from(n)
+        .map_err(|_| DataFusionError::Plan(format!("{name} value {n} does not fit in usize")))
+}
+
+fn decode_bool(name: &str, v: &Value) -> DataFusionResult<bool> {
+    v.as_bool()
+        .ok_or_else(|| DataFusionError::Plan(format!("{name} must be a boolean, got {v}")))
+}
+
+fn decode_str<'a>(name: &str, v: &'a Value) -> DataFusionResult<&'a str> {
+    v.as_str()
+        .ok_or_else(|| DataFusionError::Plan(format!("{name} must be a string, got {v}")))
 }
 
 #[derive(Debug)]
@@ -1218,15 +1262,20 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
             .clone();
 
         // Named args are rewritten by `simplify` into a JSON-encoded Utf8 literal at arg[1]
-        // (always a JSON object starting with `{`). Fall back to reading field.name() for
-        // code paths that bypass simplify (e.g. unit tests calling invoke_with_args directly).
+        // (always a JSON object starting with `{`). Treat JSON decoding as a best-effort
+        // fast path: if the literal doesn't parse as a flatten-options object, fall back
+        // to per-argument parsing below. This matters because some legitimate string
+        // options (notably `map_wildcard`) may also start with `{` when invoke_with_args
+        // is called directly in code paths that bypass `simplify` (e.g. unit tests).
         let mut opts = FlattenOptions::default();
         let mut decoded_from_json = false;
         if let Some(ColumnarValue::Scalar(ScalarValue::Utf8(Some(json)))) = args.args.get(1)
-            && json.trim_start().starts_with('{') {
-                opts = decode_flatten_options(json)?;
-                decoded_from_json = true;
-            }
+            && json.trim_start().starts_with('{')
+            && let Ok(parsed) = decode_flatten_options(json)
+        {
+            opts = parsed;
+            decoded_from_json = true;
+        }
         if !decoded_from_json {
             for (val, field) in args.args.iter().zip(args.arg_fields.iter()).skip(1) {
                 let scalar = match val {
@@ -1243,8 +1292,10 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
         }
 
         let array = input_col.into_array(args.number_rows)?;
-        // Signature restricts input to Utf8/LargeUtf8/Utf8View; normalize to
-        // Utf8 so `as_string_array` below always succeeds.
+        // `coerce_types` rejects non-string first arguments and maps all string
+        // variants to Utf8; normalize here so `as_string_array` below always succeeds.
+        // (The legacy `Utf8View`/`LargeUtf8` branch remains in case upstream DataFusion
+        // bypasses coercion.)
         let normalized = if matches!(array.data_type(), DataType::Utf8) {
             array
         } else {
@@ -1981,6 +2032,80 @@ mod tests {
         assert!(
             !path_set.contains("identityMap.id"),
             "collapsed path must not appear when expand_maps=true"
+        );
+    }
+
+    /// End-to-end SQL test: exercise the `simplify` path by registering the
+    /// scalar UDF in a `SessionContext` and calling it with a `name => value`
+    /// named argument from SQL. This is the actual user-facing path the PR
+    /// fixes — `invoke_with_args` direct calls bypass `simplify`.
+    #[tokio::test]
+    async fn scalar_udf_named_arg_via_sql_session() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::Schema;
+        use arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+        use datafusion::logical_expr::ScalarUDF;
+        use datafusion::prelude::SessionContext;
+
+        let schema_with_map = r#"{
+            "type": "object",
+            "properties": {
+                "identityMap": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "primary": {"type": "boolean"}
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let ctx = SessionContext::new();
+        ctx.register_udf(ScalarUDF::from(FlattenJsonPropertiesScalar::new()));
+
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&arrow_schema),
+            vec![Arc::new(StringArray::from(vec![schema_with_map])) as ArrayRef],
+        )
+        .expect("record batch");
+        let table =
+            MemTable::try_new(arrow_schema, vec![vec![batch]]).expect("memtable");
+        ctx.register_table("schemas", Arc::new(table))
+            .expect("register table");
+
+        // Use the named-arg SQL syntax DataFusion exposes (`name => value`).
+        // This is the planner path that was previously dropping options.
+        let df = ctx
+            .sql(
+                "SELECT a.path FROM schemas s, \
+                 UNNEST(flatten_json_properties(s.body, expand_maps => true)) AS a",
+            )
+            .await
+            .expect("plan and execute SQL with named arg");
+        let batches = df.collect().await.expect("collect results");
+
+        let mut paths: Vec<String> = Vec::new();
+        for b in &batches {
+            let arr = arrow::array::as_string_array(b.column(0));
+            for i in 0..arr.len() {
+                paths.push(arr.value(i).to_owned());
+            }
+        }
+        assert!(
+            paths.iter().any(|p| p.contains("[*]")),
+            "expected [*] wildcard paths via SQL named-arg path, got: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p == "identityMap.id"),
+            "collapsed path must not appear when expand_maps=true via SQL"
         );
     }
 }
