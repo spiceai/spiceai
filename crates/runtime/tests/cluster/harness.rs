@@ -443,7 +443,7 @@ impl ClusterHarnessBuilder {
             .executor_manager
             .clone();
 
-        let executor_registry = scheduler_rt.datafusion().executor_registry.clone();
+        let executor_registry = scheduler_rt.datafusion().executor_registry().cloned();
 
         Ok(ClusterHarness {
             scheduler: scheduler_rt,

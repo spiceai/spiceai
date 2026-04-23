@@ -203,7 +203,7 @@ pub(crate) async fn handle(
 
     // Fast path: for scheduler -> executor Cayenne writes, split by partition
     // and forward to each executor.
-    if let Some(executor_registry) = datafusion.executor_registry.as_ref()
+    if let Some(executor_registry) = datafusion.executor_registry()
         && let Some(partition_expression) = datafusion.get_table_partition_expr(&path).await.map_err(|e| Status::internal(format!(
             "Failed to resolve partition expression for table `{path}` in distributed Cayenne write via Flight: {e}"
         )))?

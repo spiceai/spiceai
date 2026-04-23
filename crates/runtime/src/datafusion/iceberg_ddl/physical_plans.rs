@@ -38,7 +38,7 @@ use spicepod::acceleration::Acceleration;
 
 use super::acceleration_options::DatasetOptions;
 use crate::accelerated_table::AcceleratedTable;
-use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::cluster::ExecutorRegistry;
 use crate::datafusion::DataFusion;
 use crate::datafusion::composed_catalog::ComposedCatalogProvider;
 use data_components::RefreshableCatalogProvider;
@@ -291,7 +291,7 @@ impl ExecutionPlan for IcebergCreateSchemaExec {
                     df.cluster_config.effective_role(),
                     Some(crate::config::ClusterRole::Scheduler)
                 )
-                && let Some(ref registry) = df.executor_registry
+                && let Some(registry) = df.executor_registry()
             {
                 let forward_sql = build_forwarded_create_schema_sql(
                     &df_catalog_name,
@@ -936,7 +936,7 @@ async fn initialize_partition_metadata(
             table_name.to_string(),
         );
         if let Err(error) = registry
-            .federated_partition_manager()
+            .federated_partition_store()
             .initialize_metadata(&table_ref, vec![expr_sql.clone()])
             .await
         {
@@ -961,7 +961,7 @@ async fn synchronize_distributed_write_through_registration(
     };
 
     initialize_partition_metadata(
-        df.executor_registry.as_deref(),
+        df.executor_registry().map(Arc::as_ref),
         catalog_name,
         schema_name,
         table_name,
@@ -972,7 +972,7 @@ async fn synchronize_distributed_write_through_registration(
     if matches!(
         df.cluster_config.effective_role(),
         Some(crate::config::ClusterRole::Scheduler)
-    ) && let Some(ref registry) = df.executor_registry
+    ) && let Some(registry) = df.executor_registry()
     {
         let forward_sql = build_forwarded_create_sql(
             catalog_name,

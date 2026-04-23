@@ -32,7 +32,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use super::get_cayenne_provider;
-use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::cluster::ExecutorRegistry;
 use arrow::array::{RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use cayenne::ddl::operations::{self, create_schema, create_table, drop_table};
@@ -317,7 +317,7 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
 
             // 3. Initialise partition metadata so the scheduler can route queries.
             if let Some(expr_sql) = partition_expr_sql.clone() {
-                let pm = executor_registry.federated_partition_manager();
+                let pm = executor_registry.federated_partition_store();
                 if let Err(e) = pm.initialize_metadata(&table_ref, vec![expr_sql]).await {
                     tracing::warn!(
                         table = %table_ref,
@@ -359,7 +359,7 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
             // 5. Copy partition assignments for LIKE tables.
             let like_detail = if let Some(ref source) = like_source_table {
                 use crate::cluster::partition::CopyAssignmentsResult;
-                let pm = executor_registry.federated_partition_manager();
+                let pm = executor_registry.federated_partition_store();
                 tracing::info!(
                     source = %source,
                     target = %table_ref,

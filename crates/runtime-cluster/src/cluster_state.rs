@@ -25,7 +25,7 @@ limitations under the License.
 //! one document — registered schedulers (without per-tick heartbeat data),
 //! accelerated table partition metadata, and catalog/federated table
 //! partition metadata. Heartbeats live in `heartbeats/{id}.json` and are
-//! managed by [`crate::cluster::heartbeat::SchedulerHeartbeatStore`].
+//! managed by the scheduler heartbeat store.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,7 +39,7 @@ use snafu::{ResultExt, Snafu};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use uuid::Uuid;
 
-use crate::cluster::partition::TablePartitionMetadata;
+use crate::metadata::TablePartitionMetadata;
 
 /// Current schema version for `cluster.json`. Bump if the on-disk shape
 /// changes; readers reject unknown versions.
@@ -52,7 +52,7 @@ const MAX_MUTATE_ATTEMPTS: usize = 8;
 
 /// Logical scheduler identifier (`host:port` style, stable across restarts).
 pub type SchedulerId = String;
-/// Normalized table name as produced by [`crate::cluster::partition::metadata::normalized_table_name`].
+/// Normalized table name as produced by the partition metadata module.
 pub type NormalizedTableName = String;
 
 /// The full distributed cluster state, persisted as a single OCC document.
