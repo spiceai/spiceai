@@ -41,8 +41,8 @@ use datafusion::logical_expr::dml::InsertOp;
 /// destructive writes against the accelerator can leave the source diverged
 /// (or in an inconsistent state under partial replication). Append is the
 /// only mode whose semantics are well-defined for write-back today.
-pub(crate) fn validate_insert_op(overwrite: InsertOp) -> DataFusionResult<()> {
-    match overwrite {
+pub(crate) fn validate_insert_op(insert_op: InsertOp) -> DataFusionResult<()> {
+    match insert_op {
         InsertOp::Append => Ok(()),
         InsertOp::Overwrite | InsertOp::Replace => Err(DataFusionError::Plan(
             "Write-back accelerated tables currently support append writes only".to_string(),

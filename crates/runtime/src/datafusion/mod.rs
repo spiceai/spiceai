@@ -1856,7 +1856,7 @@ impl DataFusion {
             accelerated_table_builder.write_to_accelerator_only();
         }
 
-        // Configure write caching mode for read-write accelerated datasets.
+        // Configure the write mode for read-write accelerated datasets.
         // `on_conflict` declares accelerator-only writes with no source
         // synchronization, so it is incompatible with write-back (which
         // expects the caller to synchronize the federated source via an

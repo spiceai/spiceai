@@ -934,7 +934,10 @@ impl Runtime {
             && !has_on_conflict
             && !has_changes_refresh
         {
-            AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
+            AcceleratedReadWriteTableWithoutReplicationSnafu {
+                dataset_name: ds.name.to_string(),
+            }
+            .fail()?;
         }
 
         // `on_conflict` declares the accelerator as the only write target
