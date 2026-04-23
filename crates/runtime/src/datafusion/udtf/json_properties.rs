@@ -36,9 +36,10 @@ limitations under the License.
 //! - **UDTF** (`register_udtf`) — accepts a literal JSON string and any number
 //!   of named options. Use in the `FROM` clause:
 //!   `SELECT * FROM flatten_json_properties('{...}')`.
-//! - **Scalar UDF** (`register_udf`) — accepts a `Utf8` column and returns
-//!   `List<Struct<...>>`. Use with `UNNEST` for per-row / LATERAL semantics:
-//!   `FROM schemas s, UNNEST(flatten_json_properties(s.body)) AS a`.
+//! - **Scalar UDF** (`register_udf`) — accepts a `Utf8` column and any number
+//!   of the same named options supported by the UDTF. Returns `List<Struct<...>>`.
+//!   Use with `UNNEST` for per-row / LATERAL semantics:
+//!   `FROM schemas s, UNNEST(flatten_json_properties(s.body, expand_maps => true)) AS a`.
 //!
 //! The walker handles:
 //! - `properties` recursion (object → nested objects).
@@ -96,8 +97,9 @@ use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::Result as DataFusionResult;
 use datafusion::datasource::TableType;
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyInfo};
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
@@ -923,6 +925,57 @@ fn parse_utf8(name: &str, v: &ScalarValue) -> DataFusionResult<String> {
     }
 }
 
+fn encode_flatten_options(opts: &FlattenOptions) -> String {
+    let path_style = match opts.path_style {
+        PathStyle::Dot => "dot",
+        PathStyle::JsonPointer => "json-pointer",
+    };
+    serde_json::json!({
+        "max_depth": opts.max_depth,
+        "max_rows": opts.max_rows,
+        "max_bytes": opts.max_bytes,
+        "dialect": opts.dialect.label(),
+        "include_internal": opts.include_internal,
+        "path_style": path_style,
+        "expand_maps": opts.expand_maps,
+        "map_wildcard": opts.map_wildcard,
+    })
+    .to_string()
+}
+
+fn decode_flatten_options(json: &str) -> DataFusionResult<FlattenOptions> {
+    let v: Value = serde_json::from_str(json)
+        .map_err(|e| DataFusionError::Plan(format!("failed to decode flatten options: {e}")))?;
+    let mut opts = FlattenOptions::default();
+    if let Some(n) = v.get("max_depth").and_then(Value::as_u64) {
+        opts.max_depth = n as usize;
+    }
+    if let Some(n) = v.get("max_rows").and_then(Value::as_u64) {
+        opts.max_rows = n as usize;
+    }
+    if let Some(n) = v.get("max_bytes").and_then(Value::as_u64) {
+        opts.max_bytes = n as usize;
+    }
+    if let Some(s) = v.get("dialect").and_then(Value::as_str) {
+        opts.dialect = Dialect::parse(s).unwrap_or(Dialect::JsonSchema);
+    }
+    if let Some(b) = v.get("include_internal").and_then(Value::as_bool) {
+        opts.include_internal = b;
+    }
+    if let Some(s) = v.get("path_style").and_then(Value::as_str) {
+        opts.path_style = PathStyle::parse(s).unwrap_or(PathStyle::Dot);
+    }
+    if let Some(b) = v.get("expand_maps").and_then(Value::as_bool) {
+        opts.expand_maps = b;
+    }
+    if let Some(s) = v.get("map_wildcard").and_then(Value::as_str) {
+        if !s.is_empty() {
+            opts.map_wildcard = s.to_owned();
+        }
+    }
+    Ok(opts)
+}
+
 #[derive(Debug)]
 pub struct FlattenJsonPropertiesTable {
     schema: SchemaRef,
@@ -1039,16 +1092,26 @@ impl Default for FlattenJsonPropertiesScalar {
 impl FlattenJsonPropertiesScalar {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            signature: Signature::one_of(
-                vec![
-                    TypeSignature::Exact(vec![DataType::Utf8]),
-                    TypeSignature::Exact(vec![DataType::LargeUtf8]),
-                    TypeSignature::Exact(vec![DataType::Utf8View]),
-                ],
-                Volatility::Immutable,
-            ),
-        }
+        // "input" must be first — DataFusion maps parameter_names 1:1 to positional
+        // positions, so arg 0 needs a name before the named options can follow.
+        let param_names = vec![
+            "input".to_string(),
+            "max_depth".to_string(),
+            "max_rows".to_string(),
+            "max_bytes".to_string(),
+            "dialect".to_string(),
+            "include_internal".to_string(),
+            "path_style".to_string(),
+            "expand_maps".to_string(),
+            "map_wildcard".to_string(),
+        ];
+        let signature = match Signature::user_defined(Volatility::Immutable)
+            .with_parameter_names(param_names)
+        {
+            Ok(sig) => sig,
+            Err(_) => Signature::variadic_any(Volatility::Immutable),
+        };
+        Self { signature }
     }
 }
 
@@ -1083,6 +1146,56 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
         Ok(ROW_LIST_TYPE.clone())
     }
 
+    fn coerce_types(&self, arg_types: &[DataType]) -> DataFusionResult<Vec<DataType>> {
+        let first = arg_types.first().ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "{FLATTEN_JSON_PROPERTIES_UDTF_NAME}() requires a JSON string argument."
+            ))
+        })?;
+        // Normalize all string variants to Utf8; reject non-string first arg.
+        let input_type = match first {
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => DataType::Utf8,
+            other => {
+                return Err(DataFusionError::Plan(format!(
+                    "{FLATTEN_JSON_PROPERTIES_UDTF_NAME}(): first argument must be a string (Utf8/LargeUtf8/Utf8View), got {other}"
+                )));
+            }
+        };
+        // Named option args are passed through unchanged (Bool, Int*, Utf8).
+        let mut coerced = vec![input_type];
+        coerced.extend_from_slice(&arg_types[1..]);
+        Ok(coerced)
+    }
+
+    fn simplify(
+        &self,
+        args: Vec<Expr>,
+        _info: &dyn SimplifyInfo,
+    ) -> DataFusionResult<ExprSimplifyResult> {
+        // No named args to rewrite; nothing to simplify.
+        if args.len() <= 1 {
+            return Ok(ExprSimplifyResult::Original(args));
+        }
+        // Guard against re-simplification: second arg is already a plain Utf8 literal
+        // with no named-arg metadata, meaning we've already encoded the options.
+        if let Some(Expr::Literal(ScalarValue::Utf8(_), None)) = args.get(1) {
+            return Ok(ExprSimplifyResult::Original(args));
+        }
+        // Extract named options while `spice.parameter_name` metadata is still available
+        // in the Expr tree (it is stripped before invoke_with_args is called).
+        let mut opts = FlattenOptions::default();
+        for arg in args.iter().skip(1) {
+            if let Some((name, value)) = named_arg(arg) {
+                apply_named_option(&name, value, &mut opts)?;
+            }
+        }
+        let json = encode_flatten_options(&opts);
+        let input = args.into_iter().next().expect("len > 1");
+        let new_args = vec![input, Expr::Literal(ScalarValue::Utf8(Some(json)), None)];
+        let udf = ScalarUDF::from(FlattenJsonPropertiesScalar::new());
+        Ok(ExprSimplifyResult::Simplified(udf.call(new_args)))
+    }
+
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DataFusionResult<ColumnarValue> {
         let input_col = args
             .args
@@ -1094,9 +1207,26 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
             })?
             .clone();
 
-        // Named args are stripped of their metadata when the scalar form is
-        // invoked; users who want non-default options should use the UDTF form.
-        let opts = FlattenOptions::default();
+        // Named args are rewritten by `simplify` into a JSON-encoded Utf8 literal at arg[1]
+        // before execution. Fall back to reading field.name() for code paths that bypass
+        // simplify (e.g. unit tests calling invoke_with_args directly with named fields).
+        let mut opts = FlattenOptions::default();
+        if let Some(ColumnarValue::Scalar(ScalarValue::Utf8(Some(json)))) = args.args.get(1) {
+            opts = decode_flatten_options(json)?;
+        } else {
+            for (val, field) in args.args.iter().zip(args.arg_fields.iter()).skip(1) {
+                let scalar = match val {
+                    ColumnarValue::Scalar(s) => s,
+                    ColumnarValue::Array(_) => {
+                        return Err(DataFusionError::Plan(format!(
+                            "{FLATTEN_JSON_PROPERTIES_UDTF_NAME}(): named argument '{}' must be a literal, not a column reference.",
+                            field.name()
+                        )));
+                    }
+                };
+                apply_named_option(field.name(), scalar, &mut opts)?;
+            }
+        }
 
         let array = input_col.into_array(args.number_rows)?;
         // Signature restricts input to Utf8/LargeUtf8/Utf8View; normalize to
@@ -1761,5 +1891,82 @@ mod tests {
         assert_eq!(results[0].num_columns(), 2, "expected 2 projected columns");
         assert_eq!(results[0].schema().field(0).name(), "path");
         assert_eq!(results[0].schema().field(1).name(), "type");
+    }
+
+    #[test]
+    fn scalar_udf_named_arg_expand_maps_applied() {
+        // Verify that `expand_maps => true` passed as a named arg in the scalar
+        // UDF causes wildcard segments to appear in the emitted paths, matching
+        // the behaviour of the UDTF form.
+        use arrow::array::StringArray;
+
+        let schema_with_map = r#"{
+            "type": "object",
+            "properties": {
+                "identityMap": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "primary": {"type": "boolean"}
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let udf = FlattenJsonPropertiesScalar::new();
+        let input = Arc::new(StringArray::from(vec![Some(schema_with_map)])) as ArrayRef;
+
+        let json_field = Arc::new(Field::new("doc", DataType::Utf8, true));
+        let expand_maps_field = Arc::new(Field::new("expand_maps", DataType::Boolean, false));
+        let return_field = Arc::new(Field::new("result", ROW_LIST_TYPE.clone(), true));
+
+        let result = udf
+            .invoke_with_args(ScalarFunctionArgs {
+                args: vec![
+                    ColumnarValue::Array(input),
+                    ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))),
+                ],
+                arg_fields: vec![json_field, expand_maps_field],
+                number_rows: 1,
+                return_field,
+                config_options: Arc::new(datafusion::config::ConfigOptions::default()),
+            })
+            .expect("invoke with expand_maps => true succeeds");
+
+        let arr = match result {
+            ColumnarValue::Array(a) => a,
+            other @ ColumnarValue::Scalar(_) => panic!("expected array, got {other:?}"),
+        };
+        let list = arr
+            .as_any()
+            .downcast_ref::<arrow::array::LargeListArray>()
+            .expect("large-list array");
+        assert_eq!(list.len(), 1);
+
+        let struct_arr = list.value(0);
+        let path_col = struct_arr
+            .column_by_name("path")
+            .expect("path column exists");
+        let paths = arrow::array::as_string_array(path_col);
+        let path_set: std::collections::HashSet<&str> =
+            (0..paths.len()).map(|i| paths.value(i)).collect();
+
+        // With expand_maps, wildcard `[*]` must appear between the map and its children.
+        assert!(
+            path_set.iter().any(|p| p.contains("[*]")),
+            "expected [*] wildcard paths with expand_maps=true, got: {path_set:?}"
+        );
+        // Without expand_maps the paths would be `identityMap.id` etc; those
+        // must NOT be present when wildcards are in effect.
+        assert!(
+            !path_set.contains("identityMap.id"),
+            "collapsed path must not appear when expand_maps=true"
+        );
     }
 }
