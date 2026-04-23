@@ -170,11 +170,11 @@ async fn sharepoint_csv_round_trip() -> Result<(), anyhow::Error> {
             assert!(!batches.is_empty(), "expected at least one batch");
 
             // Clean up — DELETE the file we wrote.
-            use data_components::sharepoint::auth::{SharepointAuth, DEFAULT_SCOPE};
+            use data_components::sharepoint::auth::{DEFAULT_SCOPE, SharepointAuth};
             use data_components::sharepoint::object_store::{
                 SharepointObjectStore, SharepointObjectStoreConfig,
             };
-            use object_store::{path::Path, ObjectStore};
+            use object_store::{ObjectStore, path::Path};
             use secrecy::SecretString;
 
             let auth = SharepointAuth::ClientCredentials {
@@ -239,9 +239,8 @@ async fn sharepoint_parquet_copy_to() -> Result<(), anyhow::Error> {
                 () = cloned.load_components() => {}
             }
 
-            let copy_sql = format!(
-                "COPY (SELECT 'Q2' AS quarter, 42 AS n) TO '{uri}' (FORMAT parquet)"
-            );
+            let copy_sql =
+                format!("COPY (SELECT 'Q2' AS quarter, 42 AS n) TO '{uri}' (FORMAT parquet)");
             let _ = rt
                 .datafusion()
                 .query_builder(&copy_sql)
@@ -261,14 +260,17 @@ async fn sharepoint_parquet_copy_to() -> Result<(), anyhow::Error> {
             while let Some(b) = q.data.next().await {
                 batches.push(b?);
             }
-            assert!(!batches.is_empty(), "COPY TO produced no rows visible on read-back");
+            assert!(
+                !batches.is_empty(),
+                "COPY TO produced no rows visible on read-back"
+            );
 
             // Clean up.
             use data_components::sharepoint::auth::SharepointAuth;
             use data_components::sharepoint::object_store::{
                 SharepointObjectStore, SharepointObjectStoreConfig,
             };
-            use object_store::{path::Path, ObjectStore};
+            use object_store::{ObjectStore, path::Path};
             use secrecy::SecretString;
 
             let auth = SharepointAuth::ClientCredentials {
@@ -351,4 +353,3 @@ async fn sharepoint_legacy_metadata_listing() -> Result<(), anyhow::Error> {
         })
         .await
 }
-

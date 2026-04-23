@@ -32,6 +32,11 @@ limitations under the License.
 //!   `ObjectStore` as raw bytes. Writes create new versions by default —
 //!   configurable via `sharepoint_conflict_behavior`.
 
+#![expect(
+    clippy::doc_markdown,
+    reason = "prose-frequent identifiers (SharePoint, DataFusion, OneDrive) are clearer without backticks"
+)]
+
 use async_trait::async_trait;
 use data_components::sharepoint::auth::{SharepointAuth, saml::SamlBearerConfig};
 use data_components::sharepoint::client::SharepointClient;
@@ -156,7 +161,6 @@ impl Sharepoint {
     /// Build the helper connector that backs `sharepoint://` datasets.
     fn listing_connector(&self) -> SharepointListingConnector {
         SharepointListingConnector {
-            client: Arc::clone(&self.client),
             params: self.params.clone(),
             tokio_io_runtime: self.tokio_io_runtime.clone(),
             runtime: self.runtime.clone(),
@@ -191,11 +195,7 @@ fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
         return Err(Error::InvalidAuthentication);
     }
 
-    let scope = params
-        .get("scope")
-        .expose()
-        .ok()
-        .map(String::from);
+    let scope = params.get("scope").expose().ok().map(String::from);
 
     if let Some(token) = bearer_token {
         return Ok(SharepointAuth::BearerToken(SecretString::new(
@@ -203,16 +203,12 @@ fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
         )));
     }
     if let Some(assertion) = saml_assertion {
-        let tenant = tenant
-            .clone()
-            .ok_or_else(|| Error::MissingParameter {
-                parameter: "tenant_id".into(),
-            })?;
-        let client_id = client_id
-            .clone()
-            .ok_or_else(|| Error::MissingParameter {
-                parameter: "client_id".into(),
-            })?;
+        let tenant = tenant.ok_or_else(|| Error::MissingParameter {
+            parameter: "tenant_id".into(),
+        })?;
+        let client_id = client_id.ok_or_else(|| Error::MissingParameter {
+            parameter: "client_id".into(),
+        })?;
         return Ok(SharepointAuth::SamlBearer(SamlBearerConfig {
             tenant_id: tenant,
             client_id,
@@ -428,15 +424,14 @@ impl DataConnector for Sharepoint {
                 connector_component: ConnectorComponent::from(dataset),
                 source: Box::new(e),
             })?;
-        let conflict =
-            parse_conflict_behavior(&self.params).map_err(|e| {
-                DataConnectorError::InvalidConfiguration {
-                    dataconnector: CONNECTOR_NAME.to_string(),
-                    message: format!("{e}"),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: Box::new(e),
-                }
-            })?;
+        let conflict = parse_conflict_behavior(&self.params).map_err(|e| {
+            DataConnectorError::InvalidConfiguration {
+                dataconnector: CONNECTOR_NAME.to_string(),
+                message: format!("{e}"),
+                connector_component: ConnectorComponent::from(dataset),
+                source: Box::new(e),
+            }
+        })?;
         let store = Arc::new(SharepointObjectStore::new(
             Arc::clone(&self.client),
             SharepointObjectStoreConfig {
@@ -455,7 +450,6 @@ impl DataConnector for Sharepoint {
 /// connector (not registered in the connector factory); instantiated on
 /// demand by [`Sharepoint`] for `sharepoint://` datasets.
 struct SharepointListingConnector {
-    client: Arc<GraphClient>,
     params: Parameters,
     tokio_io_runtime: tokio::runtime::Handle,
     runtime: Option<Runtime>,
@@ -463,7 +457,8 @@ struct SharepointListingConnector {
 
 impl fmt::Debug for SharepointListingConnector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SharepointListingConnector").finish_non_exhaustive()
+        f.debug_struct("SharepointListingConnector")
+            .finish_non_exhaustive()
     }
 }
 
@@ -517,12 +512,12 @@ pub fn factory() -> Arc<dyn DataConnectorFactory> {
     SharepointFactory::new_arc()
 }
 
-// Reference used by the client helper so the linker keeps it alive under the
-// new (object-store-backed) routing that bypasses it.
-#[allow(dead_code)]
-fn _keep_client_alive(_c: &SharepointClient) {}
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "tests use unwrap to assert happy paths"
+)]
 mod tests {
     #[test]
     fn uses_object_store_detects_prefix() {

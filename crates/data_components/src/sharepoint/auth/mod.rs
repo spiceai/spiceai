@@ -40,6 +40,11 @@ limitations under the License.
 //! - WS-Trust / ADFS direct SAML token acquisition.
 //! - Spice-minted SAML assertions (requires XMLDSig signing stack).
 
+#![expect(
+    clippy::doc_markdown,
+    reason = "prose-frequent identifiers (SharePoint, OAuth2, XMLDSig) are clearer without backticks"
+)]
+
 pub mod saml;
 
 use std::sync::Arc;
@@ -132,7 +137,9 @@ impl std::fmt::Debug for SharepointAuth {
             Self::DeviceCode { .. } => "DeviceCode",
             Self::SamlBearer(_) => "SamlBearer",
         };
-        f.debug_struct("SharepointAuth").field("flow", &tag).finish()
+        f.debug_struct("SharepointAuth")
+            .field("flow", &tag)
+            .finish()
     }
 }
 
@@ -191,8 +198,8 @@ impl SharepointAuth {
                 // `with_auth_code("")` to reach that builder, then immediately
                 // override with the refresh token — the empty auth code is
                 // unused once a refresh token is present.
-                let mut cred = ConfidentialClientApplication::builder(client_id.as_str())
-                    .with_auth_code("");
+                let mut cred =
+                    ConfidentialClientApplication::builder(client_id.as_str()).with_auth_code("");
                 cred.with_refresh_token(refresh_token.expose_secret())
                     .with_client_secret(client_secret.expose_secret())
                     .with_tenant(tenant_id)

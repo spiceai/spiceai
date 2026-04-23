@@ -27,6 +27,11 @@ limitations under the License.
 //! (commas, `!`, etc.) — putting them in the path segment instead sidesteps
 //! percent-encoding gymnastics.
 
+#![expect(
+    clippy::doc_markdown,
+    reason = "prose-frequent identifiers like SharePoint/OneDrive are clearer without backticks"
+)]
+
 use object_store::path::Path;
 use percent_encoding::percent_decode_str;
 use snafu::Snafu;
@@ -119,12 +124,14 @@ impl SharepointUrl {
         let (drive, remaining) = match kind {
             "me" => (DriveRef::Me, path_segments.as_slice()),
             "drives" | "sites" | "users" | "groups" => {
-                let (id, rest) = path_segments.split_first().ok_or_else(|| Error::Malformed {
-                    url: url.to_string(),
-                    reason: format!(
-                        "missing {kind} ID (expected 'sharepoint://{kind}/{{id}}/...')"
-                    ),
-                })?;
+                let (id, rest) = path_segments
+                    .split_first()
+                    .ok_or_else(|| Error::Malformed {
+                        url: url.to_string(),
+                        reason: format!(
+                            "missing {kind} ID (expected 'sharepoint://{kind}/{{id}}/...')"
+                        ),
+                    })?;
                 let drive = match kind {
                     "drives" => DriveRef::Drive(id.clone()),
                     "sites" => DriveRef::Site(id.clone()),
@@ -147,7 +154,7 @@ impl SharepointUrl {
         let item_path = if remaining.is_empty() {
             Path::from("")
         } else {
-            Path::from_iter(remaining.iter().map(String::as_str))
+            remaining.iter().map(String::as_str).collect::<Path>()
         };
 
         Ok(Self { drive, item_path })
@@ -174,15 +181,18 @@ impl DriveRef {
     pub fn id(&self) -> Option<&str> {
         match self {
             DriveRef::Me => None,
-            DriveRef::Drive(id)
-            | DriveRef::Site(id)
-            | DriveRef::User(id)
-            | DriveRef::Group(id) => Some(id),
+            DriveRef::Drive(id) | DriveRef::Site(id) | DriveRef::User(id) | DriveRef::Group(id) => {
+                Some(id)
+            }
         }
     }
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "tests use unwrap to assert happy paths"
+)]
 mod tests {
     use super::*;
 

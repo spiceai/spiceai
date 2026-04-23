@@ -29,6 +29,11 @@ limitations under the License.
 //! app registration must be configured for SAML bearer grant and have a trust
 //! relationship with the IdP that issued the assertion.
 
+#![expect(
+    clippy::doc_markdown,
+    reason = "prose-frequent identifiers (IdP, OAuth2, PingFederate) are clearer without backticks"
+)]
+
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -114,8 +119,6 @@ impl AcquiredToken {
 struct TokenSuccess {
     access_token: String,
     expires_in: u64,
-    #[serde(default)]
-    token_type: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -189,13 +192,10 @@ impl SamlBearerFlow {
             .context(HttpSnafu { url: url.clone() })?;
 
         if !resp.status().is_success() {
-            let err: TokenError = resp
-                .json()
-                .await
-                .unwrap_or_else(|_| TokenError {
-                    error: "unknown".into(),
-                    error_description: "Azure AD returned a non-JSON error body".into(),
-                });
+            let err: TokenError = resp.json().await.unwrap_or_else(|_| TokenError {
+                error: "unknown".into(),
+                error_description: "Azure AD returned a non-JSON error body".into(),
+            });
             return Err(Error::TokenRejected {
                 code: err.error,
                 description: err.error_description,
@@ -222,6 +222,10 @@ fn validate_assertion_encoding(assertion: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "tests use unwrap to assert happy paths"
+)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Arc;
@@ -233,13 +237,13 @@ mod tests {
     fn base64url_assertion_validates() {
         // "hello world" in base64url
         let s = general_purpose::URL_SAFE_NO_PAD.encode("hello world");
-        assert!(validate_assertion_encoding(&s).is_ok());
+        validate_assertion_encoding(&s).unwrap();
     }
 
     #[test]
     fn padded_base64url_also_validates() {
         let s = general_purpose::URL_SAFE.encode("hi");
-        assert!(validate_assertion_encoding(&s).is_ok());
+        validate_assertion_encoding(&s).unwrap();
     }
 
     #[test]
@@ -257,7 +261,11 @@ mod tests {
 
     async fn start_mock_ad(
         responses: Vec<MockResponse>,
-    ) -> (String, Arc<AtomicUsize>, Arc<tokio::sync::Mutex<Vec<String>>>) {
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<tokio::sync::Mutex<Vec<String>>>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock listener");
