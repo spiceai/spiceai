@@ -1183,14 +1183,25 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
         }
         // Extract named options while `spice.parameter_name` metadata is still available
         // in the Expr tree (it is stripped before invoke_with_args is called).
+        // Every arg after the input must be a named option — silently dropping an
+        // unrecognised positional arg would produce wrong results without any error.
         let mut opts = FlattenOptions::default();
         for arg in args.iter().skip(1) {
-            if let Some((name, value)) = named_arg(arg) {
-                apply_named_option(&name, value, &mut opts)?;
-            }
+            let Some((name, value)) = named_arg(arg) else {
+                return Err(DataFusionError::Plan(format!(
+                    "{FLATTEN_JSON_PROPERTIES_UDTF_NAME}() only accepts named options after \
+                     the JSON string argument (e.g. `expand_maps => true`). Got: {arg:?}."
+                )));
+            };
+            apply_named_option(&name, value, &mut opts)?;
         }
         let json = encode_flatten_options(&opts);
-        let input = args.into_iter().next().expect("len > 1");
+        let mut args_iter = args.into_iter();
+        let input = args_iter.next().ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "{FLATTEN_JSON_PROPERTIES_UDTF_NAME}() requires a JSON string argument."
+            ))
+        })?;
         let new_args = vec![input, Expr::Literal(ScalarValue::Utf8(Some(json)), None)];
         let udf = ScalarUDF::from(FlattenJsonPropertiesScalar::new());
         Ok(ExprSimplifyResult::Simplified(udf.call(new_args)))
@@ -1208,12 +1219,17 @@ impl ScalarUDFImpl for FlattenJsonPropertiesScalar {
             .clone();
 
         // Named args are rewritten by `simplify` into a JSON-encoded Utf8 literal at arg[1]
-        // before execution. Fall back to reading field.name() for code paths that bypass
-        // simplify (e.g. unit tests calling invoke_with_args directly with named fields).
+        // (always a JSON object starting with `{`). Fall back to reading field.name() for
+        // code paths that bypass simplify (e.g. unit tests calling invoke_with_args directly).
         let mut opts = FlattenOptions::default();
+        let mut decoded_from_json = false;
         if let Some(ColumnarValue::Scalar(ScalarValue::Utf8(Some(json)))) = args.args.get(1) {
-            opts = decode_flatten_options(json)?;
-        } else {
+            if json.trim_start().starts_with('{') {
+                opts = decode_flatten_options(json)?;
+                decoded_from_json = true;
+            }
+        }
+        if !decoded_from_json {
             for (val, field) in args.args.iter().zip(args.arg_fields.iter()).skip(1) {
                 let scalar = match val {
                     ColumnarValue::Scalar(s) => s,
