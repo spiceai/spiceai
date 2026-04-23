@@ -506,7 +506,7 @@ pub(crate) fn closest_name(typo: &str, candidates: &[String]) -> Option<String> 
     let (candidate, distance) = best?;
     // Bound: allow at most one edit per 3 chars of the longer string. Prevents a
     // wildly different name ("kafka" vs. "postgres") from being suggested while
-    // still catching "postgress_host" → "postgres_host" (d=1) and similar typos.
+    // still catching connector-name typos like "postgress" → "postgres" (d=1).
     let max_allowed = (candidate.len().max(typo.len()) / 3).max(1);
     if distance <= max_allowed {
         Some(candidate)

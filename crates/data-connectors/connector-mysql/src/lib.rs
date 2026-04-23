@@ -109,11 +109,12 @@ const PARAMETERS: &[ParameterSpec] = &[
         .examples(&["app", "analytics"])
         .help_link(MYSQL_DOCS),
     ParameterSpec::component("sslmode")
-        .description("SSL mode.")
-        .one_of(&["disabled", "preferred", "required"])
+        .description(
+            "TLS mode for the connection. Common values: 'disabled', 'preferred', 'required'.",
+        )
         .help_link(MYSQL_DOCS),
     ParameterSpec::component("sslrootcert")
-        .description("Path to a PEM-encoded CA certificate for verify-ca/verify-full modes.")
+        .description("Path to a PEM-encoded CA certificate used to verify the server when TLS is enabled.")
         .help_link(MYSQL_DOCS),
     ParameterSpec::component("pool_min")
         .description("The minimum number of connections to keep open in the pool, lazily created when requested.")

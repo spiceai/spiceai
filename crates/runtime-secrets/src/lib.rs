@@ -248,16 +248,20 @@ impl Secrets {
     ) -> Option<String> {
         // Substitution failures leave the parameter as the empty string, which the
         // component layer then reports as "missing required parameter" without any
-        // back-reference to the failed secret lookup. Include enough context here
-        // (store, key, source of reference) that users can tie cause to effect.
-        let configured = self.stores.keys().cloned().collect::<Vec<_>>().join(", ");
+        // back-reference to the failed secret lookup. Include enough context in the
+        // error branches (store, key, source of reference) that users can tie cause
+        // to effect. The store-list is allocated lazily — `inject_secrets` calls this
+        // in a tight loop for every `${...}` substitution, so we don't pay for it on
+        // the hot (success) path.
+        let configured_stores = || self.stores.keys().cloned().collect::<Vec<_>>().join(", ");
         if store_name == SECRETS {
             match self.get_secret(key).await {
                 Ok(Some(secret)) => return Some(secret.expose_secret().to_string()),
                 Ok(None) => {
                     tracing::error!(
-                        "Secret `${{ secrets:{key} }}` (referenced by `{}`) not found in any configured secret store (searched: [{configured}]). The parameter will be empty, which typically surfaces later as a missing/invalid parameter. Docs: https://spiceai.org/docs/components/secret-stores",
-                        param_str.0
+                        "Secret `${{ secrets:{key} }}` (referenced by `{}`) not found in any configured secret store (searched: [{}]). The parameter will be empty, which typically surfaces later as a missing/invalid parameter. Docs: https://spiceai.org/docs/components/secret-stores",
+                        param_str.0,
+                        configured_stores()
                     );
                     return None;
                 }
@@ -291,8 +295,9 @@ impl Secrets {
             }
         } else {
             tracing::error!(
-                "Secret reference `${{ {store_name}:{key} }}` in `{}` uses an undefined store `{store_name}`. Configured stores: [{configured}]. Add a `secrets:` entry in spicepod.yaml with `from: {store_name}`, or use one of the configured stores. Docs: https://spiceai.org/docs/components/secret-stores",
-                param_str.0
+                "Secret reference `${{ {store_name}:{key} }}` in `{}` uses an undefined store `{store_name}`. Configured stores: [{}]. Add a `secrets:` entry in spicepod.yaml with `from: {store_name}`, or use one of the configured stores. Docs: https://spiceai.org/docs/components/secret-stores",
+                param_str.0,
+                configured_stores()
             );
             return None;
         };

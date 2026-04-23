@@ -17,48 +17,70 @@ limitations under the License.
 //! Simple ANSI color helpers for terminal output.
 //!
 //! Colors are only applied when the output destination is a terminal and the user
-//! hasn't opted out via `NO_COLOR`. The check is lazy and cached once per process —
-//! subsequent calls are a plain atomic load.
+//! hasn't opted out via `NO_COLOR`. The check is lazy and cached once per process
+//! per stream (stdout/stderr), so subsequent calls are a plain atomic load.
 
 use std::fmt::{self, Display};
 use std::io::IsTerminal;
 use std::sync::OnceLock;
 
-static COLOR_ENABLED: OnceLock<bool> = OnceLock::new();
+static STDOUT_COLORS: OnceLock<bool> = OnceLock::new();
+static STDERR_COLORS: OnceLock<bool> = OnceLock::new();
 
-/// Returns `true` when colored output should be emitted.
-///
-/// Rules (in order):
-/// 1. `NO_COLOR` set (any value) — disabled, per https://no-color.org.
-/// 2. `FORCE_COLOR` set — enabled (overrides the TTY check).
-/// 3. Otherwise — enabled iff stdout *is* a terminal.
-pub fn colors_enabled() -> bool {
+/// Which output stream a [`Painted`] is targeted at. The answer to "should we emit
+/// ANSI escapes?" differs for stdout vs stderr (one can be a TTY while the other is
+/// a pipe), so callers declare the target when they create a `Painted`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Stdout,
+    Stderr,
+}
+
+fn check_target(target: Target) -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if std::env::var_os("FORCE_COLOR").is_some() {
+        return true;
+    }
+    match target {
+        Target::Stdout => std::io::stdout().is_terminal(),
+        Target::Stderr => std::io::stderr().is_terminal(),
+    }
+}
+
+/// Returns `true` when colored output should be emitted for the given stream.
+pub fn colors_enabled_for(target: Target) -> bool {
     // Internal tests assert literal escape codes, so we force colors on under cfg(test).
     // Downstream crates that want colors under their own test harness should call
     // `set_colors_enabled(true)` from a test fixture before any use.
     #[cfg(test)]
     {
+        let _ = target;
         return true;
     }
     #[cfg(not(test))]
     {
-        *COLOR_ENABLED.get_or_init(|| {
-            if std::env::var_os("NO_COLOR").is_some() {
-                return false;
-            }
-            if std::env::var_os("FORCE_COLOR").is_some() {
-                return true;
-            }
-            std::io::stdout().is_terminal()
-        })
+        let cell = match target {
+            Target::Stdout => &STDOUT_COLORS,
+            Target::Stderr => &STDERR_COLORS,
+        };
+        *cell.get_or_init(|| check_target(target))
     }
 }
 
-/// Force-set the color mode. Callers should invoke this once at startup (e.g. for tests
-/// or when the CLI knows better than the default heuristic). After the first read of
-/// `colors_enabled()` this call is a no-op.
+/// Convenience — whether stdout gets colour. Equivalent to `colors_enabled_for(Target::Stdout)`.
+pub fn colors_enabled() -> bool {
+    colors_enabled_for(Target::Stdout)
+}
+
+/// Force-set the color mode for *both* stdout and stderr. Callers should invoke this
+/// once at startup (e.g. for tests or when the CLI knows better than the default
+/// heuristic). After the first read of the relevant cell this call is a no-op for
+/// that stream.
 pub fn set_colors_enabled(enabled: bool) {
-    let _ = COLOR_ENABLED.set(enabled);
+    let _ = STDOUT_COLORS.set(enabled);
+    let _ = STDERR_COLORS.set(enabled);
 }
 
 /// ANSI color codes for terminal output.
@@ -101,10 +123,26 @@ impl Color {
         }
     }
 
-    /// Paint the given text with this color.
+    /// Paint the given text with this color for use with `println!` / stdout.
     #[must_use]
     pub fn paint<S: AsRef<str>>(self, text: S) -> Painted<S> {
-        Painted { color: self, text }
+        Painted {
+            color: self,
+            text,
+            target: Target::Stdout,
+        }
+    }
+
+    /// Paint the given text with this color for use with `eprintln!` / stderr.
+    /// Uses the stderr TTY check so a redirected stderr stays clean even when stdout
+    /// is a terminal (and vice versa).
+    #[must_use]
+    pub fn paint_err<S: AsRef<str>>(self, text: S) -> Painted<S> {
+        Painted {
+            color: self,
+            text,
+            target: Target::Stderr,
+        }
     }
 }
 
@@ -112,13 +150,14 @@ impl Color {
 pub struct Painted<S> {
     color: Color,
     text: S,
+    target: Target,
 }
 
 impl<S: AsRef<str>> Display for Painted<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         const RESET: &str = "\x1b[0m";
 
-        if !colors_enabled() {
+        if !colors_enabled_for(self.target) {
             return write!(f, "{}", self.text.as_ref());
         }
 
@@ -157,6 +196,23 @@ mod tests {
         let painted = Color::Red.paint("Error");
         let output = painted.to_string();
         assert_eq!(output, "\x1b[31mError\x1b[0m");
+    }
+
+    #[test]
+    fn test_paint_err_targets_stderr() {
+        // `paint_err` must produce a Painted tagged for the Stderr target so the
+        // Display impl consults the stderr TTY check, not stdout's.
+        let p = Color::Red.paint_err("Oops");
+        assert_eq!(p.target, Target::Stderr);
+        // Under cfg(test), `colors_enabled_for` returns true for either target, so
+        // the rendered output still contains the escape sequence.
+        assert_eq!(p.to_string(), "\x1b[31mOops\x1b[0m");
+    }
+
+    #[test]
+    fn test_paint_defaults_to_stdout_target() {
+        let p = Color::Red.paint("Hello");
+        assert_eq!(p.target, Target::Stdout);
     }
 
     #[test]

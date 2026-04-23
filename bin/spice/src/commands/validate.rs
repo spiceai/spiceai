@@ -67,7 +67,7 @@ pub async fn execute(args: &ValidateArgs) -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            eprintln!("{} {e}", Color::Red.paint("Invalid:"));
+            eprintln!("{} {e}", Color::Red.paint_err("Invalid:"));
             // Convert to our CLI's error type so the process exits with a failure code.
             InvalidArgumentSnafu {
                 message: format!("spicepod validation failed: {e}"),
