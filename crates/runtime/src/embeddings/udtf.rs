@@ -27,11 +27,15 @@ limitations under the License.
 //!  - `score` (f32): The similarity score of the row with the request `query`.
 //!  - `value` (UTF8): The subset of the column most relevant. For non-chunked embedding columns, `value` is the entire value.
 
-use arrow::{array::FixedSizeListArray, datatypes::Float32Type};
+use arrow::{
+    array::{Array, FixedSizeListArray, StringArray},
+    datatypes::Float32Type,
+};
 use arrow_schema::{DataType, Field, SchemaRef};
 use async_openai::types::embeddings::EmbeddingInput;
 use datafusion::common::exec_err;
 use datafusion::datasource::ViewTable;
+use datafusion::logical_expr::expr::FieldMetadata;
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
 use datafusion::{
     catalog::{Session, TableFunctionImpl, TableProvider},
@@ -46,7 +50,8 @@ use datafusion::{
 };
 
 use datafusion_expr::{
-    LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, binary_expr, col, ident,
+    LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, TableProviderFilterPushDown,
+    binary_expr, col, ident,
 };
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use futures::FutureExt;
@@ -60,7 +65,7 @@ use search::generation::util::get_primary_keys;
 use std::{
     any::Any,
     cmp::min,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, LazyLock, Weak},
 };
 
@@ -87,7 +92,10 @@ use {
 };
 
 #[cfg(feature = "s3_vectors")]
-use {search::index::chunking::ChunkedSearchIndex, search::index::s3_vectors::S3Vector};
+use search::index::s3_vectors::S3Vector;
+
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+use search::index::chunking::ChunkedSearchIndex;
 
 #[cfg(feature = "elasticsearch")]
 use search::index::elasticsearch::ElasticsearchIndex;
@@ -95,6 +103,12 @@ use search::index::elasticsearch::ElasticsearchIndex;
 use tokio::sync::RwLock;
 
 pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
+
+/// Upper bound on the number of query strings accepted by `vector_search` when
+/// invoked in late-interaction (multi-query) mode. Each query produces its own
+/// subplan that is `UNIONed` together, so unbounded arrays can blow up the
+/// logical plan size and runtime work.
+const VECTOR_SEARCH_MAX_QUERIES: usize = 32;
 
 /// Creates a `UserDefined` signature that allows named parameters (like `rank_weight => X`)
 /// to pass through for RRF (Reciprocal Rank Fusion) operations.
@@ -113,6 +127,7 @@ pub static VECTOR_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
         "limit".to_string(),
         "include_score".to_string(),
         "rank_weight".to_string(),
+        "distance_metric".to_string(),
     ];
     match Signature::user_defined(Volatility::Stable).with_parameter_names(param_names) {
         Ok(sig) => sig,
@@ -120,14 +135,67 @@ pub static VECTOR_SEARCH_SIGNATURE: LazyLock<Signature> = LazyLock::new(|| {
     }
 });
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum DistanceMetric {
+    /// Cosine similarity (default). Score = `1 - cosine_distance(q, v)`.
+    /// Best default; if embeddings are L2-normalized, this is equivalent to dot product.
+    Cosine,
+    /// Negated Euclidean distance: `Score = -array_distance(q, v)`.
+    /// Use when your embedding model/index was trained against L2 distance.
+    L2,
+    /// Dot product. Score = `Σ q[i] * v[i]`.
+    /// Prefer `Cosine` with L2-normalized embeddings when possible — a native
+    /// `dot` UDF is not yet wired through the runtime.
+    Dot,
+}
+
+impl DistanceMetric {
+    pub fn parse(s: &str) -> DataFusionResult<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "cosine" | "cos" => Ok(Self::Cosine),
+            "l2" | "euclidean" | "euclid" => Ok(Self::L2),
+            // Dot is not yet wired through the scan path; reject at parse time so
+            // users get a clear error instead of silently constructing args that
+            // will then fail with `NotImplemented` deeper in execution.
+            "dot" | "inner" | "ip" => Err(DataFusionError::Plan(format!(
+                "distance_metric '{s}' is not yet implemented for {VECTOR_SEARCH_UDTF_NAME}. Supported: 'cosine', 'l2'."
+            ))),
+            other => Err(DataFusionError::Plan(format!(
+                "Unsupported distance_metric '{other}' for {VECTOR_SEARCH_UDTF_NAME}. Supported: 'cosine', 'l2'."
+            ))),
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cosine => "cosine",
+            Self::L2 => "l2",
+            Self::Dot => "dot",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct VectorSearchTableFuncArgs {
     pub tbl: TableReference,
+    /// Primary query string. For single-string queries this is the only
+    /// query; for multi-string (late-interaction) queries it is the
+    /// first element of `queries` and retained here for backward
+    /// compatibility with existing consumers that read `query` directly.
     pub query: String,
+    /// All query strings. Always contains at least one entry (mirroring
+    /// `query` for single-string mode). Length > 1 triggers the
+    /// late-interaction search path when paired with a multi-vector
+    /// column.
+    pub queries: Vec<String>,
 
     pub column: Option<String>,
     pub limit: Option<usize>,
     pub include_score: Option<bool>,
+    /// Similarity/distance metric used to rank candidate vectors. Defaults to
+    /// `Cosine` for backward compatibility.
+    pub distance_metric: Option<DistanceMetric>,
 }
 
 impl VectorSearchTableFuncArgs {
@@ -143,33 +211,63 @@ impl VectorSearchTableFuncArgs {
             .cloned();
         match (self.column.as_deref(), cfg) {
             (Some(col), Some(cfg)) => Ok((col.to_string(), cfg)),
-            (Some(col), None) => Err(DataFusionError::Plan(format!(
-                "User function 'vector_search' is called on table '{}' that does not have a embedding index on '{col}' column. Index is on column(s): {}",
-                self.tbl,
-                embedded_columns
-                    .keys()
-                    .collect::<Vec<_>>()
-                    .iter()
-                    .join(", ")
-            ))),
+            (Some(col), None) => {
+                // Sort for deterministic error text / tests — `HashMap::keys()` has
+                // nondeterministic iteration order, which would make error messages
+                // (and the Levenshtein suggestion) flaky across runs.
+                let mut available: Vec<String> = embedded_columns.keys().cloned().collect();
+                available.sort();
+                let suggestion = closest_column(col, &available)
+                    .map(|s| format!(" Did you mean '{s}'?"))
+                    .unwrap_or_default();
+                Err(DataFusionError::Plan(format!(
+                    "User function 'vector_search' is called on table '{}' that does not have an embedding index on '{col}' column. Indexed column(s): {}.{suggestion}",
+                    self.tbl,
+                    available.iter().join(", ")
+                )))
+            }
             (None, _) => {
                 if embedded_columns.len() > 1 {
+                    let mut available: Vec<String> = embedded_columns.keys().cloned().collect();
+                    available.sort();
                     return Err(DataFusionError::Plan(format!(
-                        "User function 'vector_search' is called on table '{}' that has {} vector search columns. Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`.",
+                        "User function 'vector_search' is called on table '{}' that has {} vector search columns ({}). Must call 'vector_search' with column parameter, e.g. `vector_search(\"my table\", 'my query', my_embedded_col)`.",
                         self.tbl,
-                        embedded_columns.len()
+                        embedded_columns.len(),
+                        available.iter().join(", ")
                     )));
                 }
                 if let Some((col, cfg)) = embedded_columns.iter().next() {
                     Ok((col.clone(), cfg.clone()))
                 } else {
                     Err(DataFusionError::Plan(format!(
-                        "User function 'vector_search' is called on table '{}' that has no associated full text search index.",
+                        "User function 'vector_search' is called on table '{}' that has no associated embedding index.",
                         self.tbl,
                     )))
                 }
             }
         }
+    }
+}
+
+/// Suggest the closest available column to `target` using case-insensitive
+/// Levenshtein distance. Returns `None` if nothing is reasonably close.
+fn closest_column(target: &str, candidates: &[String]) -> Option<String> {
+    let target_lower = target.to_lowercase();
+    let (best, distance) = candidates
+        .iter()
+        .map(|c| {
+            (
+                c,
+                util::levenshtein::distance(&target_lower, &c.to_lowercase()),
+            )
+        })
+        .min_by_key(|(_, d)| *d)?;
+    let threshold = target.len().div_ceil(2).max(2);
+    if distance <= threshold {
+        Some(best.clone())
+    } else {
+        None
     }
 }
 
@@ -234,21 +332,39 @@ impl VectorSearchTableFunc {
 }
 
 impl VectorSearchTableFunc {
-    #[must_use]
-    pub fn to_expr(args: &VectorSearchTableFuncArgs) -> Vec<Expr> {
-        let mut expr = vec![
-            Expr::Column(to_column_expr(&args.tbl)),
-            Expr::Literal(ScalarValue::Utf8(Some(args.query.clone())), None),
-        ];
+    pub fn to_expr(args: &VectorSearchTableFuncArgs) -> DataFusionResult<Vec<Expr>> {
+        // Multi-query searches round-trip as a `make_array(...)` call;
+        // single-query stays as a bare Utf8 literal for backwards
+        // compatibility with pre-multi-query consumers.
+        let query_expr = if args.queries.len() > 1 {
+            let make_array = datafusion::functions_nested::make_array::make_array_udf();
+            Expr::ScalarFunction(ScalarFunction::new_udf(
+                make_array,
+                args.queries
+                    .iter()
+                    .map(|q| Expr::Literal(ScalarValue::Utf8(Some(q.clone())), None))
+                    .collect(),
+            ))
+        } else {
+            let q = args
+                .queries
+                .first()
+                .cloned()
+                .unwrap_or_else(|| args.query.clone());
+            Expr::Literal(ScalarValue::Utf8(Some(q)), None)
+        };
+        let mut expr = vec![Expr::Column(to_column_expr(&args.tbl)), query_expr];
 
         if let Some(col) = args.column.as_ref() {
             expr.push(Expr::Column(Column::new_unqualified(col)));
         }
         if let Some(limit) = args.limit {
-            expr.push(Expr::Literal(
-                ScalarValue::UInt64(Some(u64::try_from(limit).unwrap_or(u64::MAX))),
-                None,
-            ));
+            let limit_u64 = u64::try_from(limit).map_err(|_| {
+                DataFusionError::Plan(format!(
+                    "vector_search: limit value {limit} is out of range for u64."
+                ))
+            })?;
+            expr.push(Expr::Literal(ScalarValue::UInt64(Some(limit_u64)), None));
         }
         if let Some(include_score) = args.include_score {
             expr.push(Expr::Literal(
@@ -256,10 +372,110 @@ impl VectorSearchTableFunc {
                 None,
             ));
         }
-        expr
+        if let Some(metric) = args.distance_metric {
+            let meta = FieldMetadata::new(BTreeMap::from([(
+                "spice.parameter_name".to_string(),
+                "distance_metric".to_string(),
+            )]));
+            expr.push(Expr::Literal(
+                ScalarValue::Utf8(Some(metric.as_str().to_string())),
+                Some(meta),
+            ));
+        }
+        Ok(expr)
+    }
+
+    /// Parse the query argument of `vector_search(tbl, <query>, ...)`.
+    /// Accepts either a single Utf8 string literal, or a `make_array(...)`
+    /// (i.e. SQL `[...]` / `ARRAY[...]`) whose elements are all Utf8
+    /// literals. Returns a non-empty `Vec<String>`.
+    fn parse_query_arg(query: Option<&Expr>) -> DataFusionResult<Vec<String>> {
+        match query {
+            Some(Expr::Literal(ScalarValue::Utf8(Some(q)), None)) => Ok(vec![q.clone()]),
+            Some(Expr::ScalarFunction(ScalarFunction { func, args }))
+                if func.name().eq_ignore_ascii_case("make_array") =>
+            {
+                if args.is_empty() {
+                    return Err(DataFusionError::Plan(
+                        "Multi-query array must contain at least one query string.".to_string(),
+                    ));
+                }
+                if args.len() > VECTOR_SEARCH_MAX_QUERIES {
+                    return Err(DataFusionError::Plan(format!(
+                        "Multi-query array is limited to {VECTOR_SEARCH_MAX_QUERIES} query strings, got {}.",
+                        args.len()
+                    )));
+                }
+                let mut out = Vec::with_capacity(args.len());
+                for a in args {
+                    match a {
+                        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => out.push(s.clone()),
+                        other => {
+                            return Err(DataFusionError::Plan(format!(
+                                "Multi-query array elements must be string literals, got {other:?}."
+                            )));
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            // SQL array literal syntax: ['a', 'b', 'c'] parses as ScalarValue::List
+            Some(Expr::Literal(ScalarValue::List(arr), None)) => {
+                let inner = arr.value(0);
+                let strings = inner
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Plan(
+                            "Multi-query array elements must be strings.".to_string(),
+                        )
+                    })?;
+                if strings.is_empty() {
+                    return Err(DataFusionError::Plan(
+                        "Multi-query array must contain at least one query string.".to_string(),
+                    ));
+                }
+                if strings.len() > VECTOR_SEARCH_MAX_QUERIES {
+                    return Err(DataFusionError::Plan(format!(
+                        "Multi-query array is limited to {VECTOR_SEARCH_MAX_QUERIES} query strings, got {}.",
+                        strings.len()
+                    )));
+                }
+                let mut out = Vec::with_capacity(strings.len());
+                for i in 0..strings.len() {
+                    if strings.is_null(i) {
+                        return Err(DataFusionError::Plan(
+                            "Multi-query array elements cannot be null.".to_string(),
+                        ));
+                    }
+                    out.push(strings.value(i).to_string());
+                }
+                Ok(out)
+            }
+            other => Err(DataFusionError::Plan(format!(
+                "Second argument must be a query string or array of query strings, but got {other:?}."
+            ))),
+        }
     }
 
     fn parse_args(args: &[Expr]) -> DataFusionResult<VectorSearchTableFuncArgs> {
+        // Extract named passthrough args that vector_search cares about before
+        // filtering them out of the positional parse. `distance_metric` is the
+        // only one vector_search consumes itself; the rest (e.g. `rank_weight`)
+        // are for RRF.
+        let distance_metric = args
+            .iter()
+            .find_map(|arg| match arg {
+                Expr::Literal(ScalarValue::Utf8(Some(s)), Some(meta))
+                    if meta.inner().get("spice.parameter_name").map(String::as_str)
+                        == Some("distance_metric") =>
+                {
+                    Some(DistanceMetric::parse(s))
+                }
+                _ => None,
+            })
+            .transpose()?;
+
         // Filter out passthrough parameters (those with spice.parameter_name metadata)
         // These are meant for table functions like RRF, not for vector_search itself
         let mut args = args.iter().filter(|arg| {
@@ -276,11 +492,13 @@ impl VectorSearchTableFunc {
         let tbl_ref = table_ref_from_column_expr(c);
 
         let query = args.next();
-        let Some(Expr::Literal(ScalarValue::Utf8(Some(q)), None)) = query else {
-            return Err(DataFusionError::Plan(format!(
-                "Second argument must be a query string, but got {query:?}."
-            )));
-        };
+        let queries = Self::parse_query_arg(query)?;
+        // `q` is used in downstream error messages + back-compat field.
+        let q = queries.first().cloned().ok_or_else(|| {
+            DataFusionError::Plan(
+                "Invalid arguments: vector_search query argument must contain at least one query value.".to_string(),
+            )
+        })?;
 
         let (column, limit, include_score) = match (args.next(), args.next(), args.next()) {
             // No arguments, provides defaults
@@ -342,14 +560,25 @@ impl VectorSearchTableFunc {
                 )));
             }
         };
+        let limit_usize = limit
+            .map(|l| {
+                usize::try_from(l).map_err(|_| {
+                    DataFusionError::Plan(format!(
+                        "vector_search: limit value {l} is out of range for usize."
+                    ))
+                })
+            })
+            .transpose()?;
         Ok(VectorSearchTableFuncArgs {
             tbl: tbl_ref
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
                 .into(),
-            query: q.clone(),
+            query: q,
+            queries,
             column,
-            limit: limit.map(|l| usize::try_from(l).unwrap_or(usize::MAX)),
+            limit: limit_usize,
             include_score,
+            distance_metric,
         })
     }
 
@@ -369,15 +598,6 @@ impl VectorSearchTableFunc {
                         .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
                 );
             }
-            if let Some((chunked_indexes, _)) =
-                find_index_in_table_provider::<ChunkedSearchIndex>(tbl)
-            {
-                vector_indexes.extend(
-                    chunked_indexes
-                        .into_iter()
-                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
-                );
-            }
         }
 
         #[cfg(feature = "elasticsearch")]
@@ -389,6 +609,18 @@ impl VectorSearchTableFunc {
                         .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
                 );
             }
+        }
+
+        // Chunked search indexes (used by both S3 Vectors and Elasticsearch engines
+        // when chunking is enabled) are discovered once here to avoid registering
+        // the same `ChunkedSearchIndex` twice when both features are enabled.
+        if let Some((chunked_indexes, _)) = find_index_in_table_provider::<ChunkedSearchIndex>(tbl)
+        {
+            vector_indexes.extend(
+                chunked_indexes
+                    .into_iter()
+                    .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
+            );
         }
 
         if vector_indexes.is_empty() {
@@ -412,6 +644,20 @@ impl VectorSearchTableFunc {
         let Some(vector_index) = vector_index_opt else {
             return Ok(None);
         };
+
+        // Index-backed providers (S3 vectors, Elasticsearch, chunked) ignore
+        // `args.distance_metric` because their underlying `SearchIndex::query_table_provider`
+        // takes only the query string and uses the metric the index was configured with.
+        // Silently picking an index-configured metric while accepting a different one
+        // from the user would produce surprising rankings — fail fast instead.
+        if let Some(metric) = args.distance_metric {
+            return Err(DataFusionError::Plan(format!(
+                "vector_search on table '{}': distance_metric '{}' is not honored by the index-backed provider for this column ('{}'); the index uses its configured metric. Drop the distance_metric argument or remove the index to use the JIT path.",
+                args.tbl,
+                metric.as_str(),
+                vector_index.search_column(),
+            )));
+        }
 
         // For Elasticsearch indexes, normalize the base table provider schema to match
         // what the ES HTTP client produces (e.g. LargeUtf8 → Utf8). This ensures that
@@ -440,7 +686,9 @@ impl VectorSearchTableFunc {
                 column: args.column.clone(),
                 limit: args.limit,
                 include_score: args.include_score,
+                distance_metric: args.distance_metric.map(|m| m.as_str().to_string()),
             })
+            .with_include_score(args.include_score.unwrap_or(true))
             .call_on_scan(Arc::new(|| {
                 async {
                     let request_context = RequestContext::current(AsyncMarker::new().await);
@@ -483,7 +731,11 @@ impl TableFunctionImpl for VectorSearchTableFunc {
             })?;
 
         let (col, _) = args.get_column_and_config(&embedding_table_provider.embedded_columns)?;
-        if embedding_table_provider.is_chunked(col.as_str()) {
+        // Both chunked-scalar and multi-vector (list-typed) columns use
+        // the same UNNEST-based non-indexed search path, but with
+        // different scan modes.
+        let is_multi_vector = embedding_table_provider.is_multi_vector(col.as_str());
+        if embedding_table_provider.is_chunked(col.as_str()) || is_multi_vector {
             let state = df.ctx.state();
             let Some(embed_udf) = state.scalar_functions().get(EMBED_UDF_NAME) else {
                 return Err(DataFusionError::Plan(format!(
@@ -492,7 +744,16 @@ impl TableFunctionImpl for VectorSearchTableFunc {
             };
 
             // Unsafe: worse case is metric without dimensions.
-            let dimensions = unsafe { RequestContext::current_sync().to_dimensions() };
+            let mut dimensions = unsafe { RequestContext::current_sync().to_dimensions() };
+            if is_multi_vector {
+                dimensions.push(opentelemetry::KeyValue::new("multi_vector", true));
+                if let Some(agg) = embedding_table_provider.multi_vector_aggregation(col.as_str()) {
+                    dimensions.push(opentelemetry::KeyValue::new(
+                        "multi_vector_aggregation",
+                        agg.to_string(),
+                    ));
+                }
+            }
             telemetry::track_vector_search(&dimensions);
             let pks = self
                 .explicit_pks
@@ -500,17 +761,56 @@ impl TableFunctionImpl for VectorSearchTableFunc {
                 .cloned()
                 .or_else(|| get_primary_keys(&table_provider).ok());
 
-            let table = ChunkedNonIndexVectorGeneration::new(
-                &table_provider,
-                &args.tbl,
-                embed_udf,
-                embedding_table_provider
-                    .get_embedding_model_used_by(&col)
-                    .unwrap_or_default(),
-                pks.unwrap_or_default(),
-                &col,
-            )
-            .search(args.query)?;
+            let model_name = embedding_table_provider
+                .get_embedding_model_used_by(&col)
+                .unwrap_or_default();
+            let pks_vec = pks.unwrap_or_default();
+
+            let table = if is_multi_vector {
+                if args.queries.len() > 1 {
+                    // Multi-query × multi-vector → ColBERT-style
+                    // late-interaction: `SUM_{q in Q} MAX_{d in D} cos(q, d)`.
+                    ChunkedNonIndexVectorGeneration::new_late_interaction(
+                        &table_provider,
+                        &args.tbl,
+                        embed_udf,
+                        model_name,
+                        pks_vec,
+                        &col,
+                        args.queries.clone(),
+                    )
+                    .search(args.query)?
+                } else {
+                    let aggregation = embedding_table_provider
+                        .multi_vector_aggregation(col.as_str())
+                        .unwrap_or_default();
+                    ChunkedNonIndexVectorGeneration::new_list_multi(
+                        &table_provider,
+                        &args.tbl,
+                        embed_udf,
+                        model_name,
+                        pks_vec,
+                        &col,
+                        aggregation,
+                    )
+                    .search(args.query)?
+                }
+            } else {
+                if args.queries.len() > 1 {
+                    return Err(DataFusionError::Plan(format!(
+                        "Multi-query `vector_search(tbl, [q1, q2, ...], col)` requires a multi-vector (list-typed) column; column '{col}' is scalar."
+                    )));
+                }
+                ChunkedNonIndexVectorGeneration::new(
+                    &table_provider,
+                    &args.tbl,
+                    embed_udf,
+                    model_name,
+                    pks_vec,
+                    &col,
+                )
+                .search(args.query)?
+            };
             return alias_value_to_match(Arc::clone(&table));
         }
 
@@ -630,6 +930,11 @@ impl TableProvider for VectorSearchUDTFProvider {
     }
 
     fn schema(&self) -> SchemaRef {
+        // When the caller asked `include_score => false`, don't advertise `_score`
+        // in the schema. The scan body also omits it from the final projection.
+        if matches!(self.args.include_score, Some(false)) {
+            return self.underlying.schema();
+        }
         append_fields(
             &self.underlying.schema(),
             vec![Arc::new(Field::new(
@@ -642,6 +947,33 @@ impl TableProvider for VectorSearchUDTFProvider {
 
     fn table_type(&self) -> TableType {
         TableType::View
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        let schema = self.underlying.schema();
+        let base_field_names: HashSet<&str> =
+            schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        filters
+            .iter()
+            .map(|f| {
+                // Only push down filters whose columns all exist in the underlying table.
+                // Filters on computed columns (e.g. _score) are not pushable.
+                let pushable = f
+                    .column_refs()
+                    .iter()
+                    .all(|c| base_field_names.contains(c.name()));
+
+                Ok(if pushable {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                })
+            })
+            .collect()
     }
 
     async fn scan(
@@ -660,16 +992,6 @@ impl TableProvider for VectorSearchUDTFProvider {
             .await
             .map_err(DataFusionError::External)?;
 
-        let Some(cosine_distance_udf) = state
-            .scalar_functions()
-            .get(COSINE_DISTANCE_UDF_NAME)
-            .cloned()
-        else {
-            return Err(DataFusionError::Execution(format!(
-                "UDF '{COSINE_DISTANCE_UDF_NAME}' is required to perform {VECTOR_SEARCH_UDTF_NAME}, but it is not defined."
-            )));
-        };
-
         // TODO: eventually this will need to be a join on underlying, and auxiliary table.
         let mut scan = LogicalPlanBuilder::scan(
             self.args.tbl.clone(),
@@ -681,10 +1003,19 @@ impl TableProvider for VectorSearchUDTFProvider {
             scan = scan.filter(f)?;
         }
 
-        let search_field_index = self
-            .schema()
-            .index_of(SEARCH_SCORE_COLUMN_NAME)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        // Whether this invocation wants the `_score` column projected to the caller.
+        // Defaults to true for backward compatibility. When false, we skip it in the
+        // final projection (and the schema already omits it — see `schema()`).
+        let include_score = self.args.include_score.unwrap_or(true);
+        let search_field_index = if include_score {
+            Some(
+                self.schema()
+                    .index_of(SEARCH_SCORE_COLUMN_NAME)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
+            )
+        } else {
+            None
+        };
 
         let mut final_expr: Vec<Expr> = self
             .schema()
@@ -706,24 +1037,67 @@ impl TableProvider for VectorSearchUDTFProvider {
             .collect();
         let mut base_expr = final_expr.clone();
 
-        base_expr.push(
-            binary_expr(
-                lit(1.0),
-                Operator::Minus,
-                Expr::ScalarFunction(ScalarFunction {
-                    func: cosine_distance_udf,
-                    args: vec![
-                        lit(ScalarValue::FixedSizeList(Arc::new(query_vector))),
-                        ident(embedding_col!(embed_col)),
-                    ],
-                }),
-            )
-            .alias(SEARCH_SCORE_COLUMN_NAME),
-        );
+        // Pick the scoring expression based on the requested distance metric.
+        // In all cases the result is monotonically increasing with similarity
+        // (higher == more similar) so the downstream `ORDER BY _score DESC` is correct.
+        let metric = self.args.distance_metric.unwrap_or(DistanceMetric::Cosine);
+        let embed_expr = ident(embedding_col!(embed_col));
+        let query_lit = lit(ScalarValue::FixedSizeList(Arc::new(query_vector)));
 
-        // only include score in the projection if it is requested.
-        // Otherwise, if the query is `SELECT a FROM vector_search(...)`, it will fail because we supplied too many columns in the response!
-        if projection.is_none() || projection.is_some_and(|proj| proj.contains(&search_field_index))
+        let score_expr: Expr = match metric {
+            DistanceMetric::Cosine => {
+                let Some(cosine_distance_udf) = state
+                    .scalar_functions()
+                    .get(COSINE_DISTANCE_UDF_NAME)
+                    .cloned()
+                else {
+                    return Err(DataFusionError::Execution(format!(
+                        "UDF '{COSINE_DISTANCE_UDF_NAME}' is required to perform {VECTOR_SEARCH_UDTF_NAME}, but it is not defined."
+                    )));
+                };
+                // score = 1 - cosine_distance (higher == closer)
+                binary_expr(
+                    lit(1.0),
+                    Operator::Minus,
+                    Expr::ScalarFunction(ScalarFunction {
+                        func: cosine_distance_udf,
+                        args: vec![query_lit, embed_expr],
+                    }),
+                )
+            }
+            DistanceMetric::L2 => {
+                // DataFusion's `array_distance` is Euclidean (L2). Negate so higher == closer.
+                let Some(array_distance_udf) =
+                    state.scalar_functions().get("array_distance").cloned()
+                else {
+                    return Err(DataFusionError::Execution(format!(
+                        "UDF 'array_distance' is required for distance_metric => 'l2' in {VECTOR_SEARCH_UDTF_NAME}, but it is not registered."
+                    )));
+                };
+                binary_expr(
+                    lit(0.0),
+                    Operator::Minus,
+                    Expr::ScalarFunction(ScalarFunction {
+                        func: array_distance_udf,
+                        args: vec![query_lit, embed_expr],
+                    }),
+                )
+            }
+            DistanceMetric::Dot => {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "distance_metric => 'dot' is not yet wired through {VECTOR_SEARCH_UDTF_NAME}. \
+                     For L2-normalized embeddings, use distance_metric => 'cosine' which is \
+                     mathematically equivalent. See https://spiceai.org/docs for roadmap."
+                )));
+            }
+        };
+
+        base_expr.push(score_expr.alias(SEARCH_SCORE_COLUMN_NAME));
+
+        // Only project `_score` into the output when the caller asked for it
+        // AND either asked for all columns or explicitly projected that index.
+        if let Some(idx) = search_field_index
+            && (projection.is_none() || projection.is_some_and(|proj| proj.contains(&idx)))
         {
             final_expr.push(col(SEARCH_SCORE_COLUMN_NAME));
         }
@@ -764,4 +1138,254 @@ fn alias_value_to_match(
         })
         .collect::<Vec<Expr>>();
     Ok(Arc::new(ViewTable::new(bldr.project(cols)?.build()?, None)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VectorSearchTableFunc, VectorSearchTableFuncArgs, closest_column};
+    use crate::embeddings::udtf::VectorSearchUDTFProvider;
+    use crate::model::EmbeddingModelStore;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::TableProvider;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::Expr;
+    use datafusion::scalar::ScalarValue;
+    use datafusion::sql::TableReference;
+    use datafusion_expr::TableProviderFilterPushDown;
+    use datafusion_expr::expr::ScalarFunction;
+    use datafusion_expr::{col, lit};
+    use search::SEARCH_SCORE_COLUMN_NAME;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn fields(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn lit_utf8(s: &str) -> Expr {
+        Expr::Literal(ScalarValue::Utf8(Some(s.to_string())), None)
+    }
+
+    #[test]
+    fn closest_column_returns_close_match() {
+        let cands = fields(&["content", "title", "body"]);
+        assert_eq!(
+            closest_column("contnet", &cands),
+            Some("content".to_string())
+        );
+        // Case-insensitive
+        assert_eq!(
+            closest_column("CONTENT", &cands),
+            Some("content".to_string())
+        );
+        // Exact match
+        assert_eq!(closest_column("title", &cands), Some("title".to_string()));
+    }
+
+    #[test]
+    fn closest_column_returns_none_for_distant() {
+        let cands = fields(&["content", "title"]);
+        assert_eq!(closest_column("xyzabc_unrelated", &cands), None);
+    }
+
+    #[test]
+    fn closest_column_handles_empty_candidates() {
+        assert_eq!(closest_column("anything", &[]), None);
+    }
+
+    #[test]
+    fn test_parse_query_arg_single_string() {
+        let q = lit_utf8("hello");
+        let out = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect("ok");
+        assert_eq!(out, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_query_arg_make_array() {
+        use datafusion::functions_nested::make_array::make_array_udf;
+        let make_array = make_array_udf();
+        let q = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::clone(&make_array),
+            vec![lit_utf8("red"), lit_utf8("round")],
+        ));
+        let out = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect("ok");
+        assert_eq!(out, vec!["red".to_string(), "round".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_query_arg_make_array_non_string_element_rejected() {
+        use datafusion::functions_nested::make_array::make_array_udf;
+        let make_array = make_array_udf();
+        let q = Expr::ScalarFunction(ScalarFunction::new_udf(
+            Arc::clone(&make_array),
+            vec![
+                lit_utf8("red"),
+                Expr::Literal(ScalarValue::Int32(Some(42)), None),
+            ],
+        ));
+        let err = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect_err("expected rejection");
+        assert!(err.to_string().contains("must be string literals"));
+    }
+
+    #[test]
+    fn test_parse_query_arg_empty_make_array_rejected() {
+        use datafusion::functions_nested::make_array::make_array_udf;
+        let make_array = make_array_udf();
+        let q = Expr::ScalarFunction(ScalarFunction::new_udf(Arc::clone(&make_array), vec![]));
+        let err = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect_err("expected rejection");
+        assert!(err.to_string().contains("at least one query string"));
+    }
+
+    fn list_literal(strs: &[&str]) -> Expr {
+        use arrow::datatypes::DataType;
+        let scalars: Vec<ScalarValue> = strs
+            .iter()
+            .map(|s| ScalarValue::Utf8(Some((*s).to_string())))
+            .collect();
+        let arr = ScalarValue::new_list_nullable(&scalars, &DataType::Utf8);
+        Expr::Literal(ScalarValue::List(arr), None)
+    }
+
+    #[test]
+    fn test_parse_query_arg_sql_array_literal() {
+        let q = list_literal(&["climate", "economy", "anxiety"]);
+        let out = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect("ok");
+        assert_eq!(
+            out,
+            vec![
+                "climate".to_string(),
+                "economy".to_string(),
+                "anxiety".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_query_arg_sql_array_single_element() {
+        let q = list_literal(&["hello world"]);
+        let out = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect("ok");
+        assert_eq!(out, vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_query_arg_sql_array_empty_rejected() {
+        let q = list_literal(&[]);
+        let err = VectorSearchTableFunc::parse_query_arg(Some(&q)).expect_err("expected rejection");
+        assert!(err.to_string().contains("at least one query string"));
+    }
+
+    /// Create a minimal `VectorSearchUDTFProvider` with the given underlying schema for testing.
+    fn make_provider(schema: Schema) -> VectorSearchUDTFProvider {
+        let schema = Arc::new(schema);
+        let underlying: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("valid MemTable"));
+        VectorSearchUDTFProvider {
+            args: VectorSearchTableFuncArgs {
+                tbl: TableReference::bare("test_table"),
+                query: "test query".to_string(),
+                queries: vec!["test query".to_string()],
+                column: None,
+                limit: Some(5),
+                include_score: Some(true),
+                distance_metric: None,
+            },
+            underlying,
+            embedded_columns: HashMap::new(),
+            embedding_models: Arc::new(RwLock::new(EmbeddingModelStore::default())),
+        }
+    }
+
+    #[test]
+    fn test_filter_pushdown_base_column() {
+        let provider = make_provider(Schema::new(vec![
+            Field::new("review_date", DataType::Date32, false),
+            Field::new("review_body", DataType::Utf8, false),
+        ]));
+
+        let filter = col("review_date").gt(lit("2015-08-30"));
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(result, vec![TableProviderFilterPushDown::Exact]);
+    }
+
+    #[test]
+    fn test_filter_pushdown_computed_column_unsupported() {
+        let provider = make_provider(Schema::new(vec![Field::new(
+            "review_date",
+            DataType::Date32,
+            false,
+        )]));
+
+        let filter = col(SEARCH_SCORE_COLUMN_NAME).gt(lit(0.5));
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(result, vec![TableProviderFilterPushDown::Unsupported]);
+    }
+
+    #[test]
+    fn test_filter_pushdown_mixed_filters() {
+        let provider = make_provider(Schema::new(vec![
+            Field::new("review_date", DataType::Date32, false),
+            Field::new("star_rating", DataType::Int32, false),
+        ]));
+
+        let base_filter = col("review_date").gt(lit("2015-08-30"));
+        let score_filter = col(SEARCH_SCORE_COLUMN_NAME).gt(lit(0.5));
+        let multi_base_filter = col("star_rating").gt_eq(lit(4));
+
+        let result = provider
+            .supports_filters_pushdown(&[&base_filter, &score_filter, &multi_base_filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(
+            result,
+            vec![
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_filter_pushdown_mixed_column_expr_unsupported() {
+        let provider = make_provider(Schema::new(vec![Field::new(
+            "review_date",
+            DataType::Date32,
+            false,
+        )]));
+
+        // A filter referencing both a base column and a computed column should not be pushed down.
+        let filter = col("review_date")
+            .gt(lit("2015-08-30"))
+            .and(col(SEARCH_SCORE_COLUMN_NAME).gt(lit(0.5)));
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(result, vec![TableProviderFilterPushDown::Unsupported]);
+    }
+
+    #[test]
+    fn test_filter_pushdown_constant_expr_exact() {
+        let provider = make_provider(Schema::new(vec![Field::new(
+            "review_date",
+            DataType::Date32,
+            false,
+        )]));
+
+        // A constant expression with no column refs (e.g. `WHERE true`) references no computed
+        // columns, so it is safe to push down — consistent with EmbeddingTable behavior.
+        let filter = lit(true);
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .expect("pushdown check should succeed");
+
+        assert_eq!(result, vec![TableProviderFilterPushDown::Exact]);
+    }
 }

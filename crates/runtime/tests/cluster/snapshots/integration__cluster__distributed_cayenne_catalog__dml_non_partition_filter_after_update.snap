@@ -1,0 +1,19 @@
+---
+source: crates/runtime/tests/cluster/distributed_cayenne_catalog.rs
+assertion_line: 1870
+expression: plan
+---
++---------------+---------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                |
++---------------+---------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: CAST(npf.s.inv.region AS LargeUtf8) AS region, CAST(npf.s.inv.sku AS LargeUtf8) AS sku, npf.s.inv.qty   |
+|               |   Sort: npf.s.inv.region ASC NULLS LAST, npf.s.inv.sku ASC NULLS LAST                                               |
+|               |     SubqueryAlias: npf.s.inv                                                                                        |
+|               |       TableScan: npf.s.inv projection=[region, sku, qty]                                                            |
+| physical_plan | ProjectionExec: expr=[CAST(region@0 AS LargeUtf8) as region, CAST(sku@1 AS LargeUtf8) as sku, qty@2 as qty]         |
+|               |   RepartitionExec: partitioning=RoundRobinBatch(3), input_partitions=1, maintains_sort_order=true                   |
+|               |     CooperativeExec                                                                                                 |
+|               |       BytesProcessedExec                                                                                            |
+|               |         FlightSqlExec sql=SELECT region, sku, qty FROM npf.s.inv ORDER BY region ASC NULLS LAST, sku ASC NULLS LAST |
+|               |                                                                                                                     |
++---------------+---------------------------------------------------------------------------------------------------------------------+

@@ -61,6 +61,7 @@ use futures::{
 };
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
+use llms::rerank::RerankerModelStore;
 use model::{EmbeddingModelStore, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
@@ -482,6 +483,11 @@ pub struct Runtime {
     // LLMs that support the OpenAI Responses API
     responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
+    /// Registered reranker models (native cross-encoders, reranker-API
+    /// providers). Consumed by the `rerank()` UDTF; may be empty when only
+    /// LLM-as-reranker usage is needed — chat models are resolved from
+    /// `completion_llms` as a fallback.
+    rerankers: Arc<RwLock<RerankerModelStore>>,
     workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
     tool_factories: Arc<Mutex<HashMap<String, ToolFactory>>>,
@@ -576,6 +582,11 @@ impl Runtime {
     #[must_use]
     pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
         Arc::clone(&self.completion_llms)
+    }
+
+    #[must_use]
+    pub fn rerankers(&self) -> Arc<RwLock<RerankerModelStore>> {
+        Arc::clone(&self.rerankers)
     }
 
     #[must_use]
@@ -775,8 +786,40 @@ impl Runtime {
     pub fn partition_manager(&self) -> Option<Arc<PartitionManager>> {
         match self.distributed.as_ref() {
             Some(DistributedNode::Scheduler {
-                partition_manager, ..
-            }) => Some(Arc::clone(partition_manager)),
+                accelerations_partitions,
+                ..
+            }) => Some(Arc::clone(accelerations_partitions)),
+            _ => None,
+        }
+    }
+
+    /// Returns the catalog/federated partition manager (scheduler only).
+    #[must_use]
+    pub fn catalog_partition_manager(&self) -> Option<Arc<PartitionManager>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler {
+                catalog_partitions, ..
+            }) => Some(Arc::clone(catalog_partitions)),
+            _ => None,
+        }
+    }
+
+    /// Returns the shared cluster state store (scheduler only).
+    #[must_use]
+    pub fn cluster_state(&self) -> Option<Arc<crate::cluster::ClusterStateStore>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { cluster_state, .. }) => {
+                Some(Arc::clone(cluster_state))
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the scheduler heartbeat store (scheduler only).
+    #[must_use]
+    pub fn scheduler_heartbeats(&self) -> Option<Arc<crate::cluster::SchedulerHeartbeatStore>> {
+        match self.distributed.as_ref() {
+            Some(DistributedNode::Scheduler { heartbeats, .. }) => Some(Arc::clone(heartbeats)),
             _ => None,
         }
     }
@@ -1187,6 +1230,11 @@ impl Runtime {
                     .update_embedding(&embedding.name, ComponentStatus::Initializing);
             }
 
+            for reranker in &app.rerankers {
+                self.status
+                    .update_reranker(&reranker.name, ComponentStatus::Initializing);
+            }
+
             for model in &app.models {
                 self.status
                     .update_model(&model.name, ComponentStatus::Initializing);
@@ -1232,6 +1280,7 @@ impl Runtime {
 
         // Must be loaded before datasets
         self.load_embeddings().await;
+        self.load_rerankers().await;
 
         // Spawn each component load in its own task to run in parallel
         let task_history = tokio::spawn({

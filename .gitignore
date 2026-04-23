@@ -16,6 +16,7 @@ Makefile.local
 *.parquet
 spicepod.yaml
 !test/tpc-bench/tpch-spicepod/spicepod.yaml
+!examples/cosmosdb-connector/spicepod.yaml
 
 target/
 

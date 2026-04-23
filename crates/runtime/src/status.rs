@@ -171,6 +171,13 @@ impl RuntimeStatus {
         self.update_component_status(&format!("embedding:{model_name}"), status);
         metrics::embeddings::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
     }
+
+    pub fn update_reranker(&self, model_name: &str, status: ComponentStatus) {
+        let model_name = model_name.to_string();
+        let metric_value = status.discriminant();
+        self.update_component_status(&format!("reranker:{model_name}"), status);
+        metrics::rerankers::STATUS.record(metric_value, &[KeyValue::new("model", model_name)]);
+    }
     pub fn update_view(&self, view_name: &TableReference, status: ComponentStatus) {
         let view_name = view_name.to_string();
         let metric_value = status.discriminant();
