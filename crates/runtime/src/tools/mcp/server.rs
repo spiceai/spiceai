@@ -84,7 +84,7 @@ impl ServerHandler for RuntimeServer {
                 .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/')
             {
                 return Err(McpError::invalid_params(
-                    "Tool name contains invalid characters. Only alphanumeric, underscore, hyphen, and dot allowed".to_string(),
+                    "Tool name contains invalid characters. Only alphanumeric, underscore, hyphen, dot, and forward-slash allowed".to_string(),
                     None,
                 ));
             }

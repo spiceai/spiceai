@@ -56,8 +56,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MCPType {
-    /// Connect to an MCP server over Streamable HTTP.
-    Https(url::Url),
+    /// Connect to an MCP server over Streamable HTTP (HTTPS in production; HTTP is permitted for localhost).
+    StreamableHttp(url::Url),
 
     /// Uses stdio to communicate with an MCP server. The string is the command to run.
     Stdio(String),
@@ -81,7 +81,7 @@ pub(crate) enum MCPConfig {
         args: Vec<String>,
         env: HashMap<String, String>,
     },
-    Https {
+    StreamableHttp {
         url: url::Url,
     },
 }
@@ -108,7 +108,7 @@ impl MCPConfig {
 
                 Self::Stdio { command, args, env }
             }
-            MCPType::Https(url) => Self::Https { url },
+            MCPType::StreamableHttp(url) => Self::StreamableHttp { url },
         }
     }
 }
@@ -122,7 +122,7 @@ mod tests {
         let t = MCPType::from_str("docker").expect("valid stdio MCP directive");
         match t {
             MCPType::Stdio(cmd) => assert_eq!(cmd, "docker"),
-            MCPType::Https(_) => panic!("expected stdio variant"),
+            MCPType::StreamableHttp(_) => panic!("expected stdio variant"),
         }
     }
 
@@ -130,7 +130,7 @@ mod tests {
     fn mcp_type_parses_https_url() {
         let t = MCPType::from_str("https://example.com/v1/mcp").expect("valid https MCP directive");
         match t {
-            MCPType::Https(url) => {
+            MCPType::StreamableHttp(url) => {
                 assert_eq!(url.scheme(), "https");
                 assert_eq!(url.host_str(), Some("example.com"));
                 assert_eq!(url.path(), "/v1/mcp");
@@ -144,7 +144,7 @@ mod tests {
         let t = MCPType::from_str("http://127.0.0.1:8090/v1/mcp")
             .expect("valid http MCP directive for localhost");
         match t {
-            MCPType::Https(url) => {
+            MCPType::StreamableHttp(url) => {
                 assert_eq!(url.scheme(), "http");
                 assert_eq!(url.path(), "/v1/mcp");
             }
@@ -170,17 +170,17 @@ mod tests {
                 assert_eq!(args, vec!["run", "-i", "--rm", "mcp/fetch"]);
                 assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
             }
-            MCPConfig::Https { .. } => panic!("expected stdio config"),
+            MCPConfig::StreamableHttp { .. } => panic!("expected stdio config"),
         }
     }
 
     #[test]
     fn mcp_config_from_https_preserves_url() {
         let url = url::Url::parse("https://example.com/v1/mcp").expect("valid url");
-        let mcp_type = MCPType::Https(url.clone());
+        let mcp_type = MCPType::StreamableHttp(url.clone());
         let cfg = MCPConfig::from_type(&mcp_type, &HashMap::new(), &HashMap::new());
         match cfg {
-            MCPConfig::Https { url: u } => assert_eq!(u, url),
+            MCPConfig::StreamableHttp { url: u } => assert_eq!(u, url),
             MCPConfig::Stdio { .. } => panic!("expected https config"),
         }
     }

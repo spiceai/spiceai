@@ -189,11 +189,11 @@ impl McpToolCatalog {
                     .context(UnderlyingTransportSnafu)?,
                 ))
             }
-            MCPConfig::Https { url } => {
+            MCPConfig::StreamableHttp { url } => {
                 // Security: Validate URL scheme (only https allowed, http for localhost testing)
                 if url.scheme() != "https" && url.scheme() != "http" {
                     return Err(Error::CouldNotConstructTool {
-                        name: "mcp_https".to_string(),
+                        name: "mcp_streamable_http".to_string(),
                         e: format!(
                             "Invalid URL scheme '{}'. Only https:// (or http:// for localhost) allowed",
                             url.scheme()

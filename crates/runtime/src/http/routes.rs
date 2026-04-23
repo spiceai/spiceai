@@ -122,6 +122,20 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
 
     #[cfg(feature = "mcp")]
     {
+        use utoipa::openapi::{
+            Required,
+            path::{Parameter, ParameterIn},
+        };
+
+        let session_header = Parameter::builder()
+            .name("Mcp-Session-Id")
+            .parameter_in(ParameterIn::Header)
+            .description(Some(
+                "Session identifier returned by the server on `initialize` and required on subsequent requests to maintain MCP session continuity.",
+            ))
+            .required(Required::False)
+            .build();
+
         openai.paths.add_path_operation(
             "/v1/mcp",
             vec![HttpMethod::Post],
@@ -131,9 +145,46 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
                 .summary(Some("Send a Model Context Protocol message"))
                 .description(Some(
                     "Send a JSON-RPC message to the Spice MCP server using the MCP Streamable HTTP transport. \
-The response is either a single JSON-RPC response or an SSE stream, depending on the `Accept` header. \
-Session continuity is carried via the `Mcp-Session-Id` header.",
+The response is either a single JSON-RPC response (`application/json`) or an SSE stream (`text/event-stream`), \
+selected via the `Accept` header. Session continuity is carried via the `Mcp-Session-Id` header.",
                 ))
+                .parameter(session_header.clone())
+                .response(
+                    "200",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "JSON-RPC response. Returned as `application/json` for a single response or `text/event-stream` when the server streams additional messages.",
+                        )
+                        .build(),
+                )
+                .response(
+                    "202",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Message accepted (for JSON-RPC notifications / responses that do not require a reply).",
+                        )
+                        .build(),
+                )
+                .response(
+                    "400",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description("Malformed JSON-RPC payload.")
+                        .build(),
+                )
+                .response(
+                    "404",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Unknown or expired `Mcp-Session-Id`.",
+                        )
+                        .build(),
+                )
+                .response(
+                    "413",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description("Payload too large. Maximum allowed size is 32 MiB.")
+                        .build(),
+                )
                 .build(),
         );
         openai.paths.add_path_operation(
@@ -144,8 +195,47 @@ Session continuity is carried via the `Mcp-Session-Id` header.",
                 .tag("mcp")
                 .summary(Some("Open an MCP server-to-client SSE stream"))
                 .description(Some(
-                    "Open a long-lived server-to-client SSE stream for the current MCP session as defined by the Streamable HTTP transport.",
+                    "Open a long-lived server-to-client SSE stream for the current MCP session as defined by the Streamable HTTP transport. \
+The `Mcp-Session-Id` header must identify an existing session created via `POST /v1/mcp`.",
                 ))
+                .parameter(session_header.clone())
+                .response(
+                    "200",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description("SSE stream (`text/event-stream`) of server-originated MCP messages.")
+                        .build(),
+                )
+                .response(
+                    "404",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description("Unknown or expired `Mcp-Session-Id`.")
+                        .build(),
+                )
+                .build(),
+        );
+        openai.paths.add_path_operation(
+            "/v1/mcp",
+            vec![HttpMethod::Delete],
+            Operation::builder()
+                .operation_id(Some("mcp_terminate_session"))
+                .tag("mcp")
+                .summary(Some("Terminate an MCP Streamable HTTP session"))
+                .description(Some(
+                    "Terminate the MCP session identified by the `Mcp-Session-Id` header. Subsequent requests bearing the same session id will receive `404 Not Found`.",
+                ))
+                .parameter(session_header)
+                .response(
+                    "204",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description("Session terminated.")
+                        .build(),
+                )
+                .response(
+                    "404",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description("Unknown or already-terminated `Mcp-Session-Id`.")
+                        .build(),
+                )
                 .build(),
         );
     }

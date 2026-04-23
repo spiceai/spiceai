@@ -91,12 +91,19 @@ params:
             .expect("Failed to start spiced with tools");
 
         let client = reqwest::Client::new();
+        // Use a concrete known protocol version rather than `LATEST` so this test
+        // documents a specific wire-format contract. rmcp exposes
+        // `ProtocolVersion::KNOWN_VERSIONS`; using `V_2025_03_26` keeps the test
+        // deterministic while still exercising the server's version negotiation.
+        let protocol_version = rmcp::model::ProtocolVersion::V_2025_03_26
+            .as_str()
+            .to_string();
         let init_body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-03-26",
+                "protocolVersion": protocol_version,
                 "capabilities": {},
                 "clientInfo": {
                     "name": "spice-integration-test",
