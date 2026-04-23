@@ -16268,10 +16268,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-parameter-spec"
+version = "2.0.0-unstable"
+
+[[package]]
 name = "runtime-parameters"
 version = "2.0.0-unstable"
 dependencies = [
  "itertools 0.14.0",
+ "runtime-parameter-spec",
  "runtime-secrets",
  "secrecy",
  "snafu",
@@ -16333,6 +16338,7 @@ version = "2.0.0-unstable"
 dependencies = [
  "async-trait",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-credential-bridge",
  "aws-sdk-secretsmanager",
  "aws-sdk-sts",
@@ -16345,6 +16351,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.10.1",
  "reqwest 0.12.24",
+ "runtime-parameter-spec",
  "secrecy",
  "serde_json",
  "snafu",
