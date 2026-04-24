@@ -16306,7 +16306,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-parameter-spec"
-version = "2.0.0-unstable"
+version = "2.0.0-enterprise-beta"
 
 [[package]]
 name = "runtime-parameters"
