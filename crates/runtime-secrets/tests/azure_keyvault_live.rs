@@ -59,8 +59,6 @@ limitations under the License.
 
 #![cfg(feature = "azure-keyvault")]
 
-use std::time::Duration;
-
 use runtime_secrets::stores::azure_keyvault::{AuthMethod, AzureKeyVault, AzureKeyVaultConfig};
 use runtime_secrets::{ExposeSecret, SecretStore};
 use secrecy::SecretString;
@@ -175,30 +173,36 @@ async fn live_repeated_lookups_are_served_from_cache() {
     };
     let store = build_store(&config.vault);
 
-    let first = std::time::Instant::now();
+    // Deterministic cache-behavior assertion. The earlier implementation
+    // compared wall-clock timings (second call ≥10× faster than first),
+    // which flaked under network jitter on shared CI hosts. Instead, seed
+    // the cache with one lookup, then assert the next lookup increments
+    // the hit counter without incrementing the miss counter.
     let v1 = store
         .get_secret(&config.key)
         .await
         .expect("first lookup ok")
         .expect("present");
-    let first_elapsed = first.elapsed();
 
-    let second = std::time::Instant::now();
+    let (hits_before, misses_before) = store.cache_stats();
+
     let v2 = store
         .get_secret(&config.key)
         .await
         .expect("second lookup ok")
         .expect("present");
-    let second_elapsed = second.elapsed();
+
+    let (hits_after, misses_after) = store.cache_stats();
 
     assert_eq!(v1.expose_secret(), v2.expose_secret());
-
-    // The second lookup should be served from the in-process cache and be
-    // dramatically faster than the network round-trip. A loose 10x margin
-    // avoids flakiness on slow CI hosts.
-    let upper_bound = first_elapsed.max(Duration::from_millis(10)) / 10;
-    assert!(
-        second_elapsed <= upper_bound.max(Duration::from_millis(5)),
-        "expected cached lookup to be faster than {upper_bound:?}; got {second_elapsed:?}"
+    assert_eq!(
+        hits_after - hits_before,
+        1,
+        "second lookup should have been a cache hit (hits went {hits_before} → {hits_after})",
+    );
+    assert_eq!(
+        misses_after - misses_before,
+        0,
+        "second lookup must not issue a network fetch (misses went {misses_before} → {misses_after})",
     );
 }

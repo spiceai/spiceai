@@ -50,6 +50,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -212,10 +213,23 @@ impl AzureKeyVaultConfig {
     /// flip `auth_method: default` into service-principal mode with an
     /// empty secret, bypassing [`validate_auth_params`] and failing only
     /// later inside the Azure SDK with a much less actionable error.
+    ///
+    /// Whitespace-only values (e.g. `tenant_id: "   "`) are also treated
+    /// as missing: if a user meant to supply a value they wouldn't have
+    /// put spaces in, and if they left it blank the SDK's own error is a
+    /// worse experience than a clean `MissingAuthParams`. The stripping
+    /// is surface-only — the stored string has its surrounding whitespace
+    /// trimmed so downstream code sees the same canonical form users see
+    /// when they copy-paste values.
     #[must_use]
     pub fn from_params(vault: String, params: &HashMap<String, String>) -> Self {
         fn non_empty(s: Option<&String>) -> Option<String> {
-            s.filter(|v| !v.is_empty()).cloned()
+            let trimmed = s.map(|v| v.trim())?;
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
         }
         let auth_method = params
             .get("auth_method")
@@ -343,6 +357,16 @@ pub struct AzureKeyVault {
 
     cache_ttl: Duration,
     negative_ttl: Duration,
+
+    /// Counters that let the integration-test harness assert cache
+    /// behavior deterministically instead of relying on wall-clock timing
+    /// (which flaked under CI network jitter). These are not `#[cfg(test)]`
+    /// because integration tests compile the library as a regular
+    /// dependency, without the `test` cfg. Each counter is two words;
+    /// the footprint is negligible and the accessor [`Self::cache_stats`]
+    /// is documented as test-only via `#[doc(hidden)]`.
+    cache_hits: AtomicUsize,
+    cache_misses: AtomicUsize,
 }
 
 impl AzureKeyVault {
@@ -423,6 +447,8 @@ impl AzureKeyVault {
             inflight: Mutex::new(HashMap::new()),
             cache_ttl: DEFAULT_CACHE_TTL,
             negative_ttl: NEGATIVE_CACHE_TTL,
+            cache_hits: AtomicUsize::new(0),
+            cache_misses: AtomicUsize::new(0),
         })
     }
 
@@ -590,6 +616,22 @@ impl AzureKeyVault {
         self.client_secret.is_some()
     }
 
+    /// Test-only accessor returning `(cache_hits, cache_misses)` counted
+    /// since store construction. Used by the live integration test to
+    /// assert cache behavior deterministically without relying on
+    /// wall-clock timing (which flakes under network jitter). Not part of
+    /// the public API — integration tests call it from
+    /// `tests/azure_keyvault_live.rs`, which compiles the library as a
+    /// regular dependency so `#[cfg(test)]` wouldn't expose it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn cache_stats(&self) -> (usize, usize) {
+        (
+            self.cache_hits.load(Ordering::Relaxed),
+            self.cache_misses.load(Ordering::Relaxed),
+        )
+    }
+
     /// Returns the cached entry for `key` if it is still fresh.
     async fn try_cached(&self, key: &str) -> Option<Arc<CachedEntry>> {
         let guard = self.cache.read().await;
@@ -628,8 +670,10 @@ impl AzureKeyVault {
     async fn load(&self, key: &str) -> crate::AnyErrorResult<Option<SecretString>> {
         loop {
             if let Some(entry) = self.try_cached(key).await {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(entry.value.clone());
             }
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
 
             // Election: observe or install the in-flight entry while holding
             // the mutex, then drop it before any `.await` on the cache or
@@ -1104,6 +1148,39 @@ mod tests {
             cfg.client_secret.is_none(),
             "empty client_secret must become None",
         );
+    }
+
+    /// Whitespace-only values were a gap in the empty-string normalization:
+    /// `tenant_id: "   "` would pass `.is_empty()` and land in the store as
+    /// `Some("   ")`, later producing a confusing SDK error. Treat them as
+    /// missing and — for non-empty values — strip surrounding whitespace so
+    /// copy-paste leaks (e.g. trailing newlines) don't trip the SDK either.
+    #[test]
+    fn from_params_treats_whitespace_only_values_as_missing() {
+        let mut p = HashMap::new();
+        p.insert("auth_method".to_string(), "service_principal".to_string());
+        p.insert("tenant_id".to_string(), "   ".to_string());
+        p.insert("client_id".to_string(), "\t\n".to_string());
+        p.insert("client_secret".to_string(), " ".to_string());
+        p.insert("endpoint".to_string(), "\n".to_string());
+
+        let cfg = AzureKeyVaultConfig::from_params("my-vault".to_string(), &p);
+        assert!(cfg.tenant_id.is_none(), "whitespace tenant_id must be None");
+        assert!(cfg.client_id.is_none(), "whitespace client_id must be None");
+        assert!(
+            cfg.client_secret.is_none(),
+            "whitespace client_secret must be None",
+        );
+        assert!(cfg.endpoint.is_none(), "whitespace endpoint must be None");
+    }
+
+    #[test]
+    fn from_params_trims_surrounding_whitespace_but_keeps_value() {
+        let mut p = HashMap::new();
+        p.insert("tenant_id".to_string(), "  tenant-xyz\n".to_string());
+
+        let cfg = AzureKeyVaultConfig::from_params("my-vault".to_string(), &p);
+        assert_eq!(cfg.tenant_id.as_deref(), Some("tenant-xyz"));
     }
 
     #[test]
