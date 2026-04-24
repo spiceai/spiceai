@@ -26,6 +26,7 @@ use crate::component::embeddings::Embeddings;
 use crate::component::function::Function;
 use crate::component::is_default;
 use crate::component::management::Management;
+use crate::component::rerankers::Reranker;
 use crate::component::runtime::Runtime;
 use crate::component::secret::Secret;
 use crate::component::snapshot::Snapshots;
@@ -115,6 +116,10 @@ pub struct SpicepodDefinition {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub embeddings: Vec<ComponentOrReference<Embeddings>>,
+
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub rerankers: Vec<ComponentOrReference<Reranker>>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]

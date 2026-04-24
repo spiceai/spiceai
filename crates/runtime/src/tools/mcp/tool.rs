@@ -16,8 +16,8 @@ limitations under the License.
 
 use async_trait::async_trait;
 use rmcp::{
-    ServiceError,
-    model::{CallToolRequestParam, CallToolResult, JsonObject, Tool, object},
+    model::{CallToolRequestParams, CallToolResult, JsonObject, Tool, object},
+    service::ServiceError,
 };
 use serde_json::Value;
 use snafu::ResultExt;
@@ -117,7 +117,7 @@ impl SpiceModelTool for McpToolWrapper {
             }
 
             let response = client
-                .call_tool(CallToolRequestParam{name: self.internal_name(), arguments: Some(object(input))})
+                .call_tool(CallToolRequestParams::new(self.internal_name()).with_arguments(object(input)))
                 .await
                 .boxed()?;
 
@@ -148,11 +148,10 @@ impl McpProxy for McpToolWrapper {
         arguments: Option<JsonObject>,
     ) -> Result<CallToolResult, ServiceError> {
         let inner = self.client.read().await;
-        inner
-            .call_tool(CallToolRequestParam {
-                name: self.internal_name(),
-                arguments,
-            })
-            .await
+        let mut req = CallToolRequestParams::new(self.internal_name());
+        if let Some(args) = arguments {
+            req = req.with_arguments(args);
+        }
+        inner.call_tool(req).await
     }
 }

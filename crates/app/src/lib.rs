@@ -31,6 +31,7 @@ use spicepod::{
         function::Function,
         management::Management,
         model::Model,
+        rerankers::Reranker,
         runtime::{CorsConfig, Runtime, TlsConfig},
         secret::Secret,
         snapshot::Snapshots,
@@ -61,6 +62,8 @@ pub struct App {
     pub models: Vec<Model>,
 
     pub embeddings: Vec<Embeddings>,
+
+    pub rerankers: Vec<Reranker>,
 
     pub tools: Vec<Tool>,
 
@@ -100,6 +103,7 @@ impl Default for App {
             views: vec![],
             models: vec![],
             embeddings: vec![],
+            rerankers: vec![],
             tools: vec![],
             workers: vec![],
             functions: vec![],
@@ -131,6 +135,7 @@ pub struct AppBuilder {
     views: Vec<View>,
     models: Vec<Model>,
     embeddings: Vec<Embeddings>,
+    rerankers: Vec<Reranker>,
     tools: Vec<Tool>,
     workers: Vec<Worker>,
     functions: Vec<Function>,
@@ -151,6 +156,7 @@ impl AppBuilder {
             views: vec![],
             models: vec![],
             embeddings: vec![],
+            rerankers: vec![],
             tools: vec![],
             workers: vec![],
             functions: vec![],
@@ -176,6 +182,7 @@ impl AppBuilder {
         self.views.extend(spicepod.views.clone());
         self.models.extend(spicepod.models.clone());
         self.embeddings.extend(spicepod.embeddings.clone());
+        self.rerankers.extend(spicepod.rerankers.clone());
         self.tools.extend(spicepod.tools.clone());
         self.workers.extend(spicepod.workers.clone());
         self.functions.extend(spicepod.functions.clone());
@@ -348,6 +355,7 @@ impl AppBuilder {
             views: self.views,
             models: self.models,
             embeddings: self.embeddings,
+            rerankers: self.rerankers,
             tools: self.tools,
             workers: self.workers,
             functions: self.functions,
@@ -378,6 +386,7 @@ impl AppBuilder {
         let mut views: Vec<View> = vec![];
         let mut models: Vec<Model> = vec![];
         let mut embeddings: Vec<Embeddings> = vec![];
+        let mut rerankers: Vec<Reranker> = vec![];
         let mut tools: Vec<Tool> = vec![];
         let mut workers: Vec<Worker> = vec![];
         let mut functions: Vec<Function> = vec![];
@@ -400,6 +409,10 @@ impl AppBuilder {
 
         for embedding in &spicepod.embeddings {
             embeddings.push(embedding.clone());
+        }
+
+        for reranker in &spicepod.rerankers {
+            rerankers.push(reranker.clone());
         }
 
         for tool in &spicepod.tools {
@@ -439,6 +452,10 @@ impl AppBuilder {
             }
             for embedding in &dependent_spicepod.embeddings {
                 embeddings.push(embedding.clone());
+            }
+
+            for reranker in &dependent_spicepod.rerankers {
+                rerankers.push(reranker.clone());
             }
 
             for tool in &dependent_spicepod.tools {
@@ -491,6 +508,7 @@ impl AppBuilder {
             views,
             models,
             embeddings,
+            rerankers,
             tools,
             workers,
             functions,
