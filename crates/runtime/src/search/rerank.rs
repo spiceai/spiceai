@@ -1425,6 +1425,16 @@ mod tests {
     }
 
     async fn make_rerank_runtime() -> DataFusionResult<crate::Runtime> {
+        // Pin target_partitions so EXPLAIN snapshots are deterministic across machines with different core counts.
+        {
+            let mut config = crate::datafusion::builder::DEFAULT_DATAFUSION_CONFIG
+                .write()
+                .expect("to lock default config");
+            config.options_mut().execution.target_partitions = 3;
+            config.options_mut().execution.coalesce_batches = false;
+            config.options_mut().optimizer.repartition_joins = false;
+        }
+
         let rt = RuntimeBuilder::new().build().await;
         rt.df.ctx.state().config_mut().set_extension(Arc::new(
             RequestContext::builder(Protocol::Internal).build(),
