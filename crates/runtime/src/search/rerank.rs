@@ -932,9 +932,6 @@ impl ExecutionPlan for RerankExec {
         let input_is_nested = self.input_is_nested;
         let model_name = self.reranker.model_name().unwrap_or("unknown").to_string();
 
-        let span =
-            tracing::span!(target: "task_history", tracing::Level::INFO, "rerank", input = %query);
-
         let stream = futures::stream::once(async move {
             // 1. Execute the child plan and collect candidate batches.
             tracing::debug!(document = %document, "RerankExec: collecting candidate batches..");
@@ -947,8 +944,13 @@ impl ExecutionPlan for RerankExec {
                 batches = truncate_batches(batches, DEFAULT_MAX_CANDIDATES);
             }
 
-            tracing::info!(target: "task_history", model = %model_name, document = %document, candidates = total, "labels");
             tracing::debug!(candidates = total, document = %document, "RerankExec: collected candidate batches");
+
+            // Start the task_history span after candidate collection so `execution_duration_ms` measures only
+            // the reranker work (extract docs → API call → sort), not the child plan execution which has its own traces.
+            let span = tracing::span!(target: "task_history", tracing::Level::INFO, "rerank", input = %query);
+            async {
+            tracing::info!(target: "task_history", model = %model_name, document = %document, candidates = total, "labels");
 
             // 2. Concatenate into a single batch for the reranker.
             let concatenated = if batches.is_empty() {
@@ -1031,7 +1033,8 @@ impl ExecutionPlan for RerankExec {
                 .inspect_err(|e| {
                     tracing::error!(target: "task_history", "{e}");
                 })
-        }.instrument(span));
+            }.instrument(span).await
+        });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.output_schema),
