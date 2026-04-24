@@ -63,6 +63,7 @@ members = [
     "crates/workers",
     "crates/yaml",
     "crates/scheduler",
+    "crates/smb",
     "tools/flightpublisher/",
     "tools/flightsubscriber/",
     "tools/flight-cookie-server/",
