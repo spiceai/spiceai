@@ -121,6 +121,7 @@ pub struct LocalMergePlanInput {
 /// Returns an error when either table cannot be resolved, an assignment targets
 /// a missing column, or an assignment expression fails to parse against the
 /// joined target/source schema.
+#[expect(clippy::too_many_arguments)]
 pub async fn build_local_merge_plan_input(
     session_state: &SessionState,
     default_catalog: &str,
