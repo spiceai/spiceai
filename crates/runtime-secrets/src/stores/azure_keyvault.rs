@@ -30,8 +30,11 @@ limitations under the License.
 //! - Authentication follows an explicit `auth_method` parameter rather than
 //!   a single opaque default, because `azure_identity` 0.31 does not ship a
 //!   `DefaultAzureCredential` chain: each credential type has to be chosen
-//!   up-front. `auth_method: default` auto-detects between service principal,
-//!   workload identity, managed identity, and the CLI credential.
+//!   up-front. `auth_method: default` uses service principal when
+//!   `client_secret` is set, otherwise falls back to the Azure CLI /
+//!   `azd` developer credential. Managed and workload identity are not
+//!   tried implicitly — callers opt in by setting `auth_method` explicitly
+//!   so failure modes stay actionable.
 //! - Responses are cached per-key for a short TTL so repeated reads of the
 //!   same logical secret do not re-hit Key Vault. `404 Not Found` responses
 //!   are negatively cached for a shorter TTL to avoid hammering the service
@@ -68,18 +71,23 @@ use crate::SecretStore;
 
 /// Parameters accepted by the `azure_keyvault` secret store.
 ///
-/// Authentication is selected via `auth_method`. `default` attempts, in
-/// order: service-principal (if `client_secret` is set), workload-identity
-/// (if the federated-token env vars are present), managed-identity (if
-/// `client_id` is set), then the Azure CLI credential. Explicit modes are
-/// provided for environments that want to fail fast rather than fall through
-/// the chain.
+/// Authentication is selected via `auth_method`. `default` uses service
+/// principal when `client_secret` is set; otherwise it falls back to the
+/// local-dev chain ([`DeveloperToolsCredential`], i.e. Azure CLI + `azd`).
+/// Managed and workload identity are **not** tried implicitly — set
+/// `auth_method` explicitly for those. This is a deliberate narrowing of
+/// the default chain: implicit IMDS/federated-token probing has noisy
+/// failure modes (timeouts, misleading errors) that make misconfiguration
+/// hard to diagnose when the user actually meant the CLI path.
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::runtime("auth_method")
         .description(
             "Authentication method used to obtain tokens for Key Vault. `default` \
-             auto-detects based on the other params and the environment. \
-             Explicit modes short-circuit the chain so misconfiguration fails fast.",
+             uses service principal when `client_secret` is set, otherwise falls back \
+             to the Azure CLI / `azd` developer credential. `managed_identity` and \
+             `workload_identity` are never tried implicitly — select them explicitly \
+             when deploying to Azure VMs / AKS. Explicit modes short-circuit the \
+             chain so misconfiguration fails fast.",
         )
         .one_of(&[
             "default",
@@ -91,15 +99,20 @@ pub const PARAMETERS: &[ParameterSpec] = &[
         .default("default"),
     ParameterSpec::runtime("tenant_id")
         .description(
-            "Azure Entra ID (AAD) tenant ID. Required for `service_principal` and \
-             `workload_identity`; ignored otherwise.",
+            "Azure Entra ID (AAD) tenant ID. Required for `service_principal`. \
+             Optional for `workload_identity` — when omitted, the credential reads it \
+             from the `AZURE_TENANT_ID` environment variable injected by the AKS \
+             workload-identity webhook. Ignored otherwise.",
         )
         .examples(&["00000000-0000-0000-0000-000000000000"]),
     ParameterSpec::runtime("client_id")
         .description(
-            "Azure application (client) ID. Required for `service_principal` and \
-             `workload_identity`. Optional for `managed_identity` — when set, selects \
-             a user-assigned identity; when omitted, the system-assigned identity is used.",
+            "Azure application (client) ID. Required for `service_principal`. \
+             Optional for `workload_identity` — when omitted, the credential reads it \
+             from the `AZURE_CLIENT_ID` environment variable injected by the AKS \
+             workload-identity webhook. Optional for `managed_identity` — when set, \
+             selects a user-assigned identity; when omitted, the system-assigned \
+             identity is used.",
         )
         .examples(&["00000000-0000-0000-0000-000000000000"]),
     ParameterSpec::runtime("client_secret")
@@ -161,7 +174,10 @@ impl std::fmt::Debug for AzureKeyVaultConfig {
 /// Authentication mode for the Key Vault SDK client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {
-    /// Auto-detect: service principal → workload identity → managed identity → CLI.
+    /// Narrow auto-detect: service principal if `client_secret` is set,
+    /// otherwise [`DeveloperToolsCredential`] (Azure CLI / `azd`).
+    /// Managed and workload identity are **not** tried implicitly — set
+    /// `auth_method` explicitly for those.
     Default,
     /// Azure AD service-principal credentials (`tenant_id`, `client_id`, `client_secret`).
     ServicePrincipal,
@@ -190,8 +206,17 @@ impl AuthMethod {
 impl AzureKeyVaultConfig {
     /// Builds an [`AzureKeyVaultConfig`] from the parsed selector and a
     /// validated parameter map.
+    ///
+    /// Empty-string params are normalized to `None`. Without this,
+    /// `client_secret: ""` would pass Spicepod param validation and then
+    /// flip `auth_method: default` into service-principal mode with an
+    /// empty secret, bypassing [`validate_auth_params`] and failing only
+    /// later inside the Azure SDK with a much less actionable error.
     #[must_use]
     pub fn from_params(vault: String, params: &HashMap<String, String>) -> Self {
+        fn non_empty(s: Option<&String>) -> Option<String> {
+            s.filter(|v| !v.is_empty()).cloned()
+        }
         let auth_method = params
             .get("auth_method")
             .map(|s| AuthMethod::parse(s.as_str()))
@@ -199,13 +224,10 @@ impl AzureKeyVaultConfig {
         Self {
             vault,
             auth_method,
-            tenant_id: params.get("tenant_id").cloned(),
-            client_id: params.get("client_id").cloned(),
-            client_secret: params
-                .get("client_secret")
-                .cloned()
-                .map(SecretString::from),
-            endpoint: params.get("endpoint").cloned(),
+            tenant_id: non_empty(params.get("tenant_id")),
+            client_id: non_empty(params.get("client_id")),
+            client_secret: non_empty(params.get("client_secret")).map(SecretString::from),
+            endpoint: non_empty(params.get("endpoint")),
         }
     }
 }
@@ -372,8 +394,21 @@ impl AzureKeyVault {
 
         let vault_url = resolve_vault_url(vault, config.endpoint.as_deref())?;
 
-        validate_auth_params(
+        // Validate against the *effective* auth method, not the
+        // configured one. `auth_method: default` + `client_secret: <foo>`
+        // resolves to ServicePrincipal, and users have the right to
+        // expect `MissingAuthParams` with a clear param list if they
+        // forgot `tenant_id` or `client_id` — rather than a generic
+        // Azure-SDK auth error at first lookup.
+        let effective = effective_auth_method(
             config.auth_method,
+            config
+                .client_secret
+                .as_ref()
+                .map(ExposeSecret::expose_secret),
+        );
+        validate_auth_params(
+            effective,
             config.tenant_id.as_deref(),
             config.client_id.as_deref(),
             config
@@ -534,13 +569,14 @@ impl AzureKeyVault {
     }
 
     /// The auth method the store actually uses after accounting for
-    /// `auth_method: default` auto-detection. Factored out so init and lookup
-    /// agree on a single answer.
+    /// `auth_method: default` auto-detection. Factored out as a free
+    /// function so `from_config` can call it for validation before the
+    /// store exists, and so init + lookup agree on a single answer.
     fn effective_auth_method(&self) -> AuthMethod {
-        match self.auth_method {
-            AuthMethod::Default if self.client_secret.is_some() => AuthMethod::ServicePrincipal,
-            other => other,
-        }
+        effective_auth_method(
+            self.auth_method,
+            self.client_secret.as_ref().map(ExposeSecret::expose_secret),
+        )
     }
 
     /// Test-only accessor for the redacted client_secret field. Production
@@ -569,11 +605,25 @@ impl AzureKeyVault {
     /// Concurrency
     /// - Cache hits take only an `RwLock` read and never serialize.
     /// - On a miss for key `K`, one task per key is elected winner via an
-    ///   entry in the `inflight` map. Losers subscribe to the winner's
-    ///   `Notify` before the mutex is dropped, wait for the winner to
-    ///   publish, then re-check the cache.
+    ///   entry in the `inflight` map. Losers clone the winner's `Notify`
+    ///   under the `inflight` mutex, drop the mutex, then subscribe via
+    ///   `enable()` *before* a final cache recheck — this handshake closes
+    ///   the classic `Notify` lost-wakeup window where the winner could
+    ///   fire `notify_waiters()` between our mutex release and our
+    ///   subscription.
     /// - Fetches for distinct keys proceed fully in parallel.
-    /// - Locks are never held across the `.await` on the Azure round-trip.
+    /// - **No cache lock is ever acquired while the inflight mutex is
+    ///   held.** The earlier implementation re-checked the cache under the
+    ///   `inflight` mutex — that held the async mutex across an `await`
+    ///   against the cache `RwLock`, which is a stall/deadlock hazard and
+    ///   goes against the project's async locking guidelines.
+    /// - Winner order: fetch → publish cache → acquire inflight, remove
+    ///   entry, `notify_waiters()`, release. Publishing the cache first
+    ///   closes the race where a fresh task arrives after the inflight
+    ///   entry is gone but before the cache is written and starts a
+    ///   duplicate fetch. Keeping `notify_waiters()` inside the inflight
+    ///   critical section prevents a new loser from subscribing to a
+    ///   now-silent `Notify` between remove and notify.
     async fn load(&self, key: &str) -> crate::AnyErrorResult<Option<SecretString>> {
         loop {
             if let Some(entry) = self.try_cached(key).await {
@@ -581,14 +631,12 @@ impl AzureKeyVault {
             }
 
             // Election: observe or install the in-flight entry while holding
-            // the mutex, then drop it before any `.await` on the network.
+            // the mutex, then drop it before any `.await` on the cache or
+            // the network. We do NOT re-check the cache under the mutex —
+            // that would hold the async mutex across the cache `RwLock`'s
+            // own await.
             let waiter_role = {
                 let mut inflight = self.inflight.lock().await;
-                // Re-check under the mutex: another task may have just
-                // finished populating the cache for this key.
-                if let Some(entry) = self.try_cached(key).await {
-                    return Ok(entry.value.clone());
-                }
                 if let Some(existing) = inflight.get(key) {
                     WaiterRole::Loser(Arc::clone(existing))
                 } else {
@@ -600,35 +648,47 @@ impl AzureKeyVault {
 
             match waiter_role {
                 WaiterRole::Loser(notify) => {
-                    notify.notified().await;
-                    // Loop and re-check the cache. If the winner failed, the
-                    // cache will still be empty and we'll contend for winner.
+                    // `Notify::notified()` only registers with the list on
+                    // first poll, so a naïve `.notified().await` can miss
+                    // a `notify_waiters()` call that fires between mutex
+                    // release and our await. `enable()` pre-registers
+                    // without awaiting, then a final cache recheck covers
+                    // the winner-already-finished case.
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+
+                    if let Some(entry) = self.try_cached(key).await {
+                        return Ok(entry.value.clone());
+                    }
+                    notified.await;
                     continue;
                 }
                 WaiterRole::Winner(notify) => {
                     let result = self.fetch_one(key).await;
-                    // Always clear the in-flight slot and wake waiters before
-                    // returning, regardless of success/failure.
+
+                    // Publish the cache FIRST so any fresh task that races
+                    // past our cleanup will cache-hit on its fast path.
+                    if let Ok((value, ttl)) = &result {
+                        let entry = Arc::new(CachedEntry {
+                            value: value.clone(),
+                            fetched_at: Instant::now(),
+                            ttl: *ttl,
+                        });
+                        self.store_cached(key, entry).await;
+                    }
+
+                    // Remove the inflight entry AND notify under the same
+                    // critical section. This rules out a new loser
+                    // subscribing to our `Notify` after we've already
+                    // fired `notify_waiters()` (which would hang forever).
                     {
                         let mut inflight = self.inflight.lock().await;
                         inflight.remove(key);
+                        notify.notify_waiters();
                     }
-                    return match result {
-                        Ok((value, ttl)) => {
-                            let entry = Arc::new(CachedEntry {
-                                value: value.clone(),
-                                fetched_at: Instant::now(),
-                                ttl,
-                            });
-                            self.store_cached(key, entry).await;
-                            notify.notify_waiters();
-                            Ok(value)
-                        }
-                        Err(err) => {
-                            notify.notify_waiters();
-                            Err(err)
-                        }
-                    };
+
+                    return result.map(|(value, _)| value);
                 }
             }
         }
@@ -787,6 +847,21 @@ fn validate_https(url: &str) -> Result<()> {
     }
 }
 
+/// Resolves `AuthMethod::Default` against the supplied credentials.
+///
+/// `Default` upgrades to `ServicePrincipal` only when `client_secret` is
+/// present and non-empty — empty secrets are treated as "not set" here so
+/// bogus configs like `auth_method: default` + `client_secret: ""` fail
+/// validation rather than flipping into SP mode with an empty secret.
+fn effective_auth_method(method: AuthMethod, client_secret: Option<&str>) -> AuthMethod {
+    match method {
+        AuthMethod::Default if client_secret.is_some_and(|s| !s.is_empty()) => {
+            AuthMethod::ServicePrincipal
+        }
+        other => other,
+    }
+}
+
 fn validate_auth_params(
     method: AuthMethod,
     tenant_id: Option<&str>,
@@ -895,6 +970,72 @@ mod tests {
         let err =
             resolve_vault_url("http://insecure.example.com", None).expect_err("http rejected");
         assert!(matches!(err, Error::InvalidVaultUrl { .. }));
+    }
+
+    #[test]
+    fn from_params_normalizes_empty_strings_to_none() {
+        let mut p = HashMap::new();
+        p.insert("auth_method".to_string(), "default".to_string());
+        p.insert("tenant_id".to_string(), String::new());
+        p.insert("client_secret".to_string(), String::new());
+
+        let cfg = AzureKeyVaultConfig::from_params("my-vault".to_string(), &p);
+        assert!(cfg.tenant_id.is_none(), "empty tenant_id must become None");
+        assert!(
+            cfg.client_secret.is_none(),
+            "empty client_secret must become None",
+        );
+    }
+
+    #[test]
+    fn effective_auth_treats_empty_client_secret_as_not_set() {
+        // Belt-and-suspenders for the `from_params` normalization: even if
+        // someone hands us a `Some("")` directly (e.g. in a test or via a
+        // different construction path), `effective_auth_method` must not
+        // flip into ServicePrincipal mode with a blank secret.
+        assert_eq!(
+            effective_auth_method(AuthMethod::Default, Some("")),
+            AuthMethod::Default,
+        );
+        assert_eq!(
+            effective_auth_method(AuthMethod::Default, Some("non-empty")),
+            AuthMethod::ServicePrincipal,
+        );
+        assert_eq!(
+            effective_auth_method(AuthMethod::Default, None),
+            AuthMethod::Default,
+        );
+    }
+
+    /// `auth_method: default` + `client_secret` set + missing tenant_id /
+    /// client_id must fail at `from_config` time with a clear
+    /// `MissingAuthParams` error, rather than silently proceeding and
+    /// exploding later inside the Azure SDK.
+    #[test]
+    fn default_mode_with_client_secret_validates_effective_sp_params() {
+        let cfg = AzureKeyVaultConfig {
+            vault: "my-vault".to_string(),
+            auth_method: AuthMethod::Default,
+            tenant_id: None,
+            client_id: None,
+            client_secret: Some(SecretString::from("s".to_string())),
+            endpoint: None,
+        };
+        // `AzureKeyVault` intentionally doesn't implement `Debug` (its
+        // field list includes a `SecretString`), so we unwrap the Result
+        // manually instead of using `expect_err`.
+        let err = match AzureKeyVault::from_config(cfg) {
+            Ok(_) => panic!("should fail fast"),
+            Err(e) => e,
+        };
+        match err {
+            Error::MissingAuthParams { method, missing } => {
+                assert_eq!(method, "service_principal");
+                assert!(missing.contains("tenant_id"), "got {missing}");
+                assert!(missing.contains("client_id"), "got {missing}");
+            }
+            other => panic!("unexpected error variant {other:?}"),
+        }
     }
 
     #[test]

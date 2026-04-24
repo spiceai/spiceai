@@ -544,6 +544,24 @@ async fn load_secret_store(store_type: SecretStoreType) -> Result<Arc<dyn Secret
 mod tests {
     use async_trait::async_trait;
     use secrecy::ExposeSecret;
+    use tokio::sync::{Mutex, MutexGuard};
+
+    /// Global lock serializing any test that mutates process environment
+    /// variables. Required because `std::env::set_var`/`remove_var` are
+    /// `unsafe` on Rust 2024 — they are not sound to call concurrently
+    /// with any other thread reading or writing env vars. `cargo test`
+    /// runs tests in parallel by default, so without this lock two env
+    /// tests could step on each other and trip the safety contract.
+    ///
+    /// `tokio::sync::Mutex` (rather than `std::sync::Mutex`) because the
+    /// guard is held across `.await`s in the async test bodies — holding
+    /// a sync mutex across await would block other tasks on the same
+    /// runtime thread and clippy flags it as `await_holding_lock`.
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    pub(super) async fn lock_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().await
+    }
 
     struct MockClusterSecretExpander;
 
@@ -680,6 +698,7 @@ mod tests {
         use spicepod::param::Params;
         use std::collections::HashMap;
 
+        let _env_guard = lock_env().await;
         // Unique env-var name keeps tests isolated when run in parallel.
         let var = format!("SPICE_TEST_BOOTSTRAP_REGION_{}", rand::random::<u64>());
         unsafe { std::env::set_var(&var, "ap-south-1") };
@@ -726,6 +745,7 @@ mod tests {
         use spicepod::param::Params;
         use std::collections::HashMap;
 
+        let _env_guard = lock_env().await;
         let var = format!("SPICE_TEST_DEFINITELY_UNSET_{}", rand::random::<u64>());
         // Defensive: ensure it's not set in case of a prior leak.
         unsafe { std::env::remove_var(&var) };
@@ -901,6 +921,7 @@ mod tests {
         use spicepod::param::Params;
         use std::collections::HashMap;
 
+        let _env_guard = lock_env().await;
         // The canonical path: client_secret (and tenant/client ids) are
         // sourced from environment via `${ env:... }` references so they
         // are never committed to the spicepod.
@@ -1046,6 +1067,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_inject_secrets_env() {
+        let _env_guard = lock_env().await;
         let mut secrets = super::Secrets::new();
         secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
 
@@ -1063,6 +1085,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_inject_secrets_case_sensitive() {
+        let _env_guard = lock_env().await;
         let mut secrets = super::Secrets::new();
         secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
 
@@ -1098,6 +1121,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_inject_secrets_original_key_takes_precedence() {
+        let _env_guard = lock_env().await;
         let mut secrets = super::Secrets::new();
         secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
 
@@ -1133,6 +1157,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_inject_secrets_no_env() {
+        let _env_guard = lock_env().await;
         let mut secrets = super::Secrets::new();
         secrets.load_from(&[]).await.expect("to load successfully"); // Will automatically load `env` as the default
 
