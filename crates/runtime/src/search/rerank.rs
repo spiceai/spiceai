@@ -679,10 +679,9 @@ impl TableProvider for RerankUDTFProvider {
 
         let docs_opt = Self::extract_documents(&concatenated, &self.args.document)?;
 
-        // NULL document rows bypass the reranker and get a fixed `0.0` score
-        // — preserving NULL semantics rather than silently treating NULL as
-        // an empty string, which would otherwise produce garbage rankings
-        // when the reranker assigns non-zero relevance to "".
+        // NULL document rows bypass the reranker and get `NEG_INFINITY` so
+        // they always sort below every scored document, even when a reranker
+        // (e.g. a cross-encoder) returns negative relevance scores.
         let (non_null_indices, non_null_docs): (Vec<usize>, Vec<String>) = docs_opt
             .iter()
             .enumerate()
@@ -708,8 +707,8 @@ impl TableProvider for RerankUDTFProvider {
         }
 
         // Scatter non-null scores back into full-row positions; NULL rows
-        // keep their default 0.0.
-        let mut scores = vec![0.0_f32; docs_opt.len()];
+        // keep their default NEG_INFINITY so they sort last.
+        let mut scores = vec![f32::NEG_INFINITY; docs_opt.len()];
         for (idx, score) in non_null_indices.iter().zip(non_null_scores.iter()) {
             scores[*idx] = *score;
         }
@@ -1117,5 +1116,26 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].num_rows(), 1);
         assert_eq!(all[1].num_rows(), 1);
+    }
+
+    #[test]
+    fn null_rows_sort_below_negative_scores() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(RERANK_SCORE_COLUMN, DataType::Float32, false),
+        ]));
+        let ids = Arc::new(StringArray::from(vec!["valid_neg", "null_row", "valid_pos"])) as ArrayRef;
+        let scores = Arc::new(Float32Array::from(vec![-0.5, f32::NEG_INFINITY, 0.3])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![ids, scores]).expect("batch");
+
+        let sorted = sort_by_rerank_score_desc(&batch, None).expect("sort");
+        let id_col = sorted
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("strings");
+        assert_eq!(id_col.value(0), "valid_pos");
+        assert_eq!(id_col.value(1), "valid_neg");
+        assert_eq!(id_col.value(2), "null_row", "NULL rows must sort last even with negative reranker scores");
     }
 }
