@@ -1124,7 +1124,11 @@ mod tests {
             Field::new("id", DataType::Utf8, false),
             Field::new(RERANK_SCORE_COLUMN, DataType::Float32, false),
         ]));
-        let ids = Arc::new(StringArray::from(vec!["valid_neg", "null_row", "valid_pos"])) as ArrayRef;
+        let ids = Arc::new(StringArray::from(vec![
+            "valid_neg",
+            "null_row",
+            "valid_pos",
+        ])) as ArrayRef;
         let scores = Arc::new(Float32Array::from(vec![-0.5, f32::NEG_INFINITY, 0.3])) as ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![ids, scores]).expect("batch");
 
@@ -1136,6 +1140,10 @@ mod tests {
             .expect("strings");
         assert_eq!(id_col.value(0), "valid_pos");
         assert_eq!(id_col.value(1), "valid_neg");
-        assert_eq!(id_col.value(2), "null_row", "NULL rows must sort last even with negative reranker scores");
+        assert_eq!(
+            id_col.value(2),
+            "null_row",
+            "NULL rows must sort last even with negative reranker scores"
+        );
     }
 }
