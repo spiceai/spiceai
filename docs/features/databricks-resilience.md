@@ -8,13 +8,17 @@ The Databricks connector includes resilience controls, Unity Catalog awareness, 
 
 When using `mode: sql_warehouse`, the connector exposes parameters to tune HTTP retry behavior and concurrency limits for the Databricks SQL Statements API.
 
-| Parameter                    | Type    | Default     | Description                                                                                                              |
-| ---------------------------- | ------- | ----------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `max_concurrent_requests`    | integer | `8`         | Maximum number of concurrent HTTP requests to the SQL Warehouse API. Controls a semaphore that gates all outbound calls. |
-| `http_max_retries`           | integer | `3`         | Maximum number of HTTP-level retries for transient failures (429 rate-limit, 5xx server errors).                         |
-| `backoff_method`             | string  | `fibonacci` | Backoff strategy for transient HTTP retries. One of `fibonacci` or `exponential`.                                        |
-| `statement_max_retries`      | integer | `14`        | Maximum number of poll retries when waiting for an async SQL statement to complete (PENDING/RUNNING states).             |
-| `disable_on_permanent_error` | boolean | `true`      | When `true`, non-retryable HTTP errors (401, 403, 404) permanently disable the connector to prevent a thundering herd.   |
+| Parameter                    | Type     | Default     | Description                                                                                                              |
+| ---------------------------- | -------- | ----------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `max_concurrent_requests`    | integer  | `8`         | Maximum number of concurrent HTTP requests to the SQL Warehouse API. Controls a semaphore that gates all outbound calls. |
+| `http_max_retries`           | integer  | `3`         | Maximum number of HTTP-level retries for transient failures (429 rate-limit, 5xx server errors).                         |
+| `backoff_method`             | string   | `fibonacci` | Backoff strategy for transient HTTP retries. One of `fibonacci` or `exponential`.                                        |
+| `statement_max_retries`      | integer  | `14`        | Maximum number of poll retries when waiting for an async SQL statement to complete (PENDING/RUNNING states).             |
+| `disable_on_permanent_error` | boolean  | `true`      | When `true`, non-retryable HTTP errors (401, 403, 404) permanently disable the connector to prevent a thundering herd.   |
+| `connect_timeout`            | duration | `10s`       | Timeout for establishing TCP/TLS connections to the Databricks API. Accepts durations like `10s` or `500ms`.             |
+| `client_timeout`             | duration | `30s`       | Per-HTTP-call wall-clock timeout (statement submit, status poll, chunk fetch). See note below — set to the longest expected single call, **not** total query duration. |
+
+> **Note on `client_timeout` semantics.** In `sql_warehouse` mode `client_timeout` bounds every individual HTTP call, including large result-chunk downloads. Set it to the longest expected single call (e.g., the slowest chunk fetch), not the total query wall-clock. Total query duration is still bounded by `statement_max_retries` × poll backoff. If you have large result sets over slow links, the default 30s may be too short for chunk downloads — raise it to `2m` or higher. The same parameter name is used in `delta_lake` mode but there it controls the object-store HTTP client instead.
 
 #### Example
 
@@ -33,6 +37,8 @@ catalogs:
       backoff_method: exponential
       statement_max_retries: '20'
       disable_on_permanent_error: 'true'
+      connect_timeout: 10s
+      client_timeout: 2m
 ```
 
 ### Shared Concurrency Semaphore

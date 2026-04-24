@@ -22,4 +22,8 @@ pub mod cosine_distance;
 pub mod digest_many;
 #[cfg(feature = "models")]
 pub mod embed;
+pub mod inner_product;
+pub mod l2_distance;
+pub mod l2_norm;
 pub mod truncate;
+pub(crate) mod vector_simd;
