@@ -22,7 +22,7 @@ pub use engine::Engine;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Unknown acceleration engine '{name}'. Valid engines are: arrow, duckdb, sqlite, turso, postgres, cayenne. Docs: https://spiceai.org/docs/components/data-accelerators"
+        "Unknown acceleration engine '{name}'. Valid engines are: arrow, duckdb, sqlite, turso, postgres/postgresql, cayenne/vortex. Docs: https://spiceai.org/docs/components/data-accelerators"
     ))]
     AcceleratorEngineNotAvailable { name: String },
 }

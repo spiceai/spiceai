@@ -593,6 +593,12 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 // Identifiers keep their original case so quoted/mixed-case tables work.
                 // Single quotes are escaped (SQL standard `''`) before they're interpolated
                 // into the string literals to avoid query injection/syntax errors.
+                fn unquote(s: &str) -> &str {
+                    s.trim_matches('"').trim_matches('\'')
+                }
+                fn esc(s: &str) -> String {
+                    s.replace('\'', "''")
+                }
                 let without_semi = line.trim_end_matches(';').trim();
                 let mut parts = without_semi.splitn(2, char::is_whitespace);
                 let _kw = parts.next();
@@ -600,12 +606,6 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 // Quotes need stripping per identifier segment, not just the whole token:
                 // `describe schema."MyTable"` should split into (`schema`, `MyTable`), not
                 // (`schema`, `"MyTable"`). Unquote each side after the split.
-                fn unquote(s: &str) -> &str {
-                    s.trim_matches('"').trim_matches('\'')
-                }
-                fn esc(s: &str) -> String {
-                    s.replace('\'', "''")
-                }
                 let rewritten = if let Some((schema, name)) = raw_ident.split_once('.') {
                     let schema = unquote(schema);
                     let name = unquote(name);

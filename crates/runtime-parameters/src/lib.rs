@@ -93,13 +93,14 @@ impl Parameters {
 
         let Some(spec) = spec else {
             let suggestion = closest_param_suggestion(all_params, prefix, key);
-            match suggestion {
-                Some(candidate) => tracing::warn!(
+            if let Some(candidate) = suggestion {
+                tracing::warn!(
                     "Ignoring parameter `{key}`: not supported for {component_name}. Did you mean `{candidate}`?"
-                ),
-                None => tracing::warn!(
+                );
+            } else {
+                tracing::warn!(
                     "Ignoring parameter `{key}`: not supported for {component_name}."
-                ),
+                );
             }
             return None;
         };

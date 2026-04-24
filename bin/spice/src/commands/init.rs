@@ -121,7 +121,7 @@ fn determine_names(name_arg: &str) -> (String, String) {
 /// Create the spicepod.yaml content.
 ///
 /// The `yaml-language-server` directive enables schema validation + completion in
-/// editors (VS Code, Neovim with coc/yaml, IntelliJ) without any extra setup.
+/// editors (VS Code, Neovim with coc/yaml, `IntelliJ`) without any extra setup.
 fn create_spicepod_yaml(name: &str) -> String {
     format!(
         "# yaml-language-server: $schema=https://raw.githubusercontent.com/spiceai/spiceai/trunk/.schema/spicepod.schema.json\nversion: v2\nkind: Spicepod\nname: {name}\n"
