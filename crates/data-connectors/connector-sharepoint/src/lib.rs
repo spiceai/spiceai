@@ -64,7 +64,6 @@ use std::any::Any;
 use std::fmt::{self, Display};
 use std::future::Future;
 use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use url::Url;
 
@@ -184,44 +183,34 @@ impl Sharepoint {
     /// connector everything it needs to register a [`SharepointObjectStore`]
     /// on that fresh env (see its `get_session_context` /
     /// `get_object_store` overrides).
+    ///
+    /// When the dataset's URL has a trailing extension and the user did not
+    /// set `file_format` explicitly, we inject the inferred `file_format`
+    /// into the listing connector's [`Parameters`] so that
+    /// [`ListingTableConnector::get_file_format_and_extension`] (which reads
+    /// from `get_params()`, not `Dataset.params`) can dispatch the correct
+    /// format for non-tabular extensions like `.xlsx`/`.pdf`.
     fn listing_connector(
         &self,
         dataset: &Dataset,
     ) -> DataConnectorResult<SharepointListingConnector> {
         let (store_url, kind, config) = parse_object_store_components(&self.params, dataset)?;
+        let mut params = self.params.clone();
+        if params.get("file_format").expose().ok().is_none()
+            && let Some(ext) = url_extension(&dataset.from)
+        {
+            params.insert("file_format".to_string(), SecretString::from(ext));
+        }
         Ok(SharepointListingConnector {
             client: Arc::clone(&self.client),
             store_url,
             kind,
             config,
-            params: self.params.clone(),
+            params,
             tokio_io_runtime: self.tokio_io_runtime.clone(),
             runtime: self.runtime.clone(),
         })
     }
-}
-
-/// Return a `Dataset` whose `file_format` param is filled in from the URL's
-/// trailing extension when the user didn't set one explicitly.
-///
-/// `ListingTableConnector::get_file_format_and_extension` errors with
-/// "Missing file format" when both `file_format=` and a recognized
-/// extension are absent, so this lets `sharepoint://…/file.xlsx`-style
-/// datasets just work without forcing the user to repeat the extension
-/// in their spicepod. Recognized tabular extensions are normalized to
-/// matching `file_format` values; everything else is passed through as
-/// the raw extension so `create_text_table` can dispatch via
-/// [`document_parse::get_parser_factory`].
-fn dataset_with_inferred_format(dataset: &Dataset) -> std::borrow::Cow<'_, Dataset> {
-    if dataset.params.contains_key("file_format") {
-        return std::borrow::Cow::Borrowed(dataset);
-    }
-    let Some(ext) = url_extension(&dataset.from) else {
-        return std::borrow::Cow::Borrowed(dataset);
-    };
-    let mut owned = dataset.clone();
-    owned.params.insert("file_format".to_string(), ext);
-    std::borrow::Cow::Owned(owned)
 }
 
 /// Pull the file extension out of a SharePoint dataset URL, lowercased.
@@ -456,9 +445,11 @@ fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
 fn parse_conflict_behavior(params: &Parameters) -> Result<ConflictBehavior> {
     match params.get("conflict_behavior").expose().ok() {
         None => Ok(ConflictBehavior::default()),
-        Some(v) => ConflictBehavior::from_str(v).map_err(|_| Error::InvalidConflictBehavior {
-            value: v.to_string(),
-        }),
+        Some(v) => v
+            .parse::<ConflictBehavior>()
+            .map_err(|_| Error::InvalidConflictBehavior {
+                value: v.to_string(),
+            }),
     }
 }
 
@@ -549,10 +540,9 @@ impl DataConnector for Sharepoint {
         dataset: &Dataset,
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         if Self::uses_object_store(dataset) {
-            let inferred = dataset_with_inferred_format(dataset);
             return self
-                .listing_connector(&inferred)?
-                .read_provider(&inferred)
+                .listing_connector(dataset)?
+                .read_provider(dataset)
                 .await;
         }
         // Legacy path — metadata-listing table provider.
@@ -579,9 +569,8 @@ impl DataConnector for Sharepoint {
             return None;
         }
         if Self::uses_object_store(dataset) {
-            let inferred = dataset_with_inferred_format(dataset);
-            return match self.listing_connector(&inferred) {
-                Ok(c) => c.metadata_provider(&inferred).await,
+            return match self.listing_connector(dataset) {
+                Ok(c) => c.metadata_provider(dataset).await,
                 Err(e) => Some(Err(e)),
             };
         }

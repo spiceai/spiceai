@@ -108,10 +108,12 @@ fn is_slide_path(name: &str) -> bool {
 }
 
 fn slide_index(path: &str) -> Option<usize> {
-    path.strip_prefix("ppt/slides/slide")?
-        .strip_suffix(".xml")?
-        .parse()
-        .ok()
+    let stripped = path.strip_prefix("ppt/slides/slide")?;
+    let slide_path = std::path::Path::new(stripped);
+    slide_path
+        .extension()
+        .filter(|ext| ext.eq_ignore_ascii_case("xml"))?;
+    slide_path.file_stem()?.to_str()?.parse().ok()
 }
 
 /// Extract concatenated `<a:t>` text from a single slide's XML. Each text

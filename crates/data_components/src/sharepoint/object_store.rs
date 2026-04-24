@@ -403,10 +403,21 @@ impl ObjectStore for SharepointObjectStore {
             .await,
             location,
         )?;
+        // Prefer the actual fetched length for `range` / `meta.size` so that
+        // ranged reads (e.g. Parquet footer reads via `GetRange::Suffix`) and
+        // downstream schema inference always agree with the returned payload
+        // — even if the Graph `head` response reported a stale or missing
+        // size. For ranged reads, `bytes.len()` is the slice length, so fall
+        // back to the head size when the caller provided a range.
+        let actual_size = if options.range.is_some() {
+            meta.size
+        } else {
+            u64::try_from(bytes.len()).unwrap_or(meta.size)
+        };
         let range = options
             .range
             .as_ref()
-            .map_or(0..meta.size, |r| resolve_range(r, meta.size));
+            .map_or(0..actual_size, |r| resolve_range(r, actual_size));
 
         let stream = futures::stream::once(async move { Ok(bytes) });
         Ok(GetResult {
@@ -416,7 +427,7 @@ impl ObjectStore for SharepointObjectStore {
             meta: ObjectMeta {
                 location: location.clone(),
                 last_modified: meta.last_modified,
-                size: meta.size,
+                size: actual_size,
                 e_tag: meta.e_tag.clone(),
                 version: meta.version.clone(),
             },
