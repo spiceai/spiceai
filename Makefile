@@ -155,13 +155,13 @@ _FEATURES_FLAGS := --features $(FEATURES)
 else ifdef PACKAGES
 _FEATURES_FLAGS :=
 else
-_FEATURES_FLAGS := --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp
+_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,elasticsearch
 endif
 
 lint-rust-fix:
 	cargo fmt $(_FMT_FLAGS)
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
-	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --all-targets --fix --allow-dirty $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --fix --allow-dirty $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
