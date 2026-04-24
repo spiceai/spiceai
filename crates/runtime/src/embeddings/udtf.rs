@@ -110,7 +110,6 @@ pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
 /// logical plan size and runtime work.
 const VECTOR_SEARCH_MAX_QUERIES: usize = 32;
 
-
 /// Creates a `UserDefined` signature that allows named parameters (like `rank_weight => X`)
 /// to pass through for RRF (Reciprocal Rank Fusion) operations.
 ///
@@ -1047,7 +1046,7 @@ impl TableProvider for VectorSearchUDTFProvider {
             .iter()
             .any(|expr| expr.qualified_name().1 == embedding_col_name)
         {
-            base_expr.push(ident(embedding_col_name));
+            base_expr.push(ident(embedding_col_name.clone()));
         }
 
         // Pick the scoring expression based on the requested distance metric.
