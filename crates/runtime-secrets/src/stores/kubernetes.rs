@@ -169,10 +169,7 @@ impl KubernetesClient {
     /// zeroize-on-drop allocation. Callers pull exactly the key they care
     /// about; everything else drops with its bytes scrubbed when the map
     /// goes out of scope.
-    async fn get_secret(
-        &self,
-        secret_name: &str,
-    ) -> Result<HashMap<String, SecretString>, Error> {
+    async fn get_secret(&self, secret_name: &str) -> Result<HashMap<String, SecretString>, Error> {
         let Some(client) = &self.client else {
             return Err(Error::UnableToReadKubernetesCredentials {});
         };

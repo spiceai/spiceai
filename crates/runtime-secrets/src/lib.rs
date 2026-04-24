@@ -838,7 +838,10 @@ mod tests {
             "00000000-0000-0000-0000-000000000002".to_string(),
         );
         p.insert("client_secret".to_string(), "shh".to_string());
-        p.insert("endpoint".to_string(), "vault.usgovcloudapi.net".to_string());
+        p.insert(
+            "endpoint".to_string(),
+            "vault.usgovcloudapi.net".to_string(),
+        );
 
         let store = SpicepodSecret {
             from: "azure_keyvault:my-vault".to_string(),

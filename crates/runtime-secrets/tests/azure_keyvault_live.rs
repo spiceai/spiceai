@@ -61,9 +61,7 @@ limitations under the License.
 
 use std::time::Duration;
 
-use runtime_secrets::stores::azure_keyvault::{
-    AuthMethod, AzureKeyVault, AzureKeyVaultConfig,
-};
+use runtime_secrets::stores::azure_keyvault::{AuthMethod, AzureKeyVault, AzureKeyVaultConfig};
 use runtime_secrets::{ExposeSecret, SecretStore};
 use secrecy::SecretString;
 

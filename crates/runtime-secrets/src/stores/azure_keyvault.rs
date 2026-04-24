@@ -458,12 +458,13 @@ impl AzureKeyVault {
     /// Returns an error if credential resolution fails or the HTTP call
     /// returns a non-recoverable error (auth, DNS, network).
     pub async fn init(&self) -> Result<()> {
-        let client = self.client().await.map_err(|source| {
-            Error::UnableToResolveCredentials {
+        let client = self
+            .client()
+            .await
+            .map_err(|source| Error::UnableToResolveCredentials {
                 vault_url: self.vault_url.clone(),
                 source,
-            }
-        })?;
+            })?;
 
         // `list_secret_properties` returns a paged stream; we only need to
         // touch the first response to verify the endpoint + credentials.
@@ -511,7 +512,8 @@ impl AzureKeyVault {
 
     async fn build_credential(
         &self,
-    ) -> std::result::Result<Arc<dyn TokenCredential>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> std::result::Result<Arc<dyn TokenCredential>, Box<dyn std::error::Error + Send + Sync>>
+    {
         match self.effective_auth_method() {
             AuthMethod::ServicePrincipal => {
                 // `validate_auth_params` guarantees all three are set when
@@ -533,10 +535,13 @@ impl AzureKeyVault {
                 Ok(cred as Arc<dyn TokenCredential>)
             }
             AuthMethod::ManagedIdentity => {
-                let opts = self.client_id.clone().map(|id| ManagedIdentityCredentialOptions {
-                    user_assigned_id: Some(UserAssignedId::ClientId(id)),
-                    ..Default::default()
-                });
+                let opts = self
+                    .client_id
+                    .clone()
+                    .map(|id| ManagedIdentityCredentialOptions {
+                        user_assigned_id: Some(UserAssignedId::ClientId(id)),
+                        ..Default::default()
+                    });
                 let cred = ManagedIdentityCredential::new(opts).map_err(boxed)?;
                 Ok(cred as Arc<dyn TokenCredential>)
             }
@@ -589,10 +594,7 @@ impl AzureKeyVault {
     /// Returns the cached entry for `key` if it is still fresh.
     async fn try_cached(&self, key: &str) -> Option<Arc<CachedEntry>> {
         let guard = self.cache.read().await;
-        guard
-            .get(key)
-            .filter(|e| e.is_fresh())
-            .map(Arc::clone)
+        guard.get(key).filter(|e| e.is_fresh()).map(Arc::clone)
     }
 
     async fn store_cached(&self, key: &str, entry: Arc<CachedEntry>) {
@@ -900,7 +902,9 @@ fn validate_auth_params(
     }
 }
 
-fn boxed<E: std::error::Error + Send + Sync + 'static>(e: E) -> Box<dyn std::error::Error + Send + Sync> {
+fn boxed<E: std::error::Error + Send + Sync + 'static>(
+    e: E,
+) -> Box<dyn std::error::Error + Send + Sync> {
     Box::new(e)
 }
 
@@ -949,7 +953,8 @@ mod tests {
 
     #[test]
     fn endpoint_overrides_default_suffix_for_sovereign_cloud() {
-        let url = resolve_vault_url("gov-vault", Some("vault.usgovcloudapi.net")).expect("resolves");
+        let url =
+            resolve_vault_url("gov-vault", Some("vault.usgovcloudapi.net")).expect("resolves");
         assert_eq!(url, "https://gov-vault.vault.usgovcloudapi.net/");
     }
 
@@ -957,11 +962,8 @@ mod tests {
     fn endpoint_as_full_url_takes_precedence_over_selector() {
         // Useful escape hatch for private DNS / test endpoints where the
         // selector name does not match the URL host.
-        let url = resolve_vault_url(
-            "my-vault",
-            Some("https://override.internal.example.com/"),
-        )
-        .expect("resolves");
+        let url = resolve_vault_url("my-vault", Some("https://override.internal.example.com/"))
+            .expect("resolves");
         assert_eq!(url, "https://override.internal.example.com/");
     }
 
@@ -1145,7 +1147,10 @@ mod tests {
     #[test]
     fn vault_name_maps_underscores_to_hyphens() {
         assert_eq!(to_vault_name("openai_api_key"), "openai-api-key");
-        assert_eq!(to_vault_name("spice_openai_api_key"), "spice-openai-api-key");
+        assert_eq!(
+            to_vault_name("spice_openai_api_key"),
+            "spice-openai-api-key"
+        );
         assert_eq!(to_vault_name("already-hyphenated"), "already-hyphenated");
     }
 

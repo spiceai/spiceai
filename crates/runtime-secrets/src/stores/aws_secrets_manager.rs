@@ -55,8 +55,8 @@ use aws_sdk_credential_bridge::default_aws_config;
 use aws_sdk_secretsmanager::{error::SdkError, operation::get_secret_value::GetSecretValueError};
 use aws_sdk_sts::operation::get_caller_identity::GetCallerIdentityError;
 use runtime_parameter_spec::ParameterSpec;
-use secrecy::{ExposeSecret, SecretString};
 use secrecy::zeroize::Zeroizing;
+use secrecy::{ExposeSecret, SecretString};
 use snafu::{OptionExt, ResultExt, Snafu};
 use tokio::sync::{Mutex, Notify, OnceCell, RwLock};
 
@@ -150,14 +150,8 @@ impl AwsSecretsManagerConfig {
             region: params.get("region").cloned(),
             endpoint_url: params.get("endpoint_url").cloned(),
             access_key_id: params.get("key").cloned(),
-            secret_access_key: params
-                .get("secret")
-                .cloned()
-                .map(SecretString::from),
-            session_token: params
-                .get("session_token")
-                .cloned()
-                .map(SecretString::from),
+            secret_access_key: params.get("secret").cloned().map(SecretString::from),
+            session_token: params.get("session_token").cloned().map(SecretString::from),
         }
     }
 }
