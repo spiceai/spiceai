@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::kafka::MessageBatchCommitter;
+use crate::kafka::{MessageBatchCommitter, inject_ready_signal_on_caught_up};
 use crate::{
     cdc::{self, ChangeEnvelope, ChangesStream},
     debezium::{
@@ -101,7 +101,8 @@ impl DebeziumKafka {
         let schema = Arc::clone(&self.schema);
         let primary_keys = self.primary_keys.clone();
         let consumer = self.consumer;
-        let stream = self
+        let metrics = Arc::clone(self.consumer.metrics());
+        let inner = self
             .consumer
             .stream_json::<ChangeEventKey, ChangeEvent>()
             .chunks_timeout(self.batching.0, self.batching.1)
@@ -131,7 +132,11 @@ impl DebeziumKafka {
                 Ok(ChangeEnvelope::new(Box::new(committer), rb, true))
             });
 
-        Box::pin(stream)
+        Box::pin(inject_ready_signal_on_caught_up(
+            inner,
+            metrics,
+            Arc::clone(&self.schema),
+        ))
     }
 }
 
