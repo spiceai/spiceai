@@ -35,7 +35,7 @@ limitations under the License.
 //!
 //! Credentials follow the store's usual resolution order:
 //! - If `AZURE_CLIENT_SECRET`/`AZURE_CLIENT_ID`/`AZURE_TENANT_ID` are set,
-//!   you can drive ClientSecretCredential by also setting
+//!   you can drive `ClientSecretCredential` by also setting
 //!   `SPICE_TEST_AZURE_USE_SP=1`.
 //! - Otherwise, the store falls back to [`DeveloperToolsCredential`], which
 //!   chains the Azure CLI (`az login`) and Azure Developer CLI.
@@ -90,7 +90,7 @@ fn load_config() -> Option<TestConfig> {
 }
 
 /// Returns a fresh store configured from the environment. Honors an explicit
-/// `SPICE_TEST_AZURE_USE_SP=1` flag that forces ClientSecretCredential from
+/// `SPICE_TEST_AZURE_USE_SP=1` flag that forces `ClientSecretCredential` from
 /// the ambient AZURE_* env vars; otherwise falls back to the default chain.
 fn build_store(vault: &str) -> AzureKeyVault {
     let cfg = if std::env::var("SPICE_TEST_AZURE_USE_SP").ok().as_deref() == Some("1") {

@@ -761,9 +761,9 @@ mod tests {
     fn parses_string_number_and_bool_values() {
         let json = r#"{"a": "hello", "b": 42, "c": true, "d": null, "e": [1,2], "f": {"x": 1}}"#;
         let map = parse_json_to_hashmap(json).expect("parse succeeds");
-        assert_eq!(map.get("a").map(|s| s.expose_secret()), Some("hello"));
-        assert_eq!(map.get("b").map(|s| s.expose_secret()), Some("42"));
-        assert_eq!(map.get("c").map(|s| s.expose_secret()), Some("true"));
+        assert_eq!(map.get("a").map(ExposeSecret::expose_secret), Some("hello"));
+        assert_eq!(map.get("b").map(ExposeSecret::expose_secret), Some("42"));
+        assert_eq!(map.get("c").map(ExposeSecret::expose_secret), Some("true"));
         // Null/array/object entries are intentionally skipped.
         assert!(!map.contains_key("d"));
         assert!(!map.contains_key("e"));

@@ -219,8 +219,7 @@ impl AzureKeyVaultConfig {
         }
         let auth_method = params
             .get("auth_method")
-            .map(|s| AuthMethod::parse(s.as_str()))
-            .unwrap_or(AuthMethod::Default);
+            .map_or(AuthMethod::Default, |s| AuthMethod::parse(s.as_str()));
         Self {
             vault,
             auth_method,
@@ -253,10 +252,6 @@ const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60);
 /// visible promptly, but long enough to avoid hammering Key Vault when a
 /// spicepod references a missing name.
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(10);
-
-/// OAuth scope used to mint Key Vault access tokens. This value is defined by
-/// the Key Vault service and is the same for all public/sovereign clouds.
-const KEY_VAULT_SCOPE: &str = "https://vault.azure.net/.default";
 
 /// Default DNS suffix for Azure Public cloud vault URLs.
 const DEFAULT_VAULT_SUFFIX: &str = "vault.azure.net";
@@ -476,8 +471,7 @@ impl AzureKeyVault {
                     source: Box::new(source),
                 })?;
         match pager.next().await {
-            None => Ok(()),
-            Some(Ok(_)) => Ok(()),
+            None | Some(Ok(_)) => Ok(()),
             Some(Err(err)) => {
                 // A 403 on `secrets/list` is survivable if the principal still
                 // has `secrets/get`; don't fail init for it.
@@ -502,7 +496,7 @@ impl AzureKeyVault {
     ) -> std::result::Result<&SecretClient, Box<dyn std::error::Error + Send + Sync>> {
         self.client
             .get_or_try_init(|| async {
-                let credential = self.build_credential().await?;
+                let credential = self.build_credential()?;
                 let sdk_client =
                     SecretClient::new(&self.vault_url, credential, None).map_err(boxed)?;
                 Ok(sdk_client)
@@ -510,7 +504,12 @@ impl AzureKeyVault {
             .await
     }
 
-    async fn build_credential(
+    /// Credential construction is all synchronous — every `azure_identity`
+    /// constructor used here returns `Result<Arc<Cred>, azure_core::Error>`
+    /// without touching the network. `build_credential` therefore does not
+    /// need to be `async`; keeping it sync avoids the `unused_async` pedantic
+    /// lint and spares callers an unnecessary `.await`.
+    fn build_credential(
         &self,
     ) -> std::result::Result<Arc<dyn TokenCredential>, Box<dyn std::error::Error + Send + Sync>>
     {
@@ -584,7 +583,7 @@ impl AzureKeyVault {
         )
     }
 
-    /// Test-only accessor for the redacted client_secret field. Production
+    /// Test-only accessor for the redacted `client_secret` field. Production
     /// code never borrows this outside of the credential-build path.
     #[cfg(test)]
     fn has_client_secret(&self) -> bool {
@@ -664,7 +663,9 @@ impl AzureKeyVault {
                         return Ok(entry.value.clone());
                     }
                     notified.await;
-                    continue;
+                    // Fall through to the outer loop's next iteration; an
+                    // explicit `continue` here is redundant because the
+                    // match is the last expression in the loop body.
                 }
                 WaiterRole::Winner(notify) => {
                     let result = self.fetch_one(key).await;
@@ -696,7 +697,7 @@ impl AzureKeyVault {
         }
     }
 
-    /// Performs a single GetSecret round-trip for `logical_key`, applying the
+    /// Performs a single `GetSecret` round-trip for `logical_key`, applying the
     /// Spice-prefix precedence.
     ///
     /// Returns `(value, ttl)` where `value` is `None` for confirmed-missing
@@ -730,7 +731,10 @@ impl AzureKeyVault {
                 Ok(Some(value)) => {
                     return Ok((Some(value), self.cache_ttl));
                 }
-                Ok(None) => continue,
+                // `Ok(None)` falls through to try the next candidate; the
+                // loop naturally advances, so an explicit `continue` here
+                // is redundant (clippy::needless_continue).
+                Ok(None) => {}
                 Err(err) => {
                     return Err(Box::new(Error::UnableToGetSecret {
                         vault_url: self.vault_url.clone(),
@@ -908,14 +912,6 @@ fn boxed<E: std::error::Error + Send + Sync + 'static>(
     Box::new(e)
 }
 
-/// Explicit usage of the Key Vault OAuth scope. Holding the constant here
-/// keeps the token-resolution story colocated with the client code even
-/// though the SDK supplies the scope itself under normal operation.
-#[allow(dead_code)]
-fn key_vault_scope() -> &'static str {
-    KEY_VAULT_SCOPE
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1009,8 +1005,8 @@ mod tests {
         );
     }
 
-    /// `auth_method: default` + `client_secret` set + missing tenant_id /
-    /// client_id must fail at `from_config` time with a clear
+    /// `auth_method: default` + `client_secret` set + missing `tenant_id`
+    /// / `client_id` must fail at `from_config` time with a clear
     /// `MissingAuthParams` error, rather than silently proceeding and
     /// exploding later inside the Azure SDK.
     #[test]
@@ -1025,10 +1021,9 @@ mod tests {
         };
         // `AzureKeyVault` intentionally doesn't implement `Debug` (its
         // field list includes a `SecretString`), so we unwrap the Result
-        // manually instead of using `expect_err`.
-        let err = match AzureKeyVault::from_config(cfg) {
-            Ok(_) => panic!("should fail fast"),
-            Err(e) => e,
+        // via `let...else` instead of `expect_err`.
+        let Err(err) = AzureKeyVault::from_config(cfg) else {
+            panic!("should fail fast");
         };
         match err {
             Error::MissingAuthParams { method, missing } => {
