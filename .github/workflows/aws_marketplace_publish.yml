@@ -3,9 +3,14 @@ name: Publish to AWS Marketplace
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'Docker image tag to publish (e.g., 1.3.0-enterprise-models)'
+      version:
+        description: 'Version to publish (e.g., 2.0.0-rc.3)'
         required: true
+        type: string
+      variants:
+        description: 'Comma-separated variants to publish (e.g., enterprise,enterprise-models)'
+        required: true
+        default: 'enterprise,enterprise-models'
         type: string
       repositories:
         description: 'Target ECR repositories'
@@ -51,15 +56,32 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       repositories: ${{ steps.parse.outputs.repositories }}
+      tags: ${{ steps.parse.outputs.tags }}
     steps:
       - name: Parse repository list
         id: parse
         run: |
           # Convert comma-separated repositories into a compact JSON array for matrix strategy
           REPOS="${{ inputs.repositories }}"
-          JSON=$(echo "${REPOS}" | jq -cR 'split(",") | map(ltrimstr(" ") | rtrimstr(" "))')
-          echo "repositories=${JSON}" >> "$GITHUB_OUTPUT"
-          echo "Repositories to publish: ${JSON}"
+          REPOS_JSON=$(echo "${REPOS}" | jq -cR 'split(",") | map(ltrimstr(" ") | rtrimstr(" "))')
+          echo "repositories=${REPOS_JSON}" >> "$GITHUB_OUTPUT"
+          echo "Repositories to publish: ${REPOS_JSON}"
+
+          # Build the list of tags from version + variants (tag = {version}-{variant})
+          VERSION="${{ inputs.version }}"
+          VARIANTS="${{ inputs.variants }}"
+          TAGS_JSON=$(echo "${VARIANTS}" | jq -cR --arg v "${VERSION}" '
+            split(",")
+            | map(ltrimstr(" ") | rtrimstr(" "))
+            | map(select(length > 0))
+            | map($v + "-" + .)
+          ')
+          if ! echo "${TAGS_JSON}" | jq -e 'length > 0' >/dev/null; then
+            echo "::error title=Invalid variants input::No publishable tags were produced from inputs.variants='${VARIANTS}'. Provide at least one non-empty variant."
+            exit 1
+          fi
+          echo "tags=${TAGS_JSON}" >> "$GITHUB_OUTPUT"
+          echo "Tags to publish: ${TAGS_JSON}"
 
   publish-docker:
     needs: prepare
@@ -70,6 +92,7 @@ jobs:
       fail-fast: false
       matrix:
         repository: ${{ fromJson(needs.prepare.outputs.repositories) }}
+        tag: ${{ fromJson(needs.prepare.outputs.tags) }}
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
@@ -95,14 +118,21 @@ jobs:
 
       - name: Pull, tag and push images
         env:
-          TAG: ${{ inputs.tag }}
-          OLD_TAG: ghcr.io/spicehq/spiceai-enterprise:${{ inputs.tag }}
-          NEW_TAG: ${{ env.ECR_REGISTRY }}/${{ matrix.repository }}:${{ inputs.tag }}
+          TAG: ${{ matrix.tag }}
+          OLD_TAG: ghcr.io/spicehq/spiceai-enterprise:${{ matrix.tag }}
+          NEW_TAG: ${{ env.ECR_REGISTRY }}/${{ matrix.repository }}:${{ matrix.tag }}
         run: |
           set -e  # Exit on error
 
-          # Parse platforms
-          IFS=',' read -ra PLATFORMS <<< "${{ inputs.platforms }}"
+          # Parse platforms (trim whitespace and drop empty entries)
+          IFS=',' read -ra RAW_PLATFORMS <<< "${{ inputs.platforms }}"
+          PLATFORMS=()
+          for RP in "${RAW_PLATFORMS[@]}"; do
+            TRIMMED=$(echo "${RP}" | xargs)
+            if [ -n "${TRIMMED}" ]; then
+              PLATFORMS+=("${TRIMMED}")
+            fi
+          done
 
           # Validate that we have platforms
           if [ ${#PLATFORMS[@]} -eq 0 ]; then
@@ -116,27 +146,50 @@ jobs:
           echo "Target repository: ${{ matrix.repository }}"
           echo "Platforms: ${PLATFORMS[*]}"
 
+          # Helper: returns 0 if the given tag already exists in the ECR repository, 1 otherwise.
+          ecr_tag_exists() {
+            local repo="$1"
+            local tag="$2"
+            aws ecr describe-images \
+              --repository-name "${repo}" \
+              --image-ids "imageTag=${tag}" \
+              --region "${{ env.AWS_REGION }}" \
+              >/dev/null 2>&1
+          }
+
           # Create manifest arguments array
           MANIFEST_ARGS=""
 
           # Process each platform
           for PLATFORM in "${PLATFORMS[@]}"; do
             ARCH=$(echo "${PLATFORM}" | cut -d'/' -f2) # linux/amd64 -> amd64
-            ARCH_TAG="${{ env.ECR_REGISTRY }}/${{ matrix.repository }}:${TAG}-${ARCH}"
+            ARCH_TAG_ONLY="${TAG}-${ARCH}"
+            ARCH_TAG="${{ env.ECR_REGISTRY }}/${{ matrix.repository }}:${ARCH_TAG_ONLY}"
             
             echo "Processing platform: ${PLATFORM}, arch: ${ARCH}"
             
-            # Pull the image for specific platform
-            echo "Pulling ${OLD_TAG} for platform ${PLATFORM}..."
-            docker pull --platform "${PLATFORM}" "${OLD_TAG}"
-            
-            # Tag for ECR
-            echo "Tagging as ${ARCH_TAG}..."
-            docker tag "${OLD_TAG}" "${ARCH_TAG}"
-            
-            # Push architecture-specific image
-            echo "Pushing ${ARCH_TAG}..."
-            docker push "${ARCH_TAG}"
+            if ecr_tag_exists "${{ matrix.repository }}" "${ARCH_TAG_ONLY}"; then
+              echo "Tag ${ARCH_TAG_ONLY} already exists in ${{ matrix.repository }}; skipping pull/push for this platform."
+            else
+              # Pull the image for specific platform
+              echo "Pulling ${OLD_TAG} for platform ${PLATFORM}..."
+              docker pull --platform "${PLATFORM}" "${OLD_TAG}"
+              
+              # Tag for ECR
+              echo "Tagging as ${ARCH_TAG}..."
+              docker tag "${OLD_TAG}" "${ARCH_TAG}"
+              
+              # Push architecture-specific image; tolerate ImmutableTag races by treating as success
+              echo "Pushing ${ARCH_TAG}..."
+              if ! PUSH_OUTPUT=$(docker push "${ARCH_TAG}" 2>&1); then
+                echo "${PUSH_OUTPUT}"
+                if echo "${PUSH_OUTPUT}" | grep -qiE "ImageTagAlreadyExistsException|cannot be overwritten because the repository is immutable"; then
+                  echo "Tag already exists in ECR; continuing."
+                else
+                  exit 1
+                fi
+              fi
+            fi
             
             # Add to manifest arguments
             MANIFEST_ARGS="${MANIFEST_ARGS} --amend ${ARCH_TAG}"
@@ -144,9 +197,20 @@ jobs:
 
           echo "Creating manifest with args: ${MANIFEST_ARGS}"
 
-          # Create and push manifest
-          docker manifest create "${NEW_TAG}" ${MANIFEST_ARGS}
-          docker manifest push "${NEW_TAG}"
+          # Create and push manifest. Tolerate ImmutableTag if the manifest tag already exists.
+          if ecr_tag_exists "${{ matrix.repository }}" "${TAG}"; then
+            echo "Manifest tag ${TAG} already exists in ${{ matrix.repository }}; skipping manifest push."
+          else
+            docker manifest create "${NEW_TAG}" ${MANIFEST_ARGS}
+            if ! PUSH_OUTPUT=$(docker manifest push "${NEW_TAG}" 2>&1); then
+              echo "${PUSH_OUTPUT}"
+              if echo "${PUSH_OUTPUT}" | grep -qiE "ImageTagAlreadyExistsException|cannot be overwritten because the repository is immutable"; then
+                echo "Manifest tag already exists in ECR; continuing."
+              else
+                exit 1
+              fi
+            fi
+          fi
 
           # Verify manifest
           echo "Verifying manifest:"
@@ -191,12 +255,26 @@ jobs:
           CHART_NAME=$(echo "${{ matrix.repository }}" | cut -d'/' -f2)
           echo "Chart name extracted from repository: ${CHART_NAME}"
 
-          # Update Chart.yaml for enterprise version
-          sed -i "s/name: spiceai-enterprise/name: ${CHART_NAME}/" Chart.yaml
+          # Resolve the variant/tag used for both the chart version and the default image tag.
+          FIRST_VARIANT=$(echo "${{ inputs.variants }}" | cut -d',' -f1 | xargs)
+          if [ -z "${FIRST_VARIANT}" ]; then
+            echo "Error: inputs.variants is empty; cannot determine chart version."
+            exit 1
+          fi
+          FIRST_TAG="${{ inputs.version }}-${FIRST_VARIANT}"
 
-          # Update values.yaml to use ECR image
+          # Update Chart.yaml: rename chart to match target repository and align version
+          # with the dispatched release so the published chart and image stay in sync.
+          sed -i "s/^name: spiceai-enterprise$/name: ${CHART_NAME}/" Chart.yaml
+          sed -i "s/^version: .*/version: ${FIRST_TAG}/" Chart.yaml
+          if grep -q '^appVersion:' Chart.yaml; then
+            sed -i "s/^appVersion: .*/appVersion: ${FIRST_TAG}/" Chart.yaml
+          fi
+
+          # Update values.yaml to use ECR image. When multiple variants are provided, use the first.
+          echo "Using image tag for Helm chart: ${FIRST_TAG}"
           sed -i 's|repository: ghcr.io/spicehq/spiceai-enterprise|repository: ${{ env.ECR_REGISTRY }}/${{ matrix.repository }}|' values.yaml
-          sed -i 's/tag: .*/tag: ${{ inputs.tag }}/' values.yaml
+          sed -i "s/tag: .*/tag: ${FIRST_TAG}/" values.yaml
 
           echo "Modified Chart.yaml:"
           cat Chart.yaml
@@ -235,8 +313,17 @@ jobs:
 
           echo "Pushing chart package: ${CHART_PACKAGE}"
 
-          # Push to ECR
-          helm push "${CHART_PACKAGE}" oci://${{ env.ECR_REGISTRY }}/spice-ai/
+          # Push to ECR; tolerate the case where this chart version is already published.
+          if ! PUSH_OUTPUT=$(helm push "${CHART_PACKAGE}" oci://${{ env.ECR_REGISTRY }}/spice-ai/ 2>&1); then
+            echo "${PUSH_OUTPUT}"
+            if echo "${PUSH_OUTPUT}" | grep -qiE "ImageTagAlreadyExistsException|cannot be overwritten because the repository is immutable|already exists"; then
+              echo "Chart version already exists in ECR; continuing."
+            else
+              exit 1
+            fi
+          else
+            echo "${PUSH_OUTPUT}"
+          fi
 
           echo "Successfully pushed Helm chart: ${CHART_PACKAGE}"
 
