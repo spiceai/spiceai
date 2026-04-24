@@ -52,7 +52,7 @@ use document_parse::DocumentParser;
 use graph_rs_sdk::GraphClient;
 use runtime::Runtime;
 use runtime::component::dataset::Dataset;
-use runtime::dataconnector::listing::ListingTableConnector;
+use runtime::dataconnector::listing::{LISTING_TABLE_PARAMETERS, ListingTableConnector};
 use runtime::dataconnector::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     DataConnectorResult, NewDataConnectorResult,
@@ -65,7 +65,7 @@ use std::fmt::{self, Display};
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use url::Url;
 
 /// Name used to identify this connector in configuration (the `<name>:` prefix
@@ -488,27 +488,29 @@ impl SharepointFactory {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[
-    // Identity / tenant
-    ParameterSpec::component("client_id").secret().required(),
-    ParameterSpec::component("tenant_id").secret().required(),
-    // Auth flows (exactly one of these should be set)
-    ParameterSpec::component("client_secret").secret(),
-    ParameterSpec::component("bearer_token").secret(),
-    ParameterSpec::component("auth_code").secret(),
-    ParameterSpec::component("refresh_token").secret(),
-    ParameterSpec::component("device_code").secret(),
-    ParameterSpec::component("saml_assertion").secret(),
-    ParameterSpec::component("redirect_uri"),
-    ParameterSpec::component("scope"),
-    // Write behavior
-    ParameterSpec::component("conflict_behavior")
-        .description("How to handle writes to an existing path: 'replace' (default; creates a new SharePoint version), 'fail' (reject), or 'rename' (write under a unique name)."),
-    ParameterSpec::component("max_put_bytes")
-        .description("Hard cap (in bytes) on the size of a single put/multipart upload. Writes above this limit are rejected rather than silently buffered. Default: 1 GiB."),
-    // Legacy / shared
-    ParameterSpec::runtime("file_format"),
-];
+static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    let mut params = vec![
+        // Identity / tenant
+        ParameterSpec::component("client_id").secret().required(),
+        ParameterSpec::component("tenant_id").secret().required(),
+        // Auth flows (exactly one of these should be set)
+        ParameterSpec::component("client_secret").secret(),
+        ParameterSpec::component("bearer_token").secret(),
+        ParameterSpec::component("auth_code").secret(),
+        ParameterSpec::component("refresh_token").secret(),
+        ParameterSpec::component("device_code").secret(),
+        ParameterSpec::component("saml_assertion").secret(),
+        ParameterSpec::component("redirect_uri"),
+        ParameterSpec::component("scope"),
+        // Write behavior
+        ParameterSpec::component("conflict_behavior")
+            .description("How to handle writes to an existing path: 'replace' (default; creates a new SharePoint version), 'fail' (reject), or 'rename' (write under a unique name)."),
+        ParameterSpec::component("max_put_bytes")
+            .description("Hard cap (in bytes) on the size of a single put/multipart upload. Writes above this limit are rejected rather than silently buffered. Default: 1 GiB."),
+    ];
+    params.extend_from_slice(LISTING_TABLE_PARAMETERS);
+    params
+});
 
 impl DataConnectorFactory for SharepointFactory {
     fn as_any(&self) -> &dyn Any {
@@ -532,7 +534,7 @@ impl DataConnectorFactory for SharepointFactory {
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        PARAMETERS
+        &PARAMETERS
     }
 }
 
