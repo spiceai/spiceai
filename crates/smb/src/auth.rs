@@ -30,6 +30,10 @@ const NTLMSSP_NEGOTIATE: u32 = 1;
 const NTLMSSP_CHALLENGE: u32 = 2;
 const NTLMSSP_AUTH: u32 = 3;
 
+// NTLMv2 LM response is always 24 zero bytes.
+const LM_RESPONSE_LEN: usize = 24;
+const LM_LEN: u16 = LM_RESPONSE_LEN as u16;
+
 // Negotiate flags
 const NTLMSSP_NEGOTIATE_UNICODE: u32 = 0x0000_0001;
 const NTLMSSP_NEGOTIATE_NTLM: u32 = 0x0000_0200;
@@ -111,10 +115,7 @@ pub fn parse_challenge_message(data: &[u8]) -> Option<ChallengeMessage> {
 
 /// Compute NTLMv2 hash: `HMAC_MD5(MD4(UTF16LE(password)), UTF16LE(UPPER(username) + domain))`.
 fn ntlmv2_hash(username: &str, password: &str, domain: &str) -> [u8; 16] {
-    let password_utf16: Vec<u8> = password
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .collect();
+    let password_utf16: Vec<u8> = password.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let nt_hash = crypto::md4(&password_utf16);
 
     let user_domain = format!("{}{}", username.to_uppercase(), domain);
@@ -138,7 +139,7 @@ pub fn build_authenticate_message(
     let ntlmv2_hash = ntlmv2_hash(username, password, domain);
 
     let client_challenge = generate_client_challenge();
-    let blob = build_ntlmv2_blob(&client_challenge, &challenge.target_info);
+    let blob = build_ntlmv2_blob(client_challenge, &challenge.target_info);
 
     let mut hmac_input = Vec::with_capacity(8 + blob.len());
     hmac_input.extend_from_slice(&challenge.server_challenge);
@@ -159,7 +160,6 @@ pub fn build_authenticate_message(
         .flat_map(u16::to_le_bytes)
         .collect();
 
-    const LM_RESPONSE_LEN: usize = 24;
     let lm_response = [0u8; LM_RESPONSE_LEN];
 
     let payload_offset = 72u32;
@@ -176,7 +176,6 @@ pub fn build_authenticate_message(
     buf.put_u32_le(NTLMSSP_AUTH);
 
     // LmChallengeResponse
-    const LM_LEN: u16 = LM_RESPONSE_LEN as u16;
     buf.put_u16_le(LM_LEN);
     buf.put_u16_le(LM_LEN);
     buf.put_u32_le(lm_offset);
@@ -245,7 +244,7 @@ pub fn derive_signing_key(session_key: &[u8; 16], preauth_hash: &[u8; 64]) -> [u
     key
 }
 
-fn build_ntlmv2_blob(client_challenge: &[u8; 8], target_info: &[u8]) -> Vec<u8> {
+fn build_ntlmv2_blob(client_challenge: [u8; 8], target_info: &[u8]) -> Vec<u8> {
     let mut blob = Vec::with_capacity(28 + target_info.len() + 4);
     blob.push(0x01); // RespType
     blob.push(0x01); // HiRespType
@@ -253,7 +252,7 @@ fn build_ntlmv2_blob(client_challenge: &[u8; 8], target_info: &[u8]) -> Vec<u8> 
     blob.extend_from_slice(&[0u8; 4]);
     let ts = windows_filetime_now();
     blob.extend_from_slice(&ts.to_le_bytes());
-    blob.extend_from_slice(client_challenge);
+    blob.extend_from_slice(&client_challenge);
     blob.extend_from_slice(&[0u8; 4]);
     blob.extend_from_slice(target_info);
     blob.extend_from_slice(&[0u8; 4]);
@@ -368,9 +367,21 @@ mod tests {
         data[8..12].copy_from_slice(&NTLMSSP_CHALLENGE.to_le_bytes());
         data[20..24].copy_from_slice(&negotiate_flags.to_le_bytes());
         data[24..32].copy_from_slice(&server_challenge);
-        data[40..42].copy_from_slice(&u16::try_from(target_info.len()).unwrap().to_le_bytes());
-        data[42..44].copy_from_slice(&u16::try_from(target_info.len()).unwrap().to_le_bytes());
-        data[44..48].copy_from_slice(&u32::try_from(target_info_offset).unwrap().to_le_bytes());
+        data[40..42].copy_from_slice(
+            &u16::try_from(target_info.len())
+                .expect("test fixture")
+                .to_le_bytes(),
+        );
+        data[42..44].copy_from_slice(
+            &u16::try_from(target_info.len())
+                .expect("test fixture")
+                .to_le_bytes(),
+        );
+        data[44..48].copy_from_slice(
+            &u32::try_from(target_info_offset)
+                .expect("test fixture")
+                .to_le_bytes(),
+        );
         data[target_info_offset..target_info_offset + target_info.len()]
             .copy_from_slice(target_info);
         data
@@ -382,7 +393,7 @@ mod tests {
         assert_eq!(message.len(), 40);
         assert_eq!(&message[..8], NTLMSSP_SIGNATURE);
         assert_eq!(
-            u32::from_le_bytes(message[8..12].try_into().unwrap()),
+            u32::from_le_bytes(message[8..12].try_into().expect("test fixture")),
             NTLMSSP_NEGOTIATE
         );
 
@@ -392,7 +403,7 @@ mod tests {
             | NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
             | NTLMSSP_NEGOTIATE_VERSION;
         assert_eq!(
-            u32::from_le_bytes(message[12..16].try_into().unwrap()),
+            u32::from_le_bytes(message[12..16].try_into().expect("test fixture")),
             expected_flags
         );
         assert_eq!(&message[16..32], &[0u8; 16]);
@@ -406,7 +417,7 @@ mod tests {
         let target_info = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02];
         let challenge = build_challenge_bytes(server_challenge, negotiate_flags, &target_info, 48);
 
-        let parsed = parse_challenge_message(&challenge).unwrap();
+        let parsed = parse_challenge_message(&challenge).expect("test fixture");
         assert_eq!(parsed.server_challenge, server_challenge);
         assert_eq!(parsed.negotiate_flags, negotiate_flags);
         assert_eq!(parsed.target_info, target_info);
@@ -451,13 +462,16 @@ mod tests {
     fn test_build_ntlmv2_blob_layout() {
         let client_challenge = *b"12345678";
         let target_info = [0x01, 0x02, 0x03, 0x04];
-        let blob = build_ntlmv2_blob(&client_challenge, &target_info);
+        let blob = build_ntlmv2_blob(client_challenge, &target_info);
 
         assert_eq!(
             &blob[..8],
             &[0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
         );
-        assert!(u64::from_le_bytes(blob[8..16].try_into().unwrap()) >= 116_444_736_000_000_000);
+        assert!(
+            u64::from_le_bytes(blob[8..16].try_into().expect("test fixture"))
+                >= 116_444_736_000_000_000
+        );
         assert_eq!(&blob[16..24], client_challenge);
         assert_eq!(&blob[24..28], &[0u8; 4]);
         assert_eq!(&blob[28..32], &target_info);

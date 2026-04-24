@@ -21,6 +21,19 @@ limitations under the License.
 //!
 //! Ported from <https://github.com/spiceai/spiceio>.
 
+// Wire-protocol code does a lot of safe fixed-size casts between usize/u8/u16/u32
+// that pedantic clippy flags. These are audited and safe by construction:
+// SMB2 header offsets fit in u16, message IDs in u64, etc.
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::cast_possible_truncation,
+    clippy::cast_lossless,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown
+)]
+
 pub mod auth;
 pub mod client;
 pub mod crypto;

@@ -51,7 +51,9 @@ pub fn md5(data: &[u8]) -> [u8; 16] {
 /// Compute HMAC-MD5. Core of NTLMv2 authentication.
 #[must_use]
 pub fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
-    let mut mac = <HmacMd5 as hmac::Mac>::new_from_slice(key).expect("HMAC accepts any key size");
+    // HMAC accepts any key length; `new_from_slice` can never fail here.
+    let mut mac = <HmacMd5 as hmac::Mac>::new_from_slice(key)
+        .unwrap_or_else(|_| unreachable!("HMAC accepts any key length"));
     hmac::Mac::update(&mut mac, data);
     hmac::Mac::finalize(mac).into_bytes().into()
 }
@@ -75,8 +77,9 @@ pub fn sha512(data: &[u8]) -> [u8; 64] {
 /// Compute HMAC-SHA256. Used in signing key derivation (SP800-108 KDF).
 #[must_use]
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac =
-        <HmacSha256 as hmac::Mac>::new_from_slice(key).expect("HMAC accepts any key size");
+    // HMAC accepts any key length; `new_from_slice` can never fail here.
+    let mut mac = <HmacSha256 as hmac::Mac>::new_from_slice(key)
+        .unwrap_or_else(|_| unreachable!("HMAC accepts any key length"));
     hmac::Mac::update(&mut mac, data);
     hmac::Mac::finalize(mac).into_bytes().into()
 }
@@ -84,7 +87,9 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 /// Compute AES-128-CMAC (RFC 4493). Used for SMB 3.x message signing.
 #[must_use]
 pub fn aes128_cmac(key: &[u8; 16], data: &[u8]) -> [u8; 16] {
-    let mut mac = <Cmac<Aes128> as Mac>::new_from_slice(key).expect("Aes128 accepts a 16-byte key");
+    // AES-128 key is exactly 16 bytes; `new_from_slice` can never fail here.
+    let mut mac = <Cmac<Aes128> as Mac>::new_from_slice(key)
+        .unwrap_or_else(|_| unreachable!("AES-128 uses a 16-byte key"));
     mac.update(data);
     mac.finalize().into_bytes().into()
 }
@@ -114,7 +119,10 @@ mod tests {
         assert_eq!(hex.len() % 2, 0);
         hex.as_bytes()
             .chunks_exact(2)
-            .map(|chunk| u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap())
+            .map(|chunk| {
+                u8::from_str_radix(std::str::from_utf8(chunk).expect("test fixture"), 16)
+                    .expect("test fixture")
+            })
             .collect()
     }
 
@@ -122,7 +130,8 @@ mod tests {
         assert_eq!(hex.len(), N * 2);
         let mut out = [0u8; N];
         for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
-            out[i] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
+            out[i] = u8::from_str_radix(std::str::from_utf8(chunk).expect("test fixture"), 16)
+                .expect("test fixture");
         }
         out
     }

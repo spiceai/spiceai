@@ -279,7 +279,6 @@ pub fn encode_negotiate_request(buf: &mut BytesMut, client_guid: &[u8; 16]) {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct NegotiateResponse {
     pub security_mode: u16,
     pub dialect_revision: u16,
@@ -475,7 +474,6 @@ pub fn encode_close_request_ex(buf: &mut BytesMut, file_id: &[u8; 16], postquery
 
 /// Parsed Close response (meaningful when postquery was requested).
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct CloseResponse {
     pub last_write_time: u64,
     pub file_size: u64,
@@ -623,10 +621,7 @@ pub fn encode_query_directory_request(
     info_class: u8,
     restart: bool,
 ) {
-    let pattern_bytes: Vec<u8> = pattern
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .collect();
+    let pattern_bytes: Vec<u8> = pattern.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let name_offset = QUERY_DIR_NAME_OFFSET;
     let pattern_len = u16::try_from(pattern_bytes.len()).unwrap_or(u16::MAX);
     let mut flags: u8 = 0;
@@ -766,7 +761,7 @@ mod tests {
         let mut buf = BytesMut::with_capacity(64);
         hdr.encode(&mut buf);
 
-        let decoded = Header::decode(&buf).unwrap();
+        let decoded = Header::decode(&buf).expect("test fixture");
         assert_eq!(decoded.command, Command::Create as u16);
         assert_eq!(decoded.message_id, 42);
         assert_eq!(decoded.session_id, 0xDEAD);
@@ -815,7 +810,7 @@ mod tests {
         body[48..56].copy_from_slice(&42u64.to_le_bytes());
         body[64..80].copy_from_slice(&[1u8; 16]);
 
-        let resp = decode_create_response(&body).unwrap();
+        let resp = decode_create_response(&body).expect("test fixture");
         assert_eq!(resp.last_write_time, 100);
         assert_eq!(resp.file_size, 42);
         assert_eq!(resp.file_id, [1u8; 16]);
@@ -834,7 +829,7 @@ mod tests {
         body[4..8].copy_from_slice(&5u32.to_le_bytes());
         body[16..21].copy_from_slice(b"hello");
 
-        let data = decode_read_response(&body).unwrap();
+        let data = decode_read_response(&body).expect("test fixture");
         assert_eq!(&data[..], b"hello");
     }
 
@@ -860,7 +855,7 @@ mod tests {
         let mut body = vec![0u8; 60];
         body[24..32].copy_from_slice(&999u64.to_le_bytes());
         body[48..56].copy_from_slice(&4096u64.to_le_bytes());
-        let resp = decode_close_response(&body).unwrap();
+        let resp = decode_close_response(&body).expect("test fixture");
         assert_eq!(resp.last_write_time, 999);
         assert_eq!(resp.file_size, 4096);
     }
@@ -878,7 +873,11 @@ mod tests {
         let mut data = vec![0u8; entry_size];
         data[40..48].copy_from_slice(&512u64.to_le_bytes());
         data[56..60].copy_from_slice(&0x20u32.to_le_bytes());
-        data[60..64].copy_from_slice(&u32::try_from(name_utf16.len()).unwrap().to_le_bytes());
+        data[60..64].copy_from_slice(
+            &u32::try_from(name_utf16.len())
+                .expect("test fixture")
+                .to_le_bytes(),
+        );
         data[104..].copy_from_slice(&name_utf16);
 
         let entries = parse_directory_entries(&data);
@@ -895,7 +894,11 @@ mod tests {
         let entry_size = 104 + name_utf16.len();
         let mut data = vec![0u8; entry_size];
         data[56..60].copy_from_slice(&0x10u32.to_le_bytes());
-        data[60..64].copy_from_slice(&u32::try_from(name_utf16.len()).unwrap().to_le_bytes());
+        data[60..64].copy_from_slice(
+            &u32::try_from(name_utf16.len())
+                .expect("test fixture")
+                .to_le_bytes(),
+        );
         data[104..].copy_from_slice(&name_utf16);
 
         let entries = parse_directory_entries(&data);
@@ -932,7 +935,7 @@ mod tests {
         let packet = build_request(&hdr, |buf| {
             encode_close_request(buf, &[0u8; 16]);
         });
-        let netbios_len = u32::from_be_bytes(packet[0..4].try_into().unwrap());
+        let netbios_len = u32::from_be_bytes(packet[0..4].try_into().expect("test fixture"));
         assert_eq!(netbios_len as usize, packet.len() - 4);
         assert_eq!(&packet[4..8], SMB2_MAGIC);
     }
@@ -963,7 +966,10 @@ mod tests {
     fn set_info_rename_structure_size() {
         let mut buf = BytesMut::new();
         encode_set_info_rename(&mut buf, &[0u8; 16], "test", false);
-        assert_eq!(u16::from_le_bytes(buf[0..2].try_into().unwrap()), 33);
+        assert_eq!(
+            u16::from_le_bytes(buf[0..2].try_into().expect("test fixture")),
+            33
+        );
     }
 
     #[test]

@@ -10568,7 +10568,7 @@ version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47bb1e988e6fb779cf720ad431242d3f03167c1b3f2b1aae7f1a94b2495b36ae"
 dependencies = [
- "sha2 0.10.9",
+ "sha2",
 ]
 
 [[package]]
@@ -22537,9 +22537,9 @@ dependencies = [
  "indexmap 2.13.0",
  "lzma-rust2 0.15.7",
  "memchr",
- "pbkdf2 0.12.2",
+ "pbkdf2",
  "ppmd-rust",
- "sha1 0.10.6",
+ "sha1",
  "time",
  "typed-path",
  "zeroize",
@@ -22553,14 +22553,14 @@ version = "8.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dcab981e19633ebcf0b001ddd37dd802996098bc1864f90b7c5d970ce76c1d59"
 dependencies = [
- "aes 0.8.4",
+ "aes",
  "bzip2",
  "constant_time_eq",
  "crc32fast",
  "deflate64",
  "flate2",
  "getrandom 0.4.1",
- "hmac 0.12.1",
+ "hmac",
  "indexmap 2.13.0",
  "lzma-rust2 0.16.2",
  "memchr",

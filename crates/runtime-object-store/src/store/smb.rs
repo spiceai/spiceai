@@ -63,7 +63,6 @@ struct SMBConfig {
     share: String,
     username: String,
     password: String,
-    #[allow(dead_code)]
     timeout: Option<Duration>,
 }
 
@@ -101,7 +100,7 @@ impl SMBConfig {
         }
     }
 
-    /// DataFusion emits paths that include the share name as the first segment.
+    /// `DataFusion` emits paths that include the share name as the first segment.
     /// This strips that prefix so we forward the share-relative portion to the
     /// internal SMB client.
     fn normalize_subpath<'a>(&self, subpath: &'a str) -> &'a str {
@@ -364,36 +363,43 @@ impl ObjectStore for SMBObjectStore {
         // the upper bound. We combine head + read in a single helper: for
         // unbounded reads we use the compound Create+Read+Close fast path,
         // for ranged we fall back to a Create-once-read-loop path.
-        let (size, last_modified, data, (start, end)) =
-            if let Some(range) = options.range.as_ref() {
-                let meta = share.head_object(&key).await.map_err(|e| {
-                    object_store::Error::NotFound {
-                        path: location.to_string(),
-                        source: e.into(),
-                    }
-                })?;
-
-                let (start, end, _to_read) = resolve_range(Some(range), meta.size);
-                guard_read_size(end.saturating_sub(start))?;
-                let data = share
-                    .get_object_range(&key, start, end)
+        let (size, last_modified, data, (start, end)) = if let Some(range) = options.range.as_ref()
+        {
+            let meta =
+                share
+                    .head_object(&key)
                     .await
-                    .map_err(handle_error)?;
-                (meta.size, meta.last_modified, data, (start, end))
-            } else {
-                let (meta, data) = share.get_object(&key).await.map_err(|e| {
-                    object_store::Error::NotFound {
+                    .map_err(|e| object_store::Error::NotFound {
                         path: location.to_string(),
                         source: e.into(),
-                    }
-                })?;
-                guard_read_size(meta.size)?;
-                let end = meta.size;
-                (meta.size, meta.last_modified, data, (0, end))
-            };
+                    })?;
 
-        let object_meta =
-            build_object_meta(location.clone(), size, epoch_secs_to_datetime(last_modified));
+            let (start, end, _to_read) = resolve_range(Some(range), meta.size);
+            guard_read_size(end.saturating_sub(start))?;
+            let data = share
+                .get_object_range(&key, start, end)
+                .await
+                .map_err(handle_error)?;
+            (meta.size, meta.last_modified, data, (start, end))
+        } else {
+            let (meta, data) =
+                share
+                    .get_object(&key)
+                    .await
+                    .map_err(|e| object_store::Error::NotFound {
+                        path: location.to_string(),
+                        source: e.into(),
+                    })?;
+            guard_read_size(meta.size)?;
+            let end = meta.size;
+            (meta.size, meta.last_modified, data, (0, end))
+        };
+
+        let object_meta = build_object_meta(
+            location.clone(),
+            size,
+            epoch_secs_to_datetime(last_modified),
+        );
 
         let bytes_data = Bytes::from(data);
         let stream = futures::stream::once(async move { Ok(bytes_data) });
@@ -657,8 +663,8 @@ mod tests {
 
     #[test]
     fn test_guard_read_size() {
-        assert!(guard_read_size(1024).is_ok());
-        assert!(guard_read_size(MAX_BUFFERED_READ).is_ok());
+        guard_read_size(1024).expect("small reads are allowed");
+        guard_read_size(MAX_BUFFERED_READ).expect("exactly at cap is allowed");
         assert!(guard_read_size(MAX_BUFFERED_READ + 1).is_err());
     }
 }

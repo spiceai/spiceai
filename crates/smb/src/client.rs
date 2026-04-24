@@ -29,8 +29,8 @@ use tokio::sync::Mutex;
 use crate::auth;
 use crate::crypto;
 use crate::protocol::{
-    Command, CreateResponse, CloseResponse, DesiredAccess, DirectoryEntry, Header,
-    FILE_ID_BOTH_DIRECTORY_INFORMATION, NT_STATUS_ERROR_MASK, NtStatus, SENTINEL_FILE_ID,
+    CloseResponse, Command, CreateResponse, DesiredAccess, DirectoryEntry,
+    FILE_ID_BOTH_DIRECTORY_INFORMATION, Header, NT_STATUS_ERROR_MASK, NtStatus, SENTINEL_FILE_ID,
     SMB2_FLAGS_RELATED, SMB2_FLAGS_SIGNED, SMB2_HEADER_SIZE, STATUS_PENDING, build_request,
     decode_close_response, decode_create_response, decode_negotiate_response, decode_read_response,
     decode_read_response_owned, decode_session_setup_response, decode_write_response,
@@ -148,23 +148,19 @@ impl SmbClient {
                 "SMB connection poisoned by previous timeout",
             ));
         }
-        match tokio::time::timeout(SMB_READ_TIMEOUT, stream.read_exact(buf)).await {
-            Ok(result) => result.map(|_| ()),
-            Err(_) => {
-                self.poisoned.store(true, Ordering::Relaxed);
-                let _ = stream.shutdown().await;
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "SMB server read timed out; connection poisoned",
-                ))
-            }
+        if let Ok(result) = tokio::time::timeout(SMB_READ_TIMEOUT, stream.read_exact(buf)).await {
+            result.map(|_| ())
+        } else {
+            self.poisoned.store(true, Ordering::Relaxed);
+            let _ = stream.shutdown().await;
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SMB server read timed out; connection poisoned",
+            ))
         }
     }
 
-    async fn send_recv_raw(
-        &self,
-        packet: &mut [u8],
-    ) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
+    async fn send_recv_raw(&self, packet: &mut [u8]) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
         self.send_recv_inner(packet).await
     }
 
@@ -173,10 +169,7 @@ impl SmbClient {
         Ok((header, body))
     }
 
-    async fn send_recv_inner(
-        &self,
-        packet: &mut [u8],
-    ) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
+    async fn send_recv_inner(&self, packet: &mut [u8]) -> io::Result<(Header, Vec<u8>, Vec<u8>)> {
         let mut stream = self.stream.lock().await;
 
         if let Some(ref key) = self.signing_key {
@@ -1180,8 +1173,7 @@ fn sign_message(msg: &mut [u8], key: &[u8; 16]) {
     let mut flag_bytes = [0u8; 4];
     flag_bytes.copy_from_slice(&msg[FLAGS_OFFSET..FLAGS_OFFSET + 4]);
     let flags = u32::from_le_bytes(flag_bytes);
-    msg[FLAGS_OFFSET..FLAGS_OFFSET + 4]
-        .copy_from_slice(&(flags | SMB2_FLAGS_SIGNED).to_le_bytes());
+    msg[FLAGS_OFFSET..FLAGS_OFFSET + 4].copy_from_slice(&(flags | SMB2_FLAGS_SIGNED).to_le_bytes());
 
     msg[SIGNATURE_OFFSET..SIGNATURE_OFFSET + 16].fill(0);
 

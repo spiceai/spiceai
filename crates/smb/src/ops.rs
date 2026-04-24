@@ -343,12 +343,7 @@ impl ShareSession {
 
     /// Read a byte range of an object using sequential reads. The caller is
     /// responsible for clamping `end` to the file size.
-    pub async fn get_object_range(
-        &self,
-        key: &str,
-        start: u64,
-        end: u64,
-    ) -> io::Result<Vec<u8>> {
+    pub async fn get_object_range(&self, key: &str, start: u64, end: u64) -> io::Result<Vec<u8>> {
         if start >= end {
             return Ok(Vec::new());
         }
@@ -374,9 +369,7 @@ impl ShareSession {
         while offset < end {
             let remaining = end - offset;
             let request = u32::try_from(remaining.min(u64::from(max_read))).unwrap_or(max_read);
-            let chunk = client
-                .read(tree_id, &file.file_id, offset, request)
-                .await?;
+            let chunk = client.read(tree_id, &file.file_id, offset, request).await?;
             if chunk.is_empty() {
                 break;
             }
