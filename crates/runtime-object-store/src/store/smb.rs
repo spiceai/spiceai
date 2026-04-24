@@ -53,9 +53,14 @@ fn handle_error<T: Into<Box<dyn std::error::Error + Sync + Send>>>(
     generic_error(STORE_NAME, error)
 }
 
+fn unix_epoch_datetime() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0)
+        .unwrap_or_else(|| unreachable!("Unix epoch is always representable"))
+}
+
 fn epoch_secs_to_datetime(epoch_secs: u64) -> DateTime<Utc> {
     let secs_i64 = i64::try_from(epoch_secs).unwrap_or(i64::MAX);
-    DateTime::<Utc>::from_timestamp(secs_i64, 0).unwrap_or_else(Utc::now)
+    DateTime::<Utc>::from_timestamp(secs_i64, 0).unwrap_or_else(unix_epoch_datetime)
 }
 
 struct SMBConfig {
@@ -88,6 +93,7 @@ impl SMBConfig {
             domain: String::new(),
             workstation: String::new(),
             max_io_size: 0,
+            read_timeout: self.timeout,
         }
     }
 
@@ -102,12 +108,20 @@ impl SMBConfig {
 
     /// `DataFusion` emits paths that include the share name as the first segment.
     /// This strips that prefix so we forward the share-relative portion to the
-    /// internal SMB client.
+    /// internal SMB client. Only strips when the share name occupies a full
+    /// path segment — `share="data"` against `"database/file"` is left alone.
     fn normalize_subpath<'a>(&self, subpath: &'a str) -> &'a str {
         let trimmed = subpath.trim_start_matches('/');
+        let share = self.share.as_str();
+        if trimmed == share {
+            return "";
+        }
+        if let Some(rest) = trimmed.strip_prefix(share)
+            && matches!(rest.as_bytes().first().copied(), Some(b'/' | b'\\'))
+        {
+            return rest.trim_start_matches(['/', '\\']);
+        }
         trimmed
-            .strip_prefix(self.share.as_str())
-            .map_or(trimmed, |s| s.trim_start_matches('/'))
     }
 
     fn key_for(&self, path: &Path) -> String {
@@ -115,16 +129,24 @@ impl SMBConfig {
     }
 }
 
-pub struct SMBObjectStore {
-    config: Arc<SMBConfig>,
+/// Inner state shared across all `Clone`s of a given `SMBObjectStore`.
+/// Wrapping the `OnceCell` in an `Arc` ensures that clones reuse the cached
+/// `ShareSession` rather than each establishing their own connection pool.
+struct Inner {
+    config: SMBConfig,
     share: OnceCell<Arc<ShareSession>>,
+}
+
+#[derive(Clone)]
+pub struct SMBObjectStore {
+    inner: Arc<Inner>,
 }
 
 impl std::fmt::Debug for SMBObjectStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SMBObjectStore")
-            .field("config", &self.config)
-            .field("share_initialized", &self.share.initialized())
+            .field("config", &self.inner.config)
+            .field("share_initialized", &self.inner.share.initialized())
             .finish()
     }
 }
@@ -132,17 +154,6 @@ impl std::fmt::Debug for SMBObjectStore {
 impl std::fmt::Display for SMBObjectStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "SMB")
-    }
-}
-
-impl Clone for SMBObjectStore {
-    fn clone(&self) -> Self {
-        Self {
-            config: Arc::clone(&self.config),
-            // Cloning loses the cached share — each clone re-establishes on first use.
-            // Callers who need the cached session should share a single `Arc<SMBObjectStore>`.
-            share: OnceCell::new(),
-        }
     }
 }
 
@@ -157,37 +168,44 @@ impl SMBObjectStore {
         timeout: Option<Duration>,
     ) -> Self {
         Self {
-            config: Arc::new(SMBConfig {
-                server,
-                share,
-                username,
-                password,
-                timeout,
+            inner: Arc::new(Inner {
+                config: SMBConfig {
+                    server,
+                    share,
+                    username,
+                    password,
+                    timeout,
+                },
+                share: OnceCell::new(),
             }),
-            share: OnceCell::new(),
         }
+    }
+
+    fn config(&self) -> &SMBConfig {
+        &self.inner.config
     }
 
     async fn get_share(&self) -> object_store::Result<Arc<ShareSession>> {
         let share = self
+            .inner
             .share
             .get_or_try_init(|| async {
-                let pool = SmbPool::connect(self.config.to_smb_config(), DEFAULT_POOL_SIZE)
+                let pool = SmbPool::connect(self.config().to_smb_config(), DEFAULT_POOL_SIZE)
                     .await
                     .map_err(|e| object_store::Error::Generic {
                         store: STORE_NAME,
                         source: format!(
                             "Failed to connect to SMB server smb://{}/{}. Verify host/credentials. Details: {e}",
-                            self.config.server, self.config.share
+                            self.config().server, self.config().share
                         )
                         .into(),
                     })?;
-                let session = ShareSession::connect(pool, &self.config.share).await.map_err(|e| {
+                let session = ShareSession::connect(pool, &self.config().share).await.map_err(|e| {
                     object_store::Error::Generic {
                         store: STORE_NAME,
                         source: format!(
                             "Failed to connect to SMB share smb://{}/{}. Details: {e}",
-                            self.config.server, self.config.share
+                            self.config().server, self.config().share
                         )
                         .into(),
                     }
@@ -246,7 +264,7 @@ impl SMBObjectStore {
         prefix: Option<String>,
     ) -> object_store::Result<Vec<ObjectMeta>> {
         let share = self.get_share().await?;
-        let config = Arc::clone(&self.config);
+        let config = self.config();
         let prefix_str = prefix.unwrap_or_default();
         let normalized = config.normalize_subpath(&prefix_str).to_string();
 
@@ -254,7 +272,7 @@ impl SMBObjectStore {
         let mut queue = vec![normalized];
 
         while let Some(dir_path) = queue.pop() {
-            let entries = Self::list_dir_entries(&share, &config, &dir_path).await;
+            let entries = Self::list_dir_entries(&share, config, &dir_path).await;
             let (files, dirs) = process_directory_entries(&dir_path, entries);
             results.extend(files);
             queue.extend(dirs);
@@ -269,9 +287,9 @@ impl SMBObjectStore {
     ) -> object_store::Result<ListResult> {
         let share = self.get_share().await?;
         let prefix_str = prefix.map_or(String::new(), Path::to_string);
-        let normalized = self.config.normalize_subpath(&prefix_str).to_string();
+        let normalized = self.config().normalize_subpath(&prefix_str).to_string();
 
-        let entries = Self::list_dir_entries(&share, &self.config, &normalized).await;
+        let entries = Self::list_dir_entries(&share, self.config(), &normalized).await;
         Ok(process_directory_entries_shallow(&normalized, entries))
     }
 
@@ -334,7 +352,18 @@ impl ObjectStore for SMBObjectStore {
         }
 
         let share = self.get_share().await?;
-        let key = self.config.key_for(location);
+        let key = self.config().key_for(location);
+
+        // SMB has no atomic "create-exclusive" primitive that maps cleanly
+        // across dialects; best-effort: head first, reject if the object
+        // already exists. This is a TOCTOU race, same as `copy_if_not_exists`.
+        if matches!(opts.mode, PutMode::Create) && share.head_object(&key).await.is_ok() {
+            return Err(object_store::Error::AlreadyExists {
+                path: location.to_string(),
+                source: "put_opts(Create): destination already exists".into(),
+            });
+        }
+
         self.put_streaming(&share, &key, payload).await
     }
 
@@ -344,7 +373,7 @@ impl ObjectStore for SMBObjectStore {
         _opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         let share = self.get_share().await?;
-        let key = self.config.key_for(location);
+        let key = self.config().key_for(location);
 
         let writer = share.open_wal_write(&key).await.map_err(handle_error)?;
 
@@ -357,43 +386,28 @@ impl ObjectStore for SMBObjectStore {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         let share = self.get_share().await?;
-        let key = self.config.key_for(location);
+        let key = self.config().key_for(location);
 
-        // Fast path: ranged reads still need to know the file size to clamp
-        // the upper bound. We combine head + read in a single helper: for
-        // unbounded reads we use the compound Create+Read+Close fast path,
-        // for ranged we fall back to a Create-once-read-loop path.
-        let (size, last_modified, data, (start, end)) = if let Some(range) = options.range.as_ref()
-        {
-            let meta =
-                share
-                    .head_object(&key)
-                    .await
-                    .map_err(|e| object_store::Error::NotFound {
-                        path: location.to_string(),
-                        source: e.into(),
-                    })?;
+        // Head first so we can size-gate the read *before* buffering anything.
+        // This costs one extra round trip vs. the unbounded compound path but
+        // eliminates the OOM risk on oversized files.
+        let meta = share
+            .head_object(&key)
+            .await
+            .map_err(|e| object_store::Error::NotFound {
+                path: location.to_string(),
+                source: e.into(),
+            })?;
 
-            let (start, end, _to_read) = resolve_range(Some(range), meta.size);
-            guard_read_size(end.saturating_sub(start))?;
-            let data = share
-                .get_object_range(&key, start, end)
-                .await
-                .map_err(handle_error)?;
-            (meta.size, meta.last_modified, data, (start, end))
-        } else {
-            let (meta, data) =
-                share
-                    .get_object(&key)
-                    .await
-                    .map_err(|e| object_store::Error::NotFound {
-                        path: location.to_string(),
-                        source: e.into(),
-                    })?;
-            guard_read_size(meta.size)?;
-            let end = meta.size;
-            (meta.size, meta.last_modified, data, (0, end))
-        };
+        let (start, end, _to_read) = resolve_range(options.range.as_ref(), meta.size);
+        guard_read_size(end.saturating_sub(start))?;
+
+        let data = share
+            .get_object_range(&key, start, end)
+            .await
+            .map_err(handle_error)?;
+        let size = meta.size;
+        let last_modified = meta.last_modified;
 
         let object_meta = build_object_meta(
             location.clone(),
@@ -414,7 +428,7 @@ impl ObjectStore for SMBObjectStore {
 
     async fn head(&self, location: &Path) -> object_store::Result<ObjectMeta> {
         let share = self.get_share().await?;
-        let key = self.config.key_for(location);
+        let key = self.config().key_for(location);
 
         let meta = share
             .head_object(&key)
@@ -433,7 +447,7 @@ impl ObjectStore for SMBObjectStore {
 
     async fn delete(&self, location: &Path) -> object_store::Result<()> {
         let share = self.get_share().await?;
-        let key = self.config.key_for(location);
+        let key = self.config().key_for(location);
 
         share.delete_object(&key).await.map_err(handle_error)
     }
@@ -484,8 +498,8 @@ impl ObjectStore for SMBObjectStore {
 
     async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
         let share = self.get_share().await?;
-        let src_key = self.config.key_for(from);
-        let dst_key = self.config.key_for(to);
+        let src_key = self.config().key_for(from);
+        let dst_key = self.config().key_for(to);
 
         share
             .copy_object(&src_key, &dst_key)
@@ -498,7 +512,7 @@ impl ObjectStore for SMBObjectStore {
         // TOCTOU race: SMB has no atomic copy-if-not-exists primitive.
         // A head-then-copy sequence is the best we can do.
         let share = self.get_share().await?;
-        let dst_key = self.config.key_for(to);
+        let dst_key = self.config().key_for(to);
 
         if share.head_object(&dst_key).await.is_ok() {
             return Err(object_store::Error::AlreadyExists {
@@ -507,7 +521,7 @@ impl ObjectStore for SMBObjectStore {
             });
         }
 
-        let src_key = self.config.key_for(from);
+        let src_key = self.config().key_for(from);
         share
             .copy_object(&src_key, &dst_key)
             .await

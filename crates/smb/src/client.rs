@@ -40,9 +40,9 @@ use crate::protocol::{
     parse_directory_entries,
 };
 
-/// Timeout for a single SMB response read. Prevents indefinite mutex hold when
-/// the SMB server is slow or unresponsive under heavy load.
-const SMB_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout for a single SMB response read. Prevents indefinite mutex
+/// hold when the SMB server is slow or unresponsive under heavy load.
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default I/O cap for standalone (non-compound) read/write operations.
 /// Many NAS servers advertise multi-MB maximums in negotiate but fail at sizes
@@ -61,6 +61,8 @@ pub struct SmbConfig {
     pub workstation: String,
     /// Cap for standalone read/write I/O (0 = use `DEFAULT_MAX_IO`).
     pub max_io_size: u32,
+    /// Per-response read timeout (None = use `DEFAULT_READ_TIMEOUT`).
+    pub read_timeout: Option<Duration>,
 }
 
 impl SmbConfig {
@@ -83,6 +85,8 @@ pub struct SmbClient {
     /// Capped max for compound operations.
     pub(crate) compound_max_read_size: u32,
     pub(crate) compound_max_write_size: u32,
+    /// Effective per-response read timeout.
+    read_timeout: Duration,
     client_guid: [u8; 16],
     signing_key: Option<[u8; 16]>,
     /// Set on read timeout — connection framing is desynchronized.
@@ -108,6 +112,7 @@ impl SmbClient {
         let mut client_guid = [0u8; 16];
         crypto::random_bytes(&mut client_guid);
 
+        let read_timeout = config.read_timeout.unwrap_or(DEFAULT_READ_TIMEOUT);
         let mut client = Self {
             stream: Mutex::new(stream),
             message_id: AtomicU64::new(0),
@@ -117,6 +122,7 @@ impl SmbClient {
             max_write_size: 65536,
             compound_max_read_size: 65536,
             compound_max_write_size: 65536,
+            read_timeout,
             client_guid,
             signing_key: None,
             poisoned: AtomicBool::new(false),
@@ -148,7 +154,7 @@ impl SmbClient {
                 "SMB connection poisoned by previous timeout",
             ));
         }
-        if let Ok(result) = tokio::time::timeout(SMB_READ_TIMEOUT, stream.read_exact(buf)).await {
+        if let Ok(result) = tokio::time::timeout(self.read_timeout, stream.read_exact(buf)).await {
             result.map(|_| ())
         } else {
             self.poisoned.store(true, Ordering::Relaxed);

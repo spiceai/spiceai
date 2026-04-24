@@ -246,7 +246,7 @@ pub fn encode_negotiate_request(buf: &mut BytesMut, client_guid: &[u8; 16]) {
     contexts.put_slice(&salt);
     // Pad to 8-byte alignment
     let pad = (8 - (contexts.len() % 8)) % 8;
-    contexts.put_slice(&vec![0u8; pad]);
+    contexts.put_bytes(0, pad);
 
     // Encryption Capabilities context
     let enc_data_len: u16 = 2 + 2 * 2;
@@ -274,7 +274,7 @@ pub fn encode_negotiate_request(buf: &mut BytesMut, client_guid: &[u8; 16]) {
     for &d in &DIALECTS {
         buf.put_u16_le(d);
     }
-    buf.put_slice(&vec![0u8; ctx_padding]);
+    buf.put_bytes(0, ctx_padding);
     buf.put_slice(&contexts);
 }
 

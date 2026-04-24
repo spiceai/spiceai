@@ -28,6 +28,11 @@ use crate::protocol::{
     CREATE_OPTION_DELETE_ON_CLOSE, CreateDisposition, CreateOptions, DesiredAccess, ShareAccess,
 };
 
+/// Maximum size for a single `get_object` / `copy_object` buffered read.
+/// Operations exceeding this must be driven through a streaming handle. Set
+/// conservatively to avoid accidentally OOM'ing on a terabyte-scale file.
+pub const MAX_BUFFERED_OBJECT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
 /// A connected share session backed by a pool of SMB connections.
 pub struct ShareSession {
     pool: Arc<SmbPool>,
@@ -290,6 +295,10 @@ impl ShareSession {
 
     /// Get object (file) content. Uses compound Create+Read+Close for files
     /// that fit in one read chunk, falling back to sequential for larger files.
+    ///
+    /// Rejects files larger than [`MAX_BUFFERED_OBJECT_SIZE`] — callers that
+    /// need to handle larger objects should use [`open_read`] and stream
+    /// chunks via [`FileHandle::read_chunk`] / [`read_pipeline`].
     pub async fn get_object(&self, key: &str) -> io::Result<(ObjectMeta, Vec<u8>)> {
         let (client, tree_id) = self.pick();
         let smb_path = to_smb_path(key);
@@ -299,6 +308,16 @@ impl ShareSession {
         let (cr, first_chunk) = client
             .create_read_close(tree_id, &smb_path, compound_max)
             .await?;
+
+        if cr.file_size > MAX_BUFFERED_OBJECT_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!(
+                    "SMB object {} bytes exceeds {} byte buffered-read cap; use open_read() to stream",
+                    cr.file_size, MAX_BUFFERED_OBJECT_SIZE
+                ),
+            ));
+        }
 
         let meta = ObjectMeta {
             size: cr.file_size,
@@ -413,24 +432,27 @@ impl ShareSession {
             .await?;
 
         let mut offset = 0u64;
+        let mut write_err: Option<io::Error> = None;
         for chunk in data.chunks(chunk_size) {
-            client.write(tree_id, &file.file_id, offset, chunk).await?;
+            if let Err(e) = client.write(tree_id, &file.file_id, offset, chunk).await {
+                write_err = Some(e);
+                break;
+            }
             offset += chunk.len() as u64;
         }
 
-        let close_meta = client
-            .close_with_attrs(tree_id, &file.file_id)
-            .await
-            .ok()
-            .flatten();
-        let (last_write_time, etag) = close_meta.map_or_else(
-            || (0u64, String::new()),
-            |cl| (cl.last_write_time, format!("{:016x}", cl.last_write_time)),
-        );
+        // Always attempt to close, even on write failure, to release the
+        // server-side handle. Prefer write errors over close errors.
+        let close_result = client.close_with_attrs(tree_id, &file.file_id).await;
+        if let Some(e) = write_err {
+            return Err(e);
+        }
+        let close_meta = close_result?
+            .ok_or_else(|| io::Error::other("SMB close did not return post-query attributes"))?;
         Ok(ObjectMeta {
             size: data.len() as u64,
-            last_modified: filetime_to_epoch_secs(last_write_time),
-            etag,
+            last_modified: filetime_to_epoch_secs(close_meta.last_write_time),
+            etag: format!("{:016x}", close_meta.last_write_time),
         })
     }
 
@@ -473,15 +495,50 @@ impl ShareSession {
         })
     }
 
-    /// Copy a file on the SMB share (read source, write dest).
+    /// Copy a file on the SMB share by streaming source reads into a WAL
+    /// writer. Memory footprint is one pipeline window (`max_read_size *
+    /// PIPELINE_DEPTH`) regardless of source size.
     pub async fn copy_object(&self, src_key: &str, dst_key: &str) -> io::Result<ObjectMeta> {
-        let (meta, data) = self.get_object(src_key).await?;
-        let dst_meta = self.put_object(dst_key, &data).await?;
-        Ok(ObjectMeta {
-            last_modified: dst_meta.last_modified,
-            etag: dst_meta.etag,
-            size: meta.size,
-        })
+        let src = self.open_read(src_key).await?;
+        let src_size = src.file_size;
+        let mut writer = self.open_wal_write(dst_key).await?;
+
+        let chunk_size = src.max_chunk;
+        let mut offset = 0u64;
+        let mut result: io::Result<()> = Ok(());
+        while offset < src_size {
+            let remaining = src_size - offset;
+            match src.read_pipeline(offset, chunk_size, remaining).await {
+                Ok(chunks) => {
+                    if chunks.is_empty() {
+                        break;
+                    }
+                    for chunk in &chunks {
+                        if let Err(e) = writer.write(chunk).await {
+                            result = Err(e);
+                            break;
+                        }
+                        offset += chunk.len() as u64;
+                    }
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+
+        let _ = src.close().await;
+        match result {
+            Ok(()) => writer.commit(self).await,
+            Err(e) => {
+                writer.abort().await;
+                Err(e)
+            }
+        }
     }
 
     /// Try to remove an empty directory (best effort).
@@ -691,13 +748,36 @@ impl WalWriter {
 
     /// Flush remaining data, close the WAL file, and rename it to the final path.
     pub async fn commit(mut self, share: &ShareSession) -> io::Result<ObjectMeta> {
-        self.flush().await?;
+        // Flush before renaming so no buffered bytes are lost.
+        let flush_result = self.flush().await;
+        let rename_result = if flush_result.is_ok() {
+            self.client
+                .rename(self.tree_id, &self.file_id, &self.final_path, true)
+                .await
+        } else {
+            Ok(())
+        };
 
-        self.client
-            .rename(self.tree_id, &self.file_id, &self.final_path, true)
-            .await?;
-
+        // Always close the handle, regardless of whether flush/rename
+        // succeeded — otherwise the server retains the open file.
         let _ = self.client.close(self.tree_id, &self.file_id).await;
+
+        // If flush or rename failed, clean up the WAL temp file.
+        flush_result?;
+        if let Err(e) = rename_result {
+            let _ = self
+                .client
+                .create_close(
+                    self.tree_id,
+                    &self.wal_path,
+                    DesiredAccess::Delete as u32,
+                    ShareAccess::Delete as u32,
+                    CreateDisposition::Open as u32,
+                    CreateOptions::NonDirectoryFile as u32 | CREATE_OPTION_DELETE_ON_CLOSE,
+                )
+                .await;
+            return Err(e);
+        }
 
         share.head_object_smb(&self.final_path).await
     }
