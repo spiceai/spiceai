@@ -49,7 +49,7 @@ use super::physical_plans::{
     DistributedCayenneDeleteExec, DistributedCayenneInsertExec, DistributedCayenneMergeExec,
     DistributedCayenneUpdateExec,
 };
-use crate::cluster::executor_registry::ExecutorRegistry;
+use crate::cluster::ExecutorRegistry;
 
 // ── DML extraction helpers ───────────────────────────────────────────────────
 
