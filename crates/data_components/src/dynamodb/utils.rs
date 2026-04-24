@@ -107,9 +107,11 @@ pub fn scalar_to_attribute_value(
                     let multiplier = 10_i128.pow(abs_scale);
                     match v.checked_mul(multiplier) {
                         Some(result) => result.to_string(),
-                        None => return Err(DataFusionError::Execution(format!(
-                            "Decimal128 value {v} with scale {scale} overflows when scaling to DynamoDB number"
-                        ))),
+                        None => {
+                            return Err(DataFusionError::Execution(format!(
+                                "Decimal128 value {v} with scale {scale} overflows when scaling to DynamoDB number"
+                            )));
+                        }
                     }
                 }
                 std::cmp::Ordering::Equal => v.to_string(),
@@ -554,14 +556,20 @@ mod tests {
     fn timestamp_second_overflow_returns_error() {
         let scalar = ScalarValue::TimestampSecond(Some(i64::MAX), None);
         let result = scalar_to_attribute_value(&scalar, "%Y-%m-%dT%H:%M:%S%z");
-        assert!(result.is_err(), "TimestampSecond near i64::MAX should fail on overflow");
+        assert!(
+            result.is_err(),
+            "TimestampSecond near i64::MAX should fail on overflow"
+        );
     }
 
     #[test]
     fn decimal128_negative_scale_overflow_returns_error() {
         let scalar = ScalarValue::Decimal128(Some(i128::MAX), 38, -2);
         let result = scalar_to_attribute_value(&scalar, "%Y-%m-%dT%H:%M:%S%z");
-        assert!(result.is_err(), "Decimal128 overflow on negative scale should fail");
+        assert!(
+            result.is_err(),
+            "Decimal128 overflow on negative scale should fail"
+        );
     }
 
     // -----------------------------------------------------------------------
