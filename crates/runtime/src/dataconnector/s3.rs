@@ -240,7 +240,12 @@ impl DataConnectorFactory for S3Factory {
                         .expose()
                         .ok()
                         .map(ToString::to_string);
-                    // Initialize global AWS SDK for default credential chain.
+                    // Always probe the default AWS credential chain so env-only setups
+                    // (IRSA, EC2 IMDS, AWS_ACCESS_KEY_ID/AWS_REGION env vars, etc.) keep
+                    // working when the user did not put `region` into spicepod params.
+                    // The bridge logs internal probe failures at debug level, so we only
+                    // surface a WARN here when the user explicitly configured a `region`
+                    // (signalling AWS auth intent) but no credentials were resolved.
                     if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config_with_region(
                         region.as_deref(),
                     )
@@ -248,6 +253,12 @@ impl DataConnectorFactory for S3Factory {
                     {
                         tracing::warn!(
                             "Unable to initialize AWS credentials for S3 connector: {err}"
+                        );
+                    } else if region.is_some()
+                        && aws_sdk_credential_bridge::get_sdk_config().is_none()
+                    {
+                        tracing::warn!(
+                            "S3 connector configured with `region` but no AWS credentials were resolved from the environment; falling back to anonymous access. Set `auth: public` to silence this warning, or configure AWS credentials (env vars, ~/.aws/credentials, IAM role)."
                         );
                     }
                 }
