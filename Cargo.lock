@@ -16244,6 +16244,7 @@ dependencies = [
  "llms",
  "runtime-rate-control",
  "runtime-request-context",
+ "simsimd",
  "snafu",
  "tokio",
  "tracing",
