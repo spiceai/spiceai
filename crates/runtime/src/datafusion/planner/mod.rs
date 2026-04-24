@@ -91,7 +91,7 @@ pub struct PlannerContext {
     /// Executor registry, if running in a distributed cluster.
     /// Used by `CREATE TABLE ... LIKE` to resolve auto-generated partition
     /// labels (e.g. `expr0`) back to the original SQL expression.
-    pub executor_registry: Option<Arc<crate::cluster::executor_registry::ExecutorRegistry>>,
+    pub executor_registry: Option<Arc<crate::cluster::ExecutorRegistry>>,
 
     /// DDL handler for `CREATE TABLE ... LIKE`.
     /// Used to produce a [`datafusion_ddl::DdlExtensionNode`] for the LIKE path,
