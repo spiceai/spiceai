@@ -34,7 +34,7 @@ limitations under the License.
 //! `rerank_score DESC` and limited to the requested `limit` (or all rows).
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Weak};
 
 use arrow::array::{Array, ArrayRef, Float32Array, LargeStringArray, RecordBatch, StringArray};
@@ -42,15 +42,24 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
 use datafusion::common::{Column, exec_err};
-use datafusion::datasource::{MemTable, TableType};
+use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{ColumnarValue, Signature, Volatility};
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::expressions::Column as PhysicalColumn;
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, PlanProperties,
+};
 use datafusion::prelude::{Expr, SessionContext};
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::TableReference;
+use datafusion_expr::TableProviderFilterPushDown;
 use datafusion_expr::expr::ScalarFunction;
-use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
+use datafusion_expr::{LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl};
 use futures::TryStreamExt;
 use llms::rerank::{LlmRerank, LlmStrategy, Rerank, RerankerModelStore};
 use tokio::sync::RwLock;
@@ -501,6 +510,31 @@ impl RerankUDTFProvider {
         Arc::new(Schema::new(fields))
     }
 
+    /// Build projection expressions that keep only the columns `RerankExec`
+    /// needs: the document column plus any caller-projected output columns
+    /// (excluding `rerank_score`, which is computed later).
+    fn rerank_projection_exprs(
+        projection: &[usize],
+        document: &str,
+        output_schema: &SchemaRef,
+        available: &datafusion::common::DFSchema,
+    ) -> Vec<Expr> {
+        let mut needed: HashSet<&str> = HashSet::new();
+        needed.insert(document);
+        for &idx in projection {
+            let name = output_schema.field(idx).name();
+            if name != RERANK_SCORE_COLUMN {
+                needed.insert(name.as_str());
+            }
+        }
+        available
+            .fields()
+            .iter()
+            .filter(|f| needed.contains(f.name().as_str()))
+            .map(|f| Expr::Column(Column::new_unqualified(f.name().clone())))
+            .collect()
+    }
+
     /// Pick the reranker model to use. Checks the rerankers store first, then
     /// falls back to wrapping a chat model in `LlmRerank`.
     async fn resolve_reranker(&self) -> DataFusionResult<Arc<dyn Rerank>> {
@@ -626,6 +660,32 @@ impl TableProvider for RerankUDTFProvider {
         TableType::Temporary
     }
 
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        // `rerank_score` is computed by the reranker and cannot be pushed
+        // down. All other filters reference base columns that exist in the
+        // inner provider's schema — we apply them via `LogicalPlanBuilder`
+        // in `scan()`, so DataFusion's optimizer will push them into the
+        // inner provider or add a FilterExec internally as needed.
+        Ok(filters
+            .iter()
+            .map(|f| {
+                let refs_computed = f
+                    .column_refs()
+                    .iter()
+                    .any(|c| c.name() == RERANK_SCORE_COLUMN);
+
+                if refs_computed {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    TableProviderFilterPushDown::Exact
+                }
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         state: &dyn Session,
@@ -639,113 +699,329 @@ impl TableProvider for RerankUDTFProvider {
             ))
         })?;
 
-        // Size the candidate pool fed into the reranker. Reranking is O(N) in
-        // remote calls / token cost, so the bare-table path needs a defensive
-        // cap — `rerank(big_table, ...)` with no cap could accidentally
-        // dispatch tens of thousands of requests. For nested search UDTFs the
-        // inner UDTF already caps via its own `limit =>` argument (the whole
-        // "recall then rerank" workflow relies on that: ask vector_search for
-        // K candidates, then rerank down to top-N where N < K), so we must
-        // NOT push the rerank's own `limit` into the inner scan — that would
-        // shrink the candidate pool to the output cap and defeat the recall
-        // stage. `DEFAULT_MAX_CANDIDATES` is still enforced defensively after
-        // materialization in case a nested UDTF returns an unbounded stream.
-        let push_down_limit = if self.input_is_nested {
-            None
-        } else {
-            Some(DEFAULT_MAX_CANDIDATES)
-        };
-        let input_plan = self.input.scan(state, None, &[], push_down_limit).await?;
-        let stream = datafusion::physical_plan::execute_stream(input_plan, state.task_ctx())?;
-        let mut input_batches: Vec<RecordBatch> = stream.try_collect().await?;
+        let reranker = self.resolve_reranker().await?;
 
-        // Defensive hard cap on materialized candidates. Applies to both
-        // nested and bare-table inputs in case the underlying provider
-        // ignored the pushed-down limit (nested UDTFs are only capped by
-        // their own `limit =>`, which may be unset).
-        let total: usize = input_batches.iter().map(RecordBatch::num_rows).sum();
-        if total > DEFAULT_MAX_CANDIDATES {
-            input_batches = truncate_batches(input_batches, DEFAULT_MAX_CANDIDATES);
+        let full_output_schema = self.schema();
+
+        // Wrap in a LogicalPlan so DataFusion's optimizer can push filters
+        // into the provider and add a FilterExec for unsupported ones.
+        let source = Arc::new(DefaultTableSource::new(Arc::clone(&self.input)));
+        let mut builder = LogicalPlanBuilder::scan("__rerank_candidates", source, None)?;
+
+        if let Some(f) = filters.iter().cloned().reduce(Expr::and) {
+            builder = builder.filter(f)?;
         }
 
-        // Concatenate for a single pass through the reranker.
-        let input_schema = self.input.schema();
-        let concatenated = if input_batches.is_empty() {
-            RecordBatch::new_empty(Arc::clone(&input_schema))
-        } else {
-            arrow::compute::concat_batches(&input_schema, input_batches.iter())
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+        // Cap the candidate pool for bare-table inputs. Nested search UDTFs
+        // manage their own candidate pool via their `limit =>` argument.
+        if !self.input_is_nested {
+            builder = builder.limit(0, Some(DEFAULT_MAX_CANDIDATES))?;
+        }
+
+        // Project to only the columns RerankExec needs: the document column
+        // plus any output columns the caller requested. The optimizer will
+        // automatically include filter columns in the scan.
+        if let Some(proj) = projection {
+            let exprs = Self::rerank_projection_exprs(
+                proj,
+                &self.args.document,
+                &full_output_schema,
+                builder.schema().as_ref(),
+            );
+            builder = builder.project(exprs)?;
+        }
+
+        let logical_plan = builder.build()?;
+        let input_plan = state.create_physical_plan(&logical_plan).await?;
+
+        // Use the actual physical plan's schema — may be reduced by projection
+        // pushdown. Compute output schema from the reduced input so RerankExec's
+        // output matches what it actually produces.
+        let actual_input_schema = input_plan.schema();
+        let output_schema = Self::output_schema(&actual_input_schema);
+
+        // Effective output limit: the smaller of the rerank `limit =>` arg and
+        // DataFusion's pushed-down LIMIT. Either may be None (= unlimited).
+        let effective_limit = match (self.args.limit, limit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (some, None) | (None, some) => some,
         };
 
-        let docs_opt = Self::extract_documents(&concatenated, &self.args.document)?;
+        let rerank_exec: Arc<dyn ExecutionPlan> = Arc::new(RerankExec::new(
+            input_plan,
+            Arc::clone(&output_schema),
+            actual_input_schema,
+            query,
+            self.args.document.clone(),
+            reranker,
+            effective_limit,
+            self.input_is_nested,
+        ));
 
-        // NULL document rows bypass the reranker and get a fixed `0.0` score
-        // — preserving NULL semantics rather than silently treating NULL as
-        // an empty string, which would otherwise produce garbage rankings
-        // when the reranker assigns non-zero relevance to "".
-        let (non_null_indices, non_null_docs): (Vec<usize>, Vec<String>) = docs_opt
-            .iter()
-            .enumerate()
-            .filter_map(|(i, d)| d.as_ref().map(|s| (i, s.clone())))
-            .unzip();
+        // Remap projection indices from the full output schema to the reduced
+        // output schema. DataFusion passes indices based on `self.schema()`
+        // (the full output), but RerankExec now produces a subset.
+        if let Some(proj) = projection {
+            let proj_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = proj
+                .iter()
+                .map(|&idx| {
+                    let name = full_output_schema.field(idx).name().clone();
+                    let reduced_idx = output_schema
+                        .index_of(&name)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                    Ok((
+                        Arc::new(PhysicalColumn::new(&name, reduced_idx)) as Arc<dyn PhysicalExpr>,
+                        name,
+                    ))
+                })
+                .collect::<DataFusionResult<Vec<_>>>()?;
+            return Ok(Arc::new(ProjectionExec::try_new(proj_exprs, rerank_exec)?));
+        }
 
-        let reranker = self.resolve_reranker().await?;
-        let non_null_scores = if non_null_docs.is_empty() {
-            Vec::new()
-        } else {
-            reranker
-                .rerank(&query, &non_null_docs)
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?
-        };
+        Ok(rerank_exec)
+    }
+}
 
-        if non_null_scores.len() != non_null_docs.len() {
-            return Err(DataFusionError::Execution(format!(
-                "{RERANK_UDTF_NAME}: reranker returned {} scores for {} documents.",
-                non_null_scores.len(),
-                non_null_docs.len()
+// ---------------------------------------------------------------------------
+// RerankExec — deferred physical plan
+// ---------------------------------------------------------------------------
+
+/// Physical execution node that defers reranker API calls to `execute()` time.
+///
+/// At plan time (`TableProvider::scan`) only the *input* plan is built and
+/// optimized; the actual data materialization + reranker invocation happens
+/// when the query engine calls `execute()`. This makes `EXPLAIN` instant and
+/// allows `DataFusion`'s optimizer to push filters/limits into the inner plan.
+struct RerankExec {
+    /// Optimized child plan that produces the candidate rows.
+    input: Arc<dyn ExecutionPlan>,
+    /// Output schema (base columns minus `_score`/`_fused_score`, plus `rerank_score`).
+    output_schema: SchemaRef,
+    /// Schema of the raw input (before column dropping).
+    input_schema: SchemaRef,
+    /// The query string passed to the reranker.
+    query: String,
+    /// Column name containing the document text to score.
+    document: String,
+    /// Resolved reranker model.
+    reranker: Arc<dyn Rerank>,
+    /// User-supplied output limit (caps output after sorting by `rerank_score`).
+    rerank_limit: Option<usize>,
+    /// Whether the input is a nested search UDTF (affects defensive cap).
+    input_is_nested: bool,
+    /// Cached plan properties.
+    properties: PlanProperties,
+}
+
+impl RerankExec {
+    #[expect(clippy::too_many_arguments)]
+    fn new(
+        input: Arc<dyn ExecutionPlan>,
+        output_schema: SchemaRef,
+        input_schema: SchemaRef,
+        query: String,
+        document: String,
+        reranker: Arc<dyn Rerank>,
+        rerank_limit: Option<usize>,
+        input_is_nested: bool,
+    ) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&output_schema)),
+            datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        Self {
+            input,
+            output_schema,
+            input_schema,
+            query,
+            document,
+            reranker,
+            rerank_limit,
+            input_is_nested,
+            properties,
+        }
+    }
+}
+
+impl std::fmt::Debug for RerankExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RerankExec")
+            .field("query", &self.query)
+            .field("document", &self.document)
+            .field("rerank_limit", &self.rerank_limit)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DisplayAs for RerankExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
+                let model = self.reranker.model_name().unwrap_or("unknown");
+                write!(
+                    f,
+                    "RerankExec: model={model}, document={}, limit={:?}",
+                    self.document, self.rerank_limit,
+                )
+            }
+        }
+    }
+}
+
+impl ExecutionPlan for RerankExec {
+    fn name(&self) -> &'static str {
+        "RerankExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(format!(
+                "RerankExec expected 1 child, got {}",
+                children.len()
             )));
         }
+        Ok(Arc::new(Self::new(
+            Arc::clone(&children[0]),
+            Arc::clone(&self.output_schema),
+            Arc::clone(&self.input_schema),
+            self.query.clone(),
+            self.document.clone(),
+            Arc::clone(&self.reranker),
+            self.rerank_limit,
+            self.input_is_nested,
+        )))
+    }
 
-        // Scatter non-null scores back into full-row positions; NULL rows
-        // keep their default 0.0.
-        let mut scores = vec![0.0_f32; docs_opt.len()];
-        for (idx, score) in non_null_indices.iter().zip(non_null_scores.iter()) {
-            scores[*idx] = *score;
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Execution(format!(
+                "RerankExec only supports 1 partition, got partition {partition}"
+            )));
         }
+        let input = Arc::clone(&self.input);
+        let output_schema = Arc::clone(&self.output_schema);
+        let input_schema = Arc::clone(&self.input_schema);
+        let query = self.query.clone();
+        let document = self.document.clone();
+        let reranker = Arc::clone(&self.reranker);
+        let rerank_limit = self.rerank_limit;
+        let input_is_nested = self.input_is_nested;
 
-        // Build output schema + batch: drop _score/_fused_score, append rerank_score.
-        let output_schema = Self::output_schema(&input_schema);
-        let drop_cols: Vec<usize> = input_schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, f)| {
-                if f.name() == "_score" || f.name() == RRF_FUSED_SCORE_COLUMN_NAME {
-                    None
-                } else {
-                    Some(i)
-                }
-            })
-            .collect();
-        let mut columns: Vec<ArrayRef> = drop_cols
-            .iter()
-            .map(|&i| Arc::clone(concatenated.column(i)))
-            .collect();
-        columns.push(Arc::new(Float32Array::from(scores)) as ArrayRef);
+        let stream = futures::stream::once(async move {
+            // 1. Execute the child plan and collect candidate batches.
+            tracing::debug!(document = %document, "RerankExec: collecting candidate batches..");
+            let child_stream = datafusion::physical_plan::execute_stream(input, context)?;
+            let mut batches: Vec<RecordBatch> = child_stream.try_collect().await?;
 
-        let unsorted = RecordBatch::try_new(Arc::clone(&output_schema), columns)?;
+            // Defensive hard cap on materialized candidates.
+            let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            if !input_is_nested && total > DEFAULT_MAX_CANDIDATES {
+                batches = truncate_batches(batches, DEFAULT_MAX_CANDIDATES);
+            }
 
-        // Sort by rerank_score DESC and apply the user-supplied limit. Doing
-        // this before handing off to MemTable avoids an unnecessary round-trip
-        // through DataFusion's sort operator for what is a one-column sort of
-        // a small materialized set.
-        let sorted = sort_by_rerank_score_desc(&unsorted, self.args.limit)?;
+            tracing::debug!(candidates = total, document = %document, "RerankExec: collected candidate batches");
 
-        // Delegate projection/filter/outer-limit to MemTable so `SELECT col1,
-        // col2 FROM rerank(...) WHERE ...` pushes down naturally.
-        let mem = MemTable::try_new(output_schema, vec![vec![sorted]])?;
-        mem.scan(state, projection, filters, limit).await
+            // 2. Concatenate into a single batch for the reranker.
+            let concatenated = if batches.is_empty() {
+                RecordBatch::new_empty(Arc::clone(&input_schema))
+            } else {
+                arrow::compute::concat_batches(&input_schema, batches.iter())
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+            };
+
+            // 3. Extract document texts, skipping NULLs.
+            let docs_opt = RerankUDTFProvider::extract_documents(&concatenated, &document)?;
+            let (non_null_indices, non_null_docs): (Vec<usize>, Vec<String>) = docs_opt
+                .iter()
+                .enumerate()
+                .filter_map(|(i, d)| d.as_ref().map(|s| (i, s.clone())))
+                .unzip();
+
+            // 4. Call the reranker.
+            tracing::debug!(
+                non_null = non_null_docs.len(),
+                "RerankExec: calling reranker"
+            );
+            let non_null_scores = if non_null_docs.is_empty() {
+                Vec::new()
+            } else {
+                reranker
+                    .rerank(&query, &non_null_docs)
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
+            };
+
+            tracing::debug!(
+                scores = non_null_scores.len(),
+                "RerankExec: reranker returned candidate scores"
+            );
+
+            if non_null_scores.len() != non_null_docs.len() {
+                return Err(DataFusionError::Execution(format!(
+                    "{RERANK_UDTF_NAME}: reranker returned {} scores for {} documents.",
+                    non_null_scores.len(),
+                    non_null_docs.len()
+                )));
+            }
+
+            // 5. Scatter scores; NULL rows get 0.0.
+            let mut scores = vec![0.0_f32; docs_opt.len()];
+            for (idx, score) in non_null_indices.iter().zip(non_null_scores.iter()) {
+                scores[*idx] = *score;
+            }
+
+            // 6. Build output batch: drop _score/_fused_score, append rerank_score.
+            let keep_cols: Vec<usize> = input_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, f)| {
+                    if f.name() == "_score" || f.name() == RRF_FUSED_SCORE_COLUMN_NAME {
+                        None
+                    } else {
+                        Some(i)
+                    }
+                })
+                .collect();
+            let mut columns: Vec<ArrayRef> = keep_cols
+                .iter()
+                .map(|&i| Arc::clone(concatenated.column(i)))
+                .collect();
+            columns.push(Arc::new(Float32Array::from(scores)) as ArrayRef);
+
+            let unsorted = RecordBatch::try_new(Arc::clone(&output_schema), columns)?;
+
+            // 7. Sort by rerank_score DESC, apply output limit.
+            sort_by_rerank_score_desc(&unsorted, rerank_limit)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.output_schema),
+            stream,
+        )))
     }
 }
 
