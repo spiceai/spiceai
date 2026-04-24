@@ -110,10 +110,6 @@ pub static VECTOR_SEARCH_UDTF_NAME: &str = "vector_search";
 /// logical plan size and runtime work.
 const VECTOR_SEARCH_MAX_QUERIES: usize = 32;
 
-// Reusing `_score` alias column can cause issues with physical optimizations
-// during filter/limit/order pushdowns. Use an internal column alias for
-// ordering.
-const INTERNAL_SCORE_COLUMN_ALIAS: &str = "__spice_vector_search_score";
 
 /// Creates a `UserDefined` signature that allows named parameters (like `rank_weight => X`)
 /// to pass through for RRF (Reciprocal Rank Fusion) operations.
@@ -1041,11 +1037,24 @@ impl TableProvider for VectorSearchUDTFProvider {
             })
             .collect();
 
+        let mut base_expr = final_expr.clone();
+
+        // Keep the embedding column in the inner projection even when it is not requested
+        // in the final output. This gives `_score` a stable slot that does not collide
+        // with other projected columns (e.g. recency columns used by RRF rewrites).
+        let embedding_col_name = embedding_col!(embed_col);
+        if !base_expr
+            .iter()
+            .any(|expr| expr.qualified_name().1 == embedding_col_name)
+        {
+            base_expr.push(ident(embedding_col_name));
+        }
+
         // Pick the scoring expression based on the requested distance metric.
         // In all cases the result is monotonically increasing with similarity
         // (higher == more similar) so the downstream `ORDER BY _score DESC` is correct.
         let metric = self.args.distance_metric.unwrap_or(DistanceMetric::Cosine);
-        let embed_expr = ident(embedding_col!(embed_col));
+        let embed_expr = ident(embedding_col_name);
         let query_lit = lit(ScalarValue::FixedSizeList(Arc::new(query_vector)));
 
         let score_expr: Expr = match metric {
@@ -1096,30 +1105,22 @@ impl TableProvider for VectorSearchUDTFProvider {
             }
         };
 
-        let mut base_expr = final_expr.clone();
-        base_expr.push(score_expr.alias(INTERNAL_SCORE_COLUMN_ALIAS));
+        base_expr.push(score_expr.clone().alias(SEARCH_SCORE_COLUMN_NAME));
 
         // Only project `_score` into the output when the caller asked for it
         // AND either asked for all columns or explicitly projected that index.
         if let Some(idx) = search_field_index
             && (projection.is_none() || projection.is_some_and(|proj| proj.contains(&idx)))
         {
-            final_expr.push(col(INTERNAL_SCORE_COLUMN_ALIAS).alias(SEARCH_SCORE_COLUMN_NAME));
+            final_expr.push(score_expr.clone().alias(SEARCH_SCORE_COLUMN_NAME));
         }
 
         let final_plan = scan
             .project(base_expr)?
-            .sort(vec![SortExpr::new(
-                Expr::Column(Column::from_name(INTERNAL_SCORE_COLUMN_ALIAS)),
-                false,
-                false,
-            )])?
+            .sort(vec![SortExpr::new(score_expr, false, false)])?
             .limit(0, Some(self.limit_to_use(limit)))?
-            // Keep this alias: it creates a subquery boundary between the
-            // sort/limit stage (which uses the internal score alias) and the
-            // final projection (which may rename or omit `_score`). Without
-            // this boundary, optimizer/projection collapsing can remove or
-            // rename the computed score column and break planning.
+            // Keep the score calculation and helper columns in a subquery,
+            // then project the user-visible output schema.
             .alias("tbl")?
             .project(final_expr)?
             .build()?;
