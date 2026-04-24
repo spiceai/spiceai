@@ -63,6 +63,7 @@ use datafusion_expr::{LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl};
 use futures::TryStreamExt;
 use llms::rerank::{LlmRerank, LlmStrategy, Rerank, RerankerModelStore};
 use tokio::sync::RwLock;
+use tracing::Instrument;
 
 use crate::datafusion::{DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use crate::embeddings::udtf::VECTOR_SEARCH_UDTF_NAME;
@@ -929,6 +930,10 @@ impl ExecutionPlan for RerankExec {
         let reranker = Arc::clone(&self.reranker);
         let rerank_limit = self.rerank_limit;
         let input_is_nested = self.input_is_nested;
+        let model_name = self.reranker.model_name().unwrap_or("unknown").to_string();
+
+        let span =
+            tracing::span!(target: "task_history", tracing::Level::INFO, "rerank", input = %query);
 
         let stream = futures::stream::once(async move {
             // 1. Execute the child plan and collect candidate batches.
@@ -942,6 +947,7 @@ impl ExecutionPlan for RerankExec {
                 batches = truncate_batches(batches, DEFAULT_MAX_CANDIDATES);
             }
 
+            tracing::info!(target: "task_history", model = %model_name, document = %document, candidates = total, "labels");
             tracing::debug!(candidates = total, document = %document, "RerankExec: collected candidate batches");
 
             // 2. Concatenate into a single batch for the reranker.
@@ -1016,7 +1022,16 @@ impl ExecutionPlan for RerankExec {
 
             // 7. Sort by rerank_score DESC, apply output limit.
             sort_by_rerank_score_desc(&unsorted, rerank_limit)
-        });
+                .inspect(|batch| {
+                    tracing::info!(target: "task_history", rows_produced = batch.num_rows(), "labels");
+                    let preview = batch.slice(0, batch.num_rows().min(3));
+                    let captured_output = crate::datafusion::query::write_to_json_string(&[preview]).unwrap_or_default();
+                    tracing::info!(target: "task_history", captured_output = %captured_output);
+                })
+                .inspect_err(|e| {
+                    tracing::error!(target: "task_history", "{e}");
+                })
+        }.instrument(span));
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.output_schema),
