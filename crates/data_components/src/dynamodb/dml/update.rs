@@ -162,8 +162,11 @@ async fn execute_update(
     )?;
 
     // Build the SET expression and attribute maps from assignments.
-    let (update_expression, attr_names, attr_values) =
-        build_update_expression(&config.assignments, &config.time_format)?;
+    let UpdateExpression {
+        expression: update_expression,
+        attr_names,
+        attr_values,
+    } = build_update_expression(&config.assignments, &config.time_format)?;
 
     // Issue UpdateItem calls in parallel chunks.
     let mut total: u64 = 0;
@@ -211,11 +214,14 @@ async fn execute_update(
     Ok(total)
 }
 
-type UpdateExpression = (
-    String,
-    HashMap<String, String>,
-    HashMap<String, AttributeValue>,
-);
+struct UpdateExpression {
+    /// The `SET #n0 = :v0, ...` expression string passed to `UpdateItem`.
+    expression: String,
+    /// Maps placeholder names (e.g. `#n0`) to actual attribute names.
+    attr_names: HashMap<String, String>,
+    /// Maps placeholder names (e.g. `:v0`) to `AttributeValue`s.
+    attr_values: HashMap<String, AttributeValue>,
+}
 
 /// Build a `DynamoDB` `UpdateExpression` of the form `SET #n0 = :v0, #n1 = :v1, ...`
 /// from a list of (column, `Expr::Literal`) assignments.
@@ -252,6 +258,9 @@ fn build_update_expression(
         attr_values.insert(value_placeholder, attr_value);
     }
 
-    let update_expression = format!("SET {}", set_parts.join(", "));
-    Ok((update_expression, attr_names, attr_values))
+    Ok(UpdateExpression {
+        expression: format!("SET {}", set_parts.join(", ")),
+        attr_names,
+        attr_values,
+    })
 }
