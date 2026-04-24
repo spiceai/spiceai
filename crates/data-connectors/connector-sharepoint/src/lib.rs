@@ -80,12 +80,12 @@ pub enum Error {
     MissingParameter { parameter: String },
 
     #[snafu(display(
-        "No authentication was specified. Provide one of: client_secret, bearer_token, auth_code, refresh_token, device_code, or saml_assertion. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#auth"
+        "No authentication was specified. Provide one of: sharepoint_client_secret, sharepoint_bearer_token, sharepoint_auth_code, sharepoint_refresh_token, sharepoint_device_code, or sharepoint_saml_assertion. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#auth"
     ))]
     InvalidAuthentication,
 
     #[snafu(display(
-        "Multiple authentication methods were specified. Provide exactly one of: client_secret, bearer_token, auth_code, refresh_token, device_code, or saml_assertion. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#auth"
+        "Multiple authentication methods were specified. Provide exactly one of: sharepoint_client_secret, sharepoint_bearer_token, sharepoint_auth_code, sharepoint_refresh_token, sharepoint_device_code, or sharepoint_saml_assertion. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#auth"
     ))]
     DuplicateAuthentication,
 

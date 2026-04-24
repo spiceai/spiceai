@@ -740,19 +740,57 @@ struct RawDriveItem {
 }
 
 impl RawDriveItem {
-    fn into_meta(self) -> DriveItemMeta {
-        let epoch = DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_default();
-        let last_modified = self.last_modified.as_deref().map_or(epoch, |s| {
-            DateTime::parse_from_rfc3339(s).map_or(epoch, |d| d.with_timezone(&Utc))
-        });
-        DriveItemMeta {
+    /// Convert the raw Graph drive-item JSON into a [`DriveItemMeta`].
+    ///
+    /// Returns an error when required metadata is missing or malformed:
+    /// - `lastModifiedDateTime` is missing, or present but not RFC3339-parseable.
+    /// - `size` is present but negative.
+    ///
+    /// Folders are permitted to omit `size` (defaults to 0) because Graph
+    /// sometimes omits size on folder-only responses. For files, a missing
+    /// `size` is also tolerated (defaults to 0) — DataFusion's ListingTable
+    /// treats `size` as advisory and will re-read via the `GET` response,
+    /// so surfacing an error here would prevent otherwise-valid queries.
+    /// We still surface structural/parse errors so callers don't silently
+    /// operate on corrupted metadata (which could confuse cache invalidation).
+    fn into_meta(self) -> ObjectStoreResult<DriveItemMeta> {
+        let is_folder = self.folder.is_some();
+        let last_modified_str = self.last_modified.as_deref().ok_or_else(|| {
+            object_store::Error::Generic {
+                store: STORE_TAG,
+                source: Box::new(std::io::Error::other(format!(
+                    "SharePoint drive item '{}' is missing required field 'lastModifiedDateTime'",
+                    self.name
+                ))),
+            }
+        })?;
+        let last_modified = DateTime::parse_from_rfc3339(last_modified_str)
+            .map_err(|e| object_store::Error::Generic {
+                store: STORE_TAG,
+                source: Box::new(std::io::Error::other(format!(
+                    "SharePoint drive item '{}' has unparseable 'lastModifiedDateTime' '{last_modified_str}': {e}",
+                    self.name
+                ))),
+            })?
+            .with_timezone(&Utc);
+        let size = match self.size {
+            Some(s) => u64::try_from(s).map_err(|_| object_store::Error::Generic {
+                store: STORE_TAG,
+                source: Box::new(std::io::Error::other(format!(
+                    "SharePoint drive item '{}' reported negative size {s}",
+                    self.name
+                ))),
+            })?,
+            None => 0,
+        };
+        Ok(DriveItemMeta {
             name: self.name,
             last_modified,
-            size: u64::try_from(self.size.unwrap_or(0)).unwrap_or(0),
+            size,
             e_tag: self.e_tag,
             version: self.c_tag,
-            is_folder: self.folder.is_some(),
-        }
+            is_folder,
+        })
     }
 }
 
@@ -895,7 +933,7 @@ async fn parse_put_response(response: reqwest::Response) -> ObjectStoreResult<Pu
             store: STORE_TAG,
             source: Box::new(e),
         })?;
-    let meta = raw.into_meta();
+    let meta = raw.into_meta()?;
     Ok(PutOutcome {
         e_tag: meta.e_tag,
         version: meta.version,
@@ -947,7 +985,7 @@ async fn head_drive_item(
             store: STORE_TAG,
             source: Box::new(e),
         })?;
-    Ok(raw.into_meta())
+    raw.into_meta()
 }
 
 async fn get_content(
@@ -1098,8 +1136,18 @@ fn list_children(
                     return;
                 }
             };
-            let metas: Vec<DriveItemMeta> =
-                page.value.into_iter().map(RawDriveItem::into_meta).collect();
+            let metas: Vec<DriveItemMeta> = match page
+                .value
+                .into_iter()
+                .map(RawDriveItem::into_meta)
+                .collect::<ObjectStoreResult<Vec<_>>>()
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
             yield Ok(metas);
         }
     })
