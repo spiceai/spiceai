@@ -98,9 +98,7 @@ impl Parameters {
                     "Ignoring parameter `{key}`: not supported for {component_name}. Did you mean `{candidate}`?"
                 );
             } else {
-                tracing::warn!(
-                    "Ignoring parameter `{key}`: not supported for {component_name}."
-                );
+                tracing::warn!("Ignoring parameter `{key}`: not supported for {component_name}.");
             }
             return None;
         };
