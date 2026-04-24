@@ -804,13 +804,18 @@ fn to_vault_name(key: &str) -> String {
 /// Resolves the full vault URL from the selector and optional `endpoint`
 /// override. Accepts bare vault names, full https URLs, and DNS-suffix-only
 /// overrides for sovereign clouds.
+///
+/// URL validation goes through [`url::Url`] rather than a scheme-prefix
+/// check: strings like `https://` or `https://example.com/some/path`
+/// used to pass the prefix check and fail later inside the Azure SDK with
+/// a less actionable error. Now they're rejected here with a concrete
+/// reason.
 fn resolve_vault_url(vault_selector: &str, endpoint: Option<&str>) -> Result<String> {
     let selector = vault_selector.trim().trim_end_matches('/');
 
     // Case 1: selector is already a full URL. Endpoint override is ignored.
     if selector.starts_with("https://") || selector.starts_with("http://") {
-        validate_https(selector)?;
-        return Ok(format!("{selector}/"));
+        return validate_vault_url(selector);
     }
 
     // Case 2: endpoint override is a full URL. Ignore the selector and use
@@ -819,8 +824,7 @@ fn resolve_vault_url(vault_selector: &str, endpoint: Option<&str>) -> Result<Str
     if let Some(ep) = endpoint {
         let ep = ep.trim().trim_end_matches('/');
         if ep.starts_with("https://") || ep.starts_with("http://") {
-            validate_https(ep)?;
-            return Ok(format!("{ep}/"));
+            return validate_vault_url(ep);
         }
     }
 
@@ -830,27 +834,83 @@ fn resolve_vault_url(vault_selector: &str, endpoint: Option<&str>) -> Result<Str
         .map(|s| s.trim().trim_end_matches('/'))
         .filter(|s| !s.is_empty())
         .unwrap_or(DEFAULT_VAULT_SUFFIX);
-    let url = format!("https://{selector}.{suffix}/");
-    validate_https(url.trim_end_matches('/'))?;
-    Ok(url)
+    validate_vault_url(&format!("https://{selector}.{suffix}"))
 }
 
-fn validate_https(url: &str) -> Result<()> {
-    if url.starts_with("https://") {
-        Ok(())
-    } else if url.starts_with("http://") {
-        InvalidVaultUrlSnafu {
-            url: url.to_string(),
-            reason: "plaintext http:// is not allowed for Key Vault".to_string(),
+/// Parses the input through `url::Url` and returns a canonicalized
+/// `https://host[:port]/` string, rejecting anything that isn't a valid
+/// https URL pointing at a bare host. Key Vault URLs are always host-only —
+/// any path, query, fragment, or embedded credentials is user error.
+fn validate_vault_url(input: &str) -> Result<String> {
+    let parsed = url::Url::parse(input).map_err(|e| Error::InvalidVaultUrl {
+        url: input.to_string(),
+        reason: format!("not a valid URL: {e}"),
+    })?;
+
+    if parsed.scheme() != "https" {
+        return InvalidVaultUrlSnafu {
+            url: input.to_string(),
+            reason: if parsed.scheme() == "http" {
+                "plaintext http:// is not allowed for Key Vault".to_string()
+            } else {
+                format!("scheme must be https, got {}://", parsed.scheme())
+            },
         }
-        .fail()
-    } else {
-        InvalidVaultUrlSnafu {
-            url: url.to_string(),
-            reason: "must start with https://".to_string(),
-        }
-        .fail()
+        .fail();
     }
+
+    if !parsed.has_host() {
+        return InvalidVaultUrlSnafu {
+            url: input.to_string(),
+            reason: "missing host; expected something like `https://my-vault.vault.azure.net/`"
+                .to_string(),
+        }
+        .fail();
+    }
+
+    // Key Vault URLs are host-only. Reject paths, queries, fragments, and
+    // userinfo so users can't accidentally route lookups to the wrong
+    // vault or leak credentials in logs.
+    let path = parsed.path();
+    if !path.is_empty() && path != "/" {
+        return InvalidVaultUrlSnafu {
+            url: input.to_string(),
+            reason: format!(
+                "unexpected path `{path}`; Key Vault URLs are host-only, e.g. \
+                 `https://my-vault.vault.azure.net/`"
+            ),
+        }
+        .fail();
+    }
+    if parsed.query().is_some() {
+        return InvalidVaultUrlSnafu {
+            url: input.to_string(),
+            reason: "unexpected query string; Key Vault URLs are host-only".to_string(),
+        }
+        .fail();
+    }
+    if parsed.fragment().is_some() {
+        return InvalidVaultUrlSnafu {
+            url: input.to_string(),
+            reason: "unexpected fragment; Key Vault URLs are host-only".to_string(),
+        }
+        .fail();
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return InvalidVaultUrlSnafu {
+            url: input.to_string(),
+            reason: "unexpected userinfo in URL; credentials must go through `params`".to_string(),
+        }
+        .fail();
+    }
+
+    // Normalize to `https://host[:port]/` — strip any trailing slash the
+    // parser added beyond the root.
+    let host = parsed.host_str().unwrap_or("");
+    Ok(match parsed.port() {
+        Some(port) => format!("https://{host}:{port}/"),
+        None => format!("https://{host}/"),
+    })
 }
 
 /// Resolves `AuthMethod::Default` against the supplied credentials.
@@ -968,6 +1028,67 @@ mod tests {
         let err =
             resolve_vault_url("http://insecure.example.com", None).expect_err("http rejected");
         assert!(matches!(err, Error::InvalidVaultUrl { .. }));
+    }
+
+    /// Copilot review: `validate_https` used to accept `https://` by prefix
+    /// alone. Anything that isn't a valid https URL with a host must be
+    /// rejected up front, regardless of which parse step catches it —
+    /// `https://` fails the underlying `url::Url` parser, `https:///` fails
+    /// the host check.
+    #[test]
+    fn rejects_https_url_with_no_host() {
+        for input in ["https://", "https:///"] {
+            match resolve_vault_url(input, None) {
+                Ok(url) => panic!("expected `{input}` to be rejected but got {url}"),
+                Err(Error::InvalidVaultUrl { .. }) => {}
+                Err(other) => panic!("unexpected error variant for `{input}`: {other:?}"),
+            }
+        }
+    }
+
+    /// Key Vault URLs are host-only. A path segment indicates the user is
+    /// pointing at a specific secret or misconfigured the endpoint — fail
+    /// fast with a concrete message instead of letting it hit the SDK.
+    #[test]
+    fn rejects_https_url_with_path() {
+        let err = resolve_vault_url("https://my-vault.vault.azure.net/some/path", None)
+            .expect_err("path rejected");
+        match err {
+            Error::InvalidVaultUrl { reason, .. } => {
+                assert!(reason.contains("path"), "got {reason}");
+            }
+            other => panic!("unexpected variant {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_https_url_with_query_or_fragment() {
+        let err = resolve_vault_url("https://my-vault.vault.azure.net/?foo=bar", None)
+            .expect_err("query rejected");
+        assert!(matches!(err, Error::InvalidVaultUrl { .. }));
+
+        let err = resolve_vault_url("https://my-vault.vault.azure.net/#frag", None)
+            .expect_err("fragment rejected");
+        assert!(matches!(err, Error::InvalidVaultUrl { .. }));
+    }
+
+    #[test]
+    fn rejects_https_url_with_userinfo() {
+        let err = resolve_vault_url("https://user:pass@my-vault.vault.azure.net/", None)
+            .expect_err("userinfo rejected");
+        match err {
+            Error::InvalidVaultUrl { reason, .. } => {
+                assert!(reason.contains("userinfo"), "got {reason}");
+            }
+            other => panic!("unexpected variant {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preserves_custom_port_in_selector() {
+        // Localstack-style setups may run on a non-default port.
+        let url = resolve_vault_url("https://my-vault.vault.azure.net:8443", None).expect("valid");
+        assert_eq!(url, "https://my-vault.vault.azure.net:8443/");
     }
 
     #[test]
