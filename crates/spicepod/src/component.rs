@@ -35,6 +35,7 @@ pub mod eval;
 pub mod function;
 pub mod management;
 pub mod model;
+pub mod rerankers;
 pub mod runtime;
 pub mod secret;
 pub mod snapshot;

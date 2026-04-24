@@ -120,13 +120,11 @@ regex.workspace = true
 reqwest.workspace = true
 rmcp = { workspace = true, optional = true, features = [
     "client",
-    "reqwest",
     "server",
-    "transport-sse-server",
     "transport-io",
-    "transport-sse-client",
     "transport-child-process",
     "transport-streamable-http-server",
+    "transport-streamable-http-client-reqwest",
 ] }
 runtime-acceleration = { path = "../runtime-acceleration" }
 runtime-api-types = { path = "../runtime-api-types" }
@@ -268,7 +266,7 @@ bedrock = []
 clickhouse = ["db_connection_pool/clickhouse", "data_components/clickhouse"]
 cosmosdb = ["data_components/cosmosdb"]
 cuda = ["llms/cuda"]
-databricks = ["data_components/databricks"]
+databricks = ["data_components/databricks", "dep:duration-parse"]
 debezium = ["kafka", "data_components/debezium"]
 default = [
     "keyring-secret-store",

@@ -30,7 +30,8 @@ use std::sync::Arc;
 
 use component::{
     catalog::Catalog, dataset::Dataset, embeddings::Embeddings, function::Function, model::Model,
-    runtime::Runtime, secret::Secret, snapshot::Snapshots, tool::Tool, view::View, worker::Worker,
+    rerankers::Reranker, runtime::Runtime, secret::Secret, snapshot::Snapshots, tool::Tool,
+    view::View, worker::Worker,
 };
 
 use crate::component::Nameable;
@@ -135,6 +136,8 @@ pub struct Spicepod {
     pub dependencies: Vec<String>,
 
     pub embeddings: Vec<Embeddings>,
+
+    pub rerankers: Vec<Reranker>,
 
     pub tools: Vec<Tool>,
 
@@ -271,6 +274,15 @@ impl Spicepod {
         .await
         .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
 
+        let resolved_rerankers = component::resolve_component_references(
+            fs,
+            &path,
+            &spicepod_definition.rerankers,
+            "rerankers",
+        )
+        .await
+        .context(UnableToResolveSpicepodComponentsSnafu { path: path.clone() })?;
+
         let resolved_tools =
             component::resolve_component_references(fs, &path, &spicepod_definition.tools, "tools")
                 .await
@@ -299,6 +311,7 @@ impl Spicepod {
         detect_duplicate_component_names("view", &resolved_views[..])?;
         detect_duplicate_component_names("model", &resolved_models[..])?;
         detect_duplicate_component_names("embedding", &resolved_embeddings[..])?;
+        detect_duplicate_component_names("reranker", &resolved_rerankers[..])?;
         detect_duplicate_component_names("tool", &resolved_tools[..])?;
         detect_duplicate_component_names("worker", &resolved_workers[..])?;
         detect_duplicate_component_names("function", &resolved_functions[..])?;
@@ -311,6 +324,7 @@ impl Spicepod {
             resolved_datasets,
             resolved_views,
             resolved_embeddings,
+            resolved_rerankers,
             resolved_tools,
             resolved_models,
             resolved_workers,
@@ -400,6 +414,7 @@ fn from_definition(
     datasets: Vec<Dataset>,
     views: Vec<View>,
     embeddings: Vec<Embeddings>,
+    rerankers: Vec<Reranker>,
     tools: Vec<Tool>,
     models: Vec<Model>,
     workers: Vec<Worker>,
@@ -415,6 +430,7 @@ fn from_definition(
         views,
         models,
         embeddings,
+        rerankers,
         tools,
         workers,
         functions,
