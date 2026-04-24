@@ -89,8 +89,8 @@ const INTERNAL_COMPONENTS: &[&str] = &[
     "runtime_rate_control",
 ];
 
-const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry_sdk=off,delta_kernel::log_segment=off,delta_kernel::listed_log_files=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off,tower::buffer=off,h2::codec=off";
-const OFF_UNLESS_VERY_VERBOSE_FILTERS: &str = "datafusion_datasource::source=off,datafusion_optimizer::utils=off,datafusion_optimizer::optimizer=off,datafusion::physical_planner=off,opentelemetry=warn,tantivy=warn";
+const OFF_FILTERS: &str = "reqwest_retry::middleware=off,opentelemetry=warn,opentelemetry_sdk=off,delta_kernel::log_segment=off,delta_kernel::listed_log_files=off,aws_config::imds::region=off,aws_config::meta::credentials::chain=off,tower::buffer=off,h2::codec=off";
+const OFF_UNLESS_VERY_VERBOSE_FILTERS: &str = "datafusion_datasource::source=off,datafusion_optimizer::utils=off,datafusion_optimizer::optimizer=off,datafusion::physical_planner=off,tantivy=warn";
 
 fn specific_env_filter(filter: &str) -> String {
     format!("{OFF_FILTERS},{filter}")
@@ -498,7 +498,7 @@ mod tests {
     fn verbose_filter_suppresses_opentelemetry_info() {
         assert!(env_filter_string(&LogVerbosity::Default).contains("opentelemetry=warn"));
         assert!(env_filter_string(&LogVerbosity::Verbose).contains("opentelemetry=warn"));
-        assert!(!env_filter_string(&LogVerbosity::VeryVerbose).contains("opentelemetry=warn"));
+        assert!(env_filter_string(&LogVerbosity::VeryVerbose).contains("opentelemetry=warn"));
     }
 
     #[test]

@@ -18,10 +18,10 @@ use crate::Runtime;
 use futures::StreamExt;
 
 use rmcp::{
-    Error as McpError, RoleServer, ServerHandler,
+    ErrorData as McpError, RoleServer, ServerHandler,
     model::{
-        CallToolRequestMethod, CallToolRequestParam, CallToolResult, Content, Implementation,
-        ListToolsResult, PaginatedRequestParam, ProtocolVersion, ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
+        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
     },
     service::RequestContext,
 };
@@ -47,26 +47,21 @@ impl From<&Arc<Runtime>> for RuntimeServer {
 
 impl ServerHandler for RuntimeServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: None,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "Spice.ai Open Source".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-            protocol_version: ProtocolVersion::LATEST,
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "Spice.ai Open Source",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_protocol_version(ProtocolVersion::LATEST)
     }
 
     fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
-        let CallToolRequestParam {
-            name: tool_name,
-            arguments,
-        } = request;
+        let tool_name = request.name.clone();
+        let arguments = request.arguments.clone();
         Box::pin(async move {
             // Security constants
             const MAX_TOOL_NAME_LENGTH: usize = 256;
@@ -89,13 +84,15 @@ impl ServerHandler for RuntimeServer {
                 .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/')
             {
                 return Err(McpError::invalid_params(
-                    "Tool name contains invalid characters. Only alphanumeric, underscore, hyphen, and dot allowed".to_string(),
+                    "Tool name contains invalid characters. Only alphanumeric, underscore, hyphen, dot, and forward-slash allowed".to_string(),
                     None,
                 ));
             }
 
-            let Some(tool) = self.get_tool(tool_name.to_string().as_str()).await else {
-                return Err(McpError::method_not_found::<CallToolRequestMethod>());
+            let Some(tool) = self.0.get_tool(tool_name.as_ref()).await else {
+                return Err(McpError::method_not_found::<
+                    rmcp::model::CallToolRequestMethod,
+                >());
             };
 
             // If possible, we pass the call through to the MCP server.
@@ -143,44 +140,37 @@ impl ServerHandler for RuntimeServer {
             let text = serde_json::to_string(&result)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
-            Ok(CallToolResult {
-                content: vec![Content::text(text)],
-                is_error: Some(false),
-            })
+            Ok(CallToolResult::success(vec![Content::text(text)]))
         })
     }
 
     fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         Box::pin(async move {
             let tools = self
                 .list_all_tools()
-                .map(|t| rmcp::model::Tool {
-                    name: t.name().into_owned().into(),
-                    description: t
-                        .description()
-                        .as_deref()
-                        .map(|s| Cow::Owned(s.to_string())),
-                    // For null inputs, we default to an empty object.
-                    input_schema: to_map(t.parameters().unwrap_or(json!({
+                .map(|t| {
+                    let name: Cow<'static, str> = t.name().into_owned().into();
+                    let description: Option<Cow<'static, str>> =
+                        t.description().map(|s| Cow::Owned(s.into_owned()));
+                    let schema = to_map(t.parameters().unwrap_or(json!({
                         "$schema": "http://json-schema.org/draft-07/schema#",
                         "title": "empty",
                         "type": "object",
                         "required": [],
                         "properties": {}
-                        }
-                    )))
-                    .into(),
-                    annotations: None,
+                    })));
+                    Tool::new_with_raw(name, description, schema)
                 })
                 .collect::<Vec<_>>()
                 .await;
             Ok(ListToolsResult {
                 tools,
                 next_cursor: None,
+                meta: None,
             })
         })
     }
