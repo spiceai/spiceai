@@ -91,7 +91,7 @@ async fn forward_to_executors(
     sql: &str,
     require_all: bool,
 ) -> DFResult<()> {
-    let clients = registry.flight_sql_clients.read().await;
+    let clients = registry.flight_sql_clients_snapshot().await;
     if clients.is_empty() {
         tracing::debug!(sql, "Skipping Cayenne forwarding: no executors connected");
         return Ok(());
@@ -274,7 +274,7 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
 
         let stream = futures::stream::once(async move {
             // 1. Executor connectivity guard.
-            if executor_registry.flight_sql_clients.read().await.is_empty() {
+            if !executor_registry.has_flight_sql_clients().await {
                 return Err(DataFusionError::Execution(format!(
                     "Failed to create table '{table_name}' in Cayenne catalog '{catalog_name}': \
                      no executors are currently connected. At least one executor must be \
@@ -518,7 +518,7 @@ impl ExecutionPlan for DistributedCayenneDropTableExec {
 
         let stream = futures::stream::once(async move {
             // Executor connectivity guard.
-            if executor_registry.flight_sql_clients.read().await.is_empty() {
+            if !executor_registry.has_flight_sql_clients().await {
                 return Err(DataFusionError::Execution(format!(
                     "Failed to drop table '{table_name}' from Cayenne catalog '{catalog_name}': \
                      no executors are currently connected."
@@ -998,7 +998,7 @@ impl ExecutionPlan for DistributedCayenneInsertExec {
         let result_schema = dml_count_schema();
         let task_ctx = context;
         let stream = futures::stream::once(async move {
-            if executor_registry.flight_sql_clients.read().await.is_empty() {
+            if !executor_registry.has_flight_sql_clients().await {
                 return Err(DataFusionError::Execution(format!(
                     "INSERT on '{table_name}' cannot be forwarded: no executors connected"
                 )));

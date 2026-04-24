@@ -990,7 +990,7 @@ async fn synchronize_distributed_write_through_registration(
 }
 
 async fn forward_ddl_to_executors(executor_registry: &ExecutorRegistry, sql: &str) -> DFResult<()> {
-    let clients = executor_registry.flight_sql_clients.read().await;
+    let clients = executor_registry.flight_sql_clients_snapshot().await;
     if clients.is_empty() {
         return Ok(());
     }

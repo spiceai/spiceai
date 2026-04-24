@@ -596,9 +596,9 @@ impl ClusterService for ClusterServiceImpl {
         let tls_config_opt = self.datafusion.cluster_config.client_tls_config().cloned();
         match create_executor_flight_client(&executor_url, tls_config_opt) {
             Ok(client) => {
-                let mut flight_client_registry =
-                    self.executor_registry.flight_sql_clients.write().await;
-                flight_client_registry.insert(executor_id.to_string(), client);
+                self.executor_registry
+                    .insert_flight_sql_client(executor_id.to_string(), client)
+                    .await;
             }
             Err(e) => {
                 tracing::warn!(
@@ -706,8 +706,9 @@ impl ClusterService for ClusterServiceImpl {
                 partition_map.entry(table_ref).or_default();
             }
 
-            let mut executor_partitions = self.executor_registry.partitions.write().await;
-            executor_partitions.insert(executor_id.to_string(), partition_map);
+            self.executor_registry
+                .set_executor_partitions(executor_id.to_string(), partition_map)
+                .await;
         }
 
         Ok(Response::new(AllocateInitialPartitionsResponse {

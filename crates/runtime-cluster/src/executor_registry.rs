@@ -126,14 +126,14 @@ pub type TablePartitions = HashMap<TableReference, Vec<Expr>>;
 #[derive(Debug)]
 pub struct ExecutorRegistry {
     /// Map of `executor_id` -> connection
-    pub connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
+    connections: Arc<RwLock<HashMap<String, ExecutorConnection>>>,
 
     /// Map of `executor_id` -> `FlightSqlClient`
     /// An executor may be in `connections` and not in `flight_sql_clients` (e.g. during initial connection).
-    pub flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
+    flight_sql_clients: Arc<RwLock<HashMap<String, FlightSqlClient>>>,
 
     /// Map of `executor_id` -> table partitions for that executor
-    pub partitions: Arc<RwLock<HashMap<String, TablePartitions>>>,
+    partitions: Arc<RwLock<HashMap<String, TablePartitions>>>,
 
     /// Manager for accelerated partition metadata. Used to validate partition completeness
     /// and optimize executor selection. If None, fallback to legacy behavior.
@@ -191,12 +191,59 @@ impl ExecutorRegistry {
         pending_requests
     }
 
-    /// Unregisters an executor connection.
+    /// Unregisters an executor and removes it from all three tracking maps.
     pub async fn unregister(&self, executor_id: &str) {
-        let mut connections = self.connections.write().await;
-        if connections.remove(executor_id).is_some() {
+        if self.connections.write().await.remove(executor_id).is_some() {
             tracing::debug!("Executor {executor_id} disconnected");
         }
+        self.flight_sql_clients.write().await.remove(executor_id);
+        self.partitions.write().await.remove(executor_id);
+    }
+
+    /// Returns `true` if at least one executor has an active `FlightSqlClient`.
+    pub async fn has_flight_sql_clients(&self) -> bool {
+        !self.flight_sql_clients.read().await.is_empty()
+    }
+
+    /// Returns a point-in-time snapshot of all `executor_id` → `FlightSqlClient` mappings.
+    pub async fn flight_sql_clients_snapshot(&self) -> HashMap<String, FlightSqlClient> {
+        self.flight_sql_clients.read().await.clone()
+    }
+
+    /// Inserts or replaces the `FlightSqlClient` for `executor_id`.
+    pub async fn insert_flight_sql_client(&self, executor_id: String, client: FlightSqlClient) {
+        self.flight_sql_clients
+            .write()
+            .await
+            .insert(executor_id, client);
+    }
+
+    /// Replaces the cached `TablePartitions` for `executor_id`.
+    pub async fn set_executor_partitions(&self, executor_id: String, partitions: TablePartitions) {
+        self.partitions
+            .write()
+            .await
+            .insert(executor_id, partitions);
+    }
+
+    /// Returns a shared handle to the `flight_sql_clients` map.
+    ///
+    /// Prefer the snapshot/mutation methods above for most use cases. Use this
+    /// only when a long-lived `Arc` to the map is required (e.g. background tasks
+    /// that need to observe live updates).
+    #[must_use]
+    pub fn flight_sql_clients_handle(&self) -> Arc<RwLock<HashMap<String, FlightSqlClient>>> {
+        Arc::clone(&self.flight_sql_clients)
+    }
+
+    /// Returns a point-in-time snapshot of `executor_id` → `TablePartitions` mappings.
+    pub async fn executor_partitions_snapshot(&self) -> HashMap<String, TablePartitions> {
+        self.partitions.read().await.clone()
+    }
+
+    /// Returns the number of executors that currently have a `FlightSqlClient`.
+    pub async fn flight_sql_clients_count(&self) -> usize {
+        self.flight_sql_clients.read().await.len()
     }
 
     /// Returns the list of currently connected executor IDs.

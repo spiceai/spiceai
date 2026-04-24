@@ -212,7 +212,7 @@ pub(crate) async fn handle(
             Some(ClusterRole::Scheduler)
         )
     {
-        if executor_registry.flight_sql_clients.read().await.is_empty() {
+        if !executor_registry.has_flight_sql_clients().await {
             return Err(Status::unavailable(
                 "No executors available to write data to. Ensure that at least one executor is connected to the cluster and try again.",
             ));

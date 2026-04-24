@@ -187,7 +187,7 @@ impl ClusterHarness {
             // `connections` but not yet in `flight_sql_clients` during initial
             // connection setup, which causes INSERT forwarding to fail.
             let flight_clients_ready = if let Some(ref registry) = self.executor_registry {
-                registry.flight_sql_clients.read().await.len() >= expected
+                registry.flight_sql_clients_count().await >= expected
             } else {
                 true
             };

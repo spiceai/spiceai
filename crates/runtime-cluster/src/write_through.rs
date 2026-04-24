@@ -325,10 +325,11 @@ pub async fn forward_partitioned_batches(
 
     // Spawn forwarding tasks for ALL connected executors so we can route
     // new partitions to any executor, not just those with existing assignments.
-    let all_executor_ids: Vec<ExecutorId> = {
-        let clients = executor_registry.flight_sql_clients.read().await;
-        clients.keys().cloned().collect()
-    };
+    let all_executor_ids: Vec<ExecutorId> = executor_registry
+        .flight_sql_clients_snapshot()
+        .await
+        .into_keys()
+        .collect();
 
     let (senders, join_handles) = spawn_executor_forwarding_tasks(
         executor_registry,
@@ -800,7 +801,7 @@ async fn spawn_executor_forwarding_tasks(
         .map(str::to_string);
 
     let executor_clients: Vec<(ExecutorId, data_components::flightsql::FlightSqlClient)> = {
-        let clients = executor_registry.flight_sql_clients.read().await;
+        let clients = executor_registry.flight_sql_clients_snapshot().await;
         executors
             .iter()
             .map(|id| {
