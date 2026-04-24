@@ -24,8 +24,8 @@ use super::{
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
 };
+use crate::cluster::ExecutorRegistry;
 use crate::cluster::ResolvedClusterConfig;
-use crate::cluster::executor_registry::ExecutorRegistry;
 use crate::{config::ClusterRole, metrics::telemetry::track_bytes_processed, status};
 use crate::{dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA};
 use cache::Caching;
@@ -57,6 +57,7 @@ use {
     datafusion_optimizer_rules::physical_plan::duckdb::intermediate_index_cte::DuckDBIntermediateIndexMaterializationOptimizer,
 };
 
+use crate::cluster::partition::service::PartitionService;
 #[cfg(feature = "duckdb")]
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 #[cfg(feature = "duckdb")]
@@ -135,6 +136,7 @@ pub struct DataFusionBuilder {
     /// Arbitrary additional analyzer rules.
     additional_analyzer_rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>>,
     executor_registry: Option<Arc<ExecutorRegistry>>,
+    partition_service: Option<Arc<PartitionService>>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -180,6 +182,7 @@ impl DataFusionBuilder {
             url_tables_enabled: false,
             additional_analyzer_rules: vec![],
             executor_registry: None,
+            partition_service: None,
         }
     }
 
@@ -277,6 +280,13 @@ impl DataFusionBuilder {
     #[must_use]
     pub fn with_executor_registry(mut self, registry: Arc<ExecutorRegistry>) -> Self {
         self.executor_registry = Some(registry);
+        self
+    }
+
+    /// Sets the partition service for discovery and assignment of partitions (scheduler mode only).
+    #[must_use]
+    pub fn with_partition_service(mut self, service: Arc<PartitionService>) -> Self {
+        self.partition_service = Some(service);
         self
     }
 
@@ -435,13 +445,14 @@ impl DataFusionBuilder {
         let cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>> =
             // How we handle Cayenne DDL depends if its single node vs distributed.
             if let Some(executor_registry) = &self.executor_registry {
-                use crate::cluster::FederatedPartitionProvider;
+                use crate::cluster::{AcceleratedPartitionProvider, FederatedPartitionProvider};
 
 
                 // Rules only for distributed query
                 // Accelerated tables
                 ctx.add_analyzer_rule(Arc::new(PartitionedTableScanRewrite::new(
-                    Arc::clone(executor_registry) as Arc<dyn TablePartitionProvider>,
+                    Arc::new(AcceleratedPartitionProvider::from_registry(Arc::clone(executor_registry)))
+                        as Arc<dyn TablePartitionProvider>,
                     &ctx,
                 )));
 
@@ -530,7 +541,7 @@ impl DataFusionBuilder {
             scheduler_server: RwLock::new(None),
             executor: RwLock::new(None),
             executor_stream_registry: RwLock::new(None),
-            executor_registry: self.executor_registry,
+            partition_service: self.partition_service,
             #[cfg(not(windows))]
             cayenne_ddl_handler,
         }

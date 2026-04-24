@@ -135,7 +135,7 @@ impl Runtime {
                     schema,
                     local_table_provider,
                     Arc::clone(peers),
-                    Arc::clone(&executor_registry.flight_sql_clients),
+                    executor_registry.flight_sql_clients_handle(),
                     self.df.cluster_config.client_tls_config().cloned(),
                     node_id,
                 );
