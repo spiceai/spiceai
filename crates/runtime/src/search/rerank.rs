@@ -1084,8 +1084,16 @@ fn sort_by_rerank_score_desc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builder::RuntimeBuilder;
+    use crate::datafusion::query::QueryBuilder;
+    use crate::datafusion::udf::register_udfs;
+    use arrow::array::{Float32Array, StringArray};
+    use arrow::util::pretty::pretty_format_batches;
+    use async_trait::async_trait;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::logical_expr::{Volatility, create_udf};
+    use futures::TryStreamExt;
+    use runtime_request_context::{Protocol, RequestContext};
     use std::collections::BTreeMap;
 
     fn lit_utf8(s: &str) -> Expr {
@@ -1393,5 +1401,119 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].num_rows(), 1);
         assert_eq!(all[1].num_rows(), 1);
+    }
+
+    /// Deterministic reranker for tests. Returns pre-configured scores in order, sliced to `documents.len()`.
+    #[derive(Debug)]
+    struct MockRerank {
+        scores: Vec<f32>,
+    }
+
+    #[async_trait]
+    impl llms::rerank::Rerank for MockRerank {
+        async fn rerank(
+            &self,
+            _query: &str,
+            documents: &[String],
+        ) -> llms::rerank::Result<Vec<f32>> {
+            Ok(self.scores[..documents.len()].to_vec())
+        }
+
+        fn model_name(&self) -> Option<&str> {
+            Some("mock_reranker")
+        }
+    }
+
+    async fn make_rerank_runtime() -> DataFusionResult<crate::Runtime> {
+        let rt = RuntimeBuilder::new().build().await;
+        rt.df.ctx.state().config_mut().set_extension(Arc::new(
+            RequestContext::builder(Protocol::Internal).build(),
+        ));
+
+        register_udfs(&rt).await;
+        Ok(rt)
+    }
+
+    /// Register a small test table and insert a mock reranker into the runtime.
+    async fn setup_test_table(runtime: &crate::Runtime, scores: Vec<f32>) -> DataFusionResult<()> {
+        // Create a small in-memory table with id, content, and category.
+        runtime
+            .df
+            .ctx
+            .sql(
+                "CREATE TABLE test_docs AS SELECT * FROM (VALUES
+                    (1, 'great battery life and performance', 'electronics'),
+                    (2, 'terrible battery drains fast', 'electronics'),
+                    (3, 'amazing screen quality', 'displays'),
+                    (4, 'average product nothing special', 'general'),
+                    (5, 'best purchase ever made', 'general')
+                ) AS t(id, content, category)",
+            )
+            .await?;
+
+        // Insert MockRerank into the rerankers store.
+        let mock: Arc<dyn llms::rerank::Rerank> = Arc::new(MockRerank { scores });
+        runtime
+            .rerankers()
+            .write()
+            .await
+            .insert("mock_reranker".to_string(), mock);
+
+        Ok(())
+    }
+
+    macro_rules! execute_query {
+        ($runtime:expr, $sql:expr) => {{
+            let query = QueryBuilder::new($sql, $runtime.datafusion()).build();
+            query
+                .run()
+                .await
+                .expect("query must succeed")
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+        }};
+    }
+
+    async fn query_snapshot(rt: &crate::Runtime, sql: &str) -> String {
+        let batches = execute_query!(rt, sql).expect("query must succeed");
+        pretty_format_batches(&batches)
+            .expect("format query result")
+            .to_string()
+    }
+
+    async fn explain_query_snapshot(rt: &crate::Runtime, sql: &str) -> String {
+        query_snapshot(rt, &format!("EXPLAIN {sql}")).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerank_bare_table_ordering_and_limit() -> DataFusionResult<()> {
+        let rt = make_rerank_runtime().await?;
+        setup_test_table(&rt, vec![0.1, 0.9, 0.5, 0.3, 0.7]).await?;
+
+        let sql = "SELECT id, rerank_score FROM rerank(test_docs, document => 'content', query => 'battery', model => 'mock_reranker', limit => 3)";
+
+        insta::assert_snapshot!("bare_table_explain", explain_query_snapshot(&rt, sql).await);
+        insta::assert_snapshot!("bare_table_result", query_snapshot(&rt, sql).await);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerank_filter_pushdown_reduces_candidates() -> DataFusionResult<()> {
+        let rt = make_rerank_runtime().await?;
+        // 5 scores but only 2 rows match category='electronics' (ids 1,2).
+        // MockRerank returns scores in positional order of the filtered input.
+        setup_test_table(&rt, vec![0.4, 0.8, 0.0, 0.0, 0.0]).await?;
+
+        let sql = "SELECT id, rerank_score FROM rerank(test_docs, document => 'content', query => 'battery', model => 'mock_reranker') WHERE category = 'electronics'";
+
+        insta::assert_snapshot!(
+            "filter_pushdown_explain",
+            explain_query_snapshot(&rt, sql).await
+        );
+        insta::assert_snapshot!("filter_pushdown_result", query_snapshot(&rt, sql).await);
+
+        Ok(())
     }
 }
