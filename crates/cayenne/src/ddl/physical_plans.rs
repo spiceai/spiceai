@@ -51,7 +51,6 @@ use datafusion_datasource::memory::MemorySourceConfig;
 use super::operations::{CreateTableParams, create_schema, create_table, drop_table};
 use crate::ddl::get_cayenne_provider;
 use crate::provider::CayenneTableProvider;
-use data_components::delete::DeletionTableProviderAdapter;
 use runtime_table_partition::provider::PartitionTableProvider;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -845,25 +844,6 @@ async fn try_key_probe_delete(
         return Ok(None);
     }
 
-    // Case 2: DeletionTableProviderAdapter wrapping CayenneTableProvider.
-    if let Some(adapter) = provider
-        .as_any()
-        .downcast_ref::<DeletionTableProviderAdapter>()
-    {
-        if let Some(cayenne) = adapter
-            .source()
-            .as_any()
-            .downcast_ref::<CayenneTableProvider>()
-            && cayenne.is_position_based()
-        {
-            return cayenne
-                .delete_matched_rows_by_key_probe(matched_keys, key_columns)
-                .await
-                .map(Some);
-        }
-        return Ok(None);
-    }
-
     // Case 3: PartitionTableProvider wrapping per-partition Cayenne providers.
     // All partitions share the same table metadata and deletion strategy, so
     // checking the first partition is sufficient to decide the fast path.
@@ -871,7 +851,7 @@ async fn try_key_probe_delete(
         let providers = partitioned.partition_table_providers().await;
         if providers
             .first()
-            .and_then(unwrap_to_cayenne)
+            .and_then(|p| p.as_any().downcast_ref::<CayenneTableProvider>())
             .is_none_or(|cayenne| !cayenne.is_position_based())
         {
             return Ok(None);
@@ -879,7 +859,7 @@ async fn try_key_probe_delete(
 
         let mut total = 0u64;
         for pp in &providers {
-            if let Some(cayenne) = unwrap_to_cayenne(pp) {
+            if let Some(cayenne) = pp.as_any().downcast_ref::<CayenneTableProvider>() {
                 // Each partition's listing table only contains its own files, so
                 // the full matched_keys set is passed to each — hash probes for
                 // keys not in this partition simply find no matches.
@@ -892,23 +872,4 @@ async fn try_key_probe_delete(
     }
 
     Ok(None)
-}
-
-/// Unwrap a `dyn TableProvider` to the inner `CayenneTableProvider`, handling
-/// the `DeletionTableProviderAdapter` wrapper.
-fn unwrap_to_cayenne(provider: &Arc<dyn TableProvider>) -> Option<&CayenneTableProvider> {
-    provider
-        .as_any()
-        .downcast_ref::<CayenneTableProvider>()
-        .or_else(|| {
-            provider
-                .as_any()
-                .downcast_ref::<DeletionTableProviderAdapter>()
-                .and_then(|adapter| {
-                    adapter
-                        .source()
-                        .as_any()
-                        .downcast_ref::<CayenneTableProvider>()
-                })
-        })
 }
