@@ -178,6 +178,10 @@ pub struct JobState {
     /// Optional maximum size of results for the job in bytes
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximum_size: Option<u64>,
+    /// When true, allow queries that reference accelerated tables in
+    /// distributed execution (used by internal callers like partition discovery).
+    #[serde(default)]
+    pub allow_accelerated_tables: bool,
     /// Object store version for conditional writes (e-tag tracking).
     /// This is not serialized - it's set after reading from object store.
     #[serde(skip)]
@@ -204,6 +208,7 @@ impl JobState {
             expires_at_ms: None,
             timeout_seconds: None,
             maximum_size: None,
+            allow_accelerated_tables: false,
             version: None,
         }
     }
@@ -274,6 +279,12 @@ impl JobState {
     #[must_use]
     pub(crate) fn with_maximum_size(mut self, maximum_size: Option<u64>) -> Self {
         self.maximum_size = maximum_size;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_allow_accelerated_tables(mut self, allow: bool) -> Self {
+        self.allow_accelerated_tables = allow;
         self
     }
 }

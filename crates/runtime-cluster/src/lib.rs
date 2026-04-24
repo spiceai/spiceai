@@ -36,10 +36,11 @@ pub use cluster_state::{
     ClusterState, ClusterStateStore, MutateError, MutateOk, MutationOutcome, PartitionScope,
     SchedulerEntry, SchedulerId,
 };
+pub use context::{DiscoveryJobPollResult, PartitionDiscoverySubmitter};
 pub use executor_registry::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
 pub use metadata::{
     PartitionMetadata, PartitionValue, TablePartitionMetadata, normalized_table_name,
     partition_value_to_bytes,
 };
-pub use service::{AssignmentConfig, PartitionService};
+pub use service::{AssignmentConfig, PartitionDiff, PartitionService, compute_diff};
 pub use store::{AllocationResult, AssignmentRequest, CopyAssignmentsResult, PartitionStore};

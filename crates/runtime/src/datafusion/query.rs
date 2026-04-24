@@ -197,6 +197,13 @@ pub struct Query {
     /// regardless of per-catalog writability. Set via [`QueryBuilder::read_only`];
     /// used by `/v1/tools/sql` and `/v1/nsql` to contain LLM-generated SQL.
     read_only: bool,
+    /// When true, allow queries that reference accelerated tables in
+    /// distributed execution. Normally `submit_distributed` rejects such
+    /// queries because user queries should go through the scatter-gather
+    /// path. Internal callers (e.g. partition discovery) set this to query
+    /// the federated source through the `AcceleratedTable` wrapper on the
+    /// scheduler.
+    allow_accelerated: bool,
 }
 
 macro_rules! handle_error {
@@ -418,17 +425,21 @@ impl Query {
         }
 
         // Distributed execution doesn't currently support querying accelerated datasets
-        // or Cayenne catalog tables
-        for tr in &input_tables {
-            if self.df.is_accelerated(tr).await {
-                return Err(Error::AcceleratedTableNotSupportedInDistributedQuery {
-                    table: tr.to_string(),
-                });
-            }
-            if self.df.is_cayenne_catalog(tr) {
-                return Err(Error::CayenneCatalogTableNotSupportedInDistributedQuery {
-                    table: tr.to_string(),
-                });
+        // or Cayenne catalog tables. Internal callers (e.g. partition discovery) set
+        // `allow_accelerated` to bypass the accelerated-table check — they query the
+        // federated source through the scheduler's AcceleratedTable wrapper.
+        if !self.allow_accelerated {
+            for tr in &input_tables {
+                if self.df.is_accelerated(tr).await {
+                    return Err(Error::AcceleratedTableNotSupportedInDistributedQuery {
+                        table: tr.to_string(),
+                    });
+                }
+                if self.df.is_cayenne_catalog(tr) {
+                    return Err(Error::CayenneCatalogTableNotSupportedInDistributedQuery {
+                        table: tr.to_string(),
+                    });
+                }
             }
         }
 
@@ -909,7 +920,18 @@ impl Query {
             sql: QueryMethod::Plan(Box::new(plan.clone())),
             tracker: None,
             read_only: false,
+            allow_accelerated: false,
         }
+    }
+
+    /// Allow this query to reference accelerated tables in distributed
+    /// execution. Used by internal callers (partition discovery) that need
+    /// to query the federated source through the scheduler's
+    /// `AcceleratedTable` wrapper.
+    #[must_use]
+    pub fn with_allow_accelerated(mut self, allow: bool) -> Self {
+        self.allow_accelerated = allow;
+        self
     }
 
     #[must_use]

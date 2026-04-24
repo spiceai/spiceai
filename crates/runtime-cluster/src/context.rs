@@ -39,21 +39,48 @@ pub trait PartitionExprResolver: Send + Sync {
     ) -> Result<Expr, DataFusionError>;
 }
 
-/// Discovers the values a `table` can have for a given `partition_by` expression.
+/// Result of polling a partition discovery job.
+#[derive(Debug)]
+pub enum DiscoveryJobPollResult {
+    /// The job is still running (or queued).
+    StillRunning,
+    /// The job completed successfully; here are the discovered partition values.
+    Completed(Vec<PartitionValue>),
+    /// The job failed.
+    Failed(String),
+}
+
+/// Submits and polls partition discovery jobs via the Ballista job machinery.
 ///
-/// For >1 `partition_by` value, the cartesian product of individual options is returned.
+/// Partition discovery queries (`SELECT DISTINCT <partition_exprs> FROM <table>`)
+/// are submitted as regular Ballista jobs through `JobExecutor`/`JobStore`. This
+/// makes discovery non-blocking: the scheduler can submit a job and check for
+/// completion on subsequent ticks.
 #[async_trait]
-pub trait PartitionDiscoverer: Send + Sync {
-    async fn table_partition_values(
+pub trait PartitionDiscoverySubmitter: Send + Sync {
+    /// Submit a partition discovery query as a Ballista job.
+    ///
+    /// Returns the `job_id` from the `JobStore` on success.
+    async fn submit_discovery_job(
         &self,
         table: &TableReference,
         partition_by: &[PartitionedBy],
-    ) -> Result<Vec<PartitionValue>, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Poll a previously submitted discovery job for results.
+    ///
+    /// `partition_expressions` are the SQL expression strings (e.g.
+    /// `["bucket(8, customer_id)"]`) used to interpret the result columns.
+    async fn poll_discovery_job(
+        &self,
+        job_id: &str,
+        partition_expressions: &[String],
+    ) -> Result<DiscoveryJobPollResult, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Combined bound for partition-management operations that need both expression
-/// resolution (for serializing partition values) and source discovery (for
-/// finding new partition values).
-pub trait PartitionOperations: PartitionExprResolver + PartitionDiscoverer {}
+/// resolution (for serializing partition values) and discovery job
+/// submission/polling.
+pub trait PartitionOperations: PartitionExprResolver + PartitionDiscoverySubmitter {}
 
-impl<T: PartitionExprResolver + PartitionDiscoverer + ?Sized> PartitionOperations for T {}
+impl<T: PartitionExprResolver + PartitionDiscoverySubmitter + ?Sized> PartitionOperations for T {}

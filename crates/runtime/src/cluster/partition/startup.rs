@@ -38,10 +38,12 @@ use crate::{
 
 /// Initialize acceleration partition metadata for all accelerated tables on scheduler startup.
 ///
-/// Delegates to [`PartitionService::seed_table`] per table, which runs the
-/// standard source-vs-store diff and writes new partitions as unassigned
-/// (no assignment, no executor notification — executors typically haven't
-/// connected yet at this point in startup).
+/// For tables with statically resolvable partitions (e.g. `bucket(N, col)`),
+/// metadata is seeded synchronously via [`PartitionService::seed_table`].
+///
+/// For tables requiring dynamic discovery (source query), a Ballista discovery
+/// job is submitted via [`PartitionService::submit_discovery_job`] and returns
+/// immediately — the scheduler does NOT block on dynamic discovery.
 ///
 /// Failures are logged per-table and do not abort the loop.
 pub async fn initialize_partition_metadata(
@@ -61,15 +63,42 @@ pub async fn initialize_partition_metadata(
         "Initializing partition metadata for accelerated tables"
     );
 
+    let mut dynamic_tables = Vec::new();
+
     for (table, partitioning) in tables {
+        // Fast path: if partition values can be resolved statically (e.g. bucket(N, col)),
+        // seed the metadata synchronously — no Ballista job needed.
+        if super::discovery::try_static_partition_values(&partitioning).is_some() {
+            if let Err(e) = partition_service
+                .seed_table(&table, &partitioning, df.as_ref())
+                .await
+            {
+                tracing::warn!(
+                    table = %table,
+                    error = %e,
+                    "Failed to initialize static partition metadata"
+                );
+            }
+        } else {
+            // Dynamic discovery needed — collect for async submission.
+            dynamic_tables.push((table, partitioning));
+        }
+    }
+
+    // Submit discovery jobs for tables that need dynamic partition discovery.
+    // These run asynchronously — we don't wait for completion here.
+    if !dynamic_tables.is_empty() {
+        tracing::info!(
+            count = dynamic_tables.len(),
+            "Submitting partition discovery jobs for dynamic tables"
+        );
         if let Err(e) = partition_service
-            .seed_table(&table, &partitioning, df.as_ref())
+            .submit_discovery_for_pending_tables(&dynamic_tables, df.as_ref())
             .await
         {
             tracing::warn!(
-                table = %table,
                 error = %e,
-                "Failed to initialize partition metadata"
+                "Failed to submit partition discovery jobs"
             );
         }
     }

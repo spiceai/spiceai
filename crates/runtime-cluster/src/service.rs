@@ -42,8 +42,6 @@ use runtime_proto::{BytesArray, SchedulerControlMessage, UpdatePartitions};
 use snafu::prelude::*;
 use spicepod::partitioning::PartitionedBy;
 use tokio::sync::RwLock;
-use tokio::time::timeout;
-
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 
 use crate::context::PartitionOperations;
@@ -140,11 +138,11 @@ enum AssignmentLimit {
 
 /// Difference between source partitions and what is tracked in the store.
 #[derive(Debug, Default, Clone)]
-struct PartitionDiff {
+pub struct PartitionDiff {
     /// Partitions present in the source but not yet tracked in the store.
-    new: Vec<PartitionValue>,
+    pub new: Vec<PartitionValue>,
     /// Partitions tracked in the store but no longer present in the source.
-    removed: Vec<PartitionValue>,
+    pub removed: Vec<PartitionValue>,
 }
 
 impl PartitionDiff {
@@ -259,7 +257,8 @@ impl PartitionService {
             .refresh()
             .await
             .context(PartitionStoreRefreshSnafu)?;
-        self.record_diff(table, partition_by, ops, &config).await?;
+        self.discover_and_apply_blocking(table, partition_by, ops, &config)
+            .await?;
         Ok(())
     }
 
@@ -292,7 +291,8 @@ impl PartitionService {
             .await
             .context(PartitionStoreRefreshSnafu)?;
 
-        self.record_diff(table, &partition_by, ops, &config).await?;
+        self.discover_and_apply_blocking(table, &partition_by, ops, &config)
+            .await?;
 
         self.partition_store
             .refresh()
@@ -370,7 +370,10 @@ impl PartitionService {
 
         let mut reconciled_tables: Vec<TableReference> = Vec::new();
         for (table, partition_by) in tables {
-            match self.record_diff(&table, &partition_by, ops, &config).await {
+            match self
+                .discover_and_apply_blocking(&table, &partition_by, ops, &config)
+                .await
+            {
                 Ok(_) => reconciled_tables.push(table),
                 Err(e) => {
                     tracing::warn!(table = %table, error = %e, "Per-table diff failed, continuing");
@@ -402,44 +405,74 @@ impl PartitionService {
         .await
     }
 
-    /// Step 1: query the source via `ops`, diff against the store, and apply the diff.
-    ///
-    /// - Queries the source for current partition values.
-    /// - Diffs against store metadata (new = in source but not store; removed = in store but not source).
-    /// - When metadata is absent, treats all source partitions as new.
-    /// - Adds new partitions (unassigned) with OCC-retry.
-    /// - Removes stale partitions with OCC-retry and emits unload notifications
-    ///   to executors that previously held them.
-    ///
-    /// Returns the computed diff for logging/metrics in the caller.
-    async fn record_diff(
+    /// Submit a discovery job, poll until completion (with timeout), and apply
+    /// the diff. This is the **blocking** path used by on-demand refresh
+    /// (`reconcile_table`).
+    async fn discover_and_apply_blocking(
         &self,
         table: &TableReference,
         partition_by: &[PartitionedBy],
         ops: &dyn PartitionOperations,
         config: &AssignmentConfig,
     ) -> Result<PartitionDiff> {
-        // Query source partitions via the trait (with timeout).
-        let source_partitions = match timeout(
-            config.discovery_timeout,
-            ops.table_partition_values(table, partition_by),
-        )
-        .await
-        {
-            Ok(Ok(partitions)) => partitions,
-            Ok(Err(e)) => {
-                return Err(Error::DiscoveryFailed {
-                    table: table.to_string(),
-                    source: e,
-                });
-            }
-            Err(_) => {
+        let job_id = ops
+            .submit_discovery_job(table, partition_by)
+            .await
+            .map_err(|e| Error::DiscoveryFailed {
+                table: table.to_string(),
+                source: e,
+            })?;
+
+        let partition_expressions: Vec<String> =
+            partition_by.iter().map(|p| p.expression.clone()).collect();
+
+        // Poll until the job completes or timeout.
+        let deadline = tokio::time::Instant::now() + config.discovery_timeout;
+        let poll_interval = Duration::from_millis(500);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
                 return Err(Error::DiscoveryTimeout {
                     table: table.to_string(),
                 });
             }
-        };
 
+            match ops
+                .poll_discovery_job(&job_id, &partition_expressions)
+                .await
+            {
+                Ok(crate::context::DiscoveryJobPollResult::Completed(values)) => {
+                    return self.diff_and_apply(table, partition_by, values, ops).await;
+                }
+                Ok(crate::context::DiscoveryJobPollResult::Failed(msg)) => {
+                    return Err(Error::DiscoveryFailed {
+                        table: table.to_string(),
+                        source: msg.into(),
+                    });
+                }
+                Ok(crate::context::DiscoveryJobPollResult::StillRunning) => {
+                    tokio::time::sleep(poll_interval).await;
+                }
+                Err(e) => {
+                    return Err(Error::DiscoveryFailed {
+                        table: table.to_string(),
+                        source: e,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Compute the diff between `source_partitions` and the store, then apply
+    /// it (add new, remove stale). This is the second half of [`record_diff`],
+    /// factored out so that callers who already have `source_partitions` (e.g.
+    /// from a completed discovery job) can reuse it.
+    async fn diff_and_apply(
+        &self,
+        table: &TableReference,
+        partition_by: &[PartitionedBy],
+        source_partitions: Vec<PartitionValue>,
+        ops: &dyn PartitionOperations,
+    ) -> Result<PartitionDiff> {
         // Diff against store metadata.
         let existing_partitions: Vec<crate::PartitionMetadata> =
             match self.partition_store.get_table_metadata(table).await {
@@ -460,32 +493,25 @@ impl PartitionService {
                 }
             };
 
-        let existing: HashSet<Vec<(String, String)>> = existing_partitions
-            .iter()
-            .map(|p| sorted_kv(&p.partition_value))
-            .collect();
-
-        let source_set: HashSet<Vec<(String, String)>> =
-            source_partitions.iter().map(sorted_kv).collect();
-
-        let new: Vec<PartitionValue> = source_partitions
-            .iter()
-            .filter(|p| !existing.contains(&sorted_kv(p)))
-            .cloned()
-            .collect();
-
-        let removed: Vec<PartitionValue> = existing_partitions
-            .iter()
-            .filter(|p| !source_set.contains(&sorted_kv(&p.partition_value)))
-            .map(|p| p.partition_value.clone())
-            .collect();
-
-        let diff = PartitionDiff { new, removed };
+        let diff = compute_diff(&source_partitions, &existing_partitions);
 
         if diff.is_empty() {
             return Ok(diff);
         }
 
+        self.apply_diff(table, partition_by, &diff, ops).await?;
+        Ok(diff)
+    }
+
+    /// Apply a [`PartitionDiff`] to the store: add new partitions (unassigned)
+    /// and remove stale ones (with executor unload notifications).
+    async fn apply_diff(
+        &self,
+        table: &TableReference,
+        partition_by: &[PartitionedBy],
+        diff: &PartitionDiff,
+        ops: &dyn PartitionOperations,
+    ) -> Result<()> {
         if !diff.new.is_empty() {
             tracing::info!(
                 table = %table,
@@ -522,7 +548,7 @@ impl PartitionService {
             .await?;
         }
 
-        Ok(diff)
+        Ok(())
     }
 
     /// Step 2: find every unassigned partition across the given tables, assign
@@ -554,6 +580,208 @@ impl PartitionService {
             tracing::warn!("Failed to commit {} partition assignments", failed.len());
         }
         notify_executors(&self.executor_registry, ops, committed).await
+    }
+
+    // ================================================================
+    // Async discovery (non-blocking) entry points
+    // ================================================================
+
+    /// Submit a discovery job for a single table without waiting for results.
+    ///
+    /// Writes the job ID to `TablePartitionMetadata.active_discovery_job_id`
+    /// so any scheduler can poll for completion later. The caller should have
+    /// already checked for static partition resolution (e.g. `bucket(N, col)`)
+    /// before calling this.
+    ///
+    /// If the table already has an `active_discovery_job_id`, this is a no-op.
+    pub async fn submit_discovery_job(
+        &self,
+        table: &TableReference,
+        partition_by: &[PartitionedBy],
+        ops: &dyn PartitionOperations,
+    ) -> Result<()> {
+        // Ensure metadata is initialized so we have a place to store the job ID.
+        let partition_expressions: Vec<String> =
+            partition_by.iter().map(|p| p.expression.clone()).collect();
+        if let Err(e) = self
+            .partition_store
+            .initialize_metadata(table, partition_expressions)
+            .await
+        {
+            tracing::warn!(table = %table, error = %e, "Failed to initialize partition metadata");
+        }
+
+        // Check if there's already an active discovery job.
+        if let Some(metadata) = self.partition_store.get_cached_table_metadata(table) {
+            if metadata.active_discovery_job_id.is_some() {
+                tracing::debug!(table = %table, "Discovery job already in progress, skipping");
+                return Ok(());
+            }
+        }
+
+        // Submit the discovery job.
+        let job_id = ops
+            .submit_discovery_job(table, partition_by)
+            .await
+            .map_err(|e| Error::DiscoveryFailed {
+                table: table.to_string(),
+                source: e,
+            })?;
+
+        tracing::info!(table = %table, job_id = %job_id, "Submitted partition discovery job");
+
+        // Record the job ID in the partition metadata (OCC-safe).
+        self.partition_store
+            .set_discovery_job_id(table, Some(job_id))
+            .await
+            .context(WriteMetadataSnafu {
+                table: table.to_string(),
+            })?;
+
+        Ok(())
+    }
+
+    /// Check all in-flight discovery jobs and process completed ones.
+    ///
+    /// For each table with an `active_discovery_job_id`:
+    /// - `Completed` → compute diff, apply changes, clear the job ID.
+    /// - `Failed` → log warning, clear the job ID.
+    /// - `StillRunning` → skip (will check again next tick).
+    pub async fn check_and_process_discovery_jobs(
+        &self,
+        ops: &dyn PartitionOperations,
+    ) -> Result<()> {
+        self.partition_store
+            .refresh()
+            .await
+            .context(PartitionStoreRefreshSnafu)?;
+
+        let tables = self
+            .partition_store
+            .list_tables()
+            .await
+            .context(ListTablesSnafu)?;
+
+        for table_name in tables {
+            let table_ref = TableReference::parse_str(&table_name);
+            let Some(metadata) = self.partition_store.get_cached_table_metadata(&table_ref) else {
+                continue;
+            };
+            let Some(job_id) = &metadata.active_discovery_job_id else {
+                continue;
+            };
+            let job_id = job_id.clone();
+            let partition_expressions = metadata.partition_expressions.clone();
+
+            match ops
+                .poll_discovery_job(&job_id, &partition_expressions)
+                .await
+            {
+                Ok(crate::context::DiscoveryJobPollResult::Completed(values)) => {
+                    tracing::info!(
+                        table = %table_name,
+                        job_id = %job_id,
+                        partition_count = values.len(),
+                        "Discovery job completed"
+                    );
+
+                    // Get the partition_by config from the app.
+                    let app_guard = self.app.read().await;
+                    let partition_by = app_guard
+                        .as_ref()
+                        .and_then(|app| get_partition_config(app, &table_ref))
+                        .unwrap_or_default();
+                    drop(app_guard);
+
+                    if let Err(e) = self
+                        .diff_and_apply(&table_ref, &partition_by, values, ops)
+                        .await
+                    {
+                        tracing::warn!(
+                            table = %table_name,
+                            error = %e,
+                            "Failed to apply discovery results"
+                        );
+                    }
+
+                    // Clear the discovery job ID.
+                    if let Err(e) = self
+                        .partition_store
+                        .set_discovery_job_id(&table_ref, None)
+                        .await
+                    {
+                        tracing::warn!(
+                            table = %table_name,
+                            error = %e,
+                            "Failed to clear discovery job ID"
+                        );
+                    }
+                }
+                Ok(crate::context::DiscoveryJobPollResult::Failed(msg)) => {
+                    tracing::warn!(
+                        table = %table_name,
+                        job_id = %job_id,
+                        error = %msg,
+                        "Discovery job failed"
+                    );
+                    if let Err(e) = self
+                        .partition_store
+                        .set_discovery_job_id(&table_ref, None)
+                        .await
+                    {
+                        tracing::warn!(
+                            table = %table_name,
+                            error = %e,
+                            "Failed to clear discovery job ID"
+                        );
+                    }
+                }
+                Ok(crate::context::DiscoveryJobPollResult::StillRunning) => {
+                    tracing::debug!(
+                        table = %table_name,
+                        job_id = %job_id,
+                        "Discovery job still running"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        table = %table_name,
+                        job_id = %job_id,
+                        error = %e,
+                        "Failed to poll discovery job"
+                    );
+                    // Clear the job ID to allow a retry on the next cycle.
+                    let _ = self
+                        .partition_store
+                        .set_discovery_job_id(&table_ref, None)
+                        .await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Submit discovery jobs for tables that have no active job and no
+    /// statically resolvable partition values.
+    ///
+    /// `tables_needing_discovery` should be pre-filtered by the caller to
+    /// exclude tables with statically resolvable partitions (e.g. `bucket(N, col)`).
+    pub async fn submit_discovery_for_pending_tables(
+        &self,
+        tables: &[(TableReference, Vec<PartitionedBy>)],
+        ops: &dyn PartitionOperations,
+    ) -> Result<()> {
+        for (table, partition_by) in tables {
+            if let Err(e) = self.submit_discovery_job(table, partition_by, ops).await {
+                tracing::warn!(
+                    table = %table,
+                    error = %e,
+                    "Failed to submit discovery job"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -587,6 +815,35 @@ fn resolved_equality(a: &TableReference, b: &TableReference) -> bool {
         .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
         == b.clone()
             .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+}
+
+/// Compute the diff between source-discovered partition values and what is
+/// already tracked in the store. Pure function — no IO, no store access.
+pub fn compute_diff(
+    source_partitions: &[PartitionValue],
+    existing_partitions: &[crate::PartitionMetadata],
+) -> PartitionDiff {
+    let existing: HashSet<Vec<(String, String)>> = existing_partitions
+        .iter()
+        .map(|p| sorted_kv(&p.partition_value))
+        .collect();
+
+    let source_set: HashSet<Vec<(String, String)>> =
+        source_partitions.iter().map(sorted_kv).collect();
+
+    let new: Vec<PartitionValue> = source_partitions
+        .iter()
+        .filter(|p| !existing.contains(&sorted_kv(p)))
+        .cloned()
+        .collect();
+
+    let removed: Vec<PartitionValue> = existing_partitions
+        .iter()
+        .filter(|p| !source_set.contains(&sorted_kv(&p.partition_value)))
+        .map(|p| p.partition_value.clone())
+        .collect();
+
+    PartitionDiff { new, removed }
 }
 
 /// Sort a `PartitionValue` into a deterministic `Vec<(k, v)>` for equality comparisons.
@@ -1196,6 +1453,7 @@ mod tests {
             schema_version: 1,
             updated_at: 1000,
             partition_expressions: vec!["date".to_string()],
+            active_discovery_job_id: None,
         };
         store
             .write_metadata(&table_ref, metadata)

@@ -202,7 +202,9 @@ impl JobExecutor {
             }
         }
 
-        let query = query_builder.build();
+        let query = query_builder
+            .build()
+            .with_allow_accelerated(state.allow_accelerated_tables);
 
         let query_handle = match query.submit_distributed(job_id).await {
             Ok(handle) => handle,

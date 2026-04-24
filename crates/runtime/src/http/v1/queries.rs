@@ -96,6 +96,11 @@ pub struct SubmitQueryRequest {
     /// Jobs with results larger than this will be failed with an error for exceeding the maximum size.
     #[serde(default)]
     pub maximum_size: Option<u64>,
+    /// When true, allow queries that reference accelerated tables in
+    /// distributed execution. Used by internal callers (e.g. partition
+    /// discovery) that need to query the federated source on the scheduler.
+    #[serde(default)]
+    pub allow_accelerated_tables: bool,
 }
 
 /// Response for query submission.

@@ -16,9 +16,15 @@ limitations under the License.
 
 //! Discovery layer: query the federated source for a table's current partition values.
 //!
-//! The only public entry point is [`query_source_partitions`], which is called by
-//! the [`runtime_cluster::context::PartitionDiscoverer`] impl on `DataFusion`. The
-//! diff-and-apply logic lives in `runtime_cluster::service::PartitionService`.
+//! The primary public entry point is [`query_source_partitions`], which is used
+//! for direct synchronous discovery. The async path submits the query as a
+//! Ballista job via [`runtime_cluster::context::PartitionDiscoverySubmitter`].
+//!
+//! [`batches_to_partition_values`] converts Arrow `RecordBatch`es (from either
+//! the synchronous path or completed Ballista job results) into
+//! `Vec<PartitionValue>`.
+//!
+//! The diff-and-apply logic lives in `runtime_cluster::service::PartitionService`.
 
 use std::collections::HashMap;
 
@@ -88,27 +94,15 @@ pub(crate) async fn query_source_partitions(
 
     let batches = execute_partition_discovery_query(df, table, partition_exprs).await?;
 
-    let mut partition_values = Vec::new();
-    for batch in batches {
-        let num_rows = batch.num_rows();
-        let num_cols = batch.num_columns();
-
-        for row_idx in 0..num_rows {
-            let mut value_parts = HashMap::new();
-            for col_idx in 0..num_cols {
-                let column = batch.column(col_idx);
-                let value_str = arrow::util::display::array_value_to_string(column, row_idx)
-                    .boxed()
-                    .context(PartitionDiscoverySnafu {
-                        table: table_name.clone(),
-                    })?;
-                if let Some(pname) = partitioning.get(col_idx).map(|p| p.expression.clone()) {
-                    value_parts.insert(pname, value_str);
-                }
+    let partition_expressions: Vec<String> =
+        partitioning.iter().map(|p| p.expression.clone()).collect();
+    let partition_values =
+        batches_to_partition_values(&batches, &partition_expressions).map_err(|e| {
+            Error::PartitionDiscovery {
+                table: table_name.clone(),
+                source: e,
             }
-            partition_values.push(value_parts);
-        }
-    }
+        })?;
 
     tracing::debug!(
         table = %table_name,
@@ -217,6 +211,44 @@ async fn execute_partition_discovery_query(
 }
 
 // ---------------------------------------------------------------------------
+// Batch → PartitionValue conversion
+// ---------------------------------------------------------------------------
+
+/// Convert Arrow `RecordBatch`es (from a discovery query) into `Vec<PartitionValue>`.
+///
+/// Each row in the batches becomes one `PartitionValue` (a `HashMap<String, String>`),
+/// keyed by the partition expression string. The `partition_expressions` slice must
+/// match the column order of the batches (i.e. column 0 corresponds to
+/// `partition_expressions[0]`, etc.).
+///
+/// This is a pure conversion function with no IO — it is used both by the
+/// synchronous discovery path and by the async job-based discovery path (which
+/// reads completed job result chunks from the `JobStore`).
+pub fn batches_to_partition_values(
+    batches: &[arrow::record_batch::RecordBatch],
+    partition_expressions: &[String],
+) -> std::result::Result<Vec<PartitionValue>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut partition_values = Vec::new();
+    for batch in batches {
+        let num_rows = batch.num_rows();
+        let num_cols = batch.num_columns();
+
+        for row_idx in 0..num_rows {
+            let mut value_parts = HashMap::new();
+            for col_idx in 0..num_cols {
+                let column = batch.column(col_idx);
+                let value_str = arrow::util::display::array_value_to_string(column, row_idx)?;
+                if let Some(expr) = partition_expressions.get(col_idx) {
+                    value_parts.insert(expr.clone(), value_str);
+                }
+            }
+            partition_values.push(value_parts);
+        }
+    }
+    Ok(partition_values)
+}
+
+// ---------------------------------------------------------------------------
 // Static partition value resolution (fast path)
 // ---------------------------------------------------------------------------
 
@@ -234,7 +266,7 @@ const MAX_NUM_BUCKETS: i64 = 1_000_000;
 ///
 /// Returns `None` otherwise, causing the caller to fall back to the slow path
 /// (`SELECT DISTINCT … FROM source`).
-fn try_static_partition_values(partitioning: &[PartitionedBy]) -> Option<Vec<PartitionValue>> {
+pub fn try_static_partition_values(partitioning: &[PartitionedBy]) -> Option<Vec<PartitionValue>> {
     let [partition] = partitioning else {
         return None;
     };

@@ -134,7 +134,8 @@ impl JobStore {
         let job_id = Self::generate_job_id();
         let mut state = JobState::new_pending(job_id, request.sql, request.parameters)
             .with_timeout_seconds(request.timeout_seconds)
-            .with_maximum_size(request.maximum_size);
+            .with_maximum_size(request.maximum_size)
+            .with_allow_accelerated_tables(request.allow_accelerated_tables);
         self.write_job_state(&mut state).await?;
         Ok(state)
     }
@@ -732,6 +733,7 @@ mod tests {
             parameters: None,
             timeout_seconds: None,
             maximum_size: None,
+            allow_accelerated_tables: false,
         }
     }
 
@@ -1080,6 +1082,7 @@ mod tests {
                 parameters: None,
                 timeout_seconds: None,
                 maximum_size,
+                allow_accelerated_tables: false,
             }
         }
 

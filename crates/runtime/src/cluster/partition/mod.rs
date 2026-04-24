@@ -27,8 +27,9 @@ use snafu::Snafu;
 // Re-export types that moved into the `runtime-cluster` crate so callers inside
 // `runtime` can continue to import them from `crate::cluster::partition`.
 pub use runtime_cluster::{
-    CopyAssignmentsResult, PartitionMetadata, PartitionService, PartitionStore, PartitionValue,
-    TablePartitionMetadata, partition_value_to_bytes,
+    CopyAssignmentsResult, DiscoveryJobPollResult, PartitionDiff, PartitionMetadata,
+    PartitionService, PartitionStore, PartitionValue, TablePartitionMetadata, compute_diff,
+    partition_value_to_bytes,
 };
 pub use runtime_cluster::{executor_selection, service, store, write_through};
 

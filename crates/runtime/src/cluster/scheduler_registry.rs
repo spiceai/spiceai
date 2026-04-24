@@ -151,13 +151,18 @@ pub async fn start_scheduler_registry(
     // (store, base_prefix) pair behind ClusterStateStore.
     let (store, base_prefix) =
         build_object_store(rt.as_ref(), &config.state_location, config).await?;
-    let job_store = crate::jobs::JobStore::new(
+    let job_store = Arc::new(crate::jobs::JobStore::new(
         Arc::clone(&store),
         base_prefix.clone(),
         scheduler_id.clone(),
-    );
-    let job_executor = crate::jobs::JobExecutor::new(Arc::new(job_store), rt.datafusion());
-    rt.set_job_executor(Arc::new(job_executor)).await;
+    ));
+    let job_executor = Arc::new(crate::jobs::JobExecutor::new(
+        Arc::clone(&job_store),
+        rt.datafusion(),
+    ));
+    // Set the job executor on DataFusion so partition discovery can submit/poll jobs.
+    rt.datafusion().set_job_executor(Arc::clone(&job_executor));
+    rt.set_job_executor(job_executor).await;
     tracing::info!(
         "Initialized async SQL jobs API with state location: {}",
         config.state_location

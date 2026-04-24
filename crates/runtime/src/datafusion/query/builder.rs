@@ -110,6 +110,7 @@ impl<'a> QueryBuilder<'a> {
             },
             tracker,
             read_only: self.read_only,
+            allow_accelerated: false,
         }
     }
 }

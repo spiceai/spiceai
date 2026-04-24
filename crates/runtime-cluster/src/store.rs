@@ -544,6 +544,47 @@ impl PartitionStore {
         Ok(())
     }
 
+    /// Set or clear the `active_discovery_job_id` on a table's partition metadata.
+    ///
+    /// Pass `Some(job_id)` to record a new discovery job, or `None` to clear it
+    /// after the job has been processed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table metadata doesn't exist or if the OCC mutation fails.
+    pub async fn set_discovery_job_id(
+        &self,
+        table: &TableReference,
+        job_id: Option<String>,
+    ) -> Result<()> {
+        let key = normalized_table_name(table);
+        let scope = self.scope;
+        let key_for_err = key.clone();
+        self.cluster
+            .mutate(|state| {
+                let map = scope.map_mut(state);
+                if let Some(metadata) = map.get_mut(&key) {
+                    metadata.active_discovery_job_id = job_id.clone();
+                    MutationOutcome::Apply
+                } else {
+                    // Table metadata not found — no-op. The table may not have
+                    // been initialized yet.
+                    MutationOutcome::NoChange
+                }
+            })
+            .await
+            .map_err(|e| match e {
+                MutateError::ConcurrentModification { .. } => {
+                    Error::ConcurrentModification { table: key_for_err }
+                }
+                other => Error::MetadataAccess {
+                    table: key_for_err,
+                    source: other,
+                },
+            })?;
+        Ok(())
+    }
+
     /// List all tables (in this scope) with partition metadata.
     ///
     /// # Errors

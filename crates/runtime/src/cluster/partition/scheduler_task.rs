@@ -150,13 +150,43 @@ impl PartitionManagementTask {
     }
 
     /// Underlying logic for a single management cycle.
-    /// Delegates to [`super::service::PartitionService::reconcile_all`].
+    ///
+    /// 1. Check completed discovery jobs and process results.
+    /// 2. Submit new discovery jobs for tables without an active one.
+    /// 3. Assign unassigned partitions to executors.
     async fn run_management_cycle(&self) -> Result<()> {
         let Some(service) = &self.df.partition_service else {
             tracing::warn!("Partition service not initialized, skipping management cycle");
             return Ok(());
         };
 
+        // Step 1: Check and process completed discovery jobs.
+        service
+            .check_and_process_discovery_jobs(self.df.as_ref())
+            .await
+            .map_err(|e| Error::AssignmentCycle { source: e })?;
+
+        // Step 2: Submit discovery jobs for tables that need them.
+        let Some(app) = service.app.read().await.clone() else {
+            return Ok(());
+        };
+        let all_tables = super::startup::accelerated_tables(&app);
+        let dynamic_tables: Vec<_> = all_tables
+            .into_iter()
+            .filter(|(_, partitioning)| {
+                super::discovery::try_static_partition_values(partitioning).is_none()
+            })
+            .collect();
+        if !dynamic_tables.is_empty() {
+            service
+                .submit_discovery_for_pending_tables(&dynamic_tables, self.df.as_ref())
+                .await
+                .map_err(|e| Error::AssignmentCycle { source: e })?;
+        }
+
+        // Step 3: Run the standard reconciliation cycle (assign pending + notify).
+        // This handles static tables' discovery + assignment, and assignment of
+        // partitions that were seeded by completed discovery jobs above.
         service
             .reconcile_all(self.df.as_ref())
             .await

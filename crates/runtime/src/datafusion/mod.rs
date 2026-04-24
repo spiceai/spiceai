@@ -579,6 +579,14 @@ pub struct DataFusion {
     pub executor_stream_registry: RwLock<Option<ExecutorControlStreamRegistry>>,
     /// Partition service for discovering/assigning partitions (scheduler mode only).
     pub(crate) partition_service: Option<Arc<PartitionService>>,
+    /// Job executor for submitting and polling Ballista jobs (scheduler mode only).
+    /// Used by partition discovery to submit discovery queries and read results.
+    /// Set once during scheduler initialization via [`DataFusion::set_job_executor`].
+    ///
+    /// Note: this creates a reference cycle (`DataFusion` → `JobExecutor` →
+    /// `DataFusion`) which is acceptable because both live for the duration of
+    /// the runtime process.
+    pub(crate) job_executor: OnceLock<Arc<crate::jobs::JobExecutor>>,
     #[cfg(not(windows))]
     pub(crate) cayenne_ddl_handler: Option<Arc<dyn datafusion_ddl::CatalogDdlHandler>>,
 }
@@ -929,6 +937,12 @@ impl DataFusion {
     /// wrapping `DataFusion` in `Arc`.
     pub fn set_self_ref(self: &Arc<Self>) {
         let _ = self.datafusion_ref.set(Arc::downgrade(self));
+    }
+
+    /// Set the job executor for partition discovery. Called once during scheduler
+    /// initialization in `scheduler_registry.rs`.
+    pub fn set_job_executor(&self, executor: Arc<crate::jobs::JobExecutor>) {
+        let _ = self.job_executor.set(executor);
     }
 
     pub fn mark_dataset_writable(&self, dataset_name: &TableReference) -> Result<()> {
@@ -2906,16 +2920,90 @@ impl runtime_cluster::context::PartitionExprResolver for DataFusion {
 }
 
 #[async_trait::async_trait]
-impl runtime_cluster::context::PartitionDiscoverer for DataFusion {
-    async fn table_partition_values(
+impl runtime_cluster::context::PartitionDiscoverySubmitter for DataFusion {
+    async fn submit_discovery_job(
         &self,
         table: &TableReference,
         partition_by: &[spicepod::partitioning::PartitionedBy],
-    ) -> Result<Vec<runtime_cluster::PartitionValue>, Box<dyn std::error::Error + Send + Sync>>
-    {
-        crate::cluster::partition::discovery::query_source_partitions(table, partition_by, self)
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // Build the discovery SQL: SELECT DISTINCT <expr1> AS <name1>, ... FROM <table>
+        let partition_select: Vec<String> = partition_by
+            .iter()
+            .map(|p| format!("{} AS {}", p.expression, p.name))
+            .collect();
+        let sql = format!(
+            "SELECT DISTINCT {} FROM {}",
+            partition_select.join(", "),
+            table
+        );
+
+        let job_executor = self
+            .job_executor
+            .get()
+            .ok_or("JobExecutor not available for partition discovery")?;
+
+        let request = crate::http::v1::queries::SubmitQueryRequest {
+            sql,
+            parameters: None,
+            timeout_seconds: None,
+            maximum_size: None,
+            allow_accelerated_tables: true,
+        };
+
+        let state = job_executor
+            .submit(request)
             .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        Ok(state.job_id)
+    }
+
+    async fn poll_discovery_job(
+        &self,
+        job_id: &str,
+        partition_expressions: &[String],
+    ) -> Result<runtime_cluster::DiscoveryJobPollResult, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let job_executor = self
+            .job_executor
+            .get()
+            .ok_or("JobExecutor not available for partition discovery")?;
+
+        let state = job_executor
+            .get_status(job_id)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        match state.status {
+            crate::jobs::JobStatus::Pending | crate::jobs::JobStatus::Running => {
+                Ok(runtime_cluster::DiscoveryJobPollResult::StillRunning)
+            }
+            crate::jobs::JobStatus::Failed
+            | crate::jobs::JobStatus::Cancelled
+            | crate::jobs::JobStatus::Closed => {
+                let msg = state
+                    .error
+                    .map(|e| e.message)
+                    .unwrap_or_else(|| format!("Discovery job {job_id} failed"));
+                Ok(runtime_cluster::DiscoveryJobPollResult::Failed(msg))
+            }
+            crate::jobs::JobStatus::Succeeded => {
+                let result = state.result.ok_or("Job succeeded but has no result")?;
+                let mut all_batches = Vec::new();
+                for idx in &result.chunk_indices {
+                    let batches = job_executor
+                        .get_chunk(job_id, *idx)
+                        .await
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    all_batches.extend(batches);
+                }
+                let values = crate::cluster::partition::discovery::batches_to_partition_values(
+                    &all_batches,
+                    partition_expressions,
+                )?;
+                Ok(runtime_cluster::DiscoveryJobPollResult::Completed(values))
+            }
+        }
     }
 }
 

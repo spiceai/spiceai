@@ -542,6 +542,7 @@ impl DataFusionBuilder {
             executor: RwLock::new(None),
             executor_stream_registry: RwLock::new(None),
             partition_service: self.partition_service,
+            job_executor: std::sync::OnceLock::new(),
             #[cfg(not(windows))]
             cayenne_ddl_handler,
         }
