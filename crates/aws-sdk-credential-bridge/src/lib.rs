@@ -245,7 +245,12 @@ async fn load_sdk_config_from_env(
 
                     Ok(None)
                 } else {
-                    tracing::warn!(
+                    // Proceeding without authentication anyway: log at debug. The bridge
+                    // doesn't know whether the caller actually needs AWS credentials, so
+                    // callers with that context (e.g. the S3 connector when `region` is
+                    // explicitly configured) should warn themselves based on whether
+                    // `get_sdk_config()` returns `None` after this call.
+                    tracing::debug!(
                         "Non-retryable AWS credentials error, proceeding without authentication: {err}"
                     );
                     Ok(None)
