@@ -14,5 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub mod builder;
 pub mod registry;
 pub mod store;
+
+pub use builder::{build_azure_object_store, build_gcs_object_store};

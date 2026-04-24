@@ -491,6 +491,24 @@ export PATH="$PATH:$HOME/.spice/bin"
 - `docs/PRINCIPLES.md`, `docs/EXTENSIBILITY.md`, `docs/dev/style_guide.md`, `docs/dev/error_handling.md`
 - `CONTRIBUTING.md`, `Makefile`, `Cargo.toml`, `crates/runtime/src/lib.rs`
 
+## Trait Evolution & Wrapper Delegation (CRITICAL)
+
+When **adding a new method to a trait** — especially one with a default implementation — audit every wrapper/decorator implementation of that trait and ensure each one **forwards the call to its inner instance**. Default impls are silent traps for wrappers: they compile cleanly but no-op the behavior, causing regressions that often only surface in specific runtime configurations (e.g. cluster executors, accelerated tables, embedded/full-text wrappers).
+
+This pattern caused real regressions, e.g. [#10460](https://github.com/spiceai/spiceai/pull/10460): `register_object_stores` was added to `DataConnector` with a no-op default impl, but `EmbeddingConnector`, `FullTextConnector`, and `DeferredConnector` were not updated to forward it. On cluster executors, object stores were silently never registered for affected datasets, causing `BareRedirect` errors against non-default-region S3 buckets.
+
+**Reviewer checklist when a PR adds or changes a trait method:**
+
+1. **Identify all wrapper/decorator impls** of the trait. Common Spice traits with wrappers include (non-exhaustive):
+   - `DataConnector` — wrapped by `EmbeddingConnector`, `FullTextConnector`, `DeferredConnector`
+   - `TableProvider` — wrapped by `AcceleratedTable`, `FederatedTable`, view providers, sink providers
+   - `Read`, `ReadWrite`, `Catalog`, `SecretStore`, `Chat`, `Embed`, `Nql` — check for newtype/decorator wrappers in `data_components/`, `runtime/`, `llms/`, `model_components/`, `search/`
+   - Search by ripgrep: `rg -n "impl\s+(\w+\s+for\s+)?<TraitName>\b" crates/`
+2. **For every wrapper, verify the new method is explicitly implemented and delegates to the inner type.** Inheriting the default impl is almost always a bug for wrappers — even when the default is a no-op, since the wrapper's inner connector may have meaningful behavior.
+3. **Flag PRs that add a defaulted trait method without touching corresponding wrapper impls.** Ask the author to confirm each wrapper has been audited, or to add explicit forwarding impls.
+4. **Prefer no default impl on traits with known wrappers** when the correct behavior cannot be "do nothing". Forcing implementors to write the method makes wrappers visible at compile time. If a default is necessary for backward compatibility, leave a comment on the trait method pointing wrapper authors at the forwarding requirement.
+5. **Call out missing test coverage**: regressions of this kind typically escape unit tests because the default impl compiles. Suggest an integration or cluster/executor test that exercises the wrapped path when feasible.
+
 ## Gotchas
 
 1. Don't use `stream!` macro

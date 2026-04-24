@@ -14,37 +14,42 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//! Scheduler-side registration loop, discovery, and reaper wiring.
+//!
+//! All non-job distributed state now lives in a single document
+//! (`cluster.json`) and per-scheduler heartbeats live in
+//! `heartbeats/{id}.json`. See
+//! `plans/consolidate-cluster-state-into-cluster-json.md`.
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use app::spicepod::component::runtime::Scheduler as SchedulerConfig;
 use aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilder;
 use datafusion::execution::object_store::ObjectStoreRegistry;
-use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectStore, PutMode, PutOptions};
-use object_store_occ::{InsertResult, ObjectState, UpdateResult};
+use object_store::ObjectStore;
 use runtime_object_store::registry::SpiceObjectStoreRegistry;
 use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_secrets::{Secrets, get_params_with_secrets};
-use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use util::fibonacci_backoff::FibonacciBackoffBuilder;
+use uuid::Uuid;
 
 use crate::Runtime;
+use crate::cluster::cluster_state::{
+    self, ClusterStateStore, MutateError, MutationOutcome, SchedulerEntry,
+};
+use crate::cluster::heartbeat::{self, CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeatStore};
+use crate::cluster::reaper::Reaper;
 use crate::metrics::cluster as cluster_metrics;
 
-const CLUSTER_SCHEMA_VERSION: u32 = 1;
-const SCHEDULER_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_TTL_MS: u64 = 30_000;
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_DIVISOR: u64 = 3;
-const CLOCK_SKEW_TOLERANCE_MS: u64 = 5_000;
-const MAX_CONDITIONAL_ATTEMPTS: usize = 5;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -84,47 +89,24 @@ pub enum Error {
     #[snafu(display("Missing scheduler advertise address for registration"))]
     MissingAdvertiseAddress,
 
-    #[snafu(display("Failed to read scheduler state from object store: {source}"))]
-    ObjectStoreRead { source: ObjectStoreError },
+    #[snafu(display("Failed to access cluster state: {source}"))]
+    ClusterState { source: MutateError },
 
-    #[snafu(display("Failed to write scheduler state to object store: {source}"))]
-    ObjectStoreWrite { source: ObjectStoreError },
-
-    #[snafu(display("Failed to serialize scheduler state: {source}"))]
-    SerializeState { source: serde_json::Error },
+    #[snafu(display("Failed to access scheduler heartbeats: {source}"))]
+    Heartbeat { source: heartbeat::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SchedulerRecord {
-    pub schema_version: u32,
-    pub advertise_address: String,
-    pub grpc_address: String,
-    pub http_address: String,
-    pub started_at_ms: u64,
-    pub last_heartbeat_ms: u64,
-    pub ttl_ms: u64,
-    pub build_version: String,
-    #[serde(default)]
-    pub labels: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClusterMetadata {
-    schema_version: u32,
-    created_at_ms: u64,
-}
-
-pub type SchedulerPeers = HashMap<String, SchedulerRecord>;
+pub type SchedulerPeers = HashMap<String, SchedulerEntry>;
 
 struct SchedulerRegistryRunner {
-    store: Arc<dyn ObjectStore>,
-    state: ObjectState<SchedulerRecord>,
+    cluster: Arc<ClusterStateStore>,
+    heartbeats: Arc<SchedulerHeartbeatStore>,
+    reaper: Reaper,
     scheduler_id: String,
-    metadata_path: Path,
-    record_path: Path,
-    record: SchedulerRecord,
+    instance_id: Uuid,
+    entry: SchedulerEntry,
     peers: Arc<RwLock<SchedulerPeers>>,
 }
 
@@ -133,10 +115,9 @@ pub async fn start_scheduler_registry(
     config: &SchedulerConfig,
     cancel: CancellationToken,
     peers: Arc<RwLock<SchedulerPeers>>,
+    cluster: Arc<ClusterStateStore>,
+    heartbeats: Arc<SchedulerHeartbeatStore>,
 ) -> Result<()> {
-    let (store, base_prefix) =
-        build_object_store(rt.as_ref(), &config.state_location, config).await?;
-
     let datafusion = rt.datafusion();
     let advertise_host = datafusion
         .cluster_config
@@ -149,7 +130,27 @@ pub async fn start_scheduler_registry(
         rt.datafusion().cluster_config.node_bind_address().port()
     );
 
-    // Initialize job executor for async SQL queries
+    let instance_id = Uuid::new_v4();
+    let now = now_ms()?;
+    let entry = SchedulerEntry {
+        scheduler_id: scheduler_id.clone(),
+        instance_id,
+        advertise_address: scheduler_id.clone(),
+        grpc_address: format!(
+            "{advertise_host}:{}",
+            rt.config().flight_bind_address.port()
+        ),
+        http_address: format!("{advertise_host}:{}", rt.config().http_bind_address.port()),
+        started_at_ms: now,
+        ttl_ms: DEFAULT_TTL_MS,
+        build_version: env!("CARGO_PKG_VERSION").to_string(),
+        labels: HashMap::new(),
+    };
+
+    // Initialize job executor for async SQL queries. Reuses the raw
+    // (store, base_prefix) pair behind ClusterStateStore.
+    let (store, base_prefix) =
+        build_object_store(rt.as_ref(), &config.state_location, config).await?;
     let job_store = crate::jobs::JobStore::new(
         Arc::clone(&store),
         base_prefix.clone(),
@@ -162,80 +163,71 @@ pub async fn start_scheduler_registry(
         config.state_location
     );
 
-    let record = SchedulerRecord {
-        schema_version: SCHEDULER_SCHEMA_VERSION,
-        advertise_address: scheduler_id.clone(),
-        grpc_address: format!(
-            "{advertise_host}:{}",
-            rt.config().flight_bind_address.port()
-        ),
-        http_address: format!("{advertise_host}:{}", rt.config().http_bind_address.port()),
-        started_at_ms: now_ms()?,
-        last_heartbeat_ms: now_ms()?,
-        ttl_ms: DEFAULT_TTL_MS,
-        build_version: env!("CARGO_PKG_VERSION").to_string(),
-        labels: HashMap::new(),
-    };
+    let reaper = Reaper::new(Arc::clone(&cluster), Arc::clone(&heartbeats));
 
-    let runner = SchedulerRegistryRunner::new(
-        store,
-        &base_prefix,
+    let runner = SchedulerRegistryRunner {
+        cluster,
+        heartbeats,
+        reaper,
         scheduler_id,
-        record,
-        Arc::clone(&peers),
-    );
+        instance_id,
+        entry,
+        peers,
+    };
 
     runner.run(cancel).await
 }
 
 impl SchedulerRegistryRunner {
-    fn new(
-        store: Arc<dyn ObjectStore>,
-        base_prefix: &str,
-        scheduler_id: String,
-        record: SchedulerRecord,
-        peers: Arc<RwLock<SchedulerPeers>>,
-    ) -> Self {
-        let metadata_path = join_path(base_prefix, "metadata/cluster.json");
-        let record_path = join_path(base_prefix, &format!("schedulers/{scheduler_id}.json"));
-        let schedulers_prefix = format!("{}/schedulers/", base_prefix.trim_end_matches('/'));
-        let state: ObjectState<SchedulerRecord> =
-            ObjectState::new(Arc::clone(&store)).with_prefix(schedulers_prefix);
-
-        Self {
-            store,
-            state,
-            scheduler_id,
-            metadata_path,
-            record_path,
-            record,
-            peers,
-        }
-    }
-
-    async fn run(mut self, cancel: CancellationToken) -> Result<()> {
-        self.ensure_cluster_metadata().await?;
-        self.bootstrap_record().await?;
+    async fn run(self, cancel: CancellationToken) -> Result<()> {
+        self.cluster.bootstrap().await.context(ClusterStateSnafu)?;
+        self.register_self().await?;
 
         let heartbeat_interval =
-            Duration::from_millis(self.record.ttl_ms.saturating_div(HEARTBEAT_DIVISOR).max(1));
-        let mut heartbeat = tokio::time::interval(heartbeat_interval);
-        let mut discovery = tokio::time::interval(DISCOVERY_INTERVAL);
+            Duration::from_millis(self.entry.ttl_ms.saturating_div(HEARTBEAT_DIVISOR).max(1));
+        let reaper_interval = Duration::from_millis(self.entry.ttl_ms);
+        let reaper_jittered = heartbeat::jitter(reaper_interval, 0.2);
+        let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
+        let mut discovery_tick = tokio::time::interval(DISCOVERY_INTERVAL);
+        let mut reaper_tick = tokio::time::interval(reaper_jittered);
+
+        // Run an initial discovery so peers are populated promptly.
+        if let Err(err) = self.refresh_peers().await {
+            tracing::warn!("Initial scheduler discovery failed: {err}");
+        }
 
         loop {
             tokio::select! {
                 () = cancel.cancelled() => {
-                    self.delete_record().await;
+                    self.shutdown().await;
                     break;
                 }
-                _ = heartbeat.tick() => {
-                    if let Err(err) = self.heartbeat().await {
+                _ = heartbeat_tick.tick() => {
+                    if let Err(err) = self.send_heartbeat().await {
                         tracing::warn!("Scheduler heartbeat failed: {err}");
                     }
                 }
-                _ = discovery.tick() => {
+                _ = discovery_tick.tick() => {
                     if let Err(err) = self.refresh_peers().await {
                         tracing::warn!("Scheduler discovery failed: {err}");
+                    }
+                }
+                _ = reaper_tick.tick() => {
+                    match now_ms() {
+                        Ok(now) => match self.reaper.tick(now).await {
+                            Ok(out) if !out.evicted.is_empty() => {
+                                tracing::info!(
+                                    evicted = ?out.evicted,
+                                    skipped = ?out.skipped,
+                                    "Reaper tick"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(err) => tracing::warn!("Reaper tick failed: {err}"),
+                        },
+                        Err(err) => tracing::warn!(
+                            "Skipping reaper tick because current time is unavailable: {err}"
+                        ),
                     }
                 }
             }
@@ -244,126 +236,104 @@ impl SchedulerRegistryRunner {
         Ok(())
     }
 
-    async fn ensure_cluster_metadata(&self) -> Result<()> {
-        let metadata = ClusterMetadata {
-            schema_version: CLUSTER_SCHEMA_VERSION,
-            created_at_ms: now_ms()?,
-        };
-        let payload = serde_json::to_vec(&metadata).context(SerializeStateSnafu)?;
+    async fn register_self(&self) -> Result<()> {
+        let observed = self
+            .heartbeats
+            .read(&self.scheduler_id)
+            .await
+            .context(HeartbeatSnafu)?;
+        let observed_instance = observed.as_ref().map(|b| b.instance_id);
 
-        let put_result = self
-            .store
-            .put_opts(
-                &self.metadata_path,
-                payload.into(),
-                PutOptions::from(PutMode::Create),
-            )
+        let entry = self.entry.clone();
+        let scheduler_id = self.scheduler_id.clone();
+        let instance_id = self.instance_id;
+
+        let now = now_ms()?;
+
+        let res = self
+            .cluster
+            .mutate(|state| {
+                if let Some(existing) = state.schedulers.get(&scheduler_id) {
+                    // Allow takeover only if (a) the heartbeat we
+                    // observed matches the existing entry's
+                    // instance_id (so we are taking over the
+                    // incarnation we judged stale), AND (b) that
+                    // observation is in fact stale, OR there is no
+                    // heartbeat at all and the existing entry has
+                    // had time to publish one.
+                    let observed_matches =
+                        observed_instance.is_none_or(|i| i == existing.instance_id);
+                    let stale_or_missing = if let Some(beat) = observed.as_ref() {
+                        beat.is_stale(now)
+                    } else {
+                        let grace = existing.ttl_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS);
+                        now.saturating_sub(existing.started_at_ms) > grace
+                    };
+                    if observed_matches && stale_or_missing {
+                        state.schedulers.insert(scheduler_id.clone(), entry.clone());
+                        MutationOutcome::Apply
+                    } else if existing.instance_id == instance_id {
+                        // Re-register on top of our own (e.g. retry).
+                        MutationOutcome::NoChange
+                    } else {
+                        MutationOutcome::Abort(MutateError::Conflict {
+                            message: format!("scheduler id {scheduler_id} is already registered"),
+                        })
+                    }
+                } else {
+                    state.schedulers.insert(scheduler_id.clone(), entry.clone());
+                    MutationOutcome::Apply
+                }
+            })
             .await;
 
-        match put_result {
-            Ok(_) | Err(ObjectStoreError::AlreadyExists { .. }) => Ok(()),
-            Err(err) => Err(Error::ObjectStoreWrite { source: err }),
-        }
-    }
-
-    async fn bootstrap_record(&mut self) -> Result<()> {
-        match self
-            .state
-            .insert(&self.scheduler_id, &self.record)
-            .await
-            .map_err(|e| e.into_object_store("scheduler_registry"))
-            .context(ObjectStoreWriteSnafu)?
-        {
-            InsertResult::Ok => return Ok(()),
-            InsertResult::AlreadyExists => {}
-        }
-
-        // Record exists - check if stale
-        let existing = self
-            .state
-            .get(&self.scheduler_id)
-            .await
-            .map_err(|e| e.into_object_store("scheduler_registry"))
-            .context(ObjectStoreReadSnafu)?
-            .ok_or_else(|| Error::SchedulerIdConflict {
-                scheduler_id: self.scheduler_id.clone(),
-            })?;
-
-        if !record_is_stale(&existing, now_ms()?) {
-            return Err(Error::SchedulerIdConflict {
-                scheduler_id: self.scheduler_id.clone(),
-            });
-        }
-
-        // Stale record - overwrite it
-        self.conditional_update().await
-    }
-
-    async fn heartbeat(&mut self) -> Result<()> {
-        self.record.last_heartbeat_ms = now_ms()?;
-        self.conditional_update().await
-    }
-
-    async fn conditional_update(&mut self) -> Result<()> {
-        let mut backoff = FibonacciBackoffBuilder::new()
-            .max_retries(Some(MAX_CONDITIONAL_ATTEMPTS))
-            .build();
-
-        loop {
-            match self
-                .state
-                .update(&self.scheduler_id, &self.record)
-                .await
-                .map_err(|e| e.into_object_store("scheduler_registry"))
-                .context(ObjectStoreWriteSnafu)?
-            {
-                UpdateResult::Ok => return Ok(()),
-                UpdateResult::NotFound => {
-                    // Record was deleted - re-insert
-                    let _ = self.state.insert(&self.scheduler_id, &self.record).await;
-                    return Ok(());
-                }
-                UpdateResult::Conflict { .. } => {
-                    // ETag mismatch - state.update() already refreshed cache with current value
-                    let Some(delay) = backoff.next_duration() else {
-                        return Err(Error::ObjectStoreWrite {
-                            source: ObjectStoreError::Precondition {
-                                path: self.scheduler_id.clone(),
-                                source: Box::new(std::io::Error::other(
-                                    "Conditional update failed after retries",
-                                )),
-                            },
-                        });
-                    };
-                    tokio::time::sleep(delay).await;
-                }
+        match res {
+            Ok(_) => {}
+            Err(MutateError::Conflict { .. }) => {
+                return Err(Error::SchedulerIdConflict {
+                    scheduler_id: self.scheduler_id.clone(),
+                });
             }
+            Err(other) => return Err(Error::ClusterState { source: other }),
         }
+
+        // Write our first heartbeat so peers see liveness on next discovery.
+        self.heartbeats
+            .heartbeat(&self.scheduler_id, self.instance_id, now, self.entry.ttl_ms)
+            .await
+            .context(HeartbeatSnafu)?;
+        Ok(())
+    }
+
+    async fn send_heartbeat(&self) -> Result<()> {
+        let now = now_ms()?;
+        self.heartbeats
+            .heartbeat(&self.scheduler_id, self.instance_id, now, self.entry.ttl_ms)
+            .await
+            .context(HeartbeatSnafu)
     }
 
     async fn refresh_peers(&self) -> Result<()> {
-        self.state
-            .refresh()
-            .await
-            .map_err(|e| e.into_object_store("scheduler_registry"))
-            .context(ObjectStoreReadSnafu)?;
-
+        let snap = self.cluster.read().await.context(ClusterStateSnafu)?;
         let now = now_ms()?;
-        let records: HashMap<String, SchedulerRecord> = self
-            .state
-            .cached_entries()
-            .into_iter()
-            .filter(|(_, record)| !record_is_stale(record, now))
-            .map(|(_, record)| (record.advertise_address.clone(), record))
-            .collect();
+        let alive = self
+            .heartbeats
+            .list_alive(now, &snap)
+            .await
+            .context(HeartbeatSnafu)?;
+
+        let mut next: HashMap<String, SchedulerEntry> = HashMap::new();
+        for (id, entry) in &snap.schedulers {
+            if alive.contains_key(id) || id == &self.scheduler_id {
+                next.insert(id.clone(), entry.clone());
+            }
+        }
 
         let mut peers = self.peers.write().await;
         let previous: HashSet<String> = peers.keys().cloned().collect();
-        let next: HashSet<String> = records.keys().cloned().collect();
-
-        let added: Vec<_> = next.difference(&previous).cloned().collect();
-        let removed: Vec<_> = previous.difference(&next).cloned().collect();
-
+        let next_keys: HashSet<String> = next.keys().cloned().collect();
+        let added: Vec<_> = next_keys.difference(&previous).cloned().collect();
+        let removed: Vec<_> = previous.difference(&next_keys).cloned().collect();
         if !added.is_empty() || !removed.is_empty() {
             tracing::info!(
                 "Scheduler membership updated; added={}, removed={}",
@@ -371,18 +341,29 @@ impl SchedulerRegistryRunner {
                 removed.len()
             );
         }
-
-        *peers = records;
-
-        // Record cluster scheduler count metric
+        *peers = next;
         cluster_metrics::set_scheduler_count(&self.scheduler_id, peers.len() as u64);
-
         Ok(())
     }
 
-    async fn delete_record(&self) {
-        if let Err(err) = self.store.delete(&self.record_path).await {
-            tracing::warn!("Failed to delete scheduler record: {err}");
+    async fn shutdown(&self) {
+        let scheduler_id = self.scheduler_id.clone();
+        let instance_id = self.instance_id;
+        if let Err(err) = self
+            .cluster
+            .mutate(|state| match state.schedulers.get(&scheduler_id) {
+                Some(entry) if entry.instance_id == instance_id => {
+                    state.schedulers.remove(&scheduler_id);
+                    MutationOutcome::Apply
+                }
+                _ => MutationOutcome::NoChange,
+            })
+            .await
+        {
+            tracing::warn!("Failed to remove scheduler entry on shutdown: {err}");
+        }
+        if let Err(err) = self.heartbeats.delete(&self.scheduler_id).await {
+            tracing::warn!("Failed to delete heartbeat on shutdown: {err}");
         }
     }
 }
@@ -420,7 +401,7 @@ pub(super) async fn build_object_store(
     .await
 }
 
-pub(super) async fn build_object_store_internal(
+pub async fn build_object_store_internal(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
     state_location: &str,
@@ -431,9 +412,6 @@ pub(super) async fn build_object_store_internal(
     })?;
 
     if url.scheme() == "file" {
-        // For file:// URLs, reconstruct the local filesystem path.
-        // `file://.data/scheduler-state` → host=".data", path="/scheduler-state" → ".data/scheduler-state"
-        // `file:///absolute/path`        → host=None,    path="/absolute/path"   → "/absolute/path"
         let local_path = match url.host_str() {
             Some(host) => {
                 let path_suffix = url.path().trim_start_matches('/');
@@ -451,10 +429,6 @@ pub(super) async fn build_object_store_internal(
             source: Box::new(e),
         })?;
 
-        // Use `LocalConditionalPut` instead of plain `LocalFileSystem` because
-        // `LocalFileSystem` returns `NotImplemented` for `PutMode::Update`.
-        // The scheduler registry heartbeats and job store state transitions
-        // both rely on conditional puts (ETag-based OCC).
         let store: Arc<dyn ObjectStore> = Arc::new(
             object_store_occ::LocalConditionalPut::new(&local_path).map_err(|e| {
                 Error::LocalFileSystemInit {
@@ -464,7 +438,6 @@ pub(super) async fn build_object_store_internal(
             })?,
         );
 
-        // The store is rooted at `local_path`, so the base prefix is empty.
         return Ok((store, String::new()));
     }
 
@@ -523,32 +496,54 @@ async fn build_s3_parameters(
     }
 }
 
-fn join_path(prefix: &str, suffix: &str) -> Path {
-    if prefix.is_empty() {
-        Path::from(suffix)
-    } else {
-        Path::from(format!("{prefix}/{suffix}"))
-    }
-}
-
-fn record_is_stale(record: &SchedulerRecord, now_ms: u64) -> bool {
-    now_ms.saturating_sub(record.last_heartbeat_ms)
-        > record.ttl_ms.saturating_add(CLOCK_SKEW_TOLERANCE_MS)
-}
-
 fn now_ms() -> Result<u64> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|source| Error::ObjectStoreRead {
-            source: ObjectStoreError::Generic {
-                store: "scheduler_registry",
-                source: Box::new(source),
-            },
-        })?;
-    u64::try_from(now.as_millis()).map_err(|source| Error::ObjectStoreRead {
-        source: ObjectStoreError::Generic {
-            store: "scheduler_registry",
-            source: Box::new(source),
-        },
-    })
+    cluster_state::now_ms().map_err(|source| Error::ClusterState { source })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn registry_runner_basic_register_and_shutdown() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cluster = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+        let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+        cluster.bootstrap().await.expect("bootstrap");
+
+        let instance_id = Uuid::new_v4();
+        let entry = SchedulerEntry {
+            scheduler_id: "test:50051".to_string(),
+            instance_id,
+            advertise_address: "test:50051".to_string(),
+            grpc_address: "test:50051".to_string(),
+            http_address: "test:8090".to_string(),
+            started_at_ms: 0,
+            ttl_ms: 30_000,
+            build_version: "test".to_string(),
+            labels: HashMap::new(),
+        };
+        let runner = SchedulerRegistryRunner {
+            cluster: Arc::clone(&cluster),
+            heartbeats: Arc::clone(&heartbeats),
+            reaper: Reaper::new(Arc::clone(&cluster), Arc::clone(&heartbeats)),
+            scheduler_id: "test:50051".to_string(),
+            instance_id,
+            entry,
+            peers: Arc::new(RwLock::new(HashMap::new())),
+        };
+        runner.register_self().await.expect("register");
+
+        let snap = cluster.read().await.expect("read");
+        assert!(snap.schedulers.contains_key("test:50051"));
+        let beat = heartbeats.read("test:50051").await.expect("read hb");
+        assert!(beat.is_some());
+
+        runner.shutdown().await;
+        let snap = cluster.read().await.expect("read");
+        assert!(!snap.schedulers.contains_key("test:50051"));
+        let beat = heartbeats.read("test:50051").await.expect("read hb");
+        assert!(beat.is_none());
+    }
 }

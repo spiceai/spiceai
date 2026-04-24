@@ -198,7 +198,18 @@ message MetricsResponse {
     bytes otlp_metrics = 2;
 }
 
-// Physical plan
+// Physical plan — wrapper with oneof to unambiguously tag each node type.
+// Without this, empty proto3 messages (BytesProcessedExecNode, CayenneAccelerationExecNode, SchemaCastScanExecNode with an empty schema)
+// are wire-identical to each other and making decoding unreliable.
+message SpicePhysicalPlanNode {
+    oneof node {
+        SchemaCastScanExecNode schema_cast_scan = 1;
+        BytesProcessedExecNode bytes_processed = 2;
+        CayenneAccelerationExecNode cayenne_acceleration = 3;
+        UdtfExecNode udtf = 4;
+    }
+}
+
 message SchemaCastScanExecNode {
     bytes schema = 1;
 }

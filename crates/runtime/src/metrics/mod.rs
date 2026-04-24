@@ -28,6 +28,7 @@ pub(crate) mod datasets;
 pub(crate) mod embeddings;
 pub(crate) mod llms;
 pub(crate) mod models;
+pub(crate) mod rerankers;
 pub(crate) mod secrets;
 pub(crate) mod spiced_runtime;
 pub(crate) mod telemetry;

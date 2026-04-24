@@ -26,6 +26,7 @@ use crate::datafusion::udtf::json_properties::{
 use crate::datafusion::udtf::json_tree::{JSON_TREE_UDTF_NAME, JsonTreeScalar, JsonTreeTableFunc};
 use crate::embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc};
 use crate::search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc};
+use crate::search::rerank::{RERANK_UDTF_NAME, RerankTableFunc};
 use crate::search::rrf;
 use crate::search::rrf::RRF_UDF_NAME;
 use crate::search::util::parse_explicit_primary_keys;
@@ -96,6 +97,31 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         Arc::new(rrf::ReciprocalRankFusion::from_ctx(ctx)),
     );
 
+    // `rerank(input, model => ..., document => ..., ...)` — reorders a
+    // scored result set using a reranker model. Registered as both a scalar
+    // UDF stub (so `rerank(...)` can appear nested inside another UDTF's arg
+    // list, same trick vector_search/text_search/rrf use) and a UDTF (the
+    // actual `FROM rerank(...)` implementation).
+    let session_ctx: Arc<SessionContext> = Arc::clone(ctx);
+    ctx.register_udf(
+        RerankTableFunc::new(
+            Arc::downgrade(&runtime.df),
+            Arc::clone(&session_ctx),
+            runtime.rerankers(),
+            runtime.completion_llms(),
+        )
+        .into(),
+    );
+    ctx.register_udtf(
+        RERANK_UDTF_NAME,
+        Arc::new(RerankTableFunc::new(
+            Arc::downgrade(&runtime.df),
+            session_ctx,
+            runtime.rerankers(),
+            runtime.completion_llms(),
+        )),
+    );
+
     // `flatten_json_properties` / `flatten_json` / `json_tree` — JSON-Schema
     // and generic JSON shredders. Registered as both UDTF (FROM-clause,
     // literal input) and ScalarUDF returning `List<Struct<...>>` (per-row /
@@ -141,6 +167,7 @@ static DENY_SPICE_SPECIFIC_FUNCTIONS: LazyLock<FunctionSupport> = LazyLock::new(
         FLATTEN_JSON_PROPERTIES_UDTF_NAME,
         FLATTEN_JSON_UDTF_NAME,
         JSON_TREE_UDTF_NAME,
+        RERANK_UDTF_NAME,
     ];
 
     FunctionSupport::new(

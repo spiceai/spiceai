@@ -18,7 +18,7 @@ use crate::cluster::DistributedNode;
 use crate::cluster::ExecutorRegistry;
 use crate::cluster::PartitionManager;
 use crate::cluster::ResolvedClusterConfig;
-use crate::cluster::partition;
+use crate::cluster::{ClusterStateStore, SchedulerHeartbeatStore};
 use crate::config::ClusterRole;
 use crate::config::Config;
 use crate::datafusion::udf::register_udfs;
@@ -251,56 +251,76 @@ impl RuntimeBuilder {
                     .as_ref()
                     .and_then(|app| app.runtime.scheduler.clone())
                 {
-                    match partition::build_partition_metadata_store(
-                        io_runtime.clone(),
+                    match crate::cluster::scheduler_registry::build_object_store_internal(
                         Arc::clone(&secrets),
+                        io_runtime.clone(),
+                        &scheduler_config.state_location,
                         &scheduler_config,
                     )
                     .await
                     {
-                        Ok(store) => {
-                            let partition_manager =
-                                Arc::new(PartitionManager::new(Arc::clone(&store)));
+                        Ok((store, base_prefix)) => {
+                            let cluster_state =
+                                Arc::new(ClusterStateStore::new(Arc::clone(&store), &base_prefix));
+                            let heartbeats = Arc::new(SchedulerHeartbeatStore::new(
+                                Arc::clone(&store),
+                                &base_prefix,
+                            ));
+                            let accelerations_partitions = Arc::new(
+                                PartitionManager::accelerations(Arc::clone(&cluster_state)),
+                            );
+                            let catalog_partitions =
+                                Arc::new(PartitionManager::catalog(Arc::clone(&cluster_state)));
 
                             Some(DistributedNode::Scheduler {
                                 peers: Arc::new(RwLock::new(HashMap::new())),
                                 // Initialized later when scheduler registry starts
                                 job_executor: Arc::new(RwLock::new(None)),
                                 executor_registry: Arc::new(ExecutorRegistry::new(
-                                    Arc::clone(&partition_manager),
-                                    Arc::new(
-                                        PartitionManager::new(Arc::clone(&store))
-                                            .with_prefix("catalog/partitions/"),
-                                    ),
+                                    Arc::clone(&accelerations_partitions),
+                                    Arc::clone(&catalog_partitions),
                                 )),
-                                partition_manager,
+                                cluster_state,
+                                heartbeats,
+                                accelerations_partitions,
+                                catalog_partitions,
                             })
                         }
                         Err(e) => {
                             tracing::error!(
-                                "Failed to initialize partition metadata store for scheduler: {e}"
+                                "Failed to initialize cluster state store for scheduler: {e}"
                             );
                             None
                         }
                     }
                 } else {
                     tracing::warn!(
-                        "'--role scheduler' was specified but no `runtime.scheduler` field was found in spicepod.yaml. Using in-memory partition store."
+                        "'--role scheduler' was specified but no `runtime.scheduler` field was found in spicepod.yaml. Using in-memory cluster state."
                     );
                     let store: Arc<dyn object_store::ObjectStore> =
                         Arc::new(object_store::memory::InMemory::new());
-                    let partition_manager = Arc::new(PartitionManager::new(Arc::clone(&store)));
+                    let cluster_state = Arc::new(ClusterStateStore::new(Arc::clone(&store), ""));
+                    if let Err(err) = cluster_state.bootstrap().await {
+                        tracing::warn!(
+                            "Failed to bootstrap in-memory cluster state document; will retry: {err}"
+                        );
+                    }
+                    let heartbeats = Arc::new(SchedulerHeartbeatStore::new(Arc::clone(&store), ""));
+                    let accelerations_partitions =
+                        Arc::new(PartitionManager::accelerations(Arc::clone(&cluster_state)));
+                    let catalog_partitions =
+                        Arc::new(PartitionManager::catalog(Arc::clone(&cluster_state)));
                     Some(DistributedNode::Scheduler {
                         peers: Arc::new(RwLock::new(HashMap::new())),
                         job_executor: Arc::new(RwLock::new(None)),
                         executor_registry: Arc::new(ExecutorRegistry::new(
-                            Arc::clone(&partition_manager),
-                            Arc::new(
-                                PartitionManager::new(Arc::clone(&store))
-                                    .with_prefix("catalog/partitions/"),
-                            ),
+                            Arc::clone(&accelerations_partitions),
+                            Arc::clone(&catalog_partitions),
                         )),
-                        partition_manager,
+                        cluster_state,
+                        heartbeats,
+                        accelerations_partitions,
+                        catalog_partitions,
                     })
                 }
             }
@@ -366,6 +386,7 @@ impl RuntimeBuilder {
             responses_llms: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
+            rerankers: Arc::new(RwLock::new(HashMap::new())),
             tools: Arc::new(RwLock::new(HashMap::new())),
             tool_factories: Arc::new(Mutex::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
