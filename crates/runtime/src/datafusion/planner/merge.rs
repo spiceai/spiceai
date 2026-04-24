@@ -168,9 +168,9 @@ pub(super) async fn plan_distributed_merge(
             DmlNodeOp::Merge(Box::new(MergeParams {
                 target_table: target_ref,
                 source_table: source_ref,
-                target_qualifier: target_qualifier.to_string(),
-                source_qualifier: source_qualifier.to_string(),
-                on_keys: on_keys.to_vec(),
+                target_qualifier,
+                source_qualifier,
+                on_keys,
                 // Scheduler-mode distributed MERGE forwards the original SQL
                 // directly to executors, so no typed assignment expressions
                 // are needed here.
