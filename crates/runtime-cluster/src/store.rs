@@ -18,11 +18,10 @@ limitations under the License.
 //!
 //! The cluster's accelerated and catalog/federated partition metadata
 //! both live as submaps inside the single `cluster.json` document. This
-//! module exposes a [`PartitionManager`] type parameterised by
+//! module exposes a [`PartitionStore`] type parameterised by
 //! [`PartitionScope`] so that call sites get a typed, scope-specific
-//! handle (`AccelerationsPartitions` / `CatalogPartitions`) without
-//! duplicating method bodies. Both type aliases point at the same
-//! struct; the only difference is the scope passed at construction.
+//! handle without duplicating method bodies. Both type aliases point at
+//! the same struct; the only difference is the scope passed at construction.
 
 use std::sync::Arc;
 use std::{collections::HashMap, time::SystemTime};
@@ -30,12 +29,12 @@ use std::{collections::HashMap, time::SystemTime};
 use datafusion::sql::TableReference;
 use snafu::prelude::*;
 
-use crate::cluster::cluster_state::{
+use crate::cluster_state::{
     ClusterStateStore, MutateError, MutateOk, MutationOutcome, PartitionScope,
 };
-use crate::cluster::partition::metadata::PartitionValue;
-
-use super::metadata::{PartitionMetadata, TablePartitionMetadata, normalized_table_name};
+use crate::metadata::{
+    PartitionMetadata, PartitionValue, TablePartitionMetadata, normalized_table_name,
+};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -92,7 +91,7 @@ impl AllocationResult {
 }
 
 /// A single (table, partition, executor) assignment, used by the
-/// batched [`PartitionManager::apply_assignments`] API.
+/// batched [`PartitionStore::apply_assignments`] API.
 #[derive(Debug, Clone)]
 pub struct AssignmentRequest {
     pub table: TableReference,
@@ -100,24 +99,23 @@ pub struct AssignmentRequest {
     pub executor_id: String,
 }
 
-/// Partition metadata manager bound to one [`PartitionScope`] of the
+/// Partition metadata store bound to one [`PartitionScope`] of the
 /// shared cluster document.
 ///
-/// Construct via [`PartitionManager::accelerations`] or
-/// [`PartitionManager::catalog`] (or via the [`AccelerationsPartitions`]
-/// / [`CatalogPartitions`] type aliases for clarity at call sites).
+/// Construct via [`PartitionStore::accelerations`] or
+/// [`PartitionStore::catalog`].
 #[derive(Debug, Clone)]
-pub struct PartitionManager {
+pub struct PartitionStore {
     cluster: Arc<ClusterStateStore>,
     scope: PartitionScope,
 }
 
 /// Type alias used at scheduler/executor wiring sites for clarity.
-pub type AccelerationsPartitions = PartitionManager;
+pub type AccelerationsPartitions = PartitionStore;
 /// Type alias used at scheduler/executor wiring sites for clarity.
-pub type CatalogPartitions = PartitionManager;
+pub type CatalogPartitions = PartitionStore;
 
-impl PartitionManager {
+impl PartitionStore {
     #[must_use]
     pub fn new(cluster: Arc<ClusterStateStore>, scope: PartitionScope) -> Self {
         Self { cluster, scope }
@@ -146,6 +144,10 @@ impl PartitionManager {
     }
 
     /// Get partition metadata for a table from object store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state read fails.
     pub async fn get_table_metadata(
         &self,
         table: &TableReference,
@@ -174,6 +176,10 @@ impl PartitionManager {
     /// Initialize partition metadata for a table with the given partition expression SQL strings.
     ///
     /// Returns `Ok(true)` if a new entry was created, `Ok(false)` if one already existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
     pub async fn initialize_metadata(
         &self,
         table: &TableReference,
@@ -212,6 +218,10 @@ impl PartitionManager {
     }
 
     /// Update partition metadata with discovered partitions, all marked as unassigned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails or encounters a concurrent modification.
     pub async fn set_unassigned_partitions(
         &self,
         table: &TableReference,
@@ -223,7 +233,7 @@ impl PartitionManager {
         let table_clone = table.clone();
         self.cluster
             .mutate(|state| {
-                let now_ms = match crate::cluster::cluster_state::now_ms() {
+                let now_ms = match crate::cluster_state::now_ms() {
                     Ok(v) => u128::from(v),
                     Err(e) => return MutationOutcome::Abort(e),
                 };
@@ -258,6 +268,10 @@ impl PartitionManager {
     }
 
     /// Allocates unassigned partitions to an executor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table metadata is not found, or if the cluster state mutation fails.
     pub async fn allocate_partitions(
         &self,
         table: &TableReference,
@@ -273,7 +287,7 @@ impl PartitionManager {
         let res = self
             .cluster
             .mutate(|state| {
-                let now_ms = match crate::cluster::cluster_state::now_ms() {
+                let now_ms = match crate::cluster_state::now_ms() {
                     Ok(v) => u128::from(v),
                     Err(e) => return MutationOutcome::Abort(e),
                 };
@@ -340,6 +354,10 @@ impl PartitionManager {
 
     /// Assigns a single partition to an executor. Most callers should
     /// prefer [`Self::apply_assignments`] for batching.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the partition or table metadata is not found, or if the mutation fails.
     pub async fn assign_partition(
         &self,
         table: &TableReference,
@@ -368,6 +386,10 @@ impl PartitionManager {
     /// same `(table, partition)` are overwritten with the new executor.
     /// Partition rows that don't yet exist are created so that callers
     /// can use this both for "first-time assignment" and "reassign".
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any table metadata is not found or if the cluster state mutation fails.
     pub async fn apply_assignments(&self, assignments: &[AssignmentRequest]) -> Result<()> {
         let mut not_found: Option<(String, String)> = None;
         self.apply_assignments_inner(assignments, &mut not_found)
@@ -392,7 +414,7 @@ impl PartitionManager {
         let res = self
             .cluster
             .mutate(|state| {
-                let now_ms = match crate::cluster::cluster_state::now_ms() {
+                let now_ms = match crate::cluster_state::now_ms() {
                     Ok(v) => u128::from(v),
                     Err(e) => return MutationOutcome::Abort(e),
                 };
@@ -465,6 +487,10 @@ impl PartitionManager {
 
     /// Adds new partitions to a table's metadata and assigns each to
     /// its respective executor in a single OCC write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails (see [`Self::apply_assignments`]).
     pub async fn add_and_assign_partitions(
         &self,
         table: &TableReference,
@@ -487,6 +513,10 @@ impl PartitionManager {
     /// Replace this table's metadata wholesale (atomic OCC write). Used
     /// by callers that compute the new metadata externally and just need
     /// to persist it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
     pub async fn write_metadata(
         &self,
         table: &TableReference,
@@ -515,6 +545,10 @@ impl PartitionManager {
     }
 
     /// List all tables (in this scope) with partition metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state read fails with an unexpected error.
     pub async fn list_tables(&self) -> Result<Vec<String>> {
         match self.cluster.read().await {
             Ok(snap) => Ok(self.scope.map(&snap).keys().cloned().collect()),
@@ -527,6 +561,10 @@ impl PartitionManager {
     }
 
     /// Refresh the local cache from object store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state read fails with an unexpected error.
     pub async fn refresh(&self) -> Result<()> {
         match self.cluster.read().await {
             Ok(_) | Err(MutateError::ClusterDocMissing { .. }) => Ok(()),
@@ -539,6 +577,10 @@ impl PartitionManager {
 
     /// Copy partition assignments from one table to another atomically
     /// (read + write happen inside a single OCC mutation).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cluster state mutation fails.
     pub async fn copy_assignments(
         &self,
         source_table: &TableReference,
@@ -552,7 +594,7 @@ impl PartitionManager {
         let res = self
             .cluster
             .mutate(|state| {
-                let now_ms = match crate::cluster::cluster_state::now_ms() {
+                let now_ms = match crate::cluster_state::now_ms() {
                     Ok(v) => u128::from(v),
                     Err(e) => return MutationOutcome::Abort(e),
                 };
@@ -605,21 +647,182 @@ fn now_ms() -> Result<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::cluster_state::ClusterStateStore;
-    use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+    use crate::cluster_state::ClusterStateStore;
     use object_store::ObjectStore;
     use object_store::memory::InMemory;
+    use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 
-    async fn test_manager() -> PartitionManager {
+    async fn test_store() -> PartitionStore {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let cs = Arc::new(ClusterStateStore::new(store, ""));
         cs.bootstrap().await.expect("bootstrap");
-        PartitionManager::accelerations(cs)
+        PartitionStore::accelerations(cs)
+    }
+
+    fn table(name: &str) -> TableReference {
+        TableReference::parse_str(name)
+    }
+
+    fn partition_value(key: &str, val: &str) -> PartitionValue {
+        HashMap::from([(key.to_string(), val.to_string())])
+    }
+
+    #[tokio::test]
+    async fn test_add_and_assign_new_partitions() {
+        let pm = test_store().await;
+        let tbl = table("my_table");
+
+        pm.initialize_metadata(&tbl, vec!["bucket(3, id)".to_string()])
+            .await
+            .expect("init");
+
+        let p0 = partition_value("bucket(3, id)", "0");
+        let p1 = partition_value("bucket(3, id)", "1");
+        let p2 = partition_value("bucket(3, id)", "2");
+
+        let assignments = vec![
+            (&p0, "executor-1"),
+            (&p1, "executor-2"),
+            (&p2, "executor-1"),
+        ];
+
+        pm.add_and_assign_partitions(&tbl, &assignments)
+            .await
+            .expect("add and assign");
+
+        let metadata = pm
+            .get_table_metadata(&tbl)
+            .await
+            .expect("get metadata")
+            .expect("should exist");
+
+        assert_eq!(metadata.partitions.len(), 3);
+
+        let find_partition = |val: &str| -> &PartitionMetadata {
+            metadata
+                .partitions
+                .iter()
+                .find(|p| p.partition_value.get("bucket(3, id)") == Some(&val.to_string()))
+                .expect("partition not found")
+        };
+
+        let p0_meta = find_partition("0");
+        assert!(p0_meta.is_assigned_to("executor-1"));
+        assert!(!p0_meta.is_assigned_to("executor-2"));
+
+        let p1_meta = find_partition("1");
+        assert!(p1_meta.is_assigned_to("executor-2"));
+        assert!(!p1_meta.is_assigned_to("executor-1"));
+
+        let p2_meta = find_partition("2");
+        assert!(p2_meta.is_assigned_to("executor-1"));
+        assert!(!p2_meta.is_assigned_to("executor-2"));
+    }
+
+    #[tokio::test]
+    async fn test_add_and_assign_idempotent() {
+        let pm = test_store().await;
+        let tbl = table("my_table");
+
+        pm.initialize_metadata(&tbl, vec!["bucket(2, id)".to_string()])
+            .await
+            .expect("init");
+
+        let p0 = partition_value("bucket(2, id)", "0");
+
+        let assignments = vec![(&p0, "executor-1")];
+        pm.add_and_assign_partitions(&tbl, &assignments)
+            .await
+            .expect("first call");
+
+        pm.add_and_assign_partitions(&tbl, &assignments)
+            .await
+            .expect("second call (idempotent)");
+
+        let metadata = pm
+            .get_table_metadata(&tbl)
+            .await
+            .expect("get metadata")
+            .expect("should exist");
+
+        assert_eq!(metadata.partitions.len(), 1);
+        assert!(metadata.partitions[0].is_assigned_to("executor-1"));
+        assert_eq!(metadata.partitions[0].assigned_executors.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_add_new_partitions_alongside_existing() {
+        let pm = test_store().await;
+        let tbl = table("my_table");
+
+        pm.initialize_metadata(&tbl, vec!["region".to_string()])
+            .await
+            .expect("init");
+
+        let p_east = partition_value("region", "us-east");
+        pm.add_and_assign_partitions(&tbl, &[(&p_east, "executor-1")])
+            .await
+            .expect("initial assignment");
+
+        let metadata = pm
+            .get_table_metadata(&tbl)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(metadata.partitions.len(), 1);
+
+        let p_west = partition_value("region", "us-west");
+        pm.add_and_assign_partitions(&tbl, &[(&p_west, "executor-2")])
+            .await
+            .expect("add new partition before refresh");
+
+        let metadata = pm
+            .get_table_metadata(&tbl)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(metadata.partitions.len(), 2);
+
+        let east = metadata
+            .partitions
+            .iter()
+            .find(|p| p.partition_value.get("region") == Some(&"us-east".to_string()))
+            .expect("us-east");
+        assert!(east.is_assigned_to("executor-1"));
+
+        let west = metadata
+            .partitions
+            .iter()
+            .find(|p| p.partition_value.get("region") == Some(&"us-west".to_string()))
+            .expect("us-west");
+        assert!(west.is_assigned_to("executor-2"));
+    }
+
+    #[tokio::test]
+    async fn test_add_and_assign_empty_is_noop() {
+        let pm = test_store().await;
+        let tbl = table("my_table");
+
+        pm.initialize_metadata(&tbl, vec!["col".to_string()])
+            .await
+            .expect("init");
+
+        let empty: Vec<(&PartitionValue, &str)> = vec![];
+        pm.add_and_assign_partitions(&tbl, &empty)
+            .await
+            .expect("empty is ok");
+
+        let metadata = pm
+            .get_table_metadata(&tbl)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert!(metadata.partitions.is_empty());
     }
 
     #[tokio::test]
     async fn copy_assignments_copies_metadata() {
-        let pm = test_manager().await;
+        let pm = test_store().await;
         let source = TableReference::parse_str("catalog.schema.source");
         let target = TableReference::parse_str("catalog.schema.target");
 
@@ -660,7 +863,7 @@ mod tests {
 
     #[tokio::test]
     async fn copy_assignments_noop_when_source_missing() {
-        let pm = test_manager().await;
+        let pm = test_store().await;
         let source = TableReference::parse_str("catalog.schema.missing");
         let target = TableReference::parse_str("catalog.schema.target");
 
@@ -676,7 +879,7 @@ mod tests {
 
     #[tokio::test]
     async fn copy_assignments_overwrites_existing_target() {
-        let pm = test_manager().await;
+        let pm = test_store().await;
         let source = TableReference::parse_str("catalog.schema.source");
         let target = TableReference::parse_str("catalog.schema.target");
 
@@ -748,7 +951,7 @@ mod tests {
 
     #[tokio::test]
     async fn fully_qualified_and_bare_resolve_to_same_partition() {
-        let pm = test_manager().await;
+        let pm = test_store().await;
         let bare = TableReference::bare("my_table");
         let full = TableReference::full(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, "my_table");
 
@@ -789,8 +992,8 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let cs = Arc::new(ClusterStateStore::new(store, ""));
         cs.bootstrap().await.expect("bootstrap");
-        let acc = PartitionManager::accelerations(Arc::clone(&cs));
-        let cat = PartitionManager::catalog(Arc::clone(&cs));
+        let acc = PartitionStore::accelerations(Arc::clone(&cs));
+        let cat = PartitionStore::catalog(Arc::clone(&cs));
         let table = TableReference::bare("t");
 
         acc.initialize_metadata(&table, vec!["region".to_string()])
@@ -810,8 +1013,8 @@ mod tests {
 
     #[tokio::test]
     async fn apply_assignments_writes_once_for_many_partitions() {
-        let pm = test_manager().await;
-        let table = TableReference::bare("t");
+        let pm = test_store().await;
+        let table = table("t");
         pm.initialize_metadata(&table, vec!["region".to_string()])
             .await
             .expect("init");
