@@ -494,9 +494,11 @@ async fn huggingface_test_gemma_chat_completion() -> Result<(), anyhow::Error> {
 
     let _tracing = init_tracing(None);
 
-    verify_env_secret_exists("SPICE_HF_TOKEN")
-        .await
-        .map_err(anyhow::Error::msg)?;
+    if HF_TEST_MODEL_REQUIRES_HF_API_KEY {
+        verify_env_secret_exists("SPICE_HF_TOKEN")
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
 
     test_request_context()
         .scope_retry(3, || async {
