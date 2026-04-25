@@ -481,10 +481,10 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
     }).await
 }
 
-/// Live integration test for loading a Gemma model from HuggingFace.
+/// Live integration test for loading a Gemma model from `HuggingFace`.
 ///
 /// Regression test for <https://github.com/spiceai/spiceai/issues/...> — the
-/// `attention_bias` field is omitted from Gemma 2/3 HuggingFace configs and
+/// `attention_bias` field is omitted from Gemma 2/3 `HuggingFace` configs and
 /// must be treated as optional during deserialization. Without the fix this
 /// test fails at model load with `missing field 'attention_bias'`.
 #[tokio::test]
@@ -553,10 +553,10 @@ async fn huggingface_test_gemma_chat_completion() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// Live integration test for loading a Gemma 4 model from HuggingFace.
+/// Live integration test for loading a Gemma 4 model from `HuggingFace`.
 ///
 /// Verifies that the `gemma4` architecture (e.g. `google/gemma-4-E2B-it`) can be
-/// loaded and served via the HuggingFace model component.
+/// loaded and served via the `HuggingFace` model component.
 #[tokio::test]
 async fn huggingface_test_gemma4_chat_completion() -> Result<(), anyhow::Error> {
     const HF_GEMMA_MODEL: &str = "google/gemma-4-E2B-it";
