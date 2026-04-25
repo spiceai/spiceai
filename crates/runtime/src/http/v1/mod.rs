@@ -65,7 +65,7 @@ use snafu::ResultExt;
 
 use futures::TryStreamExt;
 
-use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+use runtime_auth::AuthPrincipalRef;
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
@@ -96,8 +96,7 @@ pub(crate) fn principal_has_write_access(principal: &AuthPrincipalRef) -> bool {
 
 pub(crate) async fn current_principal_requires_read_only() -> bool {
     let context = RequestContext::current(AsyncMarker::new().await);
-    context
-        .auth_principal()
+    runtime_auth::AuthRequestContext::auth_principal(context.as_ref())
         .is_some_and(|principal| !principal_has_write_access(principal))
 }
 

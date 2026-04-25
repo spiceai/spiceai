@@ -370,6 +370,54 @@ fn compute_file_checksum(path: &Path) -> Result<String> {
     Ok(hex_encode(&digest))
 }
 
+fn compute_reader_checksum<R: std::io::Read>(reader: &mut R) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+
+    loop {
+        let bytes_read = reader
+            .read(&mut buffer)
+            .map_err(|source| ArchiveError::ReadArchive { source })?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+fn copy_reader_to_writer<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+    write_path: &Path,
+) -> Result<u64> {
+    let mut total_bytes = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+
+    loop {
+        let bytes_read = reader
+            .read(&mut buffer)
+            .map_err(|source| ArchiveError::ReadArchive { source })?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        writer
+            .write_all(&buffer[..bytes_read])
+            .map_err(|source| ArchiveError::ExtractArchive {
+                path: write_path.to_path_buf(),
+                source,
+            })?;
+        total_bytes += bytes_read as u64;
+    }
+
+    Ok(total_bytes)
+}
+
 /// Encode bytes as lowercase hex string.
 fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
@@ -535,7 +583,6 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
     options: &ExtractOptions,
 ) -> Result<()> {
     use std::fs;
-    use std::io::{Read, Write};
 
     for entry_result in archive
         .entries()
@@ -572,18 +619,15 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
                 continue;
             }
 
-            if options.skip_if_exists && options.verify_existing_checksums {
-                // Read the archive entry contents to compute expected checksum
-                let mut archive_contents = Vec::new();
-                entry
-                    .read_to_end(&mut archive_contents)
-                    .map_err(|source| ArchiveError::ReadArchive { source })?;
+            if dest_path.is_dir() {
+                return Err(ArchiveError::UnsafeArchivePath {
+                    path: dest_path,
+                    reason: "archive file entry conflicts with an existing directory".to_string(),
+                });
+            }
 
-                let expected_checksum = {
-                    let mut hasher = Sha256::new();
-                    hasher.update(&archive_contents);
-                    hex_encode(&hasher.finalize())
-                };
+            if options.skip_if_exists && options.verify_existing_checksums {
+                let expected_checksum = compute_reader_checksum(&mut entry)?;
 
                 // Compute checksum of existing file
                 let actual_checksum = compute_file_checksum(&dest_path)?;
@@ -631,14 +675,9 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
                 source,
             })?;
         } else if entry_type.is_file() {
-            // Read file contents with checksum computation for verification
-            let mut contents = Vec::new();
-            entry
-                .read_to_end(&mut contents)
-                .map_err(|source| ArchiveError::ReadArchive { source })?;
-
             // Write to file atomically by writing to temp file then renaming
             let temp_path = dest_path.with_extension(format!("{}.tmp", std::process::id()));
+            let bytes_written;
 
             {
                 let mut file = fs::OpenOptions::new()
@@ -650,17 +689,33 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
                         source,
                     })?;
 
-                file.write_all(&contents)
-                    .map_err(|source| ArchiveError::ExtractArchive {
-                        path: temp_path.clone(),
-                        source,
-                    })?;
+                bytes_written = copy_reader_to_writer(&mut entry, &mut file, &temp_path)?;
 
                 file.sync_all()
                     .map_err(|source| ArchiveError::ExtractArchive {
                         path: temp_path.clone(),
                         source,
                     })?;
+            }
+
+            #[cfg(windows)]
+            if dest_path.exists() {
+                ensure_existing_destination_is_safe(&dest_path, &dest_root)?;
+                if dest_path.is_dir() {
+                    let _ = fs::remove_file(&temp_path);
+                    return Err(ArchiveError::UnsafeArchivePath {
+                        path: dest_path,
+                        reason: "archive file entry conflicts with an existing directory"
+                            .to_string(),
+                    });
+                }
+                fs::remove_file(&dest_path).map_err(|source| {
+                    let _ = fs::remove_file(&temp_path);
+                    ArchiveError::ExtractArchive {
+                        path: dest_path.clone(),
+                        source,
+                    }
+                })?;
             }
 
             // Atomic rename
@@ -686,7 +741,7 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
             tracing::trace!(
                 "Extracted file: {} ({} bytes)",
                 dest_path.display(),
-                contents.len()
+                bytes_written
             );
         }
     }

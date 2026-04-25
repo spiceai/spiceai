@@ -34,6 +34,18 @@ use runtime_request_context::{AsyncMarker, RequestContext};
 
 use super::{Service, metrics};
 
+fn flight_data_stream(
+    flights: Vec<FlightData>,
+    error: Option<Status>,
+) -> impl futures::Stream<Item = Result<FlightData, Status>> {
+    stream::iter(
+        flights
+            .into_iter()
+            .map(Ok::<_, Status>)
+            .chain(error.into_iter().map(Err)),
+    )
+}
+
 pub(crate) async fn handle(
     flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
@@ -143,10 +155,12 @@ pub(crate) async fn handle(
                         ) {
                             Ok(batch) => batch,
                             Err(err) => {
-                                let output =
-                                    futures::stream::iter(vec![Err(Status::internal(format!(
+                                let output = flight_data_stream(
+                                    Vec::new(),
+                                    Some(Status::internal(format!(
                                         "Unable to convert record batch into change event: {err}"
-                                    )))]);
+                                    ))),
+                                );
                                 return Some((output, rx));
                             }
                         };
@@ -166,9 +180,12 @@ pub(crate) async fn handle(
                         ) {
                             Ok(encoded_batch) => encoded_batch,
                             Err(err) => {
-                                let output = futures::stream::iter(vec![Err(Status::internal(
-                                    format!("Unable to encode batch: {err}"),
-                                ))]);
+                                let output = flight_data_stream(
+                                    Vec::new(),
+                                    Some(Status::internal(format!(
+                                        "Unable to encode batch: {err}"
+                                    ))),
+                                );
                                 return Some((output, rx));
                             }
                         };
@@ -178,17 +195,12 @@ pub(crate) async fn handle(
                     }
 
                     metrics::DO_EXCHANGE_DATA_UPDATES_SENT.add(flights.len() as u64, &[]);
-                    let output = futures::stream::iter(
-                        flights
-                            .into_iter()
-                            .map(Ok)
-                            .collect::<Vec<Result<FlightData, Status>>>(),
-                    );
+                    let output = flight_data_stream(flights, None);
 
                     Some((output, rx))
                 }
                 Err(_e) => {
-                    let output = futures::stream::iter(Vec::<Result<FlightData, Status>>::new());
+                    let output = flight_data_stream(Vec::new(), None);
                     Some((output, rx))
                 }
             }
