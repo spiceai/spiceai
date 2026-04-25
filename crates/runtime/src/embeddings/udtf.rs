@@ -132,6 +132,8 @@ impl QueryVectorExpr {
         Self {
             vector: Arc::new(vector),
             data_type,
+            // Marked `Volatile` so DataFusion does not constant-fold `query_vector()`
+            // back into a large `FixedSizeList` literal in `EXPLAIN` output.
             signature: Signature::exact(vec![], Volatility::Volatile),
         }
     }
