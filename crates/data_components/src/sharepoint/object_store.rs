@@ -392,32 +392,18 @@ impl ObjectStore for SharepointObjectStore {
         options.check_preconditions(&object_meta)?;
 
         // Slice in-memory after fetch (see note in `get_content`).
-        let bytes = with_original_location(
-            get_content(
-                &self.client,
-                &drive,
-                &in_drive,
-                options.range.as_ref(),
-                meta.size,
-            )
-            .await,
+        // `get_content` returns the authoritative total size from the
+        // fetched response body, so `range` / `meta.size` always agree
+        // with the data we actually return — even if the Graph `head`
+        // response reported a stale or missing `size`.
+        let (bytes, total_size) = with_original_location(
+            get_content(&self.client, &drive, &in_drive, options.range.as_ref()).await,
             location,
         )?;
-        // Prefer the actual fetched length for `range` / `meta.size` so that
-        // ranged reads (e.g. Parquet footer reads via `GetRange::Suffix`) and
-        // downstream schema inference always agree with the returned payload
-        // — even if the Graph `head` response reported a stale or missing
-        // size. For ranged reads, `bytes.len()` is the slice length, so fall
-        // back to the head size when the caller provided a range.
-        let actual_size = if options.range.is_some() {
-            meta.size
-        } else {
-            u64::try_from(bytes.len()).unwrap_or(meta.size)
-        };
         let range = options
             .range
             .as_ref()
-            .map_or(0..actual_size, |r| resolve_range(r, actual_size));
+            .map_or(0..total_size, |r| resolve_range(r, total_size));
 
         let stream = futures::stream::once(async move { Ok(bytes) });
         Ok(GetResult {
@@ -427,7 +413,7 @@ impl ObjectStore for SharepointObjectStore {
             meta: ObjectMeta {
                 location: location.clone(),
                 last_modified: meta.last_modified,
-                size: actual_size,
+                size: total_size,
                 e_tag: meta.e_tag.clone(),
                 version: meta.version.clone(),
             },
@@ -1004,8 +990,7 @@ async fn get_content(
     drive: &DriveRef,
     item_path: &Path,
     range: Option<&GetRange>,
-    total_size: u64,
-) -> ObjectStoreResult<Bytes> {
+) -> ObjectStoreResult<(Bytes, u64)> {
     let graph_path = SharepointObjectStore::graph_path(item_path);
     let request = match drive_chain(client, drive) {
         DriveChain::ById(c) => c.item_by_path(&graph_path).get_items_content(),
@@ -1032,17 +1017,24 @@ async fn get_content(
     // header types, so instead of the HTTP `Range` header we fetch the full
     // body and slice. For large files this is wasteful — revisit once the SDK
     // exposes a typed header API.
+    //
+    // Use `bytes.len()` as the authoritative size when resolving the range,
+    // not the HEAD-reported size: Graph occasionally omits or misreports the
+    // `size` field, which would otherwise cause suffix/offset reads (e.g.
+    // Parquet footer reads via `GetRange::Suffix`) to resolve to an empty
+    // slice even though we have the full body in memory.
+    let total_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     match range {
-        None => Ok(bytes),
+        None => Ok((bytes, total_size)),
         Some(r) => {
             let Range { start, end } = resolve_range(r, total_size);
             // Clamp both bounds to the actual buffer length so a
-            // requested range past EOF (or a stale `total_size`) produces
-            // an empty slice instead of panicking in `Bytes::slice`.
+            // requested range past EOF produces an empty slice instead of
+            // panicking in `Bytes::slice`.
             let start = usize::try_from(start).unwrap_or(0).min(bytes.len());
             let end = usize::try_from(end).unwrap_or(bytes.len()).min(bytes.len());
             let end = end.max(start);
-            Ok(bytes.slice(start..end))
+            Ok((bytes.slice(start..end), total_size))
         }
     }
 }
