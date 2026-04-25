@@ -601,14 +601,12 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
                     dest_path.display(),
                     &actual_checksum[..16] // Log first 16 chars of checksum
                 );
-            } else {
-                if options.skip_if_exists {
-                    tracing::debug!(
-                        "Skipping existing file during archive extraction: {}",
-                        dest_path.display()
-                    );
-                    continue;
-                }
+            } else if options.skip_if_exists {
+                tracing::debug!(
+                    "Skipping existing file during archive extraction: {}",
+                    dest_path.display()
+                );
+                continue;
             }
 
             if options.skip_if_exists {
@@ -950,8 +948,10 @@ mod tests {
         std::fs::create_dir_all(&mapped_dir).expect("Failed to create mapped dir");
 
         let archive_buffer = archive_with_file("data/../outside.txt", b"owned");
-        let mut options = ExtractOptions::default();
-        options.prefix_mappings = Some(vec![("data/".to_string(), mapped_dir)]);
+        let options = ExtractOptions {
+            prefix_mappings: Some(vec![("data/".to_string(), mapped_dir)]),
+            ..Default::default()
+        };
 
         let result =
             extract_archive_with_options(Cursor::new(archive_buffer), &extract_dir, options).await;

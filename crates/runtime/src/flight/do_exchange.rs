@@ -164,7 +164,7 @@ pub(crate) async fn handle(
                             &write_options,
                             &mut compression_context,
                         ) {
-                            Ok(encoded) => encoded,
+                            Ok(encoded_batch) => encoded_batch,
                             Err(err) => {
                                 let output = futures::stream::iter(vec![Err(Status::internal(
                                     format!("Unable to encode batch: {err}"),

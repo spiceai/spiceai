@@ -464,7 +464,8 @@ async fn track_metrics(
             .with_extension(DataFusionContextExtension::new(Arc::clone(&df)))
             .build(),
     );
-    let auth_request_context: Arc<dyn AuthRequestContext + Send + Sync> = request_context.clone();
+    let auth_request_context: Arc<dyn AuthRequestContext + Send + Sync> =
+        Arc::clone(&request_context) as Arc<dyn AuthRequestContext + Send + Sync>;
     req.extensions_mut().insert(auth_request_context);
 
     let request_dimensions = request_context.to_dimensions();
