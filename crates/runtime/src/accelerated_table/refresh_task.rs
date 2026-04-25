@@ -2526,9 +2526,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(TimestampNanosecondArray::from(vec![
-                None,
-                None,
-                None,
+                None, None, None,
             ]))],
         )
         .expect("batch");
